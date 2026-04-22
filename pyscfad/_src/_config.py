@@ -40,6 +40,7 @@ class _Config:
 config = _Config()
 
 config.set_default('pyscfad_scf_implicit_diff', False)
+config.set_default('pyscfad_scf_first_order_custom', False)
 config.set_default('pyscfad_ccsd_implicit_diff', False)
 #config.set_default('pyscfad_ccsd_checkpoint', False)
 config.set_default('pyscfad_moleintor_opt', False)

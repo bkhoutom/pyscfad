@@ -16,13 +16,16 @@ Restricted Hartree-Fock
 """
 from functools import partial
 import numpy
+import jax
+from jax import custom_vjp
+from jax.interpreters import ad as jax_ad
 
 from pyscf.data import nist
 from pyscf.lib import alias, module_method, with_doc
 from pyscf.scf import hf as pyscf_hf
 from pyscf.scf.hf import TIGHT_GRAD_CONV_TOL
 
-from pyscfad import config
+from pyscfad import config, config_update
 from pyscfad import numpy as np
 from pyscfad import pytree
 from pyscfad import util
@@ -37,11 +40,57 @@ from pyscfad.scipy.linalg import eigh
 from pyscfad.tools.linear_solver import gen_gmres
 
 
+def mo_response_eq78(dfock, ds1e, mo_energy_ref, mo_coeff_ref, deg_thresh=1e-9):
+    eps = mo_energy_ref
+    c = mo_coeff_ref
+    cdc = c.T.conj() @ dfock @ c
+    csc = c.T.conj() @ ds1e @ c
+    x = cdc - csc * eps[None, :]
+
+    eji = eps[None, :] - eps[:, None]
+    safe_eji = np.where(np.abs(eji) > deg_thresh, eji, 1.0)
+    wmat = np.where(np.abs(eji) > deg_thresh, 1.0 / safe_eji, 0.0)
+    ident_mask = np.where(np.abs(eji) > deg_thresh, 0.0, 1.0)
+
+    deps = np.diag(ident_mask * x)
+    rhs = wmat * x - ident_mask * (0.5 * csc)
+    dcoeff = c @ rhs
+    return deps, dcoeff, rhs
+
+
+@ops.custom_jvp
+def mo_from_fock_eq78(fock, s1e, mo_energy_ref, mo_coeff_ref):
+    del fock, s1e
+    return mo_energy_ref, mo_coeff_ref
+
+
+@mo_from_fock_eq78.defjvp
+def _mo_from_fock_eq78_jvp(primals, tangents):
+    fock, s1e, mo_energy_ref, mo_coeff_ref = primals
+    dfock, ds1e, _, _ = tangents
+
+    deps, dcoeff, _ = mo_response_eq78(dfock, ds1e, mo_energy_ref, mo_coeff_ref)
+    return (mo_energy_ref, mo_coeff_ref), (deps, dcoeff)
+
+
+def _stash_dfjk_mo_data(mf, mo_coeff, mo_occ):
+    with_df = getattr(mf, 'with_df', None)
+    if with_df is None:
+        return
+    from pyscfad.df import _df_jk_opt
+    _df_jk_opt.set_fast_exchange_dm_data(
+        with_df,
+        ops.to_numpy(mo_coeff),
+        ops.to_numpy(mo_occ),
+    )
+
+
 def _scf_fixed_point(dm, mf, s1e, h1e):
     vhf = mf.get_veff(mf.mol, dm, s1e=s1e)
     fock = mf.get_fock(h1e, s1e, vhf, dm)
     mo_energy, mo_coeff = mf.eig(fock, s1e)
     mo_occ = mf.get_occ(mo_energy, mo_coeff)
+    _stash_dfjk_mo_data(mf, mo_coeff, mo_occ)
     dm = mf.make_rdm1(mo_coeff, mo_occ)
     del mo_energy, mo_occ
     return dm
@@ -62,6 +111,7 @@ def _scf(dm, mf, s1e, h1e, *,
         fock = mf.get_fock(h1e, s1e, vhf, dm, cycle, diis, fock_last=fock_last)
         mo_energy, mo_coeff = mf.eig(fock, s1e)
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
+        _stash_dfjk_mo_data(mf, mo_coeff, mo_occ)
         dm = mf.make_rdm1(mo_coeff, mo_occ)
         vhf = mf.get_veff(mol, dm, dm_last, vhf, s1e=s1e)
         e_tot = mf.energy_tot(dm, h1e, vhf)
@@ -94,6 +144,220 @@ def _scf(dm, mf, s1e, h1e, *,
     return dm, scf_conv, e_tot, mo_energy, mo_coeff, mo_occ
 
 
+def _kernel_explicit_trace(mf, conv_tol=1e-10, conv_tol_grad=None,
+                           dump_chk=False, dm0=None, callback=None,
+                           conv_check=True):
+    """Run the JAX-traceable SCF loop without implicit-diff wrapping."""
+    if not config.scf_implicit_diff:
+        raise RuntimeError(
+            "Explicit-trace SCF requires pyscfad_scf_implicit_diff=True "
+            "so the low-level SCF ops stay JAX-traceable."
+        )
+
+    log = logger.new_logger(mf)
+    cput0 = log.get_t0()
+    if conv_tol_grad is None:
+        conv_tol_grad = numpy.sqrt(conv_tol)
+        log.info('Set gradient conv threshold to %g', conv_tol_grad)
+
+    mol = mf.mol
+    s1e = mf.get_ovlp(mol)
+
+    if dm0 is None:
+        dm = mf.get_init_guess(mol, mf.init_guess, s1e=s1e)
+    else:
+        dm = dm0
+
+    h1e = mf.get_hcore(mol, s1e=s1e)
+    vhf = mf.get_veff(mol, dm, s1e=s1e)
+    e_tot = mf.energy_tot(dm, h1e, vhf)
+    log.info('init E= %.15g', e_tot)
+
+    if mf.max_cycle <= 0:
+        fock = mf.get_fock(h1e, s1e, vhf, dm)
+        mo_energy, mo_coeff = mf.eig(fock, s1e)
+        mo_occ = mf.get_occ(mo_energy, mo_coeff)
+        _stash_dfjk_mo_data(mf, mo_coeff, mo_occ)
+        mo_energy = getattr(mo_energy, 'mo_energy', mo_energy)
+        return False, e_tot, mo_energy, mo_coeff, mo_occ
+
+    if isinstance(mf.diis, lib.diis.DIIS):
+        mf_diis = mf.diis
+    elif mf.diis:
+        assert issubclass(mf.DIIS, lib.diis.DIIS)
+        mf_diis = mf.DIIS(mf, mf.diis_file)
+        mf_diis.space = mf.diis_space
+        mf_diis.rollback = mf.diis_space_rollback
+        mf_diis.damp = mf.diis_damp
+        fock = mf.get_fock(h1e, s1e, vhf, dm)
+        _, mf_diis.Corth = mf.eig(fock, s1e)
+    else:
+        mf_diis = None
+
+    mf.pre_kernel(locals())
+    cput1 = log.timer('initialize scf', *cput0)
+    dm, scf_conv, e_tot, mo_energy, mo_coeff, mo_occ = _scf(
+        dm, mf, s1e, h1e,
+        conv_tol=conv_tol, conv_tol_grad=conv_tol_grad,
+        diis=mf_diis, dump_chk=dump_chk, callback=callback,
+        log=log, e_tot=e_tot, vhf=vhf, cput1=cput1,
+    )
+
+    if scf_conv and conv_check:
+        cput1 = log.get_t0()
+        vhf = mf.get_veff(mol, dm, s1e=s1e)
+        fock = mf.get_fock(h1e, s1e, vhf, dm)
+        mo_energy, mo_coeff = mf.eig(fock, s1e)
+        mo_occ = mf.get_occ(mo_energy, mo_coeff)
+        _stash_dfjk_mo_data(mf, mo_coeff, mo_occ)
+        dm, dm_last = mf.make_rdm1(mo_coeff, mo_occ), dm
+        vhf = mf.get_veff(mol, dm, dm_last, vhf, s1e=s1e)
+        e_tot = mf.energy_tot(dm, h1e, vhf)
+        log.timer('extra cycle', *cput1)
+
+    mo_energy = getattr(mo_energy, 'mo_energy', mo_energy)
+    log.timer('scf_cycle', *cput0)
+    mf.post_kernel(locals())
+    return scf_conv, e_tot, mo_energy, mo_coeff, mo_occ
+
+
+def _first_order_settings(mf_ref):
+    with_df = getattr(mf_ref, 'with_df', None)
+    return {
+        'with_df': with_df is not None,
+        'auxbasis': getattr(with_df, 'auxbasis', None) if with_df is not None else None,
+        'conv_tol': mf_ref.conv_tol,
+        'conv_tol_grad': mf_ref.conv_tol_grad,
+        'max_cycle': mf_ref.max_cycle,
+        'init_guess': mf_ref.init_guess,
+        'verbose': mf_ref.verbose,
+        'max_memory': mf_ref.max_memory,
+        'direct_scf': mf_ref.direct_scf,
+        'direct_scf_tol': mf_ref.direct_scf_tol,
+        'conv_check': mf_ref.conv_check,
+        'level_shift': mf_ref.level_shift,
+        'damp': mf_ref.damp,
+        'diis': bool(mf_ref.diis),
+        'diis_space': mf_ref.diis_space,
+        'diis_space_rollback': mf_ref.diis_space_rollback,
+        'diis_damp': mf_ref.diis_damp,
+        'diis_start_cycle': mf_ref.diis_start_cycle,
+    }
+
+
+def _build_mf_for_first_order(mol, settings):
+    mf = RHF(mol)
+    if settings['with_df']:
+        mf = mf.density_fit(auxbasis=settings['auxbasis'])
+    mf.conv_tol = settings['conv_tol']
+    mf.conv_tol_grad = settings['conv_tol_grad']
+    mf.max_cycle = settings['max_cycle']
+    mf.init_guess = settings['init_guess']
+    mf.verbose = settings['verbose']
+    mf.max_memory = settings['max_memory']
+    mf.direct_scf = settings['direct_scf']
+    mf.direct_scf_tol = settings['direct_scf_tol']
+    mf.conv_check = settings['conv_check']
+    mf.level_shift = settings['level_shift']
+    mf.damp = settings['damp']
+    mf.diis = settings['diis']
+    mf.diis_space = settings['diis_space']
+    mf.diis_space_rollback = settings['diis_space_rollback']
+    mf.diis_damp = settings['diis_damp']
+    mf.diis_start_cycle = settings['diis_start_cycle']
+    return mf
+
+
+def _zero_cotangent_like(x):
+    if x is None:
+        return None
+    return np.zeros_like(x)
+
+
+def _is_zero_cotangent(x):
+    return x is None or isinstance(x, jax_ad.Zero)
+
+
+def _scf_outputs_first_order_impl(mol, settings, dm0):
+    mf = _build_mf_for_first_order(mol, settings)
+    with config_update('pyscfad_scf_first_order_custom', False):
+        e_tot = mf.kernel(dm0=dm0)
+    return mf.converged, e_tot, mf.mo_energy, mf.mo_coeff, mf.mo_occ
+
+
+@partial(custom_vjp, nondiff_argnums=(1,))
+def _scf_outputs_first_order(mol, settings, dm0):
+    return _scf_outputs_first_order_impl(mol, settings, dm0)
+
+
+def _scf_outputs_first_order_fwd(mol, settings, dm0):
+    out = _scf_outputs_first_order_impl(mol, settings, dm0)
+    res = (
+        mol,
+        dm0,
+        numpy.asarray(ops.to_numpy(out[2])).copy(),
+        numpy.asarray(ops.to_numpy(out[3])).copy(),
+    )
+    return out, res
+
+
+def _scf_outputs_first_order_bwd(settings, res, cotangent):
+    mol, dm0, mo_energy_fwd, mo_coeff_fwd = res
+    _, bar_e_tot, bar_mo_energy, bar_mo_coeff, _ = cotangent
+
+    if (
+        _is_zero_cotangent(bar_e_tot)
+        and _is_zero_cotangent(bar_mo_energy)
+        and _is_zero_cotangent(bar_mo_coeff)
+    ):
+        return _zero_cotangent_like(mol), _zero_cotangent_like(dm0)
+
+    def _contract_outputs(mol_replay, mf, e_tot, mo_energy_raw, mo_coeff_raw, mo_occ_raw):
+        dm = mf.make_rdm1(mo_coeff_raw, mo_occ_raw)
+        s1e = mf.get_ovlp(mol_replay)
+        h1e = mf.get_hcore(mol_replay, s1e=s1e)
+        vhf = mf.get_veff(mol_replay, dm, s1e=s1e)
+        fock = mf.get_fock(h1e, s1e, vhf, dm)
+        mo_energy, mo_coeff = mo_from_fock_eq78(
+            fock,
+            s1e,
+            np.asarray(mo_energy_fwd),
+            np.asarray(mo_coeff_fwd),
+        )
+
+        out = 0.0
+        if not _is_zero_cotangent(bar_e_tot):
+            out = out + np.real(bar_e_tot * e_tot)
+        if not _is_zero_cotangent(bar_mo_energy):
+            out = out + np.real(np.vdot(bar_mo_energy, mo_energy))
+        if not _is_zero_cotangent(bar_mo_coeff):
+            out = out + np.real(np.vdot(bar_mo_coeff, mo_coeff))
+        return out
+
+    def weighted_outputs_explicit(mol):
+        mf = _build_mf_for_first_order(mol, settings)
+        with config_update('pyscfad_scf_first_order_custom', False):
+            _, e_tot, mo_energy_raw, mo_coeff_raw, mo_occ_raw = _kernel_explicit_trace(
+                mf,
+                mf.conv_tol,
+                mf.conv_tol_grad,
+                dump_chk=False,
+                dm0=dm0,
+                callback=None,
+                conv_check=mf.conv_check,
+            )
+        return _contract_outputs(mol, mf, e_tot, mo_energy_raw, mo_coeff_raw, mo_occ_raw)
+
+    mol_bar = jax.grad(weighted_outputs_explicit)(mol)
+    return mol_bar, _zero_cotangent_like(dm0)
+
+
+_scf_outputs_first_order.defvjp(
+    _scf_outputs_first_order_fwd,
+    _scf_outputs_first_order_bwd,
+)
+
+
 @with_doc(pyscf_hf.kernel.__doc__)
 def kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
            dump_chk=True, dm0=None, callback=None, conv_check=True, **kwargs):
@@ -124,6 +388,7 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         fock = mf.get_fock(h1e, s1e, vhf, dm)
         mo_energy, mo_coeff = mf.eig(fock, s1e)
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
+        _stash_dfjk_mo_data(mf, mo_coeff, mo_occ)
         # hack for ROHF
         mo_energy = getattr(mo_energy, 'mo_energy', mo_energy)
         return scf_conv, e_tot, mo_energy, mo_coeff, mo_occ
@@ -188,6 +453,7 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         fock = mf.get_fock(h1e, s1e, vhf, dm)
         mo_energy, mo_coeff = mf.eig(fock, s1e)
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
+        _stash_dfjk_mo_data(mf, mo_coeff, mo_occ)
         dm, dm_last = mf.make_rdm1(mo_coeff, mo_occ), dm
         vhf = mf.get_veff(mol, dm, dm_last, vhf, s1e=s1e)
         e_tot, last_hf_e = mf.energy_tot(dm, h1e, vhf), e_tot
@@ -402,7 +668,35 @@ class SCF(pytree.PytreeNode, pyscf_hf.SCF):
         self.dump_flags()
         self.build(self.mol)
 
-        if self.max_cycle > 0 or self.mo_coeff is None:
+        use_first_order_custom = config.scf_first_order_custom and dm0 is None
+        if config.scf_first_order_custom and dm0 is not None:
+            logger.warn(
+                self,
+                'Custom first-order SCF response does not yet support '
+                'explicit dm0 robustly; falling back to the standard implicit '
+                'SCF derivative for this call.',
+            )
+
+        if use_first_order_custom:
+            if not config.scf_implicit_diff:
+                raise NotImplementedError(
+                    "The experimental first-order SCF backward requires "
+                    "pyscfad_scf_implicit_diff=True."
+                )
+            if self.max_cycle <= 0 and self.mo_coeff is not None:
+                raise NotImplementedError(
+                    "The experimental first-order SCF backward does not "
+                    "support the skip-SCF / frozen-orbitals code path."
+                )
+            settings = _first_order_settings(self)
+            self.converged, self.e_tot, \
+                    self.mo_energy, self.mo_coeff, self.mo_occ = \
+                    _scf_outputs_first_order(self.mol, settings, dm0)
+            nocc = self.mol.nelectron // 2
+            mo_occ = numpy.zeros(self.mo_energy.shape[-1], dtype=float)
+            mo_occ[:nocc] = 2.0
+            self.mo_occ = mo_occ
+        elif self.max_cycle > 0 or self.mo_coeff is None:
             self.converged, self.e_tot, \
                     self.mo_energy, self.mo_coeff, self.mo_occ = \
                     kernel(self, self.conv_tol, self.conv_tol_grad,

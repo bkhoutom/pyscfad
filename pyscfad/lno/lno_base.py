@@ -15,21 +15,33 @@
 import warnings
 from functools import reduce
 import numpy
+import jax
+import jax.scipy.linalg as jsp_linalg
 from pyscf.mp.mp2 import get_frozen_mask, get_nmo, get_nocc
+from pyscf import gto as pyscf_gto
 
 from pyscfad import numpy as np
 from pyscfad import pytree
 from pyscfad.ops import stop_trace, stop_grad
+from pyscfad.ops import is_array
 from pyscfad import scipy
+from pyscfad import df as df_mod
 from pyscfad.tools import timer
 from pyscfad.ao2mo import _ao2mo
+from pyscfad.df import addons as df_addons
+from pyscfad.dlno import util as dlno_util
 from pyscfad.lno import _checkpointed
 from pyscfad.lno.mp2_rdm import make_rdm1_vo, make_rdm1_vo_frag
 from pyscfad.lno.tools import autofrag, map_lo_to_frag
+from pyscfad.gto._mole_helper import setup_exp, setup_ctr_coeff
 
 USE_CHECKPOINT = True
 THRESH_INTERNAL = 1e-10
 THRESH_OCC = 1e-6
+# Weak DLNO virtual-overlap directions can be numerically unstable when mapped
+# into the current external-virtual MO space.  Prune only these nearly-null
+# directions; the physically relevant subspace is unaffected.
+DLNO_VIR_MAP_THRESH = 1e-6
 # Tuned for benzene;
 # must be bigger than the energy difference
 # between degenerate semicanonical orbitals
@@ -56,29 +68,88 @@ def kernel(mfcc, orbloc, frag_lolist,
         fraglo = numpy.asarray(frag_lolist[ifrag]).ravel()
         orbfragloc = orbloc[:,fraglo]
         frag_target_nocc, frag_target_nvir = frag_nonvlist[ifrag]
+        frag_prescreen = mfcc.get_dlno_prescreen_fragment(ifrag)
         frag_res[ifrag] = kernel_1frag(mfcc, eris, orbfragloc, no_type,
+                                       frag_prescreen=frag_prescreen,
                                        frag_target_nocc=frag_target_nocc,
                                        frag_target_nvir=frag_target_nvir)
     return frag_res
 
 
 def kernel_1frag(mfcc, eris, orbfragloc, no_type,
+                 frag_prescreen=None,
                  frag_target_nocc=None, frag_target_nvir=None):
     mf = mfcc._scf
     frozen_mask = mfcc.get_frozen_mask()
     thresh_pno = (mfcc.thresh_occ, mfcc.thresh_vir)
-    frzfrag, orbfrag = make_fpno1(mfcc, eris, orbfragloc, no_type,
+    eris_fpno = make_fragment_eris(mfcc, eris, frag_prescreen)
+    frzfrag, orbfrag = make_fpno1(mfcc, eris_fpno, orbfragloc, no_type,
                                   THRESH_INTERNAL, thresh_pno,
+                                  frag_prescreen=frag_prescreen,
                                   frozen_mask=frozen_mask,
                                   frag_target_nocc=frag_target_nocc,
                                   frag_target_nvir=frag_target_nvir)
     if orbfrag is None:
         return (0., 0., 0.)
     frag_res = mfcc.impurity_solve(mf, orbfrag, orbfragloc,
-                                   frozen=frzfrag, eris=eris)
+                                   frozen=frzfrag, eris=eris,
+                                   frag_prescreen=frag_prescreen)
     return frag_res
 
+
+def _dlno_outside_space(full_space, selected_space, thresh):
+    """Build the frozen complement used only to preserve fragment MO layout.
+
+    The complement can become numerically null when DLNO screening is very tight.
+    Its SVD backward pass is then ill-conditioned, even though the selected
+    prescreen space itself is well behaved. Treat this bookkeeping complement
+    as frozen metadata.
+    """
+    thresh = max(float(thresh), 1e-8)
+    if full_space is None or full_space.shape[1] == 0:
+        return np.zeros((0, 0))
+    if selected_space is None or selected_space.shape[1] == 0:
+        return stop_grad(orthonormalize_colspace(full_space, thresh=thresh))
+    if selected_space.shape[1] >= full_space.shape[1]:
+        return np.zeros((full_space.shape[0], 0), dtype=full_space.dtype)
+
+    residual = full_space - np.dot(
+        stop_grad(selected_space),
+        np.dot(stop_grad(selected_space.T.conj()), stop_grad(full_space)),
+    )
+    return stop_grad(orthonormalize_colspace(residual, thresh=thresh))
+
+
+def _spans_full_molecule(mfcc, frag_prescreen):
+    if frag_prescreen is None:
+        return False
+    atmlst = frag_prescreen.get('extended_primary_domain')
+    if atmlst is None:
+        return False
+    return len(numpy.asarray(atmlst).ravel()) >= mfcc.mol.natm
+
+
+def _subspace_equivalent(full_space, trial_space, thresh, overlap_tol=1e-6):
+    if full_space is None or trial_space is None:
+        return False
+    if full_space.shape[1] == 0:
+        return True
+    if trial_space.shape[1] < full_space.shape[1]:
+        return False
+
+    q_full = orthonormalize_colspace(full_space, thresh=thresh)
+    q_trial = orthonormalize_colspace(trial_space, thresh=thresh)
+    if q_full.shape[1] < full_space.shape[1] or q_trial.shape[1] < full_space.shape[1]:
+        return False
+
+    ovlp = np.dot(q_full.T.conj(), q_trial)
+    sigma = scipy.linalg.svd(ovlp, compute_uv=False)
+    if sigma.size < full_space.shape[1]:
+        return False
+    return bool(numpy.all(numpy.abs(numpy.asarray(sigma[:full_space.shape[1]]) - 1.0) < overlap_tol))
+
 def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external,
+               frag_prescreen=None,
                frozen_mask=None, frag_target_nocc=None, frag_target_nvir=None):
     mytimer = timer.Timer()
 
@@ -95,6 +166,7 @@ def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external
     s1e = eris.s1e
     fock = eris.fock
     Lov = eris.Lov
+    semicanonicalize_fn = semicanonicalize
 
     lovir = False
     if mfcc.use_local_virt:
@@ -117,13 +189,87 @@ def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external
     # split active occ/vir into internal(1) and external(2)
     m = reduce(np.dot, (orbfragloc.T, s1e, orbocc1))
     uocc1, uocc2 = projection_construction(m, thresh_internal)
-    moefragocc1, orbfragocc1 = semicanonicalize(fock, np.dot(orbocc1, uocc1))
+    moefragocc1, orbfragocc1 = semicanonicalize_fn(fock, np.dot(orbocc1, uocc1))
+    uocc2_outside = np.zeros((uocc2.shape[0], 0), dtype=uocc2.dtype)
 
     uvir2 = None
+    uvir2_outside = np.zeros((orbvir1.shape[1], 0), dtype=orbvir1.dtype)
     if lovir:
         m = reduce(np.dot, (orbfragloc.T, s1e, orbvir1))
         uvir1, uvir2 = projection_construction(m, thresh_internal)
-        moefragvir1, orbfragvir1 = semicanonicalize(fock, np.dot(orbvir1, uvir1))
+        moefragvir1, orbfragvir1 = semicanonicalize_fn(fock, np.dot(orbvir1, uvir1))
+
+    if mfcc.use_dlno_prescreen:
+        dlno_thresh_internal = max(float(thresh_internal), 1e-8)
+        if frag_prescreen is not None:
+            if not _spans_full_molecule(mfcc, frag_prescreen):
+                uocc2_full = uocc2
+                uocc2_dlno = mfcc.get_dlno_prescreen_space(
+                    orbocc1,
+                    frag_prescreen,
+                    'occ_prescreen_coeff',
+                    anchor_spaces=(uocc1,),
+                    s1e=s1e,
+                    thresh=dlno_thresh_internal,
+                )
+                if uocc2_dlno is not None and uocc2_dlno.shape[1] > 0:
+                    if uocc2_dlno.shape[1] >= uocc2_full.shape[1]:
+                        uocc2 = uocc2_full
+                        uocc2_outside = np.zeros((uocc2_full.shape[0], 0), dtype=uocc2_full.dtype)
+                    else:
+                        uocc2_dlno = np.dot(uocc2_full, np.dot(uocc2_full.T.conj(), uocc2_dlno))
+                        uocc2_dlno = orthonormalize_colspace_fixed_gauge(
+                            uocc2_dlno,
+                            thresh=dlno_thresh_internal,
+                        )
+                        if uocc2_dlno.shape[1] > 0:
+                            if _subspace_equivalent(uocc2_full, uocc2_dlno, dlno_thresh_internal):
+                                uocc2 = uocc2_full
+                                uocc2_outside = np.zeros((uocc2_full.shape[0], 0), dtype=uocc2_full.dtype)
+                            else:
+                                uocc2 = uocc2_dlno
+                                uocc2_outside = _dlno_outside_space(
+                                    uocc2_full,
+                                    uocc2,
+                                    dlno_thresh_internal,
+                                )
+
+                vir_anchor = (uvir1,) if lovir else ()
+                uvir2_full = uvir2
+                uvir2_dlno = mfcc.get_dlno_prescreen_space(
+                    orbvir1,
+                    frag_prescreen,
+                    'vir_prescreen_coeff',
+                    anchor_spaces=vir_anchor,
+                    s1e=s1e,
+                    thresh=dlno_thresh_internal,
+                )
+                if uvir2_dlno is not None and uvir2_dlno.shape[1] > 0:
+                    if lovir and uvir2_full is not None and uvir2_dlno.shape[1] >= uvir2_full.shape[1]:
+                        uvir2 = uvir2_full
+                        uvir2_outside = np.zeros((uvir2_full.shape[0], 0), dtype=uvir2_full.dtype)
+                    else:
+                        if lovir and uvir2_full is not None and uvir2_full.shape[1] > 0:
+                            uvir2_dlno = np.dot(uvir2_full, np.dot(uvir2_full.T.conj(), uvir2_dlno))
+                        uvir2_dlno = orthonormalize_colspace_fixed_gauge(
+                            uvir2_dlno,
+                            thresh=dlno_thresh_internal,
+                        )
+                        if uvir2_dlno.shape[1] > 0:
+                            uvir2 = uvir2_dlno
+                            if lovir and uvir2_full is not None and uvir2_full.shape[1] > 0:
+                                uvir2_outside = _dlno_outside_space(
+                                    uvir2_full,
+                                    uvir2,
+                                    dlno_thresh_internal,
+                                )
+                            else:
+                                ident = np.eye(orbvir1.shape[1], dtype=orbvir1.dtype)
+                                uvir2_outside = _dlno_outside_space(
+                                    ident,
+                                    uvir2,
+                                    dlno_thresh_internal,
+                                )
 
     # augment virtual space
     uuocc2_corr = uuvir2_corr = None
@@ -197,7 +343,7 @@ def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external
             t2 = ovov / eiajb
             dmvv = make_rdm1_mp2(t2, 'vv', e1_or_e2, swapidx)
             ovov = eiajb = None
-        if lovir:
+        if uvir2 is not None:
             dmvv = reduce(np.dot, (uvir2.T, dmvv, uvir2))
 
     # Construct PT2 dm_oo
@@ -264,7 +410,7 @@ def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external
             orbfragocc2, orbfragocc0 = natorb_compression(dmoo, orbocc1, thresh_ext_occ,
                                                           uocc2, frag_target_nocc,
                                                           uuocc2_corr, mfcc.natorb_occdeg_thresh)
-            orbfragocc12 = semicanonicalize(fock, np.hstack([orbfragocc2, orbfragocc1]))[1]
+            orbfragocc12 = semicanonicalize_fn(fock, np.hstack([orbfragocc2, orbfragocc1]))[1]
     if lovir:
         if frag_target_nvir is not None:
             frag_target_nvir -= orbfragvir1.shape[1]
@@ -275,21 +421,25 @@ def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external
             orbfragvir2, orbfragvir0 = natorb_compression(dmvv, orbvir1, thresh_ext_vir,
                                                           uvir2, frag_target_nvir,
                                                           uuvir2_corr, mfcc.natorb_occdeg_thresh)
-        orbfragvir12 = semicanonicalize(fock, np.hstack([orbfragvir2, orbfragvir1]))[1]
+        orbfragvir12 = semicanonicalize_fn(fock, np.hstack([orbfragvir2, orbfragvir1]))[1]
     else:
         orbfragvir2, orbfragvir0 = natorb_compression(dmvv, orbvir1, thresh_ext_vir,
-                                                      None, frag_target_nvir,
+                                                      uvir2, frag_target_nvir,
                                                       uuvir2_corr, mfcc.natorb_occdeg_thresh)
         if orbfragvir2.shape[-1] == 0:
             warnings.warn('No virtual orbital is included for this fragment, '
                           'setting correlation energy to zero.')
             return None, None
         else:
-            orbfragvir12 = semicanonicalize(fock, orbfragvir2)[1]
+            orbfragvir12 = semicanonicalize_fn(fock, orbfragvir2)[1]
 
-    orbfrag = np.hstack([orbocc0, orbfragocc0, orbfragocc12,
-                         orbfragvir12, orbfragvir0, orbvir0])
-    frzfrag = numpy.hstack([numpy.arange(orbocc0.shape[1]+orbfragocc0.shape[1]),
+    orbocc_outside = np.dot(orbocc1, uocc2_outside)
+    orbvir_outside = np.dot(orbvir1, uvir2_outside)
+
+    orbfrag = np.hstack([orbocc0, orbocc_outside, orbfragocc0, orbfragocc12,
+                         orbfragvir12, orbfragvir0, orbvir_outside, orbvir0])
+    nfrzocc = orbocc0.shape[1] + orbocc_outside.shape[1] + orbfragocc0.shape[1]
+    frzfrag = numpy.hstack([numpy.arange(nfrzocc),
                             numpy.arange(nocc+orbfragvir12.shape[1],nmo)])
 
     mytimer.timer('make_fpno1:')
@@ -414,6 +564,179 @@ def canonical_orth_(S, thr=1e-8):
     # Plug normalization back in
     X = np.dot(np.diag(normlz), X)
     return X
+
+def orthonormalize_colspace(A, thresh=1e-10):
+    A = np.asarray(A)
+    if A.ndim != 2:
+        raise ValueError('Input space must be a rank-2 array.')
+    if A.shape[1] == 0:
+        return np.zeros((A.shape[0], 0), dtype=A.dtype)
+    u, sigma, _ = scipy.linalg.svd(A, full_matrices=False)
+    idx = numpy.where(abs(sigma) > thresh)[0]
+    if len(idx) == 0:
+        return np.zeros((A.shape[0], 0), dtype=A.dtype)
+    return u[:, idx]
+
+def _regularized_hermitian_invsqrt(gram, thresh=1e-10, deg_thresh=None):
+    gram = np.asarray(gram)
+    if gram.ndim != 2:
+        raise ValueError('Gram matrix must be rank-2.')
+    if gram.shape[0] == 0:
+        return np.zeros_like(gram)
+    if deg_thresh is None:
+        deg_thresh = max(float(thresh), 1e-9)
+    e, v = scipy.linalg.eigh(gram, deg_thresh=deg_thresh)
+    e = np.real(e)
+    floor = max(float(thresh), 1e-14)
+    scale = np.where(e > floor, 1.0 / np.sqrt(e), 1.0 / np.sqrt(floor))
+    return np.dot(v * scale[None, :], v.T.conj())
+
+def orthonormalize_colspace_smooth(A, thresh=1e-10):
+    """Differentiably orthonormalize a selected subspace with mild regularization."""
+    A = np.asarray(A)
+    if A.ndim != 2:
+        raise ValueError('Input space must be a rank-2 array.')
+    if A.shape[1] == 0:
+        return np.zeros((A.shape[0], 0), dtype=A.dtype)
+    floor = max(float(thresh), 1e-10)
+    gram = np.dot(A.T.conj(), A)
+    eye = np.eye(gram.shape[0], dtype=gram.dtype)
+    chol = np.linalg.cholesky(gram + floor * eye)
+    x = jsp_linalg.solve_triangular(chol.T.conj(), eye, lower=False)
+    return np.dot(A, x)
+
+def orthonormalize_metric_colspace_smooth(A, s, thresh=1e-10):
+    """Differentiably metric-orthonormalize a subspace with mild regularization.
+
+    Unlike the fixed-gauge helper, this uses a matrix inverse square root of the
+    Gram matrix.  The result depends only on the projector-valued function of the
+    Gram matrix and therefore avoids the arbitrary eigenvector gauge inside
+    exactly or nearly degenerate subspaces.
+    """
+    A = np.asarray(A)
+    s = np.asarray(s)
+    if A.ndim != 2:
+        raise ValueError('Input space must be a rank-2 array.')
+    if A.shape[1] == 0:
+        return np.zeros((A.shape[0], 0), dtype=A.dtype)
+    floor = max(float(thresh), 1e-10)
+    gram = np.dot(A.T.conj(), np.dot(s, A))
+    eye = np.eye(gram.shape[0], dtype=gram.dtype)
+    chol = np.linalg.cholesky(gram + floor * eye)
+    x = jsp_linalg.solve_triangular(chol.T.conj(), eye, lower=False)
+    return np.dot(A, x)
+
+
+def orthonormalize_colspace_fixed_gauge(A, thresh=1e-10):
+    """Orthonormalize a selected subspace while freezing gauge rotations.
+
+    For DLNO-selected fragment spaces we want geometry response of the span, but
+    the internal orthonormalization gauge is not physically meaningful and its
+    derivative is often singular. Keep the span differentiable while treating
+    the orthonormalizing rotation as fixed metadata.
+    """
+    A = np.asarray(A)
+    if A.ndim != 2:
+        raise ValueError('Input space must be a rank-2 array.')
+    if A.shape[1] == 0:
+        return np.zeros((A.shape[0], 0), dtype=A.dtype)
+    if A.shape[1] == 1:
+        nrm = stop_grad(np.sqrt(np.dot(A[:, 0].conj(), A[:, 0])))
+        nrm = numpy.asarray(jax.device_get(nrm)).reshape(())
+        if abs(nrm) <= thresh:
+            return np.zeros((A.shape[0], 0), dtype=A.dtype)
+        return A / stop_grad(np.asarray(nrm))
+    s = stop_grad(np.dot(A.T.conj(), A))
+    s = numpy.asarray(jax.device_get(s), dtype=numpy.float64)
+    if s.ndim == 0:
+        s = s.reshape(1, 1)
+    e, v = numpy.linalg.eigh(s)
+    e = numpy.real_if_close(e)
+    idx = numpy.where(e > thresh)[0]
+    if len(idx) == 0:
+        return np.zeros((A.shape[0], 0), dtype=A.dtype)
+    x = v[:, idx] / numpy.sqrt(e[idx])[None, :]
+    x = stop_grad(np.asarray(x))
+    return np.dot(A, x)
+
+
+def orthonormalize_metric_colspace_fixed_gauge(A, s, thresh=1e-10):
+    """Metric-orthonormalize a subspace while freezing internal gauge rotations."""
+    A = np.asarray(A)
+    s = np.asarray(s)
+    if A.ndim != 2:
+        raise ValueError('Input space must be a rank-2 array.')
+    if A.shape[1] == 0:
+        return np.zeros((A.shape[0], 0), dtype=A.dtype)
+    if A.shape[1] == 1:
+        nrm = stop_grad(np.sqrt(np.dot(A[:, 0].conj(), np.dot(s, A[:, 0]))))
+        nrm = numpy.asarray(jax.device_get(nrm)).reshape(())
+        if abs(nrm) <= thresh:
+            return np.zeros((A.shape[0], 0), dtype=A.dtype)
+        return A / stop_grad(np.asarray(nrm))
+
+    gram = stop_grad(np.dot(A.T.conj(), np.dot(s, A)))
+    gram = numpy.asarray(jax.device_get(gram), dtype=numpy.float64)
+    if gram.ndim == 0:
+        gram = gram.reshape(1, 1)
+    e, v = numpy.linalg.eigh(gram)
+    e = numpy.real_if_close(e)
+    idx = numpy.where(e > thresh)[0]
+    if len(idx) == 0:
+        return np.zeros((A.shape[0], 0), dtype=A.dtype)
+    x = v[:, idx] / numpy.sqrt(e[idx])[None, :]
+    x = stop_grad(np.asarray(x))
+    return np.dot(A, x)
+
+def compress_colspace_numerical_rank(A, thresh=1e-10):
+    """Drop numerically null column-space directions while freezing only that choice.
+
+    This is used when a residual subspace is formed by subtracting a large anchor
+    space from a mapped DLNO space.  The residual often contains exact or nearly
+    exact null directions that should not be carried into later differentiable
+    orthonormalization steps.
+    """
+    A = np.asarray(A)
+    if A.ndim != 2:
+        raise ValueError('Input space must be a rank-2 array.')
+    if A.shape[1] == 0:
+        return np.zeros((A.shape[0], 0), dtype=A.dtype)
+    gram = stop_grad(np.dot(A.T.conj(), A))
+    gram = numpy.asarray(jax.device_get(gram), dtype=numpy.float64)
+    if gram.ndim == 0:
+        gram = gram.reshape(1, 1)
+    e, v = numpy.linalg.eigh(gram)
+    e = numpy.real_if_close(e)
+    idx = numpy.where(e > thresh)[0]
+    if len(idx) == 0:
+        return np.zeros((A.shape[0], 0), dtype=A.dtype)
+    if len(idx) == A.shape[1]:
+        return A
+    keep = stop_grad(np.asarray(v[:, idx], dtype=A.dtype))
+    return np.dot(A, keep)
+
+def stack_colspaces(*spaces):
+    cols = []
+    nrow = None
+    dtype = None
+    for space in spaces:
+        if space is None:
+            continue
+        space = np.asarray(space)
+        if space.ndim != 2:
+            raise ValueError('Each space must be a rank-2 array.')
+        if nrow is None:
+            nrow = space.shape[0]
+            dtype = space.dtype
+        elif space.shape[0] != nrow:
+            raise ValueError('All spaces must have the same row dimension.')
+        if space.shape[1] > 0:
+            cols.append(space)
+    if cols:
+        return np.hstack(cols)
+    if nrow is None:
+        return np.zeros((0, 0))
+    return np.zeros((nrow, 0), dtype=dtype)
 
 def collocate_unitary(us):
     '''Collocate a few unitary matrices
@@ -590,10 +913,13 @@ class LNO(pytree.PytreeNode):
         # MP2 (relaxed dm - unrelaxed dm) in AO basis for augmenting virtual space
         self.dm_corr = None
         self.dm_corr_frag = None
+        self.use_dlno_prescreen = False
+        self.dlno_prescreen_data = None
 
         self._nmo = None
         self._nocc = None
         self.mo_occ = mf.mo_occ
+        self._current_ifrag = None
 
     get_nocc = get_nocc
     get_nmo = get_nmo
@@ -724,6 +1050,75 @@ class LNO(pytree.PytreeNode):
                           frag_nonvlist=frag_nonvlist)
         self._post_proc(frag_res, frag_wghtlist)
 
+    def get_dlno_prescreen_fragment(self, ifrag=None):
+        if not self.use_dlno_prescreen:
+            return None
+        data = self.dlno_prescreen_data
+        if data is None:
+            return None
+        if ifrag is None:
+            ifrag = self._current_ifrag
+        if ifrag is None:
+            return None
+        frag_data = data.get('fragment_data')
+        if frag_data is None or ifrag >= len(frag_data):
+            return None
+        return frag_data[ifrag]
+
+    def get_dlno_prescreen_space(self, orb, frag_data, key, anchor_spaces=(),
+                                 s1e=None, thresh=THRESH_INTERNAL):
+        if frag_data is None or key not in frag_data:
+            return None
+
+        # The DLNO prescreen coefficient matrices define the selected
+        # prescreen subspace inside a fixed domain.  Keep their span
+        # differentiable here, but later prune only nearly-null virtual
+        # overlap directions when embedding that span in the current external
+        # virtual MO space.  This preserves the physical subspace response
+        # without letting numerically meaningless weak directions dominate.
+        coeff = np.asarray(frag_data[key])
+        if coeff.ndim != 2:
+            return None
+        if coeff.shape[1] == 0:
+            return np.zeros((orb.shape[1], 0), dtype=orb.dtype)
+
+        atmlst = frag_data.get('extended_primary_domain')
+        if atmlst is None:
+            return None
+        atmlst = numpy.asarray(atmlst, dtype=numpy.int32)
+        if atmlst.size == 0:
+            return np.zeros((orb.shape[1], 0), dtype=orb.dtype)
+
+        aoslices = self.mol.aoslice_by_atom()[:, 2:]
+        ao_idx_lst = [numpy.arange(*x) for x in aoslices[atmlst].reshape(-1, 2)]
+        if not ao_idx_lst:
+            return np.zeros((orb.shape[1], 0), dtype=orb.dtype)
+        ao_idx = reduce(numpy.union1d, ao_idx_lst)
+        if coeff.shape[0] != len(ao_idx):
+            raise ValueError('DLNO prescreen data has incompatible AO dimension for '
+                             f'fragment {self._current_ifrag}: expected '
+                             f'{len(ao_idx)}, got {coeff.shape[0]}')
+
+        if s1e is None:
+            if self.s1e is not None:
+                s1e = self.s1e
+            else:
+                s1e = self._scf.get_ovlp()
+
+        coeff_full = np.zeros((self.mol.nao_nr(), coeff.shape[1]), dtype=coeff.dtype)
+        coeff_full = coeff_full.at[ao_idx].set(coeff)
+        u = reduce(np.dot, (orb.T.conj(), s1e, coeff_full))
+
+        eff_thresh = thresh
+        if key == 'vir_prescreen_coeff':
+            eff_thresh = max(float(thresh), DLNO_VIR_MAP_THRESH)
+        anchor = stack_colspaces(*anchor_spaces)
+        if anchor.shape[1] > 0:
+            u = u - np.dot(anchor, np.dot(anchor.T.conj(), u))
+            u = compress_colspace_numerical_rank(u, thresh=eff_thresh)
+        u = orthonormalize_colspace_smooth(u, thresh=eff_thresh)
+        return u
+
     def _post_proc(self, frag_res, frag_wghtlist):
         raise NotImplementedError
 
@@ -792,17 +1187,89 @@ class _LNODFINCOREERIS(_LNOERIS):
         LoV = self.get_oV(u)
         return self._get_eris(LoV, LoV)
 
+def _local_domain_atmlst(mf, atmlst):
+    if atmlst is None or not hasattr(mf, 'with_df') or mf.with_df is None:
+        if not hasattr(mf, 'with_df') or mf.with_df is None or mf.with_df.incore:
+            return None
+        atmlst = numpy.arange(mf.mol.natm, dtype=numpy.int32)
+    if mf.with_df.incore:
+        return None
+    atmlst = numpy.asarray(atmlst, dtype=numpy.int32).ravel()
+    if atmlst.size == 0:
+        return None
+    return atmlst
 
-def get_Lov(mf, mo_coeff, nocc):
+def make_local_mol(mol, atmlst):
+    fake_mol = dlno_util.fake_mol_by_atom(mol, atmlst)
+    if getattr(mol, 'coords', None) is not None:
+        fake_mol.coords = np.asarray(mol.atom_coords()[numpy.asarray(atmlst, dtype=numpy.int32)])
+    if getattr(mol, 'exp', None) is not None:
+        fake_mol.exp = np.asarray(setup_exp(fake_mol)[0])
+    else:
+        fake_mol.exp = None
+    if getattr(mol, 'ctr_coeff', None) is not None:
+        fake_mol.ctr_coeff = np.asarray(setup_ctr_coeff(fake_mol)[0])
+    else:
+        fake_mol.ctr_coeff = None
+    return fake_mol
+
+def get_local_df(mf, atmlst):
+    atmlst = tuple(map(int, numpy.asarray(atmlst).ravel()))
+    cache = getattr(mf.with_df, '_lno_local_df_cache', None)
+    if cache is None:
+        cache = {}
+        mf.with_df._lno_local_df_cache = cache
+    if atmlst in cache:
+        return cache[atmlst]
+
+    fake_mol = make_local_mol(mf.mol, atmlst)
+    local_df = df_mod.DF(fake_mol, auxbasis=mf.with_df.auxbasis, incore=True)
+    local_df.max_memory = mf.with_df.max_memory
+    local_df.build()
+    ao_idx = dlno_util.ao_index_by_atom(mf.mol, numpy.asarray(atmlst, dtype=numpy.int32))
+    cache[atmlst] = (fake_mol, local_df, ao_idx)
+    return cache[atmlst]
+
+def transform_df_to_mo(mf, mo_coeff, orbs_slice, aosym='s2', mosym='s1', atmlst=None):
+    atmlst = _local_domain_atmlst(mf, atmlst)
+    if atmlst is not None:
+        fake_mol, local_df, ao_idx = get_local_df(mf, atmlst)
+        s1e = mf.get_ovlp()
+        s21 = s1e[ao_idx]
+        s22 = s1e[np.ix_(ao_idx, ao_idx)]
+        mo_coeff = dlno_util.project_mo(mo_coeff, s21, s22)
+        get_cderi = getattr(local_df, '_get_cderi_source', None)
+        cderi = get_cderi() if get_cderi is not None else local_df._cderi
+    else:
+        get_cderi = getattr(mf.with_df, '_get_cderi_source', None)
+        cderi = get_cderi() if get_cderi is not None else mf.with_df._cderi
+
+    with df_addons.load(cderi, 'j3c') as eri1:
+        if not is_array(eri1):
+            eri1 = numpy.asarray(eri1)
+        return _ao2mo.nr_e2(eri1, mo_coeff, orbs_slice, aosym=aosym, mosym=mosym)
+
+def make_fragment_eris(mfcc, eris, frag_prescreen):
+    atmlst = None if frag_prescreen is None else frag_prescreen.get('extended_primary_domain')
+    atmlst = _local_domain_atmlst(mfcc._scf, atmlst)
+    if atmlst is None:
+        return eris
+
+    orbo, orbv = mfcc.split_mo()[1:3]
+    nocc = orbo.shape[-1]
+    mo_coeff = np.concatenate((orbo, orbv), axis=-1)
+
+    frag_eris = _LNODFINCOREERIS(fock=eris.fock, s1e=eris.s1e)
+    frag_eris.Lov = get_Lov(mfcc._scf, mo_coeff, nocc, atmlst=atmlst)
+    return frag_eris
+
+
+def get_Lov(mf, mo_coeff, nocc, atmlst=None):
     assert hasattr(mf, 'with_df')
-    cderi = mf.with_df._cderi
-    naux = cderi.shape[0]
     nmo = mo_coeff.shape[-1]
     nvir = nmo - nocc
     ijslice = (0, nocc, nocc, nmo)
-    if hasattr(cderi, 'shape'):
-        Lov = _ao2mo.nr_e2(cderi, mo_coeff, ijslice, aosym='s2')
-        Lov = Lov.reshape((naux, nocc, nvir))
-    else:
-        raise NotImplementedError
+    Lov = transform_df_to_mo(mf, mo_coeff, ijslice, aosym='s2', mosym='s1', atmlst=atmlst)
+    naux = Lov.shape[0]
+    Lov = Lov.reshape((naux, nocc, nvir))
     return Lov

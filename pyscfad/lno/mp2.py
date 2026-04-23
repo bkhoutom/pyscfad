@@ -21,6 +21,8 @@ from pyscf.lib import logger
 from pyscfad import numpy as np
 from pyscfad.ao2mo import _ao2mo
 from pyscfad.cc import dfccsd
+from pyscfad.df import addons as df_addons
+from pyscfad.ops import is_array
 from pyscfad.lno import lno_base
 from pyscfad.lno.ccsd import (
     _ChemistsERIs,
@@ -43,13 +45,16 @@ def _make_df_eris_incore(cc, mo_coeff=None, fockao=None):
 
     mo = np.asarray(eris.mo_coeff)
     ijslice = (0, nocc, nocc, nmo)
-    eri1 = with_df._cderi
-    Lov = _ao2mo.nr_e2(eri1, mo, ijslice, aosym='s2', mosym='s1')
+    atmlst = getattr(cc, '_domain_atmlst', None)
+    Lov = lno_base.transform_df_to_mo(
+        cc._scf, mo, ijslice, aosym='s2', mosym='s1', atmlst=atmlst
+    )
 
     eris.ovov = np.dot(Lov.T, Lov).reshape(nocc,nvir,nocc,nvir)
     return eris
 
 def impurity_solve(mf, mo_coeff, lo_coeff, eris=None, frozen=None,
+                   frag_prescreen=None,
                    verbose_imp=0):
     log = logger.new_logger(mf)
     maskocc = mf.mo_occ > lno_base.THRESH_OCC
@@ -74,6 +79,7 @@ def impurity_solve(mf, mo_coeff, lo_coeff, eris=None, frozen=None,
 
     # solve impurity problem
     mcc = RCCSD(mf, mo_coeff=mo_coeff, frozen=frozen)
+    mcc._domain_atmlst = None if frag_prescreen is None else frag_prescreen.get('extended_primary_domain')
     mcc.e_hf = mf.e_tot  #avoid MP2 recompute e_hf
     imp_eris = mcc.ao2mo(fockao=eris.fock)
 
@@ -90,8 +96,10 @@ class LNOMP2(lno_base.LNO):
         super().__init__(mf, thresh=thresh, frozen=frozen, **kwargs)
         self.efrag_pt2 = None
 
-    def impurity_solve(self, mf, mo_coeff, lo_coeff, eris=None, frozen=None):
+    def impurity_solve(self, mf, mo_coeff, lo_coeff, eris=None, frozen=None,
+                       frag_prescreen=None):
         return impurity_solve(mf, mo_coeff, lo_coeff, eris=eris, frozen=frozen,
+                              frag_prescreen=frag_prescreen,
                               verbose_imp=self.verbose_imp)
 
     def _post_proc(self, frag_res, frag_wghtlist):

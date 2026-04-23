@@ -23,8 +23,9 @@ from pyscf.mp.mp2 import _mo_without_core
 
 from pyscfad import numpy as np
 from pyscfad import lib
-from pyscfad.ao2mo import _ao2mo
 from pyscfad.cc import dfccsd, dfdcsd
+from pyscfad.df import addons as df_addons
+from pyscfad.ops import is_array
 from pyscfad.lno import lno_base
 from pyscfad.lno import ccsd_t as ccsd_t_mod
 
@@ -61,14 +62,14 @@ def _make_df_eris_incore(cc, mo_coeff=None, fockao=None):
     nocc = eris.nocc
     nmo = eris.fock.shape[0]
     nvir = nmo - nocc
-    with_df = cc.with_df
-    naux = with_df.get_naoaux()
 
     mo = np.asarray(eris.mo_coeff)
     ijslice = (0, nmo, 0, nmo)
-    eri1 = with_df._cderi
-    # pylint: disable=too-many-function-args
-    Lpq = _ao2mo.nr_e2(eri1, mo, ijslice, aosym='s2', mosym='s1').reshape(-1,nmo,nmo)
+    atmlst = getattr(cc, '_domain_atmlst', None)
+    Lpq = lno_base.transform_df_to_mo(
+        cc._scf, mo, ijslice, aosym='s2', mosym='s1', atmlst=atmlst
+    ).reshape(-1, nmo, nmo)
+    naux = Lpq.shape[0]
     Loo = Lpq[:,:nocc,:nocc].reshape(naux,-1)
     Lov = Lpq[:,:nocc,nocc:].reshape(naux,-1)
     eris.Lvv = Lvv = lib.pack_tril(Lpq[:,nocc:,nocc:])
@@ -87,6 +88,7 @@ def _make_df_eris_incore(cc, mo_coeff=None, fockao=None):
 
 
 def impurity_solve(mf, mo_coeff, lo_coeff, eris=None, frozen=None,
+                   frag_prescreen=None,
                    verbose_imp=0, ccsd_t=False, dcsd=False):
     r'''Solve impurity problem and calculate local correlation energy.
 
@@ -137,6 +139,7 @@ def impurity_solve(mf, mo_coeff, lo_coeff, eris=None, frozen=None,
         mcc = RDCSD(mf, mo_coeff=mo_coeff, frozen=frozen)
     else:
         mcc = RCCSD(mf, mo_coeff=mo_coeff, frozen=frozen)
+    mcc._domain_atmlst = None if frag_prescreen is None else frag_prescreen.get('extended_primary_domain')
     mcc.e_hf = mf.e_tot  #avoid MP2 recompute e_hf
     imp_eris = mcc.ao2mo(fockao=eris.fock)
 
@@ -207,8 +210,10 @@ class LNOCCSD(lno_base.LNO):
         self.ccsd_t = False
         self.dcsd = False
 
-    def impurity_solve(self, mf, mo_coeff, lo_coeff, eris=None, frozen=None):
+    def impurity_solve(self, mf, mo_coeff, lo_coeff, eris=None, frozen=None,
+                       frag_prescreen=None):
         return impurity_solve(mf, mo_coeff, lo_coeff, eris=eris, frozen=frozen,
+                              frag_prescreen=frag_prescreen,
                               verbose_imp=self.verbose_imp, ccsd_t=self.ccsd_t,
                               dcsd=self.dcsd)
 

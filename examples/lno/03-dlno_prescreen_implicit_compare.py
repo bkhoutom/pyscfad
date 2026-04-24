@@ -5,8 +5,9 @@ import jax
 import numpy as np
 
 from pyscfad import config, gto, scf
+from pyscfad.lno import LNOMP2
 from pyscfad.lno import ccsd as lnoccsd
-from pyscfad.lno.prescreen import build_dlno_prescreen_data
+from pyscfad.lno.prescreen import build_dlno_prescreen_data, rebuild_dlno_prescreen_data
 from pyscfad.lno.tools import autofrag, map_lo_to_frag
 from pyscfad.ops import stop_trace
 
@@ -21,6 +22,8 @@ config.update("pyscfad_scf_first_order_custom", False)
 config.update("pyscfad_ccsd_implicit_diff", True)
 
 LO_TYPE = "iao"  # Change to "pm" or "boys" to try other localization types.
+THRESH = 1e-4
+DOMAIN_THR = 1e-6
 
 
 def build_mol():
@@ -35,64 +38,86 @@ def build_mol():
     return mol
 
 
-def build_reference_data(mol):
-    mf = scf.RHF(mol).density_fit()
-    mf.kernel()
-
-    helper = lnoccsd.LNOCCSD(mf, thresh=1e-4, frozen=0)
-    lo_coeff = helper.get_lo(lo_type=LO_TYPE)
-    frag_atmlist = stop_trace(autofrag)(mol)
+def build_local_orbitals_and_fragments(mf):
+    lo_coeff = lnoccsd.LNOCCSD(mf, thresh=THRESH, frozen=0).get_lo(lo_type=LO_TYPE)
+    frag_atmlist = stop_trace(autofrag)(mf.mol)
     frag_lolist = stop_trace(map_lo_to_frag)(
-        mol, lo_coeff, frag_atmlist, verbose=mol.verbose
+        mf.mol, lo_coeff, frag_atmlist, verbose=mf.mol.verbose
     )
+    return lo_coeff, frag_lolist
 
-    dlno_data = build_dlno_prescreen_data(
+
+def make_cc_solver(mf):
+    mycc = lnoccsd.LNOCCSD(mf, thresh=THRESH, frozen=0)
+    mycc.thresh_occ = THRESH
+    mycc.thresh_vir = THRESH
+    mycc.lo_type = LO_TYPE
+    mycc.no_type = "ie"
+    mycc.ccsd_t = False
+    return mycc
+
+
+def make_local_mp2_solver(mf):
+    mymp = LNOMP2(mf, thresh=THRESH, frozen=0)
+    mymp.thresh_occ = THRESH
+    mymp.thresh_vir = THRESH
+    mymp.lo_type = LO_TYPE
+    mymp.no_type = "ie"
+    return mymp
+
+
+def build_dlno_data(mf, lo_coeff, frag_lolist):
+    topology = stop_trace(build_dlno_prescreen_data)(
         mf,
         lo_coeff,
         frag_lolist,
         frozen=0,
         lmo_bp_domain_thr=0.9,
         pao_bp_domain_thr=0.9,
-        domain_pao_thr=1e-6,
-        pair_energy_thr=1e-6,
+        domain_pao_thr=DOMAIN_THR,
+        pair_energy_thr=DOMAIN_THR,
         multipole_order=2,
     )
-    return frag_lolist, dlno_data
+    return rebuild_dlno_prescreen_data(mf, lo_coeff, topology, frozen=0)
 
 
-def total_energy(mol, frag_lolist, dlno_data=None):
+def lno_total_energy(mol):
     mf = scf.RHF(mol).density_fit()
     ehf = mf.kernel()
-
-    helper = lnoccsd.LNOCCSD(mf, thresh=1e-4, frozen=0)
-    lo_coeff = helper.get_lo(lo_type=LO_TYPE)
-
-    mycc = lnoccsd.LNOCCSD(mf, thresh=1e-4, frozen=0)
-    mycc.thresh_occ = 1e-4
-    mycc.thresh_vir = 1e-4
-    mycc.lo_type = LO_TYPE
-    mycc.no_type = "ie"
-    mycc.ccsd_t = False
-    if dlno_data is not None:
-        mycc.use_dlno_prescreen = True
-        mycc.dlno_prescreen_data = dlno_data
-    mycc.kernel(frag_lolist=frag_lolist, orbloc=lo_coeff)
+    lo_coeff, _ = build_local_orbitals_and_fragments(mf)
+    mycc = make_cc_solver(mf)
+    mycc.kernel(orbloc=lo_coeff)
     return ehf + mycc.e_corr
+
+
+def dlno_total_energy(mol):
+    mf = scf.RHF(mol).density_fit()
+    ehf = mf.kernel()
+    lo_coeff, frag_lolist = build_local_orbitals_and_fragments(mf)
+    dlno_data = build_dlno_data(mf, lo_coeff, frag_lolist)
+    mymp = make_local_mp2_solver(mf)
+    mymp.use_dlno_prescreen = True
+    mymp.dlno_prescreen_data = dlno_data
+    mymp.kernel(frag_lolist=frag_lolist, orbloc=lo_coeff)
+    mycc = make_cc_solver(mf)
+    mycc.use_dlno_prescreen = True
+    mycc.dlno_prescreen_data = dlno_data
+    mycc.kernel(frag_lolist=frag_lolist, orbloc=lo_coeff)
+    return ehf + mycc.e_corr_pt2corrected(mymp.e_corr)
 
 
 if __name__ == "__main__":
     mol = build_mol()
-    frag_lolist, dlno_data = build_reference_data(mol)
-
-    e_lno, g_lno = jax.value_and_grad(lambda x: total_energy(x, frag_lolist))(mol)
-    e_dlno, g_dlno = jax.value_and_grad(
-        lambda x: total_energy(x, frag_lolist, dlno_data=dlno_data)
-    )(mol)
+    e_lno, g_lno = jax.value_and_grad(lno_total_energy)(mol)
+    e_dlno, g_dlno = jax.value_and_grad(dlno_total_energy)(mol)
 
     g_lno_arr = np.asarray(g_lno.coords)
     g_dlno_arr = np.asarray(g_dlno.coords)
     g_diff = g_dlno_arr - g_lno_arr
 
+    print()
+    print("Testing whether DLNO-prescreened CCSD reproduces parent LNO-CCSD")
+    print("when both use the standard implicit SCF derivative route.")
     print()
     print(f"LO type: {LO_TYPE}")
     print(f"LNO total energy:           {float(e_lno): .12f}")

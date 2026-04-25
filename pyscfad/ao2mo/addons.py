@@ -20,8 +20,7 @@ class load(pyscf_addons.load):
     def __enter__(self):
         if is_array(self.eri):
             return self.eri
-        else:
-            raise NotImplementedError
+        return super().__enter__()
 
 
 def restore(symmetry, eri, norb, tao=None):

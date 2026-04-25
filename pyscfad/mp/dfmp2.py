@@ -21,9 +21,10 @@ from pyscf.lib import direct_sum, current_memory
 #from pyscf.mp.mp2 import _ChemistsERIs
 from pyscfad import config
 from pyscfad import numpy as np
-from pyscfad.ops import vmap
+from pyscfad.ops import is_array, vmap
 from pyscfad.lib import logger
 from pyscfad.ao2mo import _ao2mo
+from pyscfad.df import addons as df_addons
 from pyscfad.mp import mp2
 
 WITH_T2 = getattr(__config__, 'mp_dfmp2_with_t2', True)
@@ -191,8 +192,12 @@ class MP2(mp2.MP2):
             mem_incore += (nocc*nvir)**2 * 8 / 1e6
         mem_now = current_memory()[0]
         if (mem_incore + mem_now < self.max_memory) or self.mol.incore_anyway:
-            eri1 = with_df._cderi
-            Lov = _ao2mo.nr_e2(eri1, mo_coeff, ijslice, aosym='s2')
+            get_cderi = getattr(with_df, '_get_cderi_source', None)
+            cderi = get_cderi() if get_cderi is not None else with_df._cderi
+            with df_addons.load(cderi, 'j3c') as eri1:
+                if not is_array(eri1):
+                    eri1 = numpy.asarray(eri1)
+                Lov = _ao2mo.nr_e2(eri1, mo_coeff, ijslice, aosym='s2')
             return Lov
         else:
             raise RuntimeError(f'{mem_incore+mem_now} MB of memory is needed.')

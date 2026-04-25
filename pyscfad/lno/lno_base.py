@@ -51,8 +51,23 @@ COMPRESS_DEG_THRESH = 1e-12
 
 def kernel(mfcc, orbloc, frag_lolist,
            no_type='ie', eris=None, frag_nonvlist=None):
+    use_dlno_fragment_eris = _use_dlno_fragment_eris(mfcc)
     if eris is None:
-        eris = mfcc.ao2mo()
+        if use_dlno_fragment_eris:
+            eris = _make_lno_reference_eris(mfcc)
+        else:
+            eris = mfcc.ao2mo()
+    elif use_dlno_fragment_eris and getattr(eris, 'Lov', None) is not None:
+        raise RuntimeError(
+            'DLNO fragment-local mode was given ERIs with a prebuilt Lov. '
+            'Pass eris=None so each fragment builds only its own domain integrals.'
+        )
+
+    if use_dlno_fragment_eris and mfcc.dm_corr is True:
+        raise NotImplementedError(
+            'Global dm_corr=True requires a full-molecule Lov and is not '
+            'compatible with DLNO fragment-local integral construction.'
+        )
 
     if mfcc.dm_corr is True:
         mfcc.dm_corr = make_rdm1_vo(mfcc, eris=eris, ao_repr=True)
@@ -69,11 +84,37 @@ def kernel(mfcc, orbloc, frag_lolist,
         orbfragloc = orbloc[:,fraglo]
         frag_target_nocc, frag_target_nvir = frag_nonvlist[ifrag]
         frag_prescreen = mfcc.get_dlno_prescreen_fragment(ifrag)
+        if use_dlno_fragment_eris:
+            _require_dlno_fragment_domain(mfcc, frag_prescreen, ifrag)
         frag_res[ifrag] = kernel_1frag(mfcc, eris, orbfragloc, no_type,
                                        frag_prescreen=frag_prescreen,
                                        frag_target_nocc=frag_target_nocc,
                                        frag_target_nvir=frag_target_nvir)
     return frag_res
+
+
+def _use_dlno_fragment_eris(mfcc):
+    return bool(mfcc.use_dlno_prescreen and mfcc.dlno_prescreen_data is not None)
+
+
+def _make_lno_reference_eris(mfcc):
+    eris = _LNOERIS(fock=mfcc.fock, s1e=mfcc.s1e)
+    eris._common_init_(mfcc)
+    return eris
+
+
+def _require_dlno_fragment_domain(mfcc, frag_prescreen, ifrag):
+    if frag_prescreen is None:
+        raise RuntimeError(
+            f'DLNO fragment-local integral construction requires prescreen data '
+            f'for fragment {ifrag}; otherwise it would fall back to a full Lov.'
+        )
+    atmlst = frag_prescreen.get('extended_primary_domain')
+    if atmlst is None or numpy.asarray(atmlst).size == 0:
+        raise RuntimeError(
+            f'DLNO fragment {ifrag} has no extended primary domain; otherwise '
+            f'it would fall back to a full Lov.'
+        )
 
 
 def kernel_1frag(mfcc, eris, orbfragloc, no_type,
@@ -1192,8 +1233,6 @@ def _local_domain_atmlst(mf, atmlst):
         if not hasattr(mf, 'with_df') or mf.with_df is None or mf.with_df.incore:
             return None
         atmlst = numpy.arange(mf.mol.natm, dtype=numpy.int32)
-    if mf.with_df.incore:
-        return None
     atmlst = numpy.asarray(atmlst, dtype=numpy.int32).ravel()
     if atmlst.size == 0:
         return None

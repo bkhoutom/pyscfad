@@ -16,6 +16,7 @@ from functools import partial
 import ctypes
 import numpy
 import jax
+import jax.numpy as jnp
 from jax import custom_vjp
 from jax.tree_util import tree_flatten, tree_unflatten
 from pyscf import lib
@@ -26,6 +27,39 @@ from pyscfad.df import incore as df_incore
 
 libao2mo = lib.load_library('libao2mo')
 _FAST_EXCHANGE_DM_DATA = {}
+
+
+def _restore_s1_jax(cderi, nao):
+    npair = nao * (nao + 1) // 2
+    if cderi.ndim == 3 and cderi.shape[-1] == nao:
+        return cderi
+    if cderi.ndim == 2 and cderi.shape[-1] == nao**2:
+        return cderi.reshape(-1, nao, nao)
+    if cderi.ndim == 2 and cderi.shape[-1] == npair:
+        rows, cols = numpy.tril_indices(nao)
+        rows = jnp.asarray(rows)
+        cols = jnp.asarray(cols)
+        out = jnp.zeros((cderi.shape[0], nao, nao), dtype=cderi.dtype)
+        out = out.at[:, rows, cols].set(cderi)
+        return out.at[:, cols, rows].set(cderi)
+    raise RuntimeError(f'cderi shape {cderi.shape} incompatible with nao {nao}')
+
+
+def _get_jk_gen_jax(dfobj, dm, hermi=1, with_j=True, with_k=True,
+                    direct_scf_tol=1e-13):
+    del hermi, direct_scf_tol
+    nao = dfobj.mol.nao
+    dms = dm.reshape(-1, nao, nao)
+    Lpq = _restore_s1_jax(dfobj._cderi, nao)
+
+    vj = vk = jnp.zeros_like(dms)
+    if with_j:
+        tmp = jnp.einsum('Lpq,xpq->xL', Lpq, dms)
+        vj = jnp.einsum('Lpq,xL->xpq', Lpq, tmp)
+    if with_k:
+        tmp = jnp.einsum('Lij,xjk->xLki', Lpq, dms)
+        vk = jnp.einsum('Lki,xLkj->xij', Lpq, tmp)
+    return vj.reshape(dm.shape), vk.reshape(dm.shape)
 
 
 def _fast_exchange_key(dfobj):
@@ -75,6 +109,16 @@ def _cderi_mol_aux_vjp(dfobj, eri_bar):
     return mol_bar, auxmol_bar
 
 
+def _has_tracer(*xs):
+    leaves = []
+    for x in xs:
+        if x is None:
+            continue
+        x_leaves, _ = tree_flatten(x)
+        leaves.extend(x_leaves)
+    return any(isinstance(x, jax.core.Tracer) for x in leaves)
+
+
 @partial(custom_vjp, nondiff_argnums=(2,3,4,5))
 def get_jk(dfobj, dm, hermi=1, with_j=True, with_k=True, direct_scf_tol=1e-13):
     dm_forward = _tag_dm_for_fast_exchange(dfobj, dm)
@@ -92,6 +136,15 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
                res, ybar):
     dfobj, dm = res
     vj_bar, vk_bar = ybar
+
+    if _has_tracer(dfobj, dm, vj_bar, vk_bar):
+        def fn(dfobj_, dm_):
+            return _get_jk_gen_jax(
+                dfobj_, dm_, hermi=hermi, with_j=with_j, with_k=with_k,
+                direct_scf_tol=direct_scf_tol,
+            )
+        _, vjp = jax.vjp(fn, dfobj, dm)
+        return vjp((vj_bar, vk_bar))
 
     log = logger.new_logger(dfobj)
     fmmm = libao2mo.AO2MOmmm_bra_nr_s2

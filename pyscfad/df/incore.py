@@ -15,6 +15,8 @@
 import numpy
 from functools import partial
 from jax import scipy
+from jax.interpreters import ad as jax_ad
+from jax.tree_util import tree_flatten
 from pyscf import __config__
 from pyscf.df.outcore import _guess_shell_ranges
 from pyscf.gto.moleintor import _get_intor_and_comp
@@ -41,6 +43,30 @@ from . import addons, _int3c_cross_opt
 
 MAX_MEMORY = getattr(__config__, 'df_outcore_max_memory', 2000)
 LINEAR_DEP_THR = getattr(__config__, 'df_df_DF_lindep', 1e-7)
+
+
+def _has_jvp_tracer(*xs):
+    leaves = []
+    for x in xs:
+        if x is None:
+            continue
+        x_leaves, _ = tree_flatten(x)
+        leaves.extend(x_leaves)
+    return any(_contains_jvp_tracer(x) for x in leaves)
+
+
+def _contains_jvp_tracer(x):
+    if isinstance(x, jax_ad.JVPTracer):
+        return True
+    for attr in ('primal', 'val'):
+        if hasattr(x, attr):
+            try:
+                if _contains_jvp_tracer(getattr(x, attr)):
+                    return True
+            except AttributeError:
+                pass
+    return False
+
 
 @partial(custom_jvp, nondiff_argnums=tuple(range(2,7)))
 def int3c_cross(mol, auxmol, intor='int3c2e', comp=1, aosym='s1',
@@ -80,7 +106,8 @@ def int3c_cross_jvp(intor, comp, aosym, shls_slice, out,
                              aosym=aosym, shls_slice=shls_slice, out=out)
     tangent_out = np.zeros_like(primal_out)
 
-    if intor.startswith('int3c2e') and not 'spinor' in intor:
+    intor_base = intor.replace('_sph', '').replace('_cart', '')
+    if intor_base == 'int3c2e':
         intor_ip1 = intor.replace('int3c2e', 'int3c2e_ip1')
         ints = int3c_cross(mol, auxmol, intor=intor_ip1, comp=3,
                            aosym=aosym, shls_slice=shls_slice)
@@ -90,6 +117,40 @@ def int3c_cross_jvp(intor, comp, aosym, shls_slice, out,
         ints = int3c_cross(mol, auxmol, intor=intor_ip2, comp=3,
                            aosym=aosym, shls_slice=shls_slice)
         tangent_out += _int3c_fill_jvp_r0_ip2(auxmol, auxmol_t, -ints)
+    elif intor_base == 'int3c2e_ip1':
+        intor_ipip1 = intor.replace('int3c2e_ip1', 'int3c2e_ipip1')
+        ints = int3c_cross(mol, auxmol, intor=intor_ipip1, comp=9,
+                           aosym=aosym, shls_slice=shls_slice)
+        ints = -ints.reshape(3, -1, *primal_out.shape[1:])
+        tangent_out += _int3c_fill_jvp_r0_ip1_comp(mol, mol_t, ints)
+
+        intor_ipvip1 = intor.replace('int3c2e_ip1', 'int3c2e_ipvip1')
+        ints = int3c_cross(mol, auxmol, intor=intor_ipvip1, comp=9,
+                           aosym=aosym, shls_slice=shls_slice)
+        ints = -ints.reshape(primal_out.shape[0], 3, *primal_out.shape[1:])
+        ints = ints.transpose(1, 0, 2, 3, 4)
+        tangent_out += _int3c_fill_jvp_r0_ip1_comp(mol, mol_t, ints, axis=1)
+
+        intor_ip1ip2 = intor.replace('int3c2e_ip1', 'int3c2e_ip1ip2')
+        ints = int3c_cross(mol, auxmol, intor=intor_ip1ip2, comp=9,
+                           aosym=aosym, shls_slice=shls_slice)
+        ints = -ints.reshape(primal_out.shape[0], 3, *primal_out.shape[1:])
+        ints = ints.transpose(1, 0, 2, 3, 4)
+        tangent_out += _int3c_fill_jvp_r0_ip2_comp(auxmol, auxmol_t, ints)
+    elif intor_base == 'int3c2e_ip2':
+        intor_ip1ip2 = intor.replace('int3c2e_ip2', 'int3c2e_ip1ip2')
+        ints = int3c_cross(mol, auxmol, intor=intor_ip1ip2, comp=9,
+                           aosym=aosym, shls_slice=shls_slice)
+        ints = -ints.reshape(3, -1, *primal_out.shape[1:])
+        tangent = _int3c_fill_jvp_r0_ip1_comp(mol, mol_t, ints)
+        tangent_out += tangent + tangent.transpose(0, 2, 1, 3)
+
+        intor_ipip2 = intor.replace('int3c2e_ip2', 'int3c2e_ipip2')
+        ints = int3c_cross(mol, auxmol, intor=intor_ipip2, comp=9,
+                           aosym=aosym, shls_slice=shls_slice)
+        ints = -ints.reshape(primal_out.shape[0], 3, *primal_out.shape[1:])
+        ints = ints.transpose(1, 0, 2, 3, 4)
+        tangent_out += _int3c_fill_jvp_r0_ip2_comp(auxmol, auxmol_t, ints)
     else:
         raise NotImplementedError
 
@@ -250,6 +311,31 @@ def _int3c_fill_jvp_r0_ip2(mol, mol_t, ints):
     return jvp
 
 
+def _int3c_fill_jvp_r0_ip1_comp(mol, mol_t, ints, axis=0):
+    if axis == 0:
+        idx = np.arange(ints.shape[2])[None,None,:,None,None]
+    elif axis == 1:
+        idx = np.arange(ints.shape[3])[None,None,None,:,None]
+    else:
+        raise NotImplementedError
+    aoslices = mol.aoslice_by_atom()[:,2:4]
+    def _fill(sl, coord):
+        mask = (idx >= sl[0]) & (idx < sl[1])
+        grad = np.where(mask, ints, np.array(0, dtype=ints.dtype))
+        return np.einsum('xcijk,x->cijk', grad, coord)
+    return np.sum(vmap(_fill)(aoslices, mol_t.coords), axis=0)
+
+
+def _int3c_fill_jvp_r0_ip2_comp(mol, mol_t, ints):
+    idx = np.arange(ints.shape[-1])[None,None,None,None,:]
+    aoslices = mol.aoslice_by_atom()[:,2:4]
+    def _fill(sl, coord):
+        mask = (idx >= sl[0]) & (idx < sl[1])
+        grad = np.where(mask, ints, np.array(0, dtype=ints.dtype))
+        return np.einsum('xcijk,x->cijk', grad, coord)
+    return np.sum(vmap(_fill)(aoslices, mol_t.coords), axis=0)
+
+
 def cholesky_eri(mol, auxmol=None, auxbasis='weigend+etb',
                  int3c='int3c2e', aosym='s2ij', int2c='int2c2e', comp=1,
                  max_memory=MAX_MEMORY, verbose=0, fauxe2=None):
@@ -259,12 +345,14 @@ def cholesky_eri(mol, auxmol=None, auxbasis='weigend+etb',
     log = logger.new_logger(mol, verbose)
     t0 = (log._t0, log._w0)
 
-    if not config.moleintor_opt:
-        log.warn('int3c2e symmetry turned off')
-        aosym = 's1'
-
     if auxmol is None:
         auxmol = addons.make_auxmol(mol, auxbasis)
+
+    use_moleintor_opt = config.moleintor_opt and not _has_jvp_tracer(mol, auxmol)
+    if not use_moleintor_opt:
+        if not config.moleintor_opt:
+            log.warn('int3c2e symmetry turned off')
+        aosym = 's1'
 
     j2c = auxmol.intor(int2c, hermi=1)
     try:
@@ -292,7 +380,7 @@ def cholesky_eri(mol, auxmol=None, auxbasis='weigend+etb',
 
     max_words = max_memory*1e6/8 - low.size - naux*nao_pair
     buflen = min(max(int(max_words/naoaux/comp/2), 8), nao_pair)
-    if not config.moleintor_opt:
+    if not use_moleintor_opt:
         # NOTE sub-shells not supported
         buflen = nao_pair
     shranges = _guess_shell_ranges(mol, buflen, aosym)
@@ -305,7 +393,7 @@ def cholesky_eri(mol, auxmol=None, auxbasis='weigend+etb',
         bstart, bend, _ = sh_range
         shls_slice = (bstart, bend, 0, mol.nbas, mol.nbas, mol.nbas+auxmol.nbas)
 
-        if config.moleintor_opt:
+        if use_moleintor_opt:
             ints = _int3c_cross_opt.int3c_cross(
                                mol, auxmol, intor=int3c, comp=comp, aosym=aosym,
                                shls_slice=shls_slice)

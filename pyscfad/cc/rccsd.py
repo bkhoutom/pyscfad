@@ -162,8 +162,8 @@ class RCCSD(ccsd.CCSD):
         nao_pair = nao * (nao+1) // 2
         mem_incore = (max(nao_pair**2, nmo**4) + nmo_pair**2) * 8/1e6
         mem_now = current_memory()[0]
-        if (self._scf._eri is not None and
-            (mem_incore+mem_now < self.max_memory) or self.mol.incore_anyway):
+        if (self._scf._eri is not None or
+            mem_incore+mem_now < self.max_memory or self.mol.incore_anyway):
             return _make_eris_incore(self, mo_coeff)
         elif getattr(self._scf, 'with_df', None):
             raise NotImplementedError
@@ -183,7 +183,10 @@ def _make_eris_incore(mycc, mo_coeff=None, ao2mofn=None):
     if callable(ao2mofn):
         eri1 = ao2mofn(eris.mo_coeff).reshape([nmo]*4)
     else:
-        eri1 = ao2mo.incore.full(mycc._scf._eri, eris.mo_coeff, compact=False)
+        eri_ao = mycc._scf._eri
+        if eri_ao is None:
+            eri_ao = mycc.mol.intor('int2e', aosym='s1')
+        eri1 = ao2mo.incore.full(eri_ao, eris.mo_coeff, compact=False)
         #eri1 = ao2mo.restore(1, eri1, nmo)
     eris.oooo = eri1[:nocc,:nocc,:nocc,:nocc]#.copy()
     #eris.ooov = eri1[:nocc,:nocc,:nocc,nocc:]

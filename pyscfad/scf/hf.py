@@ -278,10 +278,64 @@ def _is_zero_cotangent(x):
     return x is None or isinstance(x, jax_ad.Zero)
 
 
+def _has_jvp_tracer(*xs):
+    leaves = []
+    for x in xs:
+        if x is None:
+            continue
+        leaves.extend(jax.tree_util.tree_leaves(x))
+    return any(_contains_jvp_tracer(x) for x in leaves)
+
+
+def _has_tracer(*xs):
+    leaves = []
+    for x in xs:
+        if x is None:
+            continue
+        leaves.extend(jax.tree_util.tree_leaves(x))
+    return any(_contains_tracer(x) for x in leaves)
+
+
+def _contains_tracer(x):
+    if isinstance(x, jax.core.Tracer):
+        return True
+    for attr in ('primal', 'val'):
+        if hasattr(x, attr):
+            try:
+                if _contains_tracer(getattr(x, attr)):
+                    return True
+            except AttributeError:
+                pass
+    return False
+
+
+def _contains_jvp_tracer(x):
+    if isinstance(x, jax_ad.JVPTracer):
+        return True
+    for attr in ('primal', 'val'):
+        if hasattr(x, attr):
+            try:
+                if _contains_jvp_tracer(getattr(x, attr)):
+                    return True
+            except AttributeError:
+                pass
+    return False
+
+
+def _static_bool(x, default):
+    if isinstance(x, jax.core.Tracer):
+        return default
+    return bool(x)
+
+
 def _scf_outputs_first_order_impl(mol, settings, dm0):
     mf = _build_mf_for_first_order(mol, settings)
     with config_update('pyscfad_scf_first_order_custom', False):
-        e_tot = mf.kernel(dm0=dm0)
+        if _has_jvp_tracer(mol, dm0):
+            with config_update('pyscfad_scf_implicit_diff', False):
+                e_tot = mf.kernel(dm0=dm0)
+        else:
+            e_tot = mf.kernel(dm0=dm0)
     return mf.converged, e_tot, mf.mo_energy, mf.mo_coeff, mf.mo_occ
 
 
@@ -295,8 +349,8 @@ def _scf_outputs_first_order_fwd(mol, settings, dm0):
     res = (
         mol,
         dm0,
-        numpy.asarray(ops.to_numpy(out[2])).copy(),
-        numpy.asarray(ops.to_numpy(out[3])).copy(),
+        np.asarray(out[2]),
+        np.asarray(out[3]),
     )
     return out, res
 
@@ -321,8 +375,8 @@ def _scf_outputs_first_order_bwd(settings, res, cotangent):
         mo_energy, mo_coeff = mo_from_fock_eq78(
             fock,
             s1e,
-            np.asarray(mo_energy_fwd),
-            np.asarray(mo_coeff_fwd),
+            mo_energy_fwd,
+            mo_coeff_fwd,
         )
 
         out = 0.0
@@ -441,13 +495,14 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
     )
 
     _extra_cycle = False
-    if config.scf_implicit_diff and (not conv_check or not scf_conv):
+    scf_conv_static = _static_bool(scf_conv, default=True)
+    if config.scf_implicit_diff and (not conv_check or not scf_conv_static):
         log.warn('\tAn extra scf cycle is going to be run\n'
                  '\tin order to restore the mo_energy derivatives\n'
                  '\tmissing in implicit differentiation.')
         _extra_cycle = True
 
-    if (scf_conv and conv_check) or _extra_cycle:
+    if (scf_conv_static and conv_check) or _extra_cycle:
         cput1 = log.get_t0()
         vhf = mf.get_veff(mol, dm, s1e=s1e)
         fock = mf.get_fock(h1e, s1e, vhf, dm)
@@ -646,12 +701,14 @@ class SCF(pytree.PytreeNode, pyscf_hf.SCF):
             dm = self.make_rdm1()
 
         aosym = 's4' if config.moleintor_opt else 's1'
-        if self._eri is None:
-            self._eri = mol.intor('int2e', aosym=aosym)
         if omega:
             with mol.with_range_coulomb(omega):
                 _eri = mol.intor('int2e', aosym=aosym)
+        elif _has_tracer(mol):
+            _eri = mol.intor('int2e', aosym=aosym)
         else:
+            if self._eri is None:
+                self._eri = mol.intor('int2e', aosym=aosym)
             _eri = self._eri
 
         vj, vk = dot_eri_dm(_eri, dm, hermi, with_j, with_k)
@@ -668,7 +725,11 @@ class SCF(pytree.PytreeNode, pyscf_hf.SCF):
         self.dump_flags()
         self.build(self.mol)
 
-        use_first_order_custom = config.scf_first_order_custom and dm0 is None
+        use_first_order_custom = (
+            config.scf_first_order_custom
+            and dm0 is None
+            and isinstance(self, RHF)
+        )
         if config.scf_first_order_custom and dm0 is not None:
             logger.warn(
                 self,
@@ -689,9 +750,9 @@ class SCF(pytree.PytreeNode, pyscf_hf.SCF):
                     "support the skip-SCF / frozen-orbitals code path."
                 )
             settings = _first_order_settings(self)
-            self.converged, self.e_tot, \
-                    self.mo_energy, self.mo_coeff, self.mo_occ = \
-                    _scf_outputs_first_order(self.mol, settings, dm0)
+            scf_conv, self.e_tot, self.mo_energy, self.mo_coeff, self.mo_occ = \
+                _scf_outputs_first_order(self.mol, settings, dm0)
+            self.converged = _static_bool(scf_conv, default=True)
             nocc = self.mol.nelectron // 2
             mo_occ = numpy.zeros(self.mo_energy.shape[-1], dtype=float)
             mo_occ[:nocc] = 2.0

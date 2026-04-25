@@ -12,12 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from jax.interpreters import ad as jax_ad
+from jax.tree_util import tree_flatten
 from pyscf.lib import logger
 from pyscfad import config
 
+
+def _has_jvp_tracer(obj):
+    leaves, _ = tree_flatten(obj)
+    return any(_contains_jvp_tracer(x) for x in leaves)
+
+
+def _contains_jvp_tracer(x):
+    if isinstance(x, jax_ad.JVPTracer):
+        return True
+    for attr in ('primal', 'val'):
+        if hasattr(x, attr):
+            try:
+                if _contains_jvp_tracer(getattr(x, attr)):
+                    return True
+            except AttributeError:
+                pass
+    return False
+
+
 def intor(mol, intor_name, comp=None, hermi=0, aosym='s1', out=None,
           shls_slice=None, grids=None):
-    if config.moleintor_opt:
+    if config.moleintor_opt and not _has_jvp_tracer(mol):
         from pyscfad.gto._moleintor_vjp import (intor2c, intor3c, intor4c)
     else:
         from pyscfad.gto._moleintor_jvp import (intor2c, intor3c, intor4c)

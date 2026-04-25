@@ -12,23 +12,93 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import partial
+from functools import lru_cache, partial
 import ctypes
+import jax
+import jax.numpy as jnp
 import numpy
 from jax import custom_vjp
+from jax.interpreters import ad as jax_ad
 from pyscf.scf import _vhf
 from pyscfadlib import libcvhf_vjp as libcvhf
 
 def incore(eri, dms, hermi=0, with_j=True, with_k=True):
     vj = vk = None
+    if _has_jvp_tracer(eri, dms):
+        if with_j:
+            vj = _get_j_jax(eri, dms, hermi=hermi)
+        if with_k:
+            vk = _get_k_jax(eri, dms, hermi=hermi)
+        return vj, vk
     if with_j:
         vj = _get_j(eri, dms, hermi=hermi)
     if with_k:
         vk = _get_k(eri, dms, hermi=hermi)
     return vj, vk
 
+
+@lru_cache(maxsize=None)
+def _s4_pair_index(nao):
+    pair = numpy.empty((nao, nao), dtype=numpy.int64)
+    ij = 0
+    for i in range(nao):
+        for j in range(i + 1):
+            pair[i, j] = ij
+            pair[j, i] = ij
+            ij += 1
+    return pair
+
+
+def _s4_to_s1_jax(eri, nao):
+    pair = jnp.asarray(_s4_pair_index(nao))
+    return eri[pair[:, :, None, None], pair[None, None, :, :]]
+
+
+def _get_j_jax(eri, dms, hermi=0):
+    del hermi
+    nao = dms.shape[-1]
+    eri = _s4_to_s1_jax(jnp.asarray(eri), nao)
+    return jnp.einsum('ijkl,...ji->...kl', eri, dms)
+
+
+def _get_k_jax(eri, dms, hermi=0):
+    del hermi
+    nao = dms.shape[-1]
+    eri = _s4_to_s1_jax(jnp.asarray(eri), nao)
+    return jnp.einsum('ijkl,...jk->...il', eri, dms)
+
+
+def _has_tracer(*xs):
+    return any(isinstance(x, jax.core.Tracer) for x in xs)
+
+
+def _has_jvp_tracer(*xs):
+    return any(_contains_jvp_tracer(x) for x in xs)
+
+
+def _contains_jvp_tracer(x):
+    if isinstance(x, jax_ad.JVPTracer):
+        return True
+    for attr in ('primal', 'val'):
+        if hasattr(x, attr):
+            try:
+                if _contains_jvp_tracer(getattr(x, attr)):
+                    return True
+            except AttributeError:
+                pass
+    return False
+
+
+def _jax_bwd(fun, hermi, eri, dms, vjk_bar):
+    _, vjp = jax.vjp(lambda eri_, dms_: fun(eri_, dms_, hermi), eri, dms)
+    return vjp(vjk_bar)
+
+
 @partial(custom_vjp, nondiff_argnums=(2,))
 def _get_j(eri, dms, hermi=0):
+    if _has_tracer(eri, dms):
+        return _get_j_jax(eri, dms, hermi=hermi)
+
     nao = dms.shape[-1]
     npair = nao*(nao+1)//2
     if eri.ndim == 2 and eri.size == npair*npair:
@@ -44,6 +114,9 @@ def _get_j_fwd(eri, dms, hermi):
 def _get_j_bwd(hermi, res, vjk_bar):
     #t0 = (logger.process_clock(), logger.perf_counter())
     eri, dms = res
+    if _has_tracer(eri, dms, vjk_bar):
+        return _jax_bwd(_get_j_jax, hermi, eri, dms, vjk_bar)
+
     eri = numpy.asarray(eri, order='C', dtype=numpy.double)
     dms = numpy.asarray(dms, order='C', dtype=numpy.double)
 
@@ -82,6 +155,9 @@ _get_j.defvjp(_get_j_fwd, _get_j_bwd)
 
 @partial(custom_vjp, nondiff_argnums=(2,))
 def _get_k(eri, dms, hermi=0):
+    if _has_tracer(eri, dms):
+        return _get_k_jax(eri, dms, hermi=hermi)
+
     nao = dms.shape[-1]
     npair = nao*(nao+1)//2
     if eri.ndim == 2 and eri.size == npair*npair:
@@ -97,6 +173,9 @@ def _get_k_fwd(eri, dms, hermi):
 def _get_k_bwd(hermi, res, vjk_bar):
     #t0 = (logger.process_clock(), logger.perf_counter())
     eri, dms = res
+    if _has_tracer(eri, dms, vjk_bar):
+        return _jax_bwd(_get_k_jax, hermi, eri, dms, vjk_bar)
+
     eri = numpy.asarray(eri, order='C', dtype=numpy.double)
     dms = numpy.asarray(dms, order='C', dtype=numpy.double)
 

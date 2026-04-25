@@ -13,6 +13,8 @@
 # limitations under the License.
 
 from functools import wraps
+from jax.interpreters import ad as jax_ad
+from jax.tree_util import tree_flatten
 from pyscf.df import df_jk as pyscf_df_jk
 from pyscfad import config
 from pyscfad import numpy as np
@@ -20,8 +22,32 @@ from pyscfad import pytree
 from .addons import restore
 from ._df_jk_opt import get_jk as get_jk_opt
 
+
+def _has_jvp_tracer(*xs):
+    leaves = []
+    for x in xs:
+        if x is None:
+            continue
+        x_leaves, _ = tree_flatten(x)
+        leaves.extend(x_leaves)
+    return any(_contains_jvp_tracer(x) for x in leaves)
+
+
+def _contains_jvp_tracer(x):
+    if isinstance(x, jax_ad.JVPTracer):
+        return True
+    for attr in ('primal', 'val'):
+        if hasattr(x, attr):
+            try:
+                if _contains_jvp_tracer(getattr(x, attr)):
+                    return True
+            except AttributeError:
+                pass
+    return False
+
+
 def get_jk(dfobj, dm, hermi=1, with_j=True, with_k=True, direct_scf_tol=1e-13):
-    if config.moleintor_opt:
+    if config.moleintor_opt and not _has_jvp_tracer(dfobj, dm):
         return get_jk_opt(dfobj, dm, hermi=hermi,
                           with_j=with_j, with_k=with_k,
                           direct_scf_tol=direct_scf_tol)
@@ -92,4 +118,3 @@ class _DFHF(pytree.PytreeNode, pyscf_df_jk._DFHF):
         if with_k and not with_dfk:
             vk = super().get_jk(mol, dm, hermi, False, True, omega)[1]
         return vj, vk
-

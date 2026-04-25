@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import partial
+from functools import lru_cache, partial
 import numpy
 
 from pyscf import ao2mo
@@ -43,6 +43,28 @@ from ._moleintor_helper import (
     promote_xyz,
 )
 from pyscfad.gto._pyscf_moleintor import make_loc, getints
+
+
+@lru_cache(maxsize=None)
+def _s4_pair_arrays(nao):
+    rows = []
+    cols = []
+    for i in range(nao):
+        for j in range(i + 1):
+            rows.append(i)
+            cols.append(j)
+    return (
+        numpy.asarray(rows, dtype=numpy.int64),
+        numpy.asarray(cols, dtype=numpy.int64),
+    )
+
+
+def _s1_to_s4(eri, nao):
+    rows, cols = _s4_pair_arrays(nao)
+    rows = np.asarray(rows)
+    cols = np.asarray(cols)
+    return eri[..., rows[:, None], cols[:, None], rows[None, :], cols[None, :]]
+
 
 SET_RC = ['rinv',]
 _S_NORM = 0.282094791773878143 # normalization factor for s orbital
@@ -227,6 +249,17 @@ def intor4c_jvp(intor, comp, hermi, aosym, out, shls_slice, grids,
     if grids is not None:
         msg = 'Integrals on grids are not differentiable.'
         raise NotImplementedError(msg)
+    if aosym == 's4' and shls_slice is None:
+        mol, = primals
+        _, tangent_s1 = intor4c_jvp(
+            intor, comp, hermi, 's1', out, shls_slice, grids,
+            primals, tangents,
+        )
+        primal_out = intor4c(
+            mol, intor, comp=comp, hermi=hermi, aosym=aosym, out=out,
+            shls_slice=shls_slice, grids=grids,
+        )
+        return primal_out, _s1_to_s4(tangent_s1, mol.nao)
     if aosym != 's1':
         msg = f'AD for integral {intor} with aosym = {aosym} is not supported.'
         raise NotImplementedError(msg)

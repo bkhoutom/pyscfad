@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import partial
+from functools import lru_cache, partial
 import ctypes
+import jax
+import jax.numpy as jnp
 import numpy
 from jax import custom_vjp
 from jax.tree_util import tree_flatten, tree_unflatten
@@ -43,6 +45,68 @@ from pyscfad.gto._moleintor_helper import (
 from pyscfadlib import libcgto_vjp as libcgto
 
 
+def _has_tracer(*xs):
+    leaves = []
+    for x in xs:
+        x_leaves, _ = tree_flatten(x)
+        leaves.extend(x_leaves)
+    return any(isinstance(x, jax.core.Tracer) for x in leaves)
+
+
+@lru_cache(maxsize=None)
+def _s4_pair_arrays(nao):
+    rows = []
+    cols = []
+    for i in range(nao):
+        for j in range(i + 1):
+            rows.append(i)
+            cols.append(j)
+    return (
+        numpy.asarray(rows, dtype=numpy.int64),
+        numpy.asarray(cols, dtype=numpy.int64),
+    )
+
+
+def _s1_to_s4_jax(eri, nao):
+    rows, cols = _s4_pair_arrays(nao)
+    rows = jnp.asarray(rows)
+    cols = jnp.asarray(cols)
+    return eri[..., rows[:, None], cols[:, None], rows[None, :], cols[None, :]]
+
+
+def _jvp_intor2c_vjp(mol, intor, comp, hermi, aosym, out, shls_slice, grids,
+                     ybar):
+    from pyscfad.gto import _moleintor_jvp
+    _, vjp = jax.vjp(
+        lambda mol_: _moleintor_jvp.intor2c(
+            mol_, intor, comp, hermi, aosym, out, shls_slice, grids
+        ),
+        mol,
+    )
+    return vjp(ybar)
+
+
+def _jvp_intor4c_vjp(mol, intor, comp, hermi, aosym, out, shls_slice, grids,
+                     ybar):
+    from pyscfad.gto import _moleintor_jvp
+
+    def intor4c_for_vjp(mol_):
+        if aosym == 's4' and shls_slice is None:
+            eri = _moleintor_jvp.intor4c(
+                mol_, intor, comp, hermi, 's1', out, shls_slice, grids
+            )
+            return _s1_to_s4_jax(eri, mol_.nao)
+        return _moleintor_jvp.intor4c(
+            mol_, intor, comp, hermi, aosym, out, shls_slice, grids
+        )
+
+    _, vjp = jax.vjp(
+        intor4c_for_vjp,
+        mol,
+    )
+    return vjp(ybar)
+
+
 @partial(custom_vjp, nondiff_argnums=tuple(range(1,8)))
 def intor2c(mol, intor, comp=None, hermi=0, aosym='s1', out=None,
             shls_slice=None, grids=None):
@@ -56,6 +120,11 @@ def getints2c_fwd(mol, intor, comp, hermi, aosym, out, shls_slice, grids):
 def getints2c_bwd(intor, comp, hermi, aosym, out, shls_slice, grids,
                   res, ybar):
     mol = res[0]
+    if _has_tracer(mol, ybar):
+        return _jvp_intor2c_vjp(
+            mol, intor, comp, hermi, aosym, out, shls_slice, grids, ybar
+        )
+
     leaves = []
 
     if mol.coords is not None:
@@ -100,6 +169,11 @@ def getints4c_fwd(mol, intor, comp, hermi, aosym, out, shls_slice, grids):
 def getints4c_bwd(intor, comp, hermi, aosym, out, shls_slice, grids,
                   res, ybar):
     mol = res[0]
+    if _has_tracer(mol, ybar):
+        return _jvp_intor4c_vjp(
+            mol, intor, comp, hermi, aosym, out, shls_slice, grids, ybar
+        )
+
     leaves = []
 
     if mol.coords is not None:

@@ -13,11 +13,24 @@
 # limitations under the License.
 
 from functools import reduce
+import jax
 import numpy
 import scipy
 from scipy.sparse.linalg import LinearOperator, eigsh
 from scipy.sparse.linalg import gmres as scipy_gmres
+from jax.tree_util import tree_flatten
 from pyscfad import ops
+from pyscfad.backend._jax.scipy.sparse.linalg import gmres as jax_gmres
+
+
+def _has_tracer(*xs):
+    leaves = []
+    for x in xs:
+        if x is None or callable(x):
+            continue
+        x_leaves, _ = tree_flatten(x)
+        leaves.extend(x_leaves)
+    return any(isinstance(x, jax.core.Tracer) for x in leaves)
 
 def _matvec_to_scipy(matvec, b):
     def _matvec(x):
@@ -31,6 +44,16 @@ def _matvec_to_scipy(matvec, b):
 def gmres(A_or_matvec, b, x0=None, *,
           tol=1e-05, atol=None, restart=None, maxiter=None, M=None,
           callback=None, callback_type=None):
+    if _has_tracer(A_or_matvec, b, x0):
+        del callback, callback_type
+        if atol is None:
+            atol = 0.0
+        if restart is None:
+            restart = 20
+        return jax_gmres(A_or_matvec, b, x0=x0, tol=tol, atol=atol,
+                         restart=restart, maxiter=maxiter, M=M,
+                         solve_method='incremental')
+
     if x0 is not None:
         x0 = x0.ravel()
 
@@ -57,6 +80,11 @@ def gmres(A_or_matvec, b, x0=None, *,
 def gmres_safe(A_or_matvec, b, x0=None, *,
                tol=1e-05, atol=None, restart=None, maxiter=None, M=None,
                callback=None, callback_type=None, cond=1e-6):
+    if _has_tracer(A_or_matvec, b, x0):
+        return gmres(A_or_matvec, b, x0=x0, tol=tol, atol=atol,
+                     restart=restart, maxiter=maxiter, M=M,
+                     callback=callback, callback_type=callback_type)
+
     if callable(A_or_matvec):
         A = _matvec_to_scipy(A_or_matvec, b)
     else:

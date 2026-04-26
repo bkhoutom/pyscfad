@@ -17,9 +17,11 @@ warnings.filterwarnings(
     message=r"Function mol\.dumps drops attribute .* because it is not JSON-serializable",
 )
 
+config.update("pyscfad_moleintor_opt", True)
 config.update("pyscfad_scf_implicit_diff", True)
 config.update("pyscfad_scf_first_order_custom", False)
 config.update("pyscfad_ccsd_implicit_diff", True)
+config.update("pyscfad_dfccsd_custom_response", True)
 
 LO_TYPE = "iao"  # Change to "pm" or "boys" to try other localization types.
 THRESH = 1e-4
@@ -115,9 +117,8 @@ if __name__ == "__main__":
     g_dlno_arr = np.asarray(g_dlno.coords)
     g_diff = g_dlno_arr - g_lno_arr
 
-    print()
     print("Testing whether DLNO-prescreened CCSD reproduces parent LNO-CCSD")
-    print("when both use the standard implicit SCF derivative route.")
+    print("when both use the implicit SCF derivative route and custom DF-CCSD response.")
     print()
     print(f"LO type: {LO_TYPE}")
     print(f"LNO total energy:           {float(e_lno): .12f}")

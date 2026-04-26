@@ -22,6 +22,7 @@ config.update("pyscfad_moleintor_opt", True)
 config.update("pyscfad_scf_implicit_diff", True)
 config.update("pyscfad_scf_first_order_custom", True)
 config.update("pyscfad_ccsd_implicit_diff", True)
+config.update("pyscfad_dfccsd_custom_response", True)
 
 LO_TYPE = "iao"  # Change to "pm" or "boys" to try other localization types.
 BUILD_THR = 1e-4
@@ -143,6 +144,7 @@ if __name__ == "__main__":
     print(f"LNO - canonical:            {float(e_lno - e_can): .6e}")
     print(f"DLNO - canonical:           {float(e_dlno - e_can): .6e}")
     print(f"DLNO - LNO energy diff:     {float(e_dlno - e_lno): .6e}")
+    print("CCSD response backend:      custom DF-CCSD response")
     print(f"Max |LNO - canonical grad|: {np.max(np.abs(g_lno_can)): .6e}")
     print(f"Max |DLNO - canonical grad|:{np.max(np.abs(g_dlno_can)): .6e}")
     print(f"Max |DLNO - LNO grad diff|: {np.max(np.abs(g_diff)): .6e}")

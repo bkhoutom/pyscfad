@@ -773,7 +773,8 @@ class SCF(pytree.PytreeNode, pyscf_hf.SCF):
 
     kernel = alias(scf, alias_name='kernel')
 
-    def _eigh(self, h, s):
+    def _eigh(self, h, s, *args, **kwargs):
+        del args, kwargs
         return eigh(h, s)
 
     def energy_grad(self, dm0=None, mode='rev'):

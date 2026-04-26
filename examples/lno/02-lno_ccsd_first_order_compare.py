@@ -12,6 +12,8 @@ What we are comparing:
 - implicit SCF backpropagation, which is general but relatively expensive
 - custom first-order CPHF-style SCF response, which is intended to be more
   efficient for first-order properties
+- the DF-CCSD response route is held fixed to the custom plug-in path for both
+  calculations
 
 Expected behavior:
 - the two energies and gradients should agree closely
@@ -49,6 +51,7 @@ def configure(*, use_custom_cphf: bool) -> None:
     config.update("pyscfad_scf_implicit_diff", True)
     config.update("pyscfad_scf_first_order_custom", use_custom_cphf)
     config.update("pyscfad_ccsd_implicit_diff", True)
+    config.update("pyscfad_dfccsd_custom_response", True)
 
 
 def make_mol():
@@ -116,6 +119,7 @@ print()
 print("Comparing two SCF-gradient backends inside the same PT2-corrected LNO-CCSD calculation")
 print("1. implicit SCF backprop")
 print("2. custom first-order CPHF-style SCF response")
+print("CCSD response backend held fixed: custom DF-CCSD response = True")
 print("Note: the custom CPHF-style route is intended to be more efficient than implicit backprop for first-order properties.")
 print()
 print(f"Implicit energy: {implicit['energy']:.15f}")

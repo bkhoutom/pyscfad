@@ -226,6 +226,13 @@ def _first_order_settings(mf_ref):
     return {
         'with_df': with_df is not None,
         'auxbasis': getattr(with_df, 'auxbasis', None) if with_df is not None else None,
+        'df_incore': getattr(with_df, 'incore', True) if with_df is not None else True,
+        'df_cderi_to_save': getattr(with_df, '_cderi_to_save', None) if with_df is not None else None,
+        'df_has_outcore_cderi': (
+            with_df._has_outcore_cderi_placeholder()
+            if with_df is not None and hasattr(with_df, '_has_outcore_cderi_placeholder')
+            else False
+        ),
         'conv_tol': mf_ref.conv_tol,
         'conv_tol_grad': mf_ref.conv_tol_grad,
         'max_cycle': mf_ref.max_cycle,
@@ -248,7 +255,21 @@ def _first_order_settings(mf_ref):
 def _build_mf_for_first_order(mol, settings):
     mf = RHF(mol)
     if settings['with_df']:
-        mf = mf.density_fit(auxbasis=settings['auxbasis'])
+        from pyscfad import df as df_mod
+        with_df = df_mod.DF(
+            mol,
+            auxbasis=settings['auxbasis'],
+            incore=settings.get('df_incore', True),
+        )
+        with_df.max_memory = settings['max_memory']
+        with_df.auxmol = df_mod.addons.make_auxmol(mol, settings['auxbasis'])
+        cderi_to_save = settings.get('df_cderi_to_save', None)
+        if cderi_to_save is not None:
+            with_df._cderi_to_save = cderi_to_save
+        if settings.get('df_has_outcore_cderi', False):
+            with_df._cderi = numpy.zeros((0, 0))
+            with_df._prefer_cderi_to_save = True
+        mf = mf.density_fit(with_df=with_df)
     mf.conv_tol = settings['conv_tol']
     mf.conv_tol_grad = settings['conv_tol_grad']
     mf.max_cycle = settings['max_cycle']

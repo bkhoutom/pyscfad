@@ -24,6 +24,7 @@ from pyscfad import numpy as np
 from pyscfad.ops import is_array, vmap
 from pyscfad.lib import logger
 from pyscfad.ao2mo import _ao2mo
+from pyscfad.df import incore as df_incore
 from pyscfad.df import addons as df_addons
 from pyscfad.mp import mp2
 
@@ -139,6 +140,46 @@ def _contract_scan(Lov, mo_energy, nocc, nvir, with_t2=True):
         t2 = None
     return emp2, t2
 
+
+@partial(custom_vjp, nondiff_argnums=(3, 4, 5, 6))
+def _outcore_nr_e2(mol, auxmol, mo_coeff, cderi_source, max_memory,
+                   ijslice, aosym):
+    del mol, auxmol, max_memory
+    with df_addons.load(cderi_source, 'j3c') as eri1:
+        if not is_array(eri1):
+            eri1 = numpy.asarray(eri1)
+        return _ao2mo.nr_e2(eri1, mo_coeff, ijslice, aosym=aosym)
+
+
+def _outcore_nr_e2_fwd(mol, auxmol, mo_coeff, cderi_source, max_memory,
+                       ijslice, aosym):
+    out = _outcore_nr_e2(mol, auxmol, mo_coeff, cderi_source, max_memory,
+                         ijslice, aosym)
+    return out, (mol, auxmol, mo_coeff)
+
+
+def _outcore_nr_e2_bwd(cderi_source, max_memory, ijslice, aosym, res, ybar):
+    del cderi_source
+    mol, auxmol, mo_coeff = res
+
+    def fn(mol_, auxmol_, mo_coeff_):
+        cderi = df_incore.cholesky_eri(
+            mol_,
+            auxmol=auxmol_,
+            int3c=mol_._add_suffix('int3c2e'),
+            int2c=mol_._add_suffix('int2c2e'),
+            max_memory=max(max_memory, 4096),
+            verbose=0,
+        )
+        return _ao2mo.nr_e2(cderi, mo_coeff_, ijslice, aosym=aosym)
+
+    _, pullback = jax.vjp(fn, mol, auxmol, mo_coeff)
+    return pullback(ybar)
+
+
+_outcore_nr_e2.defvjp(_outcore_nr_e2_fwd, _outcore_nr_e2_bwd)
+
+
 def kernel(mp, mo_energy=None, mo_coeff=None, eris=None, with_t2=WITH_T2,
            verbose=None):
     if mo_energy is not None or mo_coeff is not None:
@@ -194,6 +235,19 @@ class MP2(mp2.MP2):
         if (mem_incore + mem_now < self.max_memory) or self.mol.incore_anyway:
             get_cderi = getattr(with_df, '_get_cderi_source', None)
             cderi = get_cderi() if get_cderi is not None else with_df._cderi
+            has_outcore_cderi = (
+                hasattr(with_df, '_has_outcore_cderi_placeholder')
+                and with_df._has_outcore_cderi_placeholder()
+            )
+            if has_outcore_cderi:
+                if with_df.auxmol is None:
+                    with_df.auxmol = df_addons.make_auxmol(
+                        with_df.mol, with_df.auxbasis
+                    )
+                return _outcore_nr_e2(
+                    with_df.mol, with_df.auxmol, mo_coeff, cderi,
+                    with_df.max_memory, ijslice, 's2'
+                )
             with df_addons.load(cderi, 'j3c') as eri1:
                 if not is_array(eri1):
                     eri1 = numpy.asarray(eri1)

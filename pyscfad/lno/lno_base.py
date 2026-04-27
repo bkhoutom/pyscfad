@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import warnings
-from functools import reduce
+from functools import partial, reduce
 import numpy
 import jax
 import jax.scipy.linalg as jsp_linalg
@@ -29,6 +29,7 @@ from pyscfad import df as df_mod
 from pyscfad.tools import timer
 from pyscfad.ao2mo import _ao2mo
 from pyscfad.df import addons as df_addons
+from pyscfad.df import incore as df_incore
 from pyscfad.dlno import util as dlno_util
 from pyscfad.lno import _checkpointed
 from pyscfad.lno.mp2_rdm import make_rdm1_vo, make_rdm1_vo_frag
@@ -292,7 +293,7 @@ def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external
                     else:
                         if lovir and uvir2_full is not None and uvir2_full.shape[1] > 0:
                             uvir2_dlno = np.dot(uvir2_full, np.dot(uvir2_full.T.conj(), uvir2_dlno))
-                        uvir2_dlno = orthonormalize_colspace_fixed_gauge(
+                        uvir2_dlno = orthonormalize_colspace_grassmann(
                             uvir2_dlno,
                             thresh=dlno_thresh_internal,
                         )
@@ -699,6 +700,70 @@ def orthonormalize_colspace_fixed_gauge(A, thresh=1e-10):
     x = v[:, idx] / numpy.sqrt(e[idx])[None, :]
     x = stop_grad(np.asarray(x))
     return np.dot(A, x)
+
+
+def orthonormalize_colspace_grassmann(A, thresh=1e-10):
+    """Orthonormalize a subspace with a gauge-invariant reverse pass.
+
+    The returned columns are an ordinary orthonormal basis, but the backward
+    rule removes cotangent components that only rotate/rescale that basis
+    inside its own span.  The remaining cotangent corresponds to changes of the
+    selected subspace itself, which is the physically meaningful DLNO object.
+    """
+    A = np.asarray(A)
+    if A.ndim != 2:
+        raise ValueError('Input space must be a rank-2 array.')
+    thresh = float(thresh)
+
+    @jax.custom_vjp
+    def _orth_grassmann(A):
+        q, _ = _orthonormalize_colspace_grassmann_primal(A, thresh)
+        return q
+
+    def _orth_grassmann_fwd(A):
+        q, x = _orthonormalize_colspace_grassmann_primal(A, thresh)
+        return q, (q, x)
+
+    def _orth_grassmann_bwd(res, g):
+        q, x = res
+        if q.shape[1] == 0:
+            return (np.zeros((q.shape[0], x.shape[0]), dtype=g.dtype),)
+        # Remove the vertical/internal-basis cotangent before propagating back
+        # through A -> A @ x.  With q orthonormal this is (I - q q^H) g.
+        g_h = g - np.dot(q, np.dot(q.T.conj(), g))
+        return (np.dot(g_h, x.T.conj()),)
+
+    _orth_grassmann.defvjp(_orth_grassmann_fwd, _orth_grassmann_bwd)
+    return _orth_grassmann(A)
+
+
+def _orthonormalize_colspace_grassmann_primal(A, thresh=1e-10):
+    A = np.asarray(A)
+    if A.shape[1] == 0:
+        x = np.zeros((0, 0), dtype=A.dtype)
+        return np.zeros((A.shape[0], 0), dtype=A.dtype), x
+    if A.shape[1] == 1:
+        nrm = stop_grad(np.sqrt(np.dot(A[:, 0].conj(), A[:, 0])))
+        nrm = numpy.asarray(jax.device_get(nrm)).reshape(())
+        if abs(nrm) <= thresh:
+            x = np.zeros((1, 0), dtype=A.dtype)
+            return np.zeros((A.shape[0], 0), dtype=A.dtype), x
+        x = stop_grad(np.asarray([[1.0 / nrm]], dtype=A.dtype))
+        return np.dot(A, x), x
+
+    s = stop_grad(np.dot(A.T.conj(), A))
+    s = numpy.asarray(jax.device_get(s), dtype=numpy.float64)
+    if s.ndim == 0:
+        s = s.reshape(1, 1)
+    e, v = numpy.linalg.eigh(s)
+    e = numpy.real_if_close(e)
+    idx = numpy.where(e > thresh)[0]
+    if len(idx) == 0:
+        x = np.zeros((A.shape[1], 0), dtype=A.dtype)
+        return np.zeros((A.shape[0], 0), dtype=A.dtype), x
+    x = v[:, idx] / numpy.sqrt(e[idx])[None, :]
+    x = stop_grad(np.asarray(x, dtype=A.dtype))
+    return np.dot(A, x), x
 
 
 def orthonormalize_metric_colspace_fixed_gauge(A, s, thresh=1e-10):
@@ -1230,9 +1295,7 @@ class _LNODFINCOREERIS(_LNOERIS):
 
 def _local_domain_atmlst(mf, atmlst):
     if atmlst is None or not hasattr(mf, 'with_df') or mf.with_df is None:
-        if not hasattr(mf, 'with_df') or mf.with_df is None or mf.with_df.incore:
-            return None
-        atmlst = numpy.arange(mf.mol.natm, dtype=numpy.int32)
+        return None
     atmlst = numpy.asarray(atmlst, dtype=numpy.int32).ravel()
     if atmlst.size == 0:
         return None
@@ -1269,6 +1332,46 @@ def get_local_df(mf, atmlst):
     cache[atmlst] = (fake_mol, local_df, ao_idx)
     return cache[atmlst]
 
+
+@partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6))
+def _outcore_nr_e2(mol, auxmol, mo_coeff, cderi_source, max_memory,
+                   orbs_slice, aosym):
+    del mol, auxmol, max_memory
+    with df_addons.load(cderi_source, 'j3c') as eri1:
+        if not is_array(eri1):
+            eri1 = numpy.asarray(eri1)
+        return _ao2mo.nr_e2(eri1, mo_coeff, orbs_slice, aosym=aosym)
+
+
+def _outcore_nr_e2_fwd(mol, auxmol, mo_coeff, cderi_source, max_memory,
+                       orbs_slice, aosym):
+    out = _outcore_nr_e2(mol, auxmol, mo_coeff, cderi_source, max_memory,
+                         orbs_slice, aosym)
+    return out, (mol, auxmol, mo_coeff)
+
+
+def _outcore_nr_e2_bwd(cderi_source, max_memory, orbs_slice, aosym, res, ybar):
+    del cderi_source
+    mol, auxmol, mo_coeff = res
+
+    def fn(mol_, auxmol_, mo_coeff_):
+        cderi = df_incore.cholesky_eri(
+            mol_,
+            auxmol=auxmol_,
+            int3c=mol_._add_suffix('int3c2e'),
+            int2c=mol_._add_suffix('int2c2e'),
+            max_memory=max(max_memory, 4096),
+            verbose=0,
+        )
+        return _ao2mo.nr_e2(cderi, mo_coeff_, orbs_slice, aosym=aosym)
+
+    _, pullback = jax.vjp(fn, mol, auxmol, mo_coeff)
+    return pullback(ybar)
+
+
+_outcore_nr_e2.defvjp(_outcore_nr_e2_fwd, _outcore_nr_e2_bwd)
+
+
 def transform_df_to_mo(mf, mo_coeff, orbs_slice, aosym='s2', mosym='s1', atmlst=None):
     atmlst = _local_domain_atmlst(mf, atmlst)
     if atmlst is not None:
@@ -1282,6 +1385,19 @@ def transform_df_to_mo(mf, mo_coeff, orbs_slice, aosym='s2', mosym='s1', atmlst=
     else:
         get_cderi = getattr(mf.with_df, '_get_cderi_source', None)
         cderi = get_cderi() if get_cderi is not None else mf.with_df._cderi
+        has_outcore_cderi = (
+            hasattr(mf.with_df, '_has_outcore_cderi_placeholder')
+            and mf.with_df._has_outcore_cderi_placeholder()
+        )
+        if has_outcore_cderi:
+            if mf.with_df.auxmol is None:
+                mf.with_df.auxmol = df_mod.addons.make_auxmol(
+                    mf.with_df.mol, mf.with_df.auxbasis
+                )
+            return _outcore_nr_e2(
+                mf.with_df.mol, mf.with_df.auxmol, mo_coeff, cderi,
+                mf.with_df.max_memory, orbs_slice, aosym
+            )
 
     with df_addons.load(cderi, 'j3c') as eri1:
         if not is_array(eri1):

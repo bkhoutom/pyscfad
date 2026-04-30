@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import warnings
+import os
+from dataclasses import dataclass
 from functools import partial, reduce
 import numpy
 import jax
@@ -30,6 +32,7 @@ from pyscfad.tools import timer
 from pyscfad.ao2mo import _ao2mo
 from pyscfad.df import addons as df_addons
 from pyscfad.df import incore as df_incore
+from pyscfad.df import _cderi_vjp
 from pyscfad.dlno import util as dlno_util
 from pyscfad.lno import _checkpointed
 from pyscfad.lno.mp2_rdm import make_rdm1_vo, make_rdm1_vo_frag
@@ -37,6 +40,10 @@ from pyscfad.lno.tools import autofrag, map_lo_to_frag
 from pyscfad.gto._mole_helper import setup_exp, setup_ctr_coeff
 
 USE_CHECKPOINT = True
+USE_FRAGMENT_REPLAY_VJP = (
+    os.environ.get('PYSCFAD_LNO_FRAGMENT_REPLAY_VJP', '1').lower()
+    not in ('0', 'false', 'no', 'off')
+)
 THRESH_INTERNAL = 1e-10
 THRESH_OCC = 1e-6
 # Weak DLNO virtual-overlap directions can be numerically unstable when mapped
@@ -79,6 +86,22 @@ def kernel(mfcc, orbloc, frag_lolist,
     if frag_nonvlist is None:
         frag_nonvlist = [[None,None]] * nfrag
 
+    if (
+        USE_FRAGMENT_REPLAY_VJP
+        and use_dlno_fragment_eris
+        and eris is not None
+        and getattr(eris, 'Lov', None) is None
+    ):
+        return _fragment_kernel_replay_vjp(
+            _make_fragment_scf_state(mfcc, eris),
+            orbloc,
+            mfcc.dlno_prescreen_data.get('fragment_data'),
+            _static_frag_lolist(frag_lolist),
+            no_type,
+            _static_frag_nonvlist(frag_nonvlist, nfrag),
+            _make_fragment_solver_settings(mfcc),
+        )
+
     frag_res = [None] * nfrag
     for ifrag in range(nfrag):
         fraglo = numpy.asarray(frag_lolist[ifrag]).ravel()
@@ -116,6 +139,296 @@ def _require_dlno_fragment_domain(mfcc, frag_prescreen, ifrag):
             f'DLNO fragment {ifrag} has no extended primary domain; otherwise '
             f'it would fall back to a full Lov.'
         )
+
+
+@dataclass(frozen=True)
+class _FragmentMFSettings:
+    max_memory: float
+    verbose: int
+    conv_tol: float
+    conv_tol_grad: object
+    direct_scf: bool
+    direct_scf_tol: float
+
+
+@dataclass(frozen=True)
+class _FragmentSolverSettings:
+    solver_cls: type
+    frozen: object
+    thresh_occ: float
+    thresh_vir: float
+    lo_type: str
+    no_type: str
+    verbose: int
+    verbose_imp: int
+    use_local_virt: bool
+    natorb_occdeg_thresh: float
+    dm_corr_frag: object
+    ccsd_t: bool
+    dcsd: bool
+
+
+class _FragmentSCFState(pytree.PytreeNode):
+    _dynamic_attr = (
+        'mol',
+        'with_df',
+        'mo_coeff',
+        'mo_energy',
+        'e_tot',
+        'fock',
+        's1e',
+        'dm_corr',
+    )
+    _static_attr = ('mo_occ', 'mf_settings')
+
+    def __init__(self, mol, with_df, mo_coeff, mo_energy, e_tot, fock, s1e,
+                 dm_corr, mo_occ, mf_settings):
+        self.mol = mol
+        self.with_df = with_df
+        self.mo_coeff = mo_coeff
+        self.mo_energy = mo_energy
+        self.e_tot = e_tot
+        self.fock = fock
+        self.s1e = s1e
+        self.dm_corr = dm_corr
+        self.mo_occ = mo_occ
+        self.mf_settings = mf_settings
+
+
+def _static_frozen(frozen):
+    if frozen is None or numpy.isscalar(frozen):
+        return frozen
+    return tuple(map(int, numpy.asarray(frozen).ravel()))
+
+
+def _static_frag_lolist(frag_lolist):
+    return tuple(
+        tuple(map(int, numpy.asarray(fraglo).ravel()))
+        for fraglo in frag_lolist
+    )
+
+
+def _static_frag_nonvlist(frag_nonvlist, nfrag):
+    if frag_nonvlist is None:
+        frag_nonvlist = [[None, None]] * nfrag
+    out = []
+    for nocc, nvir in frag_nonvlist:
+        nocc = None if nocc is None else int(nocc)
+        nvir = None if nvir is None else int(nvir)
+        out.append((nocc, nvir))
+    return tuple(out)
+
+
+def _make_fragment_scf_state(mfcc, eris):
+    mf = mfcc._scf
+    mf_settings = _FragmentMFSettings(
+        max_memory=mf.max_memory,
+        verbose=mf.verbose,
+        conv_tol=mf.conv_tol,
+        conv_tol_grad=mf.conv_tol_grad,
+        direct_scf=mf.direct_scf,
+        direct_scf_tol=mf.direct_scf_tol,
+    )
+    return _FragmentSCFState(
+        mf.mol,
+        mf.with_df,
+        mf.mo_coeff,
+        mf.mo_energy,
+        mf.e_tot,
+        eris.fock,
+        eris.s1e,
+        mfcc.dm_corr,
+        tuple(numpy.asarray(mf.mo_occ).tolist()),
+        mf_settings,
+    )
+
+
+def _make_fragment_solver_settings(mfcc):
+    return _FragmentSolverSettings(
+        solver_cls=mfcc.__class__,
+        frozen=_static_frozen(mfcc.frozen),
+        thresh_occ=float(mfcc.thresh_occ),
+        thresh_vir=float(mfcc.thresh_vir),
+        lo_type=mfcc.lo_type,
+        no_type=mfcc.no_type,
+        verbose=int(mfcc.verbose),
+        verbose_imp=int(mfcc.verbose_imp),
+        use_local_virt=bool(mfcc.use_local_virt),
+        natorb_occdeg_thresh=float(mfcc.natorb_occdeg_thresh),
+        dm_corr_frag=mfcc.dm_corr_frag,
+        ccsd_t=bool(getattr(mfcc, 'ccsd_t', False)),
+        dcsd=bool(getattr(mfcc, 'dcsd', False)),
+    )
+
+
+def _rebuild_fragment_scf(state):
+    from pyscfad import scf  # pylint: disable=import-outside-toplevel
+
+    mf = scf.RHF(state.mol)
+    mf.max_memory = state.mf_settings.max_memory
+    mf.verbose = state.mf_settings.verbose
+    mf.conv_tol = state.mf_settings.conv_tol
+    mf.conv_tol_grad = state.mf_settings.conv_tol_grad
+    mf.direct_scf = state.mf_settings.direct_scf
+    mf.direct_scf_tol = state.mf_settings.direct_scf_tol
+
+    with_df = object.__new__(state.with_df.__class__)
+    with_df.__dict__.update(state.with_df.__dict__)
+    with_df.mol = state.mol
+    if getattr(with_df, '_cderi_to_save', None) is not None:
+        cderi = getattr(with_df, '_cderi', None)
+        if cderi is None:
+            with_df._cderi = numpy.zeros((0, 0))
+        with_df._prefer_cderi_to_save = True
+    mf = mf.density_fit(with_df=with_df)
+    mf.mo_coeff = state.mo_coeff
+    mf.mo_energy = state.mo_energy
+    mf.mo_occ = numpy.asarray(state.mo_occ)
+    mf.e_tot = state.e_tot
+    mf.converged = True
+    return mf
+
+
+def _rebuild_fragment_solver(state, dlno_fragment_data, solver_settings):
+    mf = _rebuild_fragment_scf(state)
+    mfcc = solver_settings.solver_cls(
+        mf,
+        thresh=solver_settings.thresh_occ,
+        frozen=solver_settings.frozen,
+        fock=state.fock,
+        s1e=state.s1e,
+    )
+    mfcc.thresh_occ = solver_settings.thresh_occ
+    mfcc.thresh_vir = solver_settings.thresh_vir
+    mfcc.lo_type = solver_settings.lo_type
+    mfcc.no_type = solver_settings.no_type
+    mfcc.verbose = solver_settings.verbose
+    mfcc.verbose_imp = solver_settings.verbose_imp
+    mfcc.use_local_virt = solver_settings.use_local_virt
+    mfcc.natorb_occdeg_thresh = solver_settings.natorb_occdeg_thresh
+    mfcc.dm_corr = state.dm_corr
+    mfcc.dm_corr_frag = solver_settings.dm_corr_frag
+    mfcc.use_dlno_prescreen = True
+    mfcc.dlno_prescreen_data = {'fragment_data': dlno_fragment_data}
+    if hasattr(mfcc, 'ccsd_t'):
+        mfcc.ccsd_t = solver_settings.ccsd_t
+    if hasattr(mfcc, 'dcsd'):
+        mfcc.dcsd = solver_settings.dcsd
+    return mfcc
+
+
+def _fragment_one_replay(state, orbloc, dlno_fragment_data, ifrag, frag_lolist,
+                         no_type, frag_nonvlist, solver_settings):
+    mfcc = _rebuild_fragment_solver(state, dlno_fragment_data, solver_settings)
+    eris = _LNOERIS(fock=state.fock, s1e=state.s1e)
+    eris._common_init_(mfcc)
+
+    fraglo = numpy.asarray(frag_lolist[ifrag], dtype=numpy.int64)
+    orbfragloc = orbloc[:, fraglo]
+    frag_target_nocc, frag_target_nvir = frag_nonvlist[ifrag]
+    frag_prescreen = mfcc.get_dlno_prescreen_fragment(ifrag)
+    _require_dlno_fragment_domain(mfcc, frag_prescreen, ifrag)
+    return kernel_1frag(
+        mfcc,
+        eris,
+        orbfragloc,
+        no_type,
+        frag_prescreen=frag_prescreen,
+        frag_target_nocc=frag_target_nocc,
+        frag_target_nvir=frag_target_nvir,
+    )
+
+
+def _fragment_kernel_replay_impl(state, orbloc, dlno_fragment_data, frag_lolist,
+                                 no_type, frag_nonvlist, solver_settings):
+    frag_res = [None] * len(frag_lolist)
+    for ifrag in range(len(frag_lolist)):
+        frag_res[ifrag] = _fragment_one_replay(
+            state,
+            orbloc,
+            dlno_fragment_data,
+            ifrag,
+            frag_lolist,
+            no_type,
+            frag_nonvlist,
+            solver_settings,
+        )
+    return frag_res
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6))
+def _fragment_kernel_replay_vjp(state, orbloc, dlno_fragment_data, frag_lolist,
+                                no_type, frag_nonvlist, solver_settings):
+    return _fragment_kernel_replay_impl(
+        state, orbloc, dlno_fragment_data, frag_lolist, no_type, frag_nonvlist,
+        solver_settings,
+    )
+
+
+def _fragment_kernel_replay_fwd(state, orbloc, dlno_fragment_data, frag_lolist,
+                                no_type, frag_nonvlist, solver_settings):
+    out = _fragment_kernel_replay_impl(
+        state, orbloc, dlno_fragment_data, frag_lolist, no_type, frag_nonvlist,
+        solver_settings,
+    )
+    return out, (state, orbloc, dlno_fragment_data)
+
+
+def _is_float0_cotangent(x):
+    return hasattr(x, 'dtype') and x.dtype == jax.dtypes.float0
+
+
+def _add_cotangent_leaf(x, y):
+    if x is None:
+        return y
+    if y is None:
+        return x
+    if _is_float0_cotangent(x):
+        return x
+    if _is_float0_cotangent(y):
+        return y
+    return x + y
+
+
+def _tree_add_cotangent(x, y):
+    if x is None:
+        return y
+    if y is None:
+        return x
+    return jax.tree_util.tree_map(_add_cotangent_leaf, x, y)
+
+
+def _fragment_kernel_replay_bwd(frag_lolist, no_type, frag_nonvlist,
+                                solver_settings, res, ybar):
+    state, orbloc, dlno_data = res
+    state_bar = None
+    orbloc_bar = None
+    dlno_data_bar = None
+    for ifrag in range(len(frag_lolist)):
+        def frag_fn(state_, orbloc_, dlno_fragment_data_):
+            return _fragment_one_replay(
+                state_,
+                orbloc_,
+                dlno_fragment_data_,
+                ifrag,
+                frag_lolist,
+                no_type,
+                frag_nonvlist,
+                solver_settings,
+            )
+
+        _, pullback = jax.vjp(frag_fn, state, orbloc, dlno_data)
+        frag_state_bar, frag_orbloc_bar, frag_dlno_data_bar = pullback(ybar[ifrag])
+        state_bar = _tree_add_cotangent(state_bar, frag_state_bar)
+        orbloc_bar = _tree_add_cotangent(orbloc_bar, frag_orbloc_bar)
+        dlno_data_bar = _tree_add_cotangent(dlno_data_bar, frag_dlno_data_bar)
+    return state_bar, orbloc_bar, dlno_data_bar
+
+
+_fragment_kernel_replay_vjp.defvjp(
+    _fragment_kernel_replay_fwd,
+    _fragment_kernel_replay_bwd,
+)
 
 
 def kernel_1frag(mfcc, eris, orbfragloc, no_type,
@@ -1333,6 +1646,97 @@ def get_local_df(mf, atmlst):
     return cache[atmlst]
 
 
+def _global_pair_indices_for_local_ao(ao_idx, nao):
+    ao_idx = numpy.asarray(ao_idx, dtype=numpy.int64).ravel()
+    rows, cols = numpy.tril_indices(ao_idx.size)
+    grows = ao_idx[rows]
+    gcols = ao_idx[cols]
+    if numpy.any(grows < gcols):
+        raise RuntimeError('Local AO indices must be sorted for packed s2 mapping.')
+    idx = grows * (grows + 1) // 2 + gcols
+    npair = nao * (nao + 1) // 2
+    if idx.size and (idx.min() < 0 or idx.max() >= npair):
+        raise RuntimeError('Local AO pair index exceeds global packed CDERI size.')
+    return idx
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 7))
+def _outcore_local_nr_e2_from_global_cderi(mol, auxmol, mo_coeff, cderi_source,
+                                           max_memory, orbs_slice, aosym,
+                                           pair_idx):
+    del mol, auxmol, max_memory
+    if aosym not in ('s2', 's2ij'):
+        raise NotImplementedError
+    pair_idx = numpy.asarray(pair_idx, dtype=numpy.int64)
+    with df_addons.load(cderi_source, 'j3c') as eri1:
+        cderi = numpy.asarray(eri1[:, pair_idx])
+    return _ao2mo.nr_e2(cderi, mo_coeff, orbs_slice, aosym='s2')
+
+
+def _outcore_local_nr_e2_from_global_cderi_fwd(mol, auxmol, mo_coeff,
+                                               cderi_source, max_memory,
+                                               orbs_slice, aosym, pair_idx):
+    out = _outcore_local_nr_e2_from_global_cderi(
+        mol, auxmol, mo_coeff, cderi_source, max_memory, orbs_slice, aosym,
+        pair_idx,
+    )
+    return out, (mol, auxmol, mo_coeff)
+
+
+def _outcore_local_nr_e2_from_global_cderi_bwd(cderi_source, max_memory,
+                                               orbs_slice, aosym, pair_idx,
+                                               res, ybar):
+    mol, auxmol, mo_coeff = res
+    pair_idx = numpy.asarray(pair_idx, dtype=numpy.int64)
+    try:
+        with df_addons.load(cderi_source, 'j3c') as eri1:
+            cderi = numpy.asarray(eri1[:, pair_idx])
+
+        def fn(cderi_, mo_coeff_):
+            return _ao2mo.nr_e2(cderi_, mo_coeff_, orbs_slice, aosym='s2')
+
+        _, pullback = jax.vjp(fn, np.asarray(cderi), mo_coeff)
+        cderi_bar_local, mo_coeff_bar = pullback(ybar)
+
+        naux = cderi_bar_local.shape[0]
+        nao_pair = mol.nao * (mol.nao + 1) // 2
+        cderi_bar = numpy.zeros(
+            (naux, nao_pair), dtype=numpy.asarray(cderi_bar_local).dtype
+        )
+        cderi_bar[:, pair_idx] = numpy.asarray(jax.device_get(cderi_bar_local))
+
+        mol_bar, auxmol_bar = _cderi_vjp.cholesky_eri_vjp_from_cderi_source(
+            mol, auxmol, cderi_source, cderi_bar, max(max_memory, 4096),
+            int3c=mol._add_suffix('int3c2e'),
+            int2c=mol._add_suffix('int2c2e'),
+            aosym='s2ij',
+        )
+        return mol_bar, auxmol_bar, mo_coeff_bar
+    except NotImplementedError:
+        pass
+
+    def full_fn(mol_, auxmol_, mo_coeff_):
+        cderi = df_incore.cholesky_eri(
+            mol_,
+            auxmol=auxmol_,
+            int3c=mol_._add_suffix('int3c2e'),
+            int2c=mol_._add_suffix('int2c2e'),
+            max_memory=max(max_memory, 4096),
+            verbose=0,
+        )
+        cderi = cderi[:, pair_idx]
+        return _ao2mo.nr_e2(cderi, mo_coeff_, orbs_slice, aosym='s2')
+
+    _, pullback = jax.vjp(full_fn, mol, auxmol, mo_coeff)
+    return pullback(ybar)
+
+
+_outcore_local_nr_e2_from_global_cderi.defvjp(
+    _outcore_local_nr_e2_from_global_cderi_fwd,
+    _outcore_local_nr_e2_from_global_cderi_bwd,
+)
+
+
 @partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6))
 def _outcore_nr_e2(mol, auxmol, mo_coeff, cderi_source, max_memory,
                    orbs_slice, aosym):
@@ -1351,8 +1755,20 @@ def _outcore_nr_e2_fwd(mol, auxmol, mo_coeff, cderi_source, max_memory,
 
 
 def _outcore_nr_e2_bwd(cderi_source, max_memory, orbs_slice, aosym, res, ybar):
-    del cderi_source
     mol, auxmol, mo_coeff = res
+    try:
+        cderi_bar, mo_coeff_bar = _cderi_vjp.nr_e2_vjp_from_cderi_source(
+            cderi_source, mo_coeff, ybar, orbs_slice, aosym=aosym
+        )
+        mol_bar, auxmol_bar = _cderi_vjp.cholesky_eri_vjp_from_cderi_source(
+            mol, auxmol, cderi_source, cderi_bar, max(max_memory, 4096),
+            int3c=mol._add_suffix('int3c2e'),
+            int2c=mol._add_suffix('int2c2e'),
+            aosym='s2ij',
+        )
+        return mol_bar, auxmol_bar, mo_coeff_bar
+    except NotImplementedError:
+        pass
 
     def fn(mol_, auxmol_, mo_coeff_):
         cderi = df_incore.cholesky_eri(
@@ -1375,11 +1791,31 @@ _outcore_nr_e2.defvjp(_outcore_nr_e2_fwd, _outcore_nr_e2_bwd)
 def transform_df_to_mo(mf, mo_coeff, orbs_slice, aosym='s2', mosym='s1', atmlst=None):
     atmlst = _local_domain_atmlst(mf, atmlst)
     if atmlst is not None:
-        fake_mol, local_df, ao_idx = get_local_df(mf, atmlst)
+        ao_idx = dlno_util.ao_index_by_atom(mf.mol, atmlst)
         s1e = mf.get_ovlp()
         s21 = s1e[ao_idx]
         s22 = s1e[np.ix_(ao_idx, ao_idx)]
         mo_coeff = dlno_util.project_mo(mo_coeff, s21, s22)
+        get_cderi = getattr(mf.with_df, '_get_cderi_source', None)
+        cderi = get_cderi() if get_cderi is not None else mf.with_df._cderi
+        has_outcore_cderi = (
+            hasattr(mf.with_df, '_has_outcore_cderi_placeholder')
+            and mf.with_df._has_outcore_cderi_placeholder()
+        )
+        if has_outcore_cderi:
+            if mf.with_df.auxmol is None:
+                mf.with_df.auxmol = df_mod.addons.make_auxmol(
+                    mf.with_df.mol, mf.with_df.auxbasis
+            )
+            pair_idx = tuple(
+                _global_pair_indices_for_local_ao(ao_idx, mf.mol.nao).tolist()
+            )
+            return _outcore_local_nr_e2_from_global_cderi(
+                mf.with_df.mol, mf.with_df.auxmol, mo_coeff, cderi,
+                mf.with_df.max_memory, orbs_slice, aosym, pair_idx
+            )
+
+        fake_mol, local_df, _ = get_local_df(mf, atmlst)
         get_cderi = getattr(local_df, '_get_cderi_source', None)
         cderi = get_cderi() if get_cderi is not None else local_df._cderi
     else:

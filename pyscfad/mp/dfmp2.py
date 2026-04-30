@@ -26,6 +26,7 @@ from pyscfad.lib import logger
 from pyscfad.ao2mo import _ao2mo
 from pyscfad.df import incore as df_incore
 from pyscfad.df import addons as df_addons
+from pyscfad.df import _cderi_vjp
 from pyscfad.mp import mp2
 
 WITH_T2 = getattr(__config__, 'mp_dfmp2_with_t2', True)
@@ -159,8 +160,20 @@ def _outcore_nr_e2_fwd(mol, auxmol, mo_coeff, cderi_source, max_memory,
 
 
 def _outcore_nr_e2_bwd(cderi_source, max_memory, ijslice, aosym, res, ybar):
-    del cderi_source
     mol, auxmol, mo_coeff = res
+    try:
+        cderi_bar, mo_coeff_bar = _cderi_vjp.nr_e2_vjp_from_cderi_source(
+            cderi_source, mo_coeff, ybar, ijslice, aosym=aosym
+        )
+        mol_bar, auxmol_bar = _cderi_vjp.cholesky_eri_vjp_from_cderi_source(
+            mol, auxmol, cderi_source, cderi_bar, max(max_memory, 4096),
+            int3c=mol._add_suffix('int3c2e'),
+            int2c=mol._add_suffix('int2c2e'),
+            aosym='s2ij',
+        )
+        return mol_bar, auxmol_bar, mo_coeff_bar
+    except NotImplementedError:
+        pass
 
     def fn(mol_, auxmol_, mo_coeff_):
         cderi = df_incore.cholesky_eri(

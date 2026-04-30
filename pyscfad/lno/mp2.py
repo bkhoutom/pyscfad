@@ -40,8 +40,6 @@ def _make_df_eris_incore(cc, mo_coeff=None, fockao=None):
     nocc = eris.nocc
     nmo = eris.fock.shape[0]
     nvir = nmo - nocc
-    with_df = cc.with_df
-    naux = with_df.get_naoaux()
 
     mo = np.asarray(eris.mo_coeff)
     ijslice = (0, nocc, nocc, nmo)

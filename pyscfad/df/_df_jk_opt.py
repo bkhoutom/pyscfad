@@ -24,6 +24,7 @@ from pyscf.lib import logger
 from pyscf.df import df_jk as pyscf_df_jk
 from pyscfadlib import libcvhf_vjp as libvhf
 from pyscfad.df import incore as df_incore
+from pyscfad.df import _cderi_vjp
 
 libao2mo = lib.load_library('libao2mo')
 _FAST_EXCHANGE_DM_DATA = {}
@@ -90,6 +91,29 @@ def _cderi_mol_aux_vjp(dfobj, eri_bar):
     auxmol = dfobj.auxmol
     if auxmol is None:
         return None, None
+
+    get_cderi = getattr(dfobj, '_get_cderi_source', None)
+    cderi_source = (
+        get_cderi() if get_cderi is not None else getattr(dfobj, '_cderi', None)
+    )
+    try:
+        mol_bar, auxmol_bar = _cderi_vjp.cholesky_eri_vjp_from_cderi_source(
+            dfobj.mol,
+            auxmol,
+            cderi_source,
+            eri_bar,
+            max(dfobj.max_memory, 4096),
+            int3c=dfobj.mol._add_suffix('int3c2e'),
+            int2c=dfobj.mol._add_suffix('int2c2e'),
+            aosym='s2ij',
+        )
+        mol_bar_leaves = tree_flatten(mol_bar)[0]
+        auxmol_bar_leaves = tree_flatten(auxmol_bar)[0]
+        mol_bar = mol_bar_leaves[0] if mol_bar_leaves else None
+        auxmol_bar = auxmol_bar_leaves[0] if auxmol_bar_leaves else None
+        return mol_bar, auxmol_bar
+    except NotImplementedError:
+        pass
 
     def build_cderi(mol, auxmol):
         max_memory = max(dfobj.max_memory, 4096)

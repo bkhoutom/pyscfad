@@ -85,6 +85,7 @@ def kernel(mfcc, orbloc, frag_lolist,
     nfrag = len(frag_lolist)
     if frag_nonvlist is None:
         frag_nonvlist = [[None,None]] * nfrag
+    mfcc.fragment_diagnostics = []
 
     if (
         USE_FRAGMENT_REPLAY_VJP
@@ -92,15 +93,27 @@ def kernel(mfcc, orbloc, frag_lolist,
         and eris is not None
         and getattr(eris, 'Lov', None) is None
     ):
-        return _fragment_kernel_replay_vjp(
+        dlno_fragment_data = mfcc.dlno_prescreen_data.get('fragment_data')
+        static_frag_lolist = _static_frag_lolist(frag_lolist)
+        frag_res = _fragment_kernel_replay_vjp(
             _make_fragment_scf_state(mfcc, eris),
             orbloc,
-            mfcc.dlno_prescreen_data.get('fragment_data'),
-            _static_frag_lolist(frag_lolist),
+            dlno_fragment_data,
+            static_frag_lolist,
             no_type,
             _static_frag_nonvlist(frag_nonvlist, nfrag),
             _make_fragment_solver_settings(mfcc),
         )
+        mfcc.fragment_diagnostics = [
+            make_fragment_diagnostic(
+                frag_res[ifrag],
+                None if dlno_fragment_data is None else dlno_fragment_data[ifrag],
+                ifrag,
+                static_frag_lolist[ifrag],
+            )
+            for ifrag in range(nfrag)
+        ]
+        return frag_res
 
     frag_res = [None] * nfrag
     for ifrag in range(nfrag):
@@ -114,6 +127,14 @@ def kernel(mfcc, orbloc, frag_lolist,
                                        frag_prescreen=frag_prescreen,
                                        frag_target_nocc=frag_target_nocc,
                                        frag_target_nvir=frag_target_nvir)
+        mfcc.fragment_diagnostics.append(
+            make_fragment_diagnostic(
+                frag_res[ifrag],
+                frag_prescreen,
+                ifrag,
+                fraglo,
+            )
+        )
     return frag_res
 
 
@@ -445,11 +466,130 @@ def kernel_1frag(mfcc, eris, orbfragloc, no_type,
                                   frag_target_nocc=frag_target_nocc,
                                   frag_target_nvir=frag_target_nvir)
     if orbfrag is None:
-        return (0., 0., 0.)
+        return (0., 0., 0.) + _fragment_space_counts(mfcc, None)
     frag_res = mfcc.impurity_solve(mf, orbfrag, orbfragloc,
                                    frozen=frzfrag, eris=eris,
                                    frag_prescreen=frag_prescreen)
-    return frag_res
+    return frag_res + _fragment_space_counts(mfcc, frzfrag)
+
+
+def _fragment_space_counts(mfcc, frzfrag):
+    mo_occ = mfcc._scf.mo_occ
+    nmo = int(getattr(mo_occ, 'shape', (len(mo_occ),))[0])
+    try:
+        nocc = int(numpy.count_nonzero(numpy.asarray(mo_occ) > THRESH_OCC))
+    except (TypeError, ValueError, jax.errors.TracerArrayConversionError):
+        nocc = int(mfcc.mol.nelectron // 2)
+
+    frozen = mfcc.frozen
+    if frozen is None:
+        frozen = 0
+    if numpy.isscalar(frozen):
+        frozen_occ = int(frozen)
+        frozen_vir = 0
+    else:
+        frozen_idx = numpy.asarray(frozen)
+        frozen_occ = int(numpy.count_nonzero(frozen_idx < nocc))
+        frozen_vir = int(numpy.count_nonzero(frozen_idx >= nocc))
+
+    parent_active_nocc = nocc - frozen_occ
+    parent_active_nvir = (nmo - nocc) - frozen_vir
+    parent_active_nmo = parent_active_nocc + parent_active_nvir
+
+    if frzfrag is None:
+        lno_active_nocc = 0
+        lno_active_nvir = 0
+    else:
+        frzfrag = numpy.asarray(frzfrag)
+        nfrzocc = int(numpy.count_nonzero(frzfrag < nocc))
+        nfrzvir = int(numpy.count_nonzero(frzfrag >= nocc))
+        lno_active_nocc = nocc - nfrzocc
+        lno_active_nvir = (nmo - nocc) - nfrzvir
+
+    return (
+        int(lno_active_nocc),
+        int(lno_active_nvir),
+        int(lno_active_nocc + lno_active_nvir),
+        int(parent_active_nocc),
+        int(parent_active_nvir),
+        int(parent_active_nmo),
+    )
+
+
+def _metadata_size(value):
+    if value is None:
+        return 0
+    shape = getattr(value, 'shape', None)
+    if shape is not None:
+        size = 1
+        for dim in shape:
+            size *= int(dim)
+        return int(size)
+    return int(len(value))
+
+
+def _metadata_ncol(value):
+    if value is None:
+        return 0
+    shape = getattr(value, 'shape', None)
+    if shape is not None:
+        return int(shape[1]) if len(shape) > 1 else 0
+    return int(numpy.asarray(value).shape[1])
+
+
+def make_fragment_diagnostic(frag_res, frag_prescreen, local_index, fraglo):
+    row = {
+        'fragment_index': int(local_index),
+        'local_fragment_index': int(local_index),
+        'nlo_fragment': int(numpy.asarray(fraglo).size),
+        'e_lmp2': None,
+        'e_ccsd': None,
+        'e_ccsd_t': None,
+    }
+    if frag_prescreen is not None:
+        row.update({
+            'fragment_index': int(frag_prescreen.get('fragment_index', local_index)),
+            'dlno_strong_lmo_count': _metadata_size(
+                frag_prescreen.get('strong_lmo_indices')
+            ),
+            'dlno_extended_bp_atom_count': _metadata_size(
+                frag_prescreen.get('extended_bp_domain')
+            ),
+            'dlno_extended_primary_atom_count': _metadata_size(
+                frag_prescreen.get('extended_primary_domain')
+            ),
+            'dlno_occ_prescreen_size': _metadata_ncol(
+                frag_prescreen.get('occ_prescreen_coeff')
+            ),
+            'dlno_vir_prescreen_size': _metadata_ncol(
+                frag_prescreen.get('vir_prescreen_coeff')
+            ),
+        })
+
+    if frag_res is not None:
+        row['e_lmp2'] = frag_res[0]
+        if len(frag_res) >= 9:
+            row['e_ccsd'] = frag_res[1]
+            row['e_ccsd_t'] = frag_res[2]
+            (
+                row['lno_active_nocc'],
+                row['lno_active_nvir'],
+                row['lno_active_nmo'],
+                row['parent_active_nocc'],
+                row['parent_active_nvir'],
+                row['parent_active_nmo'],
+            ) = frag_res[3:9]
+        elif len(frag_res) >= 7:
+            (
+                row['lno_active_nocc'],
+                row['lno_active_nvir'],
+                row['lno_active_nmo'],
+                row['parent_active_nocc'],
+                row['parent_active_nvir'],
+                row['parent_active_nmo'],
+            ) = frag_res[1:7]
+
+    return row
 
 
 def _dlno_outside_space(full_space, selected_space, thresh):

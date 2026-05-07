@@ -69,6 +69,8 @@ class CalculationSettings:
     mp2_correction: str = "dlno"
     ccsd_t: bool = True
     low_memory_gradient: bool = True
+    scf_init_guess: str = "minao"
+    scf_chkfile: str | None = None
 
     def with_parameter(self, name: str, value):
         if not hasattr(self, name):
@@ -342,6 +344,8 @@ def make_density_fitted_rhf(
     *,
     cderi_file=None,
     cderi_ready=False,
+    scf_init_guess=None,
+    scf_chkfile=None,
 ):
     mf = scf.RHF(mol)
     with_df = df.DF(mol)
@@ -365,7 +369,12 @@ def make_density_fitted_rhf(
         if cderi_ready:
             with_df._cderi = np.zeros((0, 0))
             with_df._prefer_cderi_to_save = True
-    return mf.density_fit(with_df=with_df)
+    mf = mf.density_fit(with_df=with_df)
+    if scf_init_guess is not None:
+        mf.init_guess = scf_init_guess
+    if scf_chkfile is not None:
+        mf.chkfile = str(Path(scf_chkfile).expanduser())
+    return mf
 
 def prepare_outcore_cderi(mol, timer=None):
     fd, filename = tempfile.mkstemp(prefix="pyscfad-solvent-mpi-cderi-", suffix=".h5")
@@ -529,6 +538,8 @@ def dlno_ccsd_t_with_mp2_correction(
             mol,
             cderi_file=cderi_file,
             cderi_ready=cderi_file is not None,
+            scf_init_guess=settings.scf_init_guess,
+            scf_chkfile=settings.scf_chkfile,
         )
         ehf = mf.kernel()
 
@@ -655,6 +666,8 @@ def run_dlno_domain_build(xyz_path, settings: CalculationSettings):
                     mol,
                     cderi_file=cderi_file,
                     cderi_ready=cderi_file is not None,
+                    scf_init_guess=settings.scf_init_guess,
+                    scf_chkfile=settings.scf_chkfile,
                 )
                 mf.kernel()
 

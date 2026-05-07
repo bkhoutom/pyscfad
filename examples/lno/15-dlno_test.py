@@ -21,8 +21,8 @@ from pyscfad.lno.dlno_workflow import (
 
 
 NWATER = None  # Set to None when using XYZ_FILE.
-XYZ_FILE = "h2_dimer.xyz"  # Set to an XYZ filename to bypass generated water_N.xyz.
-FROZEN_CORE = 0
+XYZ_FILE = "water_dimer.xyz"  # Set to an XYZ filename to bypass generated water_N.xyz.
+FROZEN_CORE = 0#NWATER
 
 SWEEP_PARAMETER = "dlno_ccsd_pair_energy_thr"
 SWEEP_VALUES = [1.0e-5]
@@ -30,19 +30,20 @@ MP2_CORRECTION = "dlno"  # "dlno" or "canonical"
 CCSD_T = True
 LOW_MEMORY_GRADIENT = True
 DOMAIN_ONLY = False
+SCF_CHKFILE = Path(__file__).with_name(f"15-dlno_test_hf_{NWATER}_rank{RANK}.chk")
 
 
 BASE_SETTINGS = CalculationSettings(
-    basis="631g",
+    basis="ccpvdz",
     lo_type="iao",
-    lno_occ_thr=1.0e-5,
-    lno_vir_thr=1.0e-6,
+    lno_occ_thr=1.0e-4,
+    lno_vir_thr=1.0e-5,
     mp2_lno_occ_thr=1.0e-7,
     mp2_lno_vir_thr=1.0e-6,
-    dlno_ccsd_domain_pao_thr=1.0e-5,
-    dlno_ccsd_pair_energy_thr=1.0e-5,
-    lmo_bp_domain_thr=0.9999,
-    pao_bp_domain_thr=0.98,
+    dlno_ccsd_domain_pao_thr=1.0e-4,
+    dlno_ccsd_pair_energy_thr=1.0e-4,
+    lmo_bp_domain_thr=0.9,
+    pao_bp_domain_thr=0.9,
     multipole_order=4,
     max_memory_mb=2000,
     frozen_core=FROZEN_CORE,
@@ -51,6 +52,8 @@ BASE_SETTINGS = CalculationSettings(
     mp2_correction=MP2_CORRECTION,
     ccsd_t=CCSD_T,
     low_memory_gradient=LOW_MEMORY_GRADIENT,
+    scf_init_guess="chkfile",
+    scf_chkfile=str(SCF_CHKFILE),
 )
 
 

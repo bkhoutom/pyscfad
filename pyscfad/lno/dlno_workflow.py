@@ -425,6 +425,15 @@ def build_local_orbitals_and_fragments(mf, frozen, settings: CalculationSettings
     return lo_coeff, frag_lolist
 
 
+def scf_reference_matrices(mf):
+    s1e = mf.get_ovlp()
+    dm = mf.make_rdm1()
+    h1e = mf.get_hcore(mf.mol, s1e=s1e)
+    vhf = mf.get_veff(mf.mol, dm, s1e=s1e)
+    fock = mf.get_fock(h1e=h1e, s1e=s1e, vhf=vhf, dm=dm)
+    return s1e, fock
+
+
 def build_dlno_data(
     mf,
     lo_coeff,
@@ -434,6 +443,8 @@ def build_dlno_data(
     *,
     domain_pao_thr,
     pair_energy_thr,
+    s1e=None,
+    fock=None,
 ):
     topology = stop_trace(build_dlno_prescreen_data)(
         mf,
@@ -445,8 +456,11 @@ def build_dlno_data(
         domain_pao_thr=domain_pao_thr,
         pair_energy_thr=pair_energy_thr,
         multipole_order=settings.multipole_order,
+        s1e=s1e,
+        fock=fock,
     )
-    return rebuild_dlno_prescreen_data(mf, lo_coeff, topology, frozen=frozen)
+    return rebuild_dlno_prescreen_data(
+        mf, lo_coeff, topology, frozen=frozen, s1e=s1e, fock=fock)
 
 
 def enable_dlno_prescreen(solver, dlno_data):
@@ -469,9 +483,13 @@ def filter_dlno_data_for_rank(dlno_data, frag_lolist):
     return local_data
 
 
-def make_cc_solver(mf, frozen, settings: CalculationSettings):
+def make_cc_solver(mf, frozen, settings: CalculationSettings, *, s1e=None, fock=None):
     cc = MPILNOCCSD(
-        mf, thresh=min(settings.lno_occ_thr, settings.lno_vir_thr), frozen=frozen
+        mf,
+        thresh=min(settings.lno_occ_thr, settings.lno_vir_thr),
+        frozen=frozen,
+        fock=fock,
+        s1e=s1e,
     )
     cc.thresh_occ = settings.lno_occ_thr
     cc.thresh_vir = settings.lno_vir_thr
@@ -481,11 +499,13 @@ def make_cc_solver(mf, frozen, settings: CalculationSettings):
     return cc
 
 
-def make_mp2_solver(mf, frozen, settings: CalculationSettings):
+def make_mp2_solver(mf, frozen, settings: CalculationSettings, *, s1e=None, fock=None):
     pt = MPILNOMP2(
         mf,
         thresh=min(settings.mp2_lno_occ_thr, settings.mp2_lno_vir_thr),
         frozen=frozen,
+        fock=fock,
+        s1e=s1e,
     )
     pt.thresh_occ = settings.mp2_lno_occ_thr
     pt.thresh_vir = settings.mp2_lno_vir_thr
@@ -500,11 +520,17 @@ def make_canonical_mp2_solver(mf, frozen):
     return pt
 
 
-def run_mp2_correction(mf, frag_lolist, lo_coeff, frozen, settings, dlno_data, timer=None):
+def run_mp2_correction(
+    mf, frag_lolist, lo_coeff, frozen, settings, dlno_data, timer=None,
+    *, s1e=None, fock=None
+):
     mode = settings.mp2_correction.lower()
     if mode in ("dlno", "local"):
         with timed_section(timer, "DLNO-MP2 correction"):
-            pt = enable_dlno_prescreen(make_mp2_solver(mf, frozen, settings), dlno_data)
+            pt = enable_dlno_prescreen(
+                make_mp2_solver(mf, frozen, settings, s1e=s1e, fock=fock),
+                dlno_data,
+            )
             pt.kernel(frag_lolist=frag_lolist, orbloc=lo_coeff)
             return pt.e_corr, getattr(pt, "fragment_diagnostics", [])
 
@@ -542,6 +568,7 @@ def dlno_ccsd_t_with_mp2_correction(
             scf_chkfile=settings.scf_chkfile,
         )
         ehf = mf.kernel()
+        s1e, fock = scf_reference_matrices(mf)
 
     with timed_section(timer, "Local orbitals/fragments"):
         lo_coeff, frag_lolist = build_local_orbitals_and_fragments(mf, ncore, settings)
@@ -555,18 +582,24 @@ def dlno_ccsd_t_with_mp2_correction(
             settings,
             domain_pao_thr=settings.dlno_ccsd_domain_pao_thr,
             pair_energy_thr=settings.dlno_ccsd_pair_energy_thr,
+            s1e=s1e,
+            fock=fock,
         )
         ccsd_dlno_data = filter_dlno_data_for_rank(ccsd_dlno_data, frag_lolist)
 
     mp2_dlno_data = ccsd_dlno_data
 
     emp2, mp2_fragment_diagnostics = run_mp2_correction(
-        mf, frag_lolist, lo_coeff, ncore, settings, mp2_dlno_data, timer=timer
+        mf, frag_lolist, lo_coeff, ncore, settings, mp2_dlno_data, timer=timer,
+        s1e=s1e, fock=fock,
     )
 
     method_name = "DLNO-CCSD(T)" if settings.ccsd_t else "DLNO-CCSD"
     with timed_section(timer, method_name):
-        cc = enable_dlno_prescreen(make_cc_solver(mf, ncore, settings), ccsd_dlno_data)
+        cc = enable_dlno_prescreen(
+            make_cc_solver(mf, ncore, settings, s1e=s1e, fock=fock),
+            ccsd_dlno_data,
+        )
         cc.kernel(frag_lolist=frag_lolist, orbloc=lo_coeff)
 
     e_corr = cc.e_corr_pt2corrected(emp2)
@@ -670,6 +703,7 @@ def run_dlno_domain_build(xyz_path, settings: CalculationSettings):
                     scf_chkfile=settings.scf_chkfile,
                 )
                 mf.kernel()
+                s1e, fock = scf_reference_matrices(mf)
 
             with timed_section(timer, "Local orbitals/fragments"):
                 lo_coeff, frag_lolist = build_local_orbitals_and_fragments(
@@ -685,6 +719,8 @@ def run_dlno_domain_build(xyz_path, settings: CalculationSettings):
                     settings,
                     domain_pao_thr=settings.dlno_ccsd_domain_pao_thr,
                     pair_energy_thr=settings.dlno_ccsd_pair_energy_thr,
+                    s1e=s1e,
+                    fock=fock,
                 )
                 dlno_data = filter_dlno_data_for_rank(dlno_data, frag_lolist)
                 local_fragment_diagnostics = {

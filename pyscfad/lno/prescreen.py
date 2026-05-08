@@ -249,10 +249,14 @@ def _build_lo_indexed_prescreen_data(
     pair_energy_model='exact',
     pao_norm_thr=1e-4,
     multipole_order=4,
+    s1e=None,
+    fock=None,
 ):
     mol = mf.mol
-    s1e = mol.intor_symmetric('int1e_ovlp')
-    fock = mf.get_fock()
+    if s1e is None:
+        s1e = mol.intor_symmetric('int1e_ovlp')
+    if fock is None:
+        fock = mf.get_fock()
 
     lmo_bp_domain = get_bp_domain = None
     # Treat domain topology as fixed metadata. The selected prescreen spaces
@@ -391,6 +395,8 @@ def build_dlno_prescreen_data(
     pair_energy_model='multipole',
     pao_norm_thr=1e-4,
     multipole_order=4,
+    s1e=None,
+    fock=None,
 ):
     """Precompute DLNO metadata for use with LNO in pyscfad.
 
@@ -412,10 +418,16 @@ def build_dlno_prescreen_data(
             pair_energy_model=pair_energy_model,
             pao_norm_thr=pao_norm_thr,
             multipole_order=multipole_order,
+            s1e=s1e,
+            fock=fock,
         )
 
     mol = mf.mol
     dlno = dlno_mod.DLNO(mf, frozen=frozen)
+    if s1e is not None:
+        dlno.s1e = s1e
+    if fock is not None:
+        dlno.fock = fock
     dlno.lmo = lo_coeff
     dlno.lmo_bp_domain_thr = lmo_bp_domain_thr
     dlno.pao_bp_domain_thr = pao_bp_domain_thr
@@ -536,7 +548,9 @@ def build_dlno_prescreen_data(
     }
 
 
-def rebuild_dlno_prescreen_data(mf, lo_coeff, topology_data, *, frozen=None):
+def rebuild_dlno_prescreen_data(
+    mf, lo_coeff, topology_data, *, frozen=None, s1e=None, fock=None
+):
     """Rebuild prescreen orbital spaces from the current SCF state.
 
     The combinatorial DLNO metadata such as strong pairs and atom domains are
@@ -548,8 +562,10 @@ def rebuild_dlno_prescreen_data(mf, lo_coeff, topology_data, *, frozen=None):
     if frozen is None:
         frozen = topology_data.get("frozen", None)
 
-    s1e = mol.intor_symmetric("int1e_ovlp")
-    fock = mf.get_fock()
+    if s1e is None:
+        s1e = mol.intor_symmetric("int1e_ovlp")
+    if fock is None:
+        fock = mf.get_fock()
     pao_norm_thr = topology_data.get("pao_norm_thr", 1e-4)
     domain_pao_thr = topology_data.get("domain_pao_thr", 1e-4)
     pao_bp_domain_thr = topology_data.get("pao_bp_domain_thr", 0.98)

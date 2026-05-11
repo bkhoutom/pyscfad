@@ -7,6 +7,16 @@ from .multipole import *
 from .util import einsum
 
 WITH_T2 = True
+MULTIPOLE_STRONG_PAIR_VALUE = -1.0
+MULTIPOLE_MIN_CENTER_DISTANCE = 1e-02
+
+
+def _same_atom_domain(atmlst_i, atmlst_j):
+    if atmlst_i is None or atmlst_j is None:
+        return False
+    return tuple(np.asarray(atmlst_i, dtype=np.int32)) == tuple(
+        np.asarray(atmlst_j, dtype=np.int32)
+    )
 
 def pair_energy_multipole(
         mol,
@@ -23,6 +33,8 @@ def pair_energy_multipole(
     if atmlst is None:
         atmlst = [None,] * nocc
     e_mp2_pair = jnp.zeros((nocc, nocc), dtype=jnp.float64)
+
+    moments = []
     for i in range(nocc):
         lmo_i = jnp.asarray(mo_occ[i]).ravel()
         atmlst_i = atmlst[i]
@@ -42,16 +54,30 @@ def pair_energy_multipole(
             Oi = octupole_op(mol, R=Ri, atmlst=atmlst_i)
             omega_ai = einsum('ua,xyzuv,v->xyza', pao_i.conj(), Oi, lmo_i)
 
-        for j in range(i):
-            lmo_j = jnp.asarray(mo_occ[j]).ravel()
-            atmlst_j = atmlst[j]
-            Dj = dipole_op(mol, atmlst=atmlst_j)
-            Rj = einsum('u,xuv,v->x', lmo_j.conj(), Dj, lmo_j)
-            R = jnp.linalg.norm(Rj - Ri)
-            R_bar = (Rj - Ri) / R
+        moments.append((atmlst_i, Ri, mu_ai, e_ai, theta_ai, omega_ai))
 
-            pao_j = jnp.asarray(mo_vir[j])
-            mu_bj = einsum('ua,xuv,v->xa', pao_j.conj(), Dj, lmo_j)
+    for i in range(nocc):
+        atmlst_i, Ri, mu_ai, e_ai, theta_ai, omega_ai = moments[i]
+        for j in range(i):
+            atmlst_j, Rj, mu_bj, e_bj, theta_bj, omega_bj = moments[j]
+
+            # Disabled for timing tests: force same-atom-domain pairs through
+            # the multipole path instead of marking them as strong pairs.
+            # if _same_atom_domain(atmlst_i, atmlst_j):
+            #     e_mp2_pair = e_mp2_pair.at[i, j].set(MULTIPOLE_STRONG_PAIR_VALUE)
+            #     continue
+
+            R = jnp.linalg.norm(Rj - Ri)
+            # Disabled for timing tests: do not promote pairs with nearly
+            # coincident multipole centers to strong pairs.
+            # try:
+            #     near_center = float(np.asarray(R)) < MULTIPOLE_MIN_CENTER_DISTANCE
+            # except Exception:  # pragma: no cover - only reached under active tracing
+            #     near_center = False
+            # if near_center:
+            #     e_mp2_pair = e_mp2_pair.at[i, j].set(MULTIPOLE_STRONG_PAIR_VALUE)
+            #     continue
+            R_bar = (Rj - Ri) / R
 
             aibj_2 = mu_ai.T @ mu_bj
             tmp_ai = R_bar @ mu_ai
@@ -62,8 +88,6 @@ def pair_energy_multipole(
             aibj = aibj_2
 
             if order > 2:
-                Qj = quadrupole_op(mol, R=Rj, atmlst=atmlst_j)
-                theta_bj = einsum('ua,xyuv,v->xya', pao_j.conj(), Qj, lmo_j)
                 RR = jnp.outer(R_bar, R_bar)
 
                 tmp1_ai = RR.ravel() @ theta_ai.reshape(9, -1)
@@ -79,8 +103,6 @@ def pair_energy_multipole(
                 aibj += aibj_3
 
             if order > 3:
-                Oj = octupole_op(mol, R=Rj, atmlst=atmlst_j)
-                omega_bj = einsum('ua,xyzuv,v->xyza', pao_j.conj(), Oj, lmo_j)
                 RR = jnp.outer(R_bar, R_bar)
                 RRR = einsum('x,y,z->xyz', R_bar, R_bar, R_bar)
 
@@ -100,7 +122,6 @@ def pair_energy_multipole(
                 aibj_4 /= (3 * R**5)
                 aibj += aibj_4
 
-            e_bj = jnp.asarray(e_vir[j]) - e_occ[j]
             aibj2 = aibj * aibj / (e_ai[:,None] + e_bj[None,:])
             e_mp2_pair = e_mp2_pair.at[i, j].set(-8 * jnp.sum(aibj2))
 

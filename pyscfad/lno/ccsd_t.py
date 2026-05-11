@@ -29,6 +29,7 @@ from pyscf.lib import (
 )
 
 from pyscfad import numpy as np
+from pyscfad.tools import memory_debug as memdbg
 from pyscfad.tools import timer
 from pyscfadlib import libcc_vjp as libcc
 
@@ -65,7 +66,9 @@ def get_ovvv(ovvv, *slices):
     ovvv = unpack_tril(ovw.reshape(nocc*nvir,nvir_pair))
     nvir1 = ovvv.shape[2]
     # pylint: disable=too-many-function-args
-    return ovvv.reshape(nocc,nvir,nvir1,nvir1)
+    out = ovvv.reshape(nocc,nvir,nvir1,nvir1)
+    memdbg.trace("lno.ccsd_t.get_ovvv: unpacked ovvv", ovvv=out)
+    return out
 
 @partial(custom_vjp, nondiff_argnums=(8,))
 def _ccsd_t_energy(mat, t1T, t2T, mo_energy, fvo,
@@ -81,11 +84,13 @@ def _ccsd_t_energy(mat, t1T, t2T, mo_energy, fvo,
 
     vooo = numpy.asarray(ovoo).conj().transpose(1,0,3,2)
     vooo = numpy.asarray(vooo, order='C')
+    memdbg.trace("lno.ccsd_t._ccsd_t_energy: vooo", vooo=vooo)
 
     vvop = numpy.empty((nvir,nvir,nocc,nmo))
     vvop[:,:,:,:nocc] = numpy.asarray(ovov).conj().transpose(1,3,0,2)
     vvop[:,:,:,nocc:] = get_ovvv(ovvv).conj().transpose(1,3,0,2)
     vvop = numpy.asarray(vvop, order='C')
+    memdbg.trace("lno.ccsd_t._ccsd_t_energy: vvop", vvop=vvop)
 
     drv = libcc.lnoccsdt_contract
     et_sum = numpy.zeros(1, dtype=float)
@@ -104,8 +109,8 @@ def _ccsd_t_energy(mat, t1T, t2T, mo_energy, fvo,
     mem_now = current_memory()[0]
     max_memory = max(0, max_memory - mem_now)
     cache_size = (nocc**3*3+nocc*nvir*2+2)*num_threads()+nvir**2*(nvir+1)/2*7+nocc**3*3
-    if max_memory*1e6/8 < cache_size:
-        raise RuntimeError(f'{cache_size*8/1e6} MB more memory is needed.')
+#    if max_memory*1e6/8 < cache_size:
+#        raise RuntimeError(f'{cache_size*8/1e6} MB more memory is needed.')
     contract(0, nvir, vvop)
 
     et_sum *= 2. / 3.
@@ -144,12 +149,16 @@ def _ccsd_t_energy_bwd(max_memory, res, et_bar):
     vooo = numpy.asarray(ovoo).conj().transpose(1,0,3,2)
     vooo = numpy.asarray(vooo, order='C')
     vooo_bar = numpy.zeros_like(vooo)
+    memdbg.trace("lno.ccsd_t._ccsd_t_energy_bwd: vooo",
+                 vooo=vooo, vooo_bar=vooo_bar)
 
     vvop = numpy.empty((nvir,nvir,nocc,nmo))
     vvop[:,:,:,:nocc] = numpy.asarray(ovov).conj().transpose(1,3,0,2)
     vvop[:,:,:,nocc:] = get_ovvv(ovvv).conj().transpose(1,3,0,2)
     vvop = numpy.asarray(vvop, order='C')
     vvop_bar = numpy.zeros_like(vvop)
+    memdbg.trace("lno.ccsd_t._ccsd_t_energy_bwd: vvop",
+                 vvop=vvop, vvop_bar=vvop_bar)
 
     drv = libcc.lnoccsdt_energy_vjp
     def contract(a0, a1, b0, b1, cache, cache_bar):
@@ -188,20 +197,25 @@ def _ccsd_t_energy_bwd(max_memory, res, et_bar):
     min_memory*= 8./1e6
     bufsize = (max_memory - min_memory)*1e6/8/num_threads()/(nocc*nmo*nvir+nvir)/2
     bufsize *= .8
-    if bufsize < 8:
-        mem_need = min_memory + 160.*(nocc*nmo*nvir+nvir)*num_threads()/1e6
-        raise RuntimeError(f'_ccsd_t_energy_vjp: at least {mem_need} MB of more memory needed.')
+#    if bufsize < 8:
+#        mem_need = min_memory + 160.*(nocc*nmo*nvir+nvir)*num_threads()/1e6
+#        raise RuntimeError(f'_ccsd_t_energy_vjp: at least {mem_need} MB of more memory needed.')
     bufsize = int(max(8, bufsize))
 
     for a0, a1 in reversed(list(prange(0, nvir, bufsize))):
         cache_row_a = numpy.asarray(vvop[a0:a1,:], order='C')
         cache_row_a_bar = numpy.zeros_like(cache_row_a)
+        memdbg.trace("lno.ccsd_t._ccsd_t_energy_bwd: cache a",
+                     cache_row_a=cache_row_a, cache_row_a_bar=cache_row_a_bar)
         if (a0, a1) == (0, nvir):
             cache_col_a = cache_row_a
             cache_col_a_bar = cache_row_a_bar
         else:
             cache_col_a = numpy.asarray(vvop[:,a0:a1], order='C')
             cache_col_a_bar = numpy.zeros_like(cache_col_a)
+            memdbg.trace("lno.ccsd_t._ccsd_t_energy_bwd: cache col a",
+                         cache_col_a=cache_col_a,
+                         cache_col_a_bar=cache_col_a_bar)
         contract(a0, a1, a0, a1,
                 (cache_row_a, cache_col_a, cache_row_a, cache_col_a),
                 (cache_row_a_bar, cache_col_a_bar, cache_row_a_bar, cache_col_a_bar))

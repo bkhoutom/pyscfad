@@ -26,6 +26,7 @@ from pyscfad import lib
 from pyscfad.cc import dfccsd, dfdcsd
 from pyscfad.df import addons as df_addons
 from pyscfad.ops import is_array
+from pyscfad.tools import memory_debug as memdbg
 from pyscfad.lno import lno_base
 from pyscfad.lno import ccsd_t as ccsd_t_mod
 
@@ -62,6 +63,8 @@ def _make_df_eris_incore(cc, mo_coeff=None, fockao=None):
     nocc = eris.nocc
     nmo = eris.fock.shape[0]
     nvir = nmo - nocc
+    memdbg.trace("lno.ccsd._make_df_eris_incore: common_init",
+                 mo_coeff=eris.mo_coeff, fock=eris.fock)
 
     mo = np.asarray(eris.mo_coeff)
     ijslice = (0, nmo, 0, nmo)
@@ -69,21 +72,37 @@ def _make_df_eris_incore(cc, mo_coeff=None, fockao=None):
     Lpq = lno_base.transform_df_to_mo(
         cc._scf, mo, ijslice, aosym='s2', mosym='s1', atmlst=atmlst
     ).reshape(-1, nmo, nmo)
+    memdbg.trace("lno.ccsd._make_df_eris_incore: Lpq",
+                 Lpq=Lpq, mo=mo)
     naux = Lpq.shape[0]
     Loo = Lpq[:,:nocc,:nocc].reshape(naux,-1)
     Lov = Lpq[:,:nocc,nocc:].reshape(naux,-1)
+    memdbg.trace("lno.ccsd._make_df_eris_incore: Loo/Lov views",
+                 Loo=Loo, Lov=Lov)
     eris.Lvv = Lvv = lib.pack_tril(Lpq[:,nocc:,nocc:])
+    memdbg.trace("lno.ccsd._make_df_eris_incore: Lvv", Lvv=Lvv)
 
     eris.oooo = np.dot(Loo.T, Loo).reshape(nocc,nocc,nocc,nocc)
+    memdbg.trace("lno.ccsd._make_df_eris_incore: oooo", oooo=eris.oooo)
     eris.ovoo = np.dot(Lov.T, Loo).reshape(nocc,nvir,nocc,nocc)
+    memdbg.trace("lno.ccsd._make_df_eris_incore: ovoo", ovoo=eris.ovoo)
     ovov = np.dot(Lov.T, Lov).reshape(nocc,nvir,nocc,nvir)
     eris.ovov = ovov
     eris.ovvo = ovov.transpose(0,1,3,2)
+    memdbg.trace("lno.ccsd._make_df_eris_incore: ovov/ovvo",
+                 ovov=eris.ovov, ovvo=eris.ovvo)
 
     oovv = np.dot(Loo.T, Lvv)
     eris.oovv = lib.unpack_tril(oovv).reshape(nocc,nocc,nvir,nvir)
+    memdbg.trace("lno.ccsd._make_df_eris_incore: oovv",
+                 oovv=eris.oovv)
     eris.ovvv = np.dot(Lov.T, Lvv).reshape(nocc,nvir,-1)
+    memdbg.trace("lno.ccsd._make_df_eris_incore: ovvv",
+                 ovvv=eris.ovvv)
     Loo = Lov = Lpq = None
+    memdbg.trace("lno.ccsd._make_df_eris_incore: done",
+                 Lvv=eris.Lvv, oooo=eris.oooo, ovoo=eris.ovoo,
+                 ovov=eris.ovov, oovv=eris.oovv, ovvv=eris.ovvv)
     return eris
 
 
@@ -141,14 +160,24 @@ def impurity_solve(mf, mo_coeff, lo_coeff, eris=None, frozen=None,
         mcc = RCCSD(mf, mo_coeff=mo_coeff, frozen=frozen)
     mcc._domain_atmlst = None if frag_prescreen is None else frag_prescreen.get('extended_primary_domain')
     mcc.e_hf = mf.e_tot  #avoid MP2 recompute e_hf
+    memdbg.trace("lno.ccsd.impurity_solve: before ao2mo",
+                 mo_coeff=mo_coeff, lo_coeff=lo_coeff)
     imp_eris = mcc.ao2mo(fockao=eris.fock)
+    memdbg.trace("lno.ccsd.impurity_solve: after ao2mo",
+                 ovov=imp_eris.ovov, oovv=imp_eris.oovv, ovvv=imp_eris.ovvv)
 
     # MP2 fragment energy
     t1, t2 = mcc.init_amps(eris=imp_eris)[1:]
+    memdbg.trace("lno.ccsd.impurity_solve: after init_amps",
+                 t1=t1, t2=t2)
     elcorr_pt2 = mp2_fragment_energy(imp_eris, t2, prjlo)
 
     # CCSD fragment energy
+    memdbg.trace("lno.ccsd.impurity_solve: before CCSD kernel",
+                 t1=t1, t2=t2)
     t1, t2 = mcc.kernel(eris=imp_eris, t1=t1, t2=t2)[1:]
+    memdbg.trace("lno.ccsd.impurity_solve: after CCSD kernel",
+                 t1=t1, t2=t2)
     elcorr_cc = ccsd_fragment_energy(imp_eris, t1, t2, prjlo)
 
     if ccsd_t and not dcsd:
@@ -159,7 +188,10 @@ def impurity_solve(mf, mo_coeff, lo_coeff, eris=None, frozen=None,
         #    mcc, imp_eris, prjlo, t1=t1, t2=t2, verbose=verbose_imp)
         #from pyscfad.cc import gccsd_t
         #elcorr_cc_t = gccsd_t.kernel(mcc, prjlo, t1=t1, t2=t2)
+        memdbg.trace("lno.ccsd.impurity_solve: before CCSD(T)",
+                     t1=t1, t2=t2, ovvv=imp_eris.ovvv)
         elcorr_cc_t = ccsd_t_mod.kernel(mcc, imp_eris, prjlo, t1=t1, t2=t2, verbose=verbose_imp)
+        memdbg.trace("lno.ccsd.impurity_solve: after CCSD(T)")
     else:
         elcorr_cc_t = 0.
 

@@ -24,6 +24,7 @@ from pyscfad.lib import logger
 #from pyscfad.ops import jit
 from pyscfad import config
 from pyscfad.implicit_diff import make_implicit_diff
+from pyscfad.tools import memory_debug as memdbg
 from pyscfad.tools.linear_solver import gen_gmres
 
 # attributes explicitly appearing in :fun:`update_amps` are dynamic
@@ -121,10 +122,13 @@ def update_amps(mycc, t1, t2, eris):
     fock = eris.fock
     mo_e_o = eris.mo_energy[:nocc]
     mo_e_v = eris.mo_energy[nocc:] + mycc.level_shift
+    memdbg.trace("cc.ccsd.update_amps: start",
+                 t1=t1, t2=t2, ovov=eris.ovov, ovvv=eris.ovvv)
 
     t1new = np.zeros_like(t1)
     t2new = mycc._add_vvvv(t1, t2, eris, t2sym='jiba')
     t2new *= .5  # *.5 because t2+t2.transpose(1,0,3,2) in the end
+    memdbg.trace("cc.ccsd.update_amps: after _add_vvvv", t2new=t2new)
 
 #** make_inter_F
     fov = fock[:nocc,nocc:].copy()
@@ -140,9 +144,12 @@ def update_amps(mycc, t1, t2, eris):
     eris_vovv = eris.ovvv.transpose(1,0,2)
     # pylint: disable=invalid-unary-operand-type
     wooVV = -np.dot(t1, eris_vovv.reshape(nvir,-1))
+    memdbg.trace("cc.ccsd.update_amps: after wooVV", wooVV=wooVV)
 
     eris_vovv = lib.unpack_tril(eris_vovv.reshape(nvir*nocc,nvir_pair))
     eris_vovv = eris_vovv.reshape(nvir,nocc,nvir,nvir)
+    memdbg.trace("cc.ccsd.update_amps: after unpack ovvv",
+                 eris_vovv=eris_vovv)
 
     fvv += 2*np.einsum('kc,ckab->ab', t1, eris_vovv)
     fvv -= np.einsum('kc,bkca->ab', t1, eris_vovv)
@@ -154,6 +161,7 @@ def update_amps(mycc, t1, t2, eris):
         t2new -= np.einsum('ka,ijbk->ijab', t1, tmp)
 
     wVOov = np.einsum('biac,jc->bija', eris_vovv, t1)
+    memdbg.trace("cc.ccsd.update_amps: after wVOov", wVOov=wVOov)
 
     theta = t2.transpose(1,2,0,3) * 2
     theta -= t2.transpose(0,2,1,3)
@@ -161,9 +169,11 @@ def update_amps(mycc, t1, t2, eris):
 
     wooVV = lib.unpack_tril(wooVV.reshape(nocc**2,nvir_pair))
     wVooV = wooVV.reshape(nocc,nocc,nvir,nvir).transpose(2,1,0,3)
+    memdbg.trace("cc.ccsd.update_amps: after wVooV", wVooV=wVooV)
     # end _add_ovvv_
 
     woooo = np.asarray(eris.oooo).transpose(0,2,1,3).copy()
+    memdbg.trace("cc.ccsd.update_amps: after woooo", woooo=woooo)
 
     eris_ovoo = eris.ovoo
     eris_oovv = eris.oovv
@@ -222,6 +232,8 @@ def update_amps(mycc, t1, t2, eris):
     t2new += tmp.transpose(2,0,1,3)
     tmp *= .5
     t2new += tmp.transpose(0,2,1,3)
+    memdbg.trace("cc.ccsd.update_amps: after wVooV contractions",
+                 t2new=t2new, tmp=tmp)
 
     wVOov += eris_voov
     eris_VOov = -.5 * eris_voov.transpose(0,2,1,3)
@@ -239,6 +251,8 @@ def update_amps(mycc, t1, t2, eris):
     theta  = t2 * 2
     theta -= t2.transpose(1,0,2,3)
     t2new += np.einsum('kica,ckjb->ijab', theta, wVOov)
+    memdbg.trace("cc.ccsd.update_amps: after wVOov contraction",
+                 t2new=t2new, wVOov=wVOov)
 
     theta = t2.transpose(1,0,2,3) * 2 - t2
     t1new += np.einsum('jb,ijba->ia', fov, theta)
@@ -267,6 +281,7 @@ def update_amps(mycc, t1, t2, eris):
     t1new /= eia
     t2new /= eijab
     eia = eijab = None
+    memdbg.trace("cc.ccsd.update_amps: done", t1new=t1new, t2new=t2new)
     return t1new, t2new
 
 

@@ -29,6 +29,7 @@ from pyscfad.ops import is_array
 from pyscfad import scipy
 from pyscfad import df as df_mod
 from pyscfad.tools import timer
+from pyscfad.tools import memory_debug as memdbg
 from pyscfad.ao2mo import _ao2mo
 from pyscfad.df import addons as df_addons
 from pyscfad.df import incore as df_incore
@@ -1808,9 +1809,15 @@ def _outcore_local_nr_e2_from_global_cderi(mol, auxmol, mo_coeff, cderi_source,
     if aosym not in ('s2', 's2ij'):
         raise NotImplementedError
     pair_idx = numpy.asarray(pair_idx, dtype=numpy.int64)
+    memdbg.trace("lno.transform_df_to_mo local: before cderi slice",
+                 mo_coeff=mo_coeff, pair_idx=pair_idx)
     with df_addons.load(cderi_source, 'j3c') as eri1:
         cderi = numpy.asarray(eri1[:, pair_idx])
-    return _ao2mo.nr_e2(cderi, mo_coeff, orbs_slice, aosym='s2')
+    memdbg.trace("lno.transform_df_to_mo local: after cderi slice",
+                 cderi=cderi, mo_coeff=mo_coeff)
+    out = _ao2mo.nr_e2(cderi, mo_coeff, orbs_slice, aosym='s2')
+    memdbg.trace("lno.transform_df_to_mo local: after nr_e2", out=out)
+    return out
 
 
 def _outcore_local_nr_e2_from_global_cderi_fwd(mol, auxmol, mo_coeff,
@@ -1881,10 +1888,16 @@ _outcore_local_nr_e2_from_global_cderi.defvjp(
 def _outcore_nr_e2(mol, auxmol, mo_coeff, cderi_source, max_memory,
                    orbs_slice, aosym):
     del mol, auxmol, max_memory
+    memdbg.trace("lno.transform_df_to_mo global: before cderi load",
+                 mo_coeff=mo_coeff)
     with df_addons.load(cderi_source, 'j3c') as eri1:
         if not is_array(eri1):
             eri1 = numpy.asarray(eri1)
-        return _ao2mo.nr_e2(eri1, mo_coeff, orbs_slice, aosym=aosym)
+        memdbg.trace("lno.transform_df_to_mo global: after cderi load",
+                     cderi=eri1, mo_coeff=mo_coeff)
+        out = _ao2mo.nr_e2(eri1, mo_coeff, orbs_slice, aosym=aosym)
+        memdbg.trace("lno.transform_df_to_mo global: after nr_e2", out=out)
+        return out
 
 
 def _outcore_nr_e2_fwd(mol, auxmol, mo_coeff, cderi_source, max_memory,
@@ -1978,7 +1991,11 @@ def transform_df_to_mo(mf, mo_coeff, orbs_slice, aosym='s2', mosym='s1', atmlst=
     with df_addons.load(cderi, 'j3c') as eri1:
         if not is_array(eri1):
             eri1 = numpy.asarray(eri1)
-        return _ao2mo.nr_e2(eri1, mo_coeff, orbs_slice, aosym=aosym, mosym=mosym)
+        memdbg.trace("lno.transform_df_to_mo loaded: before nr_e2",
+                     cderi=eri1, mo_coeff=mo_coeff)
+        out = _ao2mo.nr_e2(eri1, mo_coeff, orbs_slice, aosym=aosym, mosym=mosym)
+        memdbg.trace("lno.transform_df_to_mo loaded: after nr_e2", out=out)
+        return out
 
 def make_fragment_eris(mfcc, eris, frag_prescreen):
     atmlst = None if frag_prescreen is None else frag_prescreen.get('extended_primary_domain')

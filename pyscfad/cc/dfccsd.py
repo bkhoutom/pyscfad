@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from pyscf.lib import square_mat_in_trilu_indices
+import numpy as onp
 import jax
 from jax import custom_vjp
 from jax.interpreters import ad as jax_ad
@@ -65,14 +65,19 @@ def _contract_vvvv_t2(mycc, mol, Lvv, t2, out=None, verbose=None):
     '''Ht2 = numpy.einsum('ijcd,acbd->ijab', t2, vvvv)
     '''
     nvir = t2.shape[-1]
-    nvir2 = nvir * nvir
-    x2 = t2.reshape(-1, nvir2)
+    x2 = t2.reshape(-1, nvir, nvir)
 
-    tril2sq = square_mat_in_trilu_indices(nvir)
-    tmp = lib.unpack_tril(np.dot(np.transpose(Lvv), Lvv))
-    tmp1 = np.transpose(tmp[tril2sq], (0, 2, 1, 3)).reshape(nvir2,nvir2)
-    Ht2tril = np.dot(x2, tmp1)
-    tril2sq = None
+    itemsize = onp.dtype(t2.dtype).itemsize
+    max_memory = getattr(mycc, 'max_memory', 0) or 0
+    target_mb = min(64.0, max(8.0, max_memory * 0.05)) if max_memory > 0 else 64.0
+    blksize = int(target_mb * 1e6 / max(1, x2.shape[0] * nvir**2 * itemsize))
+    blksize = max(1, min(Lvv.shape[0], blksize))
+
+    Ht2tril = np.zeros_like(x2)
+    for p0 in range(0, Lvv.shape[0], blksize):
+        L = lib.unpack_tril(Lvv[p0:p0+blksize])
+        tmp = np.einsum('xcd,pac->pxad', x2, L)
+        Ht2tril += np.einsum('pxad,pbd->xab', tmp, L)
     return Ht2tril.reshape(t2.shape)
 
 class _ChemistsERIs(ccsd._ChemistsERIs):

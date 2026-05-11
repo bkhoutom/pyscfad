@@ -475,12 +475,9 @@ def rank_fragment_indices(nfrag):
 
 def filter_dlno_data_for_rank(dlno_data, frag_lolist):
     local_indices = rank_fragment_indices(len(frag_lolist))
-    local_data = dict(dlno_data)
-    local_data["frag_lolist"] = [frag_lolist[i] for i in local_indices]
-    local_data["fragment_data"] = [
-        dlno_data["fragment_data"][i] for i in local_indices
-    ]
-    return local_data
+    return {
+        "fragment_data": [dlno_data["fragment_data"][i] for i in local_indices],
+    }
 
 
 def make_cc_solver(mf, frozen, settings: CalculationSettings, *, s1e=None, fock=None):

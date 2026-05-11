@@ -1665,9 +1665,7 @@ class LNO(pytree.PytreeNode):
             else:
                 s1e = self._scf.get_ovlp()
 
-        coeff_full = np.zeros((self.mol.nao_nr(), coeff.shape[1]), dtype=coeff.dtype)
-        coeff_full = coeff_full.at[ao_idx].set(coeff)
-        u = reduce(np.dot, (orb.T.conj(), s1e, coeff_full))
+        u = reduce(np.dot, (orb.T.conj(), s1e[:, ao_idx], coeff))
 
         eff_thresh = thresh
         if key == 'vir_prescreen_coeff':

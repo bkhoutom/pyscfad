@@ -18,6 +18,14 @@ def _same_atom_domain(atmlst_i, atmlst_j):
         np.asarray(atmlst_j, dtype=np.int32)
     )
 
+
+def _below_multipole_min_center_distance(R):
+    try:
+        return float(np.asarray(R)) < MULTIPOLE_MIN_CENTER_DISTANCE
+    except Exception:  # pragma: no cover - only reached under active tracing
+        return False
+
+
 def pair_energy_multipole(
         mol,
         e_occ,
@@ -61,22 +69,14 @@ def pair_energy_multipole(
         for j in range(i):
             atmlst_j, Rj, mu_bj, e_bj, theta_bj, omega_bj = moments[j]
 
-            # Disabled for timing tests: force same-atom-domain pairs through
-            # the multipole path instead of marking them as strong pairs.
-            # if _same_atom_domain(atmlst_i, atmlst_j):
-            #     e_mp2_pair = e_mp2_pair.at[i, j].set(MULTIPOLE_STRONG_PAIR_VALUE)
-            #     continue
+            if _same_atom_domain(atmlst_i, atmlst_j):
+                e_mp2_pair = e_mp2_pair.at[i, j].set(MULTIPOLE_STRONG_PAIR_VALUE)
+                continue
 
             R = jnp.linalg.norm(Rj - Ri)
-            # Disabled for timing tests: do not promote pairs with nearly
-            # coincident multipole centers to strong pairs.
-            # try:
-            #     near_center = float(np.asarray(R)) < MULTIPOLE_MIN_CENTER_DISTANCE
-            # except Exception:  # pragma: no cover - only reached under active tracing
-            #     near_center = False
-            # if near_center:
-            #     e_mp2_pair = e_mp2_pair.at[i, j].set(MULTIPOLE_STRONG_PAIR_VALUE)
-            #     continue
+            if _below_multipole_min_center_distance(R):
+                e_mp2_pair = e_mp2_pair.at[i, j].set(MULTIPOLE_STRONG_PAIR_VALUE)
+                continue
             R_bar = (Rj - Ri) / R
 
             aibj_2 = mu_ai.T @ mu_bj

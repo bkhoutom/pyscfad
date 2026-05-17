@@ -15,6 +15,7 @@
 '''Impurity solver for LNO CCSD/CCSD(T).
 '''
 
+import os
 import numpy
 from functools import reduce
 
@@ -139,6 +140,12 @@ def impurity_solve(mf, mo_coeff, lo_coeff, eris=None, frozen=None,
         mcc = RDCSD(mf, mo_coeff=mo_coeff, frozen=frozen)
     else:
         mcc = RCCSD(mf, mo_coeff=mo_coeff, frozen=frozen)
+    diis_space = int(os.environ.get('PYSCFAD_LNO_CCSD_DIIS_SPACE', '3'))
+    if diis_space <= 0:
+        mcc.diis = False
+    else:
+        mcc.incore_complete = True
+        mcc.diis_space = diis_space
     mcc._domain_atmlst = None if frag_prescreen is None else frag_prescreen.get('extended_primary_domain')
     mcc.e_hf = mf.e_tot  #avoid MP2 recompute e_hf
     imp_eris = mcc.ao2mo(fockao=eris.fock)

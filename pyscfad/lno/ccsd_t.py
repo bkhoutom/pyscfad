@@ -15,8 +15,9 @@
 '''Impurity (T) correction.
 '''
 
-from functools import partial
 import ctypes
+import os
+from functools import partial
 import numpy
 from jax import custom_vjp
 
@@ -67,6 +68,27 @@ def get_ovvv(ovvv, *slices):
     # pylint: disable=too-many-function-args
     return ovvv.reshape(nocc,nvir,nvir1,nvir1)
 
+def _ovvv_unpack_block_nocc(nvir):
+    try:
+        block_mb = float(os.environ.get('PYSCFAD_LNO_CCSD_T_OVVV_BLOCK_MB', 128.0))
+    except ValueError:
+        block_mb = 128.0
+    bytes_per_occ = max(nvir**3 * numpy.dtype(numpy.float64).itemsize, 1)
+    return max(1, int(block_mb * 1024.0**2 // bytes_per_occ))
+
+def _fill_vvop(vvop, ovov, ovvv, nocc, nvir):
+    vvop[:,:,:,:nocc] = numpy.asarray(ovov).conj().transpose(1,3,0,2)
+
+    block_nocc = _ovvv_unpack_block_nocc(nvir)
+    for i0 in range(0, nocc, block_nocc):
+        i1 = min(i0 + block_nocc, nocc)
+        ovw = numpy.asarray(ovvv[i0:i1])
+        nblk, _, nvir_pair = ovw.shape
+        ovvv_block = unpack_tril(ovw.reshape(nblk*nvir, nvir_pair))
+        ovvv_block = ovvv_block.reshape(nblk, nvir, nvir, nvir)
+        vvop[:,:,i0:i1,nocc:] = ovvv_block.conj().transpose(1,3,0,2)
+        ovw = ovvv_block = None
+
 @partial(custom_vjp, nondiff_argnums=(8,))
 def _ccsd_t_energy(mat, t1T, t2T, mo_energy, fvo,
                    ovoo, ovov, ovvv, max_memory):
@@ -83,8 +105,7 @@ def _ccsd_t_energy(mat, t1T, t2T, mo_energy, fvo,
     vooo = numpy.asarray(vooo, order='C')
 
     vvop = numpy.empty((nvir,nvir,nocc,nmo))
-    vvop[:,:,:,:nocc] = numpy.asarray(ovov).conj().transpose(1,3,0,2)
-    vvop[:,:,:,nocc:] = get_ovvv(ovvv).conj().transpose(1,3,0,2)
+    _fill_vvop(vvop, ovov, ovvv, nocc, nvir)
     vvop = numpy.asarray(vvop, order='C')
 
     drv = libcc.lnoccsdt_contract
@@ -146,8 +167,7 @@ def _ccsd_t_energy_bwd(max_memory, res, et_bar):
     vooo_bar = numpy.zeros_like(vooo)
 
     vvop = numpy.empty((nvir,nvir,nocc,nmo))
-    vvop[:,:,:,:nocc] = numpy.asarray(ovov).conj().transpose(1,3,0,2)
-    vvop[:,:,:,nocc:] = get_ovvv(ovvv).conj().transpose(1,3,0,2)
+    _fill_vvop(vvop, ovov, ovvv, nocc, nvir)
     vvop = numpy.asarray(vvop, order='C')
     vvop_bar = numpy.zeros_like(vvop)
 
@@ -194,12 +214,14 @@ def _ccsd_t_energy_bwd(max_memory, res, et_bar):
     bufsize = int(max(8, bufsize))
 
     for a0, a1 in reversed(list(prange(0, nvir, bufsize))):
+        full_vvop_block = (a0, a1) == (0, nvir)
         cache_row_a = numpy.asarray(vvop[a0:a1,:], order='C')
-        cache_row_a_bar = numpy.zeros_like(cache_row_a)
-        if (a0, a1) == (0, nvir):
+        if full_vvop_block:
+            cache_row_a_bar = vvop_bar
             cache_col_a = cache_row_a
             cache_col_a_bar = cache_row_a_bar
         else:
+            cache_row_a_bar = numpy.zeros_like(cache_row_a)
             cache_col_a = numpy.asarray(vvop[:,a0:a1], order='C')
             cache_col_a_bar = numpy.zeros_like(cache_col_a)
         contract(a0, a1, a0, a1,
@@ -218,8 +240,8 @@ def _ccsd_t_energy_bwd(max_memory, res, et_bar):
             vvop_bar[b0:b1,:] += cache_row_b_bar
             vvop_bar[:,b0:b1] += cache_col_b_bar
 
-        vvop_bar[a0:a1,:] += cache_row_a_bar
-        if (a0, a1) != (0, nvir):
+        if not full_vvop_block:
+            vvop_bar[a0:a1,:] += cache_row_a_bar
             vvop_bar[:,a0:a1] += cache_col_a_bar
 
     ovoo_bar = numpy.asarray(vooo_bar.transpose(1,0,3,2))

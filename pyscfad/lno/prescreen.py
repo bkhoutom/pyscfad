@@ -4,7 +4,9 @@ This module provides `build_dlno_prescreen_data` and helper I/O wrappers
 that try to use the local `pyscfad.dlno` implementation when available,
 falling back to an externally installed `dlno` package.
 """
+from contextlib import contextmanager
 from functools import reduce
+import time
 import numpy as onp
 import numpy as np
 import jax.numpy as jnp
@@ -29,6 +31,15 @@ except Exception:
     from dlno import mp2 as dlno_mp2
     from dlno import pao as dlno_pao
     from dlno import util as dlno_util
+
+
+@contextmanager
+def _topology_profile_section(rows, name):
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        rows.append({'section': name, 'wall_s': time.perf_counter() - start})
 
 
 def union_objects(obj_list):
@@ -75,6 +86,211 @@ def _semicanonicalize_local(mol, mos, fock, atmlst):
         return jnp.asarray(f).reshape(-1), mos
     w, v = scipy.linalg.eigh(f)
     return w, mos @ v
+
+
+def _fake_multipole_mol(mol, atmlst):
+    return dlno_util.fake_mol_by_atom(mol, atmlst)
+
+
+def _dipole_op_numpy(mol, atmlst=None):
+    fake_mol = _fake_multipole_mol(mol, atmlst)
+    nao = fake_mol.nao
+    return onp.asarray(fake_mol.intor('int1e_r')).reshape(3, nao, nao)
+
+
+def _quadrupole_op_numpy(mol, R, atmlst=None):
+    fake_mol = _fake_multipole_mol(mol, atmlst)
+    nao = fake_mol.nao
+    with fake_mol.with_common_origin(onp.asarray(R)):
+        rr = onp.asarray(fake_mol.intor('int1e_rr')).reshape(3, 3, nao, nao)
+
+    r2 = onp.trace(rr)
+    rr *= 3.0
+    for x in range(3):
+        rr[x, x] -= r2
+    rr *= 0.5
+    return rr
+
+
+def _octupole_op_numpy(mol, R, atmlst=None):
+    fake_mol = _fake_multipole_mol(mol, atmlst)
+    nao = fake_mol.nao
+    with fake_mol.with_common_origin(onp.asarray(R)):
+        rrr = onp.asarray(fake_mol.intor('int1e_rrr')).reshape(3, 3, 3,
+                                                               nao, nao)
+
+    r2r_0 = onp.trace(rrr, axis1=1, axis2=2)
+    r2r_1 = onp.trace(rrr, axis1=2, axis2=0)
+    r2r_2 = onp.trace(rrr, axis1=0, axis2=1)
+
+    rrr *= 5.0
+    for x in range(3):
+        rrr[:, x, x] -= r2r_0
+        rrr[x, :, x] -= r2r_1
+        rrr[x, x, :] -= r2r_2
+    rrr *= 0.5
+    return rrr
+
+
+def _multipole_expectation_numpy(op, lmo):
+    op = onp.asarray(op)
+    lmo = onp.asarray(lmo).reshape(-1)
+    op_lmo = op.reshape(-1, lmo.size, lmo.size) @ lmo
+    return op_lmo @ lmo.conj()
+
+
+def _multipole_transition_numpy(op, lmo, pao):
+    op = onp.asarray(op)
+    lmo = onp.asarray(lmo).reshape(-1)
+    pao = onp.asarray(pao)
+    op_lmo = op.reshape(-1, lmo.size, lmo.size) @ lmo
+    return (op_lmo @ pao.conj()).reshape(*op.shape[:-2], pao.shape[1])
+
+
+def _multipole_pair_data_numpy(mol, lmo, pao, e_occ, e_vir, atmlst, order):
+    lmo = onp.asarray(lmo).reshape(-1)
+    pao = onp.asarray(pao)
+    e_occ = float(onp.asarray(e_occ).reshape(()))
+    e_vir = onp.asarray(e_vir)
+
+    Di = _dipole_op_numpy(mol, atmlst=atmlst)
+    Ri = _multipole_expectation_numpy(Di, lmo)
+    mu_i = _multipole_transition_numpy(Di, lmo, pao)
+
+    theta_i = None
+    theta_i_flat = None
+    if order > 2:
+        Qi = _quadrupole_op_numpy(mol, Ri, atmlst=atmlst)
+        theta_i = _multipole_transition_numpy(Qi, lmo, pao)
+        theta_i_flat = theta_i.reshape(9, -1)
+
+    omega_i = None
+    omega_i_flat = None
+    if order > 3:
+        Oi = _octupole_op_numpy(mol, Ri, atmlst=atmlst)
+        omega_i = _multipole_transition_numpy(Oi, lmo, pao)
+        omega_i_flat = omega_i.reshape(27, -1)
+
+    return {
+        'R': Ri,
+        'mu': mu_i,
+        'theta': theta_i,
+        'theta_flat': theta_i_flat,
+        'omega': omega_i,
+        'omega_flat': omega_i_flat,
+        'e': e_vir - e_occ,
+    }
+
+
+def _precompute_multipole_pair_data_numpy(mol, occ, vir, e_occ, e_vir,
+                                          atmlst, order):
+    return [
+        _multipole_pair_data_numpy(mol, lmo_i, pao_i, eo_i, ev_i, atmlst_i, order)
+        for lmo_i, pao_i, eo_i, ev_i, atmlst_i
+        in zip(occ, vir, e_occ, e_vir, atmlst)
+    ]
+
+
+def _pair_energy_from_multipole_data_numpy(pair_data, order):
+    nocc = len(pair_data)
+    pair_energy = onp.zeros((nocc, nocc), dtype=onp.float64)
+
+    for i in range(nocc):
+        data_i = pair_data[i]
+        Ri = data_i['R']
+        mu_ai = data_i['mu']
+        e_ai = data_i['e']
+        theta_ai = data_i['theta']
+        theta_ai_flat = data_i['theta_flat']
+        omega_ai = data_i['omega']
+        omega_ai_flat = data_i['omega_flat']
+
+        for j in range(i):
+            data_j = pair_data[j]
+            Rj = data_j['R']
+            R = onp.linalg.norm(Rj - Ri)
+            R_bar = (Rj - Ri) / R
+
+            mu_bj = data_j['mu']
+
+            aibj_2 = mu_ai.T @ mu_bj
+            tmp_ai = R_bar @ mu_ai
+            tmp_bj = R_bar @ mu_bj
+            aibj_2 -= onp.outer(tmp_ai, tmp_bj * 3.0)
+            aibj_2 /= R**3
+
+            aibj = aibj_2
+
+            if order > 2:
+                theta_bj = data_j['theta']
+                theta_bj_flat = data_j['theta_flat']
+                RR = onp.outer(R_bar, R_bar)
+
+                tmp1_ai = RR.ravel() @ theta_ai_flat
+                tmp1_bj = RR.ravel() @ theta_bj_flat
+                aibj_3 = onp.outer(tmp1_ai, tmp_bj * 5.0)
+                aibj_3 -= onp.outer(tmp_ai, tmp1_bj * 5.0)
+
+                mu_R_ai = (mu_ai[:, None, :] * R_bar[None, :, None]).reshape(9, -1)
+                mu_R_bj = (mu_bj[:, None, :] * R_bar[None, :, None]).reshape(9, -1)
+                aibj_3 += (2.0 * mu_R_ai.T) @ theta_bj_flat
+                aibj_3 -= theta_ai_flat.T @ (mu_R_bj * 2.0)
+                aibj_3 /= R**4
+                aibj = aibj + aibj_3
+
+            if order > 3:
+                omega_bj = data_j['omega']
+                omega_bj_flat = data_j['omega_flat']
+                RR = onp.outer(R_bar, R_bar)
+                RRR = (
+                    R_bar[:, None, None]
+                    * R_bar[None, :, None]
+                    * R_bar[None, None, :]
+                )
+
+                RR9 = RR * 9.0
+                omega_RR_bj = onp.tensordot(omega_bj, RR9, axes=([1, 2], [0, 1]))
+                omega_RR_ai = onp.tensordot(RR9, omega_ai, axes=([0, 1], [0, 1]))
+                aibj_4 = mu_ai.T @ omega_RR_bj
+                aibj_4 += omega_RR_ai.T @ mu_bj
+
+                omega_R3_ai = RRR.ravel() @ omega_ai_flat
+                omega_R3_bj = RRR.ravel() @ omega_bj_flat
+                aibj_4 -= onp.outer(tmp_ai, omega_R3_bj * 21.0)
+                aibj_4 -= onp.outer(omega_R3_ai, tmp_bj * 21.0)
+                aibj_4 += onp.outer(tmp1_ai, tmp1_bj * 35.0)
+
+                tmp2_ai = onp.tensordot(theta_ai, R_bar, axes=([1], [0]))
+                tmp2_bj = onp.tensordot(theta_bj, R_bar, axes=([1], [0]))
+                aibj_4 -= tmp2_ai.T @ (tmp2_bj * 20.0)
+                aibj_4 += theta_ai_flat.T @ (theta_bj_flat * 2.0)
+                aibj_4 /= 3.0 * R**5
+                aibj = aibj + aibj_4
+
+            e_bj = data_j['e']
+            aibj2 = aibj * aibj / (e_ai[:, None] + e_bj[None, :])
+            pair_energy[i, j] = -8.0 * onp.sum(aibj2)
+
+    return pair_energy + pair_energy.T
+
+
+def _pair_energy_multipole_numpy(mol, e_occ, mo_occ, e_vir, mo_vir,
+                                 atmlst=None, order=4):
+    """Static NumPy version of the DLNO multipole pair screen."""
+    nocc = len(e_occ)
+    if atmlst is None:
+        atmlst = [None] * nocc
+
+    try:
+        pair_data = _precompute_multipole_pair_data_numpy(
+            mol, mo_occ, mo_vir, e_occ, e_vir, atmlst, order
+        )
+    except Exception:
+        return dlno_mp2.pair_energy_multipole(
+            mol, e_occ, mo_occ, e_vir, mo_vir, atmlst, order
+        )
+
+    return _pair_energy_from_multipole_data_numpy(pair_data, order)
 
 
 def _loop_ov_blocks(mymp, mo_coeff, nocc):
@@ -196,10 +412,7 @@ def _lo_pair_energy_matrix_multipole(
     if fock is None:
         fock = mf.get_fock()
 
-    e_occ = []
-    v_occ = []
-    e_vir = []
-    v_vir = []
+    pair_data = []
     for i in range(lo_coeff.shape[1]):
         lo_i = lo_coeff[:, i:i+1]
         pao_i = dlno_pao.pao_overlap_with_domain(
@@ -219,22 +432,21 @@ def _lo_pair_energy_matrix_multipole(
             s1e,
             pao_bp_domain_thr,
         )
-        e_occ.append(eo_i[0])
-        v_occ.append(vo_i)
-        e_vir.append(ev_i)
-        v_vir.append(vv_i)
+        pair_data.append(
+            _multipole_pair_data_numpy(
+                mol,
+                vo_i,
+                vv_i,
+                eo_i[0],
+                ev_i,
+                lmo_primary_domain[i],
+                multipole_order,
+            )
+        )
 
-    pair_lo = dlno_mp2.pair_energy_multipole(
-        mol,
-        e_occ,
-        v_occ,
-        e_vir,
-        v_vir,
-        lmo_primary_domain,
-        multipole_order,
-    )
+    pair_lo = _pair_energy_from_multipole_data_numpy(pair_data, multipole_order)
     pair_lo = 0.5 * (pair_lo + pair_lo.T.conj())
-    return jnp.asarray(pair_lo.real)
+    return onp.asarray(pair_lo.real)
 
 
 def _build_lo_indexed_prescreen_data(
@@ -250,111 +462,120 @@ def _build_lo_indexed_prescreen_data(
     pao_norm_thr=1e-4,
     multipole_order=4,
 ):
+    profile_rows = []
     mol = mf.mol
-    s1e = mol.intor_symmetric('int1e_ovlp')
-    fock = mf.get_fock()
+    with _topology_profile_section(profile_rows, 'overlap/fock'):
+        s1e = mol.intor_symmetric('int1e_ovlp')
+        fock = mf.get_fock()
 
     lmo_bp_domain = get_bp_domain = None
     # Treat domain topology as fixed metadata. The selected prescreen spaces
     # inside those domains remain the only objects consumed downstream.
-    lmo_bp_domain = dlno_mod.get_bp_domain(mol, lo_coeff, s1e, lmo_bp_domain_thr) if hasattr(dlno_mod, 'get_bp_domain') else None
-    if lmo_bp_domain is None:
-        from pyscfad.dlno.domain import get_bp_domain as _get_bp_domain
-        lmo_bp_domain = _get_bp_domain(mol, lo_coeff, s1e, lmo_bp_domain_thr)
-    pao, ao2pao_map = _pao_space(mf, frozen=frozen, s1e=s1e, norm_thr=pao_norm_thr)
+    with _topology_profile_section(profile_rows, 'LMO BP domains'):
+        lmo_bp_domain = dlno_mod.get_bp_domain(mol, lo_coeff, s1e, lmo_bp_domain_thr) if hasattr(dlno_mod, 'get_bp_domain') else None
+        if lmo_bp_domain is None:
+            from pyscfad.dlno.domain import get_bp_domain as _get_bp_domain
+            lmo_bp_domain = _get_bp_domain(mol, lo_coeff, s1e, lmo_bp_domain_thr)
+    with _topology_profile_section(profile_rows, 'PAO build'):
+        pao, ao2pao_map = _pao_space(mf, frozen=frozen, s1e=s1e, norm_thr=pao_norm_thr)
     from pyscfad.dlno.domain import get_bp_domain as _get_bp_domain, get_primary_domain as _get_primary_domain
-    pao_bp_domain = _get_bp_domain(mol, pao, s1e, pao_bp_domain_thr)
-    lmo_primary_domain = _get_primary_domain(mol, lmo_bp_domain, pao_bp_domain, ao2pao_map)
+    with _topology_profile_section(profile_rows, 'PAO BP domains'):
+        pao_bp_domain = _get_bp_domain(mol, pao, s1e, pao_bp_domain_thr)
+    with _topology_profile_section(profile_rows, 'primary domains'):
+        lmo_primary_domain = _get_primary_domain(mol, lmo_bp_domain, pao_bp_domain, ao2pao_map)
 
-    if pair_energy_model == 'exact':
-        pair_energy = _lo_pair_energy_matrix(mf, lo_coeff, frozen=frozen, s1e=s1e)
-    elif pair_energy_model == 'multipole':
-        pair_energy = _lo_pair_energy_matrix_multipole(
-            mf,
-            lo_coeff,
-            lmo_bp_domain,
-            lmo_primary_domain,
-            pao,
-            ao2pao_map,
-            s1e=s1e,
-            fock=fock,
-            domain_pao_thr=domain_pao_thr,
-            pao_bp_domain_thr=pao_bp_domain_thr,
-            multipole_order=multipole_order,
-        )
-    else:
-        raise ValueError(f'Unknown pair_energy_model: {pair_energy_model}')
+    with _topology_profile_section(profile_rows, f'{pair_energy_model} pair energies'):
+        if pair_energy_model == 'exact':
+            pair_energy = _lo_pair_energy_matrix(mf, lo_coeff, frozen=frozen, s1e=s1e)
+        elif pair_energy_model == 'multipole':
+            pair_energy = _lo_pair_energy_matrix_multipole(
+                mf,
+                lo_coeff,
+                lmo_bp_domain,
+                lmo_primary_domain,
+                pao,
+                ao2pao_map,
+                s1e=s1e,
+                fock=fock,
+                domain_pao_thr=domain_pao_thr,
+                pao_bp_domain_thr=pao_bp_domain_thr,
+                multipole_order=multipole_order,
+            )
+        else:
+            raise ValueError(f'Unknown pair_energy_model: {pair_energy_model}')
 
-    strong_pairs = strong_pair_lists(pair_energy, pair_energy_thr)
-    extended_bp_domain = [
-        union_objects([lmo_bp_domain[j] for j in idx]) for idx in strong_pairs
-    ]
-    extended_primary_domain = [
-        union_objects([lmo_primary_domain[j] for j in idx]) for idx in strong_pairs
-    ]
+    with _topology_profile_section(profile_rows, 'strong-pair domains'):
+        strong_pairs = strong_pair_lists(pair_energy, pair_energy_thr)
+        extended_bp_domain = [
+            union_objects([lmo_bp_domain[j] for j in idx]) for idx in strong_pairs
+        ]
+        extended_primary_domain = [
+            union_objects([lmo_primary_domain[j] for j in idx]) for idx in strong_pairs
+        ]
 
     fragment_data = []
-    for ifrag, loidx in enumerate(frag_lolist):
-        loidx = np.asarray(loidx, dtype=np.int32)
-        frag_strong = union_objects([strong_pairs[i] for i in loidx])
-        frag_ext_bp = union_objects([extended_bp_domain[i] for i in loidx])
-        frag_ext_primary = union_objects([extended_primary_domain[i] for i in loidx])
+    with _topology_profile_section(profile_rows, 'fragment prescreen spaces'):
+        for ifrag, loidx in enumerate(frag_lolist):
+            loidx = np.asarray(loidx, dtype=np.int32)
+            frag_strong = union_objects([strong_pairs[i] for i in loidx])
+            frag_ext_bp = union_objects([extended_bp_domain[i] for i in loidx])
+            frag_ext_primary = union_objects([extended_primary_domain[i] for i in loidx])
 
-        ao_idx = dlno_util.ao_index_by_atom(mol, frag_ext_primary)
-        s21 = s1e[ao_idx]
-        s22 = s1e[np.ix_(ao_idx, ao_idx)]
+            ao_idx = dlno_util.ao_index_by_atom(mol, frag_ext_primary)
+            s21 = s1e[ao_idx]
+            s22 = s1e[np.ix_(ao_idx, ao_idx)]
 
-        lmo_block = lo_coeff[:, frag_strong]
-        lmo_block_prj = dlno_util.project_mo(lmo_block, s21, s22)
-        lmo_block_prj = vec_lowdin(lmo_block_prj, s=s22)
-        e_occ_prescreen, occ_prescreen = _semicanonicalize_local(
-            mol, lmo_block_prj, fock, frag_ext_primary
-        )
-
-        frag_pao = dlno_pao.pao_overlap_with_domain(
-            mol,
-            pao,
-            list(frag_ext_bp),
-            ao2pao_map=ao2pao_map,
-            s1e=s1e,
-            ovlp_thr=domain_pao_thr,
-        )
-        if frag_pao.shape[1] > 0:
-            av = dlno_mod._compute_av(mol, frag_pao, s1e=s1e, atmlst=frag_ext_primary)
-            frag_pao = frag_pao[:, av > pao_bp_domain_thr]
-        if frag_pao.shape[1] > 0:
-            frag_pao_prj = dlno_util.project_mo(frag_pao, s21, s22)
-            frag_pao_prj = dlno_util.orthogonalize(occ_prescreen, frag_pao_prj, s22)
-            frag_pao_prj = lno_base.orthonormalize_metric_colspace_smooth(
-                frag_pao_prj, s22, thresh=1e-10
+            lmo_block = lo_coeff[:, frag_strong]
+            lmo_block_prj = dlno_util.project_mo(lmo_block, s21, s22)
+            lmo_block_prj = vec_lowdin(lmo_block_prj, s=s22)
+            e_occ_prescreen, occ_prescreen = _semicanonicalize_local(
+                mol, lmo_block_prj, fock, frag_ext_primary
             )
-            # The downstream DLNO path only consumes the virtual prescreen span.
-            # Keeping these coefficients in a fixed-gauge orthonormal basis avoids
-            # introducing an extra semicanonical rotation whose derivative can
-            # become disproportionately large in near-degenerate local spaces.
-            vir_prescreen = frag_pao_prj
-            if vir_prescreen.shape[1] > 0:
-                fock22 = fock[np.ix_(ao_idx, ao_idx)]
-                e_vir_prescreen = jnp.real(jnp.diag(vir_prescreen.T.conj() @ fock22 @ vir_prescreen))
+
+            frag_pao = dlno_pao.pao_overlap_with_domain(
+                mol,
+                pao,
+                list(frag_ext_bp),
+                ao2pao_map=ao2pao_map,
+                s1e=s1e,
+                ovlp_thr=domain_pao_thr,
+            )
+            if frag_pao.shape[1] > 0:
+                av = dlno_mod._compute_av(mol, frag_pao, s1e=s1e, atmlst=frag_ext_primary)
+                frag_pao = frag_pao[:, av > pao_bp_domain_thr]
+            if frag_pao.shape[1] > 0:
+                frag_pao_prj = dlno_util.project_mo(frag_pao, s21, s22)
+                frag_pao_prj = dlno_util.orthogonalize(occ_prescreen, frag_pao_prj, s22)
+                frag_pao_prj = lno_base.orthonormalize_metric_colspace_smooth(
+                    frag_pao_prj, s22, thresh=1e-10
+                )
+                # The downstream DLNO path only consumes the virtual prescreen span.
+                # Keeping these coefficients in a fixed-gauge orthonormal basis avoids
+                # introducing an extra semicanonical rotation whose derivative can
+                # become disproportionately large in near-degenerate local spaces.
+                vir_prescreen = frag_pao_prj
+                if vir_prescreen.shape[1] > 0:
+                    fock22 = fock[np.ix_(ao_idx, ao_idx)]
+                    e_vir_prescreen = jnp.real(jnp.diag(vir_prescreen.T.conj() @ fock22 @ vir_prescreen))
+                else:
+                    e_vir_prescreen = jnp.zeros((0,))
             else:
                 e_vir_prescreen = jnp.zeros((0,))
-        else:
-            e_vir_prescreen = jnp.zeros((0,))
-            vir_prescreen = jnp.zeros((len(ao_idx), 0))
+                vir_prescreen = jnp.zeros((len(ao_idx), 0))
 
-        fragment_data.append(
-            {
-                'fragment_index': ifrag,
-                'lo_indices': loidx,
-                'strong_lmo_indices': frag_strong,
-                'extended_bp_domain': frag_ext_bp,
-                'extended_primary_domain': frag_ext_primary,
-                'occ_prescreen_energies': e_occ_prescreen,
-                'occ_prescreen_coeff': occ_prescreen,
-                'vir_prescreen_energies': e_vir_prescreen,
-                'vir_prescreen_coeff': vir_prescreen,
-            }
-        )
+            fragment_data.append(
+                {
+                    'fragment_index': ifrag,
+                    'lo_indices': loidx,
+                    'strong_lmo_indices': frag_strong,
+                    'extended_bp_domain': frag_ext_bp,
+                    'extended_primary_domain': frag_ext_primary,
+                    'occ_prescreen_energies': e_occ_prescreen,
+                    'occ_prescreen_coeff': occ_prescreen,
+                    'vir_prescreen_energies': e_vir_prescreen,
+                    'vir_prescreen_coeff': vir_prescreen,
+                }
+            )
 
     return {
         'frozen': frozen,
@@ -376,6 +597,7 @@ def _build_lo_indexed_prescreen_data(
         'extended_bp_domain': extended_bp_domain,
         'extended_primary_domain': extended_primary_domain,
         'fragment_data': fragment_data,
+        'topology_profile': profile_rows,
     }
 
 
@@ -414,100 +636,113 @@ def build_dlno_prescreen_data(
             multipole_order=multipole_order,
         )
 
+    profile_rows = []
     mol = mf.mol
-    dlno = dlno_mod.DLNO(mf, frozen=frozen)
-    dlno.lmo = lo_coeff
-    dlno.lmo_bp_domain_thr = lmo_bp_domain_thr
-    dlno.pao_bp_domain_thr = pao_bp_domain_thr
-    dlno.domain_pao_thr = domain_pao_thr
-    dlno.pair_energy_thr = pair_energy_thr
-    dlno.multipole_order = multipole_order
+    with _topology_profile_section(profile_rows, 'DLNO object'):
+        dlno = dlno_mod.DLNO(mf, frozen=frozen)
+        dlno.lmo = lo_coeff
+        dlno.lmo_bp_domain_thr = lmo_bp_domain_thr
+        dlno.pao_bp_domain_thr = pao_bp_domain_thr
+        dlno.domain_pao_thr = domain_pao_thr
+        dlno.pair_energy_thr = pair_energy_thr
+        dlno.multipole_order = multipole_order
 
-    s1e = dlno.s1e
-    fock = dlno.fock
-    lmo_bp_domain = dlno.lmo_bp_domain
-    lmo_primary_domain = dlno.lmo_primary_domain
-    pao = dlno.pao
-    ao2pao_map = dlno.ao2pao_map
-    pao_bp_domain = dlno.pao_bp_domain
+    with _topology_profile_section(profile_rows, 'overlap/fock'):
+        s1e = dlno.s1e
+        fock = dlno.fock
+    with _topology_profile_section(profile_rows, 'LMO BP domains'):
+        lmo_bp_domain = dlno.lmo_bp_domain
+    with _topology_profile_section(profile_rows, 'PAO build'):
+        pao = dlno.pao
+        ao2pao_map = dlno.ao2pao_map
+    with _topology_profile_section(profile_rows, 'PAO BP domains'):
+        pao_bp_domain = dlno.pao_bp_domain
+    with _topology_profile_section(profile_rows, 'primary domains'):
+        lmo_primary_domain = dlno.build_lmo_primary_domain()
+        dlno.lmo_primary_domain = lmo_primary_domain
 
-    domain_pao = dlno.build_domain_pao()
-    (eo, vo), (ev, vv) = dlno.canonicalize(domain_pao)
-    pair_energy = dlno_mp2.pair_energy_multipole(
-        mol,
-        eo,
-        vo,
-        ev,
-        vv,
-        lmo_primary_domain,
-        multipole_order,
-    )
-    strong_pairs = strong_pair_lists(pair_energy, pair_energy_thr)
-
-    extended_bp_domain = [
-        union_objects([lmo_bp_domain[j] for j in idx]) for idx in strong_pairs
-    ]
-    extended_primary_domain = [
-        union_objects([lmo_primary_domain[j] for j in idx]) for idx in strong_pairs
-    ]
-    fragment_data = []
-    for ifrag, loidx in enumerate(frag_lolist):
-        loidx = np.asarray(loidx, dtype=np.int32)
-        frag_strong = union_objects([strong_pairs[i] for i in loidx])
-        frag_ext_bp = union_objects([extended_bp_domain[i] for i in loidx])
-        frag_ext_primary = union_objects([extended_primary_domain[i] for i in loidx])
-
-        ao_idx = dlno_util.ao_index_by_atom(mol, frag_ext_primary)
-        s21 = s1e[ao_idx]
-        s22 = s1e[np.ix_(ao_idx, ao_idx)]
-
-        lmo_block = lo_coeff[:, frag_strong]
-        lmo_block_prj = dlno_util.project_mo(lmo_block, s21, s22)
-        lmo_block_prj = vec_lowdin(lmo_block_prj, s=s22)
-        e_occ_prescreen, occ_prescreen = dlno_mod.semicanonicalize(
-            mol, lmo_block_prj, fock, frag_ext_primary
-        )
-
-        frag_pao = dlno_pao.pao_overlap_with_domain(
+    with _topology_profile_section(profile_rows, 'domain PAOs'):
+        domain_pao = dlno.build_domain_pao()
+    with _topology_profile_section(profile_rows, 'domain canonicalization'):
+        (eo, vo), (ev, vv) = dlno.canonicalize(domain_pao)
+    with _topology_profile_section(profile_rows, 'multipole pair energies'):
+        pair_energy = _pair_energy_multipole_numpy(
             mol,
-            pao,
-            list(frag_ext_bp),
-            ao2pao_map=ao2pao_map,
-            s1e=s1e,
-            ovlp_thr=domain_pao_thr,
+            eo,
+            vo,
+            ev,
+            vv,
+            lmo_primary_domain,
+            multipole_order,
         )
-        if frag_pao.shape[1] > 0:
-            av = dlno_mod._compute_av(mol, frag_pao, s1e=s1e, atmlst=frag_ext_primary)
-            frag_pao = frag_pao[:, av > pao_bp_domain_thr]
-        if frag_pao.shape[1] > 0:
-            frag_pao_prj = dlno_util.project_mo(frag_pao, s21, s22)
-            frag_pao_prj = dlno_util.orthogonalize(occ_prescreen, frag_pao_prj, s22)
-            frag_pao_prj = lno_base.orthonormalize_metric_colspace_smooth(
-                frag_pao_prj, s22, thresh=1e-10
+    with _topology_profile_section(profile_rows, 'strong-pair domains'):
+        strong_pairs = strong_pair_lists(pair_energy, pair_energy_thr)
+
+        extended_bp_domain = [
+            union_objects([lmo_bp_domain[j] for j in idx]) for idx in strong_pairs
+        ]
+        extended_primary_domain = [
+            union_objects([lmo_primary_domain[j] for j in idx]) for idx in strong_pairs
+        ]
+    fragment_data = []
+    with _topology_profile_section(profile_rows, 'fragment prescreen spaces'):
+        for ifrag, loidx in enumerate(frag_lolist):
+            loidx = np.asarray(loidx, dtype=np.int32)
+            frag_strong = union_objects([strong_pairs[i] for i in loidx])
+            frag_ext_bp = union_objects([extended_bp_domain[i] for i in loidx])
+            frag_ext_primary = union_objects([extended_primary_domain[i] for i in loidx])
+
+            ao_idx = dlno_util.ao_index_by_atom(mol, frag_ext_primary)
+            s21 = s1e[ao_idx]
+            s22 = s1e[np.ix_(ao_idx, ao_idx)]
+
+            lmo_block = lo_coeff[:, frag_strong]
+            lmo_block_prj = dlno_util.project_mo(lmo_block, s21, s22)
+            lmo_block_prj = vec_lowdin(lmo_block_prj, s=s22)
+            e_occ_prescreen, occ_prescreen = dlno_mod.semicanonicalize(
+                mol, lmo_block_prj, fock, frag_ext_primary
             )
-            vir_prescreen = frag_pao_prj
-            if vir_prescreen.shape[1] > 0:
-                fock22 = fock[np.ix_(ao_idx, ao_idx)]
-                e_vir_prescreen = jnp.real(jnp.diag(vir_prescreen.T.conj() @ fock22 @ vir_prescreen))
+
+            frag_pao = dlno_pao.pao_overlap_with_domain(
+                mol,
+                pao,
+                list(frag_ext_bp),
+                ao2pao_map=ao2pao_map,
+                s1e=s1e,
+                ovlp_thr=domain_pao_thr,
+            )
+            if frag_pao.shape[1] > 0:
+                av = dlno_mod._compute_av(mol, frag_pao, s1e=s1e, atmlst=frag_ext_primary)
+                frag_pao = frag_pao[:, av > pao_bp_domain_thr]
+            if frag_pao.shape[1] > 0:
+                frag_pao_prj = dlno_util.project_mo(frag_pao, s21, s22)
+                frag_pao_prj = dlno_util.orthogonalize(occ_prescreen, frag_pao_prj, s22)
+                frag_pao_prj = lno_base.orthonormalize_metric_colspace_smooth(
+                    frag_pao_prj, s22, thresh=1e-10
+                )
+                vir_prescreen = frag_pao_prj
+                if vir_prescreen.shape[1] > 0:
+                    fock22 = fock[np.ix_(ao_idx, ao_idx)]
+                    e_vir_prescreen = jnp.real(jnp.diag(vir_prescreen.T.conj() @ fock22 @ vir_prescreen))
+                else:
+                    e_vir_prescreen = jnp.zeros((0,))
             else:
                 e_vir_prescreen = jnp.zeros((0,))
-        else:
-            e_vir_prescreen = jnp.zeros((0,))
-            vir_prescreen = jnp.zeros((len(ao_idx), 0))
+                vir_prescreen = jnp.zeros((len(ao_idx), 0))
 
-        fragment_data.append(
-            {
-                "fragment_index": ifrag,
-                "lo_indices": loidx,
-                "strong_lmo_indices": frag_strong,
-                "extended_bp_domain": frag_ext_bp,
-                "extended_primary_domain": frag_ext_primary,
-                "occ_prescreen_energies": jnp.asarray(e_occ_prescreen),
-                "occ_prescreen_coeff": occ_prescreen,
-                "vir_prescreen_energies": jnp.asarray(e_vir_prescreen),
-                "vir_prescreen_coeff": vir_prescreen,
-            }
-        )
+            fragment_data.append(
+                {
+                    "fragment_index": ifrag,
+                    "lo_indices": loidx,
+                    "strong_lmo_indices": frag_strong,
+                    "extended_bp_domain": frag_ext_bp,
+                    "extended_primary_domain": frag_ext_primary,
+                    "occ_prescreen_energies": jnp.asarray(e_occ_prescreen),
+                    "occ_prescreen_coeff": occ_prescreen,
+                    "vir_prescreen_energies": jnp.asarray(e_vir_prescreen),
+                    "vir_prescreen_coeff": vir_prescreen,
+                }
+            )
 
     return {
         "frozen": frozen,
@@ -533,6 +768,7 @@ def build_dlno_prescreen_data(
         "extended_bp_domain": extended_bp_domain,
         "extended_primary_domain": extended_primary_domain,
         "fragment_data": fragment_data,
+        "topology_profile": profile_rows,
     }
 
 

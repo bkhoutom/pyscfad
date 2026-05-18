@@ -484,6 +484,12 @@ def _rebuild_fragment_solver(state, dlno_fragment_data, solver_settings):
     mfcc.profile_fragments = solver_settings.profile_fragments
     mfcc.profile_label = solver_settings.profile_label
     mfcc.profile_pass = solver_settings.profile_pass
+    # The checkpointed MP2-RDM scan is not reproducible under nested replay VJP
+    # with threaded BLAS/XLA. Keep it for ordinary forward calculations, but
+    # avoid it when rebuilding fragment intermediates inside replay backward.
+    mfcc._disable_checkpointed_mp2_rdm1 = (
+        solver_settings.profile_pass == 'backward replay'
+    )
     if hasattr(mfcc, 'ccsd_t'):
         mfcc.ccsd_t = solver_settings.ccsd_t
     if hasattr(mfcc, 'dcsd'):
@@ -556,6 +562,31 @@ def _is_float0_cotangent(x):
     return hasattr(x, 'dtype') and x.dtype == jax.dtypes.float0
 
 
+def _zero_like_cotangent_leaf(x):
+    if x is None:
+        return None
+    if _is_float0_cotangent(x):
+        return x
+    return np.zeros_like(x)
+
+
+def _zero_like_cotangent_tree(tree):
+    return jax.tree_util.tree_map(_zero_like_cotangent_leaf, tree)
+
+
+def _split_tuple_cotangent(ybar_frag):
+    if not isinstance(ybar_frag, tuple):
+        return (ybar_frag,)
+    zeros = tuple(_zero_like_cotangent_tree(x) for x in ybar_frag)
+    pieces = []
+    for idx, component in enumerate(ybar_frag):
+        pieces.append(tuple(
+            component if j == idx else zeros[j]
+            for j in range(len(ybar_frag))
+        ))
+    return pieces
+
+
 def _add_cotangent_leaf(x, y):
     if x is None:
         return y
@@ -608,7 +639,16 @@ def _fragment_kernel_replay_bwd(frag_lolist, no_type, frag_nonvlist,
         _, pullback = jax.vjp(frag_fn, state, orbloc, dlno_data)
         replay_s = time.perf_counter() - replay_start
         pullback_start = time.perf_counter()
-        frag_state_bar, frag_orbloc_bar, frag_dlno_data_bar = pullback(ybar[ifrag])
+        frag_state_bar = None
+        frag_orbloc_bar = None
+        frag_dlno_data_bar = None
+        for ybar_piece in _split_tuple_cotangent(ybar[ifrag]):
+            piece_state_bar, piece_orbloc_bar, piece_dlno_data_bar = pullback(ybar_piece)
+            frag_state_bar = _tree_add_cotangent(frag_state_bar, piece_state_bar)
+            frag_orbloc_bar = _tree_add_cotangent(frag_orbloc_bar, piece_orbloc_bar)
+            frag_dlno_data_bar = _tree_add_cotangent(
+                frag_dlno_data_bar, piece_dlno_data_bar
+            )
         pullback_s = time.perf_counter() - pullback_start
         if report_bwd:
             row = None
@@ -815,6 +855,10 @@ def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external
                frag_prescreen=None,
                frozen_mask=None, frag_target_nocc=None, frag_target_nvir=None):
     mytimer = timer.Timer()
+    use_checkpoint = (
+        USE_CHECKPOINT
+        and not bool(getattr(mfcc, '_disable_checkpointed_mp2_rdm1', False))
+    )
 
     mf = mfcc._scf
     mo_occ = mf.mo_occ
@@ -960,7 +1004,7 @@ def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external
         if lovir:
             dmvv = np.einsum('ip,Ipq,qj->Iij', uvir2.T, dmvv, uvir2)
         eia = Lia = ovov = eiajb = None
-    elif no_type == 'ie' and USE_CHECKPOINT:
+    elif no_type == 'ie' and use_checkpoint:
         u = reduce(np.dot, (orbocc1.T, s1e, orbfragocc1))
         eia = moe_Ov(moefragocc1)
         ejb = eov
@@ -1001,7 +1045,7 @@ def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external
         swapidx = 'ij'
 
     if no_type != 'osv':
-        if no_type != 'ie' or not USE_CHECKPOINT:
+        if no_type != 'ie' or not use_checkpoint:
             eiajb = (eia.ravel()[:,None] + ejb.ravel()).reshape(ovov.shape)
             t2 = ovov / eiajb
             dmvv = make_rdm1_mp2(t2, 'vv', e1_or_e2, swapidx)
@@ -1054,7 +1098,7 @@ def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external
         ovov = eiajb = None
 
     if no_type != 'osv':
-        if no_type != 'ie' or not USE_CHECKPOINT:
+        if no_type != 'ie' or not use_checkpoint:
             dmoo = make_rdm1_mp2(t2, 'oo', e1_or_e2, swapidx)
             t2 = None
         dmoo = reduce(np.dot, (uocc2.T, dmoo, uocc2))

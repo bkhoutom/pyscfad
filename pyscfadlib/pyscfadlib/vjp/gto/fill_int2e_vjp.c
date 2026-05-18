@@ -226,17 +226,11 @@ void GTOnr2e_fill_r0_vjp(int (*intor)(), void (*fill)(), int (*fprescreen)(),
 
 #pragma omp parallel
 {
-    int thread_id = omp_get_thread_num();
-    double *vjp_loc;
-    if (thread_id == 0) {
-        vjp_loc = vjp;
-    } else {
-        vjp_loc = calloc(natm*comp, sizeof(double));
-    }
+    double *vjp_loc = calloc(natm*comp, sizeof(double));
 
     int ij, i, j;
     double *buf = malloc(sizeof(double) * (di*di*di*di*comp + cache_size));
-    #pragma omp for nowait schedule(dynamic)
+    #pragma omp for schedule(dynamic)
     for (ij = 0; ij < nish*njsh; ij++) {
         i = ij / njsh;
         j = ij % njsh;
@@ -245,13 +239,11 @@ void GTOnr2e_fill_r0_vjp(int (*intor)(), void (*fill)(), int (*fprescreen)(),
     }
     free(buf);
 
-    if (thread_id != 0) {
-        for (i = 0; i < natm*comp; i++) {
-            #pragma omp atomic
-            vjp[i] += vjp_loc[i];
-        }
-        free(vjp_loc);
+    for (i = 0; i < natm*comp; i++) {
+        #pragma omp atomic
+        vjp[i] += vjp_loc[i];
     }
+    free(vjp_loc);
 }
 
     //minus sign for nuclear derivative

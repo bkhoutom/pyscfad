@@ -15,7 +15,7 @@
 import warnings
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial, reduce
 import numpy
 import jax
@@ -58,10 +58,12 @@ SEMICANONICAL_DEG_THRESH = 1e-8
 # Anything not bigger than the NO occupation number gap should work
 COMPRESS_DEG_THRESH = 1e-12
 _FRAGMENT_PROFILE_ROWS = []
+_FRAGMENT_TABLE_HEADERS = set()
 
 
 def clear_fragment_profile():
     _FRAGMENT_PROFILE_ROWS.clear()
+    _FRAGMENT_TABLE_HEADERS.clear()
 
 
 def get_fragment_profile(label=None):
@@ -73,6 +75,149 @@ def get_fragment_profile(label=None):
 
 def _append_fragment_profile(row):
     _FRAGMENT_PROFILE_ROWS.append(row)
+
+
+def _verbose_at_least(obj, level=2):
+    try:
+        return int(getattr(obj, 'verbose', 0)) >= level
+    except (TypeError, ValueError):
+        return False
+
+
+def _fragment_report_enabled(mfcc):
+    return (
+        bool(getattr(mfcc, 'profile_fragments', False))
+        or (
+            _verbose_at_least(mfcc, 2)
+            and bool(getattr(mfcc, 'use_dlno_prescreen', False))
+        )
+    )
+
+
+def _fragment_profile_label(mfcc):
+    return str(getattr(mfcc, 'profile_label', mfcc.__class__.__name__))
+
+
+def _fragment_profile_pass(mfcc):
+    return str(getattr(mfcc, 'profile_pass', 'forward'))
+
+
+def _phase_time(row, name):
+    value = row.get(name, 0.0)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _print_fragment_table_header(row):
+    has_ad_times = (
+        row.get('replay_wall_s') is not None
+        or row.get('pullback_wall_s') is not None
+    )
+    key = (
+        row.get('label', 'LNO'),
+        row.get('pass', 'forward'),
+        'ad' if has_ad_times else 'forward',
+    )
+    if key in _FRAGMENT_TABLE_HEADERS:
+        return
+    _FRAGMENT_TABLE_HEADERS.add(key)
+    extra_header = (
+        f" {'replay':>8} {'pullback':>8}" if has_ad_times else ""
+    )
+    extra_units = (
+        f" {'sec':>8} {'sec':>8}" if has_ad_times else ""
+    )
+    print(
+        "  "
+        f"{'frag':>4} {'domain':>10} {'prescreen':>12} {'LNO':>10} "
+        f"{'setup':>8} {'solve':>8} {'total':>8} {'memory':>8}"
+        f"{extra_header}",
+        flush=True,
+    )
+    print(
+        "  "
+        f"{'':>4} {'atoms/AO':>10} {'occ/vir':>12} {'occ/vir':>10} "
+        f"{'sec':>8} {'sec':>8} {'sec':>8} {'MB':>8}"
+        f"{extra_units}",
+        flush=True,
+    )
+
+
+def _print_fragment_report(row):
+    _print_fragment_table_header(row)
+    idx = int(row.get('fragment', -1)) + 1
+    make_eris_s = _phase_time(row, 'make_fragment_eris_s')
+    fpno_s = _phase_time(row, 'make_fpno1_s')
+    impurity_s = _phase_time(row, 'impurity_solve_s')
+    setup_s = make_eris_s + fpno_s
+    total_s = _phase_time(row, 'wall_s')
+
+    phase_times = row.get('phase_times') or {}
+    if phase_times:
+        solver_s = _phase_time(phase_times, 'total_s')
+    else:
+        solver_s = impurity_s
+
+    domain = f"{row.get('domain_atoms', 0)}/{row.get('domain_aos', 0)}"
+    prescreen = f"{row.get('prescreen_occ', 0)}/{row.get('prescreen_vir', 0)}"
+    active = f"{row.get('active_occ', 0)}/{row.get('active_vir', 0)}"
+    print(
+        "  "
+        f"{idx:4d} {domain:>10} {prescreen:>12} {active:>10} "
+        f"{setup_s:8.3f} {solver_s:8.3f} {total_s:8.3f} "
+        f"{row.get('est_work_mb', 0.0):8.1f}"
+        + (
+            f" {_phase_time(row, 'replay_wall_s'):8.3f}"
+            f" {_phase_time(row, 'pullback_wall_s'):8.3f}"
+            if (
+                row.get('replay_wall_s') is not None
+                or row.get('pullback_wall_s') is not None
+            )
+            else ""
+        ),
+        flush=True,
+    )
+
+
+def _append_and_maybe_print_fragment_profile(mfcc, row):
+    if _fragment_report_enabled(mfcc):
+        _append_fragment_profile(row)
+        if _verbose_at_least(mfcc, 2):
+            if row.get('pass') == 'backward replay':
+                return
+            _print_fragment_report(row)
+
+
+def _print_fragment_start(mfcc, frag_prescreen, orbfragloc):
+    if not (_fragment_report_enabled(mfcc) and _verbose_at_least(mfcc, 3)):
+        return
+    idx = int(getattr(mfcc, '_current_ifrag', -1)) + 1
+    nfrag = getattr(mfcc, '_nfrag', None)
+    frag_label = f'{idx}/{int(nfrag)}' if nfrag is not None else str(idx)
+    domain_atoms = 0
+    domain_aos = 0
+    prescreen_occ = 0
+    prescreen_vir = 0
+    if frag_prescreen is not None:
+        atmlst = frag_prescreen.get('extended_primary_domain', ())
+        atmlst = numpy.asarray(atmlst, dtype=numpy.int32).ravel()
+        domain_atoms = int(atmlst.size)
+        if atmlst.size > 0:
+            domain_aos = int(dlno_util.ao_index_by_atom(mfcc.mol, atmlst).size)
+        occ_coeff = frag_prescreen.get('occ_prescreen_coeff')
+        vir_coeff = frag_prescreen.get('vir_prescreen_coeff')
+        prescreen_occ = 0 if occ_coeff is None else int(occ_coeff.shape[1])
+        prescreen_vir = 0 if vir_coeff is None else int(vir_coeff.shape[1])
+    print(
+        f"  {_fragment_profile_label(mfcc)} {_fragment_profile_pass(mfcc)} "
+        f"fragment {frag_label}: starting "
+        f"(LOs={orbfragloc.shape[1]}, domain atoms/AOs={domain_atoms}/"
+        f"{domain_aos}, prescreen occ/vir={prescreen_occ}/{prescreen_vir})",
+        flush=True,
+    )
+
 
 def kernel(mfcc, orbloc, frag_lolist,
            no_type='ie', eris=None, frag_nonvlist=None):
@@ -128,6 +273,8 @@ def kernel(mfcc, orbloc, frag_lolist,
         if use_dlno_fragment_eris:
             _require_dlno_fragment_domain(mfcc, frag_prescreen, ifrag)
         mfcc._current_ifrag = ifrag
+        mfcc._nfrag = nfrag
+        mfcc.profile_pass = getattr(mfcc, 'profile_pass', 'forward')
         frag_res[ifrag] = kernel_1frag(mfcc, eris, orbfragloc, no_type,
                                        frag_prescreen=frag_prescreen,
                                        frag_target_nocc=frag_target_nocc,
@@ -186,6 +333,7 @@ class _FragmentSolverSettings:
     dcsd: bool
     profile_fragments: bool
     profile_label: str
+    profile_pass: str
 
 
 class _FragmentSCFState(pytree.PytreeNode):
@@ -280,6 +428,7 @@ def _make_fragment_solver_settings(mfcc):
         dcsd=bool(getattr(mfcc, 'dcsd', False)),
         profile_fragments=bool(getattr(mfcc, 'profile_fragments', False)),
         profile_label=str(getattr(mfcc, 'profile_label', mfcc.__class__.__name__)),
+        profile_pass=str(getattr(mfcc, 'profile_pass', 'forward')),
     )
 
 
@@ -332,6 +481,9 @@ def _rebuild_fragment_solver(state, dlno_fragment_data, solver_settings):
     mfcc.dm_corr_frag = solver_settings.dm_corr_frag
     mfcc.use_dlno_prescreen = True
     mfcc.dlno_prescreen_data = {'fragment_data': dlno_fragment_data}
+    mfcc.profile_fragments = solver_settings.profile_fragments
+    mfcc.profile_label = solver_settings.profile_label
+    mfcc.profile_pass = solver_settings.profile_pass
     if hasattr(mfcc, 'ccsd_t'):
         mfcc.ccsd_t = solver_settings.ccsd_t
     if hasattr(mfcc, 'dcsd'):
@@ -344,6 +496,7 @@ def _fragment_one_replay(state, orbloc, dlno_fragment_data, ifrag, frag_lolist,
                          return_info=False):
     mfcc = _rebuild_fragment_solver(state, dlno_fragment_data, solver_settings)
     mfcc._current_ifrag = ifrag
+    mfcc._nfrag = len(frag_lolist)
     eris = _LNOERIS(fock=state.fock, s1e=state.s1e)
     eris._common_init_(mfcc)
 
@@ -368,33 +521,16 @@ def _fragment_kernel_replay_impl(state, orbloc, dlno_fragment_data, frag_lolist,
                                  no_type, frag_nonvlist, solver_settings):
     frag_res = [None] * len(frag_lolist)
     for ifrag in range(len(frag_lolist)):
-        if solver_settings.profile_fragments:
-            start = time.perf_counter()
-            frag_res[ifrag], info = _fragment_one_replay(
-                state,
-                orbloc,
-                dlno_fragment_data,
-                ifrag,
-                frag_lolist,
-                no_type,
-                frag_nonvlist,
-                solver_settings,
-                return_info=True,
-            )
-            info['label'] = solver_settings.profile_label
-            info['wall_s'] = time.perf_counter() - start
-            _append_fragment_profile(info)
-        else:
-            frag_res[ifrag] = _fragment_one_replay(
-                state,
-                orbloc,
-                dlno_fragment_data,
-                ifrag,
-                frag_lolist,
-                no_type,
-                frag_nonvlist,
-                solver_settings,
-            )
+        frag_res[ifrag] = _fragment_one_replay(
+            state,
+            orbloc,
+            dlno_fragment_data,
+            ifrag,
+            frag_lolist,
+            no_type,
+            frag_nonvlist,
+            solver_settings,
+        )
     return frag_res
 
 
@@ -446,6 +582,14 @@ def _fragment_kernel_replay_bwd(frag_lolist, no_type, frag_nonvlist,
     state_bar = None
     orbloc_bar = None
     dlno_data_bar = None
+    bwd_settings = replace(solver_settings, profile_pass='backward replay')
+    report_bwd = bool(solver_settings.profile_fragments) or solver_settings.verbose >= 2
+    if report_bwd:
+        print(
+            f"\n{solver_settings.profile_label} backward pass "
+            f"({len(frag_lolist)} fragment replay(s))",
+            flush=True,
+        )
     for ifrag in range(len(frag_lolist)):
         def frag_fn(state_, orbloc_, dlno_fragment_data_):
             return _fragment_one_replay(
@@ -456,11 +600,37 @@ def _fragment_kernel_replay_bwd(frag_lolist, no_type, frag_nonvlist,
                 frag_lolist,
                 no_type,
                 frag_nonvlist,
-                solver_settings,
+                bwd_settings,
             )
 
+        profile_row_start = len(_FRAGMENT_PROFILE_ROWS)
+        replay_start = time.perf_counter()
         _, pullback = jax.vjp(frag_fn, state, orbloc, dlno_data)
+        replay_s = time.perf_counter() - replay_start
+        pullback_start = time.perf_counter()
         frag_state_bar, frag_orbloc_bar, frag_dlno_data_bar = pullback(ybar[ifrag])
+        pullback_s = time.perf_counter() - pullback_start
+        if report_bwd:
+            row = None
+            for candidate in reversed(_FRAGMENT_PROFILE_ROWS[profile_row_start:]):
+                if (
+                    candidate.get('label') == solver_settings.profile_label
+                    and candidate.get('pass') == 'backward replay'
+                    and candidate.get('fragment') == ifrag
+                ):
+                    row = candidate
+                    break
+            if row is None:
+                row = {
+                    'label': solver_settings.profile_label,
+                    'pass': 'backward replay',
+                    'fragment': ifrag,
+                    'nfrag': len(frag_lolist),
+                }
+                _append_fragment_profile(row)
+            row['replay_wall_s'] = replay_s
+            row['pullback_wall_s'] = pullback_s
+            _print_fragment_report(row)
         state_bar = _tree_add_cotangent(state_bar, frag_state_bar)
         orbloc_bar = _tree_add_cotangent(orbloc_bar, frag_orbloc_bar)
         dlno_data_bar = _tree_add_cotangent(dlno_data_bar, frag_dlno_data_bar)
@@ -480,22 +650,41 @@ def kernel_1frag(mfcc, eris, orbfragloc, no_type,
     mf = mfcc._scf
     frozen_mask = mfcc.get_frozen_mask()
     thresh_pno = (mfcc.thresh_occ, mfcc.thresh_vir)
+    _print_fragment_start(mfcc, frag_prescreen, orbfragloc)
+    profile_start = time.perf_counter()
+    eris_start = time.perf_counter()
     eris_fpno = make_fragment_eris(mfcc, eris, frag_prescreen)
+    make_fragment_eris_s = time.perf_counter() - eris_start
+    fpno_start = time.perf_counter()
     frzfrag, orbfrag = make_fpno1(mfcc, eris_fpno, orbfragloc, no_type,
                                   THRESH_INTERNAL, thresh_pno,
                                   frag_prescreen=frag_prescreen,
                                   frozen_mask=frozen_mask,
                                   frag_target_nocc=frag_target_nocc,
                                   frag_target_nvir=frag_target_nvir)
+    make_fpno1_s = time.perf_counter() - fpno_start
     info = _fragment_diagnostic_info(mfcc, eris_fpno, frag_prescreen, orbfragloc,
                                      frzfrag, orbfrag)
+    info['label'] = _fragment_profile_label(mfcc)
+    info['pass'] = _fragment_profile_pass(mfcc)
+    info['nfrag'] = getattr(mfcc, '_nfrag', None)
+    info['make_fragment_eris_s'] = make_fragment_eris_s
+    info['make_fpno1_s'] = make_fpno1_s
     eris_fpno = None
     if orbfrag is None:
         frag_res = (0., 0., 0.)
+        info['impurity_solve_s'] = 0.0
+        info['wall_s'] = time.perf_counter() - profile_start
+        _append_and_maybe_print_fragment_profile(mfcc, info)
         return (frag_res, info) if return_info else frag_res
+    impurity_start = time.perf_counter()
     frag_res = mfcc.impurity_solve(mf, orbfrag, orbfragloc,
                                    frozen=frzfrag, eris=eris,
-                                   frag_prescreen=frag_prescreen)
+                                   frag_prescreen=frag_prescreen,
+                                   profile_info=info)
+    info['impurity_solve_s'] = time.perf_counter() - impurity_start
+    info['wall_s'] = time.perf_counter() - profile_start
+    _append_and_maybe_print_fragment_profile(mfcc, info)
     return (frag_res, info) if return_info else frag_res
 
 
@@ -916,7 +1105,8 @@ def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external
     frzfrag = numpy.hstack([numpy.arange(nfrzocc),
                             numpy.arange(nocc+orbfragvir12.shape[1],nmo)])
 
-    mytimer.timer('make_fpno1:')
+    if _verbose_at_least(mfcc, 5):
+        mytimer.timer('make_fpno1:')
     return frzfrag, orbfrag
 
 def make_rdm1_mp2(t2, kind, e1_or_e2, swapidx):

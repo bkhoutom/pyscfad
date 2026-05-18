@@ -16,6 +16,7 @@
 '''
 
 import os
+import time
 import numpy
 from functools import reduce
 
@@ -90,7 +91,8 @@ def _make_df_eris_incore(cc, mo_coeff=None, fockao=None):
 
 def impurity_solve(mf, mo_coeff, lo_coeff, eris=None, frozen=None,
                    frag_prescreen=None,
-                   verbose_imp=0, ccsd_t=False, dcsd=False):
+                   verbose_imp=0, ccsd_t=False, dcsd=False,
+                   profile_info=None):
     r'''Solve impurity problem and calculate local correlation energy.
 
     Args:
@@ -148,15 +150,22 @@ def impurity_solve(mf, mo_coeff, lo_coeff, eris=None, frozen=None,
         mcc.diis_space = diis_space
     mcc._domain_atmlst = None if frag_prescreen is None else frag_prescreen.get('extended_primary_domain')
     mcc.e_hf = mf.e_tot  #avoid MP2 recompute e_hf
+    total_start = time.perf_counter()
+    phase_start = time.perf_counter()
     imp_eris = mcc.ao2mo(fockao=eris.fock)
+    phase_times = {'ao2mo_s': time.perf_counter() - phase_start}
 
     # MP2 fragment energy
+    phase_start = time.perf_counter()
     t1, t2 = mcc.init_amps(eris=imp_eris)[1:]
     elcorr_pt2 = mp2_fragment_energy(imp_eris, t2, prjlo)
+    phase_times['mp2_s'] = time.perf_counter() - phase_start
 
     # CCSD fragment energy
+    phase_start = time.perf_counter()
     t1, t2 = mcc.kernel(eris=imp_eris, t1=t1, t2=t2)[1:]
     elcorr_cc = ccsd_fragment_energy(imp_eris, t1, t2, prjlo)
+    phase_times['ccsd_s'] = time.perf_counter() - phase_start
 
     if ccsd_t and not dcsd:
         #for tests
@@ -166,9 +175,19 @@ def impurity_solve(mf, mo_coeff, lo_coeff, eris=None, frozen=None,
         #    mcc, imp_eris, prjlo, t1=t1, t2=t2, verbose=verbose_imp)
         #from pyscfad.cc import gccsd_t
         #elcorr_cc_t = gccsd_t.kernel(mcc, prjlo, t1=t1, t2=t2)
+        phase_start = time.perf_counter()
         elcorr_cc_t = ccsd_t_mod.kernel(mcc, imp_eris, prjlo, t1=t1, t2=t2, verbose=verbose_imp)
+        phase_times['triples_s'] = time.perf_counter() - phase_start
     else:
         elcorr_cc_t = 0.
+        phase_times['triples_s'] = 0.0
+
+    phase_times['total_s'] = time.perf_counter() - total_start
+    if profile_info is not None:
+        profile_info['solver_occ'] = int(nactocc)
+        profile_info['solver_vir'] = int(nactvir)
+        profile_info['solver_mo'] = int(nactocc + nactvir)
+        profile_info['phase_times'] = phase_times
 
     t1 = t2 = imp_eris = mcc = None
     del log
@@ -218,11 +237,11 @@ class LNOCCSD(lno_base.LNO):
         self.dcsd = False
 
     def impurity_solve(self, mf, mo_coeff, lo_coeff, eris=None, frozen=None,
-                       frag_prescreen=None):
+                       frag_prescreen=None, profile_info=None):
         return impurity_solve(mf, mo_coeff, lo_coeff, eris=eris, frozen=frozen,
                               frag_prescreen=frag_prescreen,
                               verbose_imp=self.verbose_imp, ccsd_t=self.ccsd_t,
-                              dcsd=self.dcsd)
+                              dcsd=self.dcsd, profile_info=profile_info)
 
     def _post_proc(self, frag_res, frag_wghtlist):
         ''' Post processing results returned by ``impurity_solve`` collected in ``frag_res``.

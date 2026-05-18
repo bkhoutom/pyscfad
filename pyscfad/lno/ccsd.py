@@ -232,6 +232,7 @@ class LNOCCSD(lno_base.LNO):
         super().__init__(mf, thresh=thresh, frozen=frozen, fock=fock, s1e=s1e, **kwargs)
         self.efrag_cc = None
         self.efrag_pt2 = None
+        self.efrag_pt2_domain = None
         self.efrag_cc_t = None
         self.ccsd_t = False
         self.dcsd = False
@@ -246,13 +247,18 @@ class LNOCCSD(lno_base.LNO):
     def _post_proc(self, frag_res, frag_wghtlist):
         ''' Post processing results returned by ``impurity_solve`` collected in ``frag_res``.
         '''
-        efrag_pt2 = efrag_cc = efrag_cc_t = 0.0
+        efrag_pt2 = efrag_cc = efrag_cc_t = efrag_pt2_domain = 0.0
+        has_domain_pt2 = False
         for i, res in enumerate(frag_res):
             if res is not None:
                 efrag_pt2 += res[0] * frag_wghtlist[i]
                 efrag_cc += res[1] * frag_wghtlist[i]
                 efrag_cc_t += res[2] * frag_wghtlist[i]
+                if len(res) > 3:
+                    efrag_pt2_domain += res[3] * frag_wghtlist[i]
+                    has_domain_pt2 = True
         self.efrag_pt2  = efrag_pt2
+        self.efrag_pt2_domain = efrag_pt2_domain if has_domain_pt2 else None
         self.efrag_cc   = efrag_cc
         self.efrag_cc_t = efrag_cc_t
 
@@ -268,6 +274,13 @@ class LNOCCSD(lno_base.LNO):
     @property
     def e_corr_pt2(self):
         e_corr = self.efrag_pt2
+        return e_corr
+
+    @property
+    def e_corr_pt2_domain(self):
+        e_corr = self.efrag_pt2_domain
+        if e_corr is None:
+            e_corr = self.efrag_pt2
         return e_corr
 
     @property

@@ -107,6 +107,7 @@ class LNOMP2(lno_base.LNO):
     def __init__(self, mf, thresh=1e-4, frozen=None, **kwargs):
         super().__init__(mf, thresh=thresh, frozen=frozen, **kwargs)
         self.efrag_pt2 = None
+        self.efrag_pt2_domain = None
 
     def impurity_solve(self, mf, mo_coeff, lo_coeff, eris=None, frozen=None,
                        frag_prescreen=None, profile_info=None):
@@ -118,12 +119,24 @@ class LNOMP2(lno_base.LNO):
     def _post_proc(self, frag_res, frag_wghtlist):
         ''' Post processing results returned by `impurity_solve` collected in `frag_res`.
         '''
-        efrag_pt2 = 0.0
+        efrag_pt2 = efrag_pt2_domain = 0.0
+        has_domain_pt2 = False
         for i, res in enumerate(frag_res):
             if res is not None:
                 efrag_pt2 += res[0] * frag_wghtlist[i]
+                if len(res) > 1:
+                    efrag_pt2_domain += res[-1] * frag_wghtlist[i]
+                    has_domain_pt2 = True
         self.efrag_pt2  = efrag_pt2
+        self.efrag_pt2_domain = efrag_pt2_domain if has_domain_pt2 else None
 
     @property
     def e_corr(self):
         return self.efrag_pt2
+
+    @property
+    def e_corr_pt2_domain(self):
+        e_corr = self.efrag_pt2_domain
+        if e_corr is None:
+            e_corr = self.efrag_pt2
+        return e_corr

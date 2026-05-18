@@ -12,7 +12,7 @@ import jax
 import numpy as np
 
 from pyscfad import config, df, gto, scf
-from pyscfad.lno import LNOCCSD, LNOMP2
+from pyscfad.lno import LNOCCSD
 from pyscfad.lno.prescreen import build_dlno_prescreen_data, rebuild_dlno_prescreen_data
 from pyscfad.lno.tools import autofrag, map_lo_to_frag
 from pyscfad.ops import stop_trace
@@ -39,8 +39,6 @@ BASIS = "def2-svp"
 LO_TYPE = "iao"  # Change to "pm" or "boys" to try other localization types.
 CCSD_LNO_OCC_THR = 1e-4
 CCSD_LNO_VIR_THR = CCSD_LNO_OCC_THR / 10.0
-MP2_LNO_OCC_THR = 1e-5
-MP2_LNO_VIR_THR = MP2_LNO_OCC_THR / 10.0
 DOMAIN_THR = 1e-4
 DF_INCORE_SAFETY = 0.8
 # Increase this value, or set WATER_GRID_NMAX in the environment, to sweep
@@ -161,11 +159,7 @@ def print_threshold_summary(mol):
         f"CCSD LNO occ/vir = {CCSD_LNO_OCC_THR:.1e}/"
         f"{CCSD_LNO_VIR_THR:.1e}"
     )
-    print(
-        "  "
-        f"MP2  LNO occ/vir = {MP2_LNO_OCC_THR:.1e}/"
-        f"{MP2_LNO_VIR_THR:.1e}"
-    )
+    print("  MP2 correction = domain MP2 from the CCSD(T) fragment build")
     print(f"  domain/pair threshold = {DOMAIN_THR:.1e}")
 
 
@@ -301,16 +295,6 @@ def configure_lno_solver(solver, *, occ_thr, vir_thr, lo_type=LO_TYPE):
     return solver
 
 
-def make_mp2_solver(mf, *, occ_thr=MP2_LNO_OCC_THR,
-                    vir_thr=MP2_LNO_VIR_THR, lo_type=LO_TYPE):
-    return configure_lno_solver(
-        LNOMP2(mf, thresh=occ_thr, frozen=0),
-        occ_thr=occ_thr,
-        vir_thr=vir_thr,
-        lo_type=lo_type,
-    )
-
-
 def make_cc_solver(mf, *, occ_thr=CCSD_LNO_OCC_THR,
                    vir_thr=CCSD_LNO_VIR_THR, lo_type=LO_TYPE,
                    ccsd_t=False):
@@ -425,30 +409,21 @@ def dlno_total_energy(mol, timings=None, cderi_file=None, static_inputs=None):
         if report_setup:
             print_dlno_domain_summary(mol, dlno_data, "DLNO Domains")
 
-    with timed_section(timings, "DLNO-MP2"):
-        print_phase(mol, "Forward DLNO-MP2 Fragments")
-        pt = make_mp2_solver(mf, lo_type=LO_TYPE)
-        pt.use_dlno_prescreen = True
-        pt.dlno_prescreen_data = dlno_data
-        pt.profile_fragments = True
-        pt.profile_label = "DLNO-MP2"
-        pt.profile_pass = "forward"
-        pt.kernel(frag_lolist=frag_lolist, orbloc=lo_coeff)
-        print_scalar(mol, "DLNO-MP2 correlation energy", pt.e_corr)
-
     with timed_section(timings, "DLNO-CCSD(T)"):
         print_phase(mol, "Forward DLNO-CCSD(T) Fragments")
         mycc = make_cc_solver(mf, lo_type=LO_TYPE, ccsd_t=True)
         mycc.use_dlno_prescreen = True
         mycc.dlno_prescreen_data = dlno_data
+        mycc.compute_domain_pt2 = True
         mycc.profile_fragments = True
         mycc.profile_label = "DLNO-CCSD(T)"
         mycc.profile_pass = "forward"
         mycc.kernel(frag_lolist=frag_lolist, orbloc=lo_coeff)
-        print_scalar(mol, "DLNO fragment MP2 correlation", mycc.e_corr_pt2)
+        print_scalar(mol, "DLNO LNO-space MP2 correlation", mycc.e_corr_pt2)
+        print_scalar(mol, "DLNO domain MP2 correction", mycc.e_corr_pt2_domain)
         print_scalar(mol, "DLNO fragment CCSD correlation", mycc.e_corr_ccsd)
         print_scalar(mol, "DLNO fragment (T) correction", mycc.e_corr_ccsd_t)
-    return ehf + mycc.e_corr_pt2corrected(pt.e_corr)
+    return ehf + mycc.e_corr_pt2corrected(mycc.e_corr_pt2_domain)
 
 
 def append_csv_row(row):
@@ -525,7 +500,7 @@ def run_grid_point(grid_n):
         "scf_s": elapsed_scf(timings),
         "local_orbitals_fragments_s": timings.elapsed("Local orbitals/fragments"),
         "dlno_prescreen_s": timings.elapsed("DLNO prescreen"),
-        "mp2_s": timings.elapsed("DLNO-MP2"),
+        "mp2_s": 0.0,
         "dlno_ccsd_t_s": timings.elapsed("DLNO-CCSD(T)"),
         "forward_subtotal_s": forward_subtotal,
         "gradient_evaluation_total_s": grad_elapsed,

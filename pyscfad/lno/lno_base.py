@@ -331,6 +331,7 @@ class _FragmentSolverSettings:
     dm_corr_frag: object
     ccsd_t: bool
     dcsd: bool
+    compute_domain_pt2: bool
     profile_fragments: bool
     profile_label: str
     profile_pass: str
@@ -426,6 +427,7 @@ def _make_fragment_solver_settings(mfcc):
         dm_corr_frag=mfcc.dm_corr_frag,
         ccsd_t=bool(getattr(mfcc, 'ccsd_t', False)),
         dcsd=bool(getattr(mfcc, 'dcsd', False)),
+        compute_domain_pt2=bool(getattr(mfcc, 'compute_domain_pt2', False)),
         profile_fragments=bool(getattr(mfcc, 'profile_fragments', False)),
         profile_label=str(getattr(mfcc, 'profile_label', mfcc.__class__.__name__)),
         profile_pass=str(getattr(mfcc, 'profile_pass', 'forward')),
@@ -494,6 +496,7 @@ def _rebuild_fragment_solver(state, dlno_fragment_data, solver_settings):
         mfcc.ccsd_t = solver_settings.ccsd_t
     if hasattr(mfcc, 'dcsd'):
         mfcc.dcsd = solver_settings.dcsd
+    mfcc.compute_domain_pt2 = solver_settings.compute_domain_pt2
     return mfcc
 
 
@@ -696,12 +699,14 @@ def kernel_1frag(mfcc, eris, orbfragloc, no_type,
     eris_fpno = make_fragment_eris(mfcc, eris, frag_prescreen)
     make_fragment_eris_s = time.perf_counter() - eris_start
     fpno_start = time.perf_counter()
-    frzfrag, orbfrag = make_fpno1(mfcc, eris_fpno, orbfragloc, no_type,
-                                  THRESH_INTERNAL, thresh_pno,
-                                  frag_prescreen=frag_prescreen,
-                                  frozen_mask=frozen_mask,
-                                  frag_target_nocc=frag_target_nocc,
-                                  frag_target_nvir=frag_target_nvir)
+    frzfrag, orbfrag, domain_pt2 = make_fpno1(
+        mfcc, eris_fpno, orbfragloc, no_type,
+        THRESH_INTERNAL, thresh_pno,
+        frag_prescreen=frag_prescreen,
+        frozen_mask=frozen_mask,
+        frag_target_nocc=frag_target_nocc,
+        frag_target_nvir=frag_target_nvir,
+    )
     make_fpno1_s = time.perf_counter() - fpno_start
     info = _fragment_diagnostic_info(mfcc, eris_fpno, frag_prescreen, orbfragloc,
                                      frzfrag, orbfrag)
@@ -710,9 +715,13 @@ def kernel_1frag(mfcc, eris, orbfragloc, no_type,
     info['nfrag'] = getattr(mfcc, '_nfrag', None)
     info['make_fragment_eris_s'] = make_fragment_eris_s
     info['make_fpno1_s'] = make_fpno1_s
+    if getattr(mfcc, 'compute_domain_pt2', False):
+        info['domain_pt2'] = domain_pt2
     eris_fpno = None
     if orbfrag is None:
         frag_res = (0., 0., 0.)
+        if getattr(mfcc, 'compute_domain_pt2', False):
+            frag_res = frag_res + (domain_pt2,)
         info['impurity_solve_s'] = 0.0
         info['wall_s'] = time.perf_counter() - profile_start
         _append_and_maybe_print_fragment_profile(mfcc, info)
@@ -722,6 +731,8 @@ def kernel_1frag(mfcc, eris, orbfragloc, no_type,
                                    frozen=frzfrag, eris=eris,
                                    frag_prescreen=frag_prescreen,
                                    profile_info=info)
+    if getattr(mfcc, 'compute_domain_pt2', False):
+        frag_res = frag_res + (domain_pt2,)
     info['impurity_solve_s'] = time.perf_counter() - impurity_start
     info['wall_s'] = time.perf_counter() - profile_start
     _append_and_maybe_print_fragment_profile(mfcc, info)
@@ -851,6 +862,105 @@ def _subspace_equivalent(full_space, trial_space, thresh, overlap_tol=1e-6):
         return False
     return bool(numpy.all(numpy.abs(numpy.asarray(sigma[:full_space.shape[1]]) - 1.0) < overlap_tol))
 
+
+def _semicanonicalized_coeff(base_orb, coeff, fock, s1e, semicanonicalize_fn):
+    coeff = np.asarray(coeff)
+    if coeff.shape[-1] == 0:
+        return (
+            np.zeros((0,), dtype=fock.dtype),
+            np.zeros((base_orb.shape[1], 0), dtype=base_orb.dtype),
+        )
+    moe, orb = semicanonicalize_fn(fock, np.dot(base_orb, coeff))
+    coeff_sc = reduce(np.dot, (base_orb.T.conj(), s1e, orb))
+    return moe, coeff_sc
+
+
+def _identity_coeff(n, dtype):
+    return np.eye(n, dtype=dtype)
+
+
+def _hstack_or_empty(parts, nrow, dtype):
+    parts = [part for part in parts if part is not None and part.shape[-1] > 0]
+    if parts:
+        return np.hstack(parts)
+    return np.zeros((nrow, 0), dtype=dtype)
+
+
+def _concat_or_empty(parts, dtype):
+    parts = [part for part in parts if part is not None and part.shape[0] > 0]
+    if parts:
+        return np.concatenate(parts)
+    return np.zeros((0,), dtype=dtype)
+
+
+def _mp2_fragment_energy_from_lov(Lov, moe_occ, moe_vir, prjlo):
+    if Lov.shape[1] == 0 or Lov.shape[2] == 0:
+        return np.zeros((), dtype=Lov.dtype)
+    eov = moe_occ[:, None] - moe_vir
+    ovov = np.einsum('Lia,Ljb->iajb', Lov, Lov)
+    eiajb = eov[:, None, :, None] + eov[None, :, None, :]
+    t2 = ovov.transpose(0, 2, 1, 3) / eiajb
+    m = np.dot(prjlo.T, prjlo)
+    eij = 2 * np.einsum('pjab,qajb->pq', t2, ovov)
+    eij -= np.einsum('pjab,qbja->pq', t2, ovov)
+    return np.einsum('ij,ij', eij, m)
+
+
+def _domain_mp2_fragment_energy(mfcc, eris, orbfragloc,
+                                orbfragocc1, moefragocc1,
+                                orbfragvir1, moefragvir1,
+                                uocc2, uvir2, lovir,
+                                semicanonicalize_fn):
+    mf = mfcc._scf
+    s1e = eris.s1e
+    fock = eris.fock
+    orbocc1 = mfcc.split_mo()[1]
+    orbvir1 = mfcc.split_mo()[2]
+    moevir1 = mfcc.split_moe()[2]
+
+    occ_coeff_parts = []
+    occ_energy_parts = []
+    if uocc2 is not None and uocc2.shape[-1] > 0:
+        moe_occ2, coeff_occ2 = _semicanonicalized_coeff(
+            orbocc1, uocc2, fock, s1e, semicanonicalize_fn
+        )
+        occ_energy_parts.append(moe_occ2)
+        occ_coeff_parts.append(coeff_occ2)
+    coeff_occ1 = reduce(np.dot, (orbocc1.T.conj(), s1e, orbfragocc1))
+    occ_energy_parts.append(moefragocc1)
+    occ_coeff_parts.append(coeff_occ1)
+
+    vir_coeff_parts = []
+    vir_energy_parts = []
+    if uvir2 is None:
+        if not lovir:
+            vir_energy_parts.append(moevir1)
+            vir_coeff_parts.append(_identity_coeff(orbvir1.shape[1], orbvir1.dtype))
+    elif uvir2.shape[-1] > 0:
+        moe_vir2, coeff_vir2 = _semicanonicalized_coeff(
+            orbvir1, uvir2, fock, s1e, semicanonicalize_fn
+        )
+        vir_energy_parts.append(moe_vir2)
+        vir_coeff_parts.append(coeff_vir2)
+
+    if lovir:
+        coeff_vir1 = reduce(np.dot, (orbvir1.T.conj(), s1e, orbfragvir1))
+        vir_energy_parts.append(moefragvir1)
+        vir_coeff_parts.append(coeff_vir1)
+
+    occ_coeff = _hstack_or_empty(occ_coeff_parts, orbocc1.shape[1], orbocc1.dtype)
+    vir_coeff = _hstack_or_empty(vir_coeff_parts, orbvir1.shape[1], orbvir1.dtype)
+    moe_occ = _concat_or_empty(occ_energy_parts, mf.mo_energy.dtype)
+    moe_vir = _concat_or_empty(vir_energy_parts, mf.mo_energy.dtype)
+    if occ_coeff.shape[-1] == 0 or vir_coeff.shape[-1] == 0:
+        return np.zeros((), dtype=eris.Lov.dtype)
+
+    Lov = np.einsum('ip,Lia,aq->Lpq', occ_coeff, eris.Lov, vir_coeff)
+    occ_domain = np.dot(orbocc1, occ_coeff)
+    prjlo = reduce(np.dot, (orbfragloc.T, s1e, occ_domain))
+    return _mp2_fragment_energy_from_lov(Lov, moe_occ, moe_vir, prjlo)
+
+
 def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external,
                frag_prescreen=None,
                frozen_mask=None, frag_target_nocc=None, frag_target_nvir=None):
@@ -859,6 +969,7 @@ def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external
         USE_CHECKPOINT
         and not bool(getattr(mfcc, '_disable_checkpointed_mp2_rdm1', False))
     )
+    domain_pt2 = np.zeros((), dtype=eris.fock.dtype)
 
     mf = mfcc._scf
     mo_occ = mf.mo_occ
@@ -1103,6 +1214,16 @@ def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external
             t2 = None
         dmoo = reduce(np.dot, (uocc2.T, dmoo, uocc2))
 
+    if getattr(mfcc, 'compute_domain_pt2', False):
+        domain_pt2 = _domain_mp2_fragment_energy(
+            mfcc, eris, orbfragloc,
+            orbfragocc1, moefragocc1,
+            orbfragvir1 if lovir else None,
+            moefragvir1 if lovir else None,
+            uocc2, uvir2, lovir,
+            semicanonicalize_fn,
+        )
+
     # Compress external space by PNO
     if frag_target_nocc is not None:
         frag_target_nocc -= orbfragocc1.shape[1]
@@ -1136,7 +1257,7 @@ def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external
         if orbfragvir2.shape[-1] == 0:
             warnings.warn('No virtual orbital is included for this fragment, '
                           'setting correlation energy to zero.')
-            return None, None
+            return None, None, domain_pt2
         else:
             orbfragvir12 = semicanonicalize_fn(fock, orbfragvir2)[1]
 
@@ -1151,7 +1272,7 @@ def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external
 
     if _verbose_at_least(mfcc, 5):
         mytimer.timer('make_fpno1:')
-    return frzfrag, orbfrag
+    return frzfrag, orbfrag, domain_pt2
 
 def make_rdm1_mp2(t2, kind, e1_or_e2, swapidx):
     r''' Calculate MP2 rdm1 from T2.
@@ -1687,6 +1808,7 @@ class LNO(pytree.PytreeNode):
         self.dm_corr_frag = None
         self.use_dlno_prescreen = False
         self.dlno_prescreen_data = None
+        self.compute_domain_pt2 = False
 
         self._nmo = None
         self._nocc = None

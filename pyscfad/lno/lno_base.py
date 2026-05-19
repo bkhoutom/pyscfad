@@ -73,6 +73,33 @@ def get_fragment_profile(label=None):
     return rows
 
 
+def _profile_sort_key(row):
+    pass_order = {'forward': 0, 'backward replay': 1}
+    return (
+        str(row.get('label', '')),
+        pass_order.get(str(row.get('pass', '')), 99),
+        int(row.get('fragment', -1)),
+    )
+
+
+def remap_fragment_profile_row(row, indices, nfrag):
+    row = dict(row)
+    if 'fragment' in row:
+        ifrag = int(row['fragment'])
+        if 0 <= ifrag < len(indices):
+            row['fragment'] = int(indices[ifrag])
+    row['nfrag'] = int(nfrag)
+    phase_times = row.get('phase_times')
+    if phase_times is not None:
+        row['phase_times'] = dict(phase_times)
+    return row
+
+
+def print_fragment_profile_rows(rows):
+    for row in rows:
+        _print_fragment_report(row)
+
+
 def _append_fragment_profile(row):
     _FRAGMENT_PROFILE_ROWS.append(row)
 
@@ -184,7 +211,10 @@ def _print_fragment_report(row):
 def _append_and_maybe_print_fragment_profile(mfcc, row):
     if _fragment_report_enabled(mfcc):
         _append_fragment_profile(row)
-        if _verbose_at_least(mfcc, 2):
+        if (
+            _verbose_at_least(mfcc, 2)
+            and bool(getattr(mfcc, 'profile_print', True))
+        ):
             if row.get('pass') == 'backward replay':
                 return
             _print_fragment_report(row)
@@ -333,6 +363,10 @@ class _FragmentSolverSettings:
     dcsd: bool
     compute_domain_pt2: bool
     profile_fragments: bool
+    profile_print: bool
+    profile_mpi_indices: object
+    profile_mpi_nfrag: object
+    profile_mpi_print: bool
     profile_label: str
     profile_pass: str
 
@@ -429,6 +463,10 @@ def _make_fragment_solver_settings(mfcc):
         dcsd=bool(getattr(mfcc, 'dcsd', False)),
         compute_domain_pt2=bool(getattr(mfcc, 'compute_domain_pt2', False)),
         profile_fragments=bool(getattr(mfcc, 'profile_fragments', False)),
+        profile_print=bool(getattr(mfcc, 'profile_print', True)),
+        profile_mpi_indices=getattr(mfcc, 'profile_mpi_indices', None),
+        profile_mpi_nfrag=getattr(mfcc, 'profile_mpi_nfrag', None),
+        profile_mpi_print=bool(getattr(mfcc, 'profile_mpi_print', False)),
         profile_label=str(getattr(mfcc, 'profile_label', mfcc.__class__.__name__)),
         profile_pass=str(getattr(mfcc, 'profile_pass', 'forward')),
     )
@@ -484,6 +522,10 @@ def _rebuild_fragment_solver(state, dlno_fragment_data, solver_settings):
     mfcc.use_dlno_prescreen = True
     mfcc.dlno_prescreen_data = {'fragment_data': dlno_fragment_data}
     mfcc.profile_fragments = solver_settings.profile_fragments
+    mfcc.profile_print = solver_settings.profile_print
+    mfcc.profile_mpi_indices = solver_settings.profile_mpi_indices
+    mfcc.profile_mpi_nfrag = solver_settings.profile_mpi_nfrag
+    mfcc.profile_mpi_print = solver_settings.profile_mpi_print
     mfcc.profile_label = solver_settings.profile_label
     mfcc.profile_pass = solver_settings.profile_pass
     # The checkpointed MP2-RDM scan is not reproducible under nested replay VJP
@@ -610,6 +652,33 @@ def _tree_add_cotangent(x, y):
     return jax.tree_util.tree_map(_add_cotangent_leaf, x, y)
 
 
+def _print_mpi_replay_profile_rows(solver_settings, rows):
+    indices = solver_settings.profile_mpi_indices
+    nfrag = solver_settings.profile_mpi_nfrag
+    if indices is None or nfrag is None:
+        return
+    try:
+        from mpi4py import MPI  # pylint: disable=import-outside-toplevel
+    except ImportError:
+        return
+    comm = MPI.COMM_WORLD
+    mapped_rows = [
+        remap_fragment_profile_row(row, indices, nfrag)
+        for row in rows
+    ]
+    gathered = comm.gather(mapped_rows, root=0)
+    if comm.Get_rank() != 0:
+        return
+    all_rows = [row for rank_rows in gathered for row in rank_rows]
+    all_rows.sort(key=_profile_sort_key)
+    print(
+        f"\n{solver_settings.profile_label} backward pass "
+        f"({int(nfrag)} fragment replay(s))",
+        flush=True,
+    )
+    print_fragment_profile_rows(all_rows)
+
+
 def _fragment_kernel_replay_bwd(frag_lolist, no_type, frag_nonvlist,
                                 solver_settings, res, ybar):
     state, orbloc, dlno_data = res
@@ -617,13 +686,22 @@ def _fragment_kernel_replay_bwd(frag_lolist, no_type, frag_nonvlist,
     orbloc_bar = None
     dlno_data_bar = None
     bwd_settings = replace(solver_settings, profile_pass='backward replay')
-    report_bwd = bool(solver_settings.profile_fragments) or solver_settings.verbose >= 2
-    if report_bwd:
+    collect_bwd = (
+        bool(solver_settings.profile_fragments)
+        or solver_settings.verbose >= 2
+    )
+    print_bwd = (
+        collect_bwd
+        and bool(solver_settings.profile_print)
+        and solver_settings.verbose >= 2
+    )
+    if print_bwd:
         print(
             f"\n{solver_settings.profile_label} backward pass "
             f"({len(frag_lolist)} fragment replay(s))",
             flush=True,
         )
+    bwd_rows = []
     for ifrag in range(len(frag_lolist)):
         def frag_fn(state_, orbloc_, dlno_fragment_data_):
             return _fragment_one_replay(
@@ -653,7 +731,7 @@ def _fragment_kernel_replay_bwd(frag_lolist, no_type, frag_nonvlist,
                 frag_dlno_data_bar, piece_dlno_data_bar
             )
         pullback_s = time.perf_counter() - pullback_start
-        if report_bwd:
+        if collect_bwd:
             row = None
             for candidate in reversed(_FRAGMENT_PROFILE_ROWS[profile_row_start:]):
                 if (
@@ -673,10 +751,14 @@ def _fragment_kernel_replay_bwd(frag_lolist, no_type, frag_nonvlist,
                 _append_fragment_profile(row)
             row['replay_wall_s'] = replay_s
             row['pullback_wall_s'] = pullback_s
-            _print_fragment_report(row)
+            bwd_rows.append(dict(row))
+            if print_bwd:
+                _print_fragment_report(row)
         state_bar = _tree_add_cotangent(state_bar, frag_state_bar)
         orbloc_bar = _tree_add_cotangent(orbloc_bar, frag_orbloc_bar)
         dlno_data_bar = _tree_add_cotangent(dlno_data_bar, frag_dlno_data_bar)
+    if solver_settings.profile_mpi_print and bwd_rows:
+        _print_mpi_replay_profile_rows(solver_settings, bwd_rows)
     return state_bar, orbloc_bar, dlno_data_bar
 
 
@@ -1934,6 +2016,10 @@ class LNO(pytree.PytreeNode):
         self.use_dlno_prescreen = False
         self.dlno_prescreen_data = None
         self.compute_domain_pt2 = False
+        self.profile_print = True
+        self.profile_mpi_indices = None
+        self.profile_mpi_nfrag = None
+        self.profile_mpi_print = False
 
         self._nmo = None
         self._nocc = None

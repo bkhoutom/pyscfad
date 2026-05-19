@@ -4,6 +4,7 @@ run with:
 mpirun -n 2 python 11-mpi_lno_ccsd_t.py
 '''
 from mpi4py import MPI
+import warnings
 import jax
 import numpy
 from pyscfad import gto, scf, mp
@@ -18,12 +19,16 @@ config.update('pyscfad_ccsd_implicit_diff', True)
 atom = 'water_dimer.xyz'
 basis = 'ccpvdz'
 
-mol = gto.Mole(atom=atom, basis=basis)
-mol.verbose = 4
-mol.build(trace_exp=False, trace_ctr_coeff=False)
-
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
+if rank != 0:
+    warnings.filterwarnings('ignore',
+                            message='Function mol.dumps drops attribute coords.*')
+
+mol = gto.Mole(atom=atom, basis=basis)
+mol.verbose = 2 if rank == 0 else 0
+mol.build(trace_exp=False, trace_ctr_coeff=False)
+
 frozen = 2
 thresh_occ = 1e-3
 thresh_vir = 1e-4
@@ -36,6 +41,7 @@ def energy(mol):
     mfcc.thresh_vir = thresh_vir
     mfcc.lo_type = 'iao'
     mfcc.ccsd_t = True
+    mfcc.profile_fragments = True
     mfcc.kernel(frag_lolist=None)
 
     if rank == 0:

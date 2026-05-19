@@ -87,12 +87,15 @@ class TimingBreakdown:
         return sum(elapsed for section, elapsed in self.rows if section == name)
 
     def print_summary(self):
-        print()
-        print("Timing breakdown")
+        print(flush=True)
+        print("Timing breakdown", flush=True)
         width = max((len(name) for name, _ in self.rows), default=0)
         for name, elapsed in self.rows:
-            print(f"  {name:<{width}} : {elapsed:8.3f} s")
-        print(f"  {'Static+forward subtotal':<{width}} : {self.total():8.3f} s")
+            print(f"  {name:<{width}} : {elapsed:8.3f} s", flush=True)
+        print(
+            f"  {'Static+forward subtotal':<{width}} : {self.total():8.3f} s",
+            flush=True,
+        )
 
 
 @contextmanager
@@ -113,16 +116,16 @@ def verbose_enabled(obj, level=2):
 
 def print_phase(mol, title):
     if verbose_enabled(mol, 2):
-        print()
-        print(title)
-        print("-" * len(title))
+        print(flush=True)
+        print(title, flush=True)
+        print("-" * len(title), flush=True)
 
 
 def print_scalar(mol, label, value):
     if not verbose_enabled(mol, 2):
         return
     try:
-        print(f"  {label}: {float(value): .12f}")
+        print(f"  {label}: {float(value): .12f}", flush=True)
     except Exception:
         jax.debug.print(f"  {label}: {{value: .12f}}", value=value)
 
@@ -143,24 +146,28 @@ def print_topology_profile(mol, data):
     rows = data.get("topology_profile") or ()
     if not rows:
         return
-    print("  topology build timings:")
+    print("  topology build timings:", flush=True)
     for row in rows:
-        print(f"    {row['section']:<28} {row['wall_s']:8.3f} s")
+        print(f"    {row['section']:<28} {row['wall_s']:8.3f} s", flush=True)
 
 
 def print_threshold_summary(mol):
     if not verbose_enabled(mol, 2):
         return
-    print()
-    print("DLNO Thresholds")
-    print("---------------")
+    print(flush=True)
+    print("DLNO Thresholds", flush=True)
+    print("---------------", flush=True)
     print(
         "  "
         f"CCSD LNO occ/vir = {CCSD_LNO_OCC_THR:.1e}/"
-        f"{CCSD_LNO_VIR_THR:.1e}"
+        f"{CCSD_LNO_VIR_THR:.1e}",
+        flush=True,
     )
-    print("  MP2 correction = domain MP2 from the CCSD(T) fragment build")
-    print(f"  domain/pair threshold = {DOMAIN_THR:.1e}")
+    print(
+        "  MP2 correction = domain MP2 from the CCSD(T) fragment build",
+        flush=True,
+    )
+    print(f"  domain/pair threshold = {DOMAIN_THR:.1e}", flush=True)
 
 
 def print_dlno_domain_summary(mol, data, title, include_timing=False):
@@ -169,12 +176,13 @@ def print_dlno_domain_summary(mol, data, title, include_timing=False):
 
     fragments = data.get("fragment_data", ())
     print_phase(mol, title)
-    print(f"  number of domains/fragments: {len(fragments)}")
+    print(f"  number of domains/fragments: {len(fragments)}", flush=True)
     if fragments:
         print(
             "  "
             f"{'frag':>4} {'LOs':>5} {'strong':>7} "
-            f"{'atoms':>7} {'AOs':>6} {'occ':>6} {'vir':>6}"
+            f"{'atoms':>7} {'AOs':>6} {'occ':>6} {'vir':>6}",
+            flush=True,
         )
     for frag in fragments:
         ifrag = int(frag.get("fragment_index", 0))
@@ -189,7 +197,8 @@ def print_dlno_domain_summary(mol, data, title, include_timing=False):
             "  "
             f"{ifrag:4d} {len(loidx):5d} {len(strong):7d} "
             f"{atom_count(domain):7d} {ao_count_for_atoms(mol, domain):6d} "
-            f"{nocc:6d} {nvir:6d}"
+            f"{nocc:6d} {nvir:6d}",
+            flush=True,
         )
     if include_timing:
         print_topology_profile(mol, data)
@@ -396,8 +405,8 @@ def dlno_total_energy(mol, timings=None, cderi_file=None, static_inputs=None):
             lo_coeff = build_local_orbitals(mf)
             frag_lolist = static_frag_lolist
         if report_setup and verbose_enabled(mol, 2):
-            print(f"  localized occupied orbitals: {lo_coeff.shape[1]}")
-            print(f"  fragments: {len(frag_lolist)}")
+            print(f"  localized occupied orbitals: {lo_coeff.shape[1]}", flush=True)
+            print(f"  fragments: {len(frag_lolist)}", flush=True)
 
     with timed_section(timings, "DLNO prescreen"):
         dlno_data = build_dlno_data(
@@ -439,7 +448,7 @@ def append_csv_row(row):
 
 
 def run_grid_point(grid_n):
-    print()
+    print(flush=True)
     print(
         f"Running water grid {grid_n} x {grid_n} x {grid_n} "
         f"with spacing {WATER_SPACING_ANG:.2f} Angstrom",
@@ -474,22 +483,27 @@ def run_grid_point(grid_n):
     forward_subtotal = timings.total()
     ad_backward_residual = grad_elapsed - forward_subtotal
 
-    print()
-    print("DLNO-CCSD(T) gradient summary")
-    print()
-    print("SCF backend: cphf")
-    print(f"LO type: {LO_TYPE}")
+    print(flush=True)
+    print("DLNO-CCSD(T) gradient summary", flush=True)
+    print(flush=True)
+    print("SCF backend: cphf", flush=True)
+    print(f"LO type: {LO_TYPE}", flush=True)
     print(
         f"Water grid: {grid_n} x {grid_n} x {grid_n}, "
-        f"spacing = {WATER_SPACING_ANG:.2f} Angstrom, atoms = {mol.natm}"
+        f"spacing = {WATER_SPACING_ANG:.2f} Angstrom, atoms = {mol.natm}",
+        flush=True,
     )
-    print(f"DLNO-prescreen total energy:{float(e_dlno): .12f}")
-    print("DLNO-prescreen gradient:\n", g_dlno_arr)
+    print(f"DLNO-prescreen total energy:{float(e_dlno): .12f}", flush=True)
+    print("DLNO-prescreen gradient:\n", g_dlno_arr, flush=True)
     timings.print_summary()
-    print(f"  {'Gradient evaluation total':<24} : {grad_elapsed:8.3f} s")
+    print(
+        f"  {'Gradient evaluation total':<24} : {grad_elapsed:8.3f} s",
+        flush=True,
+    )
     print(
         f"  {'AD/backward residual':<24} : "
-        f"{ad_backward_residual:8.3f} s"
+        f"{ad_backward_residual:8.3f} s",
+        flush=True,
     )
 
     row = {
@@ -507,7 +521,7 @@ def run_grid_point(grid_n):
         "ad_backward_residual_s": ad_backward_residual,
     }
     append_csv_row(row)
-    print(f"Appended timing row to {CSV_PATH}")
+    print(f"Appended timing row to {CSV_PATH}", flush=True)
     return row
 
 

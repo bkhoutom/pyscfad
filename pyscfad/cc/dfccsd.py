@@ -14,7 +14,6 @@
 
 from dataclasses import dataclass
 from functools import partial
-import os
 from pyscf.lib import square_mat_in_trilu_indices
 import numpy
 import jax
@@ -119,48 +118,23 @@ class RCCSD(ccsd.CCSD):
         return self.e_corr, self.t1, self.t2
 
 
-def _dfccsd_vvvv_b_block(nvir):
-    try:
-        block = int(os.environ.get('PYSCFAD_DFCCSD_VVVV_B_BLOCK', '16'))
-    except ValueError:
-        block = 16
-    return max(1, min(nvir, block))
-
-
 @custom_vjp
 def _contract_vvvv_t2_lowmem(Lvv, t2):
     nvir = t2.shape[-1]
-    naux = Lvv.shape[0]
-    b_block = _dfccsd_vvvv_b_block(nvir)
-    nblocks = (nvir + b_block - 1) // b_block
     tril2sq = jnp.asarray(square_mat_in_trilu_indices(nvir))
-    b_offsets = jnp.arange(nblocks) * b_block
-    b_rel = jnp.arange(b_block)
+    x2 = t2.reshape(-1, nvir*nvir)
 
     def contract_one_a(_, a):
         pair_ac = jax.lax.dynamic_index_in_dim(
             tril2sq, a, axis=0, keepdims=False
         )
         lac = jnp.take(Lvv, pair_ac, axis=1)
+        g_acbd = lib.unpack_tril(jnp.dot(jnp.transpose(lac), Lvv))
+        g_cdb = jnp.transpose(g_acbd, (0, 2, 1)).reshape(nvir*nvir, nvir)
+        return None, jnp.dot(x2, g_cdb)
 
-        def contract_one_b_block(_, b0):
-            b_idx = b0 + b_rel
-            b_mask = b_idx < nvir
-            b_safe = jnp.minimum(b_idx, nvir - 1)
-            pair_bd = jnp.take(tril2sq, b_safe, axis=0)
-            lbd = jnp.take(Lvv, pair_bd.reshape(-1), axis=1)
-            lbd = lbd.reshape(naux, b_block, nvir)
-            g_cbd = jnp.einsum('xc,xbd->cbd', lac, lbd)
-            h_ablock = jnp.einsum('pcd,cbd->bp', t2, g_cbd)
-            h_ablock = jnp.where(b_mask[:, None], h_ablock, 0)
-            return None, h_ablock
-
-        _, H_block_bp = jax.lax.scan(contract_one_b_block, None, b_offsets)
-        H_bp = H_block_bp.reshape(nblocks * b_block, t2.shape[0])
-        return None, H_bp[:nvir]
-
-    _, H_abp = jax.lax.scan(contract_one_a, None, jnp.arange(nvir))
-    return jnp.transpose(H_abp, (2, 0, 1))
+    _, H_apb = jax.lax.scan(contract_one_a, None, jnp.arange(nvir))
+    return jnp.transpose(H_apb, (1, 0, 2))
 
 
 def _contract_vvvv_t2_lowmem_fwd(Lvv, t2):
@@ -172,11 +146,7 @@ def _contract_vvvv_t2_lowmem_bwd(res, out_bar):
     Lvv, t2 = res
     nvir = t2.shape[-1]
     naux = Lvv.shape[0]
-    b_block = _dfccsd_vvvv_b_block(nvir)
-    nblocks = (nvir + b_block - 1) // b_block
     tril2sq = jnp.asarray(square_mat_in_trilu_indices(nvir))
-    b_offsets = jnp.arange(nblocks) * b_block
-    b_rel = jnp.arange(b_block)
 
     def add_one_a(carry, a):
         Lvv_bar, t2_bar = carry
@@ -184,28 +154,18 @@ def _contract_vvvv_t2_lowmem_bwd(res, out_bar):
             tril2sq, a, axis=0, keepdims=False
         )
         lac = jnp.take(Lvv, pair_ac, axis=1)
-
-        def add_one_b_block(carry_b, b0):
-            Lvv_bar_b, t2_bar_b = carry_b
-            b_idx = b0 + b_rel
-            b_mask = b_idx < nvir
-            b_safe = jnp.minimum(b_idx, nvir - 1)
-            pair_bd = jnp.take(tril2sq, b_safe, axis=0)
-            lbd = jnp.take(Lvv, pair_bd.reshape(-1), axis=1)
-            lbd = lbd.reshape(naux, b_block, nvir)
-            hbar = jnp.take(jnp.take(out_bar, a, axis=1), b_safe, axis=1)
-            hbar = jnp.where(b_mask[None, :], hbar, 0)
-            g_cbd = jnp.einsum('xc,xbd->cbd', lac, lbd)
-            t2_bar_b += jnp.einsum('pb,cbd->pcd', hbar, g_cbd)
-            lac_bar = jnp.einsum('pb,pcd,xbd->xc', hbar, t2, lbd)
-            lbd_bar = jnp.einsum('pb,pcd,xc->xbd', hbar, t2, lac)
-            Lvv_bar_b = Lvv_bar_b.at[:, pair_ac].add(lac_bar)
-            Lvv_bar_b = Lvv_bar_b.at[:, pair_bd.reshape(-1)].add(
-                lbd_bar.reshape(naux, b_block * nvir)
-            )
-            return (Lvv_bar_b, t2_bar_b), None
-
-        return jax.lax.scan(add_one_b_block, (Lvv_bar, t2_bar), b_offsets)[0], None
+        lbd = jnp.take(Lvv, tril2sq.reshape(-1), axis=1)
+        lbd = lbd.reshape(naux, nvir, nvir)
+        hbar = jnp.take(out_bar, a, axis=1)
+        g_cbd = jnp.einsum('xc,xbd->cbd', lac, lbd)
+        t2_bar += jnp.einsum('pb,cbd->pcd', hbar, g_cbd)
+        lac_bar = jnp.einsum('pb,pcd,xbd->xc', hbar, t2, lbd)
+        lbd_bar = jnp.einsum('pb,pcd,xc->xbd', hbar, t2, lac)
+        Lvv_bar = Lvv_bar.at[:, pair_ac].add(lac_bar)
+        Lvv_bar = Lvv_bar.at[:, tril2sq.reshape(-1)].add(
+            lbd_bar.reshape(naux, nvir*nvir)
+        )
+        return (Lvv_bar, t2_bar), None
 
     init = (np.zeros_like(Lvv), np.zeros_like(t2))
     (Lvv_bar, t2_bar), _ = jax.lax.scan(add_one_a, init, jnp.arange(nvir))

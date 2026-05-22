@@ -135,8 +135,6 @@ def _ccsd_t_energy_vjp(eris, t1, t2, et_bar, max_memory):
     mem_now = current_memory()[0]
     max_memory = max(0, max_memory - mem_now)
     min_memory = (nvir**2*nocc**2+nvir*nocc**3+nocc**3*6+2*nvir*nocc+nmo)*num_threads()*8/1e6
-    if max_memory < min_memory:
-        raise RuntimeError(f'_ccsd_t_energy_vjp: at least {min_memory} MB of memory needed.')
     bufsize = (max_memory - min_memory)*1e6/8/num_threads()/(nocc*nmo)
     bufsize *= .5
     bufsize *= .8
@@ -183,10 +181,13 @@ def _ccsd_t_energy_vjp(eris, t1, t2, et_bar, max_memory):
 
     ovoo_bar = numpy.asarray(vooo_bar.transpose(1,0,3,2))
     ovov_bar = numpy.asarray(vvop_bar[:,:,:,:nocc].transpose(2,0,3,1))
-    ovvv_bar = vvop_bar[:,:,:,nocc:].transpose(2,0,3,1)
-    ovvv_bar += ovvv_bar.transpose(0,1,3,2)
-    idx, idy = numpy.diag_indices(nvir)
-    ovvv_bar[:,:,idx,idy] *= .5
-    idx, idy = numpy.tril_indices(nvir)
-    ovvv_tril_bar = numpy.asarray(ovvv_bar[:,:,idx,idy])
-    return t1_bar, t2_bar, fock_bar, mo_energy_bar, ovoo_bar, ovov_bar, ovvv_tril_bar
+    if eris.ovvv.ndim == 4:
+        ovvv_out_bar = numpy.asarray(vvop_bar[:,:,:,nocc:].transpose(2,0,3,1))
+    else:
+        ovvv_bar = vvop_bar[:,:,:,nocc:].transpose(2,0,3,1)
+        ovvv_bar += ovvv_bar.transpose(0,1,3,2)
+        idx, idy = numpy.diag_indices(nvir)
+        ovvv_bar[:,:,idx,idy] *= .5
+        idx, idy = numpy.tril_indices(nvir)
+        ovvv_out_bar = numpy.asarray(ovvv_bar[:,:,idx,idy])
+    return t1_bar, t2_bar, fock_bar, mo_energy_bar, ovoo_bar, ovov_bar, ovvv_out_bar

@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass
+from functools import partial
 from pyscf.lib import square_mat_in_trilu_indices
+import numpy
 import jax
 from jax import custom_vjp
 from jax.interpreters import ad as jax_ad
@@ -22,6 +25,58 @@ from pyscfad import config, config_update
 from pyscfad.ao2mo import _ao2mo
 from pyscfad.cc import ccsd, ccsd_lambda
 from pyscfad.tools.linear_solver import gen_gmres
+
+
+@dataclass(frozen=True)
+class _DFCCSDResponseContext:
+    nmo: int
+    nocc: int
+    level_shift: float
+    cc2: bool
+    direct: bool
+    dcsd: bool
+
+    def vector_to_amplitudes(self, vec):
+        return ccsd.vector_to_amplitudes(vec, self.nmo, self.nocc)
+
+    def amplitudes_to_vector(self, t1, t2, out=None):
+        return ccsd.amplitudes_to_vector(t1, t2, out=out)
+
+    def _add_vvvv(self, t1, t2, eris, out=None, with_ovvv=None, t2sym=None):
+        return ccsd._add_vvvv(self, t1, t2, eris, out=out,
+                              with_ovvv=with_ovvv, t2sym=t2sym)
+
+
+class _DFCCSDResponseERIs:
+    def __init__(self, fock, mo_energy, oooo, ovoo, ovov, oovv, ovvo,
+                 ovvv, Lvv):
+        self.fock = fock
+        self.mo_energy = mo_energy
+        self.oooo = oooo
+        self.ovoo = ovoo
+        self.ovov = ovov
+        self.oovv = oovv
+        self.ovvo = ovvo
+        self.ovvv = ovvv
+        self.vvvv = None
+        self.Lvv = Lvv
+        self.mol = None
+
+    def _contract_vvvv_t2(self, mycc, t2, direct=False, out=None,
+                          verbose=None):
+        assert not direct
+        return _contract_vvvv_t2(mycc, self.mol, self.Lvv, t2)
+
+
+@partial(jax.jit, static_argnums=0)
+def _dfccsd_response_optimality(ctx, amp, fock, mo_energy, oooo, ovoo, ovov,
+                                oovv, ovvo, ovvv, Lvv):
+    eris = _DFCCSDResponseERIs(fock, mo_energy, oooo, ovoo, ovov, oovv, ovvo,
+                               ovvv, Lvv)
+    t1, t2 = ctx.vector_to_amplitudes(amp)
+    t1new, t2new = ccsd.update_amps(ctx, t1, t2, eris)
+    return ctx.amplitudes_to_vector(t1new, t2new) - amp
+
 
 class RCCSD(ccsd.CCSD):
     _dynamic_attr = _keys = {'with_df'}
@@ -61,19 +116,75 @@ class RCCSD(ccsd.CCSD):
         self._finalize()
         return self.e_corr, self.t1, self.t2
 
+@custom_vjp
+def _contract_vvvv_t2_lowmem(Lvv, t2):
+    nvir = t2.shape[-1]
+    tril2sq = np.asarray(square_mat_in_trilu_indices(nvir))
+    b_range = np.arange(nvir)
+
+    def contract_one_a(_, a):
+        pair_ac = tril2sq[a]
+        lac = Lvv[:, pair_ac]
+
+        def contract_one_ab(_, b):
+            pair_bd = tril2sq[b]
+            lbd = Lvv[:, pair_bd]
+            g_cd = np.dot(np.transpose(lac), lbd)
+            h_ab = np.einsum('pcd,cd->p', t2, g_cd)
+            return None, h_ab
+
+        return None, jax.lax.scan(contract_one_ab, None, b_range)[1]
+
+    _, H_abp = jax.lax.scan(contract_one_a, None, np.arange(nvir))
+    return np.transpose(H_abp, (2, 0, 1))
+
+
+def _contract_vvvv_t2_lowmem_fwd(Lvv, t2):
+    out = _contract_vvvv_t2_lowmem(Lvv, t2)
+    return out, (Lvv, t2)
+
+
+def _contract_vvvv_t2_lowmem_bwd(res, out_bar):
+    Lvv, t2 = res
+    nvir = t2.shape[-1]
+    tril2sq = np.asarray(square_mat_in_trilu_indices(nvir))
+    b_range = np.arange(nvir)
+
+    def add_one_a(carry, a):
+        Lvv_bar, t2_bar = carry
+        pair_ac = tril2sq[a]
+        lac = Lvv[:, pair_ac]
+
+        def add_one_ab(carry_b, b):
+            Lvv_bar_b, t2_bar_b = carry_b
+            pair_bd = tril2sq[b]
+            lbd = Lvv[:, pair_bd]
+            hbar = out_bar[:, a, b]
+            g_cd = np.dot(np.transpose(lac), lbd)
+            t2_bar_b += hbar[:, None, None] * g_cd[None, :, :]
+            lac_bar = np.einsum('p,pcd,xd->xc', hbar, t2, lbd)
+            lbd_bar = np.einsum('p,pcd,xc->xd', hbar, t2, lac)
+            Lvv_bar_b = Lvv_bar_b.at[:, pair_ac].add(lac_bar)
+            Lvv_bar_b = Lvv_bar_b.at[:, pair_bd].add(lbd_bar)
+            return (Lvv_bar_b, t2_bar_b), None
+
+        return jax.lax.scan(add_one_ab, (Lvv_bar, t2_bar), b_range)[0], None
+
+    init = (np.zeros_like(Lvv), np.zeros_like(t2))
+    (Lvv_bar, t2_bar), _ = jax.lax.scan(add_one_a, init, np.arange(nvir))
+    return Lvv_bar, t2_bar
+
+
+_contract_vvvv_t2_lowmem.defvjp(
+    _contract_vvvv_t2_lowmem_fwd,
+    _contract_vvvv_t2_lowmem_bwd,
+)
+
+
 def _contract_vvvv_t2(mycc, mol, Lvv, t2, out=None, verbose=None):
     '''Ht2 = numpy.einsum('ijcd,acbd->ijab', t2, vvvv)
     '''
-    nvir = t2.shape[-1]
-    nvir2 = nvir * nvir
-    x2 = t2.reshape(-1, nvir2)
-
-    tril2sq = square_mat_in_trilu_indices(nvir)
-    tmp = lib.unpack_tril(np.dot(np.transpose(Lvv), Lvv))
-    tmp1 = np.transpose(tmp[tril2sq], (0, 2, 1, 3)).reshape(nvir2,nvir2)
-    Ht2tril = np.dot(x2, tmp1)
-    tril2sq = None
-    return Ht2tril.reshape(t2.shape)
+    return _contract_vvvv_t2_lowmem(Lvv, t2)
 
 class _ChemistsERIs(ccsd._ChemistsERIs):
     _dynamic_attr = {'Lvv'}
@@ -186,6 +297,17 @@ def _init_amps_no_side_effect(mycc, eris):
     return t1, t2
 
 
+def _amplitudes_cotangent_to_vector(bar_t1, bar_t2):
+    nocc, nvir = bar_t1.shape
+    nov = nocc * nvir
+    bar_t2_mat = np.transpose(bar_t2, (0, 2, 1, 3)).reshape(nov, nov)
+    idx = numpy.tril_indices(nov)
+    lower = bar_t2_mat[idx]
+    upper = np.transpose(bar_t2_mat)[idx]
+    bar_t2_vec = np.where(idx[0] == idx[1], lower, lower + upper)
+    return np.concatenate((bar_t1.ravel(), bar_t2_vec), axis=None)
+
+
 def _dfccsd_kernel_plain(mycc, eris, t1=None, t2=None):
     with config_update('pyscfad_ccsd_implicit_diff', False):
         return ccsd.kernel(
@@ -274,8 +396,7 @@ def _dfccsd_kernel_custom_bwd_with_amplitudes(
     if not _cotangent_is_zero(bar_t1) or not _cotangent_is_zero(bar_t2):
         bar_t1 = _cotangent_or_zeros(bar_t1, t1)
         bar_t2 = _cotangent_or_zeros(bar_t2, t2)
-        _, amplitudes_vjp = jax.vjp(mycc.vector_to_amplitudes, amp)
-        bar_amp += amplitudes_vjp((bar_t1, bar_t2))[0]
+        bar_amp += _amplitudes_cotangent_to_vector(bar_t1, bar_t2)
 
     if not _cotangent_is_zero(bar_e):
         def scaled_energy(amp_, eris_):
@@ -294,22 +415,40 @@ def _dfccsd_kernel_custom_bwd_with_amplitudes(
         t1new, t2new = mycc.update_amps(t1_, t2_, eris_)
         return mycc.amplitudes_to_vector(t1new, t2new)
 
-    def optimality_amp(amp_):
-        return fixed_point(amp_, eris) - amp_
+    def optimality(amp_, eris_):
+        return fixed_point(amp_, eris_) - amp_
 
-    _, amp_vjp = jax.vjp(optimality_amp, amp)
+    eris_leaves, eris_treedef = jax.tree_util.tree_flatten(eris)
+    if len(eris_leaves) != 9:
+        def optimality_from_eris_leaves(amp_, *eris_leaves_):
+            eris_ = jax.tree_util.tree_unflatten(eris_treedef, eris_leaves_)
+            return optimality(amp_, eris_)
+    else:
+        ctx = _DFCCSDResponseContext(
+            nmo=int(mycc.nmo),
+            nocc=int(mycc.nocc),
+            level_shift=float(mycc.level_shift),
+            cc2=bool(mycc.cc2),
+            direct=bool(mycc.direct),
+            dcsd=bool(mycc.dcsd),
+        )
+
+        def optimality_from_eris_leaves(amp_, *eris_leaves_):
+            return _dfccsd_response_optimality(ctx, amp_, *eris_leaves_)
+
+    _, optimality_vjp = jax.vjp(
+        optimality_from_eris_leaves, amp, *eris_leaves
+    )
 
     def matvec(u):
-        return amp_vjp(u)[0]
+        return optimality_vjp(u)[0]
 
     solver = gen_gmres(tol=mycc.conv_tol_normt)
     lambda_bar = solver(matvec, -bar_amp)[0]
-
-    def optimality_eris(eris_):
-        return fixed_point(amp, eris_) - amp
-
-    _, eris_vjp = jax.vjp(optimality_eris, eris)
-    eris_bar_response = eris_vjp(lambda_bar)[0]
+    response_bars = optimality_vjp(lambda_bar)
+    eris_bar_response = jax.tree_util.tree_unflatten(
+        eris_treedef, response_bars[1:]
+    )
     return _tree_add(eris_bar, eris_bar_response)
 
 

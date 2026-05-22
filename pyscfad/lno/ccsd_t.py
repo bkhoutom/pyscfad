@@ -89,6 +89,22 @@ def _fill_vvop(vvop, ovov, ovvv, nocc, nvir):
         vvop[:,:,i0:i1,nocc:] = ovvv_block.conj().transpose(1,3,0,2)
         ovw = ovvv_block = None
 
+def _ccsd_t_forward_block_nvir(nocc, nvir, max_memory):
+    try:
+        block_mb = float(os.environ.get('PYSCFAD_LNO_CCSD_T_FWD_BLOCK_MB', 128.0))
+    except ValueError:
+        block_mb = 128.0
+
+    thread_scratch = (nocc**3*3 + nocc*nvir*2 + 2) * num_threads()
+    shared_scratch = nocc**3 * 3
+    job_doubles_per_a = nvir * (nvir + 1) / 2 * 7
+    base_doubles = thread_scratch + shared_scratch
+    avail_doubles = max_memory * 1e6 / 8
+
+    block_from_memory = int((avail_doubles - base_doubles) // job_doubles_per_a)
+    block_from_target = int(block_mb * 1024.0**2 / 8 // job_doubles_per_a)
+    return max(1, min(nvir, block_from_memory, max(1, block_from_target)))
+
 @partial(custom_vjp, nondiff_argnums=(8,))
 def _ccsd_t_energy(mat, t1T, t2T, mo_energy, fvo,
                    ovoo, ovov, ovvv, max_memory):
@@ -124,10 +140,9 @@ def _ccsd_t_energy(mat, t1T, t2T, mo_energy, fvo,
 
     mem_now = current_memory()[0]
     max_memory = max(0, max_memory - mem_now)
-    cache_size = (nocc**3*3+nocc*nvir*2+2)*num_threads()+nvir**2*(nvir+1)/2*7+nocc**3*3
-    if max_memory*1e6/8 < cache_size:
-        raise RuntimeError(f'{cache_size*8/1e6} MB more memory is needed.')
-    contract(0, nvir, vvop)
+    bufsize = _ccsd_t_forward_block_nvir(nocc, nvir, max_memory)
+    for a0, a1 in prange(0, nvir, bufsize):
+        contract(a0, a1, vvop)
 
     et_sum *= 2. / 3.
     et = et_sum[0].real
@@ -208,9 +223,6 @@ def _ccsd_t_energy_bwd(max_memory, res, et_bar):
     min_memory*= 8./1e6
     bufsize = (max_memory - min_memory)*1e6/8/num_threads()/(nocc*nmo*nvir+nvir)/2
     bufsize *= .8
-    if bufsize < 8:
-        mem_need = min_memory + 160.*(nocc*nmo*nvir+nvir)*num_threads()/1e6
-        raise RuntimeError(f'_ccsd_t_energy_vjp: at least {mem_need} MB of more memory needed.')
     bufsize = int(max(8, bufsize))
 
     for a0, a1 in reversed(list(prange(0, nvir, bufsize))):

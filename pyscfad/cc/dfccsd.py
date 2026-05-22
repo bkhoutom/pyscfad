@@ -129,8 +129,10 @@ def _contract_vvvv_t2_lowmem(Lvv, t2):
             tril2sq, a, axis=0, keepdims=False
         )
         lac = jnp.take(Lvv, pair_ac, axis=1)
-        g_acbd = lib.unpack_tril(jnp.dot(jnp.transpose(lac), Lvv))
-        g_cdb = jnp.transpose(g_acbd, (0, 2, 1)).reshape(nvir*nvir, nvir)
+        g_cbd_packed = jnp.dot(jnp.transpose(lac), Lvv)
+        g_cbd = jnp.take(g_cbd_packed, tril2sq.reshape(-1), axis=1)
+        g_cbd = g_cbd.reshape(nvir, nvir, nvir)
+        g_cdb = jnp.transpose(g_cbd, (0, 2, 1)).reshape(nvir*nvir, nvir)
         return None, jnp.dot(x2, g_cdb)
 
     _, H_apb = jax.lax.scan(contract_one_a, None, jnp.arange(nvir))

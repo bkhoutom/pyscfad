@@ -17,6 +17,7 @@ from functools import partial
 from pyscf.lib import square_mat_in_trilu_indices
 import numpy
 import jax
+import jax.numpy as jnp
 from jax import custom_vjp
 from jax.interpreters import ad as jax_ad
 from pyscfad import numpy as np
@@ -119,24 +120,28 @@ class RCCSD(ccsd.CCSD):
 @custom_vjp
 def _contract_vvvv_t2_lowmem(Lvv, t2):
     nvir = t2.shape[-1]
-    tril2sq = np.asarray(square_mat_in_trilu_indices(nvir))
-    b_range = np.arange(nvir)
+    tril2sq = jnp.asarray(square_mat_in_trilu_indices(nvir))
+    b_range = jnp.arange(nvir)
 
     def contract_one_a(_, a):
-        pair_ac = tril2sq[a]
-        lac = Lvv[:, pair_ac]
+        pair_ac = jax.lax.dynamic_index_in_dim(
+            tril2sq, a, axis=0, keepdims=False
+        )
+        lac = jnp.take(Lvv, pair_ac, axis=1)
 
         def contract_one_ab(_, b):
-            pair_bd = tril2sq[b]
-            lbd = Lvv[:, pair_bd]
-            g_cd = np.dot(np.transpose(lac), lbd)
-            h_ab = np.einsum('pcd,cd->p', t2, g_cd)
+            pair_bd = jax.lax.dynamic_index_in_dim(
+                tril2sq, b, axis=0, keepdims=False
+            )
+            lbd = jnp.take(Lvv, pair_bd, axis=1)
+            g_cd = jnp.dot(jnp.transpose(lac), lbd)
+            h_ab = jnp.einsum('pcd,cd->p', t2, g_cd)
             return None, h_ab
 
         return None, jax.lax.scan(contract_one_ab, None, b_range)[1]
 
-    _, H_abp = jax.lax.scan(contract_one_a, None, np.arange(nvir))
-    return np.transpose(H_abp, (2, 0, 1))
+    _, H_abp = jax.lax.scan(contract_one_a, None, jnp.arange(nvir))
+    return jnp.transpose(H_abp, (2, 0, 1))
 
 
 def _contract_vvvv_t2_lowmem_fwd(Lvv, t2):
@@ -147,23 +152,27 @@ def _contract_vvvv_t2_lowmem_fwd(Lvv, t2):
 def _contract_vvvv_t2_lowmem_bwd(res, out_bar):
     Lvv, t2 = res
     nvir = t2.shape[-1]
-    tril2sq = np.asarray(square_mat_in_trilu_indices(nvir))
-    b_range = np.arange(nvir)
+    tril2sq = jnp.asarray(square_mat_in_trilu_indices(nvir))
+    b_range = jnp.arange(nvir)
 
     def add_one_a(carry, a):
         Lvv_bar, t2_bar = carry
-        pair_ac = tril2sq[a]
-        lac = Lvv[:, pair_ac]
+        pair_ac = jax.lax.dynamic_index_in_dim(
+            tril2sq, a, axis=0, keepdims=False
+        )
+        lac = jnp.take(Lvv, pair_ac, axis=1)
 
         def add_one_ab(carry_b, b):
             Lvv_bar_b, t2_bar_b = carry_b
-            pair_bd = tril2sq[b]
-            lbd = Lvv[:, pair_bd]
-            hbar = out_bar[:, a, b]
-            g_cd = np.dot(np.transpose(lac), lbd)
+            pair_bd = jax.lax.dynamic_index_in_dim(
+                tril2sq, b, axis=0, keepdims=False
+            )
+            lbd = jnp.take(Lvv, pair_bd, axis=1)
+            hbar = jnp.take(jnp.take(out_bar, a, axis=1), b, axis=1)
+            g_cd = jnp.dot(jnp.transpose(lac), lbd)
             t2_bar_b += hbar[:, None, None] * g_cd[None, :, :]
-            lac_bar = np.einsum('p,pcd,xd->xc', hbar, t2, lbd)
-            lbd_bar = np.einsum('p,pcd,xc->xd', hbar, t2, lac)
+            lac_bar = jnp.einsum('p,pcd,xd->xc', hbar, t2, lbd)
+            lbd_bar = jnp.einsum('p,pcd,xc->xd', hbar, t2, lac)
             Lvv_bar_b = Lvv_bar_b.at[:, pair_ac].add(lac_bar)
             Lvv_bar_b = Lvv_bar_b.at[:, pair_bd].add(lbd_bar)
             return (Lvv_bar_b, t2_bar_b), None
@@ -171,7 +180,7 @@ def _contract_vvvv_t2_lowmem_bwd(res, out_bar):
         return jax.lax.scan(add_one_ab, (Lvv_bar, t2_bar), b_range)[0], None
 
     init = (np.zeros_like(Lvv), np.zeros_like(t2))
-    (Lvv_bar, t2_bar), _ = jax.lax.scan(add_one_a, init, np.arange(nvir))
+    (Lvv_bar, t2_bar), _ = jax.lax.scan(add_one_a, init, jnp.arange(nvir))
     return Lvv_bar, t2_bar
 
 

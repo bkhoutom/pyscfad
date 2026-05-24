@@ -133,6 +133,12 @@ class LNO(lno_base.LNO):
             )
         collect_profile = comm.bcast(root_collect_profile, root=0)
         print_profile = collect_profile and root_verbose >= 2 and nproc > 1
+        use_subset_replay = (
+            nproc > 1
+            and lno_base.USE_FRAGMENT_REPLAY_VJP
+            and bool(getattr(self, 'use_dlno_prescreen', False))
+            and self.dlno_prescreen_data is not None
+        )
 
         frag_lolist_local, frag_wghtlist_local, indices = partition_jobs(
             frag_lolist, frag_wghtlist)
@@ -146,19 +152,34 @@ class LNO(lno_base.LNO):
         orig_profile_mpi_nfrag = getattr(self, 'profile_mpi_nfrag', None)
         orig_profile_mpi_print = bool(getattr(self, 'profile_mpi_print', False))
         orig_dlno_data = self.dlno_prescreen_data
-        if nproc > 1:
+        profile_indices = tuple(range(nfrag)) if use_subset_replay else tuple(indices)
+        if nproc > 1 and not use_subset_replay:
             self.dlno_prescreen_data = _partition_dlno_data(orig_dlno_data, indices)
         if print_profile:
             self.verbose = 0
             self.profile_fragments = True
             self.profile_print = False
-            self.profile_mpi_indices = tuple(indices)
+            self.profile_mpi_indices = profile_indices
             self.profile_mpi_nfrag = nfrag
             self.profile_mpi_print = True
 
         try:
-            frag_res_local = lno_base.kernel(self, orbloc, frag_lolist_local,
-                                             frag_nonvlist=frag_nonvlist_local)
+            if use_subset_replay:
+                frag_res_local = lno_base.kernel_mpi_subset(
+                    self,
+                    orbloc,
+                    frag_lolist,
+                    indices,
+                    no_type=no_type,
+                    frag_nonvlist=frag_nonvlist,
+                )
+            else:
+                frag_res_local = lno_base.kernel(
+                    self,
+                    orbloc,
+                    frag_lolist_local,
+                    frag_nonvlist=frag_nonvlist_local,
+                )
         finally:
             self.verbose = orig_verbose
             self.profile_fragments = orig_profile_fragments
@@ -171,7 +192,11 @@ class LNO(lno_base.LNO):
         if print_profile:
             local_rows = lno_base.get_fragment_profile()[profile_start:]
             local_rows = [
-                _sanitize_profile_row(row, indices, nfrag)
+                _sanitize_profile_row(
+                    lno_base.sanitize_fragment_profile_row_for_mpi(row),
+                    profile_indices,
+                    nfrag,
+                )
                 for row in local_rows
             ]
             gathered = comm.gather(local_rows, root=0)

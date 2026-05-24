@@ -95,6 +95,69 @@ def remap_fragment_profile_row(row, indices, nfrag):
     return row
 
 
+_FRAGMENT_PROFILE_MPI_KEYS = (
+    'label',
+    'pass',
+    'fragment',
+    'nfrag',
+    'n_lo',
+    'domain_atoms',
+    'domain_aos',
+    'strong_lmo',
+    'prescreen_occ',
+    'prescreen_vir',
+    'active_occ',
+    'active_vir',
+    'lov_mb',
+    't2_mb',
+    'est_work_mb',
+    'make_fragment_eris_s',
+    'make_fpno1_s',
+    'impurity_solve_s',
+    'wall_s',
+    'replay_wall_s',
+    'pullback_wall_s',
+)
+
+
+def _as_profile_scalar(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, numpy.integer)):
+        return int(value)
+    if isinstance(value, (float, numpy.floating)):
+        return float(value)
+    try:
+        arr = numpy.asarray(jax.device_get(value))
+    except Exception:
+        return None
+    if arr.shape == ():
+        if numpy.issubdtype(arr.dtype, numpy.integer):
+            return int(arr)
+        if numpy.issubdtype(arr.dtype, numpy.floating):
+            return float(arr)
+    return None
+
+
+def sanitize_fragment_profile_row_for_mpi(row):
+    out = {}
+    for key in _FRAGMENT_PROFILE_MPI_KEYS:
+        if key not in row:
+            continue
+        value = _as_profile_scalar(row[key])
+        if value is not None:
+            out[key] = value
+    phase_times = row.get('phase_times') or {}
+    phase_out = {}
+    for key, value in phase_times.items():
+        value = _as_profile_scalar(value)
+        if value is not None:
+            phase_out[key] = value
+    if phase_out:
+        out['phase_times'] = phase_out
+    return out
+
+
 def print_fragment_profile_rows(rows):
     for row in rows:
         _print_fragment_report(row)
@@ -585,6 +648,24 @@ def _fragment_kernel_replay_impl(state, orbloc, dlno_fragment_data, frag_lolist,
     return frag_res
 
 
+def _fragment_kernel_replay_subset_impl(state, orbloc, dlno_fragment_data,
+                                        frag_lolist, owned_indices, no_type,
+                                        frag_nonvlist, solver_settings):
+    frag_res = [None] * len(owned_indices)
+    for ilocal, ifrag in enumerate(owned_indices):
+        frag_res[ilocal] = _fragment_one_replay(
+            state,
+            orbloc,
+            dlno_fragment_data,
+            ifrag,
+            frag_lolist,
+            no_type,
+            frag_nonvlist,
+            solver_settings,
+        )
+    return frag_res
+
+
 @partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6))
 def _fragment_kernel_replay_vjp(state, orbloc, dlno_fragment_data, frag_lolist,
                                 no_type, frag_nonvlist, solver_settings):
@@ -594,11 +675,31 @@ def _fragment_kernel_replay_vjp(state, orbloc, dlno_fragment_data, frag_lolist,
     )
 
 
+@partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 7))
+def _fragment_kernel_replay_subset_vjp(state, orbloc, dlno_fragment_data,
+                                       frag_lolist, owned_indices, no_type,
+                                       frag_nonvlist, solver_settings):
+    return _fragment_kernel_replay_subset_impl(
+        state, orbloc, dlno_fragment_data, frag_lolist, owned_indices, no_type,
+        frag_nonvlist, solver_settings,
+    )
+
+
 def _fragment_kernel_replay_fwd(state, orbloc, dlno_fragment_data, frag_lolist,
                                 no_type, frag_nonvlist, solver_settings):
     out = _fragment_kernel_replay_impl(
         state, orbloc, dlno_fragment_data, frag_lolist, no_type, frag_nonvlist,
         solver_settings,
+    )
+    return out, (state, orbloc, dlno_fragment_data)
+
+
+def _fragment_kernel_replay_subset_fwd(state, orbloc, dlno_fragment_data,
+                                       frag_lolist, owned_indices, no_type,
+                                       frag_nonvlist, solver_settings):
+    out = _fragment_kernel_replay_subset_impl(
+        state, orbloc, dlno_fragment_data, frag_lolist, owned_indices, no_type,
+        frag_nonvlist, solver_settings,
     )
     return out, (state, orbloc, dlno_fragment_data)
 
@@ -652,6 +753,69 @@ def _tree_add_cotangent(x, y):
     return jax.tree_util.tree_map(_add_cotangent_leaf, x, y)
 
 
+def _full_cotangent_like(bar, ref):
+    zeros = _zero_like_cotangent_tree(ref)
+    if bar is None:
+        return zeros
+    return _tree_add_cotangent(zeros, bar)
+
+
+def _mpi_reduce_cotangent_leaf_to_root(leaf, ref_leaf, comm, mpi_sum):
+    dtype = getattr(ref_leaf, 'dtype', None)
+    shape = getattr(ref_leaf, 'shape', None)
+    if dtype is None:
+        if not isinstance(ref_leaf, (float, complex, numpy.floating, numpy.complexfloating)):
+            return leaf
+        ref_arr = numpy.asarray(ref_leaf)
+        dtype = ref_arr.dtype
+        shape = ref_arr.shape
+    if dtype is None or not numpy.issubdtype(dtype, numpy.inexact):
+        return leaf
+    if shape is None:
+        shape = ()
+
+    rank = comm.Get_rank()
+    if leaf is None or _is_float0_cotangent(leaf):
+        send = numpy.zeros(shape, dtype=dtype)
+    else:
+        try:
+            send = numpy.asarray(jax.device_get(leaf))
+        except Exception as err:
+            raise RuntimeError(
+                'MPI cotangent reduction requires concrete array leaves. '
+                'Use an MPI-aware JAX collective if this path is transformed by jit.'
+            ) from err
+
+    recv = numpy.zeros_like(send) if rank == 0 else None
+    comm.Reduce(send, recv, op=mpi_sum, root=0)
+    if rank == 0:
+        return np.asarray(recv)
+    return np.zeros_like(leaf)
+
+
+def _mpi_reduce_cotangent_tree_to_root(bar, ref):
+    try:
+        from mpi4py import MPI  # pylint: disable=import-outside-toplevel
+    except ImportError:
+        return bar
+
+    comm = MPI.COMM_WORLD
+    if comm.Get_size() <= 1:
+        return bar
+
+    full_bar = _full_cotangent_like(bar, ref)
+    leaves, treedef = jax.tree_util.tree_flatten(full_bar)
+    ref_leaves, ref_treedef = jax.tree_util.tree_flatten(ref)
+    if treedef != ref_treedef:
+        raise RuntimeError('MPI cotangent reduction requires matching PyTree structures.')
+
+    reduced = [
+        _mpi_reduce_cotangent_leaf_to_root(leaf, ref_leaf, comm, MPI.SUM)
+        for leaf, ref_leaf in zip(leaves, ref_leaves)
+    ]
+    return jax.tree_util.tree_unflatten(treedef, reduced)
+
+
 def _print_mpi_replay_profile_rows(solver_settings, rows):
     indices = solver_settings.profile_mpi_indices
     nfrag = solver_settings.profile_mpi_nfrag
@@ -663,7 +827,9 @@ def _print_mpi_replay_profile_rows(solver_settings, rows):
         return
     comm = MPI.COMM_WORLD
     mapped_rows = [
-        remap_fragment_profile_row(row, indices, nfrag)
+        remap_fragment_profile_row(
+            sanitize_fragment_profile_row_for_mpi(row), indices, nfrag
+        )
         for row in rows
     ]
     gathered = comm.gather(mapped_rows, root=0)
@@ -762,10 +928,132 @@ def _fragment_kernel_replay_bwd(frag_lolist, no_type, frag_nonvlist,
     return state_bar, orbloc_bar, dlno_data_bar
 
 
+def _fragment_kernel_replay_subset_bwd(frag_lolist, owned_indices, no_type,
+                                       frag_nonvlist, solver_settings, res,
+                                       ybar):
+    state, orbloc, dlno_data = res
+    state_bar = None
+    orbloc_bar = None
+    dlno_data_bar = None
+    bwd_settings = replace(solver_settings, profile_pass='backward replay')
+    collect_bwd = (
+        bool(solver_settings.profile_fragments)
+        or solver_settings.verbose >= 2
+    )
+    bwd_rows = []
+    for ilocal, ifrag in enumerate(owned_indices):
+        def frag_fn(state_, orbloc_, dlno_fragment_data_):
+            return _fragment_one_replay(
+                state_,
+                orbloc_,
+                dlno_fragment_data_,
+                ifrag,
+                frag_lolist,
+                no_type,
+                frag_nonvlist,
+                bwd_settings,
+            )
+
+        profile_row_start = len(_FRAGMENT_PROFILE_ROWS)
+        replay_start = time.perf_counter()
+        _, pullback = jax.vjp(frag_fn, state, orbloc, dlno_data)
+        replay_s = time.perf_counter() - replay_start
+        pullback_start = time.perf_counter()
+        frag_state_bar = None
+        frag_orbloc_bar = None
+        frag_dlno_data_bar = None
+        for ybar_piece in _split_tuple_cotangent(ybar[ilocal]):
+            piece_state_bar, piece_orbloc_bar, piece_dlno_data_bar = pullback(ybar_piece)
+            frag_state_bar = _tree_add_cotangent(frag_state_bar, piece_state_bar)
+            frag_orbloc_bar = _tree_add_cotangent(frag_orbloc_bar, piece_orbloc_bar)
+            frag_dlno_data_bar = _tree_add_cotangent(
+                frag_dlno_data_bar, piece_dlno_data_bar
+            )
+        pullback_s = time.perf_counter() - pullback_start
+        if collect_bwd:
+            row = None
+            for candidate in reversed(_FRAGMENT_PROFILE_ROWS[profile_row_start:]):
+                if (
+                    candidate.get('label') == solver_settings.profile_label
+                    and candidate.get('pass') == 'backward replay'
+                    and candidate.get('fragment') == ifrag
+                ):
+                    row = candidate
+                    break
+            if row is None:
+                row = {
+                    'label': solver_settings.profile_label,
+                    'pass': 'backward replay',
+                    'fragment': ifrag,
+                    'nfrag': len(frag_lolist),
+                }
+                _append_fragment_profile(row)
+            row['replay_wall_s'] = replay_s
+            row['pullback_wall_s'] = pullback_s
+            bwd_rows.append(dict(row))
+        state_bar = _tree_add_cotangent(state_bar, frag_state_bar)
+        orbloc_bar = _tree_add_cotangent(orbloc_bar, frag_orbloc_bar)
+        dlno_data_bar = _tree_add_cotangent(dlno_data_bar, frag_dlno_data_bar)
+
+    state_bar = _mpi_reduce_cotangent_tree_to_root(state_bar, state)
+    orbloc_bar = _mpi_reduce_cotangent_tree_to_root(orbloc_bar, orbloc)
+    dlno_data_bar = _mpi_reduce_cotangent_tree_to_root(dlno_data_bar, dlno_data)
+
+    if solver_settings.profile_mpi_print and bwd_rows:
+        _print_mpi_replay_profile_rows(solver_settings, bwd_rows)
+    return state_bar, orbloc_bar, dlno_data_bar
+
+
 _fragment_kernel_replay_vjp.defvjp(
     _fragment_kernel_replay_fwd,
     _fragment_kernel_replay_bwd,
 )
+
+_fragment_kernel_replay_subset_vjp.defvjp(
+    _fragment_kernel_replay_subset_fwd,
+    _fragment_kernel_replay_subset_bwd,
+)
+
+
+def kernel_mpi_subset(mfcc, orbloc, frag_lolist, owned_indices,
+                      no_type='ie', frag_nonvlist=None):
+    use_dlno_fragment_eris = _use_dlno_fragment_eris(mfcc)
+    if not (
+        USE_FRAGMENT_REPLAY_VJP
+        and use_dlno_fragment_eris
+        and mfcc.dlno_prescreen_data is not None
+    ):
+        frag_lolist_local = [frag_lolist[i] for i in owned_indices]
+        frag_nonvlist_local = None
+        if frag_nonvlist is not None:
+            frag_nonvlist_local = [frag_nonvlist[i] for i in owned_indices]
+        return kernel(
+            mfcc, orbloc, frag_lolist_local, no_type=no_type,
+            frag_nonvlist=frag_nonvlist_local,
+        )
+
+    eris = _make_lno_reference_eris(mfcc)
+    if mfcc.dm_corr is True:
+        raise NotImplementedError(
+            'Global dm_corr=True requires a full-molecule Lov and is not '
+            'compatible with DLNO fragment-local integral construction.'
+        )
+    if mfcc.dm_corr is False:
+        mfcc.dm_corr = None
+
+    nfrag = len(frag_lolist)
+    if frag_nonvlist is None:
+        frag_nonvlist = [[None, None]] * nfrag
+    return _fragment_kernel_replay_subset_vjp(
+        _make_fragment_scf_state(mfcc, eris),
+        orbloc,
+        mfcc.dlno_prescreen_data.get('fragment_data'),
+        _static_frag_lolist(frag_lolist),
+        tuple(int(i) for i in owned_indices),
+        no_type,
+        _static_frag_nonvlist(frag_nonvlist, nfrag),
+        _make_fragment_solver_settings(mfcc),
+    )
 
 
 def kernel_1frag(mfcc, eris, orbfragloc, no_type,

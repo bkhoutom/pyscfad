@@ -995,10 +995,12 @@ def _fragment_kernel_replay_subset_bwd(frag_lolist, owned_indices, no_type,
         orbloc_bar = _tree_add_cotangent(orbloc_bar, frag_orbloc_bar)
         dlno_data_bar = _tree_add_cotangent(dlno_data_bar, frag_dlno_data_bar)
 
-    state_bar = _mpi_reduce_cotangent_tree_to_root(state_bar, state)
-    orbloc_bar = _mpi_reduce_cotangent_tree_to_root(orbloc_bar, orbloc)
-    dlno_data_bar = _mpi_reduce_cotangent_tree_to_root(dlno_data_bar, dlno_data)
-
+    # Each rank returns the cotangents from its own fragments and lets the
+    # upstream backward pass run independently on every rank. The user code
+    # then Allreduces the final gradient w.r.t. mol — equivalent by linearity
+    # of the SCF/CC response. Reducing the cotangents to root before the
+    # upstream response (the previous approach) gave incorrect, non-reproducible
+    # gradients in practice; see commit history.
     if solver_settings.profile_mpi_print and bwd_rows:
         _print_mpi_replay_profile_rows(solver_settings, bwd_rows)
     return state_bar, orbloc_bar, dlno_data_bar

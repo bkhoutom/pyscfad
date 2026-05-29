@@ -84,11 +84,27 @@ def make_local_mp2_solver(mf):
     return mymp
 
 
-def build_dlno_data(mf, lo_coeff, frag_lolist):
-    topology = stop_trace(build_dlno_prescreen_data)(
-        mf,
-        lo_coeff,
-        frag_lolist,
+def _build_static_dlno_topology():
+    """Build the DLNO topology once with a concrete (non-traced) SCF.
+
+    ``build_dlno_prescreen_data`` internally calls ``np.asarray`` on PAO
+    coefficient matrices.  Inside ``jax.value_and_grad`` those are tracers
+    and the conversion blows up, so the topology must be built outside the
+    AD pass.  Only ``rebuild_dlno_prescreen_data`` (called inside the
+    energy function) is tracer-safe.
+    """
+    # Use the implicit-diff config for the seed.  The topology depends only
+    # on the converged SCF + LO partition, not on which CCSD response path
+    # is later used to differentiate.
+    configure(use_custom_ccsd_response=False)
+    seed_mol = build_mol()
+    seed_mf = scf.RHF(seed_mol).density_fit()
+    seed_mf.kernel()
+    seed_lo, seed_frag_lolist = build_local_orbitals_and_fragments(seed_mf)
+    topology = build_dlno_prescreen_data(
+        seed_mf,
+        seed_lo,
+        seed_frag_lolist,
         frozen=0,
         lmo_bp_domain_thr=0.9,
         pao_bp_domain_thr=0.9,
@@ -96,7 +112,16 @@ def build_dlno_data(mf, lo_coeff, frag_lolist):
         pair_energy_thr=DOMAIN_THR,
         multipole_order=2,
     )
-    return rebuild_dlno_prescreen_data(mf, lo_coeff, topology, frozen=0)
+    return seed_frag_lolist, topology
+
+
+STATIC_FRAG_LOLIST, STATIC_TOPOLOGY = _build_static_dlno_topology()
+
+
+def build_dlno_data(mf, lo_coeff):
+    return rebuild_dlno_prescreen_data(
+        mf, lo_coeff, STATIC_TOPOLOGY, frozen=0,
+    )
 
 
 def lno_total_energy(mol, *, use_custom_ccsd_response: bool):
@@ -113,16 +138,16 @@ def dlno_total_energy(mol, *, use_custom_ccsd_response: bool):
     configure(use_custom_ccsd_response=use_custom_ccsd_response)
     mf = scf.RHF(mol).density_fit()
     ehf = mf.kernel()
-    lo_coeff, frag_lolist = build_local_orbitals_and_fragments(mf)
-    dlno_data = build_dlno_data(mf, lo_coeff, frag_lolist)
+    lo_coeff, _ = build_local_orbitals_and_fragments(mf)
+    dlno_data = build_dlno_data(mf, lo_coeff)
     mymp = make_local_mp2_solver(mf)
     mymp.use_dlno_prescreen = True
     mymp.dlno_prescreen_data = dlno_data
-    mymp.kernel(frag_lolist=frag_lolist, orbloc=lo_coeff)
+    mymp.kernel(frag_lolist=STATIC_FRAG_LOLIST, orbloc=lo_coeff)
     mycc = make_cc_solver(mf)
     mycc.use_dlno_prescreen = True
     mycc.dlno_prescreen_data = dlno_data
-    mycc.kernel(frag_lolist=frag_lolist, orbloc=lo_coeff)
+    mycc.kernel(frag_lolist=STATIC_FRAG_LOLIST, orbloc=lo_coeff)
     return ehf + mycc.e_corr_pt2corrected(mymp.e_corr)
 
 

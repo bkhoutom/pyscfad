@@ -96,6 +96,10 @@ def kernel(mycc, eris, t1=None, t2=None, verbose=logger.NOTE):
     return _ccsd_t_kernel(eris, t1, t2)
 
 def _ccsd_t_energy_vjp(eris, t1, t2, et_bar, max_memory):
+    # JAX may hand us its host-side TypedNdArray wrapper here; coerce to
+    # plain numpy so the .transpose / arithmetic API below works.
+    t1 = numpy.asarray(t1)
+    t2 = numpy.asarray(t2)
     nocc, nvir = t1.shape
     nmo = nocc + nvir
 

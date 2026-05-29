@@ -103,8 +103,18 @@ def make_cc_solver(mf):
     return cc
 
 
-def build_dlno_topology(mf, lo_coeff, frag_lolist, *, domain_pao_thr, pair_energy_thr):
-    return stop_trace(build_dlno_prescreen_data)(
+def build_static_dlno_topology(mol, *, domain_pao_thr, pair_energy_thr):
+    """Build the DLNO topology once with a concrete (non-traced) SCF.
+
+    ``build_dlno_prescreen_data`` calls ``np.asarray`` on PAO coefficient
+    matrices internally; that fails on JAX tracers inside
+    ``jax.value_and_grad``.  The topology must therefore be built outside
+    the AD pass and the differentiated function may only call the
+    tracer-safe ``rebuild_dlno_prescreen_data``.
+    """
+    mf = run_rhf(mol)
+    lo_coeff, frag_lolist = build_local_orbitals_and_fragments(mf)
+    topology = build_dlno_prescreen_data(
         mf,
         lo_coeff,
         frag_lolist,
@@ -115,6 +125,7 @@ def build_dlno_topology(mf, lo_coeff, frag_lolist, *, domain_pao_thr, pair_energ
         pair_energy_thr=pair_energy_thr,
         multipole_order=MULTIPOLE_ORDER,
     )
+    return frag_lolist, topology
 
 
 def build_dlno_data(mf, lo_coeff, topology):
@@ -136,29 +147,22 @@ def lno_total_energy(mol):
     return mf.e_tot + mycc.e_corr_pt2corrected(mymp.e_corr)
 
 
-def dlno_total_energy_threshold(mol, threshold):
+def dlno_total_energy_threshold(mol, static_frag_lolist, static_topology):
     mf = run_rhf(mol)
-    lo_coeff, frag_lolist = build_local_orbitals_and_fragments(mf)
-    topology = build_dlno_topology(
-        mf,
-        lo_coeff,
-        frag_lolist,
-        domain_pao_thr=threshold,
-        pair_energy_thr=threshold,
-    )
-    dlno_data = build_dlno_data(mf, lo_coeff, topology)
+    lo_coeff, _ = build_local_orbitals_and_fragments(mf)
+    dlno_data = build_dlno_data(mf, lo_coeff, static_topology)
     mycc = enable_dlno_prescreen(make_cc_solver(mf), dlno_data)
-    mycc.kernel(frag_lolist=frag_lolist, orbloc=lo_coeff)
+    mycc.kernel(frag_lolist=static_frag_lolist, orbloc=lo_coeff)
     mymp = enable_dlno_prescreen(make_local_mp2_solver(mf), dlno_data)
-    mymp.kernel(frag_lolist=frag_lolist, orbloc=lo_coeff)
+    mymp.kernel(frag_lolist=static_frag_lolist, orbloc=lo_coeff)
     total = mf.e_tot + mycc.e_corr_pt2corrected(mymp.e_corr)
     return total, {
         "primary_sizes": np.asarray(
-            [len(np.asarray(f["extended_primary_domain"]).ravel()) for f in topology["fragment_data"]],
+            [len(np.asarray(f["extended_primary_domain"]).ravel()) for f in static_topology["fragment_data"]],
             dtype=float,
         ),
         "strong_sizes": np.asarray(
-            [len(np.asarray(f["strong_lmo_indices"]).ravel()) for f in topology["fragment_data"]],
+            [len(np.asarray(f["strong_lmo_indices"]).ravel()) for f in static_topology["fragment_data"]],
             dtype=float,
         ),
     }
@@ -224,8 +228,11 @@ def main():
     for threshold in THRESHOLDS:
         print(f"Running threshold {threshold:.0e}..." if threshold else "Running threshold 0 (full-domain limit)...")
         t1 = time.time()
+        static_frag_lolist, static_topology = build_static_dlno_topology(
+            mol, domain_pao_thr=threshold, pair_energy_thr=threshold,
+        )
         (e_dlno, info_dlno), g_dlno = jax.value_and_grad(
-            lambda x: dlno_total_energy_threshold(x, threshold),
+            lambda x: dlno_total_energy_threshold(x, static_frag_lolist, static_topology),
             has_aux=True,
         )(mol)
         g_dlno = np.asarray(g_dlno.coords)

@@ -114,15 +114,24 @@ def make_cc_solver(mf, *, thresh, lo_type=LO_TYPE, ccsd_t=False):
     return cc
 
 
-def build_dlno_topology(
-    mf,
-    lo,
-    frag_los,
+def build_static_dlno_topology(
+    mol,
     *,
+    lno_thresh,
     domain_pao_thr,
     pair_energy_thr,
 ):
-    return stop_trace(build_dlno_prescreen_data)(
+    """Build the DLNO topology once with a concrete (non-traced) SCF.
+
+    ``build_dlno_prescreen_data`` internally calls ``np.asarray`` on PAO
+    coefficients, which fails on JAX tracers.  The topology must therefore
+    be built outside ``jax.value_and_grad``; only the tracer-safe
+    ``rebuild_dlno_prescreen_data`` is used inside the differentiated
+    function.
+    """
+    mf = run_rhf(mol)
+    lo, frag_los = build_local_orbitals_and_fragments(mf, thresh=lno_thresh)
+    topology = build_dlno_prescreen_data(
         mf,
         lo,
         frag_los,
@@ -133,16 +142,10 @@ def build_dlno_topology(
         pair_energy_thr=pair_energy_thr,
         multipole_order=MULTIPOLE_ORDER,
     )
+    return frag_los, topology
 
 
-def build_current_dlno_data(mf, lo, frag_los, *, domain_pao_thr, pair_energy_thr):
-    topology = build_dlno_topology(
-        mf,
-        lo,
-        frag_los,
-        domain_pao_thr=domain_pao_thr,
-        pair_energy_thr=pair_energy_thr,
-    )
+def build_current_dlno_data(mf, lo, topology):
     return rebuild_dlno_prescreen_data(mf, lo, topology, frozen=FROZEN)
 
 
@@ -176,18 +179,12 @@ def build_dlno_inputs(
     mol,
     *,
     thresh,
-    domain_pao_thr=DLNO_CCSD_DOMAIN_PAO_THR,
-    pair_energy_thr=DLNO_CCSD_PAIR_ENERGY_THR,
+    ccsd_frag_los,
+    ccsd_topology,
 ):
-    mf, lo, frag_los = build_lno_inputs(mol, thresh=thresh)
-    dlno_data = build_current_dlno_data(
-        mf,
-        lo,
-        frag_los,
-        domain_pao_thr=domain_pao_thr,
-        pair_energy_thr=pair_energy_thr,
-    )
-    return mf, lo, frag_los, dlno_data
+    mf, lo, _ = build_lno_inputs(mol, thresh=thresh)
+    dlno_data = build_current_dlno_data(mf, lo, ccsd_topology)
+    return mf, lo, ccsd_frag_los, dlno_data
 
 
 def lno_total_energy(mol, *, thresh):
@@ -198,8 +195,12 @@ def lno_total_energy(mol, *, thresh):
     return total_energy(mf, cc, pt)
 
 
-def dlno_total_energy(mol, *, thresh, correction):
-    mf, lo, frag_los, dlno_data = build_dlno_inputs(mol, thresh=thresh)
+def dlno_total_energy(mol, *, thresh, correction, ccsd_frag_los, ccsd_topology,
+                      mp2_frag_los=None, mp2_topology=None):
+    mf, lo, frag_los, dlno_data = build_dlno_inputs(
+        mol, thresh=thresh,
+        ccsd_frag_los=ccsd_frag_los, ccsd_topology=ccsd_topology,
+    )
     cc = enable_dlno_prescreen(make_cc_solver(mf, thresh=thresh, ccsd_t=False), dlno_data)
     cc.kernel(frag_lolist=frag_los, orbloc=lo)
 
@@ -208,17 +209,11 @@ def dlno_total_energy(mol, *, thresh, correction):
     if correction == "canonical":
         pt = make_canonical_mp2_solver(mf)
     elif correction == "dlno":
-        mp2_lo, mp2_frag_los = build_local_orbitals_and_fragments(
+        mp2_lo, _ = build_local_orbitals_and_fragments(
             mf,
             thresh=DLNO_MP2_LNO_THRESH,
         )
-        mp2_dlno_data = build_current_dlno_data(
-            mf,
-            mp2_lo,
-            mp2_frag_los,
-            domain_pao_thr=DLNO_MP2_DOMAIN_PAO_THR,
-            pair_energy_thr=DLNO_MP2_PAIR_ENERGY_THR,
-        )
+        mp2_dlno_data = build_current_dlno_data(mf, mp2_lo, mp2_topology)
         pt = enable_dlno_prescreen(
             make_local_mp2_solver(mf, thresh=DLNO_MP2_LNO_THRESH),
             mp2_dlno_data,
@@ -230,18 +225,29 @@ def dlno_total_energy(mol, *, thresh, correction):
     return total_energy(mf, cc, pt)
 
 
-def build_energy_functions(thresh):
+def build_energy_functions(thresh, ccsd_frag_los, ccsd_topology,
+                           mp2_frag_los, mp2_topology):
     def lno_fn(mol):
         return lno_total_energy(mol, thresh=thresh)
 
     def dlno_bare_fn(mol):
-        return dlno_total_energy(mol, thresh=thresh, correction="none")
+        return dlno_total_energy(
+            mol, thresh=thresh, correction="none",
+            ccsd_frag_los=ccsd_frag_los, ccsd_topology=ccsd_topology,
+        )
 
     def dlno_can_fn(mol):
-        return dlno_total_energy(mol, thresh=thresh, correction="canonical")
+        return dlno_total_energy(
+            mol, thresh=thresh, correction="canonical",
+            ccsd_frag_los=ccsd_frag_los, ccsd_topology=ccsd_topology,
+        )
 
     def dlno_dlno_fn(mol):
-        return dlno_total_energy(mol, thresh=thresh, correction="dlno")
+        return dlno_total_energy(
+            mol, thresh=thresh, correction="dlno",
+            ccsd_frag_los=ccsd_frag_los, ccsd_topology=ccsd_topology,
+            mp2_frag_los=mp2_frag_los, mp2_topology=mp2_topology,
+        )
 
     return lno_fn, dlno_bare_fn, dlno_can_fn, dlno_dlno_fn
 
@@ -303,9 +309,26 @@ def main():
     direction = rng.normal(size=base_coords.shape)
     direction /= np.linalg.norm(direction)
 
+    # Build the DLNO-MP2 topology once: it only depends on
+    # DLNO_MP2_LNO_THRESH, which doesn't change across the sweep.
+    mp2_frag_los, mp2_topology = build_static_dlno_topology(
+        base_mol,
+        lno_thresh=DLNO_MP2_LNO_THRESH,
+        domain_pao_thr=DLNO_MP2_DOMAIN_PAO_THR,
+        pair_energy_thr=DLNO_MP2_PAIR_ENERGY_THR,
+    )
+
     rows = []
     for threshold in THRESHOLDS:
-        lno_fn, dlno_bare_fn, dlno_canonical_mp2_fn, dlno_fn = build_energy_functions(threshold)
+        ccsd_frag_los, ccsd_topology = build_static_dlno_topology(
+            base_mol,
+            lno_thresh=threshold,
+            domain_pao_thr=DLNO_CCSD_DOMAIN_PAO_THR,
+            pair_energy_thr=DLNO_CCSD_PAIR_ENERGY_THR,
+        )
+        lno_fn, dlno_bare_fn, dlno_canonical_mp2_fn, dlno_fn = build_energy_functions(
+            threshold, ccsd_frag_los, ccsd_topology, mp2_frag_los, mp2_topology,
+        )
 
         e_lno, g_lno = jax.value_and_grad(lno_fn)(base_mol)
         e_dlno_bare, g_dlno_bare = jax.value_and_grad(dlno_bare_fn)(base_mol)

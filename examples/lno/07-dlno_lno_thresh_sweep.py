@@ -103,8 +103,19 @@ def make_cc_solver(mf, *, thresh, lo_type=LO_TYPE, ccsd_t=False):
     return mycc
 
 
-def build_dlno_data(mf, lo_coeff, frag_lolist):
-    topology = stop_trace(build_dlno_prescreen_data)(
+def build_static_dlno_topology(mol, *, lno_thresh):
+    """Build the DLNO topology once with a concrete (non-traced) SCF.
+
+    The topology depends on ``lno_thresh`` through ``lo_coeff``.  Inside
+    ``jax.value_and_grad`` the PAO coefficients are tracers and
+    ``build_dlno_prescreen_data``'s internal ``np.asarray`` blows up, so
+    the topology must be built outside the AD pass.  Only the tracer-safe
+    ``rebuild_dlno_prescreen_data`` is used inside the differentiated
+    function below.
+    """
+    mf = run_rhf(mol)
+    lo_coeff, frag_lolist = build_local_orbitals_and_fragments(mf, thresh=lno_thresh)
+    topology = build_dlno_prescreen_data(
         mf,
         lo_coeff,
         frag_lolist,
@@ -115,6 +126,10 @@ def build_dlno_data(mf, lo_coeff, frag_lolist):
         pair_energy_thr=DLNO_PAIR_ENERGY_THR,
         multipole_order=MULTIPOLE_ORDER,
     )
+    return frag_lolist, topology
+
+
+def build_dlno_data(mf, lo_coeff, topology):
     return rebuild_dlno_prescreen_data(mf, lo_coeff, topology, frozen=FROZEN)
 
 
@@ -167,6 +182,9 @@ def main():
 
     for threshold in THRESHOLDS:
         t0 = time.time()
+        static_frag_lolist, static_topology = build_static_dlno_topology(
+            mol, lno_thresh=threshold,
+        )
 
         def lno_fn(mol):
             mf = run_rhf(mol)
@@ -178,12 +196,12 @@ def main():
 
         def dlno_fn(mol):
             mf = run_rhf(mol)
-            lo, frag_los = build_local_orbitals_and_fragments(mf, thresh=threshold)
-            dlno_data = build_dlno_data(mf, lo, frag_los)
+            lo, _ = build_local_orbitals_and_fragments(mf, thresh=threshold)
+            dlno_data = build_dlno_data(mf, lo, static_topology)
             pt = enable_dlno_prescreen(make_local_mp2_solver(mf, thresh=threshold), dlno_data)
             cc = enable_dlno_prescreen(make_cc_solver(mf, thresh=threshold, ccsd_t=False), dlno_data)
-            pt.kernel(frag_lolist=frag_los, orbloc=lo)
-            cc.kernel(frag_lolist=frag_los, orbloc=lo)
+            pt.kernel(frag_lolist=static_frag_lolist, orbloc=lo)
+            cc.kernel(frag_lolist=static_frag_lolist, orbloc=lo)
             return mf.e_tot + cc.e_corr_pt2corrected(pt.e_corr)
 
         e_lno, g_lno = jax.value_and_grad(lno_fn)(mol)

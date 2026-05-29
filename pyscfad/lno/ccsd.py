@@ -207,11 +207,28 @@ def get_maskact(frozen, nmo):
         maskact = numpy.array([i not in frozen for i in range(nmo)])
     return frozen, maskact
 
+def _fragment_pq_contractions(amp, ovov):
+    """Compute the two fragment contractions in mp2/ccsd_fragment_energy as
+    explicit GEMMs.  Equivalent to::
+
+        2*einsum('pjab,qajb->pq', amp, ovov) - einsum('pjab,qbja->pq', amp, ovov)
+
+    Reshaping to a single matmul avoids XLA selecting a Triton kernel whose
+    shared-memory request exceeds the per-block limit for large virtual
+    spaces.
+    """
+    p = amp.shape[0]
+    q = ovov.shape[0]
+    amp_flat = amp.reshape(p, -1)
+    ovov_qjab = ovov.transpose(0, 2, 1, 3).reshape(q, -1)
+    ovov_qjab_alt = ovov.transpose(0, 2, 3, 1).reshape(q, -1)
+    return 2.0 * (amp_flat @ ovov_qjab.T) - (amp_flat @ ovov_qjab_alt.T)
+
+
 def mp2_fragment_energy(eris, t2, prj):
     m = np.dot(prj.T, prj)
     ovov = np.asarray(eris.ovov)
-    eij  = 2*np.einsum('pjab,qajb->pq', t2, ovov)
-    eij +=  -np.einsum('pjab,qbja->pq', t2, ovov)
+    eij = _fragment_pq_contractions(t2, ovov)
     e2 = np.einsum('ij,ij', eij, m)
     return e2
 
@@ -223,8 +240,7 @@ def ccsd_fragment_energy(eris, t1, t2, prj):
     tau = np.einsum('ia,jb->ijab', t1, t1)
     tau += t2
     ovov = np.asarray(eris.ovov)
-    eij += 2*np.einsum('pjab,qajb->pq', tau, ovov)
-    eij -= np.einsum('pjab,qbja->pq', tau, ovov)
+    eij += _fragment_pq_contractions(tau, ovov)
     e2 = np.einsum('ij,ij', eij, m)
     return e2
 

@@ -209,6 +209,32 @@ def _eigh_gen_batching_rule(batched_args, batch_dims, *,
                            itype=itype,
                            deg_thresh=deg_thresh), (0, 0)
 
+def _eigh_gen_cuda_cholesky(a, b, *, lower, itype, deg_thresh):
+    """CUDA lowering for generalized eigh via Cholesky reduction to a
+    standard eigenproblem, using only JAX primitives with native GPU
+    lowerings.  Used because jaxlib >= 0.5 no longer ships the
+    ``cusolver_sygvd_ffi`` FFI handler.
+    """
+    del deg_thresh
+    if itype != 1:
+        raise NotImplementedError(
+            "Generalized eigh on CUDA only supports itype=1 (A x = lambda B x)."
+        )
+    import jax.scipy.linalg as _jsl
+    L = jnp.linalg.cholesky(b)
+    if not lower:
+        L = jnp.swapaxes(L.conj(), -1, -2)
+    Y = _jsl.solve_triangular(L, a, lower=True)
+    A_tilde = _jsl.solve_triangular(L, jnp.swapaxes(Y.conj(), -1, -2), lower=True)
+    A_tilde = jnp.swapaxes(A_tilde.conj(), -1, -2)
+    A_tilde = 0.5 * (A_tilde + jnp.swapaxes(A_tilde.conj(), -1, -2))
+    w, y = jnp.linalg.eigh(A_tilde)
+    v = _jsl.solve_triangular(
+        jnp.swapaxes(L.conj(), -1, -2), y, lower=False
+    )
+    return w, v
+
+
 eigh_gen_p = Primitive('eigh_gen')
 eigh_gen_p.multiple_results = True
 eigh_gen_p.def_impl(_eigh_gen_impl)
@@ -222,7 +248,7 @@ mlir.register_lowering(
 )
 mlir.register_lowering(
     eigh_gen_p,
-    partial(_eigh_gen_cpu_gpu_lowering, target_name_prefix="cuda"),
+    mlir.lower_fun(_eigh_gen_cuda_cholesky, multiple_results=True),
     platform="cuda"
 )
 

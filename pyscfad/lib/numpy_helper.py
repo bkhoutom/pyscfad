@@ -14,6 +14,7 @@
 
 from functools import partial
 import math
+import jax
 from pyscf.lib.numpy_helper import (
     PLAIN,
     HERMITIAN,
@@ -24,6 +25,10 @@ from pyscfad import numpy as np
 from pyscfad import ops
 from pyscfad.ops import jit, vmap
 from pyscfad import config
+
+
+def _is_traced(x):
+    return isinstance(x, jax.core.Tracer)
 
 __all__ = [
     'PLAIN',
@@ -98,7 +103,7 @@ def _unpack_tril(tril, filltriu=HERMITIAN):
         raise KeyError
 
 def unpack_tril(tril, filltriu=HERMITIAN, axis=-1, out=None):
-    if config.moleintor_opt and axis == -1:
+    if config.moleintor_opt and axis == -1 and not _is_traced(tril):
         from pyscfad.lib import _numpy_helper_opt
         return _numpy_helper_opt._unpack_tril(tril, filltriu, axis, out)
     if tril.ndim == 1:
@@ -116,7 +121,7 @@ def pack_tril(a, axis=-1, out=None):
     '''
     Lower triangular part of a matrix as a vector
     '''
-    if config.moleintor_opt and axis == -1:
+    if config.moleintor_opt and axis == -1 and not _is_traced(a):
         from pyscfad.lib import _numpy_helper_opt
         return _numpy_helper_opt._pack_tril(a, axis, out)
     def fn(mat):

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import ctypes
+import time
 import numpy
 from jax import custom_vjp
 from jax.tree_util import tree_flatten_with_path, tree_unflatten
@@ -46,7 +47,13 @@ def kernel(mycc, eris, t1=None, t2=None, verbose=logger.NOTE):
         return et, (eris, t1, t2)
 
     def _ccsd_t_kernel_bwd(res, ybar):
+        log = logger.new_logger(mycc, verbose)
         eris, t1, t2 = res
+
+        nocc, nvir = t1.shape
+        log.info('CCSD(T) pullback: nocc=%d nvir=%d  et_bar=%.6g  max_memory=%.0f MB',
+                 nocc, nvir, float(ybar), max_memory)
+        wall_total = time.perf_counter()
 
         # TODO clean up tree unflatten
         path_vals, treedef = tree_flatten_with_path(eris)
@@ -54,8 +61,11 @@ def kernel(mycc, eris, t1=None, t2=None, verbose=logger.NOTE):
         shapes = [item[1].shape for item in path_vals]
         path_vals = None
 
+        wall_vjp = time.perf_counter()
         t1_bar, t2_bar, fock_bar, mo_energy_bar,\
             ovoo_bar, ovov_bar, ovvv_bar = _ccsd_t_energy_vjp(eris, t1, t2, ybar, max_memory)
+        log.info('CCSD(T) pullback  _ccsd_t_energy_vjp  wall=%.2f s',
+                 time.perf_counter() - wall_vjp)
 
         leaves = [None] * len(keys)
         key_to_bar = {
@@ -74,6 +84,12 @@ def kernel(mycc, eris, t1=None, t2=None, verbose=logger.NOTE):
                 leaves[i] = numpy.zeros(shapes[i])
 
         eris_bar = tree_unflatten(treedef, leaves)
+        log.info('CCSD(T) pullback total wall=%.2f s  '
+                 '|t1_bar|max=%.3e |t2_bar|max=%.3e |ovvv_bar|max=%.3e',
+                 time.perf_counter() - wall_total,
+                 float(numpy.abs(t1_bar).max()),
+                 float(numpy.abs(t2_bar).max()),
+                 float(numpy.abs(ovvv_bar).max()))
         return eris_bar, t1_bar, t2_bar
 
     _ccsd_t_kernel.defvjp(_ccsd_t_kernel_fwd, _ccsd_t_kernel_bwd)

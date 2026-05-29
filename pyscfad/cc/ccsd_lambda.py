@@ -10,16 +10,49 @@ as JAX-visible arrays.  The implementation is intentionally in-core; it is used
 by the experimental DF-CCSD custom response path.
 """
 
-from functools import reduce
+from functools import partial, reduce
 import jax
 from jax.interpreters import ad as jax_ad
 
 from pyscfad import numpy as np
 from pyscfad import lib
+from pyscfad.lib import logger
 
 
 class _IMDS:
     pass
+
+
+_IMDS_FIELDS = ('w1', 'w2', 'w3', 'w4',
+                'woooo', 'wvooo', 'wvvov', 'wVOov', 'wvOOv')
+
+
+def _imds_flatten(imds):
+    return tuple(getattr(imds, k, None) for k in _IMDS_FIELDS), None
+
+
+def _imds_unflatten(_aux, children):
+    imds = _IMDS()
+    for k, v in zip(_IMDS_FIELDS, children):
+        setattr(imds, k, v)
+    return imds
+
+
+jax.tree_util.register_pytree_node(_IMDS, _imds_flatten, _imds_unflatten)
+
+
+def _get_ovvv_full(eris):
+    """Unpack the (ov|vv) integral block to shape (nocc, nvir, nvir, nvir).
+
+    Skips ``eris.get_ovvv``'s optimized numpy path so the result is
+    JAX-traceable inside a jit boundary.
+    """
+    ovvv_packed = eris.ovvv
+    nocc, nvir = ovvv_packed.shape[:2]
+    ovvv = lib.unpack_tril(
+        ovvv_packed.reshape(nocc * nvir, ovvv_packed.shape[-1])
+    )
+    return ovvv.reshape(nocc, nvir, nvir, nvir)
 
 
 def _has_tracer(*xs):
@@ -44,6 +77,7 @@ def _contains_tracer(x):
     return False
 
 
+#@partial(jax.jit, static_argnums=0)
 def make_intermediates(mycc, t1, t2, eris):
     nocc, nvir = t1.shape
     foo = eris.fock[:nocc, :nocc]
@@ -51,7 +85,7 @@ def make_intermediates(mycc, t1, t2, eris):
     fvv = eris.fock[nocc:, nocc:]
 
     imds = _IMDS()
-    eris_ovvv = eris.get_ovvv(slice(None), slice(None))
+    eris_ovvv = _get_ovvv_full(eris)
     eris_vvov = np.transpose(eris_ovvv, (2, 3, 0, 1))
 
     w1 = fvv - np.einsum('ja,jb->ba', fov, t1)
@@ -161,6 +195,7 @@ def make_intermediates(mycc, t1, t2, eris):
     return imds
 
 
+#@partial(jax.jit, static_argnums=0)
 def update_lambda(mycc, t1, t2, l1, l2, eris=None, imds=None):
     if imds is None:
         imds = make_intermediates(mycc, t1, t2, eris)
@@ -211,7 +246,7 @@ def update_lambda(mycc, t1, t2, l1, l2, eris=None, imds=None):
 
     l1new -= np.einsum('jb,jiab->ia', l1, eris.oovv)
 
-    eris_ovvv = eris.get_ovvv(slice(None), slice(None))
+    eris_ovvv = _get_ovvv_full(eris)
     l1new += np.einsum('iabc,bc->ia', eris_ovvv, mba1) * 2
     l1new -= np.einsum('ibca,bc->ia', eris_ovvv, mba1)
     l2new += np.einsum('jbac,ic->jiba', eris_ovvv, l1)
@@ -259,15 +294,39 @@ def update_lambda(mycc, t1, t2, l1, l2, eris=None, imds=None):
     return l1new, l2new
 
 
-def kernel(mycc, eris, t1, t2, max_cycle=50, tol=1e-8):
+def kernel(mycc, eris, t1, t2, max_cycle=50, tol=1e-8, verbose=None):
+    log = logger.new_logger(mycc, verbose)
+    cput0 = (logger.process_clock(), logger.perf_counter())
+
+    if isinstance(mycc.diis, lib.diis.DIIS):
+        adiis = mycc.diis
+    elif mycc.diis:
+        adiis = lib.diis.DIIS(mycc, mycc.diis_file, incore=mycc.incore_complete)
+        adiis.space = mycc.diis_space
+    else:
+        adiis = None
+
     imds = make_intermediates(mycc, t1, t2, eris)
+    name = mycc.__class__.__name__
+    cput0 = log.timer(f'{name} lambda initialization', *cput0)
+
     l1, l2 = t1, t2
     conv = False
-    for _ in range(max_cycle):
+    for istep in range(max_cycle):
         l1new, l2new = update_lambda(mycc, t1, t2, l1, l2, eris, imds)
-        normt = np.linalg.norm(mycc.amplitudes_to_vector(l1new - l1, l2new - l2))
+        normt = np.linalg.norm(
+            mycc.amplitudes_to_vector(l1new, l2new)
+            - mycc.amplitudes_to_vector(l1, l2)
+        )
         l1, l2 = l1new, l2new
-        if not _has_tracer(normt) and float(normt) < tol:
-            conv = True
-            break
+        l1new = l2new = None
+        l1, l2 = mycc.run_diis(l1, l2, istep, normt, 0, adiis)
+        if not _has_tracer(normt):
+            normt_val = float(normt)
+            log.info('cycle = %d  norm(lambda1,lambda2) = %.6g',
+                     istep + 1, normt_val)
+            cput0 = log.timer(f'{name} lambda iter', *cput0)
+            if normt_val < tol:
+                conv = True
+                break
     return conv, l1, l2

@@ -367,6 +367,7 @@ def _dfccsd_kernel_custom_bwd(res, cotangent):
         t2,
         max_cycle=mycc.max_cycle,
         tol=mycc.conv_tol_normt,
+        verbose=mycc.verbose,
     )
 
     def lagrangian(eris_):

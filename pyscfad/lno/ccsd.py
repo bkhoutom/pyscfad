@@ -92,7 +92,7 @@ def _make_df_eris_incore(cc, mo_coeff=None, fockao=None):
 def impurity_solve(mf, mo_coeff, lo_coeff, eris=None, frozen=None,
                    frag_prescreen=None,
                    verbose_imp=0, ccsd_t=False, dcsd=False,
-                   profile_info=None):
+                   profile_info=None, profile_pass=None):
     r'''Solve impurity problem and calculate local correlation energy.
 
     Args:
@@ -150,6 +150,7 @@ def impurity_solve(mf, mo_coeff, lo_coeff, eris=None, frozen=None,
         mcc.diis_space = diis_space
     mcc._domain_atmlst = None if frag_prescreen is None else frag_prescreen.get('extended_primary_domain')
     mcc.e_hf = mf.e_tot  #avoid MP2 recompute e_hf
+    mcc.profile_pass = profile_pass
     total_start = time.perf_counter()
     phase_start = time.perf_counter()
     imp_eris = mcc.ao2mo(fockao=eris.fock)
@@ -242,7 +243,8 @@ class LNOCCSD(lno_base.LNO):
         return impurity_solve(mf, mo_coeff, lo_coeff, eris=eris, frozen=frozen,
                               frag_prescreen=frag_prescreen,
                               verbose_imp=self.verbose_imp, ccsd_t=self.ccsd_t,
-                              dcsd=self.dcsd, profile_info=profile_info)
+                              dcsd=self.dcsd, profile_info=profile_info,
+                              profile_pass=getattr(self, 'profile_pass', None))
 
     def _post_proc(self, frag_res, frag_wghtlist):
         ''' Post processing results returned by ``impurity_solve`` collected in ``frag_res``.

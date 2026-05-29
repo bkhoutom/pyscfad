@@ -52,8 +52,12 @@ def kernel(mycc, eris, ulo, t1=None, t2=None, verbose=logger.NOTE):
     ovov = eris.ovov
     ovvv = eris.ovvv
 
-    et = _ccsd_t_energy(mat, t1T, t2T, mo_energy, fvo,
-                        ovoo, ovov, ovvv, mycc.max_memory)
+    if getattr(mycc, 'profile_pass', None) == 'backward replay':
+        et = _ccsd_t_energy_lazy(mat, t1T, t2T, mo_energy, fvo,
+                                 ovoo, ovov, ovvv, mycc.max_memory)
+    else:
+        et = _ccsd_t_energy(mat, t1T, t2T, mo_energy, fvo,
+                            ovoo, ovov, ovvv, mycc.max_memory)
 
     log.timer('CCSD(T)')
     log.note('CCSD(T) correction = %.15g', et)
@@ -270,3 +274,26 @@ def _ccsd_t_energy_bwd(max_memory, res, et_bar):
     return mat_bar, t1T_bar, t2T_bar, mo_energy_bar, fvo_bar, ovoo_bar, ovov_bar, ovvv_tril_bar
 
 _ccsd_t_energy.defvjp(_ccsd_t_energy_fwd, _ccsd_t_energy_bwd)
+
+
+@partial(custom_vjp, nondiff_argnums=(8,))
+def _ccsd_t_energy_lazy(mat, t1T, t2T, mo_energy, fvo,
+                        ovoo, ovov, ovvv, max_memory):
+    """Backward-replay variant of :func:`_ccsd_t_energy`.
+
+    The (T) forward contraction is skipped and a zero primal is returned;
+    the saved residuals are identical to those of the real forward so the
+    shared backward kernel produces correct cotangents.  Only safe to call
+    when the caller will discard the primal output (e.g. inside
+    ``jax.vjp(frag_fn, ...)`` during DLNO replay).
+    """
+    return numpy.zeros((), dtype=t1T.dtype)
+
+
+def _ccsd_t_energy_lazy_fwd(mat, t1T, t2T, mo_energy, fvo,
+                            ovoo, ovov, ovvv, max_memory):
+    et = numpy.zeros((), dtype=t1T.dtype)
+    return et, (mat, t1T, t2T, mo_energy, fvo, ovoo, ovov, ovvv)
+
+
+_ccsd_t_energy_lazy.defvjp(_ccsd_t_energy_lazy_fwd, _ccsd_t_energy_bwd)

@@ -12,6 +12,7 @@ by the experimental DF-CCSD custom response path.
 
 from functools import partial, reduce
 import jax
+import numpy
 from jax.interpreters import ad as jax_ad
 
 from pyscfad import numpy as np
@@ -295,6 +296,13 @@ def update_lambda(mycc, t1, t2, l1, l2, eris=None, imds=None):
 
 
 def kernel(mycc, eris, t1, t2, max_cycle=50, tol=1e-8, verbose=None):
+    """Solve the standard CCSD lambda equations (bar_e = 1, no amplitude
+    cotangent source).
+
+    For the response gradient used by the DF-CCSD custom VJP, see
+    :func:`solve_response_lambda` which handles arbitrary energy and amplitude
+    cotangents.
+    """
     log = logger.new_logger(mycc, verbose)
     cput0 = (logger.process_clock(), logger.perf_counter())
 
@@ -330,3 +338,119 @@ def kernel(mycc, eris, t1, t2, max_cycle=50, tol=1e-8, verbose=None):
                 conv = True
                 break
     return conv, l1, l2
+
+
+def solve_response_lambda(mycc, eris, t1, t2, bar_e, bar_t1, bar_t2,
+                          max_cycle=50, tol=1e-8, verbose=None):
+    """Solve the CCSD response lambda equation in implicit-diff form.
+
+    Returns the vector ``lambda_vec`` (in the same packing as
+    ``mycc.amplitudes_to_vector``) satisfying
+
+        lambda_vec @ (d update_amps/dt - I) = -(bar_e * dE/dt + bar_t),
+
+    so that ``lambda_vec @ d Omega/d eris`` gives the response contribution to
+    the ERI cotangent (where ``Omega(t, eris) = update_amps(t, eris) - t``).
+    This is the implicit-diff form of the CCSD lambda equations; it reduces to
+    the standard CCSD lambda multipliers when ``bar_e = 1`` and the amplitude
+    cotangents vanish.
+
+    Picard iteration with optional DIIS acceleration.  Inputs are expected to
+    be concrete arrays; the iteration uses a Python convergence check.
+    """
+    log = logger.new_logger(mycc, verbose)
+    cput0 = (logger.process_clock(), logger.perf_counter())
+
+    amp = mycc.amplitudes_to_vector(t1, t2)
+
+    def update_fn(amp_):
+        t1_, t2_ = mycc.vector_to_amplitudes(amp_)
+        t1new, t2new = mycc.update_amps(t1_, t2_, eris)
+        return mycc.amplitudes_to_vector(t1new, t2new)
+
+    # Linearize update_amps at the converged amplitudes; vjp_fn(u) returns
+    # u @ d(update_amps)/dt.
+    _, vjp_fn = jax.vjp(update_fn, amp)
+
+    # Build the source: bar_e * dE/dt + bar_t (all as a single vector).
+    source = np.zeros_like(amp)
+    if not _is_scalar_zero(bar_e):
+        def scaled_energy(amp_):
+            t1_, t2_ = mycc.vector_to_amplitudes(amp_)
+            return np.real(bar_e * mycc.energy(t1_, t2_, eris))
+
+        source = source + jax.grad(scaled_energy)(amp)
+    if bar_t1 is not None or bar_t2 is not None:
+        if bar_t1 is None:
+            bar_t1 = np.zeros_like(t1)
+        if bar_t2 is None:
+            bar_t2 = np.zeros_like(t2)
+        source = source + _amplitudes_cotangent_to_vector(bar_t1, bar_t2)
+
+    cput0 = log.timer(f'{mycc.__class__.__name__} response init', *cput0)
+
+    if isinstance(mycc.diis, lib.diis.DIIS):
+        adiis = mycc.diis
+    elif mycc.diis:
+        adiis = lib.diis.DIIS(mycc, mycc.diis_file, incore=mycc.incore_complete)
+        adiis.space = mycc.diis_space
+    else:
+        adiis = None
+
+    lambda_vec = np.zeros_like(amp)
+    conv = False
+    for istep in range(max_cycle):
+        (lambda_df,) = vjp_fn(lambda_vec)
+        lambda_new = lambda_df + source
+        diff = mycc.amplitudes_to_vector(
+            *mycc.vector_to_amplitudes(lambda_new - lambda_vec)
+        )
+        normt = np.linalg.norm(diff)
+        lambda_vec = lambda_new
+        if adiis is not None:
+            l1_iter, l2_iter = mycc.vector_to_amplitudes(lambda_vec)
+            l1_iter, l2_iter = mycc.run_diis(
+                l1_iter, l2_iter, istep, normt, 0, adiis
+            )
+            lambda_vec = mycc.amplitudes_to_vector(l1_iter, l2_iter)
+        if not _has_tracer(normt):
+            normt_val = float(normt)
+            log.info(
+                'cycle = %d  norm(response lambda) = %.6g',
+                istep + 1, normt_val,
+            )
+            cput0 = log.timer(
+                f'{mycc.__class__.__name__} response iter', *cput0,
+            )
+            if normt_val < tol:
+                conv = True
+                break
+
+    return conv, lambda_vec
+
+
+def _is_scalar_zero(x):
+    try:
+        return bool(np.asarray(x) == 0)
+    except Exception:
+        return False
+
+
+def _amplitudes_cotangent_to_vector(bar_t1, bar_t2):
+    """Pack amplitude cotangents into the same vector layout as
+    ``ccsd.amplitudes_to_vector``.
+
+    ``ccsd.amplitudes_to_vector`` reads t2 from a lower-triangular pair index
+    ``[i*nv+a, j*nv+b]`` with ``i*nv+a >= j*nv+b``; each off-diagonal entry of
+    t2 is sampled once, so its cotangent must sum contributions from both
+    ``(i,a,j,b)`` and the symmetric partner ``(j,b,i,a)``.  Diagonal entries
+    contribute only once.
+    """
+    nocc, nvir = bar_t1.shape
+    nov = nocc * nvir
+    bar_t2_mat = np.transpose(bar_t2, (0, 2, 1, 3)).reshape(nov, nov)
+    idx = numpy.tril_indices(nov)
+    lower = bar_t2_mat[idx]
+    upper = np.transpose(bar_t2_mat)[idx]
+    bar_t2_vec = np.where(idx[0] == idx[1], lower, lower + upper)
+    return np.concatenate((bar_t1.ravel(), bar_t2_vec), axis=None)

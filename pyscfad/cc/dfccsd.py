@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
-from functools import partial
 from pyscf.lib import square_mat_in_trilu_indices
-import numpy
 import jax
 import jax.numpy as jnp
 from jax import custom_vjp
@@ -25,58 +22,6 @@ from pyscfad import lib
 from pyscfad import config, config_update
 from pyscfad.ao2mo import _ao2mo
 from pyscfad.cc import ccsd, ccsd_lambda
-from pyscfad.tools.linear_solver import gen_gmres
-
-
-@dataclass(frozen=True)
-class _DFCCSDResponseContext:
-    nmo: int
-    nocc: int
-    level_shift: float
-    cc2: bool
-    direct: bool
-    dcsd: bool
-
-    def vector_to_amplitudes(self, vec):
-        return ccsd.vector_to_amplitudes(vec, self.nmo, self.nocc)
-
-    def amplitudes_to_vector(self, t1, t2, out=None):
-        return ccsd.amplitudes_to_vector(t1, t2, out=out)
-
-    def _add_vvvv(self, t1, t2, eris, out=None, with_ovvv=None, t2sym=None):
-        return ccsd._add_vvvv(self, t1, t2, eris, out=out,
-                              with_ovvv=with_ovvv, t2sym=t2sym)
-
-
-class _DFCCSDResponseERIs:
-    def __init__(self, fock, mo_energy, oooo, ovoo, ovov, oovv, ovvo,
-                 ovvv, Lvv):
-        self.fock = fock
-        self.mo_energy = mo_energy
-        self.oooo = oooo
-        self.ovoo = ovoo
-        self.ovov = ovov
-        self.oovv = oovv
-        self.ovvo = ovvo
-        self.ovvv = ovvv
-        self.vvvv = None
-        self.Lvv = Lvv
-        self.mol = None
-
-    def _contract_vvvv_t2(self, mycc, t2, direct=False, out=None,
-                          verbose=None):
-        assert not direct
-        return _contract_vvvv_t2(mycc, self.mol, self.Lvv, t2)
-
-
-@partial(jax.jit, static_argnums=0)
-def _dfccsd_response_optimality(ctx, amp, fock, mo_energy, oooo, ovoo, ovov,
-                                oovv, ovvo, ovvv, Lvv):
-    eris = _DFCCSDResponseERIs(fock, mo_energy, oooo, ovoo, ovov, oovv, ovvo,
-                               ovvv, Lvv)
-    t1, t2 = ctx.vector_to_amplitudes(amp)
-    t1new, t2new = ccsd.update_amps(ctx, t1, t2, eris)
-    return ctx.amplitudes_to_vector(t1new, t2new) - amp
 
 
 class RCCSD(ccsd.CCSD):
@@ -232,57 +177,6 @@ def _is_zero_cotangent(x):
     return x is None or isinstance(x, jax_ad.Zero)
 
 
-def _has_concrete_nonzero_cotangent(x):
-    if _is_zero_cotangent(x):
-        return False
-    for leaf in jax.tree_util.tree_leaves(x):
-        try:
-            if bool(np.any(np.asarray(leaf))):
-                return True
-        except Exception:  # Traced cotangents cannot be inspected here.
-            pass
-    return False
-
-
-def _has_tracer(x):
-    if _is_zero_cotangent(x):
-        return False
-    for leaf in jax.tree_util.tree_leaves(x):
-        if isinstance(leaf, (jax.core.Tracer, jax_ad.JVPTracer)):
-            return True
-        for attr in ('primal', 'val'):
-            if hasattr(leaf, attr):
-                if _has_tracer(getattr(leaf, attr)):
-                    return True
-    return False
-
-
-def _cotangent_is_zero(x):
-    if _is_zero_cotangent(x):
-        return True
-    for leaf in jax.tree_util.tree_leaves(x):
-        try:
-            if bool(np.any(np.asarray(leaf))):
-                return False
-        except Exception:  # Traced cotangents should take the general path.
-            return False
-    return True
-
-
-def _cotangent_or_zeros(x, ref):
-    if _is_zero_cotangent(x):
-        return np.zeros_like(ref)
-    return np.asarray(x)
-
-
-def _tree_add(x, y):
-    if x is None:
-        return y
-    if y is None:
-        return x
-    return jax.tree_util.tree_map(lambda a, b: a + b, x, y)
-
-
 def _init_amps_no_side_effect(mycc, eris):
     mo_e = eris.mo_energy
     nocc = mycc.nocc
@@ -294,17 +188,6 @@ def _init_amps_no_side_effect(mycc, eris):
         / (eia[:, None, :, None] + eia[None, :, None, :])
     )
     return t1, t2
-
-
-def _amplitudes_cotangent_to_vector(bar_t1, bar_t2):
-    nocc, nvir = bar_t1.shape
-    nov = nocc * nvir
-    bar_t2_mat = np.transpose(bar_t2, (0, 2, 1, 3)).reshape(nov, nov)
-    idx = numpy.tril_indices(nov)
-    lower = bar_t2_mat[idx]
-    upper = np.transpose(bar_t2_mat)[idx]
-    bar_t2_vec = np.where(idx[0] == idx[1], lower, lower + upper)
-    return np.concatenate((bar_t1.ravel(), bar_t2_vec), axis=None)
 
 
 def _dfccsd_kernel_plain(mycc, eris, t1=None, t2=None):
@@ -333,6 +216,14 @@ def _dfccsd_kernel_custom_fwd(mycc, eris, t1=None, t2=None):
 
 
 def _dfccsd_kernel_custom_bwd(res, cotangent):
+    """Backward of the DF-CCSD custom-VJP via implicit-diff-form lambda equations.
+
+    Given upstream cotangents (bar_e on the CCSD energy, bar_t1/bar_t2 on the
+    converged amplitudes), solve a single response lambda equation that
+    incorporates both, then evaluate the ERI cotangent as the gradient of the
+    Lagrangian ``bar_e * E_cc(t, eris) + lambda . Omega(t, eris)`` with
+    ``Omega = update_amps(t, eris) - t``.
+    """
     mycc, eris, t1, t2 = res
     _, bar_e, bar_t1, bar_t2 = cotangent
     t1 = np.asarray(t1)
@@ -345,111 +236,28 @@ def _dfccsd_kernel_custom_bwd(res, cotangent):
     ):
         return None, None, None, None
 
-    if (
-        _has_tracer(eris)
-        or _has_tracer(t1)
-        or _has_tracer(t2)
-        or _has_tracer(bar_e)
-        or _has_concrete_nonzero_cotangent(bar_t1)
-        or _has_concrete_nonzero_cotangent(bar_t2)
-        or not _cotangent_is_zero(bar_t1)
-        or not _cotangent_is_zero(bar_t2)
-    ):
-        eris_bar = _dfccsd_kernel_custom_bwd_with_amplitudes(
-            mycc, eris, t1, t2, bar_e, bar_t1, bar_t2
-        )
-        return None, eris_bar, None, None
+    bar_e_val = 0.0 if _is_zero_cotangent(bar_e) else np.asarray(bar_e)
+    bar_t1_val = None if _is_zero_cotangent(bar_t1) else np.asarray(bar_t1)
+    bar_t2_val = None if _is_zero_cotangent(bar_t2) else np.asarray(bar_t2)
 
-    _, l1, l2 = ccsd_lambda.kernel(
-        mycc,
-        eris,
-        t1,
-        t2,
+    _, lambda_vec = ccsd_lambda.solve_response_lambda(
+        mycc, eris, t1, t2,
+        bar_e_val, bar_t1_val, bar_t2_val,
         max_cycle=mycc.max_cycle,
         tol=mycc.conv_tol_normt,
         verbose=mycc.verbose,
     )
 
     def lagrangian(eris_):
+        # Lambda already absorbs bar_e * dE/dt + bar_t via the response solve,
+        # so the Lagrangian scales only the energy term by bar_e.
         ecc = mycc.energy(t1, t2, eris_)
         t1new, t2new = mycc.update_amps(t1, t2, eris_)
-        nocc = t1.shape[0]
-        mo_e = eris_.mo_energy
-        eia = mo_e[:nocc, None] - mo_e[None, nocc:]
-        eijab = eia[:, None, :, None] + eia[None, :, None, :]
-        amp_dot = 2 * np.vdot(l1, (t1new - t1) * eia)
-        l2_metric = l2 * 2 - np.transpose(l2, (1, 0, 2, 3))
-        amp_dot += np.vdot(l2_metric, (t2new - t2) * eijab)
-        return np.real(bar_e * (ecc + amp_dot))
+        omega_vec = mycc.amplitudes_to_vector(t1new - t1, t2new - t2)
+        return np.real(bar_e_val * ecc + np.vdot(lambda_vec, omega_vec))
 
     eris_bar = jax.grad(lagrangian)(eris)
     return None, eris_bar, None, None
-
-
-def _dfccsd_kernel_custom_bwd_with_amplitudes(
-    mycc, eris, t1, t2, bar_e, bar_t1, bar_t2
-):
-    amp = mycc.amplitudes_to_vector(t1, t2)
-    eris_bar = None
-
-    bar_amp = np.zeros_like(amp)
-    if not _cotangent_is_zero(bar_t1) or not _cotangent_is_zero(bar_t2):
-        bar_t1 = _cotangent_or_zeros(bar_t1, t1)
-        bar_t2 = _cotangent_or_zeros(bar_t2, t2)
-        bar_amp += _amplitudes_cotangent_to_vector(bar_t1, bar_t2)
-
-    if not _cotangent_is_zero(bar_e):
-        def scaled_energy(amp_, eris_):
-            t1_, t2_ = mycc.vector_to_amplitudes(amp_)
-            return np.real(bar_e * mycc.energy(t1_, t2_, eris_))
-
-        bar_amp_e, eris_bar_e = jax.grad(scaled_energy, argnums=(0, 1))(amp, eris)
-        bar_amp += bar_amp_e
-        eris_bar = _tree_add(eris_bar, eris_bar_e)
-
-    if _cotangent_is_zero(bar_amp):
-        return eris_bar
-
-    def fixed_point(amp_, eris_):
-        t1_, t2_ = mycc.vector_to_amplitudes(amp_)
-        t1new, t2new = mycc.update_amps(t1_, t2_, eris_)
-        return mycc.amplitudes_to_vector(t1new, t2new)
-
-    def optimality(amp_, eris_):
-        return fixed_point(amp_, eris_) - amp_
-
-    eris_leaves, eris_treedef = jax.tree_util.tree_flatten(eris)
-    if len(eris_leaves) != 9:
-        def optimality_from_eris_leaves(amp_, *eris_leaves_):
-            eris_ = jax.tree_util.tree_unflatten(eris_treedef, eris_leaves_)
-            return optimality(amp_, eris_)
-    else:
-        ctx = _DFCCSDResponseContext(
-            nmo=int(mycc.nmo),
-            nocc=int(mycc.nocc),
-            level_shift=float(mycc.level_shift),
-            cc2=bool(mycc.cc2),
-            direct=bool(mycc.direct),
-            dcsd=bool(mycc.dcsd),
-        )
-
-        def optimality_from_eris_leaves(amp_, *eris_leaves_):
-            return _dfccsd_response_optimality(ctx, amp_, *eris_leaves_)
-
-    _, optimality_vjp = jax.vjp(
-        optimality_from_eris_leaves, amp, *eris_leaves
-    )
-
-    def matvec(u):
-        return optimality_vjp(u)[0]
-
-    solver = gen_gmres(tol=mycc.conv_tol_normt)
-    lambda_bar = solver(matvec, -bar_amp)[0]
-    response_bars = optimality_vjp(lambda_bar)
-    eris_bar_response = jax.tree_util.tree_unflatten(
-        eris_treedef, response_bars[1:]
-    )
-    return _tree_add(eris_bar, eris_bar_response)
 
 
 _dfccsd_kernel_custom.defvjp(

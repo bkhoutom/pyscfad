@@ -886,16 +886,10 @@ def _fragment_kernel_replay_bwd(frag_lolist, no_type, frag_nonvlist,
         _, pullback = jax.vjp(frag_fn, state, orbloc, dlno_data)
         replay_s = time.perf_counter() - replay_start
         pullback_start = time.perf_counter()
-        frag_state_bar = None
-        frag_orbloc_bar = None
-        frag_dlno_data_bar = None
-        for ybar_piece in _split_tuple_cotangent(ybar[ifrag]):
-            piece_state_bar, piece_orbloc_bar, piece_dlno_data_bar = pullback(ybar_piece)
-            frag_state_bar = _tree_add_cotangent(frag_state_bar, piece_state_bar)
-            frag_orbloc_bar = _tree_add_cotangent(frag_orbloc_bar, piece_orbloc_bar)
-            frag_dlno_data_bar = _tree_add_cotangent(
-                frag_dlno_data_bar, piece_dlno_data_bar
-            )
+        # Pullback is linear in ybar, so passing the full tuple at once is
+        # equivalent to splitting per-component and summing -- but avoids
+        # running the per-fragment lambda response solve N_outputs times.
+        frag_state_bar, frag_orbloc_bar, frag_dlno_data_bar = pullback(ybar[ifrag])
         pullback_s = time.perf_counter() - pullback_start
         if collect_bwd:
             row = None
@@ -959,16 +953,10 @@ def _fragment_kernel_replay_subset_bwd(frag_lolist, owned_indices, no_type,
         _, pullback = jax.vjp(frag_fn, state, orbloc, dlno_data)
         replay_s = time.perf_counter() - replay_start
         pullback_start = time.perf_counter()
-        frag_state_bar = None
-        frag_orbloc_bar = None
-        frag_dlno_data_bar = None
-        for ybar_piece in _split_tuple_cotangent(ybar[ilocal]):
-            piece_state_bar, piece_orbloc_bar, piece_dlno_data_bar = pullback(ybar_piece)
-            frag_state_bar = _tree_add_cotangent(frag_state_bar, piece_state_bar)
-            frag_orbloc_bar = _tree_add_cotangent(frag_orbloc_bar, piece_orbloc_bar)
-            frag_dlno_data_bar = _tree_add_cotangent(
-                frag_dlno_data_bar, piece_dlno_data_bar
-            )
+        # Pullback is linear in ybar, so passing the full tuple at once is
+        # equivalent to splitting per-component and summing -- but avoids
+        # running the per-fragment lambda response solve N_outputs times.
+        frag_state_bar, frag_orbloc_bar, frag_dlno_data_bar = pullback(ybar[ilocal])
         pullback_s = time.perf_counter() - pullback_start
         if collect_bwd:
             row = None

@@ -74,6 +74,7 @@ def _make_df_eris_incore(cc, mo_coeff=None, fockao=None):
     naux = Lpq.shape[0]
     Loo = Lpq[:,:nocc,:nocc].reshape(naux,-1)
     Lov = Lpq[:,:nocc,nocc:].reshape(naux,-1)
+    eris.Lov = Lov.reshape(naux, nocc, nvir)
     eris.Lvv = Lvv = lib.pack_tril(Lpq[:,nocc:,nocc:])
 
     eris.oooo = np.dot(Loo.T, Loo).reshape(nocc,nocc,nocc,nocc)

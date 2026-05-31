@@ -1926,19 +1926,38 @@ def orthonormalize_metric_colspace_smooth(A, s, thresh=1e-10):
     Gram matrix.  The result depends only on the projector-valued function of the
     Gram matrix and therefore avoids the arbitrary eigenvector gauge inside
     exactly or nearly degenerate subspaces.
+
+    Dispatches to a pure numpy/scipy path on concrete (non-tracer) inputs to
+    avoid XLA compile-cache growth in per-LMO/per-fragment eager prescreen
+    builds.  Under ``jax.value_and_grad`` the JAX path is taken so the gradient
+    propagates.
     """
-    A = np.asarray(A)
-    s = np.asarray(s)
-    if A.ndim != 2:
+    if isinstance(A, jax.core.Tracer) or isinstance(s, jax.core.Tracer):
+        A = np.asarray(A)
+        s = np.asarray(s)
+        if A.ndim != 2:
+            raise ValueError('Input space must be a rank-2 array.')
+        if A.shape[1] == 0:
+            return np.zeros((A.shape[0], 0), dtype=A.dtype)
+        floor = max(float(thresh), 1e-10)
+        gram = np.dot(A.T.conj(), np.dot(s, A))
+        eye = np.eye(gram.shape[0], dtype=gram.dtype)
+        chol = np.linalg.cholesky(gram + floor * eye)
+        x = jsp_linalg.solve_triangular(chol.T.conj(), eye, lower=False)
+        return np.dot(A, x)
+    A_np = numpy.asarray(A)
+    s_np = numpy.asarray(s)
+    if A_np.ndim != 2:
         raise ValueError('Input space must be a rank-2 array.')
-    if A.shape[1] == 0:
-        return np.zeros((A.shape[0], 0), dtype=A.dtype)
+    if A_np.shape[1] == 0:
+        return numpy.zeros((A_np.shape[0], 0), dtype=A_np.dtype)
     floor = max(float(thresh), 1e-10)
-    gram = np.dot(A.T.conj(), np.dot(s, A))
-    eye = np.eye(gram.shape[0], dtype=gram.dtype)
-    chol = np.linalg.cholesky(gram + floor * eye)
-    x = jsp_linalg.solve_triangular(chol.T.conj(), eye, lower=False)
-    return np.dot(A, x)
+    gram = A_np.T.conj() @ s_np @ A_np
+    eye = numpy.eye(gram.shape[0], dtype=gram.dtype)
+    chol = numpy.linalg.cholesky(gram + floor * eye)
+    from scipy.linalg import solve_triangular
+    x = solve_triangular(chol.T.conj(), eye, lower=False)
+    return A_np @ x
 
 
 def orthonormalize_colspace_fixed_gauge(A, thresh=1e-10):

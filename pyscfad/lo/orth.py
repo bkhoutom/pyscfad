@@ -13,6 +13,9 @@
 # limitations under the License.
 
 from functools import partial, reduce
+import numpy as _onp
+import scipy.linalg as _onp_sla
+import jax
 from pyscfad import numpy as np
 from pyscfad import ops
 from pyscfad import scipy
@@ -23,6 +26,31 @@ def lowdin(s, thresh=1e-15):
     e_sqrt = np.where(e>thresh, np.sqrt(e), np.inf)
     return np.dot(v/e_sqrt[None,:], v.conj().T)
 
+
+def _lowdin_numpy(s, thresh=1e-15):
+    s_np = _onp.asarray(s)
+    e, v = _onp_sla.eigh(s_np)
+    e_sqrt = _onp.where(e > thresh, _onp.sqrt(e), _onp.inf)
+    return _onp.dot(v / e_sqrt[None, :], v.conj().T)
+
+
 def vec_lowdin(c, s=1):
-    return np.dot(c, lowdin(reduce(np.dot, (c.conj().T, s, c))))
+    """Lowdin-orthonormalize ``c`` with overlap ``s``.
+
+    Dispatches to a pure numpy path on concrete inputs to avoid XLA
+    compile-cache growth from per-shape variation; otherwise uses the JAX
+    path so the gradient propagates inside ``jax.value_and_grad``.
+    """
+    if isinstance(c, jax.core.Tracer) or (
+        not isinstance(s, (int, float, complex))
+        and isinstance(s, jax.core.Tracer)
+    ):
+        return np.dot(c, lowdin(reduce(np.dot, (c.conj().T, s, c))))
+    c_np = _onp.asarray(c)
+    if isinstance(s, (int, float, complex)):
+        m = c_np.conj().T @ (s * c_np)
+    else:
+        s_np = _onp.asarray(s)
+        m = c_np.conj().T @ s_np @ c_np
+    return c_np @ _lowdin_numpy(m)
 

@@ -9,6 +9,8 @@ from functools import reduce
 import time
 import numpy as onp
 import numpy as np
+import scipy.linalg as onp_scipy_linalg
+import jax
 import jax.numpy as jnp
 from pyscf import gto, lo, scf, mp, lib
 from pyscf.data.elements import chemcore
@@ -79,13 +81,28 @@ def _pao_space(mf, frozen=None, s1e=None, norm_thr=1e-4):
 
 
 def _semicanonicalize_local(mol, mos, fock, atmlst):
+    """Eigh of the local Fock block in the (small) ``mos`` basis.
+
+    Dispatches on whether ``mos`` / ``fock`` are JAX tracers. Concrete inputs
+    take a numpy/scipy path; tracer inputs keep the JAX path so the gradient
+    propagates inside ``jax.value_and_grad``.
+    """
     ao_idx = dlno_util.ao_index_by_atom(mol, atmlst)
-    fock22 = fock[np.ix_(ao_idx, ao_idx)]
-    f = mos.T.conj() @ fock22 @ mos
-    if mos.shape[1] == 1:
-        return jnp.asarray(f).reshape(-1), mos
-    w, v = scipy.linalg.eigh(f)
-    return w, mos @ v
+    if isinstance(mos, jax.core.Tracer) or isinstance(fock, jax.core.Tracer):
+        fock22 = fock[np.ix_(ao_idx, ao_idx)]
+        f = mos.T.conj() @ fock22 @ mos
+        if mos.shape[1] == 1:
+            return jnp.asarray(f).reshape(-1), mos
+        w, v = scipy.linalg.eigh(f)
+        return w, mos @ v
+    mos_np = onp.asarray(mos)
+    fock_np = onp.asarray(fock)
+    fock22 = fock_np[onp.ix_(ao_idx, ao_idx)]
+    f = mos_np.T.conj() @ fock22 @ mos_np
+    if mos_np.shape[1] == 1:
+        return f.reshape(-1), mos_np
+    w, v = onp_scipy_linalg.eigh(f)
+    return w, mos_np @ v
 
 
 def _fake_multipole_mol(mol, atmlst):

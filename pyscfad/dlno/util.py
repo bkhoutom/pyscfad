@@ -1,19 +1,32 @@
 from functools import reduce
 import numpy as np
+import jax
 import jax.numpy as jnp
 
 from pyscf import lib, gto
+
+
+def _is_traced(*xs):
+    for x in xs:
+        if isinstance(x, jax.core.Tracer):
+            return True
+    return False
 
 
 def project_mo(mo1, s21, s22):
     """Project ``mo1`` to basis ``2`` using a jax-friendly solver.
 
     This mirrors the original dlno.util.project_mo but uses ``jnp.linalg.solve``
-    so it can participate in JAX tracing where inputs are jax arrays.
+    so it can participate in JAX tracing where inputs are jax arrays. When the
+    inputs are concrete (not tracers), a numpy/scipy path is taken to avoid
+    XLA compile-cache growth from per-shape variation in eager prescreen
+    builds.
     """
-    # solve s22 x = s21 @ mo1  => x = solve(s22, s21 @ mo1)
-    rhs = jnp.asarray(s21) @ jnp.asarray(mo1)
-    return jnp.linalg.solve(jnp.asarray(s22), rhs)
+    if _is_traced(mo1, s21, s22):
+        rhs = jnp.asarray(s21) @ jnp.asarray(mo1)
+        return jnp.linalg.solve(jnp.asarray(s22), rhs)
+    rhs = np.asarray(s21) @ np.asarray(mo1)
+    return np.linalg.solve(np.asarray(s22), rhs)
 
 
 def orthogonalize(mo1, mo2, s):
@@ -22,13 +35,21 @@ def orthogonalize(mo1, mo2, s):
     Notes
     -----
     ``mo1`` must be orthonormal with respect to ``s``.
+
+    Dispatches to numpy on concrete inputs to keep eager prescreen builds
+    out of the JAX compile pipeline.
     """
-    s = jnp.asarray(s)
-    mo1 = jnp.asarray(mo1)
-    mo2 = jnp.asarray(mo2)
-    s12 = mo1.conj().T @ s @ mo2
-    mo2 = mo2 - mo1 @ s12
-    return mo2
+    if _is_traced(mo1, mo2, s):
+        s = jnp.asarray(s)
+        mo1 = jnp.asarray(mo1)
+        mo2 = jnp.asarray(mo2)
+        s12 = mo1.conj().T @ s @ mo2
+        return mo2 - mo1 @ s12
+    s_np = np.asarray(s)
+    mo1_np = np.asarray(mo1)
+    mo2_np = np.asarray(mo2)
+    s12 = mo1_np.conj().T @ s_np @ mo2_np
+    return mo2_np - mo1_np @ s12
 
 
 def ao_index_by_atom(mol, atmlst):

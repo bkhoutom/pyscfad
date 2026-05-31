@@ -85,7 +85,9 @@ def _make_df_eris_incore(cc, mo_coeff=None, fockao=None):
 
     oovv = np.dot(Loo.T, Lvv)
     eris.oovv = lib.unpack_tril(oovv).reshape(nocc,nocc,nvir,nvir)
-    eris.ovvv = np.dot(Lov.T, Lvv).reshape(nocc,nvir,-1)
+    # eris.ovvv is built lazily via eris.get_ovvv_packed() on first access so
+    # forward CCSD (which builds tiles from Lov/Lvv) doesn't pay the
+    # persistent allocation.  The (T) and lambda paths trigger it on demand.
     Loo = Lov = Lpq = None
     return eris
 

@@ -46,8 +46,11 @@ def _get_ovvv_full(eris):
     """Unpack the (ov|vv) integral block to shape (nocc, nvir, nvir, nvir).
 
     Skips ``eris.get_ovvv``'s optimized numpy path so the result is
-    JAX-traceable inside a jit boundary.
+    JAX-traceable inside a jit boundary. Triggers the lazy ``eris.ovvv``
+    build if Lov/Lvv are stored but ovvv has not been materialized yet.
     """
+    if eris.ovvv is None and hasattr(eris, 'get_ovvv_packed'):
+        eris.get_ovvv_packed()
     ovvv_packed = eris.ovvv
     nocc, nvir = ovvv_packed.shape[:2]
     ovvv = lib.unpack_tril(

@@ -1,13 +1,38 @@
 import numpy as np
+import scipy.linalg as _sla_numpy
+import jax
 import jax.numpy as jnp
 from pyscfad import scipy
 from . import util
 
 
-def _canonical_orth_jax(s, thr=1e-6):
-    e, v = scipy.linalg.eigh(jnp.asarray(s), deg_thresh=thr)
+def _is_traced(*xs):
+    for x in xs:
+        if isinstance(x, jax.core.Tracer):
+            return True
+    return False
+
+
+def _canonical_orth(s, thr=1e-6):
+    """Build the canonical-orthonormalization matrix from the overlap ``s``.
+
+    When ``s`` is a concrete (non-tracer) array, take a plain numpy path: no
+    JAX tracing, no XLA compilation, allocator returns large mmaps on free.
+    When ``s`` is a tracer (called from inside ``jax.value_and_grad``), use
+    the JAX path so the gradient propagates.
+    """
+    if _is_traced(s):
+        e, v = scipy.linalg.eigh(jnp.asarray(s), deg_thresh=thr)
+        idx = e > thr
+        return v[:, idx] / jnp.sqrt(e[idx])[None, :]
+    s_np = np.asarray(s)
+    e, v = _sla_numpy.eigh(s_np)
     idx = e > thr
-    return v[:, idx] / jnp.sqrt(e[idx])[None, :]
+    return v[:, idx] / np.sqrt(e[idx])[None, :]
+
+
+# Back-compat alias for any external callers.
+_canonical_orth_jax = _canonical_orth
 
 def pao(mol, mos, s1e=None, norm_thr=1e-4):
     """Compute PAOs.
@@ -62,6 +87,11 @@ def pao_overlap_with_domain(
         ao2pao_map=None, s1e=None, ovlp_thr=1e-4, orth_thr=1e-6
     ):
     """PAOs in the larger domain that overlap with the smaller domain.
+
+    Dispatches on whether the inputs are JAX tracers: under
+    ``jax.value_and_grad`` we keep the JAX path so the gradient propagates;
+    outside (eager builds) we use plain numpy/scipy to avoid XLA compile
+    cache growth from per-LMO/per-fragment shape variation.
     """
     if p_domain is None:
         p_domain = bp_domain
@@ -69,16 +99,25 @@ def pao_overlap_with_domain(
         s1e = mol.intor_symmetric('int1e_ovlp')
 
     pao_pd = pao_by_atom(mol, paos, p_domain, ao2pao_map)
-
-    x = _canonical_orth_jax(pao_pd.T.conj() @ s1e @ pao_pd, thr=orth_thr)
-    pao_pd_orth = pao_pd @ x
-
     ao_idx_bp = util.ao_index_by_atom(mol, bp_domain)
-    s21 = s1e[ao_idx_bp]
-    s22 = s1e[np.ix_(ao_idx_bp, ao_idx_bp)]
-    s22_inv = jnp.linalg.inv(jnp.asarray(s22))
 
+    if _is_traced(paos, s1e, pao_pd):
+        x = _canonical_orth(pao_pd.T.conj() @ s1e @ pao_pd, thr=orth_thr)
+        pao_pd_orth = pao_pd @ x
+        s21 = s1e[ao_idx_bp]
+        s22 = s1e[np.ix_(ao_idx_bp, ao_idx_bp)]
+        tmp = s21 @ pao_pd_orth
+        ovlp = tmp.T.conj() @ jnp.linalg.solve(jnp.asarray(s22), tmp)
+        w, v = scipy.linalg.eigh(jnp.asarray(ovlp), deg_thresh=max(orth_thr, 1e-6))
+        return pao_pd_orth @ v[:, w > ovlp_thr]
+
+    pao_pd_np = np.asarray(pao_pd)
+    s1e_np = np.asarray(s1e)
+    x = _canonical_orth(pao_pd_np.T.conj() @ s1e_np @ pao_pd_np, thr=orth_thr)
+    pao_pd_orth = pao_pd_np @ x
+    s21 = s1e_np[ao_idx_bp]
+    s22 = s1e_np[np.ix_(ao_idx_bp, ao_idx_bp)]
     tmp = s21 @ pao_pd_orth
-    ovlp = tmp.T.conj() @ s22_inv @ tmp
-    w, v = scipy.linalg.eigh(jnp.asarray(ovlp), deg_thresh=max(orth_thr, 1e-6))
-    return pao_pd_orth @ v[:, w>ovlp_thr]
+    ovlp = tmp.T.conj() @ np.linalg.solve(s22, tmp)
+    w, v = _sla_numpy.eigh(ovlp)
+    return pao_pd_orth @ v[:, w > ovlp_thr]

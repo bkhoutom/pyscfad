@@ -1,5 +1,6 @@
 from functools import reduce
 import numpy as np
+import jax
 import jax.numpy as jnp
 from pyscf.gto.mole import inter_distance
 from . import util
@@ -97,21 +98,29 @@ def get_primary_domain(mol, lmo_bp_domain, pao_bp_domain, ao2pao_map=None):
 
 
 def _compute_av(mol, mo, s1e=None, atmlst=None):
-    """Compute BP value
+    """Compute BP value.
+
+    Dispatches to a pure numpy path on concrete inputs to avoid XLA
+    compile-cache growth in per-LMO eager prescreen builds. Keeps the JAX
+    path when called under ``jax.value_and_grad`` so the gradient propagates.
     """
     if s1e is None:
         s1e = mol.intor_symmetric('int1e_ovlp')
     if atmlst is None:
         atmlst = np.arange(mol.natm)
 
-    mo = jnp.asarray(mo)
-
-    ao_idx = util.ao_index_by_atom(mol, atmlst)
-    s1e = jnp.asarray(s1e)
-    v = s1e[ao_idx] @ mo
-    a = jnp.linalg.solve(s1e[jnp.ix_(jnp.asarray(ao_idx), jnp.asarray(ao_idx))], v)
-    av = jnp.sum(a * v, axis=0)
-    return av
+    if isinstance(mo, jax.core.Tracer) or (
+        s1e is not None and isinstance(s1e, jax.core.Tracer)
+    ):
+        mo = jnp.asarray(mo)
+        ao_idx = util.ao_index_by_atom(mol, atmlst)
+        s1e = jnp.asarray(s1e)
+        v = s1e[ao_idx] @ mo
+        a = jnp.linalg.solve(
+            s1e[jnp.ix_(jnp.asarray(ao_idx), jnp.asarray(ao_idx))], v
+        )
+        return jnp.sum(a * v, axis=0)
+    return _compute_av_numpy(mol, mo, s1e=s1e, atmlst=atmlst)
 
 
 def atom_distance(mol, atmlst=None):

@@ -50,7 +50,11 @@ def kernel(mycc, eris, ulo, t1=None, t2=None, verbose=logger.NOTE):
     fvo = eris.fock[nocc:,:nocc]
     ovoo = eris.ovoo
     ovov = eris.ovov
-    ovvv = eris.ovvv
+    # eris.ovvv is built lazily; trigger the build now so the custom_vjp
+    # below has a concrete tensor to save as a residual.
+    ovvv = (
+        eris.get_ovvv_packed() if eris.ovvv is None else eris.ovvv
+    )
 
     if getattr(mycc, 'profile_pass', None) == 'backward replay':
         et = _ccsd_t_energy_lazy(mat, t1T, t2T, mo_energy, fvo,

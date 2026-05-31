@@ -143,6 +143,32 @@ class _ChemistsERIs(ccsd._ChemistsERIs):
         assert not direct
         return _contract_vvvv_t2(mycc, self.mol, self.Lvv, t2)
 
+    def get_ovvv_packed(self):
+        """Return the packed ``(ov|vv)`` block of shape (nocc, nvir, nvir_pair).
+
+        Builds lazily from ``Lov`` and ``Lvv`` on first access and caches on
+        ``self.ovvv``.  Forward DF-CCSD's ``update_amps`` no longer needs this
+        tensor (it builds tiles from ``Lov`` directly), so the packed form is
+        only materialized when the lambda or (T) paths actually need it.
+        """
+        if self.ovvv is not None:
+            return self.ovvv
+        if self.Lov is None or self.Lvv is None:
+            raise ValueError(
+                'Cannot lazily build eris.ovvv: Lov/Lvv missing on eris.'
+            )
+        Lov_flat = self.Lov.reshape(self.Lov.shape[0], -1)
+        nocc = self.nocc
+        self.ovvv = np.dot(np.transpose(Lov_flat), self.Lvv).reshape(
+            nocc, -1, self.Lvv.shape[1]
+        )
+        return self.ovvv
+
+    def get_ovvv(self, *slices):
+        if self.ovvv is None:
+            self.get_ovvv_packed()
+        return super().get_ovvv(*slices)
+
 
 def _make_df_eris_incore(cc, mo_coeff=None):
     eris = _ChemistsERIs()
@@ -171,7 +197,10 @@ def _make_df_eris_incore(cc, mo_coeff=None):
 
     oovv = np.dot(np.transpose(Loo), Lvv)
     eris.oovv = lib.unpack_tril(oovv).reshape(nocc,nocc,nvir,nvir)
-    eris.ovvv = np.dot(np.transpose(Lov), Lvv).reshape(nocc,nvir,-1)
+    # eris.ovvv is built lazily via eris.get_ovvv_packed() on first access so
+    # the forward DF-CCSD path (which builds tiles from Lov/Lvv directly) does
+    # not pay the persistent nocc*nvir*nvir_pair allocation.  The (T) and
+    # lambda paths trigger the build the first time they read eris.ovvv.
     return eris
 
 

@@ -21,7 +21,7 @@ from pyscfad.ops import jit, vmap
 def full(eri_ao, mo_coeff, verbose=0, compact=True, **kwargs):
     nao = mo_coeff.shape[0]
     if eri_ao.size != nao**4:
-        raise NotImplementedError
+        return general(eri_ao, (mo_coeff,)*4, verbose, compact)
     return general(eri_ao, (mo_coeff,)*4, verbose, compact)
 
 def general(eri_ao, mo_coeffs, verbose=0, compact=True, **kwargs):

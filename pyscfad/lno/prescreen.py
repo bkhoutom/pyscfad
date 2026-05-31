@@ -35,6 +35,40 @@ except Exception:
     from dlno import util as dlno_util
 
 
+def _is_traced(*xs):
+    for x in xs:
+        if isinstance(x, jax.core.Tracer):
+            return True
+    return False
+
+
+def _diag_subspace_energies(vir_prescreen, fock_block):
+    """Compute diag(V^H F V) eagerly with numpy when possible.
+
+    When ``vir_prescreen`` or ``fock_block`` are JAX tracers we stay on the
+    JAX path so gradients propagate; otherwise we drop straight into numpy
+    to skip XLA compilation and avoid pinning the intermediates in the
+    JAX allocator.
+    """
+    if _is_traced(vir_prescreen, fock_block):
+        return jnp.real(jnp.diag(vir_prescreen.T.conj() @ fock_block @ vir_prescreen))
+    v = onp.asarray(vir_prescreen)
+    f = onp.asarray(fock_block)
+    return onp.real(onp.einsum('ji,jk,ki->i', v.conj(), f, v))
+
+
+def _maybe_asarray(x):
+    """Return ``jnp.asarray(x)`` only if ``x`` already lives in JAX.
+
+    Used at the end of the build/rebuild loops where converting a freshly
+    computed numpy array to a JAX array does no useful work — the caller
+    will consume it as numpy anyway when not under tracing.
+    """
+    if _is_traced(x):
+        return jnp.asarray(x)
+    return onp.asarray(x)
+
+
 @contextmanager
 def _topology_profile_section(rows, name):
     start = time.perf_counter()
@@ -404,9 +438,9 @@ def _canonicalize_single_lo_domain(
         pao_i = vec_lowdin(pao_i, s=s22)
         e_vir_i, pao_i_canon = _semicanonicalize_local(mol, pao_i, fock, primary_domain)
     else:
-        e_vir_i = jnp.zeros((0,))
-        pao_i_canon = jnp.zeros((len(ao_idx), 0))
-    return jnp.asarray(e_occ_i).reshape(-1), lo_i_canon, jnp.asarray(e_vir_i), pao_i_canon
+        e_vir_i = onp.zeros((0,))
+        pao_i_canon = onp.zeros((len(ao_idx), 0))
+    return _maybe_asarray(e_occ_i).reshape(-1), lo_i_canon, _maybe_asarray(e_vir_i), pao_i_canon
 
 
 def _lo_pair_energy_matrix_multipole(
@@ -573,12 +607,12 @@ def _build_lo_indexed_prescreen_data(
                 vir_prescreen = frag_pao_prj
                 if vir_prescreen.shape[1] > 0:
                     fock22 = fock[np.ix_(ao_idx, ao_idx)]
-                    e_vir_prescreen = jnp.real(jnp.diag(vir_prescreen.T.conj() @ fock22 @ vir_prescreen))
+                    e_vir_prescreen = _diag_subspace_energies(vir_prescreen, fock22)
                 else:
-                    e_vir_prescreen = jnp.zeros((0,))
+                    e_vir_prescreen = onp.zeros((0,))
             else:
-                e_vir_prescreen = jnp.zeros((0,))
-                vir_prescreen = jnp.zeros((len(ao_idx), 0))
+                e_vir_prescreen = onp.zeros((0,))
+                vir_prescreen = onp.zeros((len(ao_idx), 0))
 
             fragment_data.append(
                 {
@@ -740,12 +774,12 @@ def build_dlno_prescreen_data(
                 vir_prescreen = frag_pao_prj
                 if vir_prescreen.shape[1] > 0:
                     fock22 = fock[np.ix_(ao_idx, ao_idx)]
-                    e_vir_prescreen = jnp.real(jnp.diag(vir_prescreen.T.conj() @ fock22 @ vir_prescreen))
+                    e_vir_prescreen = _diag_subspace_energies(vir_prescreen, fock22)
                 else:
-                    e_vir_prescreen = jnp.zeros((0,))
+                    e_vir_prescreen = onp.zeros((0,))
             else:
-                e_vir_prescreen = jnp.zeros((0,))
-                vir_prescreen = jnp.zeros((len(ao_idx), 0))
+                e_vir_prescreen = onp.zeros((0,))
+                vir_prescreen = onp.zeros((len(ao_idx), 0))
 
             fragment_data.append(
                 {
@@ -754,9 +788,9 @@ def build_dlno_prescreen_data(
                     "strong_lmo_indices": frag_strong,
                     "extended_bp_domain": frag_ext_bp,
                     "extended_primary_domain": frag_ext_primary,
-                    "occ_prescreen_energies": jnp.asarray(e_occ_prescreen),
+                    "occ_prescreen_energies": _maybe_asarray(e_occ_prescreen),
                     "occ_prescreen_coeff": occ_prescreen,
-                    "vir_prescreen_energies": jnp.asarray(e_vir_prescreen),
+                    "vir_prescreen_energies": _maybe_asarray(e_vir_prescreen),
                     "vir_prescreen_coeff": vir_prescreen,
                 }
             )
@@ -847,12 +881,12 @@ def rebuild_dlno_prescreen_data(mf, lo_coeff, topology_data, *, frozen=None):
             vir_prescreen = frag_pao_prj
             if vir_prescreen.shape[1] > 0:
                 fock22 = fock[np.ix_(ao_idx, ao_idx)]
-                e_vir_prescreen = jnp.real(jnp.diag(vir_prescreen.T.conj() @ fock22 @ vir_prescreen))
+                e_vir_prescreen = _diag_subspace_energies(vir_prescreen, fock22)
             else:
-                e_vir_prescreen = jnp.zeros((0,))
+                e_vir_prescreen = onp.zeros((0,))
         else:
-            e_vir_prescreen = np.zeros((0,))
-            vir_prescreen = np.zeros((len(ao_idx), 0))
+            e_vir_prescreen = onp.zeros((0,))
+            vir_prescreen = onp.zeros((len(ao_idx), 0))
 
         fragment_data.append(
             {
@@ -861,9 +895,9 @@ def rebuild_dlno_prescreen_data(mf, lo_coeff, topology_data, *, frozen=None):
                 "strong_lmo_indices": frag_strong,
                 "extended_bp_domain": frag_ext_bp,
                 "extended_primary_domain": frag_ext_primary,
-                "occ_prescreen_energies": jnp.asarray(e_occ_prescreen),
+                "occ_prescreen_energies": _maybe_asarray(e_occ_prescreen),
                 "occ_prescreen_coeff": occ_prescreen,
-                "vir_prescreen_energies": jnp.asarray(e_vir_prescreen),
+                "vir_prescreen_energies": _maybe_asarray(e_vir_prescreen),
                 "vir_prescreen_coeff": vir_prescreen,
             }
         )

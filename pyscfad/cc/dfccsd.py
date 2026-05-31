@@ -181,9 +181,26 @@ def _make_df_eris_incore(cc, mo_coeff=None):
 
     mo = np.asarray(eris.mo_coeff)
     ijslice = (0, nmo, 0, nmo)
-    eri1 = with_df._cderi
-    # pylint: disable=too-many-function-args
-    Lpq = _ao2mo.nr_e2(eri1, mo, ijslice, aosym='s2', mosym='s1').reshape(-1,nmo,nmo)
+    has_outcore = (
+        hasattr(with_df, '_has_outcore_cderi_placeholder')
+        and with_df._has_outcore_cderi_placeholder()
+    )
+    if has_outcore:
+        # Stream cderi from disk and route the AO->MO transform through the
+        # outcore custom_vjp so the (naux, nao_pair) tensor never enters the
+        # JAX trace.  The custom_vjp's backward analytically propagates
+        # mo_coeff_bar via streamed nr_e2 VJP and mol/auxmol_bar via the
+        # chunked cholesky_eri VJP.
+        from pyscfad.lno.lno_base import _outcore_nr_e2
+        cderi_source = with_df._get_cderi_source()
+        Lpq = _outcore_nr_e2(
+            with_df.mol, with_df.auxmol, mo, cderi_source,
+            max(with_df.max_memory, 4096), ijslice, 's2'
+        ).reshape(-1, nmo, nmo)
+    else:
+        eri1 = with_df._cderi
+        # pylint: disable=too-many-function-args
+        Lpq = _ao2mo.nr_e2(eri1, mo, ijslice, aosym='s2', mosym='s1').reshape(-1,nmo,nmo)
     Loo = Lpq[:,:nocc,:nocc].reshape(naux,-1)
     Lov = Lpq[:,:nocc,nocc:].reshape(naux,-1)
     eris.Lov = Lov.reshape(naux, nocc, nvir)

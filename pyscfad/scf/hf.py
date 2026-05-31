@@ -237,6 +237,7 @@ def _first_order_settings(mf_ref):
         'conv_tol_grad': mf_ref.conv_tol_grad,
         'max_cycle': mf_ref.max_cycle,
         'init_guess': mf_ref.init_guess,
+        'chkfile': mf_ref.chkfile,
         'verbose': mf_ref.verbose,
         'max_memory': mf_ref.max_memory,
         'direct_scf': mf_ref.direct_scf,
@@ -274,6 +275,7 @@ def _build_mf_for_first_order(mol, settings):
     mf.conv_tol_grad = settings['conv_tol_grad']
     mf.max_cycle = settings['max_cycle']
     mf.init_guess = settings['init_guess']
+    mf.chkfile = settings['chkfile']
     mf.verbose = settings['verbose']
     mf.max_memory = settings['max_memory']
     mf.direct_scf = settings['direct_scf']

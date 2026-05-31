@@ -1,5 +1,6 @@
 import jax
 import numpy
+import pytest
 
 from pyscfad import config, gto, scf
 from pyscfad.cc import dfccsd
@@ -12,6 +13,13 @@ def _make_mol():
     mol.verbose = 0
     mol.build(trace_exp=False, trace_ctr_coeff=False)
     return mol
+
+
+@pytest.fixture(autouse=True)
+def _reset_config():
+    config.reset()
+    yield
+    config.reset()
 
 
 def _configure():

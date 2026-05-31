@@ -17,6 +17,7 @@ from pyscf.lib import current_memory
 from pyscfad.lib import logger
 from pyscfad.ops import jit
 from pyscfad import ao2mo
+from pyscfad import config
 from pyscfad.cc import ccsd
 from pyscfad.cc import rintermediates as imd
 
@@ -185,7 +186,8 @@ def _make_eris_incore(mycc, mo_coeff=None, ao2mofn=None):
     else:
         eri_ao = mycc._scf._eri
         if eri_ao is None:
-            eri_ao = mycc.mol.intor('int2e', aosym='s1')
+            aosym = 's4' if config.moleintor_opt else 's1'
+            eri_ao = mycc.mol.intor('int2e', aosym=aosym)
         eri1 = ao2mo.incore.full(eri_ao, eris.mo_coeff, compact=False)
         #eri1 = ao2mo.restore(1, eri1, nmo)
     eris.oooo = eri1[:nocc,:nocc,:nocc,:nocc]#.copy()

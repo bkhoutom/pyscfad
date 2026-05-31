@@ -54,19 +54,33 @@ def pao(mol, mos, s1e=None, norm_thr=1e-4):
     if s1e is None:
         s1e = mol.intor_symmetric('int1e_ovlp')
 
-    mos = jnp.asarray(mos)
+    if _is_traced(mos, s1e):
+        mos = jnp.asarray(mos)
+        if mos.ndim == 1:
+            mos = mos.reshape(-1,1)
+        assert mos.ndim == 2
+        nao, nmo = mos.shape
+        s1e = jnp.asarray(s1e)
+        paos = jnp.eye(nao) - mos @ (mos.T.conj() @ s1e)
+        norm = jnp.sqrt(util.einsum('ui,uv,vi->i', paos.conj(), s1e, paos))
+        pao_idx = jnp.where(norm > norm_thr)[0]
+        inv_idx = np.full(nao, -1, dtype=np.int32)
+        inv_idx[np.asarray(pao_idx)] = np.arange(len(pao_idx))
+        paos = paos[:,pao_idx] / norm[pao_idx]
+        return paos, inv_idx
+
+    mos = np.asarray(mos)
     if mos.ndim == 1:
-        mos = mos.reshape(-1,1)
+        mos = mos.reshape(-1, 1)
     assert mos.ndim == 2
     nao, nmo = mos.shape
-
-    s1e = jnp.asarray(s1e)
-    paos = jnp.eye(nao) - mos @ (mos.T.conj() @ s1e)
-    norm = jnp.sqrt(util.einsum('ui,uv,vi->i', paos.conj(), s1e, paos))
-    pao_idx = jnp.where(norm > norm_thr)[0]
+    s1e = np.asarray(s1e)
+    paos = np.eye(nao) - mos @ (mos.T.conj() @ s1e)
+    norm = np.sqrt(np.einsum('ui,uv,vi->i', paos.conj(), s1e, paos))
+    pao_idx = np.where(norm > norm_thr)[0]
     inv_idx = np.full(nao, -1, dtype=np.int32)
-    inv_idx[np.asarray(pao_idx)] = np.arange(len(pao_idx))
-    paos = paos[:,pao_idx] / norm[pao_idx]
+    inv_idx[pao_idx] = np.arange(len(pao_idx))
+    paos = paos[:, pao_idx] / norm[pao_idx]
     return paos, inv_idx
 
 

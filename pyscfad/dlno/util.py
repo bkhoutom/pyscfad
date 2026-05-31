@@ -97,4 +97,7 @@ def list_to_array(a):
 
 
 def einsum(expr, *args):
-    return jnp.einsum(expr, *args)
+    for a in args:
+        if isinstance(a, jax.core.Tracer):
+            return jnp.einsum(expr, *args)
+    return np.einsum(expr, *[np.asarray(a) for a in args])

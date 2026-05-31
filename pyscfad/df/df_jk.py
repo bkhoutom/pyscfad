@@ -46,7 +46,21 @@ def _contains_jvp_tracer(x):
     return False
 
 
+def _has_outcore_cderi(dfobj):
+    fn = getattr(dfobj, '_has_outcore_cderi_placeholder', None)
+    return bool(fn() if callable(fn) else False)
+
+
 def get_jk(dfobj, dm, hermi=1, with_j=True, with_k=True, direct_scf_tol=1e-13):
+    # When CDERI lives on disk (outcore placeholder), always route through the
+    # custom_vjp opt path: its forward streams cderi blocks from disk via
+    # ``dfobj.loop()`` and its backward computes mol/auxmol cotangents
+    # analytically via ``_cderi_vjp``.  ``get_jk_gen`` would try to einsum the
+    # ``(0, 0)`` placeholder and die.
+    if _has_outcore_cderi(dfobj):
+        return get_jk_opt(dfobj, dm, hermi=hermi,
+                          with_j=with_j, with_k=with_k,
+                          direct_scf_tol=direct_scf_tol)
     if config.moleintor_opt and not _has_jvp_tracer(dfobj, dm):
         return get_jk_opt(dfobj, dm, hermi=hermi,
                           with_j=with_j, with_k=with_k,

@@ -63,6 +63,17 @@ class DF(pyscf_df.DF):
             log.info('Skip DF.build(). Existing _cderi will be used.')
             return self
 
+        # Caller has already wired up the outcore-placeholder pattern
+        # (``_cderi_to_save`` points at an existing on-disk j3c file, ``_cderi``
+        # is the zero-shape placeholder, ``_prefer_cderi_to_save`` is True).
+        # Skip the build entirely — re-running ``outcore.cholesky_eri`` here
+        # would overwrite the file and, under JAX tracing, fail because
+        # pyscf's outcore routine cannot consume a traced ``mol``.
+        if self._has_outcore_cderi_placeholder() and self.auxmol is not None:
+            log.info('Skip DF.build(). Outcore CDERI at %s will be used.',
+                     self._cderi_to_save)
+            return self
+
         mol = self.mol
         if self.auxmol is None:
             self.auxmol = addons.make_auxmol(self.mol, self.auxbasis)
@@ -105,6 +116,21 @@ class DF(pyscf_df.DF):
             self._prefer_cderi_to_save = True
 
         del log
+        return self
+
+    def attach_outcore_cderi(self, path):
+        """Wire this DF object up to read an existing on-disk j3c file.
+
+        After this call, ``self.build()`` will be a no-op, and ``get_jk`` /
+        ``transform_df_to_mo`` will stream cderi blocks from ``path`` via
+        their custom_vjp paths.  Use to reuse a cderi file built once (e.g.
+        by an eager reference SCF) across many traced gradient evaluations.
+        """
+        if self.auxmol is None:
+            self.auxmol = addons.make_auxmol(self.mol, self.auxbasis)
+        self._cderi_to_save = path
+        self._cderi = numpy.zeros(_OUTCORE_CDERI_PLACEHOLDER_SHAPE)
+        self._prefer_cderi_to_save = True
         return self
 
     def reset(self, mol=None):

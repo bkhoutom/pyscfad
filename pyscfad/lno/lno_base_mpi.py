@@ -133,12 +133,6 @@ class LNO(lno_base.LNO):
             )
         collect_profile = comm.bcast(root_collect_profile, root=0)
         print_profile = collect_profile and root_verbose >= 2 and nproc > 1
-        use_subset_replay = (
-            nproc > 1
-            and lno_base.USE_FRAGMENT_REPLAY_VJP
-            and bool(getattr(self, 'use_dlno_prescreen', False))
-            and self.dlno_prescreen_data is not None
-        )
 
         frag_lolist_local, frag_wghtlist_local, indices = partition_jobs(
             frag_lolist, frag_wghtlist)
@@ -152,8 +146,8 @@ class LNO(lno_base.LNO):
         orig_profile_mpi_nfrag = getattr(self, 'profile_mpi_nfrag', None)
         orig_profile_mpi_print = bool(getattr(self, 'profile_mpi_print', False))
         orig_dlno_data = self.dlno_prescreen_data
-        profile_indices = tuple(range(nfrag)) if use_subset_replay else tuple(indices)
-        if nproc > 1 and not use_subset_replay:
+        profile_indices = tuple(indices)
+        if nproc > 1:
             self.dlno_prescreen_data = _partition_dlno_data(orig_dlno_data, indices)
         if print_profile:
             self.verbose = 0
@@ -164,22 +158,12 @@ class LNO(lno_base.LNO):
             self.profile_mpi_print = True
 
         try:
-            if use_subset_replay:
-                frag_res_local = lno_base.kernel_mpi_subset(
-                    self,
-                    orbloc,
-                    frag_lolist,
-                    indices,
-                    no_type=no_type,
-                    frag_nonvlist=frag_nonvlist,
-                )
-            else:
-                frag_res_local = lno_base.kernel(
-                    self,
-                    orbloc,
-                    frag_lolist_local,
-                    frag_nonvlist=frag_nonvlist_local,
-                )
+            frag_res_local = lno_base.kernel(
+                self,
+                orbloc,
+                frag_lolist_local,
+                frag_nonvlist=frag_nonvlist_local,
+            )
         finally:
             self.verbose = orig_verbose
             self.profile_fragments = orig_profile_fragments

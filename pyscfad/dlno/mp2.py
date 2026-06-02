@@ -204,3 +204,22 @@ def kernel_dfmp2(fake_mf, prj, with_t2=False):
     # small convenience wrapper if needed
     _mp2 = dfmp2.DFMP2(fake_mf)
     return _mp2.kernel(prj, with_t2=with_t2)
+
+
+from pyscfad.lno.mp2 import LNOMP2 as _LNOMP2  # noqa: E402
+
+
+class DLNOMP2(_LNOMP2):
+    """MP2 with domain-restricted LNO prescreening.
+
+    A thin subclass of :class:`pyscfad.lno.mp2.LNOMP2` whose constructor
+    accepts ``dlno_prescreen_data`` directly and enables
+    ``use_dlno_prescreen`` by default.  See
+    :class:`pyscfad.dlno.ccsd.DLNOCCSD` for the rationale.
+    """
+
+    def __init__(self, mf, thresh=1e-4, frozen=None,
+                 dlno_prescreen_data=None, **kwargs):
+        super().__init__(mf, thresh=thresh, frozen=frozen, **kwargs)
+        self.use_dlno_prescreen = True
+        self.dlno_prescreen_data = dlno_prescreen_data

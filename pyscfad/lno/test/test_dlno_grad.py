@@ -5,6 +5,7 @@ import numpy
 
 from pyscfad import config, df, gto, scf
 from pyscfad.lno import ccsd as lnoccsd
+from pyscfad.dlno.ccsd import DLNOCCSD
 from pyscfad.dlno.prescreen import build_dlno_prescreen_data, rebuild_dlno_prescreen_data
 from pyscfad.lno.tools import autofrag, map_lo_to_frag
 from pyscfad.ops import stop_trace
@@ -64,8 +65,12 @@ def _build_local_orbitals_and_fragments(mf, thresh):
     return lo_coeff, frag_lolist
 
 
-def _make_solver(mf, thresh):
-    mycc = lnoccsd.LNOCCSD(mf, thresh=thresh, frozen=0)
+def _make_solver(mf, thresh, dlno_data=None):
+    if dlno_data is None:
+        mycc = lnoccsd.LNOCCSD(mf, thresh=thresh, frozen=0)
+    else:
+        mycc = DLNOCCSD(mf, thresh=thresh, frozen=0,
+                        dlno_prescreen_data=dlno_data)
     mycc.thresh_occ = thresh
     mycc.thresh_vir = thresh
     mycc.lo_type = 'iao'
@@ -116,9 +121,7 @@ def test_dlno_ccsd_gradient_matches_parent_lno_for_full_domains(tmp_path):
         dlno_data = rebuild_dlno_prescreen_data(
             mf, lo_coeff, static_topology, frozen=0
         )
-        mycc = _make_solver(mf, thresh)
-        mycc.use_dlno_prescreen = True
-        mycc.dlno_prescreen_data = dlno_data
+        mycc = _make_solver(mf, thresh, dlno_data=dlno_data)
         mycc.kernel(frag_lolist=static_frag_lolist, orbloc=lo_coeff)
         return ehf + mycc.e_corr
 

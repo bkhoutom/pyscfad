@@ -26,6 +26,8 @@ import numpy as np
 
 from pyscfad import config, gto, mp, scf
 from pyscfad.lno import LNOCCSD, LNOMP2
+from pyscfad.dlno.ccsd import DLNOCCSD
+from pyscfad.dlno.mp2 import DLNOMP2
 from pyscfad.dlno.prescreen import build_dlno_prescreen_data, rebuild_dlno_prescreen_data
 from pyscfad.lno.tools import autofrag, map_lo_to_frag
 from pyscfad.ops import stop_trace
@@ -100,15 +102,24 @@ def make_canonical_mp2_solver(mf):
     return pt
 
 
-def make_local_mp2_solver(mf, *, thresh, lo_type=LO_TYPE):
-    pt = LNOMP2(mf, thresh=thresh, frozen=FROZEN)
+def make_local_mp2_solver(mf, *, thresh, lo_type=LO_TYPE, dlno_data=None):
+    if dlno_data is None:
+        pt = LNOMP2(mf, thresh=thresh, frozen=FROZEN)
+    else:
+        pt = DLNOMP2(mf, thresh=thresh, frozen=FROZEN,
+                     dlno_prescreen_data=dlno_data)
     pt.thresh_occ = pt.thresh_vir = thresh
     pt.lo_type, pt.no_type = lo_type, "ie"
     return pt
 
 
-def make_cc_solver(mf, *, thresh, lo_type=LO_TYPE, ccsd_t=False):
-    cc = LNOCCSD(mf, thresh=thresh, frozen=FROZEN)
+def make_cc_solver(mf, *, thresh, lo_type=LO_TYPE, ccsd_t=False,
+                   dlno_data=None):
+    if dlno_data is None:
+        cc = LNOCCSD(mf, thresh=thresh, frozen=FROZEN)
+    else:
+        cc = DLNOCCSD(mf, thresh=thresh, frozen=FROZEN,
+                      dlno_prescreen_data=dlno_data)
     cc.thresh_occ = cc.thresh_vir = thresh
     cc.lo_type, cc.no_type, cc.ccsd_t = lo_type, "ie", ccsd_t
     return cc
@@ -147,12 +158,6 @@ def build_static_dlno_topology(
 
 def build_current_dlno_data(mf, lo, topology):
     return rebuild_dlno_prescreen_data(mf, lo, topology, frozen=FROZEN)
-
-
-def enable_dlno_prescreen(solver, dlno_data):
-    solver.use_dlno_prescreen = True
-    solver.dlno_prescreen_data = dlno_data
-    return solver
 
 
 def five_point_directional_derivative(fn, symbols, base_coords, direction, h):
@@ -201,7 +206,7 @@ def dlno_total_energy(mol, *, thresh, correction, ccsd_frag_los, ccsd_topology,
         mol, thresh=thresh,
         ccsd_frag_los=ccsd_frag_los, ccsd_topology=ccsd_topology,
     )
-    cc = enable_dlno_prescreen(make_cc_solver(mf, thresh=thresh, ccsd_t=False), dlno_data)
+    cc = make_cc_solver(mf, thresh=thresh, ccsd_t=False, dlno_data=dlno_data)
     cc.kernel(frag_lolist=frag_los, orbloc=lo)
 
     if correction == "none":
@@ -214,9 +219,8 @@ def dlno_total_energy(mol, *, thresh, correction, ccsd_frag_los, ccsd_topology,
             thresh=DLNO_MP2_LNO_THRESH,
         )
         mp2_dlno_data = build_current_dlno_data(mf, mp2_lo, mp2_topology)
-        pt = enable_dlno_prescreen(
-            make_local_mp2_solver(mf, thresh=DLNO_MP2_LNO_THRESH),
-            mp2_dlno_data,
+        pt = make_local_mp2_solver(
+            mf, thresh=DLNO_MP2_LNO_THRESH, dlno_data=mp2_dlno_data,
         )
         pt.kernel(frag_lolist=mp2_frag_los, orbloc=mp2_lo)
     else:

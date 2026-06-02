@@ -24,6 +24,8 @@ import numpy as np
 
 from pyscfad import config, gto, mp, scf
 from pyscfad.lno import LNOCCSD, LNOMP2
+from pyscfad.dlno.ccsd import DLNOCCSD
+from pyscfad.dlno.mp2 import DLNOMP2
 from pyscfad.dlno.prescreen import build_dlno_prescreen_data, rebuild_dlno_prescreen_data
 from pyscfad.lno.tools import autofrag, map_lo_to_frag
 from pyscfad.ops import stop_trace
@@ -88,15 +90,24 @@ def make_canonical_mp2_solver(mf):
     return mymp
 
 
-def make_local_mp2_solver(mf, *, thresh=LNO_THRESH, lo_type=LO_TYPE):
-    mymp = LNOMP2(mf, thresh=thresh, frozen=FROZEN)
+def make_local_mp2_solver(mf, *, thresh=LNO_THRESH, lo_type=LO_TYPE,
+                          dlno_data=None):
+    if dlno_data is None:
+        mymp = LNOMP2(mf, thresh=thresh, frozen=FROZEN)
+    else:
+        mymp = DLNOMP2(mf, thresh=thresh, frozen=FROZEN,
+                       dlno_prescreen_data=dlno_data)
     mymp.thresh_occ = mymp.thresh_vir = thresh
     mymp.lo_type, mymp.no_type = lo_type, "ie"
     return mymp
 
 
-def make_cc_solver(mf):
-    cc = LNOCCSD(mf, thresh=LNO_THRESH, frozen=FROZEN)
+def make_cc_solver(mf, dlno_data=None):
+    if dlno_data is None:
+        cc = LNOCCSD(mf, thresh=LNO_THRESH, frozen=FROZEN)
+    else:
+        cc = DLNOCCSD(mf, thresh=LNO_THRESH, frozen=FROZEN,
+                      dlno_prescreen_data=dlno_data)
     cc.thresh_occ = cc.thresh_vir = LNO_THRESH
     cc.lo_type, cc.no_type, cc.ccsd_t = LO_TYPE, "ie", False
     cc.verbose = 0
@@ -132,12 +143,6 @@ def build_dlno_data(mf, lo_coeff, topology):
     return rebuild_dlno_prescreen_data(mf, lo_coeff, topology, frozen=FROZEN)
 
 
-def enable_dlno_prescreen(solver, dlno_data):
-    solver.use_dlno_prescreen = True
-    solver.dlno_prescreen_data = dlno_data
-    return solver
-
-
 def lno_total_energy(mol):
     mf = run_rhf(mol)
     lo_coeff, _ = build_local_orbitals_and_fragments(mf)
@@ -151,9 +156,9 @@ def dlno_total_energy_threshold(mol, static_frag_lolist, static_topology):
     mf = run_rhf(mol)
     lo_coeff, _ = build_local_orbitals_and_fragments(mf)
     dlno_data = build_dlno_data(mf, lo_coeff, static_topology)
-    mycc = enable_dlno_prescreen(make_cc_solver(mf), dlno_data)
+    mycc = make_cc_solver(mf, dlno_data=dlno_data)
     mycc.kernel(frag_lolist=static_frag_lolist, orbloc=lo_coeff)
-    mymp = enable_dlno_prescreen(make_local_mp2_solver(mf), dlno_data)
+    mymp = make_local_mp2_solver(mf, dlno_data=dlno_data)
     mymp.kernel(frag_lolist=static_frag_lolist, orbloc=lo_coeff)
     total = mf.e_tot + mycc.e_corr_pt2corrected(mymp.e_corr)
     return total, {

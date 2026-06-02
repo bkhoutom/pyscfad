@@ -7,6 +7,8 @@ import numpy as np
 from pyscfad import config, gto, scf
 from pyscfad.lno import LNOMP2
 from pyscfad.lno import ccsd as lnoccsd
+from pyscfad.dlno.ccsd import DLNOCCSD
+from pyscfad.dlno.mp2 import DLNOMP2
 from pyscfad.dlno.prescreen import build_dlno_prescreen_data, rebuild_dlno_prescreen_data
 from pyscfad.lno.tools import autofrag, map_lo_to_frag
 from pyscfad.ops import stop_trace
@@ -49,8 +51,12 @@ def build_local_orbitals_and_fragments(mf):
     return lo_coeff, frag_lolist
 
 
-def make_cc_solver(mf):
-    mycc = lnoccsd.LNOCCSD(mf, thresh=THRESH, frozen=0)
+def make_cc_solver(mf, dlno_data=None):
+    if dlno_data is None:
+        mycc = lnoccsd.LNOCCSD(mf, thresh=THRESH, frozen=0)
+    else:
+        mycc = DLNOCCSD(mf, thresh=THRESH, frozen=0,
+                        dlno_prescreen_data=dlno_data)
     mycc.thresh_occ = THRESH
     mycc.thresh_vir = THRESH
     mycc.lo_type = LO_TYPE
@@ -59,8 +65,12 @@ def make_cc_solver(mf):
     return mycc
 
 
-def make_local_mp2_solver(mf):
-    mymp = LNOMP2(mf, thresh=THRESH, frozen=0)
+def make_local_mp2_solver(mf, dlno_data=None):
+    if dlno_data is None:
+        mymp = LNOMP2(mf, thresh=THRESH, frozen=0)
+    else:
+        mymp = DLNOMP2(mf, thresh=THRESH, frozen=0,
+                       dlno_prescreen_data=dlno_data)
     mymp.thresh_occ = THRESH
     mymp.thresh_vir = THRESH
     mymp.lo_type = LO_TYPE
@@ -118,13 +128,9 @@ def dlno_total_energy(mol):
     ehf = mf.kernel()
     lo_coeff, _ = build_local_orbitals_and_fragments(mf)
     dlno_data = build_dlno_data(mf, lo_coeff)
-    mymp = make_local_mp2_solver(mf)
-    mymp.use_dlno_prescreen = True
-    mymp.dlno_prescreen_data = dlno_data
+    mymp = make_local_mp2_solver(mf, dlno_data=dlno_data)
     mymp.kernel(frag_lolist=STATIC_FRAG_LOLIST, orbloc=lo_coeff)
-    mycc = make_cc_solver(mf)
-    mycc.use_dlno_prescreen = True
-    mycc.dlno_prescreen_data = dlno_data
+    mycc = make_cc_solver(mf, dlno_data=dlno_data)
     mycc.kernel(frag_lolist=STATIC_FRAG_LOLIST, orbloc=lo_coeff)
     return ehf + mycc.e_corr_pt2corrected(mymp.e_corr)
 

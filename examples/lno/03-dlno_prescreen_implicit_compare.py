@@ -7,7 +7,7 @@ import numpy as np
 from pyscfad import config, gto, scf
 from pyscfad.lno import LNOMP2
 from pyscfad.lno import ccsd as lnoccsd
-from pyscfad.lno.prescreen import build_dlno_prescreen_data, rebuild_dlno_prescreen_data
+from pyscfad.dlno.prescreen import build_dlno_prescreen_data, rebuild_dlno_prescreen_data
 from pyscfad.lno.tools import autofrag, map_lo_to_frag
 from pyscfad.ops import stop_trace
 

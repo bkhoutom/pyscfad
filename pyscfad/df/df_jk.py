@@ -114,7 +114,15 @@ def density_fit(mf, auxbasis=None, with_df=None, only_dfj=False):
     return dfmf
 
 class _DFHF(pytree.PytreeNode, pyscf_df_jk._DFHF):
-    _dynamic_attr = {'mol', 'with_df'}
+    # mo_coeff, mo_energy, e_tot are stateful attributes ``kernel()`` writes
+    # onto the SCF object.  If they sit as aux data (i.e. not in
+    # ``_dynamic_attr``), the JAX pytree machinery preserves them verbatim
+    # across flatten/unflatten and they carry outer-trace tracer references
+    # into any custom_vjp body that re-traces with the SCF as an input.
+    # That breaks both the readers (UnexpectedTracerError on attribute
+    # reads) and the equality checks JAX uses for treedef matching
+    # (``data_for_hash`` equality comparing tracer leaves).
+    _dynamic_attr = {'mol', 'with_df', 'mo_coeff', 'mo_energy', 'e_tot'}
 
     def get_jk(self, mol=None, dm=None, hermi=1, with_j=True, with_k=True,
                omega=None):

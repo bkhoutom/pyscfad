@@ -15,6 +15,9 @@
 import os
 from functools import reduce
 import numpy
+import jax
+from jax import custom_vjp
+from jax.interpreters import ad as jax_ad
 from pyscf.cc import ccsd as pyscf_ccsd
 from pyscf.mp.mp2 import _mo_without_core
 from pyscfad import numpy as np
@@ -22,6 +25,112 @@ from pyscfad import pytree
 from pyscfad import ops
 from pyscfad import lib
 from pyscfad.lib import logger
+
+
+# Toggle for the analytical (custom_vjp) init_amps path.  Default True so
+# the heavy LNO calculations benefit immediately; tests can flip to False
+# to get the plain JAX-AD baseline for cross-checking.
+_USE_CUSTOM_VJP_INIT_AMPS = True
+
+
+# ---------------------------------------------------------------------------
+# MP2 initial amplitudes wrapped as jax.custom_vjp.
+#
+# Forward computes the same expressions as ``CCSD.init_amps`` but the backward
+# is hand-coded so the JAX trace doesn't have to retain ``eia``, ``eijab``,
+# the t2 = ovov / eijab division, or the two emp2 einsums.  Eliminates a
+# small but real contribution to the recorded jaxpr around the MP2-init step.
+#
+# Math (real-valued path used in practice):
+#   eia[i,a]    = mo_e[i] - mo_e[nocc+a]
+#   eijab[i,j,a,b] = eia[i,a] + eia[j,b]
+#   t1[i,a]     = fock_oa[i,a] / eia[i,a]
+#   t2[i,j,a,b] = ovov[i,a,j,b] / eijab[i,j,a,b]
+#   emp2 = einsum('ijab,iajb', 2*t2 - t2.swapaxes(0,1), ovov)
+# ---------------------------------------------------------------------------
+@custom_vjp
+def _init_amps_jax(mo_energy, fock_oa, ovov):
+    nocc = ovov.shape[0]
+    eia = mo_energy[:nocc, None] - mo_energy[None, nocc:]
+    eijab = eia[:, None, :, None] + eia[None, :, None, :]
+    t1 = fock_oa / eia
+    t2 = ovov.transpose(0, 2, 1, 3).conj() / eijab
+    emp2 = 2 * np.einsum('ijab,iajb', t2, ovov) - np.einsum('jiab,iajb', t2, ovov)
+    return emp2.real, t1, t2
+
+
+def _init_amps_jax_fwd(mo_energy, fock_oa, ovov):
+    nocc = ovov.shape[0]
+    eia = mo_energy[:nocc, None] - mo_energy[None, nocc:]
+    eijab = eia[:, None, :, None] + eia[None, :, None, :]
+    t1 = fock_oa / eia
+    t2 = ovov.transpose(0, 2, 1, 3).conj() / eijab
+    emp2 = 2 * np.einsum('ijab,iajb', t2, ovov) - np.einsum('jiab,iajb', t2, ovov)
+    return (emp2.real, t1, t2), (mo_energy, fock_oa, ovov, eia, eijab, t1, t2)
+
+
+def _is_zero_cot(x):
+    return x is None or isinstance(x, jax_ad.Zero)
+
+
+def _init_amps_jax_bwd(res, cotangent):
+    mo_energy, fock_oa, ovov, eia, eijab, t1, t2 = res
+    bar_emp2, bar_t1, bar_t2 = cotangent
+
+    # Promote zero cotangents to real arrays.
+    if _is_zero_cot(bar_t1):
+        bar_t1 = np.zeros_like(t1)
+    if _is_zero_cot(bar_t2):
+        bar_t2 = np.zeros_like(t2)
+    bar_e = 0.0 if _is_zero_cot(bar_emp2) else bar_emp2.real
+
+    # emp2 = einsum('ijab,iajb', 2*t2 - t2.swapaxes(0,1), ovov)
+    # d emp2 / d t2[I,J,A,B] = 2*ovov[I,A,J,B] - ovov[J,A,I,B]
+    # d emp2 / d ovov[I,A,J,B] = 2*t2[I,J,A,B] - t2[J,I,A,B]
+    ovov_T = ovov.transpose(0, 2, 1, 3)             # ovov_T[i,j,a,b] = ovov[i,a,j,b]
+    bar_t2 = bar_t2 + bar_e * (2 * ovov_T - ovov_T.transpose(1, 0, 2, 3))
+
+    t2_T = t2.transpose(0, 2, 1, 3)                 # t2_T[i,a,j,b] = t2[i,j,a,b]
+    # bar_ovov from emp2:
+    #   bar_ovov[I,A,J,B] += bar_e * (2*t2[I,J,A,B] - t2[J,I,A,B])
+    bar_ovov_from_emp2 = bar_e * (2 * t2_T - t2_T.transpose(2, 1, 0, 3))
+
+    # bar_ovov from t2 = ovov / eijab:
+    #   bar_ovov[I,A,J,B] += bar_t2[I,J,A,B] / eijab[I,J,A,B]
+    bar_ovov_from_t2 = bar_t2.transpose(0, 2, 1, 3) / eijab.transpose(0, 2, 1, 3)
+    bar_ovov = bar_ovov_from_emp2 + bar_ovov_from_t2
+
+    # bar_eijab from t2 = ovov / eijab:
+    #   bar_eijab[I,J,A,B] = -bar_t2[I,J,A,B] * t2[I,J,A,B] / eijab[I,J,A,B]
+    bar_eijab = -bar_t2 * t2 / eijab
+
+    # bar_fock_oa from t1 = fock_oa / eia:
+    bar_fock_oa = bar_t1 / eia
+
+    # bar_eia from t1 = fock_oa / eia:
+    bar_eia_from_t1 = -bar_t1 * t1 / eia
+
+    # bar_eia from eijab[i,j,a,b] = eia[i,a] + eia[j,b]:
+    #   bar_eia[I,A] += sum_{j,b} bar_eijab[I,j,A,b]   (first term)
+    #               +  sum_{i,a} bar_eijab[i,I,a,A]   (second term)
+    bar_eia_from_eijab = bar_eijab.sum(axis=(1, 3)) + bar_eijab.sum(axis=(0, 2))
+    bar_eia = bar_eia_from_t1 + bar_eia_from_eijab
+
+    # bar_eia → bar_mo_energy
+    nocc = bar_eia.shape[0]
+    nmo = mo_energy.shape[0]
+    bar_mo_energy = np.zeros(nmo, dtype=mo_energy.dtype)
+    bar_mo_energy = ops.index_update(
+        bar_mo_energy, ops.index[:nocc], bar_eia.sum(axis=1)
+    )
+    bar_mo_energy = ops.index_update(
+        bar_mo_energy, ops.index[nocc:], -bar_eia.sum(axis=0)
+    )
+
+    return bar_mo_energy, bar_fock_oa, bar_ovov
+
+
+_init_amps_jax.defvjp(_init_amps_jax_fwd, _init_amps_jax_bwd)
 #from pyscfad.ops import jit
 from pyscfad import config
 from pyscfad.implicit_diff import make_implicit_diff
@@ -456,16 +565,25 @@ class CCSD(pytree.PytreeNode, pyscf_ccsd.CCSD):
             e_hf = self.get_e_hf(mo_coeff=self.mo_coeff)
         mo_e = eris.mo_energy
         nocc = self.nocc
-        nvir = mo_e.size - nocc
-        eia = mo_e[:nocc,None] - mo_e[None,nocc:]
 
-        t1 = eris.fock[:nocc,nocc:] / eia
-        eris_ovov = eris.ovov
-        t2 = (eris_ovov.transpose(0,2,1,3).conj()
-              / (eia[:,None,:,None] + eia[None,:,None,:]))
-        emp2  = 2 * np.einsum('ijab,iajb', t2, eris_ovov)
-        emp2 -=     np.einsum('jiab,iajb', t2, eris_ovov)
-        self.emp2 = emp2.real
+        if _USE_CUSTOM_VJP_INIT_AMPS:
+            # Hand-coded backward; avoids retaining eia/eijab and the two
+            # emp2 einsums in the JAX trace.
+            fock_oa = eris.fock[:nocc, nocc:]
+            eris_ovov = eris.ovov
+            emp2, t1, t2 = _init_amps_jax(mo_e, fock_oa, eris_ovov)
+            self.emp2 = emp2
+        else:
+            # Plain JAX-AD path -- used by tests that need to baseline the
+            # custom_vjp against ordinary autodiff.
+            eia = mo_e[:nocc, None] - mo_e[None, nocc:]
+            t1 = eris.fock[:nocc, nocc:] / eia
+            eris_ovov = eris.ovov
+            t2 = (eris_ovov.transpose(0, 2, 1, 3).conj()
+                  / (eia[:, None, :, None] + eia[None, :, None, :]))
+            emp2 = 2 * np.einsum('ijab,iajb', t2, eris_ovov)
+            emp2 -= np.einsum('jiab,iajb', t2, eris_ovov)
+            self.emp2 = emp2.real
 
         log.info('Init t2, MP2 energy = %.15g  E_corr(MP2) %.15g',
                  e_hf + self.emp2, self.emp2)

@@ -10,7 +10,7 @@ import numpy
 from pyscfad import gto, scf, mp
 from pyscfad import config
 from pyscfad.lno.ccsd_mpi import LNOCCSD
-from pyscfad.lno.prescreen import (
+from pyscfad.dlno.prescreen import (
     build_dlno_prescreen_data,
     rebuild_dlno_prescreen_data,
 )
@@ -27,13 +27,14 @@ if rank != 0:
     warnings.filterwarnings('ignore',
                             message='Function mol.dumps drops attribute coords.*')
 
-mol = gto.Mole(atom='water_trimer.xyz', basis='ccpvdz')
+mol = gto.Mole(atom='OMCB.xyz', basis='aug-ccpvtz')
 mol.verbose = 4 if rank == 0 else 0
+#mol.max_memory = 2000
 mol.build(trace_exp=False, trace_ctr_coeff=False)
 
-frozen = 3
-thresh_occ = 1e-5
-thresh_vir = 1e-6
+frozen = 0
+thresh_occ = 1e-4
+thresh_vir = 1e-5
 domain_thr = 1e-4
 
 
@@ -42,7 +43,7 @@ def _make_lnoccsd(mf):
     cc.thresh_occ = thresh_occ
     cc.thresh_vir = thresh_vir
     cc.lo_type = 'iao'
-    cc.ccsd_t = True
+    #cc.ccsd_t = True
     return cc
 
 
@@ -58,7 +59,7 @@ topology = build_dlno_prescreen_data(
     _mf0, lo_coeff0, frag_lolist, frozen=frozen,
     lmo_bp_domain_thr=0.9, pao_bp_domain_thr=0.9,
     domain_pao_thr=domain_thr, pair_energy_thr=domain_thr,
-    multipole_order=2,
+    multipole_order=4,
 )
 
 

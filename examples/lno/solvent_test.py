@@ -13,7 +13,7 @@ import numpy as np
 
 from pyscfad import config, df, gto, scf
 from pyscfad.lno import LNOCCSD
-from pyscfad.lno.prescreen import build_dlno_prescreen_data, rebuild_dlno_prescreen_data
+from pyscfad.dlno.prescreen import build_dlno_prescreen_data, rebuild_dlno_prescreen_data
 from pyscfad.lno.tools import autofrag, map_lo_to_frag
 from pyscfad.ops import stop_trace
 from pyscfad.lno import ccsd as lnoccsd
@@ -35,7 +35,7 @@ for key, value in {
     config.update(key, value)
 
 
-BASIS = "def2-svp"
+BASIS = "aug-cc-pvtz"
 LO_TYPE = "iao"  # Change to "pm" or "boys" to try other localization types.
 CCSD_LNO_OCC_THR = 1e-4
 CCSD_LNO_VIR_THR = CCSD_LNO_OCC_THR / 10.0
@@ -205,8 +205,10 @@ def print_dlno_domain_summary(mol, data, title, include_timing=False):
 
 
 def read_water_monomer():
-    xyz_path = Path(__file__).with_name("water_dimer.xyz")
-    atom_lines = xyz_path.read_text().splitlines()[2:5]
+    # xyz_path = Path(__file__).with_name("water_dimer.xyz")
+    # atom_lines = xyz_path.read_text().splitlines()[2:5]
+    xyz_path = Path(__file__).with_name("OMCB.xyz")
+    atom_lines = xyz_path.read_text().splitlines()[2:39]
     monomer = []
     for line in atom_lines:
         symbol, *xyz = line.split()
@@ -236,7 +238,7 @@ def build_mol(grid_n):
         atom=atom,
         basis=BASIS,
         unit="Angstrom",
-        verbose=2,
+        verbose=5,
         max_memory=4000,
     )
     mol.build(trace_exp=False, trace_ctr_coeff=False)
@@ -526,7 +528,8 @@ def run_grid_point(grid_n):
 
 
 if __name__ == "__main__":
-    print(f"Writing timing sweep rows to {CSV_PATH}")
-    print(f"Sweeping N = 1 ... {NMAX}")
-    for grid_n in range(1, NMAX + 1):
-        run_grid_point(grid_n)
+    run_grid_point(1)
+    # print(f"Writing timing sweep rows to {CSV_PATH}")
+    # print(f"Sweeping N = 1 ... {NMAX}")
+    # for grid_n in range(1, NMAX + 1):
+    #     run_grid_point(grid_n)

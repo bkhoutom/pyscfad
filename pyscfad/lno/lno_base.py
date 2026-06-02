@@ -476,8 +476,13 @@ def kernel_1frag(mfcc, eris, orbfragloc, no_type,
     info['nfrag'] = getattr(mfcc, '_nfrag', None)
     info['make_fragment_eris_s'] = make_fragment_eris_s
     info['make_fpno1_s'] = make_fpno1_s
-    if getattr(mfcc, 'compute_domain_pt2', False):
-        info['domain_pt2'] = domain_pt2
+    # Note: domain_pt2 is intentionally NOT stored on ``info`` here.  The
+    # info dict is passed through ``impurity_solve`` as the
+    # ``profile_info`` argument, which is a ``nondiff_argnum`` of the
+    # ``_impurity_solve_jax`` custom_vjp; under tracing ``domain_pt2`` is
+    # a JAX tracer and putting it into a nondiff argument raises
+    # ``UnexpectedTracerError``.  The value is preserved via ``frag_res``
+    # below (line ~485).
     eris_fpno = None
     if orbfrag is None:
         frag_res = (0., 0., 0.)
@@ -796,50 +801,99 @@ def _domain_mp2_fragment_energy(mfcc, eris, orbfragloc,
                                 orbfragvir1, moefragvir1,
                                 uocc2, uvir2, lovir,
                                 semicanonicalize_fn):
+    """Per-fragment LO-projected MP2 energy in the in-domain subspace.
+
+    The in-domain occupied subspace is the joint span of ``uocc2`` (the
+    external active occupied component selected for this fragment's
+    domain) and ``orbfragocc1`` (the LO span itself), expressed in the
+    active occupied MO basis ``orbocc1``.  Out-of-domain occupied
+    orbitals (i.e., the orthogonal complement of this joint subspace
+    within ``orbocc1``) are frozen.
+
+    The crucial detail is *how* the orbital energies for this subspace
+    are obtained.  An earlier version of this routine semi-canonicalized
+    ``uocc2`` and ``orbfragocc1`` separately and concatenated the two
+    blocks; that ignored the off-diagonal Fock coupling between the LO
+    subspace and the external subspace, biasing the MP2 denominators.
+    For a *full* domain (i.e., the joint subspace = all of ``orbocc1``)
+    that block-wise scheme failed to recover the canonical MP2 even in
+    principle.
+
+    Here we instead diagonalize the Fock matrix in the joint in-domain
+    subspace once, giving true canonical-within-domain orbital energies.
+    For full domain this recovers the canonical full-system MP2 exactly;
+    for partial domain it gives the "canonical MP2 inside the domain
+    with out-of-domain occupied frozen" the LNO PNO-truncation correction
+    is supposed to be.  Virtuals are handled the same way when ``lovir``
+    is in use; for the common occupied-LO case ``vir_coeff`` is the full
+    active virtual MO basis with its canonical eigenvalues
+    (``moevir1``), which already gives a canonical evaluation.
+    """
     mf = mfcc._scf
     s1e = eris.s1e
     fock = eris.fock
     orbocc1 = mfcc.split_mo()[1]
     orbvir1 = mfcc.split_mo()[2]
+    moeocc1 = mfcc.split_moe()[1]
     moevir1 = mfcc.split_moe()[2]
 
-    occ_coeff_parts = []
-    occ_energy_parts = []
+    # ---- Build the joint in-domain occupied subspace in orbocc1 basis. ----
+    occ_basis_parts = []
     if uocc2 is not None and uocc2.shape[-1] > 0:
-        moe_occ2, coeff_occ2 = _semicanonicalized_coeff(
-            orbocc1, uocc2, fock, s1e, semicanonicalize_fn
-        )
-        occ_energy_parts.append(moe_occ2)
-        occ_coeff_parts.append(coeff_occ2)
-    coeff_occ1 = reduce(np.dot, (orbocc1.T.conj(), s1e, orbfragocc1))
-    occ_energy_parts.append(moefragocc1)
-    occ_coeff_parts.append(coeff_occ1)
-
-    vir_coeff_parts = []
-    vir_energy_parts = []
-    if uvir2 is None:
-        if not lovir:
-            vir_energy_parts.append(moevir1)
-            vir_coeff_parts.append(_identity_coeff(orbvir1.shape[1], orbvir1.dtype))
-    elif uvir2.shape[-1] > 0:
-        moe_vir2, coeff_vir2 = _semicanonicalized_coeff(
-            orbvir1, uvir2, fock, s1e, semicanonicalize_fn
-        )
-        vir_energy_parts.append(moe_vir2)
-        vir_coeff_parts.append(coeff_vir2)
-
-    if lovir:
-        coeff_vir1 = reduce(np.dot, (orbvir1.T.conj(), s1e, orbfragvir1))
-        vir_energy_parts.append(moefragvir1)
-        vir_coeff_parts.append(coeff_vir1)
-
-    occ_coeff = _hstack_or_empty(occ_coeff_parts, orbocc1.shape[1], orbocc1.dtype)
-    vir_coeff = _hstack_or_empty(vir_coeff_parts, orbvir1.shape[1], orbvir1.dtype)
-    moe_occ = _concat_or_empty(occ_energy_parts, mf.mo_energy.dtype)
-    moe_vir = _concat_or_empty(vir_energy_parts, mf.mo_energy.dtype)
-    if occ_coeff.shape[-1] == 0 or vir_coeff.shape[-1] == 0:
+        occ_basis_parts.append(uocc2)
+    coeff_lo_in_orbocc1 = reduce(np.dot, (orbocc1.T.conj(), s1e, orbfragocc1))
+    occ_basis_parts.append(coeff_lo_in_orbocc1)
+    joint_occ = _hstack_or_empty(occ_basis_parts, orbocc1.shape[1], orbocc1.dtype)
+    if joint_occ.shape[-1] == 0:
         return np.zeros((), dtype=eris.Lov.dtype)
 
+    # ---- Diagonalize Fock in this joint subspace ----
+    # In the canonical active-occ MO basis orbocc1, Fock = diag(moeocc1).
+    # The projected Fock in the joint subspace is joint_occ.T @ diag(moe) @ joint_occ.
+    fock_in_joint_occ = np.dot(
+        joint_occ.T.conj(), moeocc1[:, None] * joint_occ
+    )
+    moe_occ, U_occ = np.linalg.eigh(fock_in_joint_occ)
+    occ_coeff = np.dot(joint_occ, U_occ)   # still in orbocc1 basis
+
+    # ---- Virtual subspace ----
+    if lovir and uvir2 is not None and uvir2.shape[-1] > 0:
+        # Joint-canonicalize the in-domain active virtual subspace too.
+        vir_basis_parts = [uvir2]
+        coeff_lov_in_orbvir1 = reduce(np.dot,
+                                      (orbvir1.T.conj(), s1e, orbfragvir1))
+        vir_basis_parts.append(coeff_lov_in_orbvir1)
+        joint_vir = _hstack_or_empty(vir_basis_parts,
+                                     orbvir1.shape[1], orbvir1.dtype)
+        if joint_vir.shape[-1] == 0:
+            return np.zeros((), dtype=eris.Lov.dtype)
+        fock_in_joint_vir = np.dot(
+            joint_vir.T.conj(), moevir1[:, None] * joint_vir
+        )
+        moe_vir, U_vir = np.linalg.eigh(fock_in_joint_vir)
+        vir_coeff = np.dot(joint_vir, U_vir)
+    elif lovir:
+        # lovir but uvir2 missing/empty — use only the LO virtual span.
+        coeff_lov_in_orbvir1 = reduce(np.dot,
+                                      (orbvir1.T.conj(), s1e, orbfragvir1))
+        if coeff_lov_in_orbvir1.shape[-1] == 0:
+            return np.zeros((), dtype=eris.Lov.dtype)
+        fock_in_joint_vir = np.dot(
+            coeff_lov_in_orbvir1.T.conj(),
+            moevir1[:, None] * coeff_lov_in_orbvir1,
+        )
+        moe_vir, U_vir = np.linalg.eigh(fock_in_joint_vir)
+        vir_coeff = np.dot(coeff_lov_in_orbvir1, U_vir)
+    else:
+        # Occupied-LO common case: use the full active virtual MO basis
+        # (which is already canonical with eigenvalues ``moevir1``).
+        vir_coeff = _identity_coeff(orbvir1.shape[1], orbvir1.dtype)
+        moe_vir = moevir1
+
+    if vir_coeff.shape[-1] == 0:
+        return np.zeros((), dtype=eris.Lov.dtype)
+
+    # ---- Fragment-LO projector in the new canonical in-domain basis. ----
     occ_domain = np.dot(orbocc1, occ_coeff)
     prjlo = reduce(np.dot, (orbfragloc.T, s1e, occ_domain))
     return _mp2_fragment_energy_from_df_lov(

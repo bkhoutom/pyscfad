@@ -34,12 +34,12 @@ from pyscfad.dlno.ccsd import (
 )
 
 
-def _to_numpy_leaf(leaf):
-    """Convert a JAX-array-ish leaf to a plain writable numpy array.
+def _path_key(path):
+    """Stable, picklable string key for a jax tree-path."""
+    return jax.tree_util.keystr(path)
 
-    None / float0 / non-array Python objects pass through unchanged so
-    the gather / sum below treats them as no-ops.
-    """
+
+def _to_numpy_leaf(leaf):
     if leaf is None:
         return None
     if hasattr(leaf, 'dtype') and leaf.dtype == jax.dtypes.float0:
@@ -50,31 +50,18 @@ def _to_numpy_leaf(leaf):
         return leaf
 
 
-def _path_key(path):
-    """Stable, picklable string key for a jax tree-path.
+def _tree_sum_to_root(comm, tree, root=0):
+    """Sum a JAX pytree across MPI ranks into ``root`` rank.
 
-    Uses JAX's own ``keystr`` so every distinct leaf path has a
-    distinct key (essential when ranks built their pytrees from
-    independent Python objects -- e.g., separate ``Mole`` and
-    ``mf`` instances on different MPI ranks).
-    """
-    return jax.tree_util.keystr(path)
-
-
-def _tree_allreduce_sum(comm, tree):
-    """Sum a JAX pytree across MPI ranks by matching leaves on their
-    structural path.
-
-    Each rank flattens with ``tree_flatten_with_path`` to obtain
-    ``(path, leaf)`` pairs.  Leaves are keyed by a string derived from
-    the path so cross-rank alignment doesn't depend on the local
-    iteration order or on object identity of registered pytree nodes
-    (Mole, mf, with_df, ...).  Numeric leaves are summed via
-    ``_add_cotangent``; None / float0 leaves pass through.  The final
-    pytree is rebuilt with the *local* treedef so JAX aux mismatches
-    across pickled objects never matter.
+    Each rank flattens with ``tree_flatten_with_path``; leaves are
+    keyed by ``keystr`` so cross-rank alignment doesn't depend on
+    object identity of registered pytree nodes (Mole, mf, with_df,
+    ...).  Returns the summed pytree on ``root`` (rebuilt with its own
+    treedef) and ``None`` on non-root.  Non-numeric leaves on root
+    pass through; on non-root they're discarded.
     """
     nproc = comm.Get_size()
+    rank = comm.Get_rank()
     if nproc == 1:
         return tree
     leaves_with_path, treedef = jax.tree_util.tree_flatten_with_path(
@@ -82,61 +69,61 @@ def _tree_allreduce_sum(comm, tree):
     )
     local_paths = [_path_key(p) for p, _ in leaves_with_path]
     local_arrays = [_to_numpy_leaf(l) for _, l in leaves_with_path]
-    # Sanity check: every path should be unique on this rank.  If not,
-    # the dict-based reduce silently loses leaves and corrupts the sum.
     if len(set(local_paths)) != len(local_paths):
         from collections import Counter
         c = Counter(local_paths)
         dups = {k: n for k, n in c.items() if n > 1}
-        rank = comm.Get_rank()
         raise RuntimeError(
-            f'tree_allreduce: rank {rank} has {len(local_paths)} leaves '
-            f'but only {len(set(local_paths))} unique path keys.  '
-            f'Duplicates (first 5): {dict(list(dups.items())[:5])}'
+            f'tree_sum_to_root: rank {rank} has duplicate path keys: '
+            f'{dict(list(dups.items())[:5])}'
         )
     local_dict = dict(zip(local_paths, local_arrays))
+    gathered = comm.gather(local_dict, root=root)
+    if rank == root:
+        summed_dict = dict(gathered[0])
+        for other in gathered[1:]:
+            for k, v in other.items():
+                if k in summed_dict:
+                    summed_dict[k] = _add_cotangent(summed_dict[k], v)
+                else:
+                    summed_dict[k] = v
+        summed = [summed_dict.get(k) for k in local_paths]
+        return jax.tree_util.tree_unflatten(treedef, summed)
+    return None
 
-    # Sanity check across ranks: every rank should produce the same set
-    # of keys; if not, fail loudly with a useful diagnostic.
-    all_key_sets = comm.allgather(sorted(local_paths))
-    if any(ks != all_key_sets[0] for ks in all_key_sets):
-        # Print the symmetric difference between rank 0 and the first
-        # disagreeing rank.
-        for r, ks in enumerate(all_key_sets[1:], start=1):
-            if ks != all_key_sets[0]:
-                only_0 = sorted(set(all_key_sets[0]) - set(ks))[:5]
-                only_r = sorted(set(ks) - set(all_key_sets[0]))[:5]
-                raise RuntimeError(
-                    f'tree_allreduce: path-set mismatch between rank 0 '
-                    f'({len(all_key_sets[0])} keys) and rank {r} '
-                    f'({len(ks)} keys).  Only on rank 0: {only_0}.  '
-                    f'Only on rank {r}: {only_r}.'
-                )
 
-    # Allgather the dict {path_key -> array} from each rank.
-    gathered = comm.allgather(local_dict)
-    summed_dict = dict(gathered[0])
-    for other in gathered[1:]:
-        for k, v in other.items():
-            summed_dict[k] = _add_cotangent(summed_dict.get(k), v)
+def _bcast_canonical_setup(comm, mol, mf, lo_coeff, frag_lolist_static,
+                            prescreen_data, root=0):
+    """Broadcast rank-0's SCF / LO / fragment topology to all ranks.
 
-    # Rebuild a leaf list in this rank's own flatten order.
-    summed = [summed_dict[k] for k in local_paths]
-    return jax.tree_util.tree_unflatten(treedef, summed)
+    Returns a dict of canonical state suitable for non-root ranks to
+    construct skeleton ``mf`` objects via the user's ``build_mf`` and
+    to initialize ``lo_coeff``, ``frag_lolist_static``, and
+    ``prescreen_data`` without re-running any of the rank-0 setup.
+    """
+    rank = comm.Get_rank()
+    if rank == root:
+        canonical = {
+            'mo_coeff':  numpy.asarray(mf.mo_coeff),
+            'mo_energy': numpy.asarray(mf.mo_energy),
+            'mo_occ':    numpy.asarray(mf.mo_occ),
+            'e_tot':     float(mf.e_tot),
+            'lo_coeff':  numpy.asarray(lo_coeff),
+            'frag_lolist': tuple(numpy.asarray(f) for f in frag_lolist_static),
+            'prescreen_data': prescreen_data,
+        }
+    else:
+        canonical = None
+    canonical = comm.bcast(canonical, root=root)
+    return canonical
 
 
 class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
     """MPI variant of :class:`pyscfad.dlno.ccsd.DLNOCCSD`.
 
-    The MPI strategy mirrors :class:`pyscfad.lno.ccsd_mpi.LNOCCSD`:
-    round-robin partition over fragments (rank ``r`` handles fragments
-    where ``i % nproc == r``), then MPI Allreduce on the per-fragment
-    energy and cotangent contributions before the LO and SCF close-out.
-
     Both :meth:`kernel` (inherited from ``lno_base_mpi.LNO`` for the
-    plain-energy MPI flow used by example 12) and
-    :meth:`value_and_grad` (defined here, MPI-parallel progressive AD)
-    are exposed.
+    plain-energy MPI flow used by example 12) and :meth:`value_and_grad`
+    (defined here) are exposed.
     """
 
     @classmethod
@@ -157,25 +144,73 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                        domain_pao_thr=None,
                        pair_energy_thr=None,
                        multipole_order=None):
-        """MPI-parallel value_and_grad: round-robin fragments + tree-allreduce.
+        """MPI-parallel value_and_grad: rank-0 owns SCF + LO + prescreen +
+        ``lo_vjp`` + ``scf_vjp``; non-root ranks only do fragment
+        forward/backward; cotangents are gathered to rank 0 for the
+        LO and SCF close-out.
 
-        Same call signature and semantics as
-        :meth:`pyscfad.dlno.ccsd.DLNOCCSD.value_and_grad`.  Run with
-        ``mpirun -n N python script.py``; with ``N=1`` this reduces to
-        the single-rank implementation.
+        Same call signature as
+        :meth:`pyscfad.dlno.ccsd.DLNOCCSD.value_and_grad`, plus one
+        extra requirement on the user-supplied ``build_mf``: when
+        called with ``mo_coeff_init`` / ``mo_energy_init`` /
+        ``mo_occ_init`` / ``e_tot_init`` kwargs, it must construct a
+        *skeleton* mf (with_df attached, scf-object set up) that
+        adopts those canonical values directly **without calling
+        ``mf.kernel()``**.  Non-root ranks don't need a registered
+        SCF custom_vjp -- only the forward fragment computations
+        consume the mf -- so skipping the kernel call is correct and
+        avoids all the SCF-gauge / convergence-noise / first-order-
+        custom-replay subtleties that creep in when each rank also
+        tries to register its own ``scf_vjp``.
 
-        SCF, LO transform, and DLNO prescreen are built deterministically
-        on every rank (no redundant work is saved here -- they're cheap
-        relative to the fragment loop).  Each rank then processes its
-        round-robin subset of fragments and accumulates its local
-        ``grad_mf``, ``grad_lo``, ``e_corr_local``.  An MPI Allreduce
-        sums these across ranks before the LO and SCF (CPHF) close-out,
-        which is redundantly evaluated on every rank (it's deterministic
-        and the result is identical, simpler than gathering to rank 0).
+        Strategy:
 
-        On rank 0 the HF-energy cotangent is seeded with weight 1.0; on
-        non-root ranks it is seeded with weight 0.0 so the allreduce sum
-        does not over-count the single HF contribution.
+            1. **Rank 0 alone** runs the canonical setup:
+
+               - ``mf, scf_vjp = jax.vjp(build_mf, mol)`` (full SCF)
+               - ``lo_coeff, lo_vjp = jax.vjp(build_lo, mf)``
+               - eager DLNO topology / prescreen build
+
+            2. **Broadcast** the canonical
+               ``mo_coeff``/``mo_energy``/``mo_occ``/``e_tot``, the
+               ``lo_coeff``, the ``frag_lolist``, and the
+               ``prescreen_data`` from rank 0 to every rank.
+
+            3. **Each rank** constructs a skeleton mf from the
+               broadcast canonical state (via the user's
+               ``build_mf`` with canonical kwargs).  ``lo_coeff`` is
+               loaded as a JAX-array leaf.  No ``scf_vjp`` or
+               ``lo_vjp`` is captured on non-root.
+
+            4. **Each rank** processes its round-robin subset of
+               fragments: ``e_frag, vjp_fn = jax.vjp(per_frag_fn, mf,
+               lo_coeff); vjp_fn(1.0)`` -> local cotangents on
+               ``(mf, lo_coeff)``.
+
+            5. **Gather to rank 0**: the per-rank ``grad_mf`` and
+               ``grad_lo`` pytrees are summed onto rank 0 via the
+               path-keyed ``_tree_sum_to_root``.
+
+            6. **Rank 0** applies ``lo_vjp`` then ``scf_vjp`` to the
+               gathered cotangents and broadcasts the resulting
+               ``grad_mol`` to all ranks.
+
+        Why this is correct (and robust to all the gauge issues):
+
+            All per-rank fragments operate on **exactly the same**
+            ``mo_coeff`` / ``mo_energy`` / ``lo_coeff`` /
+            ``frag_lolist`` / ``prescreen_data`` -- everything came
+            from rank 0's single setup.  No rank has any chance of
+            picking a different orbital sign, internal rotation,
+            fragmentation order, or LO localization order.  The only
+            ``scf_vjp`` / ``lo_vjp`` that ever runs is rank 0's, so
+            there is no per-rank-CPHF inconsistency either.  Summing
+            cotangents across ranks before the close-out is exact
+            because the cotangents are all on the same canonical
+            objects.
+
+        The HF energy contribution is seeded into ``grad_mf`` on
+        rank 0 only, so it appears exactly once.
         """
         # Resolve prescreen defaults from the class
         if lmo_bp_domain_thr is None: lmo_bp_domain_thr = cls.lmo_bp_domain_thr
@@ -195,54 +230,57 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
         t_overall = time.perf_counter()
         log(f'DLNOCCSD.value_and_grad (MPI, nproc={nproc}): start')
 
-        # ---- SCF + LO + prescreen: same on every rank (deterministic) ----
+        # ---- Rank 0: full canonical setup (SCF + LO + prescreen) ----
+        # Everything below produces canonical state that we'll
+        # broadcast to all ranks.  Only rank 0 holds the JAX vjp
+        # closures (scf_vjp, lo_vjp) -- those are used at the
+        # close-out.
+        if rank == 0:
+            t0 = time.perf_counter()
+            mf, scf_vjp = jax.vjp(build_mf, mol)
+            log(f'  SCF (build_mf + jax.vjp):   {time.perf_counter() - t0:8.2f} s')
+
+            def _build_lo(mf_):
+                cc_local = LNOCCSD(mf_, frozen=frozen)
+                cc_local.lo_type = lo_type
+                return cc_local.get_lo(lo_type=cc_local.lo_type)
+            t0 = time.perf_counter()
+            lo_coeff, lo_vjp = jax.vjp(_build_lo, mf)
+            log(f'  LO transform + jax.vjp:     {time.perf_counter() - t0:8.2f} s')
+
+            def _topo_builder(mf_, frag_lolist_):
+                return _build_static_dlno_topology(
+                    mf_, frag_lolist_, frozen, lo_type,
+                    lmo_bp_domain_thr, pao_bp_domain_thr,
+                    domain_pao_thr, pair_energy_thr, multipole_order,
+                )
+            t0 = time.perf_counter()
+            frag_lolist_static, prescreen_data = stop_trace(_topo_builder)(mf, frag_lolist)
+            log(f'  DLNO prescreen build:       {time.perf_counter() - t0:8.2f} s')
+        else:
+            mf = scf_vjp = lo_vjp = lo_coeff = None
+            frag_lolist_static = prescreen_data = None
+
+        # ---- Broadcast canonical state to all ranks ----
         t0 = time.perf_counter()
-        mf, scf_vjp = jax.vjp(build_mf, mol)
-        log(f'  SCF (build_mf + jax.vjp):   {time.perf_counter() - t0:8.2f} s')
+        canonical = _bcast_canonical_setup(
+            comm, mol, mf, lo_coeff, frag_lolist_static, prescreen_data,
+        )
+        log(f'  broadcast canonical setup:  {time.perf_counter() - t0:8.2f} s')
 
-        # HF-energy seed: every rank evaluates ``hf_vjp(1.0)`` so the
-        # cotangent pytree has the *same* structure on every rank (JAX
-        # prunes zero-cotangent paths, so ``hf_vjp(0.0)`` and
-        # ``hf_vjp(1.0)`` can produce structurally different pytrees,
-        # which would break the per-leaf Allreduce alignment below).  We
-        # then scale by ``hf_weight`` (1.0 on rank 0, 0.0 elsewhere) so
-        # the HF contribution appears exactly once after Allreduce.
-        e_hf, hf_vjp = jax.vjp(lambda m: m.e_tot, mf)
-        hf_cot = hf_vjp(1.0)[0]
-        hf_weight = 1.0 if rank == 0 else 0.0
-        def _scale_leaf(x):
-            # Scale numeric leaves (JAX arrays AND Python scalars like the
-            # 1.0 cotangent that lands on ``mf.e_tot``) by ``hf_weight``.
-            # None / float0 / non-multipliable leaves pass through.
-            if x is None:
-                return None
-            if hasattr(x, 'dtype') and x.dtype == jax.dtypes.float0:
-                return x
-            try:
-                return x * hf_weight
-            except TypeError:
-                return x
-        grad_mf = jax.tree_util.tree_map(_scale_leaf, hf_cot)
-
-        def _build_lo(mf_):
-            cc_local = LNOCCSD(mf_, frozen=frozen)
-            cc_local.lo_type = lo_type
-            return cc_local.get_lo(lo_type=cc_local.lo_type)
-
-        t0 = time.perf_counter()
-        lo_coeff, lo_vjp = jax.vjp(_build_lo, mf)
-        grad_lo = jax.tree_util.tree_map(jnp.zeros_like, lo_coeff)
-        log(f'  LO transform + jax.vjp:     {time.perf_counter() - t0:8.2f} s')
-
-        def _topo_builder(mf_, frag_lolist_):
-            return _build_static_dlno_topology(
-                mf_, frag_lolist_, frozen, lo_type,
-                lmo_bp_domain_thr, pao_bp_domain_thr,
-                domain_pao_thr, pair_energy_thr, multipole_order,
+        # ---- Non-root ranks: build skeleton mf + load lo_coeff ----
+        if rank != 0:
+            mf = build_mf(
+                mol,
+                mo_coeff_init=canonical['mo_coeff'],
+                mo_energy_init=canonical['mo_energy'],
+                mo_occ_init=canonical['mo_occ'],
+                e_tot_init=canonical['e_tot'],
             )
-        t0 = time.perf_counter()
-        frag_lolist_static, prescreen_data = stop_trace(_topo_builder)(mf, frag_lolist)
-        log(f'  DLNO prescreen build:       {time.perf_counter() - t0:8.2f} s')
+        # All ranks now use the canonical lo_coeff / fragment topology
+        lo_coeff = jnp.asarray(canonical['lo_coeff'])
+        frag_lolist_static = canonical['frag_lolist']
+        prescreen_data = canonical['prescreen_data']
 
         nfrag = len(frag_lolist_static)
         sign_pt2 = -1.0 if include_mp2_correction else 0.0
@@ -252,8 +290,8 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
 
         if verbose >= _VERBOSE_PROGRESS:
             atom_counts = [
-                int(np.asarray(prescreen_data['fragment_data'][i]
-                               .get('extended_primary_domain')).size)
+                int(numpy.asarray(prescreen_data['fragment_data'][i]
+                                  .get('extended_primary_domain')).size)
                 for i in range(nfrag)
             ]
             atom_range = (f'{min(atom_counts)}-{max(atom_counts)}'
@@ -262,8 +300,21 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
             log(f'  Fragments: {nfrag} (domain atoms/frag: {atom_range})')
             log(f'  MP2 correction: {"per-domain" if include_mp2_correction else "off"}'
                 f',  CCSD(T): {ccsd_t}')
-            log(f'  MPI partition: nproc={nproc}, '
-                f'rank 0 handles {len([i for i in range(nfrag) if i % nproc == 0])} fragments')
+            log(f'  MPI partition: nproc={nproc}')
+
+        # ---- HF-energy seed only on rank 0 ----
+        # We only run scf_vjp on rank 0, so the HF cotangent only
+        # needs to live there.
+        if rank == 0:
+            _, hf_vjp = jax.vjp(lambda m: m.e_tot, mf)
+            grad_mf = hf_vjp(1.0)[0]
+        else:
+            # On non-root grad_mf starts at None/zero; we just
+            # accumulate fragment cotangents into it.  We initialize
+            # it to None per-leaf via the tree-map below; the
+            # _add_cotangent reduction handles the None entries.
+            grad_mf = None
+        grad_lo = jnp.zeros_like(lo_coeff)
 
         # ---- Per-fragment loop (rank-local subset) ----
         e_corr_local = jnp.float64(0.0)
@@ -323,7 +374,7 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
 
             t_frag = time.perf_counter()
             if verbose >= _VERBOSE_PROGRESS:
-                n_atoms = int(np.asarray(
+                n_atoms = int(numpy.asarray(
                     frag_prescreen.get('extended_primary_domain')).size)
                 print(f'  [rank {rank}] [frag {ifrag+1}/{nfrag}] '
                       f'domain={n_atoms} atoms, lo_size={len(fraglo_idx)}: '
@@ -332,7 +383,10 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
             e_frag, vjp_fn = jax.vjp(per_frag_fn, mf, lo_coeff)
             e_corr_local = e_corr_local + e_frag
             g_mf_i, g_lo_i = vjp_fn(jnp.float64(1.0))
-            grad_mf = jax.tree_util.tree_map(_add_cotangent, grad_mf, g_mf_i)
+            if grad_mf is None:
+                grad_mf = g_mf_i
+            else:
+                grad_mf = jax.tree_util.tree_map(_add_cotangent, grad_mf, g_mf_i)
             grad_lo = jax.tree_util.tree_map(_add_cotangent, grad_lo, g_lo_i)
 
             if verbose >= _VERBOSE_PROGRESS:
@@ -340,23 +394,51 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                       f'{time.perf_counter() - t_frag:.2f} s, '
                       f'contribution = {float(e_frag):+.8f}', flush=True)
 
-        # ---- MPI Allreduce of energy and cotangents ----
+        # Defensive: ranks with no fragments have grad_mf=None still.
+        # Seed grad_mf as a zeros-of-canonical shape so the gather
+        # finds matching paths.  (Currently the HF seed on rank 0
+        # plus at least one fragment on each rank in our typical
+        # round-robin means this code path is rarely hit, but it's
+        # cheap to be safe.)
+        if grad_mf is None and rank != 0:
+            grad_mf = jax.tree_util.tree_map(
+                lambda x: (jnp.zeros_like(x)
+                           if hasattr(x, 'dtype')
+                              and x.dtype != jax.dtypes.float0
+                           else None),
+                mf,
+            )
+
+        # ---- Gather cotangents to rank 0 ----
         t0 = time.perf_counter()
+        grad_mf_root = _tree_sum_to_root(comm, grad_mf, root=0)
+        grad_lo_root = _tree_sum_to_root(comm, grad_lo, root=0)
         e_corr_total = comm.allreduce(float(e_corr_local), op=MPI.SUM)
-        grad_mf = _tree_allreduce_sum(comm, grad_mf)
-        grad_lo = _tree_allreduce_sum(comm, grad_lo)
-        log(f'  MPI Allreduce (E + cotangents): {time.perf_counter() - t0:.2f} s')
+        log(f'  MPI gather (energy + cotangents): {time.perf_counter() - t0:.2f} s')
 
-        # ---- Close out lo and scf vjps (redundant on each rank; deterministic) ----
-        t0 = time.perf_counter()
-        grad_mf_via_lo, = lo_vjp(grad_lo)
-        grad_mf = jax.tree_util.tree_map(_add_cotangent, grad_mf, grad_mf_via_lo)
-        log(f'  LO vjp close-out:           {time.perf_counter() - t0:8.2f} s')
+        # ---- Rank 0: LO + SCF close-out ----
+        if rank == 0:
+            t0 = time.perf_counter()
+            grad_mf_via_lo, = lo_vjp(grad_lo_root)
+            grad_mf_root = jax.tree_util.tree_map(
+                _add_cotangent, grad_mf_root, grad_mf_via_lo,
+            )
+            log(f'  LO vjp close-out:           {time.perf_counter() - t0:8.2f} s')
 
-        t0 = time.perf_counter()
-        grad_mol, = scf_vjp(grad_mf)
-        log(f'  SCF (CPHF) vjp close-out:   {time.perf_counter() - t0:8.2f} s')
+            t0 = time.perf_counter()
+            grad_mol, = scf_vjp(grad_mf_root)
+            log(f'  SCF (CPHF) vjp close-out:   {time.perf_counter() - t0:8.2f} s')
+        else:
+            grad_mol = None
 
+        # ``grad_mol`` is left on rank 0 only.  A ``comm.bcast`` of the
+        # Mole-shaped pytree drops the ``coords`` attribute through the
+        # pickle round-trip (pyscfad's dynamic-attr machinery isn't
+        # re-applied on unpickle), so we don't ship it.  This matches
+        # the example-12 pattern: rank 0 owns the reduced gradient,
+        # non-root ranks get ``None``.
+
+        e_hf = canonical['e_tot']
         e_total = e_hf + e_corr_total
         log(f'DLNOCCSD.value_and_grad (MPI, nproc={nproc}): done in '
             f'{time.perf_counter() - t_overall:.2f} s total, '

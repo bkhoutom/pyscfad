@@ -30,7 +30,6 @@ from pyscf.lib import (
 )
 
 from pyscfad import numpy as np
-from pyscfad.tools import timer
 from pyscfadlib import libcc_vjp as libcc
 
 def kernel(mycc, eris, ulo, t1=None, t2=None, verbose=logger.NOTE):
@@ -163,8 +162,6 @@ def _ccsd_t_energy_fwd(mat, t1T, t2T, mo_energy, fvo,
     return et, (mat, t1T, t2T, mo_energy, fvo, ovoo, ovov, ovvv)
 
 def _ccsd_t_energy_bwd(max_memory, res, et_bar):
-    mytimer = timer.Timer()
-
     mat, t1T, t2T, mo_energy, fvo, ovoo, ovov, ovvv = res
 
     nvir, nocc = t1T.shape
@@ -273,8 +270,6 @@ def _ccsd_t_energy_bwd(max_memory, res, et_bar):
     idx, idy = numpy.tril_indices(nvir)
     ovvv_tril_bar = numpy.asarray(ovvv_bar[:,:,idx,idy])
 
-    if os.environ.get('PYSCFAD_LNO_CCSD_T_BWD_TIMER'):
-        mytimer.timer('_ccsd_t_energy_bwd:')
     return mat_bar, t1T_bar, t2T_bar, mo_energy_bar, fvo_bar, ovoo_bar, ovov_bar, ovvv_tril_bar
 
 _ccsd_t_energy.defvjp(_ccsd_t_energy_fwd, _ccsd_t_energy_bwd)

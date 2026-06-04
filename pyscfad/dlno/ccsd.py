@@ -81,7 +81,7 @@ class DLNOCCSD(LNOCCSD):
 
     @classmethod
     def value_and_grad(cls, mol, *, build_mf, frag_lolist=None,
-                       include_mp2_correction=False,
+                       include_mp2_correction=True,
                        # CCSD solver config (mirrors LNOCCSD attributes):
                        frozen=0,
                        thresh_occ=1e-4,
@@ -125,7 +125,7 @@ class DLNOCCSD(LNOCCSD):
                 Per-fragment LO indices.  If ``None``, built eagerly via
                 ``autofrag + map_lo_to_frag`` on the concrete reference
                 geometry inside ``stop_trace``.
-            include_mp2_correction : bool, default False
+            include_mp2_correction : bool, default True
                 If ``True``, each fragment's contribution is
                 ``cc + cc_t - lno_pt2 + domain_mp2`` (per-domain MP2
                 replaces LNO PT2; no full canonical MP2).  If ``False``,
@@ -322,7 +322,15 @@ class DLNOCCSD(LNOCCSD):
                 per_frag_fn, mf, lo_coeff, has_aux=True,
             )
             e_corr = e_corr + e_frag
-            g_mf_i, g_lo_i = vjp_fn(jnp.float64(1.0))
+            if verbose >= _VERBOSE_PROGRESS:
+                log(f'  [frag {ifrag+1}/{nfrag}] reverse VJP: start')
+            with lno_base.vjp_progress(
+                f'  [frag {ifrag+1}/{nfrag}] reverse VJP:'
+                if verbose >= _VERBOSE_PROGRESS else None
+            ):
+                g_mf_i, g_lo_i = vjp_fn(jnp.float64(1.0))
+            if verbose >= _VERBOSE_PROGRESS:
+                log(f'  [frag {ifrag+1}/{nfrag}] reverse VJP: done')
             grad_mf = jax.tree_util.tree_map(_add_cotangent, grad_mf, g_mf_i)
             grad_lo = jax.tree_util.tree_map(_add_cotangent, grad_lo, g_lo_i)
             # per-fragment t1, t2, PNOs, eris_fpno, transient cc all

@@ -15,6 +15,8 @@
 import warnings
 import os
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from functools import partial, reduce
 import numpy
@@ -55,6 +57,36 @@ SEMICANONICAL_DEG_THRESH = 1e-8
 COMPRESS_DEG_THRESH = 1e-12
 _FRAGMENT_PROFILE_ROWS = []
 _FRAGMENT_TABLE_HEADERS = set()
+_VJP_PROGRESS_PREFIX = ContextVar('pyscfad_lno_vjp_progress_prefix', default=None)
+
+
+@contextmanager
+def vjp_progress(prefix):
+    token = _VJP_PROGRESS_PREFIX.set(prefix)
+    try:
+        yield
+    finally:
+        _VJP_PROGRESS_PREFIX.reset(token)
+
+
+def _vjp_progress(msg):
+    prefix = _VJP_PROGRESS_PREFIX.get()
+    if prefix is not None:
+        print(f'{prefix} {msg}', flush=True)
+
+
+@contextmanager
+def _vjp_progress_section(name):
+    prefix = _VJP_PROGRESS_PREFIX.get()
+    if prefix is None:
+        yield
+        return
+    t0 = time.perf_counter()
+    _vjp_progress(f'{name}: start')
+    try:
+        yield
+    finally:
+        _vjp_progress(f'{name}: {time.perf_counter() - t0:.2f} s')
 
 
 def clear_fragment_profile():
@@ -834,20 +866,21 @@ def _mp2_fragment_energy_from_df_lov_bwd(res, e2_bar):
     prjlo_bar = np.zeros_like(prjlo)
     block_nvir = _domain_mp2_block_nvir(naux, nocc, nvir)
 
-    for a0 in range(0, nvir, block_nvir):
-        a1 = min(a0 + block_nvir, nvir)
-        for b0 in range(0, nvir, block_nvir):
-            b1 = min(b0 + block_nvir, nvir)
-            block_bars = _mp2_fragment_energy_from_df_lov_block_bwd(
-                Lov, occ_coeff, vir_coeff, moe_occ, moe_vir, prjlo,
-                a0, a1, b0, b1, e2_bar,
-            )
-            Lov_bar += block_bars[0]
-            occ_coeff_bar += block_bars[1]
-            vir_coeff_bar += block_bars[2]
-            moe_occ_bar += block_bars[3]
-            moe_vir_bar += block_bars[4]
-            prjlo_bar += block_bars[5]
+    with _vjp_progress_section('domain MP2 correction backward'):
+        for a0 in range(0, nvir, block_nvir):
+            a1 = min(a0 + block_nvir, nvir)
+            for b0 in range(0, nvir, block_nvir):
+                b1 = min(b0 + block_nvir, nvir)
+                block_bars = _mp2_fragment_energy_from_df_lov_block_bwd(
+                    Lov, occ_coeff, vir_coeff, moe_occ, moe_vir, prjlo,
+                    a0, a1, b0, b1, e2_bar,
+                )
+                Lov_bar += block_bars[0]
+                occ_coeff_bar += block_bars[1]
+                vir_coeff_bar += block_bars[2]
+                moe_occ_bar += block_bars[3]
+                moe_vir_bar += block_bars[4]
+                prjlo_bar += block_bars[5]
 
     return (Lov_bar, occ_coeff_bar, vir_coeff_bar,
             moe_occ_bar, moe_vir_bar, prjlo_bar)
@@ -2255,6 +2288,19 @@ def _nr_e2_local_cderi_bar_block(mo_coeff, ybar, orbs_slice, pair_idx, p0, p1):
     return block
 
 
+def _is_full_global_pair_idx(pair_idx, nao):
+    pair_idx = numpy.asarray(pair_idx, dtype=numpy.int64).ravel()
+    npair = nao * (nao + 1) // 2
+    return (
+        pair_idx.size == npair
+        and (npair == 0 or (
+            pair_idx[0] == 0
+            and pair_idx[-1] == npair - 1
+            and numpy.all(numpy.diff(pair_idx) == 1)
+        ))
+    )
+
+
 @partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 7))
 def _outcore_local_nr_e2_from_global_cderi(mol, auxmol, mo_coeff, cderi_source,
                                            max_memory, orbs_slice, aosym,
@@ -2284,24 +2330,45 @@ def _outcore_local_nr_e2_from_global_cderi_bwd(cderi_source, max_memory,
     mol, auxmol, mo_coeff = res
     pair_idx = numpy.asarray(pair_idx, dtype=numpy.int64)
     try:
-        mo_coeff_bar = _cderi_vjp.nr_e2_mo_coeff_vjp_from_cderi_source(
-            cderi_source, mo_coeff, ybar, orbs_slice, aosym='s2',
-            pair_idx=pair_idx,
-        )
+        with _vjp_progress_section('fragment DF AO2MO MO-coeff backward'):
+            mo_coeff_bar = _cderi_vjp.nr_e2_mo_coeff_vjp_from_cderi_source(
+                cderi_source, mo_coeff, ybar, orbs_slice, aosym='s2',
+                pair_idx=pair_idx,
+            )
 
         ybar_np = numpy.asarray(jax.device_get(ybar))
-        mol_bar, auxmol_bar = _cderi_vjp.cholesky_eri_vjp_from_cderi_block_fn(
-            mol,
-            auxmol,
-            cderi_source,
-            lambda p0, p1: _nr_e2_local_cderi_bar_block(
-                mo_coeff, ybar_np, orbs_slice, pair_idx, p0, p1
-            ),
-            max(max_memory, 4096),
-            int3c=mol._add_suffix('int3c2e'),
-            int2c=mol._add_suffix('int2c2e'),
-            aosym='s2ij',
-        )
+        if _is_full_global_pair_idx(pair_idx, mol.nao):
+            try:
+                with _vjp_progress_section('fragment DF integral derivative backward'):
+                    mol_bar, auxmol_bar = _cderi_vjp.cholesky_eri_vjp_from_mo_coeff_ybar(
+                        mol,
+                        auxmol,
+                        cderi_source,
+                        mo_coeff,
+                        ybar_np,
+                        orbs_slice,
+                        max(max_memory, 4096),
+                        int3c=mol._add_suffix('int3c2e'),
+                        int2c=mol._add_suffix('int2c2e'),
+                        aosym='s2ij',
+                    )
+            except NotImplementedError:
+                mol_bar = auxmol_bar = None
+            if mol_bar is not None:
+                return mol_bar, auxmol_bar, mo_coeff_bar
+        with _vjp_progress_section('fragment DF integral derivative backward'):
+            mol_bar, auxmol_bar = _cderi_vjp.cholesky_eri_vjp_from_cderi_block_fn(
+                mol,
+                auxmol,
+                cderi_source,
+                lambda p0, p1: _nr_e2_local_cderi_bar_block(
+                    mo_coeff, ybar_np, orbs_slice, pair_idx, p0, p1
+                ),
+                max(max_memory, 4096),
+                int3c=mol._add_suffix('int3c2e'),
+                int2c=mol._add_suffix('int2c2e'),
+                aosym='s2ij',
+            )
         return mol_bar, auxmol_bar, mo_coeff_bar
     except NotImplementedError:
         pass
@@ -2347,24 +2414,41 @@ def _outcore_nr_e2_fwd(mol, auxmol, mo_coeff, cderi_source, max_memory,
 def _outcore_nr_e2_bwd(cderi_source, max_memory, orbs_slice, aosym, res, ybar):
     mol, auxmol, mo_coeff = res
     try:
-        mo_coeff_bar = _cderi_vjp.nr_e2_mo_coeff_vjp_from_cderi_source(
-            cderi_source, mo_coeff, ybar, orbs_slice, aosym=aosym
-        )
+        with _vjp_progress_section('global DF AO2MO MO-coeff backward'):
+            mo_coeff_bar = _cderi_vjp.nr_e2_mo_coeff_vjp_from_cderi_source(
+                cderi_source, mo_coeff, ybar, orbs_slice, aosym=aosym
+            )
 
         ybar_np = numpy.asarray(jax.device_get(ybar))
-        mol_bar, auxmol_bar = _cderi_vjp.cholesky_eri_vjp_from_cderi_block_fn(
-            mol,
-            auxmol,
-            cderi_source,
-            lambda p0, p1: _nr_e2_global_cderi_bar_block(
-                mo_coeff, ybar_np, orbs_slice,
-                numpy.arange(p0, p1, dtype=numpy.int64), p0, p1
-            ),
-            max(max_memory, 4096),
-            int3c=mol._add_suffix('int3c2e'),
-            int2c=mol._add_suffix('int2c2e'),
-            aosym='s2ij',
-        )
+        try:
+            with _vjp_progress_section('global DF integral derivative backward'):
+                mol_bar, auxmol_bar = _cderi_vjp.cholesky_eri_vjp_from_mo_coeff_ybar(
+                    mol,
+                    auxmol,
+                    cderi_source,
+                    mo_coeff,
+                    ybar_np,
+                    orbs_slice,
+                    max(max_memory, 4096),
+                    int3c=mol._add_suffix('int3c2e'),
+                    int2c=mol._add_suffix('int2c2e'),
+                    aosym='s2ij',
+                )
+        except NotImplementedError:
+            with _vjp_progress_section('global DF integral derivative backward'):
+                mol_bar, auxmol_bar = _cderi_vjp.cholesky_eri_vjp_from_cderi_block_fn(
+                    mol,
+                    auxmol,
+                    cderi_source,
+                    lambda p0, p1: _nr_e2_global_cderi_bar_block(
+                        mo_coeff, ybar_np, orbs_slice,
+                        numpy.arange(p0, p1, dtype=numpy.int64), p0, p1
+                    ),
+                    max(max_memory, 4096),
+                    int3c=mol._add_suffix('int3c2e'),
+                    int2c=mol._add_suffix('int2c2e'),
+                    aosym='s2ij',
+                )
         return mol_bar, auxmol_bar, mo_coeff_bar
     except NotImplementedError:
         pass

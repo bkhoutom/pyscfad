@@ -15,21 +15,49 @@
 """Memory-conscious VJP helpers for out-of-core molecular DF CDERI."""
 
 from functools import lru_cache
+import ctypes
 
 import numpy
 import scipy.linalg
 import jax
 from jax import scipy as jax_scipy
-from jax.tree_util import tree_map
+from jax.tree_util import tree_flatten, tree_map, tree_unflatten
+from pyscf import lib as pyscf_lib
+from pyscf.ao2mo import _ao2mo as pyscf_ao2mo
+from pyscf.ao2mo.outcore import balance_partition
 from pyscf.df.outcore import _guess_shell_ranges
 
 from pyscfad import numpy as np
 from pyscfad.ao2mo import _ao2mo
 from pyscfad.df import _int3c_cross_opt
 from pyscfad.df import addons as df_addons
+try:
+    from pyscfadlib import libao2mo_vjp
+except (ImportError, OSError):
+    libao2mo_vjp = None
 
 
 _INT3C_VJP_TARGET_MB = 256.0
+_NR_E2_VJP_BLOCK_MB = 256.0
+_CDERI_BAR_PAIR_BLOCK_MB = 256.0
+_INT3C_MO_VJP_BLOCK_MB = 512.0
+_NR_E2_CDERI_BAR_NATIVE = (
+    libao2mo_vjp is not None
+    and hasattr(libao2mo_vjp, 'AO2MOnr_e2_cderi_bar_project_omp')
+)
+if _NR_E2_CDERI_BAR_NATIVE:
+    libao2mo_vjp.AO2MOnr_e2_cderi_bar_project_omp.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    libao2mo_vjp.AO2MOnr_e2_cderi_bar_project_omp.restype = None
 
 
 @lru_cache(maxsize=16)
@@ -64,11 +92,86 @@ def nr_e2_vjp_from_cderi_source(cderi_source, mo_coeff, ybar,
 
 
 def _nr_e2_vjp_block_mb():
-    import os
-    try:
-        return max(float(os.environ.get('PYSCFAD_DF_NR_E2_VJP_BLOCK_MB', 256.0)), 1.0)
-    except ValueError:
-        return 256.0
+    return _NR_E2_VJP_BLOCK_MB
+
+
+def _cderi_bar_pair_block_mb():
+    return _CDERI_BAR_PAIR_BLOCK_MB
+
+
+def _int3c_mo_vjp_block_mb():
+    return _INT3C_MO_VJP_BLOCK_MB
+
+
+def _use_native_cderi_bar_project(ybar, mok_rows, mol_cols):
+    return (
+        _NR_E2_CDERI_BAR_NATIVE
+        and ybar.dtype == numpy.float64
+        and mok_rows.dtype == numpy.float64
+        and mol_cols.dtype == numpy.float64
+    )
+
+
+def _nr_e2_cderi_bar_project_native(ybar, mok_rows, mol_cols, blksize):
+    naux, kc, lc = ybar.shape
+    npos = mok_rows.shape[0]
+    y2 = numpy.asarray(
+        ybar.transpose(0, 2, 1).reshape(naux * lc, kc),
+        order='C',
+        dtype=numpy.double,
+    )
+    mok_rows = numpy.asarray(mok_rows, order='C', dtype=numpy.double)
+    mol_cols = numpy.asarray(mol_cols, order='C', dtype=numpy.double)
+    out = numpy.empty((naux, npos), order='C', dtype=numpy.double)
+    drv = libao2mo_vjp.AO2MOnr_e2_cderi_bar_project_omp
+    drv(
+        out.ctypes.data_as(ctypes.c_void_p),
+        y2.ctypes.data_as(ctypes.c_void_p),
+        mok_rows.ctypes.data_as(ctypes.c_void_p),
+        mol_cols.ctypes.data_as(ctypes.c_void_p),
+        ctypes.c_int(naux),
+        ctypes.c_int(kc),
+        ctypes.c_int(lc),
+        ctypes.c_int(npos),
+        ctypes.c_int(blksize),
+    )
+    return out
+
+
+def _nr_e2_cderi_bar_project(ybar, mok_rows, mol_cols):
+    """Project ``ybar[Lij]`` onto pair-specific MO rows.
+
+    The direct expression ``einsum('Lij,pi,pj->Lp', ...)`` often dispatches to
+    NumPy's generic ``c_einsum`` loop, which is single-threaded.  Splitting the
+    contraction makes the dominant ``i`` contraction a GEMM-shaped
+    ``numpy.dot`` so threaded BLAS can do the heavy work.
+    """
+    naux, kc, lc = ybar.shape
+    npos = mok_rows.shape[0]
+    if npos == 0:
+        return numpy.zeros((naux, 0), dtype=ybar.dtype)
+
+    target_bytes = _cderi_bar_pair_block_mb() * 1e6
+    itemsize = numpy.dtype(ybar.dtype).itemsize
+    blksize = max(int(target_bytes / max(naux * lc * itemsize, 1)), 1)
+    blksize = min(blksize, npos)
+
+    if _use_native_cderi_bar_project(ybar, mok_rows, mol_cols):
+        return _nr_e2_cderi_bar_project_native(
+            ybar, mok_rows, mol_cols, blksize
+        )
+
+    y2 = numpy.asarray(ybar.transpose(0, 2, 1).reshape(naux * lc, kc), order='C')
+    out = numpy.empty((naux, npos), dtype=ybar.dtype)
+    for p0 in range(0, npos, blksize):
+        p1 = min(p0 + blksize, npos)
+        tmp = numpy.dot(y2, numpy.asarray(mok_rows[p0:p1], order='C').T)
+        tmp = tmp.reshape(naux, lc, p1 - p0)
+        out[:, p0:p1] = numpy.sum(
+            tmp * mol_cols[p0:p1].T[None, :, :],
+            axis=1,
+        )
+    return out
 
 
 def nr_e2_mo_coeff_vjp_from_cderi_source(cderi_source, mo_coeff, ybar,
@@ -150,15 +253,14 @@ def nr_e2_cderi_bar_packed_block(mo_coeff, ybar, orbs_slice, pair_positions):
 
     mok_rows = mo[rows, k0:k1]
     mol_cols = mo[cols, l0:l1]
-    out = numpy.einsum('Lij,pi,pj->Lp', ybar, mok_rows, mol_cols,
-                       optimize=True)
+    out = _nr_e2_cderi_bar_project(ybar, mok_rows, mol_cols)
 
     offdiag = rows != cols
     if numpy.any(offdiag):
         mok_cols = mo[cols[offdiag], k0:k1]
         mol_rows = mo[rows[offdiag], l0:l1]
-        out[:, offdiag] += numpy.einsum(
-            'Lij,pi,pj->Lp', ybar, mok_cols, mol_rows, optimize=True
+        out[:, offdiag] += _nr_e2_cderi_bar_project(
+            ybar, mok_cols, mol_rows
         )
     return out
 
@@ -232,7 +334,6 @@ def cholesky_eri_vjp_from_cderi_source(mol, auxmol, cderi_source, cderi_bar,
                 continue
 
             cderi_blk = numpy.asarray(feri[:, p0:p1])
-
             ints_bar = scipy.linalg.solve_triangular(
                 low.T, cderi_bar_blk, lower=False, check_finite=False
             )
@@ -348,6 +449,208 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
 
     if p1 != nao_pair:
         raise RuntimeError('CDERI VJP shell ranges did not cover all AO pairs.')
+
+    def metric_cholesky(auxmol_):
+        return jax_scipy.linalg.cholesky(auxmol_.intor(int2c, hermi=1), lower=True)
+
+    _, chol_pullback = jax.vjp(metric_cholesky, auxmol)
+    aux_metric_bar = chol_pullback(np.asarray(numpy.tril(low_bar)))[0]
+    auxmol_bar = _tree_add(auxmol_bar, aux_metric_bar)
+    return mol_bar, auxmol_bar
+
+
+def _coords_tree_like(obj, coords_bar):
+    leaves, tree = tree_flatten(obj)
+    if len(leaves) != 1:
+        raise NotImplementedError(
+            'Direct int3c-MO VJP currently supports coordinate derivatives only.'
+        )
+    return tree_unflatten(tree, [coords_bar])
+
+
+def _ao_to_atom_coords_bar(mol, ao_bar):
+    coords_bar = numpy.zeros((mol.natm, 3), dtype=ao_bar.dtype)
+    for ia, (p0, p1) in enumerate(mol.aoslice_by_atom()[:, 2:4]):
+        coords_bar[ia] = ao_bar[p0:p1].sum(axis=0)
+    return coords_bar
+
+
+def _stream_nr_e2_from_cderi_source(cderi_source, mo_coeff, orbs_slice,
+                                    max_memory, aosym='s2'):
+    with df_addons.load(cderi_source, 'j3c') as eri1:
+        if not hasattr(eri1, 'shape'):
+            raise NotImplementedError('Unsupported CDERI source for streamed nr_e2.')
+        naux = int(eri1.shape[0])
+        npair = int(eri1.shape[1])
+        target_bytes = max(_int3c_mo_vjp_block_mb(), 1.0) * 1024.0**2
+        row_bytes = max(npair, 1) * numpy.dtype(numpy.float64).itemsize
+        blksize = max(1, min(naux, int(target_bytes // row_bytes)))
+
+        out = None
+        for p0 in range(0, naux, blksize):
+            p1 = min(p0 + blksize, naux)
+            cderi = numpy.asarray(eri1[p0:p1])
+            block = pyscf_ao2mo.nr_e2(
+                cderi, mo_coeff, orbs_slice, aosym=aosym, mosym='s1'
+            )
+            if out is None:
+                out = numpy.empty((naux, block.shape[1]), dtype=block.dtype)
+            out[p0:p1] = block
+    if out is None:
+        return numpy.empty((0, 0), dtype=mo_coeff.dtype)
+    return out
+
+
+def _int3c_mo_deriv_coords_vjp(mol, auxmol, mo_coeff, z,
+                               orbs_slice, int3c='int3c2e',
+                               aosym='s2ij'):
+    if aosym not in ('s2', 's2ij'):
+        raise NotImplementedError(f'Only packed s2 CDERI is supported, got {aosym}.')
+    if mo_coeff.shape[0] != mol.nao:
+        raise NotImplementedError(
+            'Direct int3c-MO VJP currently requires the full AO basis.'
+        )
+
+    nao = mol.nao
+    naux = auxmol.nao
+    nbas = mol.nbas
+    nauxbas = auxmol.nbas
+    npair = nao * (nao + 1) // 2
+    k0, k1, l0, l1 = orbs_slice
+    kc = k1 - k0
+    lc = l1 - l0
+    kl_count = kc * lc
+    mo_k = numpy.asarray(mo_coeff[:, k0:k1], order='F')
+    mo_l = numpy.asarray(mo_coeff[:, l0:l1], order='F')
+    z = numpy.asarray(z).reshape(naux, kc, lc)
+    z_flat = z.reshape(naux, kl_count)
+
+    target_words = _int3c_mo_vjp_block_mb() * 1024.0**2 / 8
+    words_per_aux = (
+        3 * nao * nao
+        + 4 * nao * max(kc, 1)
+        + 4 * nao * max(lc, 1)
+        + 3 * npair
+        + 3 * kl_count
+    )
+    blksize = max(1, min(naux, int(target_words // max(words_per_aux, 1))))
+    aux_loc = auxmol.ao_loc
+    aux_ranges = balance_partition(aux_loc, blksize)
+
+    int3c_ip1 = int3c.replace('int3c2e', 'int3c2e_ip1')
+    int3c_ip2 = int3c.replace('int3c2e', 'int3c2e_ip2')
+    mol_ao_bar = numpy.zeros((nao, 3), dtype=z.dtype)
+    aux_ao_bar = numpy.zeros((naux, 3), dtype=z.dtype)
+
+    for shl0, shl1, _ in aux_ranges:
+        p0, p1 = aux_loc[shl0], aux_loc[shl1]
+        shls_slice = (0, nbas, 0, nbas, nbas + shl0, nbas + shl1)
+        z_blk = z[p0:p1]
+
+        # AO-center derivative.  Keep the MO transform factorized as
+        # d(mu nu|P) C_mu,k C_nu,l, and accumulate AO-center rows before
+        # summing to atoms.
+        ints = _int3c_cross_opt.int3c_cross(
+            mol, auxmol, intor=int3c_ip1, comp=3, aosym='s1',
+            shls_slice=shls_slice,
+        )
+        ints = numpy.asarray(ints)
+        intbuf = pyscf_lib.einsum('xuvp,vl->xupl', ints, mo_l)
+        dm2buf = pyscf_lib.einsum('uk,pkl->upl', mo_k, z_blk)
+        mol_ao_bar -= numpy.einsum('upl,xupl->ux', dm2buf, intbuf)
+        intbuf = dm2buf = None
+
+        intbuf = pyscf_lib.einsum('xuvp,vk->xupk', ints, mo_k)
+        dm2buf = pyscf_lib.einsum('ul,pkl->upk', mo_l, z_blk)
+        mol_ao_bar -= numpy.einsum('upk,xupk->ux', dm2buf, intbuf)
+        ints = intbuf = dm2buf = None
+
+        # Auxiliary-center derivative.  The derivative three-center rows are
+        # batched as 3*naux_block ordinary packed AO rows, transformed by the
+        # same nr_e2 C kernel as the forward AO2MO, then dotted with Z.
+        ints = _int3c_cross_opt.int3c_cross(
+            mol, auxmol, intor=int3c_ip2, comp=3, aosym='s2ij',
+            shls_slice=shls_slice,
+        )
+        ints = numpy.ascontiguousarray(
+            numpy.asarray(ints).transpose(0, 2, 1).reshape(3 * (p1 - p0), npair)
+        )
+        ints_mo = pyscf_ao2mo.nr_e2(
+            ints, mo_coeff, orbs_slice, aosym='s2', mosym='s1'
+        ).reshape(3, p1 - p0, kl_count)
+        aux_ao_bar[p0:p1] -= numpy.einsum(
+            'pm,xpm->px', z_flat[p0:p1], ints_mo
+        )
+        ints = ints_mo = None
+
+    mol_bar = _coords_tree_like(mol, _ao_to_atom_coords_bar(mol, mol_ao_bar))
+    auxmol_bar = _coords_tree_like(
+        auxmol, _ao_to_atom_coords_bar(auxmol, aux_ao_bar)
+    )
+    return mol_bar, auxmol_bar
+
+
+def cholesky_eri_vjp_from_mo_coeff_ybar(mol, auxmol, cderi_source,
+                                        mo_coeff, ybar, orbs_slice,
+                                        max_memory, int3c=None, int2c=None,
+                                        aosym='s2ij'):
+    """Back-propagate through CDERI using MO-basis int3c derivatives.
+
+    This avoids materializing the large packed AO-pair cotangent
+    ``cderi_bar[naux, nao_pair]``.  It is currently limited to the full AO
+    basis; localized AO domains should keep using the block-function fallback.
+    """
+    if aosym not in ('s2', 's2ij'):
+        raise NotImplementedError(f'Only packed s2 CDERI is supported, got {aosym}.')
+    if cderi_source is None:
+        raise NotImplementedError('Missing CDERI source for cholesky_eri VJP.')
+    mo_coeff = numpy.asarray(jax.device_get(mo_coeff))
+    if mo_coeff.shape[0] != mol.nao:
+        raise NotImplementedError(
+            'Direct int3c-MO VJP currently requires the full AO basis.'
+        )
+
+    if int3c is None:
+        int3c = mol._add_suffix('int3c2e')
+    if int2c is None:
+        int2c = mol._add_suffix('int2c2e')
+
+    ybar = numpy.asarray(jax.device_get(ybar))
+    naux = auxmol.nao
+    k0, k1, l0, l1 = orbs_slice
+    kl_count = (k1 - k0) * (l1 - l0)
+    ybar = ybar.reshape(naux, kl_count)
+
+    with df_addons.load(cderi_source, 'j3c') as feri:
+        if not hasattr(feri, 'shape'):
+            raise NotImplementedError('Unsupported CDERI source for cholesky_eri VJP.')
+        nao_pair = mol.nao * (mol.nao + 1) // 2
+        if int(feri.shape[0]) != naux or int(feri.shape[1]) != nao_pair:
+            raise NotImplementedError('CDERI source shape does not match mol/auxmol.')
+
+    j2c = auxmol.intor(int2c, hermi=1)
+    j2c_np = numpy.asarray(jax.device_get(j2c))
+    try:
+        low = scipy.linalg.cholesky(j2c_np, lower=True, check_finite=False)
+    except scipy.linalg.LinAlgError as err:
+        raise NotImplementedError('2c metric Cholesky fallback is not implemented.') from err
+    if low.shape[0] != low.shape[1] or low.shape[0] != naux:
+        raise NotImplementedError(
+            'Linear-dependent auxiliary metric fallback is not implemented.'
+        )
+
+    z = scipy.linalg.solve_triangular(
+        low.T, ybar, lower=False, check_finite=False
+    )
+
+    y = _stream_nr_e2_from_cderi_source(
+        cderi_source, mo_coeff, orbs_slice, max_memory, aosym='s2'
+    )
+    low_bar = -numpy.dot(z, y.T)
+
+    mol_bar, auxmol_bar = _int3c_mo_deriv_coords_vjp(
+        mol, auxmol, mo_coeff, z, orbs_slice, int3c=int3c, aosym=aosym
+    )
 
     def metric_cholesky(auxmol_):
         return jax_scipy.linalg.cholesky(auxmol_.intor(int2c, hermi=1), lower=True)

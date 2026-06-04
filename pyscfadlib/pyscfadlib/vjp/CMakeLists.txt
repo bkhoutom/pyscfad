@@ -42,6 +42,7 @@ target_link_libraries(cvhf_vjp np_helper_ad vjp_util ${BLAS_LIBRARIES} ${OPENMP_
 add_library(cc_vjp SHARED
   cc/ccsd_t.c
   cc/ccsd_t_vjp.c
+  cc/dfccsd_vjp.c
   cc/lno_ccsd_t.c
   cc/lno_ccsd_t_vjp.c
 )
@@ -59,4 +60,3 @@ set_target_properties(vjp_util PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}
 )
 target_link_libraries(vjp_util ${OPENMP_C_PROPERTIES})
-

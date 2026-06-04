@@ -65,6 +65,23 @@ _USE_CUSTOM_VJP_AO2MO_DF_ERIS = True
 _USE_CUSTOM_VJP_IMPURITY_SOLVE = True
 
 
+def _print_forward_t_energy(et):
+    jax.debug.print(
+        '    forward (T) energy = {et:+.15g}',
+        et=et,
+        ordered=True,
+    )
+
+
+def _should_print_forward_t_energy(verbose_imp, profile_pass):
+    if profile_pass == 'backward replay':
+        return False
+    try:
+        return int(verbose_imp) < logger.NOTE
+    except (TypeError, ValueError):
+        return True
+
+
 def _mf_supports_impurity_solve_wrap(mf):
     """True iff ``mf`` is in the outcore-CDERI regime the wrap requires.
 
@@ -186,7 +203,7 @@ def _build_eris_tensors_from_Lpq_bwd(nocc, res, cotangents):
     if not _is_zero_cot(bar_Lvv):
         bar_Lvv_packed = bar_Lvv_packed + bar_Lvv
 
-    # oooo = Loo.T @ Loo  →  bar_Loo += Loo @ (bar_oooo + bar_oooo.T)
+    # oooo = Loo.T @ Loo  ->  bar_Loo += Loo @ (bar_oooo + bar_oooo.T)
     if not _is_zero_cot(bar_oooo):
         bf = bar_oooo.reshape(nocc * nocc, nocc * nocc)
         bar_Loo = bar_Loo + np.dot(Loo, bf + bf.T)
@@ -199,13 +216,13 @@ def _build_eris_tensors_from_Lpq_bwd(nocc, res, cotangents):
         bar_Lov_flat = bar_Lov_flat + np.dot(Loo, bf.T)
         bar_Loo = bar_Loo + np.dot(Lov_flat, bf)
 
-    # ovov = Lov_flat.T @ Lov_flat  →  bar_Lov_flat += Lov_flat @ (bar + bar.T)
+    # ovov = Lov_flat.T @ Lov_flat -> bar_Lov_flat += Lov_flat @ (bar + bar.T)
     if not _is_zero_cot(bar_ovov):
         bf = bar_ovov.reshape(nocc * nvir, nocc * nvir)
         bar_Lov_flat = bar_Lov_flat + np.dot(Lov_flat, bf + bf.T)
 
     # oovv = unpack_tril(Loo.T @ Lvv):
-    #   bar_oovv_packed = adjoint_unpack_tril(bar_oovv_flat)   (size nocc² × nvir_pair)
+    #   bar_oovv_packed = adjoint_unpack_tril(bar_oovv_flat)   (size nocc^2 x nvir_pair)
     #   bar_Loo += Lvv @ bar_oovv_packed.T
     #   bar_Lvv += Loo @ bar_oovv_packed
     if not _is_zero_cot(bar_oovv):
@@ -214,14 +231,18 @@ def _build_eris_tensors_from_Lpq_bwd(nocc, res, cotangents):
         bar_Loo = bar_Loo + np.dot(Lvv, bar_oovv_packed.T)
         bar_Lvv_packed = bar_Lvv_packed + np.dot(Loo, bar_oovv_packed)
 
-    # bar_Lvv_packed → bar_Lvv_full (scatter into lower triangle).
+    # bar_Lvv_packed -> bar_Lvv_full (scatter into lower triangle).
     bar_Lvv_full = _scatter_lower_tril_last2(bar_Lvv_packed, nvir)
 
     # Scatter all three back into bar_Lpq.
     nmo = nocc + nvir
     bar_Lpq = np.zeros((naux, nmo, nmo), dtype=dtype)
-    bar_Lpq = bar_Lpq.at[:, :nocc, :nocc].add(bar_Loo.reshape(naux, nocc, nocc))
-    bar_Lpq = bar_Lpq.at[:, :nocc, nocc:].add(bar_Lov_flat.reshape(naux, nocc, nvir))
+    bar_Lpq = bar_Lpq.at[:, :nocc, :nocc].add(
+        bar_Loo.reshape(naux, nocc, nocc)
+    )
+    bar_Lpq = bar_Lpq.at[:, :nocc, nocc:].add(
+        bar_Lov_flat.reshape(naux, nocc, nvir)
+    )
     bar_Lpq = bar_Lpq.at[:, nocc:, nocc:].add(bar_Lvv_full)
     return (bar_Lpq,)
 
@@ -481,6 +502,8 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
         #elcorr_cc_t = gccsd_t.kernel(mcc, prjlo, t1=t1, t2=t2)
         phase_start = time.perf_counter()
         elcorr_cc_t = ccsd_t_mod.kernel(mcc, imp_eris, prjlo, t1=t1, t2=t2, verbose=verbose_imp)
+        if _should_print_forward_t_energy(verbose_imp, profile_pass):
+            _print_forward_t_energy(elcorr_cc_t)
         phase_times['triples_s'] = time.perf_counter() - phase_start
     else:
         elcorr_cc_t = 0.
@@ -571,15 +594,15 @@ def _mp2_fragment_energy_jax_bwd(res, bar_e2):
     bar_e2 = np.asarray(bar_e2)
 
     # e2 = einsum('ij,ij', eij, m)
-    # → bar_eij[p,q] = bar_e2 * m[p,q],  bar_m[p,q] = bar_e2 * eij[p,q]
+    # -> bar_eij[p,q] = bar_e2 * m[p,q],  bar_m[p,q] = bar_e2 * eij[p,q]
     bar_eij = bar_e2 * m
     bar_m = bar_e2 * eij
 
     # eij[p,q] = 2*sum_{j,a,b} t2[p,j,a,b] * ovov[q,a,j,b]
     #         -   sum_{j,a,b} t2[p,j,a,b] * ovov[q,b,j,a]
-    # → bar_t2[p,j,a,b] = sum_q bar_eij[p,q] * (2*ovov[q,a,j,b] - ovov[q,b,j,a])
-    # → bar_ovov[q,a,j,b] += 2 * sum_p bar_eij[p,q] * t2[p,j,a,b]
-    # → bar_ovov[q,b,j,a] += -   sum_p bar_eij[p,q] * t2[p,j,a,b]
+    # -> bar_t2[p,j,a,b] = sum_q bar_eij[p,q] * (2*ovov[q,a,j,b] - ovov[q,b,j,a])
+    # -> bar_ovov[q,a,j,b] += 2 * sum_p bar_eij[p,q] * t2[p,j,a,b]
+    # -> bar_ovov[q,b,j,a] += -   sum_p bar_eij[p,q] * t2[p,j,a,b]
     bar_t2 = (
         2 * np.einsum('pq,qajb->pjab', bar_eij, ovov)
         -     np.einsum('pq,qbja->pjab', bar_eij, ovov)
@@ -589,8 +612,8 @@ def _mp2_fragment_energy_jax_bwd(res, bar_e2):
         -     np.einsum('pq,pjab->qbja', bar_eij, t2)
     )
 
-    # m = prj.T @ prj  →  m[p,q] = sum_l prj[l,p] * prj[l,q]
-    # → bar_prj[l,p] = sum_q (bar_m[p,q] + bar_m[q,p]) * prj[l,q]
+    # m = prj.T @ prj -> m[p,q] = sum_l prj[l,p] * prj[l,q]
+    # -> bar_prj[l,p] = sum_q (bar_m[p,q] + bar_m[q,p]) * prj[l,q]
     bar_prj = np.dot(prj, bar_m + bar_m.T)
 
     return bar_ovov, bar_t2, bar_prj

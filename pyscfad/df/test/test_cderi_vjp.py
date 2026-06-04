@@ -2,9 +2,10 @@ import h5py
 import jax
 import numpy
 
+from pyscfad import config, gto
 from pyscfad import numpy as np
 from pyscfad.ao2mo import _ao2mo
-from pyscfad.df import _cderi_vjp
+from pyscfad.df import _cderi_vjp, addons, incore
 
 
 def test_nr_e2_cderi_bar_packed_blocks_match_full_vjp():
@@ -42,7 +43,7 @@ def test_nr_e2_cderi_bar_packed_blocks_match_full_vjp():
     assert numpy.allclose(cderi_bar, cderi_bar_ref, atol=1e-10, rtol=1e-10)
 
 
-def test_nr_e2_mo_coeff_vjp_from_cderi_source_is_blocked(tmp_path, monkeypatch):
+def test_nr_e2_mo_coeff_vjp_from_cderi_source_is_blocked(tmp_path):
     rng = numpy.random.default_rng(13)
     naux = 5
     nao = 4
@@ -65,7 +66,6 @@ def test_nr_e2_mo_coeff_vjp_from_cderi_source_is_blocked(tmp_path, monkeypatch):
     _, pullback = jax.vjp(fn, np.asarray(mo_coeff))
     mo_coeff_bar_ref = numpy.asarray(pullback(np.asarray(ybar))[0])
 
-    monkeypatch.setenv('PYSCFAD_DF_NR_E2_VJP_BLOCK_MB', '0.001')
     mo_coeff_bar = _cderi_vjp.nr_e2_mo_coeff_vjp_from_cderi_source(
         str(cderi_file),
         np.asarray(mo_coeff),
@@ -77,7 +77,7 @@ def test_nr_e2_mo_coeff_vjp_from_cderi_source_is_blocked(tmp_path, monkeypatch):
     assert numpy.allclose(mo_coeff_bar, mo_coeff_bar_ref, atol=1e-10, rtol=1e-10)
 
 
-def test_nr_e2_mo_coeff_vjp_from_local_cderi_source(tmp_path, monkeypatch):
+def test_nr_e2_mo_coeff_vjp_from_local_cderi_source(tmp_path):
     rng = numpy.random.default_rng(14)
     naux = 5
     nao = 5
@@ -108,7 +108,6 @@ def test_nr_e2_mo_coeff_vjp_from_local_cderi_source(tmp_path, monkeypatch):
     _, pullback = jax.vjp(fn, np.asarray(mo_coeff))
     mo_coeff_bar_ref = numpy.asarray(pullback(np.asarray(ybar))[0])
 
-    monkeypatch.setenv('PYSCFAD_DF_NR_E2_VJP_BLOCK_MB', '0.001')
     mo_coeff_bar = _cderi_vjp.nr_e2_mo_coeff_vjp_from_cderi_source(
         str(cderi_file),
         np.asarray(mo_coeff),
@@ -119,3 +118,81 @@ def test_nr_e2_mo_coeff_vjp_from_local_cderi_source(tmp_path, monkeypatch):
     )
 
     assert numpy.allclose(mo_coeff_bar, mo_coeff_bar_ref, atol=1e-10, rtol=1e-10)
+
+
+def test_cholesky_eri_mo_deriv_vjp_matches_cderi_bar_path(tmp_path):
+    rng = numpy.random.default_rng(15)
+    mol = gto.Mole(
+        atom='O 0 0 0; H 0 0 1; H 0 1 0',
+        basis='sto-3g',
+        verbose=0,
+    )
+    mol.build(trace_exp=False, trace_ctr_coeff=False)
+    auxmol = addons.make_auxmol(mol, 'weigend')
+    old_moleintor_opt = config.moleintor_opt
+    config.update('pyscfad_moleintor_opt', True)
+    try:
+        cderi = numpy.asarray(
+            incore.cholesky_eri(
+                mol,
+                auxmol=auxmol,
+                int3c=mol._add_suffix('int3c2e'),
+                int2c=mol._add_suffix('int2c2e'),
+                aosym='s2ij',
+                verbose=0,
+            )
+        )
+    finally:
+        config.update('pyscfad_moleintor_opt', old_moleintor_opt)
+    cderi_file = tmp_path / 'cderi.h5'
+    with h5py.File(cderi_file, 'w') as h5f:
+        h5f.create_dataset('j3c', data=cderi)
+
+    nao = mol.nao
+    nmo = 4
+    mo_coeff = rng.normal(size=(nao, nmo))
+    orbs_slice = (0, nmo, 0, nmo)
+    ybar = rng.normal(size=(auxmol.nao, nmo * nmo))
+    def cderi_bar_block(p0, p1):
+        return _cderi_vjp.nr_e2_cderi_bar_packed_block(
+            np.asarray(mo_coeff),
+            np.asarray(ybar),
+            orbs_slice,
+            numpy.arange(p0, p1, dtype=numpy.int64),
+        )
+
+    mol_ref, aux_ref = _cderi_vjp.cholesky_eri_vjp_from_cderi_block_fn(
+        mol,
+        auxmol,
+        str(cderi_file),
+        cderi_bar_block,
+        1024,
+        int3c=mol._add_suffix('int3c2e'),
+        int2c=mol._add_suffix('int2c2e'),
+        aosym='s2ij',
+    )
+    mol_test, aux_test = _cderi_vjp.cholesky_eri_vjp_from_mo_coeff_ybar(
+        mol,
+        auxmol,
+        str(cderi_file),
+        np.asarray(mo_coeff),
+        np.asarray(ybar),
+        orbs_slice,
+        1024,
+        int3c=mol._add_suffix('int3c2e'),
+        int2c=mol._add_suffix('int2c2e'),
+        aosym='s2ij',
+    )
+
+    assert numpy.allclose(
+        numpy.asarray(mol_test.coords),
+        numpy.asarray(mol_ref.coords),
+        atol=1e-8,
+        rtol=1e-8,
+    )
+    assert numpy.allclose(
+        numpy.asarray(aux_test.coords),
+        numpy.asarray(aux_ref.coords),
+        atol=1e-8,
+        rtol=1e-8,
+    )

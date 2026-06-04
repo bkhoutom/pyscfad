@@ -128,7 +128,7 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
 
     @classmethod
     def value_and_grad(cls, mol, *, build_mf, frag_lolist=None,
-                       include_mp2_correction=False,
+                       include_mp2_correction=True,
                        # CCSD solver config
                        frozen=0,
                        thresh_occ=1e-4,
@@ -395,7 +395,18 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                 per_frag_fn, mf, lo_coeff, has_aux=True,
             )
             e_corr_local = e_corr_local + e_frag
-            g_mf_i, g_lo_i = vjp_fn(jnp.float64(1.0))
+            if verbose >= _VERBOSE_PROGRESS:
+                print(f'  [rank {rank}] [frag {ifrag+1}/{nfrag}] '
+                      'reverse VJP: start', flush=True)
+            progress_prefix = (
+                f'  [rank {rank}] [frag {ifrag+1}/{nfrag}] reverse VJP:'
+                if verbose >= _VERBOSE_PROGRESS else None
+            )
+            with lno_base.vjp_progress(progress_prefix):
+                g_mf_i, g_lo_i = vjp_fn(jnp.float64(1.0))
+            if verbose >= _VERBOSE_PROGRESS:
+                print(f'  [rank {rank}] [frag {ifrag+1}/{nfrag}] '
+                      'reverse VJP: done', flush=True)
             if grad_mf is None:
                 grad_mf = g_mf_i
             else:

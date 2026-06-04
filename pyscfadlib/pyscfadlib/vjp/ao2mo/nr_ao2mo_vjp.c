@@ -197,3 +197,77 @@ void AO2MOnr_e2_vjp_drv(void (*ftrans)(), int (*fmmm)(),
         }
     }
 }
+
+
+void AO2MOnr_e2_cderi_bar_project_omp(
+        double *out, const double *y2,
+        const double *mok_rows, const double *mol_cols,
+        int naux, int kc, int lc, int npos, int blksize)
+{
+    if (naux <= 0 || kc <= 0 || lc <= 0 || npos <= 0) {
+        return;
+    }
+
+    const int m = naux * lc;
+    const double D1 = 1.0;
+    const double D0 = 0.0;
+    const char TRANS_T = 'T';
+    const char TRANS_N = 'N';
+
+    int block = blksize;
+    if (block <= 0) {
+        block = 1;
+    }
+#ifdef _OPENMP
+    const int max_threads = omp_get_max_threads();
+    if (max_threads > 1) {
+        block = (block + max_threads - 1) / max_threads;
+    }
+#endif
+    if (block < 1) {
+        block = 1;
+    }
+    if (block > npos) {
+        block = npos;
+    }
+
+    const int nblocks = (npos + block - 1) / block;
+
+#pragma omp parallel
+    {
+        double *tmp = malloc(sizeof(double) * (size_t)m * block);
+
+#pragma omp for schedule(dynamic)
+        for (int ib = 0; ib < nblocks; ib++) {
+            const int p0 = ib * block;
+            const int nb = (p0 + block <= npos) ? block : (npos - p0);
+
+            /*
+             * tmp[(P,l),p] = sum_k ybar[P,k,l] * mok_rows[p,k]
+             *
+             * y2 is the C-contiguous view ybar.transpose(0,2,1)
+             * reshaped to (naux*lc, kc).  The row-major result tmp
+             * (m, nb) is represented to Fortran BLAS as (nb, m).
+             */
+            dgemm_(&TRANS_T, &TRANS_N,
+                   &nb, &m, &kc,
+                   &D1, mok_rows + (size_t)p0 * kc, &kc,
+                   y2, &kc,
+                   &D0, tmp, &nb);
+
+            for (int p = 0; p < nb; p++) {
+                const double *col = mol_cols + (size_t)(p0 + p) * lc;
+                for (int x = 0; x < naux; x++) {
+                    double acc = 0.0;
+                    const double *tmp_xp = tmp + (size_t)x * lc * nb + p;
+                    for (int l = 0; l < lc; l++) {
+                        acc += tmp_xp[(size_t)l * nb] * col[l];
+                    }
+                    out[(size_t)x * npos + p0 + p] = acc;
+                }
+            }
+        }
+
+        free(tmp);
+    }
+}

@@ -747,6 +747,77 @@ def _mp2_fragment_energy_from_df_lov_fwd(Lov, occ_coeff, vir_coeff,
     return e2, (Lov, occ_coeff, vir_coeff, moe_occ, moe_vir, prjlo)
 
 
+def _mp2_fragment_energy_from_df_lov_block_bwd(
+        Lov, occ_coeff, vir_coeff, moe_occ, moe_vir, prjlo,
+        a0, a1, b0, b1, e2_bar):
+    vir_a = vir_coeff[:, a0:a1]
+    vir_b = vir_coeff[:, b0:b1]
+    Lov_a = np.einsum('ip,Lia,aq->Lpq', occ_coeff, Lov, vir_a)
+    same_vir_block = b0 == a0 and b1 == a1
+    if same_vir_block:
+        Lov_b = Lov_a
+    else:
+        Lov_b = np.einsum('ip,Lia,aq->Lpq', occ_coeff, Lov, vir_b)
+
+    eov = moe_occ[:, None] - moe_vir
+    eov_a = eov[:, a0:a1]
+    eov_b = eov[:, b0:b1]
+    denom = eov_a[:, None, :, None] + eov_b[None, :, None, :]
+    m = np.dot(prjlo.T, prjlo)
+    ovov = np.einsum('Lia,Ljb->iajb', Lov_a, Lov_b)
+    t2 = ovov.transpose(0, 2, 1, 3) / denom
+    scale = np.asarray(e2_bar)
+
+    m_bar = scale * (
+        2 * np.einsum('pjab,qajb->pq', t2, ovov)
+        - np.einsum('pjab,jaqb->pq', t2, ovov)
+    )
+    t2_bar = scale * (
+        2 * np.einsum('pq,qajb->pjab', m, ovov)
+        - np.einsum('pq,jaqb->pjab', m, ovov)
+    )
+    ovov_bar = scale * (
+        2 * np.einsum('pq,pjab->qajb', m, t2)
+        - np.einsum('pq,pjab->jaqb', m, t2)
+    )
+
+    ovov_t = ovov.transpose(0, 2, 1, 3)
+    denom_bar = -t2_bar * ovov_t / (denom * denom)
+    ovov_bar += (t2_bar / denom).transpose(0, 2, 1, 3)
+
+    moe_occ_bar = np.zeros_like(moe_occ)
+    moe_vir_bar = np.zeros_like(moe_vir)
+    moe_occ_bar += np.sum(denom_bar, axis=(1, 2, 3))
+    moe_occ_bar += np.sum(denom_bar, axis=(0, 2, 3))
+    moe_vir_bar = moe_vir_bar.at[a0:a1].add(
+        -np.sum(denom_bar, axis=(0, 1, 3))
+    )
+    moe_vir_bar = moe_vir_bar.at[b0:b1].add(
+        -np.sum(denom_bar, axis=(0, 1, 2))
+    )
+
+    Lov_a_bar = np.einsum('iajb,Ljb->Lia', ovov_bar, Lov_b)
+    Lov_b_bar = np.einsum('iajb,Lia->Ljb', ovov_bar, Lov_a)
+    if same_vir_block:
+        Lov_a_bar += Lov_b_bar
+
+    Lov_bar = np.einsum('ip,Lpq,aq->Lia', occ_coeff, Lov_a_bar, vir_a)
+    occ_coeff_bar = np.einsum('Lia,aq,Lpq->ip', Lov, vir_a, Lov_a_bar)
+    vir_coeff_bar = np.zeros_like(vir_coeff)
+    vir_coeff_bar = vir_coeff_bar.at[:, a0:a1].add(
+        np.einsum('ip,Lia,Lpq->aq', occ_coeff, Lov, Lov_a_bar)
+    )
+    if not same_vir_block:
+        Lov_bar += np.einsum('ip,Lpq,aq->Lia', occ_coeff, Lov_b_bar, vir_b)
+        occ_coeff_bar += np.einsum('Lia,aq,Lpq->ip', Lov, vir_b, Lov_b_bar)
+        vir_coeff_bar = vir_coeff_bar.at[:, b0:b1].add(
+            np.einsum('ip,Lia,Lpq->aq', occ_coeff, Lov, Lov_b_bar)
+        )
+
+    prjlo_bar = np.dot(prjlo, m_bar + m_bar.T)
+    return Lov_bar, occ_coeff_bar, vir_coeff_bar, moe_occ_bar, moe_vir_bar, prjlo_bar
+
+
 def _mp2_fragment_energy_from_df_lov_bwd(res, e2_bar):
     Lov, occ_coeff, vir_coeff, moe_occ, moe_vir, prjlo = res
     naux = Lov.shape[0]
@@ -767,19 +838,10 @@ def _mp2_fragment_energy_from_df_lov_bwd(res, e2_bar):
         a1 = min(a0 + block_nvir, nvir)
         for b0 in range(0, nvir, block_nvir):
             b1 = min(b0 + block_nvir, nvir)
-
-            def block_fn(Lov_, occ_coeff_, vir_coeff_,
-                         moe_occ_, moe_vir_, prjlo_):
-                return _mp2_fragment_energy_from_df_lov_block(
-                    Lov_, occ_coeff_, vir_coeff_,
-                    moe_occ_, moe_vir_, prjlo_,
-                    a0, a1, b0, b1,
-                )
-
-            _, pullback = jax.vjp(
-                block_fn, Lov, occ_coeff, vir_coeff, moe_occ, moe_vir, prjlo
+            block_bars = _mp2_fragment_energy_from_df_lov_block_bwd(
+                Lov, occ_coeff, vir_coeff, moe_occ, moe_vir, prjlo,
+                a0, a1, b0, b1, e2_bar,
             )
-            block_bars = pullback(e2_bar)
             Lov_bar += block_bars[0]
             occ_coeff_bar += block_bars[1]
             vir_coeff_bar += block_bars[2]
@@ -787,7 +849,8 @@ def _mp2_fragment_energy_from_df_lov_bwd(res, e2_bar):
             moe_vir_bar += block_bars[4]
             prjlo_bar += block_bars[5]
 
-    return Lov_bar, occ_coeff_bar, vir_coeff_bar, moe_occ_bar, moe_vir_bar, prjlo_bar
+    return (Lov_bar, occ_coeff_bar, vir_coeff_bar,
+            moe_occ_bar, moe_vir_bar, prjlo_bar)
 
 
 _mp2_fragment_energy_from_df_lov.defvjp(

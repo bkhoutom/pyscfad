@@ -128,7 +128,7 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
 
     @classmethod
     def value_and_grad(cls, mol, *, build_mf, frag_lolist=None,
-                       include_mp2_correction=True,
+                       include_mp2_correction=False,
                        # CCSD solver config
                        frozen=0,
                        thresh_occ=1e-4,
@@ -351,9 +351,14 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                 )
 
                 if orbfrag is None:
-                    if include_mp2_correction:
-                        return _weight * domain_pt2
-                    return jnp.float64(0.0)
+                    contribution = domain_pt2 if include_mp2_correction else jnp.float64(0.0)
+                    aux = {
+                        'pt2':        jnp.float64(0.0),
+                        'cc':         jnp.float64(0.0),
+                        'cc_t':       jnp.float64(0.0),
+                        'domain_pt2': jnp.asarray(domain_pt2 if include_mp2_correction else 0.0),
+                    }
+                    return _weight * contribution, aux
 
                 res = _impurity_solve_core(
                     mf_, orbfrag, orbfragloc,
@@ -370,7 +375,13 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                 contribution = e_cc_frag + e_cc_t_frag + sign_pt2 * e_pt2_frag
                 if include_mp2_correction:
                     contribution = contribution + domain_pt2
-                return _weight * contribution
+                aux = {
+                    'pt2':        jnp.asarray(e_pt2_frag),
+                    'cc':         jnp.asarray(e_cc_frag),
+                    'cc_t':       jnp.asarray(e_cc_t_frag),
+                    'domain_pt2': jnp.asarray(domain_pt2 if include_mp2_correction else 0.0),
+                }
+                return _weight * contribution, aux
 
             t_frag = time.perf_counter()
             if verbose >= _VERBOSE_PROGRESS:
@@ -380,7 +391,9 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                       f'domain={n_atoms} atoms, lo_size={len(fraglo_idx)}: '
                       f'starting fwd+bwd...', flush=True)
 
-            e_frag, vjp_fn = jax.vjp(per_frag_fn, mf, lo_coeff)
+            e_frag, vjp_fn, aux = jax.vjp(
+                per_frag_fn, mf, lo_coeff, has_aux=True,
+            )
             e_corr_local = e_corr_local + e_frag
             g_mf_i, g_lo_i = vjp_fn(jnp.float64(1.0))
             if grad_mf is None:
@@ -392,7 +405,14 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
             if verbose >= _VERBOSE_PROGRESS:
                 print(f'  [rank {rank}] [frag {ifrag+1}/{nfrag}] done in '
                       f'{time.perf_counter() - t_frag:.2f} s, '
-                      f'contribution = {float(e_frag):+.8f}', flush=True)
+                      f'contribution = {float(e_frag):+.8f}  '
+                      f'(pt2={float(aux["pt2"]):+.8f}, '
+                      f'cc={float(aux["cc"]):+.8f}, '
+                      f'(T)={float(aux["cc_t"]):+.8f}'
+                      + (f', domain_pt2={float(aux["domain_pt2"]):+.8f}'
+                         if include_mp2_correction else '')
+                      + ')',
+                      flush=True)
 
         # Defensive: ranks with no fragments have grad_mf=None still.
         # Seed grad_mf as a zeros-of-canonical shape so the gather

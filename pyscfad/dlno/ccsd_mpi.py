@@ -138,6 +138,11 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                        ccsd_t=False,
                        dcsd=False,
                        verbose_imp=0,
+                       ccsd_t_use_lt=False,
+                       ccsd_t_lt_nlap=None,
+                       ccsd_t_lt_quadrature=None,
+                       ccsd_t_lt_fit_ratio=None,
+                       ccsd_t_lt_fit_tol=None,
                        # Prescreen build config
                        lmo_bp_domain_thr=None,
                        pao_bp_domain_thr=None,
@@ -335,6 +340,15 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                 cc_local.ccsd_t = ccsd_t
                 cc_local.dcsd = dcsd
                 cc_local.verbose_imp = verbose_imp
+                cc_local.ccsd_t_use_lt = ccsd_t_use_lt
+                if ccsd_t_lt_nlap is not None:
+                    cc_local.ccsd_t_lt_nlap = ccsd_t_lt_nlap
+                if ccsd_t_lt_quadrature is not None:
+                    cc_local.ccsd_t_lt_quadrature = ccsd_t_lt_quadrature
+                if ccsd_t_lt_fit_ratio is not None:
+                    cc_local.ccsd_t_lt_fit_ratio = ccsd_t_lt_fit_ratio
+                if ccsd_t_lt_fit_tol is not None:
+                    cc_local.ccsd_t_lt_fit_tol = ccsd_t_lt_fit_tol
                 cc_local.compute_domain_pt2 = include_mp2_correction
 
                 orbfragloc = lo_coeff_[:, _fraglo]
@@ -369,6 +383,11 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                     dcsd=cc_local.dcsd,
                     profile_info=None,
                     profile_pass=getattr(cc_local, 'profile_pass', None),
+                    ccsd_t_use_lt=cc_local.ccsd_t_use_lt,
+                    ccsd_t_lt_nlap=cc_local.ccsd_t_lt_nlap,
+                    ccsd_t_lt_quadrature=cc_local.ccsd_t_lt_quadrature,
+                    ccsd_t_lt_fit_ratio=cc_local.ccsd_t_lt_fit_ratio,
+                    ccsd_t_lt_fit_tol=cc_local.ccsd_t_lt_fit_tol,
                 )
                 e_pt2_frag, e_cc_frag, e_cc_t_frag = res
 

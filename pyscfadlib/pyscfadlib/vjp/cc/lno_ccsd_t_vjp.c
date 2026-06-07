@@ -1,4 +1,5 @@
 #include <stdlib.h>
+#include <math.h>
 #include "config.h"
 #include "vhf/fblas.h"
 #include "vjp/cc/ccsd_t.h"
@@ -47,6 +48,39 @@ static void get_wz(double *w0_mat, double *w0, double* z0,
     dgemm_(&TRANS_N, &TRANS_T, &noo, &nocc, &nocc,
            &D1, w0, &noo, mat, &nocc,
            &D0, w0_mat, &noo);
+}
+
+static void get_wz_lt(double *w0, double* z0,
+                      int nocc, int nvir, int a, int b, int c,
+                      double *t1T, double *t2T, double *fvo,
+                      double *vooo, double *cache1, void **cache,
+                      int *permute_idx, double fac)
+{
+    const int nooo = nocc * nocc * nocc;
+    int *idx0 = permute_idx;
+    int *idx1 = idx0 + nooo;
+    int *idx2 = idx1 + nooo;
+    int *idx3 = idx2 + nooo;
+    int *idx4 = idx3 + nooo;
+    int *idx5 = idx4 + nooo;
+
+    double *v0 = cache1;
+    double *wtmp = v0 + nooo;
+    int i;
+
+    for (i = 0; i < nooo; i++) {
+        w0[i] = 0;
+        v0[i] = 0;
+    }
+
+    get_wv(w0, v0, wtmp, fvo, vooo, cache[0], t1T, t2T, nocc, nvir, a, b, c, idx0);
+    get_wv(w0, v0, wtmp, fvo, vooo, cache[1], t1T, t2T, nocc, nvir, a, c, b, idx1);
+    get_wv(w0, v0, wtmp, fvo, vooo, cache[2], t1T, t2T, nocc, nvir, b, a, c, idx2);
+    get_wv(w0, v0, wtmp, fvo, vooo, cache[3], t1T, t2T, nocc, nvir, b, c, a, idx3);
+    get_wv(w0, v0, wtmp, fvo, vooo, cache[4], t1T, t2T, nocc, nvir, c, a, b, idx4);
+    get_wv(w0, v0, wtmp, fvo, vooo, cache[5], t1T, t2T, nocc, nvir, c, b, a, idx5);
+
+    add_and_permute(z0, w0, v0, nocc, fac);
 }
 
 static void get_d3(double *d3, double *mo_energy, int nocc,
@@ -108,6 +142,109 @@ static void get_w0v0d3_bar(double *mat_bar, double *w0_bar, double *v0_bar, doub
     dgemm_(&TRANS_N, &TRANS_N, &noo, &nocc, &nocc,
            &D1, w0_mat_bar, &noo, mat, &nocc,
            &D0, w0_bar, &noo);
+
+    get_v0_bar(v0_bar, z0_bar,  4., nocc, idx0);
+    get_v0_bar(v0_bar, z0_bar, -2., nocc, idx1);
+    get_v0_bar(v0_bar, z0_bar, -2., nocc, idx2);
+    get_v0_bar(v0_bar, z0_bar,  1., nocc, idx3);
+    get_v0_bar(v0_bar, z0_bar,  1., nocc, idx4);
+    get_v0_bar(v0_bar, z0_bar, -2., nocc, idx5);
+
+    for (n = 0; n < nooo; n++) {
+        w0_bar[n] += v0_bar[n];
+    }
+}
+
+static void get_w0v0lt_ulo_bar(double *ulo_bar, double *mo_energy_bar,
+                               double *w0_bar, double *v0_bar,
+                               double *ulo, int nlo,
+                               double *lt_t, double *lt_w, int nlap,
+                               double *mo_energy,
+                               double *z0, double *w0,
+                               double et_bar, int nocc,
+                               int a, int b, int c, double fac,
+                               int *permute_idx, double *cache)
+{
+    const int noo = nocc * nocc;
+    const int nooo = noo * nocc;
+    int n, x, q, i, j, k, l;
+    int *idx0 = permute_idx;
+    int *idx1 = idx0 + nooo;
+    int *idx2 = idx1 + nooo;
+    int *idx3 = idx2 + nooo;
+    int *idx4 = idx3 + nooo;
+    int *idx5 = idx4 + nooo;
+
+    double *z0_bar = cache;
+    double *wu = z0_bar + nooo;
+    double *wu_bar = wu + noo;
+    double *eo_exp = wu_bar + noo;
+    double *pvir = mo_energy_bar + nocc;
+    double abc = mo_energy[nocc+a] + mo_energy[nocc+b] + mo_energy[nocc+c];
+
+    for (n = 0; n < nooo; n++) {
+        z0_bar[n] = 0;
+        w0_bar[n] = 0;
+        v0_bar[n] = 0;
+    }
+
+    for (q = 0; q < nlap; q++) {
+        double tq = lt_t[q];
+        double qfac = -fac * lt_w[q] * exp(-tq * abc);
+        for (i = 0; i < nocc; i++) {
+            eo_exp[i] = exp(tq * mo_energy[i]);
+        }
+
+        for (x = 0; x < nlo; x++) {
+            double *ux = ulo + x * nocc;
+            double *ux_bar = ulo_bar + x * nocc;
+
+            for (j = 0; j < nocc; j++) {
+            for (k = 0; k < nocc; k++) {
+                double s = 0;
+                for (l = 0; l < nocc; l++) {
+                    s += ux[l] * w0[(l*nocc+j)*nocc+k];
+                }
+                wu[j*nocc+k] = s;
+                wu_bar[j*nocc+k] = 0;
+            } }
+
+            for (i = 0; i < nocc; i++) {
+                double qi = et_bar * qfac * eo_exp[i];
+                for (j = 0; j < nocc; j++) {
+                    double qij = qi * eo_exp[j];
+                    for (k = 0; k < nocc; k++) {
+                        n = (i*nocc+j)*nocc+k;
+                        double base = qij * eo_exp[k];
+                        double coeff = base * ux[i];
+                        double ez = coeff * z0[n];
+                        double term = ez * wu[j*nocc+k];
+
+                        z0_bar[n] += coeff * wu[j*nocc+k];
+                        wu_bar[j*nocc+k] += coeff * z0[n];
+                        ux_bar[i] += base * wu[j*nocc+k] * z0[n];
+
+                        mo_energy_bar[i] += tq * term;
+                        mo_energy_bar[j] += tq * term;
+                        mo_energy_bar[k] += tq * term;
+                        pvir[a] -= tq * term;
+                        pvir[b] -= tq * term;
+                        pvir[c] -= tq * term;
+                    }
+                }
+            }
+
+            for (j = 0; j < nocc; j++) {
+            for (k = 0; k < nocc; k++) {
+                double wb = wu_bar[j*nocc+k];
+                for (l = 0; l < nocc; l++) {
+                    n = (l*nocc+j)*nocc+k;
+                    w0_bar[n] += ux[l] * wb;
+                    ux_bar[l] += w0[n] * wb;
+                }
+            } }
+        }
+    }
 
     get_v0_bar(v0_bar, z0_bar,  4., nocc, idx0);
     get_v0_bar(v0_bar, z0_bar, -2., nocc, idx1);
@@ -352,6 +489,62 @@ static void contract6_vjp(double *mat, double *mo_energy, double *t1Thalf, doubl
                       t1Thalf, t2T, fvohalf, vooo, cache[5], nocc, nvir, c, b, a, idx5, cache1);
 }
 
+static void contract6_lt_ulo_vjp(double *ulo, int nlo,
+                                 double *lt_t, double *lt_w, int nlap,
+                                 double *mo_energy, double *t1Thalf, double *t2T,
+                                 double *fvohalf, double *vooo, void **cache,
+                                 double *ulo_bar, double *mo_energy_bar,
+                                 double *t1T_bar, double *t2T_bar,
+                                 double *fvo_bar, double *vooo_bar,
+                                 void **cache_vjp, double et_bar,
+                                 int nocc, int nvir, int a, int b, int c,
+                                 int *permute_idx, double fac, double *cache1)
+{
+    int nooo = nocc * nocc * nocc;
+    int *idx0 = permute_idx;
+    int *idx1 = idx0 + nooo;
+    int *idx2 = idx1 + nooo;
+    int *idx3 = idx2 + nooo;
+    int *idx4 = idx3 + nooo;
+    int *idx5 = idx4 + nooo;
+
+    double *w0 = cache1;
+    double *z0 = w0 + nooo;
+    double *w0_bar = z0 + nooo;
+    double *v0_bar = w0_bar + nooo;
+
+    cache1 += nooo * 4;
+    get_wz_lt(w0, z0, nocc, nvir, a, b, c,
+              t1Thalf, t2T, fvohalf, vooo, cache1, cache,
+              permute_idx, fac);
+
+    cache1 += nooo * 2;
+    if (b == c) {
+        get_w0v0lt_ulo_bar(ulo_bar, mo_energy_bar, w0_bar, v0_bar,
+                           ulo, nlo, lt_t, lt_w, nlap, mo_energy,
+                           z0, w0, et_bar, nocc, a, b, c, .5,
+                           permute_idx, cache1);
+    } else {
+        get_w0v0lt_ulo_bar(ulo_bar, mo_energy_bar, w0_bar, v0_bar,
+                           ulo, nlo, lt_t, lt_w, nlap, mo_energy,
+                           z0, w0, et_bar, nocc, a, b, c, 1.,
+                           permute_idx, cache1);
+    }
+
+    get_eris_amps_bar(t1T_bar, t2T_bar, fvo_bar, vooo_bar, cache_vjp[0], w0_bar, v0_bar,
+                      t1Thalf, t2T, fvohalf, vooo, cache[0], nocc, nvir, a, b, c, idx0, cache1);
+    get_eris_amps_bar(t1T_bar, t2T_bar, fvo_bar, vooo_bar, cache_vjp[1], w0_bar, v0_bar,
+                      t1Thalf, t2T, fvohalf, vooo, cache[1], nocc, nvir, a, c, b, idx1, cache1);
+    get_eris_amps_bar(t1T_bar, t2T_bar, fvo_bar, vooo_bar, cache_vjp[2], w0_bar, v0_bar,
+                      t1Thalf, t2T, fvohalf, vooo, cache[2], nocc, nvir, b, a, c, idx2, cache1);
+    get_eris_amps_bar(t1T_bar, t2T_bar, fvo_bar, vooo_bar, cache_vjp[3], w0_bar, v0_bar,
+                      t1Thalf, t2T, fvohalf, vooo, cache[3], nocc, nvir, b, c, a, idx3, cache1);
+    get_eris_amps_bar(t1T_bar, t2T_bar, fvo_bar, vooo_bar, cache_vjp[4], w0_bar, v0_bar,
+                      t1Thalf, t2T, fvohalf, vooo, cache[4], nocc, nvir, c, a, b, idx4, cache1);
+    get_eris_amps_bar(t1T_bar, t2T_bar, fvo_bar, vooo_bar, cache_vjp[5], w0_bar, v0_bar,
+                      t1Thalf, t2T, fvohalf, vooo, cache[5], nocc, nvir, c, b, a, idx5, cache1);
+}
+
 static size_t lnoccsdt_gen_jobs(CacheJob *jobs, int nocc, int nvir,
                                 int b0, int b1, int c0, int c1,
                                 void *cache_row_b, void *cache_col_b,
@@ -537,6 +730,181 @@ void lnoccsdt_energy_vjp(double *mat, double *mo_energy, double *t1T, double *t2
         omp_dsum_reduce_inplace(cache_row_a_bar_bufs, da*db*nocc*nmo);
         if (thread_id != 0) {
             free(mat_bar_priv);
+            free(mo_energy_bar_priv);
+            free(t1T_bar_priv);
+            free(t2T_bar_priv);
+            free(vooo_bar_priv);
+            free(fvo_bar_priv);
+            free(cache_row_a_bar_priv);
+        }
+
+        if (b0 != 0 || b1 != nvir) {
+            omp_dsum_reduce_inplace(cache_col_a_bar_bufs, da*db*nocc*nmo);
+            if (thread_id != 0) {
+                free(cache_col_a_bar_priv);
+            }
+        }
+        if (c1 <= b0) {
+            omp_dsum_reduce_inplace(cache_row_b_bar_bufs, da*dc*nocc*nmo);
+            omp_dsum_reduce_inplace(cache_col_b_bar_bufs, da*dc*nocc*nmo);
+            if (thread_id != 0) {
+                free(cache_row_b_bar_priv);
+                free(cache_col_b_bar_priv);
+            }
+        }
+    }
+    free(jobs);
+    free(permute_idx);
+    free(t1Thalf);
+}
+
+void lnoccsdt_energy_lt_ulo_vjp(double *ulo, int nlo,
+                                double *lt_t, double *lt_w, int nlap,
+                                double *mo_energy, double *t1T, double *t2T,
+                                double *vooo, double *fvo, double et_bar,
+                                int nocc, int nvir, int b0, int b1, int c0, int c1,
+                                void *cache_row_a, void *cache_col_a,
+                                void *cache_row_b, void *cache_col_b,
+                                double *ulo_bar,
+                                double *mo_energy_bar,
+                                double *t1T_bar,
+                                double *t2T_bar,
+                                double *vooo_bar,
+                                double *fvo_bar,
+                                double *cache_row_a_bar,
+                                double *cache_col_a_bar,
+                                double *cache_row_b_bar,
+                                double *cache_col_b_bar)
+{
+    int da = nvir;
+    int db = b1 - b0;
+    int dc = c1 - c0;
+    int nmo = nocc + nvir;
+
+    CacheJob *jobs = malloc(sizeof(CacheJob) * da*db*dc);
+    size_t njobs = lnoccsdt_gen_jobs(jobs, nocc, nvir, b0, b1, c0, c1,
+                                     cache_row_a, cache_col_a,
+                                     cache_row_b, cache_col_b, sizeof(double));
+
+    int *permute_idx = malloc(sizeof(int) * nocc*nocc*nocc * 6);
+    _make_permute_indices(permute_idx, nocc);
+
+    double *t1Thalf = malloc(sizeof(double) * nvir*nocc * 2);
+    double *fvohalf = t1Thalf + nvir*nocc;
+    int k;
+    for (k = 0; k < nvir*nocc; k++) {
+        t1Thalf[k] = t1T[k] * .5;
+        fvohalf[k] = fvo[k] * .5;
+    }
+
+    double *ulo_bar_bufs[MAX_THREADS];
+    double *mo_energy_bar_bufs[MAX_THREADS];
+    double *t1T_bar_bufs[MAX_THREADS];
+    double *t2T_bar_bufs[MAX_THREADS];
+    double *vooo_bar_bufs[MAX_THREADS];
+    double *fvo_bar_bufs[MAX_THREADS];
+
+    double *cache_row_a_bar_bufs[MAX_THREADS];
+    double *cache_col_a_bar_bufs[MAX_THREADS];
+    double *cache_row_b_bar_bufs[MAX_THREADS];
+    double *cache_col_b_bar_bufs[MAX_THREADS];
+
+    #pragma omp parallel
+    {
+        int thread_id = omp_get_thread_num();
+        double *ulo_bar_priv;
+        double *mo_energy_bar_priv;
+        double *t1T_bar_priv;
+        double *t2T_bar_priv;
+        double *vooo_bar_priv;
+        double *fvo_bar_priv;
+        double *cache_row_a_bar_priv=NULL;
+        double *cache_col_a_bar_priv=NULL;
+        double *cache_row_b_bar_priv=NULL;
+        double *cache_col_b_bar_priv=NULL;
+        if (thread_id == 0) {
+            ulo_bar_priv = ulo_bar;
+            mo_energy_bar_priv = mo_energy_bar;
+            t1T_bar_priv = t1T_bar;
+            t2T_bar_priv = t2T_bar;
+            vooo_bar_priv = vooo_bar;
+            fvo_bar_priv = fvo_bar;
+            cache_row_a_bar_priv = cache_row_a_bar;
+            cache_col_a_bar_priv = cache_col_a_bar;
+            if (c1 <= b0) {
+                cache_row_b_bar_priv = cache_row_b_bar;
+                cache_col_b_bar_priv = cache_col_b_bar;
+            }
+        } else {
+            ulo_bar_priv = calloc(nlo*nocc, sizeof(double));
+            mo_energy_bar_priv = calloc(nmo, sizeof(double));
+            t1T_bar_priv = calloc(nvir*nocc, sizeof(double));
+            t2T_bar_priv = calloc(nvir*nvir*nocc*nocc, sizeof(double));
+            vooo_bar_priv = calloc(nvir*nocc*nocc*nocc, sizeof(double));
+            fvo_bar_priv = calloc(nvir*nocc, sizeof(double));
+            cache_row_a_bar_priv = calloc(da*db*nocc*nmo, sizeof(double));
+            if (b0 == 0 && b1 == nvir) {
+                cache_col_a_bar_priv = cache_row_a_bar_priv;
+            }
+            else {
+                cache_col_a_bar_priv = calloc(da*db*nocc*nmo, sizeof(double));
+            }
+            if (c1 <= b0) {
+                cache_row_b_bar_priv = calloc(da*dc*nocc*nmo, sizeof(double));
+                cache_col_b_bar_priv = calloc(da*dc*nocc*nmo, sizeof(double));
+            }
+        }
+
+        ulo_bar_bufs[thread_id] = ulo_bar_priv;
+        mo_energy_bar_bufs[thread_id] = mo_energy_bar_priv;
+        t1T_bar_bufs[thread_id] = t1T_bar_priv;
+        t2T_bar_bufs[thread_id] = t2T_bar_priv;
+        vooo_bar_bufs[thread_id] = vooo_bar_priv;
+        fvo_bar_bufs[thread_id] = fvo_bar_priv;
+
+        cache_row_a_bar_bufs[thread_id] = cache_row_a_bar_priv;
+        cache_col_a_bar_bufs[thread_id] = cache_col_a_bar_priv;
+        cache_row_b_bar_bufs[thread_id] = cache_row_b_bar_priv;
+        cache_col_b_bar_bufs[thread_id] = cache_col_b_bar_priv;
+
+        CacheJob *jobs_vjp = malloc(sizeof(CacheJob) * da*db*dc);
+        lnoccsdt_gen_jobs(jobs_vjp, nocc, nvir, b0, b1, c0, c1,
+                          (void*)cache_row_a_bar_priv, (void*)cache_col_a_bar_priv,
+                          (void*)cache_row_b_bar_priv, (void*)cache_col_b_bar_priv,
+                          sizeof(double));
+
+        int a, b, c;
+        size_t k;
+        double *cache1 = malloc(sizeof(double) * (nocc*nocc*nocc*8
+                                                 + nocc*nocc*2
+                                                 + nocc + 2));
+        #pragma omp for schedule(dynamic)
+        for (k = 0; k < njobs; k++) {
+            a = jobs[k].a;
+            b = jobs[k].b;
+            c = jobs[k].c;
+            contract6_lt_ulo_vjp(ulo, nlo, lt_t, lt_w, nlap,
+                                 mo_energy, t1Thalf, t2T,
+                                 fvohalf, vooo, jobs[k].cache,
+                                 ulo_bar_priv, mo_energy_bar_priv,
+                                 t1T_bar_priv, t2T_bar_priv,
+                                 fvo_bar_priv, vooo_bar_priv,
+                                 jobs_vjp[k].cache, et_bar,
+                                 nocc, nvir, a, b, c,
+                                 permute_idx, 1., cache1);
+        }
+        free(jobs_vjp);
+        free(cache1);
+
+        omp_dsum_reduce_inplace(ulo_bar_bufs, nlo*nocc);
+        omp_dsum_reduce_inplace(mo_energy_bar_bufs, nmo);
+        omp_dsum_reduce_inplace(t1T_bar_bufs, nvir*nocc);
+        omp_dsum_reduce_inplace(t2T_bar_bufs, nvir*nvir*nocc*nocc);
+        omp_dsum_reduce_inplace(vooo_bar_bufs, nvir*nocc*nocc*nocc);
+        omp_dsum_reduce_inplace(fvo_bar_bufs, nvir*nocc);
+        omp_dsum_reduce_inplace(cache_row_a_bar_bufs, da*db*nocc*nmo);
+        if (thread_id != 0) {
+            free(ulo_bar_priv);
             free(mo_energy_bar_priv);
             free(t1T_bar_priv);
             free(t2T_bar_priv);

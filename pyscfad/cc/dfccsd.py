@@ -272,6 +272,24 @@ def _dfccsd_kernel_custom_fwd(mycc, eris, t1=None, t2=None):
     return out, (mycc, eris, t1_out, t2_out)
 
 
+def _coerce_eris_tensors_for_bwd(eris):
+    """Re-wrap host-side TypedNdArray literals on eris as proper jnp arrays.
+
+    JAX saves non-dynamic eris attributes as static aux data and re-emits them
+    as TypedNdArray host literals in the bwd; those lack .transpose() and other
+    array methods needed by update_amps / lagrangian_grad.
+    """
+    import copy
+    out = copy.copy(eris)
+    for attr in ('fock', 'mo_energy', 'oooo', 'ovoo', 'ovov', 'oovv',
+                 'ovvo', 'ovvv', 'Lvv', 'Lov', 'mo_coeff'):
+        val = getattr(out, attr, None)
+        if val is None or hasattr(val, 'transpose'):
+            continue
+        setattr(out, attr, jnp.asarray(val))
+    return out
+
+
 def _dfccsd_kernel_custom_bwd(res, cotangent):
     """Backward of the DF-CCSD custom-VJP via implicit-diff-form lambda equations.
 
@@ -283,6 +301,7 @@ def _dfccsd_kernel_custom_bwd(res, cotangent):
     """
     mycc, eris, t1, t2 = res
     _, bar_e, bar_t1, bar_t2 = cotangent
+    eris = _coerce_eris_tensors_for_bwd(eris)
     t1 = np.asarray(t1)
     t2 = np.asarray(t2)
 

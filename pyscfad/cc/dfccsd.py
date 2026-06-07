@@ -138,11 +138,12 @@ def _contract_vvvv_t2(mycc, mol, Lvv, t2, out=None, verbose=None):
     return _contract_vvvv_t2_lowmem(Lvv, t2)
 
 class _ChemistsERIs(ccsd._ChemistsERIs):
-    _dynamic_attr = {'Lvv', 'Lov'}
+    _dynamic_attr = {'Loo', 'Lvv', 'Lov'}
 
     def __init__(self, mol=None):
         super().__init__(mol=mol)
         self.naux = None
+        self.Loo = None
         self.Lvv = None
         self.Lov = None
 
@@ -210,6 +211,7 @@ def _make_df_eris_incore(cc, mo_coeff=None):
         Lpq = _ao2mo.nr_e2(eri1, mo, ijslice, aosym='s2', mosym='s1').reshape(-1,nmo,nmo)
     Loo = Lpq[:,:nocc,:nocc].reshape(naux,-1)
     Lov = Lpq[:,:nocc,nocc:].reshape(naux,-1)
+    eris.Loo = Loo.reshape(naux, nocc, nocc)
     eris.Lov = Lov.reshape(naux, nocc, nvir)
     eris.Lvv = Lvv = lib.pack_tril(Lpq[:,nocc:,nocc:])
 

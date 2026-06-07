@@ -65,12 +65,18 @@ _USE_CUSTOM_VJP_AO2MO_DF_ERIS = True
 _USE_CUSTOM_VJP_IMPURITY_SOLVE = True
 
 
-def _print_forward_t_energy(et):
+def _print_forward_t_energy(et, wall_time=None):
     jax.debug.print(
         '    forward (T) energy = {et:+.15g}',
         et=et,
         ordered=True,
     )
+    if wall_time is not None:
+        jax.debug.print(
+            '    forward (T) time = {wall_time:.2f} s',
+            wall_time=wall_time,
+            ordered=True,
+        )
 
 
 def _should_print_forward_t_energy(verbose_imp, profile_pass):
@@ -80,6 +86,16 @@ def _should_print_forward_t_energy(verbose_imp, profile_pass):
         return int(verbose_imp) < logger.NOTE
     except (TypeError, ValueError):
         return True
+
+
+def _should_print_t_timing(verbose_imp, mol_verbose):
+    for value in (mol_verbose, verbose_imp):
+        try:
+            if int(value) >= logger.INFO:
+                return True
+        except (TypeError, ValueError):
+            pass
+    return False
 
 
 def _mf_supports_impurity_solve_wrap(mf):
@@ -110,7 +126,7 @@ def _is_zero_cot(x):
 #
 # After ``transform_df_to_mo`` returns the global Lpq tensor (shape
 # ``(naux, nmo, nmo)``), this function builds the standard chemistry-eris
-# attributes (Lov, Lvv, oooo, ovoo, ovov, oovv) via reshapes + matmuls.
+# attributes (Loo, Lov, Lvv, oooo, ovoo, ovov, oovv) via reshapes + matmuls.
 # Those intermediates are otherwise transparent to the JAX trace and bloat
 # the recorded jaxpr by ~500 MB at the LNO impurity fragment scale.
 #
@@ -166,7 +182,7 @@ def _build_eris_tensors_from_Lpq(Lpq, nocc):
     oovv_packed = np.dot(Loo.T, Lvv)
     oovv = lib.unpack_tril(oovv_packed).reshape(nocc, nocc, nvir, nvir)
 
-    return Lov_resh, Lvv, oooo, ovoo, ovov, oovv
+    return Loo.reshape(naux, nocc, nocc), Lov_resh, Lvv, oooo, ovoo, ovov, oovv
 
 
 def _build_eris_tensors_from_Lpq_fwd(Lpq, nocc):
@@ -184,20 +200,22 @@ def _build_eris_tensors_from_Lpq_fwd(Lpq, nocc):
     oovv_packed = np.dot(Loo.T, Lvv)
     oovv = lib.unpack_tril(oovv_packed).reshape(nocc, nocc, nvir, nvir)
 
-    return ((Lov_resh, Lvv, oooo, ovoo, ovov, oovv),
+    return ((Loo.reshape(naux, nocc, nocc), Lov_resh, Lvv, oooo, ovoo, ovov, oovv),
             (Loo, Lov_flat, Lvv, naux, nvir))
 
 
 def _build_eris_tensors_from_Lpq_bwd(nocc, res, cotangents):
     Loo, Lov_flat, Lvv, naux, nvir = res
     dtype = Loo.dtype
-    bar_Lov_resh, bar_Lvv, bar_oooo, bar_ovoo, bar_ovov, bar_oovv = cotangents
+    bar_Loo_resh, bar_Lov_resh, bar_Lvv, bar_oooo, bar_ovoo, bar_ovov, bar_oovv = cotangents
 
     # Aggregate bar contributions to the L-form tensors.
     bar_Loo = np.zeros_like(Loo)
     bar_Lov_flat = np.zeros_like(Lov_flat)
     bar_Lvv_packed = np.zeros_like(Lvv)
 
+    if not _is_zero_cot(bar_Loo_resh):
+        bar_Loo = bar_Loo + bar_Loo_resh.reshape(naux, -1)
     if not _is_zero_cot(bar_Lov_resh):
         bar_Lov_flat = bar_Lov_flat + bar_Lov_resh.reshape(naux, -1)
     if not _is_zero_cot(bar_Lvv):
@@ -296,9 +314,10 @@ def _make_df_eris_incore(cc, mo_coeff=None, fockao=None):
     if _USE_CUSTOM_VJP_AO2MO_DF_ERIS:
         # Single custom_vjp boundary hides Loo/Lov/Lvv + matmul outputs from
         # the outer LNO replay's recorded jaxpr.
-        Lov_r, Lvv, oooo, ovoo, ovov, oovv = _build_eris_tensors_from_Lpq(
+        Loo, Lov_r, Lvv, oooo, ovoo, ovov, oovv = _build_eris_tensors_from_Lpq(
             Lpq, int(nocc),
         )
+        eris.Loo = Loo
         eris.Lov = Lov_r
         eris.Lvv = Lvv
         eris.oooo = oooo
@@ -310,6 +329,7 @@ def _make_df_eris_incore(cc, mo_coeff=None, fockao=None):
         naux = Lpq.shape[0]
         Loo = Lpq[:, :nocc, :nocc].reshape(naux, -1)
         Lov = Lpq[:, :nocc, nocc:].reshape(naux, -1)
+        eris.Loo = Loo.reshape(naux, nocc, nocc)
         eris.Lov = Lov.reshape(naux, nocc, nvir)
         eris.Lvv = Lvv = lib.pack_tril(Lpq[:, nocc:, nocc:])
         eris.oooo = np.dot(Loo.T, Loo).reshape(nocc, nocc, nocc, nocc)
@@ -329,12 +349,7 @@ def _make_df_eris_incore(cc, mo_coeff=None, fockao=None):
 def impurity_solve(mf, mo_coeff, lo_coeff, eris=None, frozen=None,
                    frag_prescreen=None,
                    verbose_imp=0, ccsd_t=False, dcsd=False,
-                   profile_info=None, profile_pass=None,
-                   ccsd_t_use_lt=False,
-                   ccsd_t_lt_nlap=ccsd_t_mod.LT_NLAP,
-                   ccsd_t_lt_quadrature=ccsd_t_mod.LT_QUADRATURE,
-                   ccsd_t_lt_fit_ratio=ccsd_t_mod.LT_FIT_RATIO,
-                   ccsd_t_lt_fit_tol=ccsd_t_mod.LT_FIT_TOL):
+                   profile_info=None, profile_pass=None):
     r'''Solve impurity problem and calculate local correlation energy.
 
     Args:
@@ -362,19 +377,12 @@ def impurity_solve(mf, mo_coeff, lo_coeff, eris=None, frozen=None,
         return _impurity_solve_jax(
             mf, mo_coeff, lo_coeff, eris.fock, eris.s1e, frag_prescreen,
             frozen, verbose_imp, ccsd_t, dcsd, profile_info, profile_pass,
-            ccsd_t_use_lt, ccsd_t_lt_nlap, ccsd_t_lt_quadrature,
-            ccsd_t_lt_fit_ratio, ccsd_t_lt_fit_tol,
         )
     return _impurity_solve_core(
         mf, mo_coeff, lo_coeff, eris.fock, eris.s1e,
         frozen=frozen, frag_prescreen=frag_prescreen,
         verbose_imp=verbose_imp, ccsd_t=ccsd_t, dcsd=dcsd,
         profile_info=profile_info, profile_pass=profile_pass,
-        ccsd_t_use_lt=ccsd_t_use_lt,
-        ccsd_t_lt_nlap=ccsd_t_lt_nlap,
-        ccsd_t_lt_quadrature=ccsd_t_lt_quadrature,
-        ccsd_t_lt_fit_ratio=ccsd_t_lt_fit_ratio,
-        ccsd_t_lt_fit_tol=ccsd_t_lt_fit_tol,
     )
 
 
@@ -399,50 +407,33 @@ def impurity_solve(mf, mo_coeff, lo_coeff, eris=None, frozen=None,
 # forward already filled in.
 # ---------------------------------------------------------------------------
 
-@partial(jax.custom_vjp, nondiff_argnums=(6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16))
+@partial(jax.custom_vjp, nondiff_argnums=(6, 7, 8, 9, 10, 11))
 def _impurity_solve_jax(mf, mo_coeff, lo_coeff, fock, s1e, frag_prescreen,
                         frozen, verbose_imp, ccsd_t, dcsd,
-                        profile_info, profile_pass, ccsd_t_use_lt,
-                        ccsd_t_lt_nlap, ccsd_t_lt_quadrature,
-                        ccsd_t_lt_fit_ratio, ccsd_t_lt_fit_tol):
+                        profile_info, profile_pass):
     return _impurity_solve_core(
         mf, mo_coeff, lo_coeff, fock, s1e,
         frozen=frozen, frag_prescreen=frag_prescreen,
         verbose_imp=verbose_imp, ccsd_t=ccsd_t, dcsd=dcsd,
         profile_info=profile_info, profile_pass=profile_pass,
-        ccsd_t_use_lt=ccsd_t_use_lt,
-        ccsd_t_lt_nlap=ccsd_t_lt_nlap,
-        ccsd_t_lt_quadrature=ccsd_t_lt_quadrature,
-        ccsd_t_lt_fit_ratio=ccsd_t_lt_fit_ratio,
-        ccsd_t_lt_fit_tol=ccsd_t_lt_fit_tol,
     )
 
 
 def _impurity_solve_jax_fwd(mf, mo_coeff, lo_coeff, fock, s1e, frag_prescreen,
                             frozen, verbose_imp, ccsd_t, dcsd,
-                            profile_info, profile_pass, ccsd_t_use_lt,
-                            ccsd_t_lt_nlap, ccsd_t_lt_quadrature,
-                            ccsd_t_lt_fit_ratio, ccsd_t_lt_fit_tol):
+                            profile_info, profile_pass):
     out = _impurity_solve_core(
         mf, mo_coeff, lo_coeff, fock, s1e,
         frozen=frozen, frag_prescreen=frag_prescreen,
         verbose_imp=verbose_imp, ccsd_t=ccsd_t, dcsd=dcsd,
         profile_info=profile_info, profile_pass=profile_pass,
-        ccsd_t_use_lt=ccsd_t_use_lt,
-        ccsd_t_lt_nlap=ccsd_t_lt_nlap,
-        ccsd_t_lt_quadrature=ccsd_t_lt_quadrature,
-        ccsd_t_lt_fit_ratio=ccsd_t_lt_fit_ratio,
-        ccsd_t_lt_fit_tol=ccsd_t_lt_fit_tol,
     )
     res = (mf, mo_coeff, lo_coeff, fock, s1e, frag_prescreen)
     return out, res
 
 
 def _impurity_solve_jax_bwd(frozen, verbose_imp, ccsd_t, dcsd,
-                            profile_info, profile_pass, ccsd_t_use_lt,
-                            ccsd_t_lt_nlap, ccsd_t_lt_quadrature,
-                            ccsd_t_lt_fit_ratio, ccsd_t_lt_fit_tol,
-                            res, ybar):
+                            profile_info, profile_pass, res, ybar):
     mf, mo_coeff, lo_coeff, fock, s1e, frag_prescreen = res
 
     def fn(mf_, mo_coeff_, lo_coeff_, fock_, s1e_, frag_prescreen_):
@@ -451,11 +442,6 @@ def _impurity_solve_jax_bwd(frozen, verbose_imp, ccsd_t, dcsd,
             frozen=frozen, frag_prescreen=frag_prescreen_,
             verbose_imp=verbose_imp, ccsd_t=ccsd_t, dcsd=dcsd,
             profile_info=None, profile_pass=profile_pass,
-            ccsd_t_use_lt=ccsd_t_use_lt,
-            ccsd_t_lt_nlap=ccsd_t_lt_nlap,
-            ccsd_t_lt_quadrature=ccsd_t_lt_quadrature,
-            ccsd_t_lt_fit_ratio=ccsd_t_lt_fit_ratio,
-            ccsd_t_lt_fit_tol=ccsd_t_lt_fit_tol,
         )
 
     _, vjp_fn = jax.vjp(fn, mf, mo_coeff, lo_coeff, fock, s1e, frag_prescreen)
@@ -468,12 +454,7 @@ _impurity_solve_jax.defvjp(_impurity_solve_jax_fwd, _impurity_solve_jax_bwd)
 def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
                          frag_prescreen=None,
                          verbose_imp=0, ccsd_t=False, dcsd=False,
-                         profile_info=None, profile_pass=None,
-                         ccsd_t_use_lt=False,
-                         ccsd_t_lt_nlap=ccsd_t_mod.LT_NLAP,
-                         ccsd_t_lt_quadrature=ccsd_t_mod.LT_QUADRATURE,
-                         ccsd_t_lt_fit_ratio=ccsd_t_mod.LT_FIT_RATIO,
-                         ccsd_t_lt_fit_tol=ccsd_t_mod.LT_FIT_TOL):
+                         profile_info=None, profile_pass=None):
     '''Numerical core of :func:`impurity_solve`; see that function for docs.
 
     Takes ``fock`` and ``s1e`` directly (rather than the parent ``eris``
@@ -514,11 +495,9 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
     mcc._domain_atmlst = None if frag_prescreen is None else frag_prescreen.get('extended_primary_domain')
     mcc.e_hf = mf.e_tot  #avoid MP2 recompute e_hf
     mcc.profile_pass = profile_pass
-    mcc.ccsd_t_use_lt = ccsd_t_use_lt
-    mcc.ccsd_t_lt_nlap = ccsd_t_lt_nlap
-    mcc.ccsd_t_lt_quadrature = ccsd_t_lt_quadrature
-    mcc.ccsd_t_lt_fit_ratio = ccsd_t_lt_fit_ratio
-    mcc.ccsd_t_lt_fit_tol = ccsd_t_lt_fit_tol
+    mcc.lno_ccsd_t_timing = _should_print_t_timing(
+        verbose_imp, getattr(getattr(mf, 'mol', None), 'verbose', 0),
+    )
     total_start = time.perf_counter()
     phase_start = time.perf_counter()
     imp_eris = mcc.ao2mo(fockao=fock)
@@ -546,9 +525,11 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
         #elcorr_cc_t = gccsd_t.kernel(mcc, prjlo, t1=t1, t2=t2)
         phase_start = time.perf_counter()
         elcorr_cc_t = ccsd_t_mod.kernel(mcc, imp_eris, prjlo, t1=t1, t2=t2, verbose=verbose_imp)
-        if _should_print_forward_t_energy(verbose_imp, profile_pass):
-            _print_forward_t_energy(elcorr_cc_t)
         phase_times['triples_s'] = time.perf_counter() - phase_start
+        if (profile_pass != 'backward replay' and
+                (_should_print_forward_t_energy(verbose_imp, profile_pass) or
+                 mcc.lno_ccsd_t_timing)):
+            _print_forward_t_energy(elcorr_cc_t, phase_times['triples_s'])
     else:
         elcorr_cc_t = 0.
         phase_times['triples_s'] = 0.0
@@ -785,11 +766,6 @@ class LNOCCSD(lno_base.LNO):
         self.efrag_cc_t = None
         self.ccsd_t = False
         self.dcsd = False
-        self.ccsd_t_use_lt = False
-        self.ccsd_t_lt_nlap = ccsd_t_mod.LT_NLAP
-        self.ccsd_t_lt_quadrature = ccsd_t_mod.LT_QUADRATURE
-        self.ccsd_t_lt_fit_ratio = ccsd_t_mod.LT_FIT_RATIO
-        self.ccsd_t_lt_fit_tol = ccsd_t_mod.LT_FIT_TOL
 
     def impurity_solve(self, mf, mo_coeff, lo_coeff, eris=None, frozen=None,
                        frag_prescreen=None, profile_info=None):
@@ -797,12 +773,7 @@ class LNOCCSD(lno_base.LNO):
                               frag_prescreen=frag_prescreen,
                               verbose_imp=self.verbose_imp, ccsd_t=self.ccsd_t,
                               dcsd=self.dcsd, profile_info=profile_info,
-                              profile_pass=getattr(self, 'profile_pass', None),
-                              ccsd_t_use_lt=self.ccsd_t_use_lt,
-                              ccsd_t_lt_nlap=self.ccsd_t_lt_nlap,
-                              ccsd_t_lt_quadrature=self.ccsd_t_lt_quadrature,
-                              ccsd_t_lt_fit_ratio=self.ccsd_t_lt_fit_ratio,
-                              ccsd_t_lt_fit_tol=self.ccsd_t_lt_fit_tol)
+                              profile_pass=getattr(self, 'profile_pass', None))
 
     def _post_proc(self, frag_res, frag_wghtlist):
         ''' Post processing results returned by ``impurity_solve`` collected in ``frag_res``.

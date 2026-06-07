@@ -96,6 +96,31 @@ endif()
 option(ENABLE_OPENMP "Compiling C extensions with openmp" ON)
 set(OPENMP_C_PROPERTIES "")
 if(ENABLE_OPENMP)
+  if(APPLE)
+    set(_pyscfad_openmp_roots
+        "$ENV{OpenMP_ROOT}"
+        "/opt/homebrew/opt/libomp"
+        "/usr/local/opt/libomp")
+    foreach(_pyscfad_openmp_root IN LISTS _pyscfad_openmp_roots)
+      if(_pyscfad_openmp_root
+         AND EXISTS "${_pyscfad_openmp_root}/include/omp.h"
+         AND EXISTS "${_pyscfad_openmp_root}/lib/libomp.dylib")
+        set(OpenMP_C_FLAGS
+            "-Xpreprocessor -fopenmp -I${_pyscfad_openmp_root}/include"
+            CACHE STRING "OpenMP C flags")
+        set(OpenMP_CXX_FLAGS
+            "-Xpreprocessor -fopenmp -I${_pyscfad_openmp_root}/include"
+            CACHE STRING "OpenMP CXX flags")
+        set(OpenMP_C_LIB_NAMES "omp" CACHE STRING "OpenMP C library names")
+        set(OpenMP_CXX_LIB_NAMES "omp" CACHE STRING "OpenMP CXX library names")
+        set(OpenMP_omp_LIBRARY "${_pyscfad_openmp_root}/lib/libomp.dylib"
+            CACHE FILEPATH "OpenMP runtime library")
+        break()
+      endif()
+    endforeach()
+    unset(_pyscfad_openmp_root)
+    unset(_pyscfad_openmp_roots)
+  endif()
   find_package(OpenMP)
   if(OPENMP_FOUND)
     set(HAVE_OPENMP 1)

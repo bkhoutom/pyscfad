@@ -17,11 +17,11 @@
 
 import ctypes
 import os
+import time
 from functools import partial
 import numpy
 from jax import custom_vjp
 
-from pyscf import __config__
 from pyscf.lib import (
     logger,
     prange,
@@ -31,13 +31,29 @@ from pyscf.lib import (
 )
 
 from pyscfad import numpy as np
-from pyscfad.mp import ltdfmp2
 from pyscfadlib import libcc_vjp as libcc
 
-LT_NLAP = getattr(__config__, 'lno_ccsd_t_lt_nlap', 'auto')
-LT_QUADRATURE = getattr(__config__, 'lno_ccsd_t_lt_quadrature', 'fit')
-LT_FIT_RATIO = getattr(__config__, 'lno_ccsd_t_lt_fit_ratio', None)
-LT_FIT_TOL = getattr(__config__, 'lno_ccsd_t_lt_fit_tol', 1e-5)
+
+def _profile_enabled():
+    value = os.environ.get('PYSCFAD_LNO_CCSD_T_PROFILE', '')
+    return value.lower() not in ('', '0', 'false', 'no', 'off')
+
+
+def _profile_start(label, nocc, nvir, enabled=False):
+    if not (enabled or _profile_enabled()):
+        return None
+    fields = [f'nocc={nocc}', f'nvir={nvir}']
+    print(f'    {label}: start ({", ".join(fields)})',
+          flush=True)
+    return time.perf_counter()
+
+
+def _profile_done(label, t0):
+    if t0 is None:
+        return
+    print(f'    {label}: done in {time.perf_counter() - t0:.2f} s',
+          flush=True)
+
 
 def kernel(mycc, eris, ulo, t1=None, t2=None, verbose=logger.NOTE):
     log = logger.new_logger(mycc, verbose)
@@ -45,6 +61,7 @@ def kernel(mycc, eris, ulo, t1=None, t2=None, verbose=logger.NOTE):
         t1 = mycc.t1
     if t2 is None:
         t2 = mycc.t2
+    profile_timing = bool(getattr(mycc, 'lno_ccsd_t_timing', False))
 
     mat = np.dot(ulo.T, ulo)
     assert mat.shape[0] == t1.shape[0]
@@ -62,26 +79,14 @@ def kernel(mycc, eris, ulo, t1=None, t2=None, verbose=logger.NOTE):
         eris.get_ovvv_packed() if eris.ovvv is None else eris.ovvv
     )
 
-    if getattr(mycc, 'ccsd_t_use_lt', False):
-        energy_fn = (
-            _ccsd_t_energy_lt_projected_lazy
-            if getattr(mycc, 'profile_pass', None) == 'backward replay'
-            else _ccsd_t_energy_lt_projected
-        )
-        et = energy_fn(
-            ulo, t1T, t2T, mo_energy, fvo, ovoo, ovov, ovvv,
-            mycc.max_memory,
-            nlap=getattr(mycc, 'ccsd_t_lt_nlap', LT_NLAP),
-            quadrature=getattr(mycc, 'ccsd_t_lt_quadrature', LT_QUADRATURE),
-            fit_ratio=getattr(mycc, 'ccsd_t_lt_fit_ratio', LT_FIT_RATIO),
-            fit_tol=getattr(mycc, 'ccsd_t_lt_fit_tol', LT_FIT_TOL),
-        )
-    elif getattr(mycc, 'profile_pass', None) == 'backward replay':
+    if getattr(mycc, 'profile_pass', None) == 'backward replay':
         et = _ccsd_t_energy_lazy(mat, t1T, t2T, mo_energy, fvo,
-                                 ovoo, ovov, ovvv, mycc.max_memory)
+                                 ovoo, ovov, ovvv, mycc.max_memory,
+                                 profile_timing)
     else:
         et = _ccsd_t_energy(mat, t1T, t2T, mo_energy, fvo,
-                            ovoo, ovov, ovvv, mycc.max_memory)
+                            ovoo, ovov, ovvv, mycc.max_memory,
+                            profile_timing)
 
     log.timer('CCSD(T)')
     log.note('CCSD(T) correction = %.15g', et)
@@ -133,11 +138,13 @@ def _ccsd_t_forward_block_nvir(nocc, nvir, max_memory):
     block_from_target = int(block_mb * 1024.0**2 / 8 // job_doubles_per_a)
     return max(1, min(nvir, block_from_memory, max(1, block_from_target)))
 
-@partial(custom_vjp, nondiff_argnums=(8,))
+@partial(custom_vjp, nondiff_argnums=(8, 9))
 def _ccsd_t_energy(mat, t1T, t2T, mo_energy, fvo,
-                   ovoo, ovov, ovvv, max_memory):
+                   ovoo, ovov, ovvv, max_memory, profile_timing=False):
+    del profile_timing
     nvir, nocc = t1T.shape
     nmo = nocc + nvir
+    profile_t0 = _profile_start('forward (T)', nocc, nvir)
 
     mat = numpy.asarray(mat, order='C')
     t1T = numpy.asarray(t1T, order='C')
@@ -174,298 +181,23 @@ def _ccsd_t_energy(mat, t1T, t2T, mo_energy, fvo,
 
     et_sum *= 2. / 3.
     et = et_sum[0].real
+    _profile_done('forward (T)', profile_t0)
     return et
 
 
-def _ccsd_t_laplace_quadrature(mo_energy, nocc, nlap=LT_NLAP,
-                               quadrature=LT_QUADRATURE,
-                               fit_ratio=LT_FIT_RATIO,
-                               fit_tol=LT_FIT_TOL):
-    mo_energy = numpy.asarray(mo_energy)
-    eo = mo_energy[:nocc]
-    ev = mo_energy[nocc:]
-    dmin = 3.0 * (numpy.min(ev) - numpy.max(eo))
-    dmax = 3.0 * (numpy.max(ev) - numpy.min(eo))
-    if dmin <= 0:
-        raise ValueError('CCSD(T) LT denominators require positive gaps.')
-    if quadrature == 'fit':
-        t, w = ltdfmp2.fitted_laplace_quadrature(
-            dmin, dmax, n=nlap, fit_ratio=fit_ratio, fit_tol=fit_tol
-        )
-    elif quadrature == 'logtrap':
-        t, w = ltdfmp2.laplace_quadrature(dmin, dmax, n=nlap)
-    else:
-        raise ValueError(f'Unknown CCSD(T) LT quadrature: {quadrature}')
-    return numpy.asarray(t, order='C'), numpy.asarray(w, order='C')
-
-
-@partial(custom_vjp, nondiff_argnums=(8, 9, 10, 11, 12))
-def _ccsd_t_energy_lt_projected(ulo, t1T, t2T, mo_energy, fvo,
-                                ovoo, ovov, ovvv, max_memory,
-                                nlap=LT_NLAP, quadrature=LT_QUADRATURE,
-                                fit_ratio=LT_FIT_RATIO,
-                                fit_tol=LT_FIT_TOL):
-    if not hasattr(libcc, 'lnoccsdt_contract_lt_ulo'):
-        raise NotImplementedError(
-            'The installed libcc_vjp does not provide lnoccsdt_contract_lt_ulo.'
-        )
-
-    nvir, nocc = t1T.shape
-    nmo = nocc + nvir
-
-    ulo = numpy.asarray(ulo, order='C')
-    nlo = ulo.shape[0]
-    if ulo.shape[1] != nocc:
-        raise ValueError('ulo must have shape (nlo, nocc).')
-
-    t_lap, w_lap = _ccsd_t_laplace_quadrature(
-        mo_energy, nocc, nlap=nlap, quadrature=quadrature,
-        fit_ratio=fit_ratio, fit_tol=fit_tol,
-    )
-    nlap = int(t_lap.size)
-
-    t1T = numpy.asarray(t1T, order='C')
-    t2T = numpy.asarray(t2T, order='C')
-    mo_energy = numpy.asarray(mo_energy, order='C')
-    fvo = numpy.asarray(fvo, order='C')
-
-    vooo = numpy.asarray(ovoo).conj().transpose(1, 0, 3, 2)
-    vooo = numpy.asarray(vooo, order='C')
-
-    vvop = numpy.empty((nvir, nvir, nocc, nmo))
-    _fill_vvop(vvop, ovov, ovvv, nocc, nvir)
-    vvop = numpy.asarray(vvop, order='C')
-
-    drv = libcc.lnoccsdt_contract_lt_ulo
-    et_sum = numpy.zeros(1, dtype=float)
-
-    def contract(a0, a1, cache):
-        drv(et_sum.ctypes.data_as(ctypes.c_void_p),
-            ulo.ctypes.data_as(ctypes.c_void_p),
-            ctypes.c_int(nlo),
-            t_lap.ctypes.data_as(ctypes.c_void_p),
-            w_lap.ctypes.data_as(ctypes.c_void_p),
-            ctypes.c_int(nlap),
-            mo_energy.ctypes.data_as(ctypes.c_void_p),
-            t1T.ctypes.data_as(ctypes.c_void_p),
-            t2T.ctypes.data_as(ctypes.c_void_p),
-            vooo.ctypes.data_as(ctypes.c_void_p),
-            fvo.ctypes.data_as(ctypes.c_void_p),
-            ctypes.c_int(nocc),
-            ctypes.c_int(nvir),
-            ctypes.c_int(a0),
-            ctypes.c_int(a1),
-            cache.ctypes.data_as(ctypes.c_void_p))
-
-    mem_now = current_memory()[0]
-    max_memory = max(0, max_memory - mem_now)
-    bufsize = _ccsd_t_forward_block_nvir(nocc, nvir, max_memory)
-    for a0, a1 in prange(0, nvir, bufsize):
-        contract(a0, a1, vvop)
-
-    et_sum *= 2. / 3.
-    return et_sum[0].real
-
-
-def _ccsd_t_energy_lt_projected_fwd(ulo, t1T, t2T, mo_energy, fvo,
-                                    ovoo, ovov, ovvv, max_memory,
-                                    nlap=LT_NLAP, quadrature=LT_QUADRATURE,
-                                    fit_ratio=LT_FIT_RATIO,
-                                    fit_tol=LT_FIT_TOL):
-    et = _ccsd_t_energy_lt_projected(
-        ulo, t1T, t2T, mo_energy, fvo, ovoo, ovov, ovvv, max_memory,
-        nlap=nlap, quadrature=quadrature, fit_ratio=fit_ratio,
-        fit_tol=fit_tol,
-    )
-    t_lap, w_lap = _ccsd_t_laplace_quadrature(
-        mo_energy, t1T.shape[1], nlap=nlap, quadrature=quadrature,
-        fit_ratio=fit_ratio, fit_tol=fit_tol,
-    )
-    res = (ulo, t1T, t2T, mo_energy, fvo, ovoo, ovov, ovvv, t_lap, w_lap)
-    return et, res
-
-
-def _ccsd_t_energy_lt_projected_bwd(max_memory, nlap, quadrature, fit_ratio,
-                                    fit_tol, res, et_bar):
-    del nlap, quadrature, fit_ratio, fit_tol
-    if not hasattr(libcc, 'lnoccsdt_energy_lt_ulo_vjp'):
-        raise NotImplementedError(
-            'The installed libcc_vjp does not provide '
-            'lnoccsdt_energy_lt_ulo_vjp.'
-        )
-
-    ulo, t1T, t2T, mo_energy, fvo, ovoo, ovov, ovvv, t_lap, w_lap = res
-
-    nvir, nocc = t1T.shape
-    nmo = nocc + nvir
-
-    et_bar *= 2. / 3.
-
-    ulo = numpy.asarray(ulo, order='C')
-    nlo = ulo.shape[0]
-    ulo_bar = numpy.zeros_like(ulo)
-
-    t_lap = numpy.asarray(t_lap, order='C')
-    w_lap = numpy.asarray(w_lap, order='C')
-    nlap = int(t_lap.size)
-
-    t1T = numpy.asarray(t1T, order='C')
-    t1T_bar = numpy.zeros_like(t1T)
-    t2T = numpy.asarray(t2T, order='C')
-    t2T_bar = numpy.zeros_like(t2T)
-
-    mo_energy = numpy.asarray(mo_energy, order='C')
-    mo_energy_bar = numpy.zeros_like(mo_energy)
-    fvo = numpy.asarray(fvo, order='C')
-    fvo_bar = numpy.zeros_like(fvo)
-
-    vooo = numpy.asarray(ovoo).conj().transpose(1, 0, 3, 2)
-    vooo = numpy.asarray(vooo, order='C')
-    vooo_bar = numpy.zeros_like(vooo)
-
-    vvop = numpy.empty((nvir, nvir, nocc, nmo))
-    _fill_vvop(vvop, ovov, ovvv, nocc, nvir)
-    vvop = numpy.asarray(vvop, order='C')
-    vvop_bar = numpy.zeros_like(vvop)
-
-    drv = libcc.lnoccsdt_energy_lt_ulo_vjp
-
-    def contract(a0, a1, b0, b1, cache, cache_bar):
-        cache_row_a, cache_col_a, cache_row_b, cache_col_b = cache
-        cache_row_a_bar, cache_col_a_bar, cache_row_b_bar, cache_col_b_bar = cache_bar
-        drv(ulo.ctypes.data_as(ctypes.c_void_p),
-            ctypes.c_int(nlo),
-            t_lap.ctypes.data_as(ctypes.c_void_p),
-            w_lap.ctypes.data_as(ctypes.c_void_p),
-            ctypes.c_int(nlap),
-            mo_energy.ctypes.data_as(ctypes.c_void_p),
-            t1T.ctypes.data_as(ctypes.c_void_p),
-            t2T.ctypes.data_as(ctypes.c_void_p),
-            vooo.ctypes.data_as(ctypes.c_void_p),
-            fvo.ctypes.data_as(ctypes.c_void_p),
-            ctypes.c_double(et_bar),
-            ctypes.c_int(nocc), ctypes.c_int(nvir),
-            ctypes.c_int(a0), ctypes.c_int(a1),
-            ctypes.c_int(b0), ctypes.c_int(b1),
-            cache_row_a.ctypes.data_as(ctypes.c_void_p),
-            cache_col_a.ctypes.data_as(ctypes.c_void_p),
-            cache_row_b.ctypes.data_as(ctypes.c_void_p),
-            cache_col_b.ctypes.data_as(ctypes.c_void_p),
-            ulo_bar.ctypes.data_as(ctypes.c_void_p),
-            mo_energy_bar.ctypes.data_as(ctypes.c_void_p),
-            t1T_bar.ctypes.data_as(ctypes.c_void_p),
-            t2T_bar.ctypes.data_as(ctypes.c_void_p),
-            vooo_bar.ctypes.data_as(ctypes.c_void_p),
-            fvo_bar.ctypes.data_as(ctypes.c_void_p),
-            cache_row_a_bar.ctypes.data_as(ctypes.c_void_p),
-            cache_col_a_bar.ctypes.data_as(ctypes.c_void_p),
-            cache_row_b_bar.ctypes.data_as(ctypes.c_void_p),
-            cache_col_b_bar.ctypes.data_as(ctypes.c_void_p))
-
-    mem_now = current_memory()[0]
-    max_memory = max(0, max_memory - mem_now)
-
-    min_memory = nocc**3*3 + nvir*nocc*2
-    min_memory += (
-        nmo*(nocc+1) + nvir*nocc*(nvir*nocc+1)
-        + (nvir+8)*nocc**3 + nlo*nocc + 2*nocc**2 + nocc + 2
-    ) * (num_threads()-1)
-    min_memory *= 8./1e6
-    bufsize = (max_memory - min_memory)*1e6/8/num_threads()/(nocc*nmo*nvir+nvir)/2
-    bufsize *= .8
-    bufsize = int(max(8, bufsize))
-
-    for a0, a1 in reversed(list(prange(0, nvir, bufsize))):
-        full_vvop_block = (a0, a1) == (0, nvir)
-        cache_row_a = numpy.asarray(vvop[a0:a1, :], order='C')
-        if full_vvop_block:
-            cache_row_a_bar = vvop_bar
-            cache_col_a = cache_row_a
-            cache_col_a_bar = cache_row_a_bar
-        else:
-            cache_row_a_bar = numpy.zeros_like(cache_row_a)
-            cache_col_a = numpy.asarray(vvop[:, a0:a1], order='C')
-            cache_col_a_bar = numpy.zeros_like(cache_col_a)
-        contract(a0, a1, a0, a1,
-                (cache_row_a, cache_col_a, cache_row_a, cache_col_a),
-                (cache_row_a_bar, cache_col_a_bar, cache_row_a_bar, cache_col_a_bar))
-
-        for b0, b1 in prange(0, a0, bufsize//4):
-            cache_row_b = numpy.asarray(vvop[b0:b1, :], order='C')
-            cache_row_b_bar = numpy.zeros_like(cache_row_b)
-            cache_col_b = numpy.asarray(vvop[:, b0:b1], order='C')
-            cache_col_b_bar = numpy.zeros_like(cache_col_b)
-            contract(a0, a1, b0, b1,
-                    (cache_row_a, cache_col_a, cache_row_b, cache_col_b),
-                    (cache_row_a_bar, cache_col_a_bar,
-                     cache_row_b_bar, cache_col_b_bar))
-
-            vvop_bar[b0:b1, :] += cache_row_b_bar
-            vvop_bar[:, b0:b1] += cache_col_b_bar
-
-        if not full_vvop_block:
-            vvop_bar[a0:a1, :] += cache_row_a_bar
-            vvop_bar[:, a0:a1] += cache_col_a_bar
-
-    ovoo_bar = numpy.asarray(vooo_bar.transpose(1, 0, 3, 2))
-    ovov_bar = numpy.asarray(vvop_bar[:, :, :, :nocc].transpose(2, 0, 3, 1))
-    ovvv_bar = vvop_bar[:, :, :, nocc:].transpose(2, 0, 3, 1)
-    ovvv_bar += ovvv_bar.transpose(0, 1, 3, 2)
-    idx, idy = numpy.diag_indices(nvir)
-    ovvv_bar[:, :, idx, idy] *= .5
-    idx, idy = numpy.tril_indices(nvir)
-    ovvv_tril_bar = numpy.asarray(ovvv_bar[:, :, idx, idy])
-
-    return (ulo_bar, t1T_bar, t2T_bar, mo_energy_bar,
-            fvo_bar, ovoo_bar, ovov_bar, ovvv_tril_bar)
-
-
-_ccsd_t_energy_lt_projected.defvjp(
-    _ccsd_t_energy_lt_projected_fwd,
-    _ccsd_t_energy_lt_projected_bwd,
-)
-
-
-@partial(custom_vjp, nondiff_argnums=(8, 9, 10, 11, 12))
-def _ccsd_t_energy_lt_projected_lazy(ulo, t1T, t2T, mo_energy, fvo,
-                                     ovoo, ovov, ovvv, max_memory,
-                                     nlap=LT_NLAP, quadrature=LT_QUADRATURE,
-                                     fit_ratio=LT_FIT_RATIO,
-                                     fit_tol=LT_FIT_TOL):
-    return numpy.zeros((), dtype=t1T.dtype)
-
-
-def _ccsd_t_energy_lt_projected_lazy_fwd(ulo, t1T, t2T, mo_energy, fvo,
-                                         ovoo, ovov, ovvv, max_memory,
-                                         nlap=LT_NLAP, quadrature=LT_QUADRATURE,
-                                         fit_ratio=LT_FIT_RATIO,
-                                         fit_tol=LT_FIT_TOL):
-    et = numpy.zeros((), dtype=t1T.dtype)
-    t_lap, w_lap = _ccsd_t_laplace_quadrature(
-        mo_energy, t1T.shape[1], nlap=nlap, quadrature=quadrature,
-        fit_ratio=fit_ratio, fit_tol=fit_tol,
-    )
-    res = (ulo, t1T, t2T, mo_energy, fvo, ovoo, ovov, ovvv, t_lap, w_lap)
-    return et, res
-
-
-_ccsd_t_energy_lt_projected_lazy.defvjp(
-    _ccsd_t_energy_lt_projected_lazy_fwd,
-    _ccsd_t_energy_lt_projected_bwd,
-)
-
-
 def _ccsd_t_energy_fwd(mat, t1T, t2T, mo_energy, fvo,
-                       ovoo, ovov, ovvv, max_memory):
+                       ovoo, ovov, ovvv, max_memory, profile_timing=False):
     et = _ccsd_t_energy(mat, t1T, t2T, mo_energy, fvo,
-                        ovoo, ovov, ovvv, max_memory)
+                        ovoo, ovov, ovvv, max_memory, profile_timing)
     return et, (mat, t1T, t2T, mo_energy, fvo, ovoo, ovov, ovvv)
 
-def _ccsd_t_energy_bwd(max_memory, res, et_bar):
+def _ccsd_t_energy_bwd(max_memory, profile_timing, res, et_bar):
     mat, t1T, t2T, mo_energy, fvo, ovoo, ovov, ovvv = res
 
     nvir, nocc = t1T.shape
     nmo = nocc + nvir
+    profile_t0 = _profile_start('backward (T)', nocc, nvir,
+                                enabled=profile_timing)
 
     et_bar *= 2. / 3.
 
@@ -570,14 +302,16 @@ def _ccsd_t_energy_bwd(max_memory, res, et_bar):
     idx, idy = numpy.tril_indices(nvir)
     ovvv_tril_bar = numpy.asarray(ovvv_bar[:,:,idx,idy])
 
+    _profile_done('backward (T)', profile_t0)
     return mat_bar, t1T_bar, t2T_bar, mo_energy_bar, fvo_bar, ovoo_bar, ovov_bar, ovvv_tril_bar
 
 _ccsd_t_energy.defvjp(_ccsd_t_energy_fwd, _ccsd_t_energy_bwd)
 
 
-@partial(custom_vjp, nondiff_argnums=(8,))
+@partial(custom_vjp, nondiff_argnums=(8, 9))
 def _ccsd_t_energy_lazy(mat, t1T, t2T, mo_energy, fvo,
-                        ovoo, ovov, ovvv, max_memory):
+                        ovoo, ovov, ovvv, max_memory,
+                        profile_timing=False):
     """Backward-replay variant of :func:`_ccsd_t_energy`.
 
     The (T) forward contraction is skipped and a zero primal is returned;
@@ -586,11 +320,14 @@ def _ccsd_t_energy_lazy(mat, t1T, t2T, mo_energy, fvo,
     when the caller will discard the primal output (e.g. inside
     ``jax.vjp(frag_fn, ...)`` during DLNO replay).
     """
+    del profile_timing
     return numpy.zeros((), dtype=t1T.dtype)
 
 
 def _ccsd_t_energy_lazy_fwd(mat, t1T, t2T, mo_energy, fvo,
-                            ovoo, ovov, ovvv, max_memory):
+                            ovoo, ovov, ovvv, max_memory,
+                            profile_timing=False):
+    del profile_timing
     et = numpy.zeros((), dtype=t1T.dtype)
     return et, (mat, t1T, t2T, mo_energy, fvo, ovoo, ovov, ovvv)
 

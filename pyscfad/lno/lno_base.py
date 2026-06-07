@@ -22,6 +22,7 @@ from functools import partial, reduce
 import numpy
 import jax
 import jax.scipy.linalg as jsp_linalg
+from pyscf import __config__
 from pyscf.mp.mp2 import get_frozen_mask, get_nmo, get_nocc
 from pyscf import gto as pyscf_gto
 
@@ -58,6 +59,10 @@ COMPRESS_DEG_THRESH = 1e-12
 _FRAGMENT_PROFILE_ROWS = []
 _FRAGMENT_TABLE_HEADERS = set()
 _VJP_PROGRESS_PREFIX = ContextVar('pyscfad_lno_vjp_progress_prefix', default=None)
+DOMAIN_MP2_USE_LT = getattr(__config__, 'lno_domain_mp2_use_lt', True)
+DOMAIN_MP2_LT_NLAP = getattr(__config__, 'lno_domain_mp2_lt_nlap', 9)
+DOMAIN_MP2_LT_QUADRATURE = getattr(__config__, 'lno_domain_mp2_lt_quadrature', 'fit')
+DOMAIN_MP2_LT_FIT_RATIO = getattr(__config__, 'lno_domain_mp2_lt_fit_ratio', 64.0)
 
 
 @contextmanager
@@ -892,6 +897,36 @@ _mp2_fragment_energy_from_df_lov.defvjp(
 )
 
 
+def _mp2_fragment_energy_from_lt_projected_lov(
+        Lov, occ_coeff, vir_coeff, moe_occ, moe_vir, prjlo,
+        nlap=DOMAIN_MP2_LT_NLAP, quadrature=DOMAIN_MP2_LT_QUADRATURE,
+        fit_ratio=DOMAIN_MP2_LT_FIT_RATIO):
+    from pyscfad.mp import ltdfmp2
+
+    @jax.checkpoint
+    def _impl(Lov, occ_coeff, vir_coeff, moe_occ, moe_vir, prjlo):
+        nocc = occ_coeff.shape[1]
+        nvir = vir_coeff.shape[1]
+        if nocc == 0 or nvir == 0 or prjlo.shape[0] == 0:
+            return np.zeros((), dtype=Lov.dtype)
+
+        Lov_domain = np.einsum('ip,Lia,aq->Lpq', occ_coeff, Lov, vir_coeff)
+        mo_energy = np.concatenate((moe_occ, moe_vir))
+        emp2, _, _ = ltdfmp2._contract_laplace_projected_occ(
+            Lov_domain,
+            mo_energy,
+            prjlo.T,
+            nocc,
+            nvir,
+            nlap=nlap,
+            quadrature=quadrature,
+            fit_ratio=fit_ratio,
+        )
+        return np.sum(emp2)
+
+    return _impl(Lov, occ_coeff, vir_coeff, moe_occ, moe_vir, prjlo)
+
+
 def _domain_mp2_fragment_energy(mfcc, eris, orbfragloc,
                                 orbfragocc1, moefragocc1,
                                 orbfragvir1, moefragvir1,
@@ -992,6 +1027,15 @@ def _domain_mp2_fragment_energy(mfcc, eris, orbfragloc,
     # ---- Fragment-LO projector in the new canonical in-domain basis. ----
     occ_domain = np.dot(orbocc1, occ_coeff)
     prjlo = reduce(np.dot, (orbfragloc.T, s1e, occ_domain))
+    if getattr(mfcc, 'domain_mp2_use_lt', DOMAIN_MP2_USE_LT):
+        return _mp2_fragment_energy_from_lt_projected_lov(
+            eris.Lov, occ_coeff, vir_coeff, moe_occ, moe_vir, prjlo,
+            nlap=getattr(mfcc, 'domain_mp2_lt_nlap', DOMAIN_MP2_LT_NLAP),
+            quadrature=getattr(mfcc, 'domain_mp2_lt_quadrature',
+                               DOMAIN_MP2_LT_QUADRATURE),
+            fit_ratio=getattr(mfcc, 'domain_mp2_lt_fit_ratio',
+                              DOMAIN_MP2_LT_FIT_RATIO),
+        )
     return _mp2_fragment_energy_from_df_lov(
         eris.Lov, occ_coeff, vir_coeff, moe_occ, moe_vir, prjlo
     )
@@ -1864,6 +1908,10 @@ class LNO(pytree.PytreeNode):
         self.use_dlno_prescreen = False
         self.dlno_prescreen_data = None
         self.compute_domain_pt2 = False
+        self.domain_mp2_use_lt = DOMAIN_MP2_USE_LT
+        self.domain_mp2_lt_nlap = DOMAIN_MP2_LT_NLAP
+        self.domain_mp2_lt_quadrature = DOMAIN_MP2_LT_QUADRATURE
+        self.domain_mp2_lt_fit_ratio = DOMAIN_MP2_LT_FIT_RATIO
         self.profile_print = True
         self.profile_mpi_indices = None
         self.profile_mpi_nfrag = None

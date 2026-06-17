@@ -16,6 +16,8 @@
 
 from functools import lru_cache
 import ctypes
+import os
+import time
 
 import numpy
 import scipy.linalg
@@ -58,6 +60,16 @@ if _NR_E2_CDERI_BAR_NATIVE:
         ctypes.c_int,
     ]
     libao2mo_vjp.AO2MOnr_e2_cderi_bar_project_omp.restype = None
+
+
+def _profile_enabled():
+    value = os.environ.get('PYSCFAD_PROFILE_BACKWARD_PHASES')
+    return value is not None and value.strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _profile_msg(msg):
+    if _profile_enabled():
+        print(f'[profile][df.cderi_vjp] {msg}', flush=True)
 
 
 @lru_cache(maxsize=16)
@@ -600,6 +612,11 @@ def cholesky_eri_vjp_from_mo_coeff_ybar(mol, auxmol, cderi_source,
     ``cderi_bar[naux, nao_pair]``.  It is currently limited to the full AO
     basis; localized AO domains should keep using the block-function fallback.
     """
+    t_total = time.perf_counter()
+    _profile_msg(
+        'cholesky_eri_vjp_from_mo_coeff_ybar start '
+        f'orbs_slice={orbs_slice}'
+    )
     if aosym not in ('s2', 's2ij'):
         raise NotImplementedError(f'Only packed s2 CDERI is supported, got {aosym}.')
     if cderi_source is None:
@@ -628,6 +645,7 @@ def cholesky_eri_vjp_from_mo_coeff_ybar(mol, auxmol, cderi_source,
         if int(feri.shape[0]) != naux or int(feri.shape[1]) != nao_pair:
             raise NotImplementedError('CDERI source shape does not match mol/auxmol.')
 
+    t = time.perf_counter()
     j2c = auxmol.intor(int2c, hermi=1)
     j2c_np = numpy.asarray(jax.device_get(j2c))
     try:
@@ -642,20 +660,43 @@ def cholesky_eri_vjp_from_mo_coeff_ybar(mol, auxmol, cderi_source,
     z = scipy.linalg.solve_triangular(
         low.T, ybar, lower=False, check_finite=False
     )
+    _profile_msg(
+        'cholesky_eri_vjp_from_mo_coeff_ybar metric/z setup done '
+        f'{time.perf_counter() - t:.2f} s'
+    )
 
+    t = time.perf_counter()
     y = _stream_nr_e2_from_cderi_source(
         cderi_source, mo_coeff, orbs_slice, max_memory, aosym='s2'
     )
     low_bar = -numpy.dot(z, y.T)
+    _profile_msg(
+        'cholesky_eri_vjp_from_mo_coeff_ybar stream y/low_bar done '
+        f'{time.perf_counter() - t:.2f} s'
+    )
 
+    t = time.perf_counter()
     mol_bar, auxmol_bar = _int3c_mo_deriv_coords_vjp(
         mol, auxmol, mo_coeff, z, orbs_slice, int3c=int3c, aosym=aosym
+    )
+    _profile_msg(
+        'cholesky_eri_vjp_from_mo_coeff_ybar int3c_mo_deriv done '
+        f'{time.perf_counter() - t:.2f} s'
     )
 
     def metric_cholesky(auxmol_):
         return jax_scipy.linalg.cholesky(auxmol_.intor(int2c, hermi=1), lower=True)
 
+    t = time.perf_counter()
     _, chol_pullback = jax.vjp(metric_cholesky, auxmol)
     aux_metric_bar = chol_pullback(np.asarray(numpy.tril(low_bar)))[0]
     auxmol_bar = _tree_add(auxmol_bar, aux_metric_bar)
+    _profile_msg(
+        'cholesky_eri_vjp_from_mo_coeff_ybar metric cholesky pullback done '
+        f'{time.perf_counter() - t:.2f} s'
+    )
+    _profile_msg(
+        'cholesky_eri_vjp_from_mo_coeff_ybar done '
+        f'{time.perf_counter() - t_total:.2f} s'
+    )
     return mol_bar, auxmol_bar

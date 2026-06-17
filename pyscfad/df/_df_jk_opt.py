@@ -14,6 +14,8 @@
 
 from functools import partial
 import ctypes
+import os
+import time
 import numpy
 import jax
 import jax.numpy as jnp
@@ -28,6 +30,16 @@ from pyscfad.df import _cderi_vjp
 
 libao2mo = lib.load_library('libao2mo')
 _FAST_EXCHANGE_DM_DATA = {}
+
+
+def _profile_enabled():
+    value = os.environ.get('PYSCFAD_PROFILE_BACKWARD_PHASES')
+    return value is not None and value.strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _profile_msg(msg):
+    if _profile_enabled():
+        print(f'[profile][df_jk_opt] {msg}', flush=True)
 
 
 def _restore_s1_jax(cderi, nao):
@@ -158,17 +170,27 @@ def get_jk_fwd(dfobj, dm, hermi, with_j, with_k, direct_scf_tol):
 
 def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
                res, ybar):
+    t_bwd = time.perf_counter()
+    _profile_msg(
+        f'get_jk_bwd start hermi={hermi} with_j={with_j} with_k={with_k}'
+    )
     dfobj, dm = res
     vj_bar, vk_bar = ybar
 
     if _has_tracer(dfobj, dm, vj_bar, vk_bar):
+        _profile_msg('get_jk_bwd tracer fallback start')
         def fn(dfobj_, dm_):
             return _get_jk_gen_jax(
                 dfobj_, dm_, hermi=hermi, with_j=with_j, with_k=with_k,
                 direct_scf_tol=direct_scf_tol,
             )
         _, vjp = jax.vjp(fn, dfobj, dm)
-        return vjp((vj_bar, vk_bar))
+        out = vjp((vj_bar, vk_bar))
+        _profile_msg(
+            'get_jk_bwd tracer fallback done '
+            f'{time.perf_counter() - t_bwd:.2f} s'
+        )
+        return out
 
     log = logger.new_logger(dfobj)
     fmmm = libao2mo.AO2MOmmm_bra_nr_s2
@@ -206,6 +228,7 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
     blksize = max(4, int(min(dfobj.blockdim, max_memory*.3e6/8/nao**2)))
     buf = numpy.empty((blksize,nao,nao))
     p1 = 0
+    t_loop = time.perf_counter()
     for eri1 in dfobj.loop(blksize):
         naux, nao_pair = eri1.shape
         p0, p1 = p1, p1 + naux
@@ -234,6 +257,10 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
                    eri1.ctypes.data_as(ctypes.c_void_p),
                    dms[k].ctypes.data_as(ctypes.c_void_p),
                    ctypes.c_int(naux), ctypes.c_int(nao))
+    _profile_msg(
+        f'get_jk_bwd DF block loop done naux={p1} blksize={blksize} '
+        f'{time.perf_counter() - t_loop:.2f} s'
+    )
 
     dm_bar = numpy.asarray(dms_bar).reshape(dm_shape)
     #TODO need a better way to add vjps for objects
@@ -241,7 +268,13 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
     bar_leaves = []
     mol_bar = auxmol_bar = None
     if len(leaves) >= 3 and hasattr(leaves[-1], 'shape') and tuple(leaves[-1].shape) != tuple(eri_bar.shape):
+        t_cderi = time.perf_counter()
+        _profile_msg('get_jk_bwd cderi mol/aux vjp start')
         mol_bar, auxmol_bar = _cderi_mol_aux_vjp(dfobj, eri_bar)
+        _profile_msg(
+            'get_jk_bwd cderi mol/aux vjp done '
+            f'{time.perf_counter() - t_cderi:.2f} s'
+        )
     for i, leaf in enumerate(leaves):
         if i == 0:
             bar_leaves.append(mol_bar)
@@ -261,6 +294,7 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
     dfobj_bar = tree_unflatten(tree, bar_leaves)
     log.timer('get_jk_bwd')
     del log
+    _profile_msg(f'get_jk_bwd done {time.perf_counter() - t_bwd:.2f} s')
     return (dfobj_bar, dm_bar)
 
 

@@ -29,6 +29,7 @@ from pyscfad.dlno.ccsd import (
     DLNOCCSD as _DLNOCCSDSingle,
     _add_cotangent,
     _build_static_dlno_topology,
+    _cleanup_after_fragment,
     _make_stub_eris,
     _VERBOSE_PROGRESS,
 )
@@ -129,6 +130,9 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
     @classmethod
     def value_and_grad(cls, mol, *, build_mf, frag_lolist=None,
                        include_mp2_correction=True,
+                       mp2_correction_method='sos',
+                       mp2_correction_scope='domain',
+                       sos_c_os=None,
                        # CCSD solver config
                        frozen=0,
                        thresh_occ=1e-4,
@@ -218,6 +222,14 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
         if domain_pao_thr    is None: domain_pao_thr    = cls.domain_pao_thr
         if pair_energy_thr   is None: pair_energy_thr   = cls.pair_energy_thr
         if multipole_order   is None: multipole_order   = cls.multipole_order
+        if sos_c_os is None:
+            sos_c_os = lno_base.DOMAIN_SOS_MP2_C_OS
+        mp2_correction_scope = str(mp2_correction_scope).lower().replace('_', '-')
+        if mp2_correction_scope not in ('domain', 'full'):
+            raise ValueError(
+                "mp2_correction_scope must be either 'domain' or 'full', "
+                f"got {mp2_correction_scope!r}"
+            )
 
         comm = MPI.COMM_WORLD
         nproc = comm.Get_size()
@@ -298,7 +310,18 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                           if min(atom_counts) != max(atom_counts)
                           else f'{atom_counts[0]}')
             log(f'  Fragments: {nfrag} (domain atoms/frag: {atom_range})')
-            log(f'  MP2 correction: {"per-domain" if include_mp2_correction else "off"}'
+            if include_mp2_correction:
+                correction_method = str(mp2_correction_method).lower().replace('_', '-')
+                scope_label = 'full-system' if mp2_correction_scope == 'full' else 'per-domain'
+                if correction_method in ('sos', 'sos-mp2', 'lt-sos', 'lt-sos-mp2'):
+                    correction_label = f'{scope_label} SOS-MP2 (c_os={sos_c_os:g})'
+                elif correction_method in ('mp2', 'full-mp2', 'conventional'):
+                    correction_label = f'{scope_label} full MP2'
+                else:
+                    correction_label = f'{scope_label} {mp2_correction_method}'
+            else:
+                correction_label = 'off'
+            log(f'  MP2 correction: {correction_label}'
                 f',  CCSD(T): {ccsd_t}')
             log(f'  MPI partition: nproc={nproc}')
 
@@ -318,6 +341,22 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
 
         # ---- Per-fragment loop (rank-local subset) ----
         e_corr_local = jnp.float64(0.0)
+        if rank == 0 and include_mp2_correction and mp2_correction_scope == 'full':
+            t0 = time.perf_counter()
+            full_mp2_correction, full_mp2_vjp = jax.vjp(
+                lambda m: lno_base.full_system_mp2_correction(
+                    m, method=mp2_correction_method, c_os=sos_c_os
+                ),
+                mf,
+            )
+            grad_mf_full, = full_mp2_vjp(jnp.float64(1.0))
+            grad_mf = jax.tree_util.tree_map(
+                _add_cotangent, grad_mf, grad_mf_full
+            )
+            e_corr_local = e_corr_local + full_mp2_correction
+            log(f'  Full-system MP2 correction: {time.perf_counter() - t0:.2f} s, '
+                f'e = {float(full_mp2_correction):+.10f}')
+
         for ifrag in my_fragment_indices:
             fraglo_idx = frag_lolist_static[ifrag]
             frag_prescreen = prescreen_data['fragment_data'][ifrag]
@@ -335,7 +374,12 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                 cc_local.ccsd_t = ccsd_t
                 cc_local.dcsd = dcsd
                 cc_local.verbose_imp = verbose_imp
-                cc_local.compute_domain_pt2 = include_mp2_correction
+                cc_local.compute_domain_pt2 = (
+                    include_mp2_correction
+                    and mp2_correction_scope == 'domain'
+                )
+                cc_local.domain_mp2_method = mp2_correction_method
+                cc_local.domain_sos_mp2_c_os = sos_c_os
 
                 orbfragloc = lo_coeff_[:, _fraglo]
                 stub_eris = _make_stub_eris(mf_)
@@ -351,12 +395,20 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                 )
 
                 if orbfrag is None:
-                    contribution = domain_pt2 if include_mp2_correction else jnp.float64(0.0)
+                    contribution = (
+                        domain_pt2
+                        if include_mp2_correction and mp2_correction_scope == 'domain'
+                        else jnp.float64(0.0)
+                    )
                     aux = {
                         'pt2':        jnp.float64(0.0),
                         'cc':         jnp.float64(0.0),
                         'cc_t':       jnp.float64(0.0),
-                        'domain_pt2': jnp.asarray(domain_pt2 if include_mp2_correction else 0.0),
+                        'domain_pt2': jnp.asarray(
+                            domain_pt2
+                            if include_mp2_correction and mp2_correction_scope == 'domain'
+                            else 0.0
+                        ),
                     }
                     return _weight * contribution, aux
 
@@ -373,13 +425,17 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                 e_pt2_frag, e_cc_frag, e_cc_t_frag = res
 
                 contribution = e_cc_frag + e_cc_t_frag + sign_pt2 * e_pt2_frag
-                if include_mp2_correction:
+                if include_mp2_correction and mp2_correction_scope == 'domain':
                     contribution = contribution + domain_pt2
                 aux = {
                     'pt2':        jnp.asarray(e_pt2_frag),
                     'cc':         jnp.asarray(e_cc_frag),
                     'cc_t':       jnp.asarray(e_cc_t_frag),
-                    'domain_pt2': jnp.asarray(domain_pt2 if include_mp2_correction else 0.0),
+                    'domain_pt2': jnp.asarray(
+                        domain_pt2
+                        if include_mp2_correction and mp2_correction_scope == 'domain'
+                        else 0.0
+                    ),
                 }
                 return _weight * contribution, aux
 
@@ -412,6 +468,7 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
             else:
                 grad_mf = jax.tree_util.tree_map(_add_cotangent, grad_mf, g_mf_i)
             grad_lo = jax.tree_util.tree_map(_add_cotangent, grad_lo, g_lo_i)
+            jax.block_until_ready((e_corr_local, grad_mf, grad_lo))
 
             if verbose >= _VERBOSE_PROGRESS:
                 print(f'  [rank {rank}] [frag {ifrag+1}/{nfrag}] done in '
@@ -421,9 +478,15 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                       f'cc={float(aux["cc"]):+.8f}, '
                       f'(T)={float(aux["cc_t"]):+.8f}'
                       + (f', domain_pt2={float(aux["domain_pt2"]):+.8f}'
-                         if include_mp2_correction else '')
+                         if include_mp2_correction and mp2_correction_scope == 'domain' else '')
                       + ')',
                       flush=True)
+            del e_frag, vjp_fn, aux, g_mf_i, g_lo_i, per_frag_fn
+            del fraglo_idx, frag_prescreen
+            _cleanup_after_fragment(
+                log if verbose >= _VERBOSE_PROGRESS else None,
+                label=f'rank {rank} fragment {ifrag+1}/{nfrag}',
+            )
 
         # Defensive: ranks with no fragments have grad_mf=None still.
         # Seed grad_mf as a zeros-of-canonical shape so the gather

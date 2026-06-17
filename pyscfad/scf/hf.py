@@ -15,6 +15,8 @@
 Restricted Hartree-Fock
 """
 from functools import partial
+import os
+import time
 import numpy
 import jax
 from jax import custom_vjp
@@ -38,6 +40,16 @@ from pyscfad.scf import chkfile
 from pyscfad.scf.diis import SCF_DIIS
 from pyscfad.scipy.linalg import eigh
 from pyscfad.tools.linear_solver import gen_gmres
+
+
+def _profile_enabled():
+    value = os.environ.get('PYSCFAD_PROFILE_BACKWARD_PHASES')
+    return value is not None and value.strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _profile_msg(msg):
+    if _profile_enabled():
+        print(f'[profile][scf.hf] {msg}', flush=True)
 
 
 def mo_response_eq78(dfock, ds1e, mo_energy_ref, mo_coeff_ref, deg_thresh=1e-9):
@@ -379,6 +391,8 @@ def _scf_outputs_first_order_fwd(mol, settings, dm0):
 
 
 def _scf_outputs_first_order_bwd(settings, res, cotangent):
+    t_bwd = time.perf_counter()
+    _profile_msg('first_order_bwd start')
     mol, dm0, mo_energy_fwd, mo_coeff_fwd = res
     _, bar_e_tot, bar_mo_energy, bar_mo_coeff, _ = cotangent
 
@@ -387,6 +401,10 @@ def _scf_outputs_first_order_bwd(settings, res, cotangent):
         and _is_zero_cotangent(bar_mo_energy)
         and _is_zero_cotangent(bar_mo_coeff)
     ):
+        _profile_msg(
+            'first_order_bwd zero cotangent '
+            f'{time.perf_counter() - t_bwd:.2f} s'
+        )
         return _zero_cotangent_like(mol), _zero_cotangent_like(dm0)
 
     def _contract_outputs(mol_replay, mf, e_tot, mo_energy_raw, mo_coeff_raw, mo_occ_raw):
@@ -412,6 +430,8 @@ def _scf_outputs_first_order_bwd(settings, res, cotangent):
         return out
 
     def weighted_outputs_explicit(mol):
+        t = time.perf_counter()
+        _profile_msg('first_order_bwd explicit SCF replay start')
         mf = _build_mf_for_first_order(mol, settings)
         with config_update('pyscfad_scf_first_order_custom', False):
             _, e_tot, mo_energy_raw, mo_coeff_raw, mo_occ_raw = _kernel_explicit_trace(
@@ -423,9 +443,26 @@ def _scf_outputs_first_order_bwd(settings, res, cotangent):
                 callback=None,
                 conv_check=mf.conv_check,
             )
-        return _contract_outputs(mol, mf, e_tot, mo_energy_raw, mo_coeff_raw, mo_occ_raw)
+        _profile_msg(
+            'first_order_bwd explicit SCF replay returned '
+            f'{time.perf_counter() - t:.2f} s'
+        )
+        t = time.perf_counter()
+        out = _contract_outputs(
+            mol, mf, e_tot, mo_energy_raw, mo_coeff_raw, mo_occ_raw
+        )
+        _profile_msg(
+            'first_order_bwd contract_outputs traced '
+            f'{time.perf_counter() - t:.2f} s'
+        )
+        return out
 
+    _profile_msg('first_order_bwd jax.grad(weighted_outputs_explicit) start')
     mol_bar = jax.grad(weighted_outputs_explicit)(mol)
+    _profile_msg(
+        'first_order_bwd jax.grad(weighted_outputs_explicit) done '
+        f'{time.perf_counter() - t_bwd:.2f} s'
+    )
     return mol_bar, _zero_cotangent_like(dm0)
 
 

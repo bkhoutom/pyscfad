@@ -15,6 +15,7 @@
 import warnings
 import os
 import time
+import tempfile
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
@@ -59,10 +60,12 @@ COMPRESS_DEG_THRESH = 1e-12
 _FRAGMENT_PROFILE_ROWS = []
 _FRAGMENT_TABLE_HEADERS = set()
 _VJP_PROGRESS_PREFIX = ContextVar('pyscfad_lno_vjp_progress_prefix', default=None)
-DOMAIN_MP2_USE_LT = getattr(__config__, 'lno_domain_mp2_use_lt', True)
+DOMAIN_MP2_USE_LT = getattr(__config__, 'lno_domain_mp2_use_lt', False)
 DOMAIN_MP2_LT_NLAP = getattr(__config__, 'lno_domain_mp2_lt_nlap', 9)
 DOMAIN_MP2_LT_QUADRATURE = getattr(__config__, 'lno_domain_mp2_lt_quadrature', 'fit')
 DOMAIN_MP2_LT_FIT_RATIO = getattr(__config__, 'lno_domain_mp2_lt_fit_ratio', 64.0)
+DOMAIN_MP2_METHOD = getattr(__config__, 'lno_domain_mp2_method', 'mp2')
+DOMAIN_SOS_MP2_C_OS = getattr(__config__, 'lno_domain_sos_mp2_c_os', 1.3)
 
 
 @contextmanager
@@ -724,6 +727,140 @@ def _domain_mp2_block_nvir(naux, nocc, nvir):
     return block
 
 
+def _env_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _tree_add(x, y):
+    if x is None:
+        return y
+    if y is None:
+        return x
+    return jax.tree_util.tree_map(lambda a, b: a + b, x, y)
+
+
+def _domain_mp2_lov_bar_on_disk():
+    return _env_flag('PYSCFAD_LNO_DOMAIN_MP2_LOV_BAR_ON_DISK', False)
+
+
+def _domain_mp2_lov_bar_disk_dir():
+    return os.environ.get('PYSCFAD_LNO_DOMAIN_MP2_LOV_BAR_DIR') or None
+
+
+def _domain_sos_mp2_fuse_outcore():
+    return _env_flag('PYSCFAD_LNO_DOMAIN_SOS_MP2_FUSE_OUTCORE', True)
+
+
+def _domain_sos_mp2_fuse_outcore_mode():
+    mode = os.environ.get('PYSCFAD_LNO_DOMAIN_SOS_MP2_FUSE_OUTCORE_MODE')
+    if mode is None:
+        mode = getattr(__config__, 'lno_domain_sos_mp2_fuse_outcore_mode',
+                       'hybrid')
+    mode = str(mode).strip().lower().replace('_', '-')
+    aliases = {
+        'dense': 'hybrid',
+        'dense-ybar': 'hybrid',
+        'fast': 'hybrid',
+        'block': 'stream',
+        'blocked': 'stream',
+        'streamed': 'stream',
+    }
+    return aliases.get(mode, mode)
+
+
+def _domain_sos_mp2_ybar_block_mb():
+    try:
+        return max(float(os.environ.get('PYSCFAD_LNO_DOMAIN_SOS_MP2_YBAR_BLOCK_MB', 128.0)), 1.0)
+    except ValueError:
+        return 128.0
+
+
+def _is_exact_identity_matrix(x):
+    if getattr(x, 'ndim', None) != 2 or x.shape[0] != x.shape[1]:
+        return False
+    try:
+        x_np = numpy.asarray(jax.device_get(x))
+    except Exception:
+        return False
+    eye = numpy.eye(x_np.shape[0], dtype=x_np.dtype)
+    return bool(numpy.array_equal(x_np, eye))
+
+
+def _domain_sos_mp2_block_naux(naux, nocc, nvir):
+    try:
+        block_mb = float(os.environ.get('PYSCFAD_LNO_DOMAIN_SOS_MP2_BLOCK_MB', 128.0))
+    except ValueError:
+        block_mb = 128.0
+    target_bytes = max(block_mb, 1.0) * 1024.0**2
+    bytes_per_aux = (
+        2 * naux + nocc * nvir
+    ) * numpy.dtype(numpy.float64).itemsize
+    return max(1, min(naux, int(target_bytes // max(bytes_per_aux, 1))))
+
+
+def full_system_mp2_correction(mf, method='sos', c_os=DOMAIN_SOS_MP2_C_OS):
+    """Full-system MP2 correction used as an alternative to domain MP2."""
+    method = str(method).lower().replace('_', '-')
+    if method in ('sos', 'sos-mp2', 'df-sos', 'df-sos-mp2'):
+        from pyscfad.mp import dfmp2
+
+        pt = dfmp2.MP2(mf)
+        pt.max_memory = mf.max_memory
+        eris = pt.ao2mo()
+        mo_energy = eris.mo_energy
+        nocc = pt.nocc
+        nvir = pt.nmo - nocc
+        Lov = pt.loop_ao2mo(eris.mo_coeff, nocc, with_t2=False)
+        Lov = Lov.reshape((-1, nocc, nvir))
+        eia = mo_energy[:nocc, None] - mo_energy[None, nocc:]
+        Lov_flat = Lov.reshape((Lov.shape[0], nocc * nvir))
+
+        @jax.checkpoint
+        def _scan(e_os, x):
+            Li, ei = x
+            gijab = np.dot(Li.T, Lov_flat).reshape((nvir, nocc, nvir))
+            gijab = gijab.transpose(1, 0, 2)
+            denom = eia[:, None, :] + ei[None, :, None]
+            e_os = e_os + np.einsum('jab,jab->', gijab, gijab / denom)
+            return e_os, None
+
+        e_os, _ = jax.lax.scan(
+            _scan,
+            np.zeros((), dtype=Lov.dtype),
+            (Lov.transpose(1, 0, 2), eia),
+        )
+        return (c_os * e_os).real
+
+    if method in ('lt-sos', 'lt-sos-mp2'):
+        from pyscfad.mp import ltdfmp2
+
+        pt = ltdfmp2.MP2(mf, c_os=c_os, sos=True)
+        pt.max_memory = mf.max_memory
+        e_corr, _ = pt.kernel(with_t2=False)
+        return e_corr
+
+    if method in ('mp2', 'full-mp2', 'conventional', 'df-mp2'):
+        from pyscfad.mp import dfmp2
+
+        pt = dfmp2.MP2(mf)
+        pt.max_memory = mf.max_memory
+        e_corr, _ = pt.kernel(with_t2=False)
+        return e_corr
+
+    if method in ('lt-mp2', 'lt-df-mp2'):
+        from pyscfad.mp import ltdfmp2
+
+        pt = ltdfmp2.MP2(mf, sos=False)
+        pt.max_memory = mf.max_memory
+        e_corr, _ = pt.kernel(with_t2=False)
+        return e_corr
+
+    raise ValueError(f'Unknown full-system MP2 correction method: {method}')
+
+
 def _mp2_fragment_energy_from_df_lov_block(Lov, occ_coeff, vir_coeff,
                                            moe_occ, moe_vir, prjlo,
                                            a0, a1, b0, b1):
@@ -855,6 +992,77 @@ def _mp2_fragment_energy_from_df_lov_block_bwd(
     return Lov_bar, occ_coeff_bar, vir_coeff_bar, moe_occ_bar, moe_vir_bar, prjlo_bar
 
 
+def _mp2_fragment_energy_from_df_lov_block_bwd_identity_vir(
+        Lov, occ_coeff, moe_occ, moe_vir, prjlo,
+        a0, a1, b0, b1, e2_bar):
+    Lov_a = np.einsum('ip,Liq->Lpq', occ_coeff, Lov[:, :, a0:a1])
+    same_vir_block = b0 == a0 and b1 == a1
+    if same_vir_block:
+        Lov_b = Lov_a
+    else:
+        Lov_b = np.einsum('ip,Liq->Lpq', occ_coeff, Lov[:, :, b0:b1])
+
+    eov = moe_occ[:, None] - moe_vir
+    eov_a = eov[:, a0:a1]
+    eov_b = eov[:, b0:b1]
+    denom = eov_a[:, None, :, None] + eov_b[None, :, None, :]
+    m = np.dot(prjlo.T, prjlo)
+    ovov = np.einsum('Lia,Ljb->iajb', Lov_a, Lov_b)
+    t2 = ovov.transpose(0, 2, 1, 3) / denom
+    scale = np.asarray(e2_bar)
+
+    m_bar = scale * (
+        2 * np.einsum('pjab,qajb->pq', t2, ovov)
+        - np.einsum('pjab,jaqb->pq', t2, ovov)
+    )
+    t2_bar = scale * (
+        2 * np.einsum('pq,qajb->pjab', m, ovov)
+        - np.einsum('pq,jaqb->pjab', m, ovov)
+    )
+    ovov_bar = scale * (
+        2 * np.einsum('pq,pjab->qajb', m, t2)
+        - np.einsum('pq,pjab->jaqb', m, t2)
+    )
+
+    ovov_t = ovov.transpose(0, 2, 1, 3)
+    denom_bar = -t2_bar * ovov_t / (denom * denom)
+    ovov_bar += (t2_bar / denom).transpose(0, 2, 1, 3)
+
+    moe_occ_bar = np.zeros_like(moe_occ)
+    moe_vir_bar = np.zeros_like(moe_vir)
+    moe_occ_bar += np.sum(denom_bar, axis=(1, 2, 3))
+    moe_occ_bar += np.sum(denom_bar, axis=(0, 2, 3))
+    moe_vir_bar = moe_vir_bar.at[a0:a1].add(
+        -np.sum(denom_bar, axis=(0, 1, 3))
+    )
+    moe_vir_bar = moe_vir_bar.at[b0:b1].add(
+        -np.sum(denom_bar, axis=(0, 1, 2))
+    )
+
+    Lov_a_bar = np.einsum('iajb,Ljb->Lia', ovov_bar, Lov_b)
+    Lov_b_bar = np.einsum('iajb,Lia->Ljb', ovov_bar, Lov_a)
+    if same_vir_block:
+        Lov_a_bar += Lov_b_bar
+
+    Lov_bar_a = np.einsum('ip,Lpq->Liq', occ_coeff, Lov_a_bar)
+    Lov_bar_b = None
+    occ_coeff_bar = np.einsum('Liq,Lpq->ip', Lov[:, :, a0:a1], Lov_a_bar)
+    vir_coeff_bar = np.zeros((Lov.shape[2], Lov.shape[2]), dtype=Lov.dtype)
+    vir_coeff_bar = vir_coeff_bar.at[:, a0:a1].add(
+        np.einsum('ip,Lia,Lpq->aq', occ_coeff, Lov, Lov_a_bar)
+    )
+    if not same_vir_block:
+        Lov_bar_b = np.einsum('ip,Lpq->Liq', occ_coeff, Lov_b_bar)
+        occ_coeff_bar += np.einsum('Liq,Lpq->ip', Lov[:, :, b0:b1], Lov_b_bar)
+        vir_coeff_bar = vir_coeff_bar.at[:, b0:b1].add(
+            np.einsum('ip,Lia,Lpq->aq', occ_coeff, Lov, Lov_b_bar)
+        )
+
+    prjlo_bar = np.dot(prjlo, m_bar + m_bar.T)
+    return (Lov_bar_a, Lov_bar_b, occ_coeff_bar, vir_coeff_bar,
+            moe_occ_bar, moe_vir_bar, prjlo_bar)
+
+
 def _mp2_fragment_energy_from_df_lov_bwd(res, e2_bar):
     Lov, occ_coeff, vir_coeff, moe_occ, moe_vir, prjlo = res
     naux = Lov.shape[0]
@@ -863,7 +1071,27 @@ def _mp2_fragment_energy_from_df_lov_bwd(res, e2_bar):
     if nocc == 0 or nvir == 0:
         return tuple(np.zeros_like(x) for x in res)
 
-    Lov_bar = np.zeros_like(Lov)
+    identity_vir = _is_exact_identity_matrix(vir_coeff)
+    use_disk_lov_bar = _domain_mp2_lov_bar_on_disk()
+    lov_bar_path = None
+    lov_bar_mm = None
+    if use_disk_lov_bar:
+        fd, lov_bar_path = tempfile.mkstemp(
+            prefix='pyscfad-domain-mp2-lov-bar-',
+            suffix='.dat',
+            dir=_domain_mp2_lov_bar_disk_dir(),
+        )
+        os.close(fd)
+        lov_bar_mm = numpy.memmap(
+            lov_bar_path,
+            dtype=numpy.asarray(jax.device_get(Lov)).dtype,
+            mode='w+',
+            shape=tuple(int(x) for x in Lov.shape),
+        )
+        lov_bar_mm[:] = 0
+        Lov_bar = None
+    else:
+        Lov_bar = np.zeros_like(Lov)
     occ_coeff_bar = np.zeros_like(occ_coeff)
     vir_coeff_bar = np.zeros_like(vir_coeff)
     moe_occ_bar = np.zeros_like(moe_occ)
@@ -871,21 +1099,62 @@ def _mp2_fragment_energy_from_df_lov_bwd(res, e2_bar):
     prjlo_bar = np.zeros_like(prjlo)
     block_nvir = _domain_mp2_block_nvir(naux, nocc, nvir)
 
-    with _vjp_progress_section('domain MP2 correction backward'):
-        for a0 in range(0, nvir, block_nvir):
-            a1 = min(a0 + block_nvir, nvir)
-            for b0 in range(0, nvir, block_nvir):
-                b1 = min(b0 + block_nvir, nvir)
-                block_bars = _mp2_fragment_energy_from_df_lov_block_bwd(
-                    Lov, occ_coeff, vir_coeff, moe_occ, moe_vir, prjlo,
-                    a0, a1, b0, b1, e2_bar,
-                )
-                Lov_bar += block_bars[0]
-                occ_coeff_bar += block_bars[1]
-                vir_coeff_bar += block_bars[2]
-                moe_occ_bar += block_bars[3]
-                moe_vir_bar += block_bars[4]
-                prjlo_bar += block_bars[5]
+    try:
+        with _vjp_progress_section('domain MP2 correction backward'):
+            for a0 in range(0, nvir, block_nvir):
+                a1 = min(a0 + block_nvir, nvir)
+                for b0 in range(0, nvir, block_nvir):
+                    b1 = min(b0 + block_nvir, nvir)
+                    if identity_vir:
+                        block_bars = _mp2_fragment_energy_from_df_lov_block_bwd_identity_vir(
+                            Lov, occ_coeff, moe_occ, moe_vir, prjlo,
+                            a0, a1, b0, b1, e2_bar,
+                        )
+                        if lov_bar_mm is None:
+                            Lov_bar = Lov_bar.at[:, :, a0:a1].add(block_bars[0])
+                            if block_bars[1] is not None:
+                                Lov_bar = Lov_bar.at[:, :, b0:b1].add(block_bars[1])
+                        else:
+                            lov_bar_mm[:, :, a0:a1] += numpy.asarray(
+                                jax.device_get(block_bars[0])
+                            )
+                            if block_bars[1] is not None:
+                                lov_bar_mm[:, :, b0:b1] += numpy.asarray(
+                                    jax.device_get(block_bars[1])
+                                )
+                        occ_coeff_bar += block_bars[2]
+                        vir_coeff_bar += block_bars[3]
+                        moe_occ_bar += block_bars[4]
+                        moe_vir_bar += block_bars[5]
+                        prjlo_bar += block_bars[6]
+                    else:
+                        block_bars = _mp2_fragment_energy_from_df_lov_block_bwd(
+                            Lov, occ_coeff, vir_coeff, moe_occ, moe_vir, prjlo,
+                            a0, a1, b0, b1, e2_bar,
+                        )
+                        if lov_bar_mm is None:
+                            Lov_bar += block_bars[0]
+                        else:
+                            lov_bar_mm[:] += numpy.asarray(
+                                jax.device_get(block_bars[0])
+                            )
+                        occ_coeff_bar += block_bars[1]
+                        vir_coeff_bar += block_bars[2]
+                        moe_occ_bar += block_bars[3]
+                        moe_vir_bar += block_bars[4]
+                        prjlo_bar += block_bars[5]
+
+        if lov_bar_mm is not None:
+            lov_bar_mm.flush()
+            Lov_bar = np.asarray(numpy.array(lov_bar_mm, copy=True))
+    finally:
+        if lov_bar_mm is not None:
+            del lov_bar_mm
+        if lov_bar_path is not None:
+            try:
+                os.remove(lov_bar_path)
+            except FileNotFoundError:
+                pass
 
     return (Lov_bar, occ_coeff_bar, vir_coeff_bar,
             moe_occ_bar, moe_vir_bar, prjlo_bar)
@@ -925,6 +1194,663 @@ def _mp2_fragment_energy_from_lt_projected_lov(
         return np.sum(emp2)
 
     return _impl(Lov, occ_coeff, vir_coeff, moe_occ, moe_vir, prjlo)
+
+
+def _sos_mp2_fragment_energy_from_lov_domain_block(
+        Lov_domain, moe_occ, moe_vir, prjlo, qidx, p0, p1,
+        nlap=DOMAIN_MP2_LT_NLAP,
+        quadrature=DOMAIN_MP2_LT_QUADRATURE,
+        fit_ratio=DOMAIN_MP2_LT_FIT_RATIO):
+    from pyscfad.mp import ltdfmp2
+
+    naux = Lov_domain.shape[0]
+    nocc = Lov_domain.shape[1]
+    nvir = Lov_domain.shape[2]
+    m = np.dot(prjlo.T, prjlo)
+    mo_energy = np.concatenate((moe_occ, moe_vir))
+    t, w = ltdfmp2._laplace_quadrature_for_mp2(
+        mo_energy,
+        nocc,
+        nvir,
+        nlap=nlap,
+        quadrature=quadrature,
+        fit_ratio=fit_ratio,
+    )
+
+    tq = t[qidx]
+    wq = w[qidx]
+    so = np.exp(0.5 * moe_occ * tq)
+    sv = np.exp(-0.5 * moe_vir * tq)
+    Lov_q = Lov_domain * so[None, :, None] * sv[None, None, :]
+    Lov_q_blk = Lov_q[p0:p1]
+    metric_blk = np.dot(
+        Lov_q_blk.reshape(p1 - p0, nocc * nvir),
+        Lov_q.reshape(naux, nocc * nvir).T,
+    )
+    projected_metric_blk = np.einsum(
+        'pq,Lpa,Qqa->LQ', m, Lov_q_blk, Lov_q
+    )
+    return -wq * np.einsum('LQ,LQ->', projected_metric_blk, metric_blk)
+
+
+def _sos_mp2_fragment_energy_from_lov_domain_pair_block(
+        Lov_left, Lov_right, moe_occ, moe_vir, prjlo, qidx,
+        nlap=DOMAIN_MP2_LT_NLAP,
+        quadrature=DOMAIN_MP2_LT_QUADRATURE,
+        fit_ratio=DOMAIN_MP2_LT_FIT_RATIO):
+    from pyscfad.mp import ltdfmp2
+
+    nocc = Lov_left.shape[1]
+    nvir = Lov_left.shape[2]
+    m = np.dot(prjlo.T, prjlo)
+    mo_energy = np.concatenate((moe_occ, moe_vir))
+    t, w = ltdfmp2._laplace_quadrature_for_mp2(
+        mo_energy,
+        nocc,
+        nvir,
+        nlap=nlap,
+        quadrature=quadrature,
+        fit_ratio=fit_ratio,
+    )
+
+    tq = t[qidx]
+    wq = w[qidx]
+    so = np.exp(0.5 * moe_occ * tq)
+    sv = np.exp(-0.5 * moe_vir * tq)
+    Lov_l = Lov_left * so[None, :, None] * sv[None, None, :]
+    Lov_r = Lov_right * so[None, :, None] * sv[None, None, :]
+    metric = np.dot(
+        Lov_l.reshape(Lov_l.shape[0], nocc * nvir),
+        Lov_r.reshape(Lov_r.shape[0], nocc * nvir).T,
+    )
+    projected_metric = np.einsum(
+        'pq,Lpa,Qqa->LQ', m, Lov_l, Lov_r
+    )
+    return -wq * np.einsum('LQ,LQ->', projected_metric, metric)
+
+
+def _sos_mp2_fragment_energy_from_lov_domain_impl(
+        Lov_domain, moe_occ, moe_vir, prjlo,
+        c_os=DOMAIN_SOS_MP2_C_OS,
+        nlap=DOMAIN_MP2_LT_NLAP,
+        quadrature=DOMAIN_MP2_LT_QUADRATURE,
+        fit_ratio=DOMAIN_MP2_LT_FIT_RATIO):
+    from pyscfad.mp import ltdfmp2
+
+    nocc = Lov_domain.shape[1]
+    nvir = Lov_domain.shape[2]
+    if nocc == 0 or nvir == 0 or prjlo.shape[0] == 0:
+        return np.zeros((), dtype=Lov_domain.dtype)
+
+    naux = Lov_domain.shape[0]
+    mo_energy = np.concatenate((moe_occ, moe_vir))
+    t, w = ltdfmp2._laplace_quadrature_for_mp2(
+        mo_energy,
+        nocc,
+        nvir,
+        nlap=nlap,
+        quadrature=quadrature,
+        fit_ratio=fit_ratio,
+    )
+
+    e_os = np.zeros((), dtype=Lov_domain.dtype)
+    block_naux = _domain_sos_mp2_block_naux(naux, nocc, nvir)
+    for qidx in range(len(t)):
+        for p0 in range(0, naux, block_naux):
+            p1 = min(p0 + block_naux, naux)
+            e_os += _sos_mp2_fragment_energy_from_lov_domain_block(
+                Lov_domain, moe_occ, moe_vir, prjlo, qidx, p0, p1,
+                nlap=nlap, quadrature=quadrature, fit_ratio=fit_ratio,
+            )
+    return (c_os * e_os).real
+
+
+def _sos_mp2_fragment_energy_from_df_lov_impl(
+        Lov, occ_coeff, vir_coeff, moe_occ, moe_vir, prjlo,
+        c_os=DOMAIN_SOS_MP2_C_OS,
+        nlap=DOMAIN_MP2_LT_NLAP,
+        quadrature=DOMAIN_MP2_LT_QUADRATURE,
+        fit_ratio=DOMAIN_MP2_LT_FIT_RATIO):
+    """Scaled opposite-spin projected DF-MP2 without virtual-pair tensors.
+
+    This is the domain-local analogue of ``pyscfad.mp.ltdfmp2``'s SOS
+    contraction.  For an identity LO projector it reduces to the canonical
+    LT-DF-SOS-MP2 energy on the supplied domain orbitals.  For a fragment
+    projector ``P = prjlo.T @ prjlo`` it evaluates the projected
+    opposite-spin direct term through auxiliary-space metrics, avoiding the
+    ``(ijab)`` and ``(ab)`` intermediates used by the conventional MP2
+    correction.
+    """
+    nocc = occ_coeff.shape[1]
+    nvir = vir_coeff.shape[1]
+    if nocc == 0 or nvir == 0 or prjlo.shape[0] == 0:
+        return np.zeros((), dtype=Lov.dtype)
+
+    Lov_domain = np.einsum('ip,Lia,aq->Lpq', occ_coeff, Lov, vir_coeff)
+    return _sos_mp2_fragment_energy_from_lov_domain_impl(
+        Lov_domain, moe_occ, moe_vir, prjlo,
+        c_os=c_os, nlap=nlap, quadrature=quadrature, fit_ratio=fit_ratio,
+    )
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(6, 7, 8, 9))
+def _sos_mp2_fragment_energy_from_df_lov(
+        Lov, occ_coeff, vir_coeff, moe_occ, moe_vir, prjlo,
+        c_os=DOMAIN_SOS_MP2_C_OS,
+        nlap=DOMAIN_MP2_LT_NLAP,
+        quadrature=DOMAIN_MP2_LT_QUADRATURE,
+        fit_ratio=DOMAIN_MP2_LT_FIT_RATIO):
+    return _sos_mp2_fragment_energy_from_df_lov_impl(
+        Lov, occ_coeff, vir_coeff, moe_occ, moe_vir, prjlo,
+        c_os=c_os, nlap=nlap, quadrature=quadrature, fit_ratio=fit_ratio,
+    )
+
+
+def _sos_mp2_fragment_energy_from_df_lov_fwd(
+        Lov, occ_coeff, vir_coeff, moe_occ, moe_vir, prjlo,
+        c_os, nlap, quadrature, fit_ratio):
+    e = _sos_mp2_fragment_energy_from_df_lov_impl(
+        Lov, occ_coeff, vir_coeff, moe_occ, moe_vir, prjlo,
+        c_os=c_os, nlap=nlap, quadrature=quadrature, fit_ratio=fit_ratio,
+    )
+    return e, (Lov, occ_coeff, vir_coeff, moe_occ, moe_vir, prjlo)
+
+
+class _LovDomainBarAccumulator:
+    def __init__(self, template, use_disk=False):
+        self.shape = tuple(int(x) for x in template.shape)
+        self.dtype = numpy.asarray(jax.device_get(template)).dtype
+        self._path = None
+        self._mm = None
+        self._array = None
+        if use_disk:
+            fd, self._path = tempfile.mkstemp(
+                prefix='pyscfad-domain-sos-mp2-lov-domain-bar-',
+                suffix='.dat',
+                dir=_domain_mp2_lov_bar_disk_dir(),
+            )
+            os.close(fd)
+            self._mm = numpy.memmap(
+                self._path,
+                dtype=self.dtype,
+                mode='w+',
+                shape=self.shape,
+            )
+            self._mm[:] = 0
+        else:
+            self._array = np.zeros(self.shape, dtype=template.dtype)
+
+    def add(self, p0, p1, block):
+        if self._mm is None:
+            self._array = self._array.at[p0:p1].add(block)
+        else:
+            self._mm[p0:p1] += numpy.asarray(jax.device_get(block))
+
+    def get_block(self, p0, p1):
+        if self._mm is None:
+            return self._array[p0:p1]
+        return np.asarray(numpy.asarray(self._mm[p0:p1]))
+
+    def materialize(self):
+        if self._mm is None:
+            return self._array
+        self._mm.flush()
+        return np.asarray(numpy.array(self._mm, copy=True))
+
+    def close(self):
+        if self._mm is not None:
+            del self._mm
+            self._mm = None
+        if self._path is not None:
+            try:
+                os.remove(self._path)
+            except FileNotFoundError:
+                pass
+            self._path = None
+
+
+def _lov_domain_bar_block(Lov_domain_bar, p0, p1):
+    get_block = getattr(Lov_domain_bar, 'get_block', None)
+    if get_block is not None:
+        return get_block(p0, p1)
+    return Lov_domain_bar[p0:p1]
+
+
+def _sos_mp2_lov_domain_bar_and_scalar_bars(
+        Lov_domain, moe_occ, moe_vir, prjlo, e_bar,
+        c_os=DOMAIN_SOS_MP2_C_OS,
+        nlap=DOMAIN_MP2_LT_NLAP,
+        quadrature=DOMAIN_MP2_LT_QUADRATURE,
+        fit_ratio=DOMAIN_MP2_LT_FIT_RATIO,
+        return_lov_domain_bar_store=False):
+    nocc = Lov_domain.shape[1]
+    nvir = Lov_domain.shape[2]
+    naux = Lov_domain.shape[0]
+    block_naux = _domain_sos_mp2_block_naux(naux, nocc, nvir)
+    Lov_domain_bar = _LovDomainBarAccumulator(
+        Lov_domain, use_disk=_domain_mp2_lov_bar_on_disk()
+    )
+    moe_occ_bar = np.zeros_like(moe_occ)
+    moe_vir_bar = np.zeros_like(moe_vir)
+    prjlo_bar = np.zeros_like(prjlo)
+
+    from pyscfad.mp import ltdfmp2
+    mo_energy = np.concatenate((moe_occ, moe_vir))
+    t, _ = ltdfmp2._laplace_quadrature_for_mp2(
+        mo_energy,
+        nocc,
+        nvir,
+        nlap=nlap,
+        quadrature=quadrature,
+        fit_ratio=fit_ratio,
+    )
+
+    return_store = False
+    try:
+        with _vjp_progress_section('domain SOS-MP2 correction backward'):
+            for qidx in range(len(t)):
+                for p0 in range(0, naux, block_naux):
+                    p1 = min(p0 + block_naux, naux)
+                    Lov_p = Lov_domain[p0:p1]
+                    for q0 in range(0, naux, block_naux):
+                        q1 = min(q0 + block_naux, naux)
+                        Lov_q = Lov_domain[q0:q1]
+
+                        def block_fn(Lov_p_, Lov_q_, moe_occ_, moe_vir_, prjlo_):
+                            return c_os * _sos_mp2_fragment_energy_from_lov_domain_pair_block(
+                                Lov_p_, Lov_q_, moe_occ_, moe_vir_, prjlo_,
+                                qidx,
+                                nlap=nlap,
+                                quadrature=quadrature,
+                                fit_ratio=fit_ratio,
+                            ).real
+
+                        _, pullback = jax.vjp(
+                            block_fn, Lov_p, Lov_q, moe_occ, moe_vir, prjlo
+                        )
+                        block_bars = pullback(e_bar)
+                        Lov_domain_bar.add(p0, p1, block_bars[0])
+                        Lov_domain_bar.add(q0, q1, block_bars[1])
+                        moe_occ_bar += block_bars[2]
+                        moe_vir_bar += block_bars[3]
+                        prjlo_bar += block_bars[4]
+
+        if return_lov_domain_bar_store:
+            return_store = True
+            Lov_domain_bar_out = Lov_domain_bar
+        else:
+            Lov_domain_bar_out = Lov_domain_bar.materialize()
+        return Lov_domain_bar_out, moe_occ_bar, moe_vir_bar, prjlo_bar
+    finally:
+        if not return_store:
+            Lov_domain_bar.close()
+
+
+def _lov_domain_pullback_no_lov_bar(Lov, occ_coeff, vir_coeff, Lov_domain_bar):
+    naux = Lov.shape[0]
+    try:
+        block_mb = float(os.environ.get('PYSCFAD_LNO_DOMAIN_SOS_MP2_PULLBACK_BLOCK_MB', 128.0))
+    except ValueError:
+        block_mb = 128.0
+    itemsize = numpy.dtype(numpy.float64).itemsize
+    words_per_aux = (
+        Lov.shape[1] * Lov.shape[2]
+        + Lov_domain_bar.shape[1] * Lov_domain_bar.shape[2]
+    )
+    block_naux = max(
+        1,
+        min(naux, int(max(block_mb, 1.0) * 1024.0**2
+                      // max(words_per_aux * itemsize, 1)))
+    )
+    occ_coeff_bar = np.zeros_like(occ_coeff)
+    vir_coeff_bar = np.zeros_like(vir_coeff)
+    for p0 in range(0, naux, block_naux):
+        p1 = min(p0 + block_naux, naux)
+        Lov_blk = Lov[p0:p1]
+        Lov_domain_bar_blk = _lov_domain_bar_block(Lov_domain_bar, p0, p1)
+        occ_coeff_bar += np.einsum(
+            'Lia,aq,Lpq->ip', Lov_blk, vir_coeff, Lov_domain_bar_blk
+        )
+        vir_coeff_bar += np.einsum(
+            'ip,Lia,Lpq->aq', occ_coeff, Lov_blk, Lov_domain_bar_blk
+        )
+    return occ_coeff_bar, vir_coeff_bar
+
+
+def _sos_mp2_fragment_energy_from_df_lov_bwd(
+        c_os, nlap, quadrature, fit_ratio, res, e_bar):
+    Lov, occ_coeff, vir_coeff, moe_occ, moe_vir, prjlo = res
+
+    nocc = occ_coeff.shape[1]
+    nvir = vir_coeff.shape[1]
+    if nocc == 0 or nvir == 0 or prjlo.shape[0] == 0:
+        return (
+            np.zeros_like(Lov),
+            np.zeros_like(occ_coeff),
+            np.zeros_like(vir_coeff),
+            np.zeros_like(moe_occ),
+            np.zeros_like(moe_vir),
+            np.zeros_like(prjlo),
+        )
+
+    def lov_domain_fn(Lov_, occ_coeff_, vir_coeff_):
+        return np.einsum('ip,Lia,aq->Lpq', occ_coeff_, Lov_, vir_coeff_)
+
+    Lov_domain, lov_domain_pullback = jax.vjp(
+        lov_domain_fn, Lov, occ_coeff, vir_coeff
+    )
+    Lov_domain_bar, moe_occ_bar, moe_vir_bar, prjlo_bar = (
+        _sos_mp2_lov_domain_bar_and_scalar_bars(
+            Lov_domain, moe_occ, moe_vir, prjlo, e_bar,
+            c_os=c_os, nlap=nlap, quadrature=quadrature,
+            fit_ratio=fit_ratio,
+        )
+    )
+    Lov_bar, occ_coeff_bar, vir_coeff_bar = lov_domain_pullback(Lov_domain_bar)
+    return (
+        Lov_bar,
+        occ_coeff_bar,
+        vir_coeff_bar,
+        moe_occ_bar,
+        moe_vir_bar,
+        prjlo_bar,
+    )
+
+
+_sos_mp2_fragment_energy_from_df_lov.defvjp(
+    _sos_mp2_fragment_energy_from_df_lov_fwd,
+    _sos_mp2_fragment_energy_from_df_lov_bwd,
+)
+
+
+def _nr_e2_mo_coeff_vjp_from_cderi_source_ybar_block_fn(
+        cderi_source, mo_coeff, ybar_block_fn, ybar_shape,
+        orbs_slice, aosym='s2'):
+    if cderi_source is None:
+        raise NotImplementedError('Missing CDERI source for fused nr_e2 VJP.')
+    if aosym not in ('s2', 's2ij'):
+        raise NotImplementedError(f'Only packed s2 CDERI is supported, got {aosym}.')
+
+    naux = int(ybar_shape[0])
+    kc = int(orbs_slice[1] - orbs_slice[0])
+    lc = int(orbs_slice[3] - orbs_slice[2])
+    mo_coeff_bar = None
+    with df_addons.load(cderi_source, 'j3c') as eri1:
+        if not hasattr(eri1, 'shape'):
+            raise NotImplementedError('Unsupported CDERI source for fused nr_e2 VJP.')
+        npair = int(eri1.shape[1])
+        target_bytes = _domain_sos_mp2_ybar_block_mb() * 1024.0**2
+        row_bytes = max(npair + kc * lc, 1) * numpy.dtype(numpy.float64).itemsize
+        blksize = max(1, min(naux, int(target_bytes // row_bytes)))
+
+        for p0 in range(0, naux, blksize):
+            p1 = min(p0 + blksize, naux)
+            cderi = numpy.asarray(eri1[p0:p1])
+            ybar_blk = ybar_block_fn(p0, p1)
+
+            def fn(cderi_, mo_coeff_):
+                return _ao2mo.nr_e2(
+                    cderi_, mo_coeff_, orbs_slice, aosym=aosym, mosym='s1'
+                )
+
+            _, pullback = jax.vjp(fn, np.asarray(cderi), mo_coeff)
+            _, mo_coeff_bar_blk = pullback(np.asarray(ybar_blk))
+            mo_coeff_bar = _tree_add(mo_coeff_bar, mo_coeff_bar_blk)
+            cderi = ybar_blk = mo_coeff_bar_blk = None
+    return mo_coeff_bar
+
+
+def _nr_e2_cderi_bar_packed_block_from_ybar_block_fn(
+        mo_coeff, ybar_block_fn, naux, orbs_slice, pair_positions):
+    pair_positions = numpy.asarray(pair_positions, dtype=numpy.int64).ravel()
+    if pair_positions.size == 0:
+        return numpy.zeros((naux, 0), dtype=numpy.float64)
+
+    kc = int(orbs_slice[1] - orbs_slice[0])
+    lc = int(orbs_slice[3] - orbs_slice[2])
+    target_bytes = _domain_sos_mp2_ybar_block_mb() * 1024.0**2
+    row_bytes = max(pair_positions.size + kc * lc, 1) * numpy.dtype(numpy.float64).itemsize
+    blksize = max(1, min(naux, int(target_bytes // row_bytes)))
+
+    out = None
+    for p0 in range(0, naux, blksize):
+        p1 = min(p0 + blksize, naux)
+        ybar_blk = ybar_block_fn(p0, p1)
+        cderi_bar_blk = _cderi_vjp.nr_e2_cderi_bar_packed_block(
+            mo_coeff, ybar_blk, orbs_slice, pair_positions
+        )
+        if out is None:
+            out = numpy.zeros((naux, pair_positions.size),
+                              dtype=numpy.asarray(cderi_bar_blk).dtype)
+        out[p0:p1] = numpy.asarray(cderi_bar_blk)
+        ybar_blk = cderi_bar_blk = None
+    if out is None:
+        out = numpy.zeros((naux, pair_positions.size), dtype=numpy.float64)
+    return out
+
+
+def _outcore_full_nr_e2_bwd_from_ybar_block_fn(
+        mol, auxmol, mo_coeff, cderi_source, max_memory,
+        orbs_slice, ybar_shape):
+    naux = int(ybar_shape[0])
+    nkl = int(numpy.prod(ybar_shape[1:]))
+
+    # The nested setter keeps the public helper signature compact while letting
+    # the fused MP2 VJP provide a closure below.
+    def run(block_fn):
+        with _vjp_progress_section('fused SOS-MP2 DF AO2MO MO-coeff backward'):
+            mo_coeff_bar = _nr_e2_mo_coeff_vjp_from_cderi_source_ybar_block_fn(
+                cderi_source, mo_coeff, block_fn, (naux, nkl),
+                orbs_slice, aosym='s2'
+            )
+
+        with _vjp_progress_section('fused SOS-MP2 DF integral derivative backward'):
+            mol_bar, auxmol_bar = _cderi_vjp.cholesky_eri_vjp_from_cderi_block_fn(
+                mol,
+                auxmol,
+                cderi_source,
+                lambda p0, p1: _nr_e2_cderi_bar_packed_block_from_ybar_block_fn(
+                    mo_coeff,
+                    block_fn,
+                    naux,
+                    orbs_slice,
+                    numpy.arange(p0, p1, dtype=numpy.int64),
+                ),
+                max(max_memory, 4096),
+                int3c=mol._add_suffix('int3c2e'),
+                int2c=mol._add_suffix('int2c2e'),
+                aosym='s2ij',
+            )
+        return mol_bar, auxmol_bar, mo_coeff_bar
+
+    return run
+
+
+def _sos_mp2_dense_ybar_from_lov_domain_bar(
+        Lov, occ_coeff, vir_coeff, Lov_domain_bar):
+    naux = int(Lov.shape[0])
+    nocc = int(Lov.shape[1])
+    nvir = int(Lov.shape[2])
+    target_bytes = _domain_sos_mp2_ybar_block_mb() * 1024.0**2
+    words_per_aux = max(nocc * nvir + occ_coeff.shape[1] * vir_coeff.shape[1], 1)
+    itemsize = numpy.dtype(numpy.float64).itemsize
+    blksize = max(1, min(naux, int(target_bytes // max(words_per_aux * itemsize, 1))))
+
+    out = numpy.empty((naux, nocc, nvir),
+                      dtype=numpy.asarray(jax.device_get(Lov)).dtype)
+    for p0 in range(0, naux, blksize):
+        p1 = min(p0 + blksize, naux)
+        Lov_domain_bar_blk = _lov_domain_bar_block(Lov_domain_bar, p0, p1)
+        ybar_blk = np.einsum(
+            'ip,Lpq,aq->Lia', occ_coeff, Lov_domain_bar_blk, vir_coeff
+        )
+        out[p0:p1] = numpy.asarray(jax.device_get(ybar_blk))
+    return out.reshape(naux, nocc * nvir)
+
+
+def _outcore_full_nr_e2_bwd_from_dense_ybar(
+        mol, auxmol, mo_coeff, cderi_source, max_memory,
+        orbs_slice, ybar):
+    ybar = numpy.asarray(jax.device_get(ybar))
+    with _vjp_progress_section('hybrid SOS-MP2 DF AO2MO MO-coeff backward'):
+        mo_coeff_bar = _cderi_vjp.nr_e2_mo_coeff_vjp_from_cderi_source(
+            cderi_source, mo_coeff, ybar, orbs_slice, aosym='s2'
+        )
+
+    try:
+        with _vjp_progress_section('hybrid SOS-MP2 DF integral derivative backward'):
+            mol_bar, auxmol_bar = _cderi_vjp.cholesky_eri_vjp_from_mo_coeff_ybar(
+                mol,
+                auxmol,
+                cderi_source,
+                mo_coeff,
+                ybar,
+                orbs_slice,
+                max(max_memory, 4096),
+                int3c=mol._add_suffix('int3c2e'),
+                int2c=mol._add_suffix('int2c2e'),
+                aosym='s2ij',
+            )
+    except NotImplementedError:
+        with _vjp_progress_section('hybrid SOS-MP2 DF integral derivative backward'):
+            mol_bar, auxmol_bar = _cderi_vjp.cholesky_eri_vjp_from_cderi_block_fn(
+                mol,
+                auxmol,
+                cderi_source,
+                lambda p0, p1: _nr_e2_global_cderi_bar_block(
+                    mo_coeff,
+                    ybar,
+                    orbs_slice,
+                    numpy.arange(p0, p1, dtype=numpy.int64),
+                    p0,
+                    p1,
+                ),
+                max(max_memory, 4096),
+                int3c=mol._add_suffix('int3c2e'),
+                int2c=mol._add_suffix('int2c2e'),
+                aosym='s2ij',
+            )
+    return mol_bar, auxmol_bar, mo_coeff_bar
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(9, 10, 11, 12, 13, 14, 15))
+def _sos_mp2_fragment_energy_from_outcore_lov_fused(
+        mol, auxmol, mo_coeff, Lov, occ_coeff, vir_coeff,
+        moe_occ, moe_vir, prjlo,
+        cderi_source, max_memory, orbs_slice,
+        c_os=DOMAIN_SOS_MP2_C_OS,
+        nlap=DOMAIN_MP2_LT_NLAP,
+        quadrature=DOMAIN_MP2_LT_QUADRATURE,
+        fit_ratio=DOMAIN_MP2_LT_FIT_RATIO):
+    return _sos_mp2_fragment_energy_from_df_lov_impl(
+        Lov, occ_coeff, vir_coeff, moe_occ, moe_vir, prjlo,
+        c_os=c_os, nlap=nlap, quadrature=quadrature, fit_ratio=fit_ratio,
+    )
+
+
+def _sos_mp2_fragment_energy_from_outcore_lov_fused_fwd(
+        mol, auxmol, mo_coeff, Lov, occ_coeff, vir_coeff,
+        moe_occ, moe_vir, prjlo,
+        cderi_source, max_memory, orbs_slice,
+        c_os, nlap, quadrature, fit_ratio):
+    e = _sos_mp2_fragment_energy_from_outcore_lov_fused(
+        mol, auxmol, mo_coeff, Lov, occ_coeff, vir_coeff,
+        moe_occ, moe_vir, prjlo,
+        cderi_source, max_memory, orbs_slice,
+        c_os=c_os, nlap=nlap, quadrature=quadrature, fit_ratio=fit_ratio,
+    )
+    return e, (mol, auxmol, mo_coeff, Lov, occ_coeff, vir_coeff,
+               moe_occ, moe_vir, prjlo)
+
+
+def _sos_mp2_fragment_energy_from_outcore_lov_fused_bwd(
+        cderi_source, max_memory, orbs_slice, c_os, nlap, quadrature, fit_ratio,
+        res, e_bar):
+    mol, auxmol, mo_coeff, Lov, occ_coeff, vir_coeff, moe_occ, moe_vir, prjlo = res
+    nocc = occ_coeff.shape[1]
+    nvir = vir_coeff.shape[1]
+    if nocc == 0 or nvir == 0 or prjlo.shape[0] == 0:
+        return (
+            None,
+            None,
+            np.zeros_like(mo_coeff),
+            None,
+            np.zeros_like(occ_coeff),
+            np.zeros_like(vir_coeff),
+            np.zeros_like(moe_occ),
+            np.zeros_like(moe_vir),
+            np.zeros_like(prjlo),
+        )
+
+    Lov_domain = np.einsum('ip,Lia,aq->Lpq', occ_coeff, Lov, vir_coeff)
+    Lov_domain_bar, moe_occ_bar, moe_vir_bar, prjlo_bar = (
+        _sos_mp2_lov_domain_bar_and_scalar_bars(
+            Lov_domain, moe_occ, moe_vir, prjlo, e_bar,
+            c_os=c_os, nlap=nlap, quadrature=quadrature,
+            fit_ratio=fit_ratio,
+            return_lov_domain_bar_store=True,
+        )
+    )
+    try:
+        occ_coeff_bar, vir_coeff_bar = _lov_domain_pullback_no_lov_bar(
+            Lov, occ_coeff, vir_coeff, Lov_domain_bar
+        )
+
+        fuse_mode = _domain_sos_mp2_fuse_outcore_mode()
+        if fuse_mode == 'hybrid':
+            with _vjp_progress_section('hybrid SOS-MP2 dense ybar build'):
+                ybar = _sos_mp2_dense_ybar_from_lov_domain_bar(
+                    Lov, occ_coeff, vir_coeff, Lov_domain_bar
+                )
+            mol_bar, auxmol_bar, mo_coeff_bar = (
+                _outcore_full_nr_e2_bwd_from_dense_ybar(
+                    mol, auxmol, mo_coeff, cderi_source, max_memory,
+                    orbs_slice, ybar,
+                )
+            )
+            ybar = None
+        elif fuse_mode == 'stream':
+            def ybar_block_fn(p0, p1):
+                Lov_domain_bar_blk = _lov_domain_bar_block(
+                    Lov_domain_bar, p0, p1
+                )
+                ybar_blk = np.einsum(
+                    'ip,Lpq,aq->Lia', occ_coeff, Lov_domain_bar_blk, vir_coeff
+                )
+                return ybar_blk.reshape(p1 - p0, -1)
+
+            run_outcore_bwd = _outcore_full_nr_e2_bwd_from_ybar_block_fn(
+                mol, auxmol, mo_coeff, cderi_source, max_memory,
+                orbs_slice, Lov.shape,
+            )
+            mol_bar, auxmol_bar, mo_coeff_bar = run_outcore_bwd(ybar_block_fn)
+        else:
+            raise ValueError(
+                'Unknown PYSCFAD_LNO_DOMAIN_SOS_MP2_FUSE_OUTCORE_MODE: '
+                f'{fuse_mode}'
+            )
+
+        return (
+            mol_bar,
+            auxmol_bar,
+            mo_coeff_bar,
+            None,
+            occ_coeff_bar,
+            vir_coeff_bar,
+            moe_occ_bar,
+            moe_vir_bar,
+            prjlo_bar,
+        )
+    finally:
+        close = getattr(Lov_domain_bar, 'close', None)
+        if close is not None:
+            close()
+
+
+_sos_mp2_fragment_energy_from_outcore_lov_fused.defvjp(
+    _sos_mp2_fragment_energy_from_outcore_lov_fused_fwd,
+    _sos_mp2_fragment_energy_from_outcore_lov_fused_bwd,
+)
 
 
 def _domain_mp2_fragment_energy(mfcc, eris, orbfragloc,
@@ -1027,6 +1953,55 @@ def _domain_mp2_fragment_energy(mfcc, eris, orbfragloc,
     # ---- Fragment-LO projector in the new canonical in-domain basis. ----
     occ_domain = np.dot(orbocc1, occ_coeff)
     prjlo = reduce(np.dot, (orbfragloc.T, s1e, occ_domain))
+    domain_mp2_method = str(
+        getattr(mfcc, 'domain_mp2_method', DOMAIN_MP2_METHOD)
+    ).lower().replace('_', '-')
+    if domain_mp2_method in ('sos', 'sos-mp2', 'lt-sos', 'lt-sos-mp2'):
+        with_df = getattr(mf, 'with_df', None)
+        placeholder_check = getattr(with_df, '_has_outcore_cderi_placeholder', None)
+        cderi_source_getter = getattr(with_df, '_get_cderi_source', None)
+        can_fuse_outcore = (
+            _domain_sos_mp2_fuse_outcore()
+            and placeholder_check is not None
+            and placeholder_check()
+            and cderi_source_getter is not None
+            and getattr(with_df, 'auxmol', None) is not None
+            and bool(getattr(eris, '_lov_full_domain', False))
+            and getattr(eris, '_lov_mo_coeff', None) is not None
+            and getattr(eris, '_lov_orbs_slice', None) is not None
+        )
+        if can_fuse_outcore:
+            return _sos_mp2_fragment_energy_from_outcore_lov_fused(
+                with_df.mol,
+                with_df.auxmol,
+                eris._lov_mo_coeff,
+                eris.Lov,
+                occ_coeff,
+                vir_coeff,
+                moe_occ,
+                moe_vir,
+                prjlo,
+                cderi_source_getter(),
+                with_df.max_memory,
+                eris._lov_orbs_slice,
+                c_os=getattr(mfcc, 'domain_sos_mp2_c_os', DOMAIN_SOS_MP2_C_OS),
+                nlap=getattr(mfcc, 'domain_mp2_lt_nlap', DOMAIN_MP2_LT_NLAP),
+                quadrature=getattr(mfcc, 'domain_mp2_lt_quadrature',
+                                   DOMAIN_MP2_LT_QUADRATURE),
+                fit_ratio=getattr(mfcc, 'domain_mp2_lt_fit_ratio',
+                                  DOMAIN_MP2_LT_FIT_RATIO),
+            )
+        return _sos_mp2_fragment_energy_from_df_lov(
+            eris.Lov, occ_coeff, vir_coeff, moe_occ, moe_vir, prjlo,
+            c_os=getattr(mfcc, 'domain_sos_mp2_c_os', DOMAIN_SOS_MP2_C_OS),
+            nlap=getattr(mfcc, 'domain_mp2_lt_nlap', DOMAIN_MP2_LT_NLAP),
+            quadrature=getattr(mfcc, 'domain_mp2_lt_quadrature',
+                               DOMAIN_MP2_LT_QUADRATURE),
+            fit_ratio=getattr(mfcc, 'domain_mp2_lt_fit_ratio',
+                              DOMAIN_MP2_LT_FIT_RATIO),
+        )
+    if domain_mp2_method not in ('mp2', 'full-mp2', 'conventional'):
+        raise ValueError(f'Unknown domain MP2 correction method: {domain_mp2_method}')
     if getattr(mfcc, 'domain_mp2_use_lt', DOMAIN_MP2_USE_LT):
         return _mp2_fragment_energy_from_lt_projected_lov(
             eris.Lov, occ_coeff, vir_coeff, moe_occ, moe_vir, prjlo,
@@ -1049,6 +2024,7 @@ def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external
         USE_CHECKPOINT
         and not bool(getattr(mfcc, '_disable_checkpointed_mp2_rdm1', False))
     )
+
     domain_pt2 = np.zeros((), dtype=eris.fock.dtype)
 
     mf = mfcc._scf
@@ -1908,6 +2884,8 @@ class LNO(pytree.PytreeNode):
         self.use_dlno_prescreen = False
         self.dlno_prescreen_data = None
         self.compute_domain_pt2 = False
+        self.domain_mp2_method = DOMAIN_MP2_METHOD
+        self.domain_sos_mp2_c_os = DOMAIN_SOS_MP2_C_OS
         self.domain_mp2_use_lt = DOMAIN_MP2_USE_LT
         self.domain_mp2_lt_nlap = DOMAIN_MP2_LT_NLAP
         self.domain_mp2_lt_quadrature = DOMAIN_MP2_LT_QUADRATURE
@@ -2583,6 +3561,13 @@ def make_fragment_eris(mfcc, eris, frag_prescreen):
 
     frag_eris = _LNODFINCOREERIS(fock=eris.fock, s1e=eris.s1e)
     frag_eris.Lov = get_Lov(mfcc._scf, mo_coeff, nocc, atmlst=atmlst)
+    frag_eris._lov_mo_coeff = mo_coeff
+    frag_eris._lov_orbs_slice = (0, nocc, nocc, mo_coeff.shape[-1])
+    frag_eris._lov_atmlst = tuple(numpy.asarray(atmlst, dtype=numpy.int32).tolist())
+    frag_eris._lov_full_domain = (
+        len(frag_eris._lov_atmlst) == mfcc._scf.mol.natm
+        and set(frag_eris._lov_atmlst) == set(range(mfcc._scf.mol.natm))
+    )
     return frag_eris
 
 

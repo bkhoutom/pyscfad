@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
+import os
 import time
 
 import jax
@@ -31,6 +33,36 @@ from pyscfad.dlno.prescreen import (
 # Progress-print verbosity threshold (matches pyscf logger convention:
 # ``log.info`` = level 4).  Reads ``mol.verbose`` from the input mol.
 _VERBOSE_PROGRESS = 4
+
+
+def _env_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _rss_gb():
+    try:
+        with open('/proc/self/status') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    return int(line.split()[1]) / 1024.0**2
+    except OSError:
+        pass
+    return None
+
+
+def _cleanup_after_fragment(log=None, label=None):
+    if _env_flag('PYSCFAD_DLNO_FRAGMENT_GC', True):
+        gc.collect()
+    if _env_flag('PYSCFAD_DLNO_CLEAR_JAX_CACHES_PER_FRAGMENT', False):
+        jax.clear_caches()
+    if log is not None and _env_flag('PYSCFAD_DLNO_LOG_FRAGMENT_RSS', True):
+        rss = _rss_gb()
+        if rss is not None:
+            suffix = f' after {label}' if label else ''
+            log(f'  RSS{suffix}: {rss:.2f} GB')
 
 
 class DLNOCCSD(LNOCCSD):
@@ -74,14 +106,17 @@ class DLNOCCSD(LNOCCSD):
     # PNO orbitals, and the fragment-local Lov are freed at the end of
     # each iteration before the next fragment starts.
     #
-    # MP2 correction (default off): replaces the per-fragment LNO PT2
-    # contribution with the per-domain MP2 energy that ``make_fpno1``
-    # already returns.  No full-system canonical MP2 is computed.
+    # MP2 correction: replaces the per-fragment LNO PT2 contribution with
+    # the per-domain correction that ``make_fpno1`` returns.  The default
+    # correction in value_and_grad is SOS-MP2.
     # ------------------------------------------------------------------
 
     @classmethod
     def value_and_grad(cls, mol, *, build_mf, frag_lolist=None,
                        include_mp2_correction=True,
+                       mp2_correction_method='sos',
+                       mp2_correction_scope='domain',
+                       sos_c_os=None,
                        # CCSD solver config (mirrors LNOCCSD attributes):
                        frozen=0,
                        thresh_occ=1e-4,
@@ -110,9 +145,17 @@ class DLNOCCSD(LNOCCSD):
         orbitals, and the fragment-local Lov are freed at the end of
         each iteration before the next fragment starts.
 
-        MP2 correction (default off): replaces the per-fragment LNO PT2
-        contribution with the per-domain MP2 energy that ``make_fpno1``
-        already returns.  No full-system canonical MP2 is computed.
+        MP2 correction: replaces the per-fragment LNO PT2 contribution
+        with either the per-domain correction that ``make_fpno1`` returns
+        (``mp2_correction_scope='domain'``) or one full-system correction
+        evaluated once outside the fragment loop
+        (``mp2_correction_scope='full'``).
+        The default correction method is scaled opposite-spin MP2
+        (``mp2_correction_method='sos'``), which uses a density-fitted
+        Laplace/SOS contraction and avoids the conventional MP2
+        virtual-pair tensors.  Set ``mp2_correction_method='mp2'`` to
+        recover the previous full same-spin plus opposite-spin MP2
+        correction within the selected correction scope.
 
         Args:
             mol : :class:`pyscfad.gto.Mole`
@@ -127,9 +170,23 @@ class DLNOCCSD(LNOCCSD):
                 geometry inside ``stop_trace``.
             include_mp2_correction : bool, default True
                 If ``True``, each fragment's contribution is
-                ``cc + cc_t - lno_pt2 + domain_mp2`` (per-domain MP2
+                ``cc + cc_t - lno_pt2 + domain_mp2`` (per-domain MP2/SOS-MP2
                 replaces LNO PT2; no full canonical MP2).  If ``False``,
                 the contribution is just ``cc + cc_t``.
+            mp2_correction_method : {'sos', 'mp2'}, default 'sos'
+                Domain correction used when ``include_mp2_correction`` is true.
+                ``'sos'`` uses scaled opposite-spin DF-MP2 and is the default
+                for differentiated DLNO-CCSD/(T). ``'mp2'`` uses the previous
+                full MP2 correction.
+            mp2_correction_scope : {'domain', 'full'}, default 'domain'
+                ``'domain'`` preserves the historical per-fragment domain MP2
+                correction. ``'full'`` computes one full-system MP2/SOS-MP2
+                correction and adds its VJP once, avoiding repeated
+                near-full-domain MP2 work.
+            sos_c_os : float, optional
+                Opposite-spin scale factor for ``mp2_correction_method='sos'``.
+                Defaults to ``lno_base.DOMAIN_SOS_MP2_C_OS`` (1.3 unless
+                overridden through PySCF config).
             frozen, thresh_occ, thresh_vir, lo_type, no_type, ccsd_t,
             dcsd, verbose_imp:
                 CCSD-solver settings, mirror the like-named attributes on
@@ -151,6 +208,14 @@ class DLNOCCSD(LNOCCSD):
         if domain_pao_thr    is None: domain_pao_thr    = cls.domain_pao_thr
         if pair_energy_thr   is None: pair_energy_thr   = cls.pair_energy_thr
         if multipole_order   is None: multipole_order   = cls.multipole_order
+        if sos_c_os is None:
+            sos_c_os = lno_base.DOMAIN_SOS_MP2_C_OS
+        mp2_correction_scope = str(mp2_correction_scope).lower().replace('_', '-')
+        if mp2_correction_scope not in ('domain', 'full'):
+            raise ValueError(
+                "mp2_correction_scope must be either 'domain' or 'full', "
+                f"got {mp2_correction_scope!r}"
+            )
 
         # Progress reporting (gated on ``mol.verbose >= 4``, matching the
         # pyscf logger convention).
@@ -219,12 +284,40 @@ class DLNOCCSD(LNOCCSD):
                           if min(atom_counts) != max(atom_counts)
                           else f'{atom_counts[0]}')
             log(f'  Fragments: {nfrag} (domain atoms/frag: {atom_range})')
-            log(f'  MP2 correction: {"per-domain" if include_mp2_correction else "off"}'
+            if include_mp2_correction:
+                correction_method = str(mp2_correction_method).lower().replace('_', '-')
+                scope_label = 'full-system' if mp2_correction_scope == 'full' else 'per-domain'
+                if correction_method in ('sos', 'sos-mp2', 'lt-sos', 'lt-sos-mp2'):
+                    correction_label = f'{scope_label} SOS-MP2 (c_os={sos_c_os:g})'
+                elif correction_method in ('mp2', 'full-mp2', 'conventional'):
+                    correction_label = f'{scope_label} full MP2'
+                else:
+                    correction_label = f'{scope_label} {mp2_correction_method}'
+            else:
+                correction_label = 'off'
+            log(f'  MP2 correction: {correction_label}'
                 f',  CCSD(T): {ccsd_t}')
 
         # ---------------- Per-fragment loop ----------------
 
-        e_corr = 0.0
+        e_corr = jnp.float64(0.0)
+        full_mp2_correction = jnp.float64(0.0)
+        if include_mp2_correction and mp2_correction_scope == 'full':
+            t0 = time.perf_counter()
+            full_mp2_correction, full_mp2_vjp = jax.vjp(
+                lambda m: lno_base.full_system_mp2_correction(
+                    m, method=mp2_correction_method, c_os=sos_c_os
+                ),
+                mf,
+            )
+            grad_mf_full, = full_mp2_vjp(jnp.float64(1.0))
+            grad_mf = jax.tree_util.tree_map(
+                _add_cotangent, grad_mf, grad_mf_full
+            )
+            e_corr = e_corr + full_mp2_correction
+            log(f'  Full-system MP2 correction: {time.perf_counter() - t0:8.2f} s, '
+                f'e = {float(full_mp2_correction):+.10f}')
+
         for ifrag in range(nfrag):
             fraglo_idx = frag_lolist_static[ifrag]
             frag_prescreen = prescreen_data['fragment_data'][ifrag]
@@ -247,7 +340,12 @@ class DLNOCCSD(LNOCCSD):
                 cc_local.ccsd_t = ccsd_t
                 cc_local.dcsd = dcsd
                 cc_local.verbose_imp = verbose_imp
-                cc_local.compute_domain_pt2 = include_mp2_correction
+                cc_local.compute_domain_pt2 = (
+                    include_mp2_correction
+                    and mp2_correction_scope == 'domain'
+                )
+                cc_local.domain_mp2_method = mp2_correction_method
+                cc_local.domain_sos_mp2_c_os = sos_c_os
 
                 orbfragloc = lo_coeff_[:, _fraglo]
 
@@ -271,7 +369,7 @@ class DLNOCCSD(LNOCCSD):
                 if orbfrag is None:
                     # No PNOs survived the threshold; only the
                     # per-domain MP2 contributes (if MP2 correction on).
-                    if include_mp2_correction:
+                    if include_mp2_correction and mp2_correction_scope == 'domain':
                         return _weight * domain_pt2
                     return jnp.float64(0.0)
 
@@ -301,13 +399,17 @@ class DLNOCCSD(LNOCCSD):
                 e_pt2_frag, e_cc_frag, e_cc_t_frag = res
 
                 contribution = e_cc_frag + e_cc_t_frag + sign_pt2 * e_pt2_frag
-                if include_mp2_correction:
+                if include_mp2_correction and mp2_correction_scope == 'domain':
                     contribution = contribution + domain_pt2
                 aux = {
                     'pt2':        jnp.asarray(e_pt2_frag),
                     'cc':         jnp.asarray(e_cc_frag),
                     'cc_t':       jnp.asarray(e_cc_t_frag),
-                    'domain_pt2': jnp.asarray(domain_pt2 if include_mp2_correction else 0.0),
+                    'domain_pt2': jnp.asarray(
+                        domain_pt2
+                        if include_mp2_correction and mp2_correction_scope == 'domain'
+                        else 0.0
+                    ),
                 }
                 return _weight * contribution, aux
 
@@ -333,6 +435,7 @@ class DLNOCCSD(LNOCCSD):
                 log(f'  [frag {ifrag+1}/{nfrag}] reverse VJP: done')
             grad_mf = jax.tree_util.tree_map(_add_cotangent, grad_mf, g_mf_i)
             grad_lo = jax.tree_util.tree_map(_add_cotangent, grad_lo, g_lo_i)
+            jax.block_until_ready((e_corr, grad_mf, grad_lo))
             # per-fragment t1, t2, PNOs, eris_fpno, transient cc all
             # freed at the end of this iteration.
             log(f'  [frag {ifrag+1}/{nfrag}] done in '
@@ -342,8 +445,14 @@ class DLNOCCSD(LNOCCSD):
                 f'cc={float(aux["cc"]):+.8f}, '
                 f'(T)={float(aux["cc_t"]):+.8f}'
                 + (f', domain_pt2={float(aux["domain_pt2"]):+.8f}'
-                   if include_mp2_correction else '')
+                   if include_mp2_correction and mp2_correction_scope == 'domain' else '')
                 + ')')
+            del e_frag, vjp_fn, aux, g_mf_i, g_lo_i, per_frag_fn
+            del fraglo_idx, frag_prescreen
+            _cleanup_after_fragment(
+                log if verbose >= _VERBOSE_PROGRESS else None,
+                label=f'fragment {ifrag+1}/{nfrag}',
+            )
 
         # ---------------- Close out outer-loop vjps ----------------
 

@@ -421,6 +421,10 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                     dcsd=cc_local.dcsd,
                     profile_info=None,
                     profile_pass=getattr(cc_local, 'profile_pass', None),
+                    pt2_fragment_method=(
+                        mp2_correction_method if include_mp2_correction else 'mp2'
+                    ),
+                    sos_c_os=sos_c_os,
                 )
                 e_pt2_frag, e_cc_frag, e_cc_t_frag = res
 

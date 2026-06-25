@@ -400,7 +400,7 @@ def solve_response_lambda(mycc, eris, t1, t2, bar_e, bar_t1, bar_t2,
     else:
         adiis = None
 
-    lambda_vec = np.zeros_like(amp)
+    lambda_vec = np.array(amp, copy=True)
     conv = False
     for istep in range(max_cycle):
         (lambda_df,) = vjp_fn(lambda_vec)

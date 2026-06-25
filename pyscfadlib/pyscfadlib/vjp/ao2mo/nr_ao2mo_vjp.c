@@ -199,6 +199,56 @@ void AO2MOnr_e2_vjp_drv(void (*ftrans)(), int (*fmmm)(),
 }
 
 
+void AO2MOnr_e2_mo_coeff_vjp_drv(int (*fmmm)(),
+                        double *mo_coeff_bar,
+                        double *eri, double *mo_coeff, double *ybar,
+                        int nij, int nao, int nmo, int *orbs_slice)
+{
+    struct _AO2MOvjpEnvs envs;
+    envs.bra_start = orbs_slice[0];
+    envs.bra_count = orbs_slice[1] - orbs_slice[0];
+    envs.ket_start = orbs_slice[2];
+    envs.ket_count = orbs_slice[3] - orbs_slice[2];
+    envs.nao = nao;
+    envs.nmo = nmo;
+    envs.mo_coeff = mo_coeff;
+
+    size_t ij_pair = (*fmmm)(NULL, NULL, NULL, NULL, NULL, &envs, OUTPUTIJ);
+    size_t nao2 = (*fmmm)(NULL, NULL, NULL, NULL, NULL, &envs, INPUT_IJ);
+
+    double *mo_coeff_bar_bufs[MAX_THREADS];
+    #pragma omp parallel
+    {
+        int i;
+        int i_count = envs.bra_count;
+        int j_count = envs.ket_count;
+        int thread_id = omp_get_thread_num();
+        double *mo_coeff_bar_priv;
+        if (thread_id == 0) {
+            mo_coeff_bar_priv = mo_coeff_bar;
+        } else {
+            mo_coeff_bar_priv = calloc(nao*nmo, sizeof(double));
+        }
+        mo_coeff_bar_bufs[thread_id] = mo_coeff_bar_priv;
+        double *eri_bar_row = malloc(sizeof(double) * nao2);
+        double *buf = malloc(sizeof(double) * (nao*nao*2 + nao*MIN(i_count, j_count)));
+        #pragma omp for schedule(dynamic)
+        for (i = 0; i < nij; i++) {
+            NPdunpack_tril(nao, eri + nao2*i, buf, 0);
+            (*fmmm)(eri_bar_row, mo_coeff_bar_priv, buf,
+                    ybar + ij_pair*i, buf + nao*nao, &envs, 0);
+        }
+        free(buf);
+        free(eri_bar_row);
+
+        omp_dsum_reduce_inplace(mo_coeff_bar_bufs, nao*nmo);
+        if (thread_id != 0) {
+            free(mo_coeff_bar_priv);
+        }
+    }
+}
+
+
 void AO2MOnr_e2_cderi_bar_project_omp(
         double *out, const double *y2,
         const double *mok_rows, const double *mol_cols,

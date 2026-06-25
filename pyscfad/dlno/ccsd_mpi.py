@@ -341,22 +341,6 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
 
         # ---- Per-fragment loop (rank-local subset) ----
         e_corr_local = jnp.float64(0.0)
-        if rank == 0 and include_mp2_correction and mp2_correction_scope == 'full':
-            t0 = time.perf_counter()
-            full_mp2_correction, full_mp2_vjp = jax.vjp(
-                lambda m: lno_base.full_system_mp2_correction(
-                    m, method=mp2_correction_method, c_os=sos_c_os
-                ),
-                mf,
-            )
-            grad_mf_full, = full_mp2_vjp(jnp.float64(1.0))
-            grad_mf = jax.tree_util.tree_map(
-                _add_cotangent, grad_mf, grad_mf_full
-            )
-            e_corr_local = e_corr_local + full_mp2_correction
-            log(f'  Full-system MP2 correction: {time.perf_counter() - t0:.2f} s, '
-                f'e = {float(full_mp2_correction):+.10f}')
-
         for ifrag in my_fragment_indices:
             fraglo_idx = frag_lolist_static[ifrag]
             frag_prescreen = prescreen_data['fragment_data'][ifrag]
@@ -491,6 +475,24 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                 log if verbose >= _VERBOSE_PROGRESS else None,
                 label=f'rank {rank} fragment {ifrag+1}/{nfrag}',
             )
+
+        if rank == 0 and include_mp2_correction and mp2_correction_scope == 'full':
+            t0 = time.perf_counter()
+            full_mp2_correction, full_mp2_vjp = jax.vjp(
+                lambda m: lno_base.full_system_mp2_correction(
+                    m, method=mp2_correction_method, c_os=sos_c_os
+                ),
+                mf,
+            )
+            grad_mf_full, = full_mp2_vjp(jnp.float64(1.0))
+            grad_mf = jax.tree_util.tree_map(
+                _add_cotangent, grad_mf, grad_mf_full
+            )
+            e_corr_local = e_corr_local + full_mp2_correction
+            jax.block_until_ready((e_corr_local, grad_mf))
+            log(f'  Full-system MP2 correction: {time.perf_counter() - t0:.2f} s, '
+                f'e = {float(full_mp2_correction):+.10f}')
+            del full_mp2_correction, full_mp2_vjp, grad_mf_full
 
         # Defensive: ranks with no fragments have grad_mf=None still.
         # Seed grad_mf as a zeros-of-canonical shape so the gather

@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from functools import reduce
 import numpy
 import jax
+import jax.numpy as jnp
 from jax import custom_vjp
 from jax.interpreters import ad as jax_ad
 from pyscf.cc import ccsd as pyscf_ccsd
@@ -253,6 +253,10 @@ def update_amps(mycc, t1, t2, eris):
     )
 
     if use_df_tile:
+        if mycc.direct:
+            raise NotImplementedError(
+                'DF tiled ovvv update does not support direct AO mode')
+
         # DF-direct path: build the ovvv block (nvir, nocc, nvir, nvir) on the
         # fly per tile from Lov, Lvv -- avoids the 1.9 GB persistent
         # `eris.ovvv` and the ~6 GB transient full unpack of `eris_vovv`.
@@ -261,9 +265,6 @@ def update_amps(mycc, t1, t2, eris):
         Lov_full = eris.Lov
         Lvv_full = eris.Lvv
 
-        blksize = int(os.environ.get('PYSCFAD_CCSD_OVVV_BLKSIZE', '32'))
-        blksize = max(1, min(blksize, nvir))
-
         wooVV_flat = np.zeros((nocc, nocc * nvir_pair))
         wVOov = np.zeros((nvir, nocc, nocc, nvir))
 
@@ -271,60 +272,50 @@ def update_amps(mycc, t1, t2, eris):
         theta = t2.transpose(1, 2, 0, 3) * 2
         theta -= t2.transpose(0, 2, 1, 3)  # (nocc, nvir, nocc, nvir) ~ (i, c, j, b)
 
-        if not mycc.direct:
-            tau_for_vvvo = t2 + np.einsum('ia,jb->ijab', t1, t1)
-            tmp_acc = np.zeros((nocc, nocc, nvir, nocc))
+        tau_for_vvvo = t2 + np.einsum('ia,jb->ijab', t1, t1)
+        tmp_acc = np.zeros((nocc, nocc, nvir, nocc))
 
-        for p0 in range(0, nvir, blksize):
-            p1 = min(p0 + blksize, nvir)
-            bw = p1 - p0
+        scan_idx = jnp.arange(nvir)
+        t1_scan = jnp.asarray(t1)
+        theta_scan = jnp.asarray(theta)
+        Lov_scan = jnp.asarray(Lov_full)
+        Lvv_scan = jnp.asarray(Lvv_full)
+        tau_scan = jnp.asarray(tau_for_vvvo)
 
-            # Build vovv[a in p0:p1, i, (bc)_packed] = einsum('xia,xb->aib', Lov[:,:,p0:p1], Lvv)
-            Lov_tile = Lov_full[:, :, p0:p1]
-            vovv_packed = np.einsum('xia,xb->aib', Lov_tile, Lvv_full)
-
-            # wooVV accumulator (packed): -t1[:, p0:p1] @ vovv_tile_flat
-            wooVV_flat = wooVV_flat - np.dot(
-                t1[:, p0:p1], vovv_packed.reshape(bw, nocc * nvir_pair)
+        def ovvv_body(carry, aidx):
+            fvv, wooVV_flat, wVOov, t1new, tmp_acc = carry
+            Lov_col = Lov_scan[:, :, aidx]
+            vovv_packed = np.einsum('xi,xb->ib', Lov_col, Lvv_scan)
+            wooVV_flat = wooVV_flat - (
+                t1_scan[:, aidx][:, None]
+                * vovv_packed.reshape(1, nocc * nvir_pair)
             )
-
-            # Unpack just this tile of vovv: (bw, nocc, nvir, nvir)
-            vovv_tile = lib.unpack_tril(vovv_packed.reshape(bw * nocc, nvir_pair))
-            vovv_tile = vovv_tile.reshape(bw, nocc, nvir, nvir)
-            vovv_packed = None
-
-            # einsum 'kc,ckab->ab' (vovv axis 0 is c, contract over tile range)
-            fvv = fvv + 2 * np.einsum('kc,ckab->ab', t1[:, p0:p1], vovv_tile)
-            # einsum 'kc,bkca->ab' (vovv axis 0 is b, output column b in [p0, p1))
-            fvv = fvv.at[:, p0:p1].add(
-                -np.einsum('kc,bkca->ab', t1, vovv_tile)
+            vovv = lib.unpack_tril(vovv_packed).reshape(nocc, nvir, nvir)
+            fvv = fvv + 2 * np.einsum('k,kab->ab',
+                                      t1_scan[:, aidx], vovv)
+            fvv = fvv.at[:, aidx].add(
+                -np.einsum('kc,kca->a', t1_scan, vovv)
             )
-
-            if not mycc.direct:
-                # vvvo[c, d, b, k] = vovv_tile[c, k, d, b].transpose(0, 2, 3, 1)
-                vvvo_tile = vovv_tile.transpose(0, 2, 3, 1)
-                tmp_acc = tmp_acc + np.einsum(
-                    'ijcd,cdbk->ijbk',
-                    tau_for_vvvo[:, :, p0:p1, :], vvvo_tile,
-                )
-
-            # einsum 'biac,jc->bija' (vovv axis 0 is b, output rows b in [p0, p1))
-            wVOov = wVOov.at[p0:p1].set(
-                np.einsum('biac,jc->bija', vovv_tile, t1)
+            vvvo = vovv.transpose(1, 2, 0)
+            tmp_acc = tmp_acc + np.einsum(
+                'ijd,dbk->ijbk',
+                tau_scan[:, :, aidx, :],
+                vvvo,
             )
-
-            # einsum 'icjb,cjba->ia' (vovv axis 0 is c, slice theta[:, p0:p1])
+            wVOov = wVOov.at[aidx].set(
+                np.einsum('iac,jc->ija', vovv, t1_scan)
+            )
             t1new = t1new + np.einsum(
-                'icjb,cjba->ia',
-                theta[:, p0:p1, :, :], vovv_tile,
-            )
+                'ijb,jba->ia', theta_scan[:, aidx, :, :], vovv)
+            return (fvv, wooVV_flat, wVOov, t1new, tmp_acc), None
 
-            vovv_tile = None
+        init = (fvv, wooVV_flat, wVOov, t1new, tmp_acc)
+        fvv, wooVV_flat, wVOov, t1new, tmp_acc = jax.lax.scan(
+            ovvv_body, init, scan_idx)[0]
 
-        if not mycc.direct:
-            t2new = t2new - np.einsum('ka,ijbk->ijab', t1, tmp_acc)
-            tmp_acc = None
-            tau_for_vvvo = None
+        t2new = t2new - np.einsum('ka,ijbk->ijab', t1, tmp_acc)
+        tmp_acc = None
+        tau_for_vvvo = None
 
         wooVV = lib.unpack_tril(wooVV_flat.reshape(nocc**2, nvir_pair))
         wVooV = wooVV.reshape(nocc, nocc, nvir, nvir).transpose(2, 1, 0, 3)

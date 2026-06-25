@@ -88,3 +88,56 @@ def nr_e2_bwd(orbs_slice, aosym, mosym, out, ao_loc,
     return (eri_bar, mo_coeff_bar)
 
 nr_e2.defvjp(nr_e2_fwd, nr_e2_bwd)
+
+
+def nr_e2_mo_coeff_vjp(eri, mo_coeff, ybar, orbs_slice, aosym='s1',
+                       mosym='s1', ao_loc=None):
+    """Return only the MO-coefficient cotangent of ``nr_e2``.
+
+    This is the memory-light path for callers that will backpropagate the
+    CDERI/AO-integral part separately.  It avoids materializing the
+    ``eri_bar`` array that the generic custom VJP has to return.
+    """
+    if ao_loc is not None:
+        raise NotImplementedError
+
+    eri = numpy.asarray(eri, order='C')
+    ybar = numpy.asarray(ybar, order='C')
+    nrow, nao_pair = eri.shape
+    nao, nmo = mo_coeff.shape
+    assert nrow == ybar.shape[0]
+
+    k0, k1, l0, l1 = orbs_slice
+    kc = k1 - k0
+    lc = l1 - l0
+    kl_count = kc * lc
+    assert kl_count == ybar.shape[1]
+
+    if aosym in ('s4', 's2', 's2kl'):
+        assert nao_pair == nao*(nao+1)// 2
+        if mosym == 's2':
+            raise NotImplementedError(
+                f'nr_e2_mo_coeff_vjp: mosym={mosym} not supported'
+            )
+        elif kc <= lc:
+            fmmm = _fpointer('AO2MOmmm_nr_vjp_s2_iltj')
+            mo_coeff = numpy.asarray(mo_coeff, order='F')
+            mo_coeff_bar = numpy.zeros_like(mo_coeff, order='C')
+        else:
+            fmmm = _fpointer('AO2MOmmm_nr_vjp_s2_igtj')
+            mo_coeff = numpy.asarray(mo_coeff, order='C')
+            mo_coeff_bar = numpy.zeros_like(mo_coeff, order='F')
+    else:
+        raise NotImplementedError(
+            f'nr_e2_mo_coeff_vjp: aosym={aosym} not supported'
+        )
+
+    fdrv = getattr(libao2mo, 'AO2MOnr_e2_mo_coeff_vjp_drv')
+    fdrv(fmmm,
+         mo_coeff_bar.ctypes.data_as(ctypes.c_void_p),
+         eri.ctypes.data_as(ctypes.c_void_p),
+         mo_coeff.ctypes.data_as(ctypes.c_void_p),
+         ybar.ctypes.data_as(ctypes.c_void_p),
+         ctypes.c_int(nrow), ctypes.c_int(nao), ctypes.c_int(nmo),
+         (ctypes.c_int*4)(*orbs_slice))
+    return mo_coeff_bar

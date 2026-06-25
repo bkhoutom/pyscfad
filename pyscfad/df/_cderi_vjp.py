@@ -24,6 +24,7 @@ import scipy.linalg
 import jax
 from jax import scipy as jax_scipy
 from jax.tree_util import tree_flatten, tree_map, tree_unflatten
+from pyscf import __config__
 from pyscf import lib as pyscf_lib
 from pyscf.ao2mo import _ao2mo as pyscf_ao2mo
 from pyscf.ao2mo.outcore import balance_partition
@@ -186,9 +187,18 @@ def _nr_e2_cderi_bar_project(ybar, mok_rows, mol_cols):
     return out
 
 
+def _df_jk_style_blockdim(max_memory, row_width):
+    blockdim = getattr(__config__, 'df_df_DF_blockdim', 240)
+    if max_memory is None:
+        return int(blockdim)
+    max_memory = max(float(max_memory) - pyscf_lib.current_memory()[0], 1.0)
+    return max(4, int(min(blockdim, max_memory*.3e6/8/max(row_width, 1))))
+
+
 def nr_e2_mo_coeff_vjp_from_cderi_source(cderi_source, mo_coeff, ybar,
                                          orbs_slice, aosym='s2',
-                                         mosym='s1', pair_idx=None):
+                                         mosym='s1', pair_idx=None,
+                                         max_memory=None):
     """Return only the MO-coefficient cotangent, streaming CDERI rows."""
     if cderi_source is None:
         raise NotImplementedError('Missing CDERI source for nr_e2 VJP.')
@@ -218,9 +228,10 @@ def nr_e2_mo_coeff_vjp_from_cderi_source(cderi_source, mo_coeff, ybar,
             else:
                 npair = int(pair_idx.size)
 
-        target_bytes = _nr_e2_vjp_block_mb() * 1024.0**2
-        row_bytes = max(npair + ybar.shape[1], 1) * numpy.dtype(numpy.float64).itemsize
-        blksize = max(1, min(naux, int(target_bytes // row_bytes)))
+        blksize = max(
+            1,
+            min(naux, _df_jk_style_blockdim(max_memory, npair + ybar.shape[1])),
+        )
 
         for p0 in range(0, naux, blksize):
             p1 = min(p0 + blksize, naux)
@@ -229,12 +240,10 @@ def nr_e2_mo_coeff_vjp_from_cderi_source(cderi_source, mo_coeff, ybar,
             else:
                 cderi = numpy.asarray(eri1[p0:p1, pair_idx])
 
-            def fn(cderi_, mo_coeff_):
-                return _ao2mo.nr_e2(cderi_, mo_coeff_, orbs_slice,
-                                    aosym=aosym, mosym=mosym)
-
-            _, pullback = jax.vjp(fn, np.asarray(cderi), mo_coeff)
-            _, mo_coeff_bar_blk = pullback(np.asarray(ybar[p0:p1]))
+            mo_coeff_bar_blk = _ao2mo.nr_e2_mo_coeff_vjp(
+                cderi, mo_coeff, ybar[p0:p1], orbs_slice,
+                aosym=aosym, mosym=mosym,
+            )
             mo_coeff_bar = _tree_add(mo_coeff_bar, mo_coeff_bar_blk)
             cderi = mo_coeff_bar_blk = None
     return mo_coeff_bar
@@ -291,6 +300,8 @@ def cholesky_eri_vjp_from_cderi_source(mol, auxmol, cderi_source, cderi_bar,
     solve VJP; derivative integral VJPs are evaluated one AO-pair block at a
     time.
     """
+    t_total = time.perf_counter()
+    _profile_msg('cholesky_eri_vjp_from_cderi_source start')
     if aosym not in ('s2', 's2ij'):
         raise NotImplementedError(f'Only packed s2 CDERI is supported, got {aosym}.')
     if cderi_source is None:
@@ -307,6 +318,7 @@ def cholesky_eri_vjp_from_cderi_source(mol, auxmol, cderi_source, cderi_bar,
     if nao_pair != nao * (nao + 1) // 2:
         raise NotImplementedError('Only packed s2 CDERI cotangents are supported.')
 
+    t = time.perf_counter()
     j2c = auxmol.intor(int2c, hermi=1)
     j2c_np = numpy.asarray(jax.device_get(j2c))
     try:
@@ -319,6 +331,10 @@ def cholesky_eri_vjp_from_cderi_source(mol, auxmol, cderi_source, cderi_bar,
         raise NotImplementedError(
             'Linear-dependent auxiliary metric fallback is not implemented.'
         )
+    _profile_msg(
+        'cholesky_eri_vjp_from_cderi_source metric setup done '
+        f'{time.perf_counter() - t:.2f} s'
+    )
 
     max_words = max(max_memory, 0) * 1e6 / 8 - low.size - naux * nao_pair
     mem_buflen = max(int(max_words / max(naoaux, 1) / 2), 8)
@@ -330,6 +346,8 @@ def cholesky_eri_vjp_from_cderi_source(mol, auxmol, cderi_source, cderi_bar,
     auxmol_bar = None
     low_bar = numpy.zeros_like(low)
 
+    t = time.perf_counter()
+    nblocks = 0
     with df_addons.load(cderi_source, 'j3c') as feri:
         p1 = 0
         for sh_range in shranges:
@@ -344,6 +362,7 @@ def cholesky_eri_vjp_from_cderi_source(mol, auxmol, cderi_source, cderi_bar,
             cderi_bar_blk = cderi_bar[:, p0:p1]
             if not numpy.any(cderi_bar_blk):
                 continue
+            nblocks += 1
 
             cderi_blk = numpy.asarray(feri[:, p0:p1])
             ints_bar = scipy.linalg.solve_triangular(
@@ -362,6 +381,11 @@ def cholesky_eri_vjp_from_cderi_source(mol, auxmol, cderi_source, cderi_bar,
             mol_blk_bar, auxmol_blk_bar = int3c_pullback(np.asarray(ints_bar))
             mol_bar = _tree_add(mol_bar, mol_blk_bar)
             auxmol_bar = _tree_add(auxmol_bar, auxmol_blk_bar)
+            cderi_blk = ints_bar = mol_blk_bar = auxmol_blk_bar = None
+    _profile_msg(
+        'cholesky_eri_vjp_from_cderi_source int3c block loop done '
+        f'nblocks={nblocks} {time.perf_counter() - t:.2f} s'
+    )
 
     if p1 != nao_pair:
         raise RuntimeError('CDERI VJP shell ranges did not cover all AO pairs.')
@@ -369,9 +393,18 @@ def cholesky_eri_vjp_from_cderi_source(mol, auxmol, cderi_source, cderi_bar,
     def metric_cholesky(auxmol_):
         return jax_scipy.linalg.cholesky(auxmol_.intor(int2c, hermi=1), lower=True)
 
+    t = time.perf_counter()
     _, chol_pullback = jax.vjp(metric_cholesky, auxmol)
     aux_metric_bar = chol_pullback(np.asarray(numpy.tril(low_bar)))[0]
     auxmol_bar = _tree_add(auxmol_bar, aux_metric_bar)
+    _profile_msg(
+        'cholesky_eri_vjp_from_cderi_source metric cholesky pullback done '
+        f'{time.perf_counter() - t:.2f} s'
+    )
+    _profile_msg(
+        'cholesky_eri_vjp_from_cderi_source done '
+        f'{time.perf_counter() - t_total:.2f} s'
+    )
     return mol_bar, auxmol_bar
 
 
@@ -380,6 +413,8 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
                                          int3c=None, int2c=None,
                                          aosym='s2ij'):
     """Back-propagate through Cholesky CDERI from AO-pair cotangent blocks."""
+    t_total = time.perf_counter()
+    _profile_msg('cholesky_eri_vjp_from_cderi_block_fn start')
     if aosym not in ('s2', 's2ij'):
         raise NotImplementedError(f'Only packed s2 CDERI is supported, got {aosym}.')
     if cderi_source is None:
@@ -393,6 +428,7 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
     nao = mol.nao
     nao_pair = nao * (nao + 1) // 2
 
+    t = time.perf_counter()
     j2c = auxmol.intor(int2c, hermi=1)
     j2c_np = numpy.asarray(jax.device_get(j2c))
     try:
@@ -405,6 +441,10 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
         raise NotImplementedError(
             'Linear-dependent auxiliary metric fallback is not implemented.'
         )
+    _profile_msg(
+        'cholesky_eri_vjp_from_cderi_block_fn metric setup done '
+        f'{time.perf_counter() - t:.2f} s'
+    )
 
     max_words = max(max_memory, 0) * 1e6 / 8 - low.size
     mem_buflen = max(int(max_words / max(naoaux, 1) / 3), 8)
@@ -416,6 +456,8 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
     auxmol_bar = None
     low_bar = numpy.zeros_like(low)
 
+    t = time.perf_counter()
+    nblocks = 0
     with df_addons.load(cderi_source, 'j3c') as feri:
         if int(feri.shape[0]) != naoaux or int(feri.shape[1]) != nao_pair:
             raise NotImplementedError('CDERI source shape does not match mol/auxmol.')
@@ -435,9 +477,10 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
                 raise RuntimeError(
                     'CDERI cotangent block has shape '
                     f'{cderi_bar_blk.shape}, expected {(naoaux, p1 - p0)}.'
-                )
+            )
             if not numpy.any(cderi_bar_blk):
                 continue
+            nblocks += 1
 
             cderi_blk = numpy.asarray(feri[:, p0:p1])
 
@@ -458,6 +501,11 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
             mol_bar = _tree_add(mol_bar, mol_blk_bar)
             auxmol_bar = _tree_add(auxmol_bar, auxmol_blk_bar)
             cderi_bar_blk = cderi_blk = ints_bar = None
+            mol_blk_bar = auxmol_blk_bar = None
+    _profile_msg(
+        'cholesky_eri_vjp_from_cderi_block_fn int3c block loop done '
+        f'nblocks={nblocks} {time.perf_counter() - t:.2f} s'
+    )
 
     if p1 != nao_pair:
         raise RuntimeError('CDERI VJP shell ranges did not cover all AO pairs.')
@@ -465,9 +513,18 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
     def metric_cholesky(auxmol_):
         return jax_scipy.linalg.cholesky(auxmol_.intor(int2c, hermi=1), lower=True)
 
+    t = time.perf_counter()
     _, chol_pullback = jax.vjp(metric_cholesky, auxmol)
     aux_metric_bar = chol_pullback(np.asarray(numpy.tril(low_bar)))[0]
     auxmol_bar = _tree_add(auxmol_bar, aux_metric_bar)
+    _profile_msg(
+        'cholesky_eri_vjp_from_cderi_block_fn metric cholesky pullback done '
+        f'{time.perf_counter() - t:.2f} s'
+    )
+    _profile_msg(
+        'cholesky_eri_vjp_from_cderi_block_fn done '
+        f'{time.perf_counter() - t_total:.2f} s'
+    )
     return mol_bar, auxmol_bar
 
 

@@ -14,8 +14,10 @@
 
 from functools import partial
 import ctypes
+import tempfile
 import os
 import time
+import h5py
 import numpy
 import jax
 import jax.numpy as jnp
@@ -145,6 +147,32 @@ def _cderi_mol_aux_vjp(dfobj, eri_bar):
     return mol_bar, auxmol_bar
 
 
+def _cderi_mol_aux_vjp_from_block_fn(dfobj, eri_bar_block_fn):
+    auxmol = dfobj.auxmol
+    if auxmol is None:
+        return None, None
+
+    get_cderi = getattr(dfobj, '_get_cderi_source', None)
+    cderi_source = (
+        get_cderi() if get_cderi is not None else getattr(dfobj, '_cderi', None)
+    )
+    mol_bar, auxmol_bar = _cderi_vjp.cholesky_eri_vjp_from_cderi_block_fn(
+        dfobj.mol,
+        auxmol,
+        cderi_source,
+        eri_bar_block_fn,
+        max(dfobj.max_memory, 4096),
+        int3c=dfobj.mol._add_suffix('int3c2e'),
+        int2c=dfobj.mol._add_suffix('int2c2e'),
+        aosym='s2ij',
+    )
+    mol_bar_leaves = tree_flatten(mol_bar)[0]
+    auxmol_bar_leaves = tree_flatten(auxmol_bar)[0]
+    mol_bar = mol_bar_leaves[0] if mol_bar_leaves else None
+    auxmol_bar = auxmol_bar_leaves[0] if auxmol_bar_leaves else None
+    return mol_bar, auxmol_bar
+
+
 def _has_tracer(*xs):
     leaves = []
     for x in xs:
@@ -202,6 +230,7 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
     dms = numpy.asarray(dm)
     dm_shape = dms.shape
     nao = dm_shape[-1]
+    nao_pair = nao * (nao + 1) // 2
     dms = dms.reshape(-1,nao,nao)
     nset = dms.shape[0]
 
@@ -214,8 +243,14 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
         vj_bar_tril = lib.pack_tril(vj_bar + vj_bar.conj().transpose(0,2,1))
         vj_bar_tril[:,idx*(idx+1)//2+idx] *= .5
 
-    #TODO save eri_bar on disk
-    eri_bar = numpy.zeros((dfobj.get_naoaux(), nao*(nao+1)//2))
+    naoaux = dfobj.get_naoaux()
+    eri_bar_shape = (naoaux, nao_pair)
+    leaves, tree = tree_flatten(dfobj)
+    cderi_leaf = leaves[-1] if leaves else None
+    return_cderi_bar_leaf = (
+        hasattr(cderi_leaf, 'shape')
+        and tuple(cderi_leaf.shape) == eri_bar_shape
+    )
     dms_bar = [numpy.zeros((nao,nao), order='F'),] * nset
 
     vk_bar = numpy.asarray(vk_bar).reshape(-1,nao,nao)
@@ -227,71 +262,123 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
     max_memory = dfobj.max_memory - lib.current_memory()[0]
     blksize = max(4, int(min(dfobj.blockdim, max_memory*.3e6/8/nao**2)))
     buf = numpy.empty((blksize,nao,nao))
-    p1 = 0
-    t_loop = time.perf_counter()
-    for eri1 in dfobj.loop(blksize):
-        naux, nao_pair = eri1.shape
-        p0, p1 = p1, p1 + naux
-        if with_j:
-            rho_bar = vj_bar_tril @ eri1.T
-            dmtril_bar = rho_bar @ eri1
-            dms_bar += lib.unpack_tril(dmtril_bar)
-
-            rho = dmtril @ eri1.T
-            eri_bar[p0:p1] += rho.T @ vj_bar_tril
-            eri_bar[p0:p1] += rho_bar.T @ dmtril
-
-        for k in range(nset):
-            #TODO save buf1 on disk to avoid recomputation
-            buf1 = buf[:naux]
-            fdrv(ftrans, fmmm,
-                 buf1.ctypes.data_as(ctypes.c_void_p),
-                 eri1.ctypes.data_as(ctypes.c_void_p),
-                 dms[k].ctypes.data_as(ctypes.c_void_p),
-                 ctypes.c_int(naux), *rargs)
-
-            vjpdrv(eri_bar[p0:p1].ctypes.data_as(ctypes.c_void_p),
-                   dms_bar[k].ctypes.data_as(ctypes.c_void_p),
-                   vk_bar[k].ctypes.data_as(ctypes.c_void_p),
-                   buf1.ctypes.data_as(ctypes.c_void_p),
-                   eri1.ctypes.data_as(ctypes.c_void_p),
-                   dms[k].ctypes.data_as(ctypes.c_void_p),
-                   ctypes.c_int(naux), ctypes.c_int(nao))
-    _profile_msg(
-        f'get_jk_bwd DF block loop done naux={p1} blksize={blksize} '
-        f'{time.perf_counter() - t_loop:.2f} s'
-    )
-
-    dm_bar = numpy.asarray(dms_bar).reshape(dm_shape)
-    #TODO need a better way to add vjps for objects
-    leaves, tree = tree_flatten(dfobj)
-    bar_leaves = []
-    mol_bar = auxmol_bar = None
-    if len(leaves) >= 3 and hasattr(leaves[-1], 'shape') and tuple(leaves[-1].shape) != tuple(eri_bar.shape):
-        t_cderi = time.perf_counter()
-        _profile_msg('get_jk_bwd cderi mol/aux vjp start')
-        mol_bar, auxmol_bar = _cderi_mol_aux_vjp(dfobj, eri_bar)
-        _profile_msg(
-            'get_jk_bwd cderi mol/aux vjp done '
-            f'{time.perf_counter() - t_cderi:.2f} s'
+    stream_eri_bar = (dfobj.auxmol is not None and not return_cderi_bar_leaf)
+    eri_bar = None
+    eri_bar_file = None
+    eri_bar_path = None
+    eri_bar_h5 = None
+    if stream_eri_bar:
+        fd, eri_bar_path = tempfile.mkstemp(
+            suffix='.h5', prefix='pyscfad_dfjk_eri_bar_', dir=lib.param.TMPDIR
         )
-    for i, leaf in enumerate(leaves):
-        if i == 0:
-            bar_leaves.append(mol_bar)
-        elif i == 1:
-            bar_leaves.append(auxmol_bar)
-        elif i == len(leaves) - 1:
-            if hasattr(leaf, 'shape') and tuple(leaf.shape) == tuple(eri_bar.shape):
-                bar_leaves.append(eri_bar)
+        os.close(fd)
+        eri_bar_file = h5py.File(eri_bar_path, 'w')
+        chunk_pair = min(nao_pair, 1024)
+        chunk_aux = min(naoaux, max(blksize, 16))
+        eri_bar_h5 = eri_bar_file.create_dataset(
+            'eri_bar_T',
+            shape=(nao_pair, naoaux),
+            dtype=numpy.float64,
+            chunks=(chunk_pair, chunk_aux),
+        )
+    else:
+        eri_bar = numpy.zeros(eri_bar_shape)
+
+    p1 = 0
+    try:
+        t_loop = time.perf_counter()
+        for eri1 in dfobj.loop(blksize):
+            naux, nao_pair_blk = eri1.shape
+            if nao_pair_blk != nao_pair:
+                raise RuntimeError(
+                    f'DF block has pair dimension {nao_pair_blk}, '
+                    f'expected {nao_pair}.'
+                )
+            p0, p1 = p1, p1 + naux
+            if stream_eri_bar:
+                eri_bar_blk = numpy.zeros((naux, nao_pair), dtype=eri1.dtype)
+            else:
+                eri_bar_blk = eri_bar[p0:p1]
+            if with_j:
+                rho_bar = vj_bar_tril @ eri1.T
+                dmtril_bar = rho_bar @ eri1
+                dms_bar += lib.unpack_tril(dmtril_bar)
+
+                rho = dmtril @ eri1.T
+                eri_bar_blk += rho.T @ vj_bar_tril
+                eri_bar_blk += rho_bar.T @ dmtril
+
+            for k in range(nset):
+                #TODO save buf1 on disk to avoid recomputation
+                buf1 = buf[:naux]
+                fdrv(ftrans, fmmm,
+                     buf1.ctypes.data_as(ctypes.c_void_p),
+                     eri1.ctypes.data_as(ctypes.c_void_p),
+                     dms[k].ctypes.data_as(ctypes.c_void_p),
+                     ctypes.c_int(naux), *rargs)
+
+                vjpdrv(eri_bar_blk.ctypes.data_as(ctypes.c_void_p),
+                       dms_bar[k].ctypes.data_as(ctypes.c_void_p),
+                       vk_bar[k].ctypes.data_as(ctypes.c_void_p),
+                       buf1.ctypes.data_as(ctypes.c_void_p),
+                       eri1.ctypes.data_as(ctypes.c_void_p),
+                       dms[k].ctypes.data_as(ctypes.c_void_p),
+                       ctypes.c_int(naux), ctypes.c_int(nao))
+            if stream_eri_bar:
+                eri_bar_h5[:, p0:p1] = eri_bar_blk.T
+            eri_bar_blk = None
+        _profile_msg(
+            f'get_jk_bwd DF block loop done naux={p1} blksize={blksize} '
+            f'{time.perf_counter() - t_loop:.2f} s'
+        )
+
+        dm_bar = numpy.asarray(dms_bar).reshape(dm_shape)
+        #TODO need a better way to add vjps for objects
+        bar_leaves = []
+        mol_bar = auxmol_bar = None
+        if len(leaves) >= 3 and not return_cderi_bar_leaf:
+            t_cderi = time.perf_counter()
+            _profile_msg('get_jk_bwd cderi mol/aux vjp start')
+            if stream_eri_bar:
+                eri_bar_file.flush()
+
+                def eri_bar_block_fn(q0, q1):
+                    return numpy.asarray(eri_bar_h5[q0:q1, :]).T
+
+                mol_bar, auxmol_bar = _cderi_mol_aux_vjp_from_block_fn(
+                    dfobj, eri_bar_block_fn
+                )
+            else:
+                mol_bar, auxmol_bar = _cderi_mol_aux_vjp(dfobj, eri_bar)
+            _profile_msg(
+                'get_jk_bwd cderi mol/aux vjp done '
+                f'{time.perf_counter() - t_cderi:.2f} s'
+            )
+        for i, leaf in enumerate(leaves):
+            if i == 0:
+                bar_leaves.append(mol_bar)
+            elif i == 1:
+                bar_leaves.append(auxmol_bar)
+            elif i == len(leaves) - 1:
+                if return_cderi_bar_leaf:
+                    bar_leaves.append(eri_bar)
+                elif hasattr(leaf, 'shape'):
+                    bar_leaves.append(numpy.zeros(leaf.shape))
+                else:
+                    bar_leaves.append(None)
             elif hasattr(leaf, 'shape'):
                 bar_leaves.append(numpy.zeros(leaf.shape))
             else:
                 bar_leaves.append(None)
-        elif hasattr(leaf, 'shape'):
-            bar_leaves.append(numpy.zeros(leaf.shape))
-        else:
-            bar_leaves.append(None)
-    dfobj_bar = tree_unflatten(tree, bar_leaves)
+        dfobj_bar = tree_unflatten(tree, bar_leaves)
+    finally:
+        if eri_bar_file is not None:
+            eri_bar_file.close()
+        if eri_bar_path is not None:
+            try:
+                os.remove(eri_bar_path)
+            except OSError:
+                pass
     log.timer('get_jk_bwd')
     del log
     _profile_msg(f'get_jk_bwd done {time.perf_counter() - t_bwd:.2f} s')

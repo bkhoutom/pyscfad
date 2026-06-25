@@ -38,10 +38,10 @@ nb::dict Registrations() {
     dict["lapack_zhegvd"] =
         EncapsulateFunction(ComplexHegvd<std::complex<double>>::Kernel);
 
-    dict["lapack_ssygvd_ffi"] = EncapsulateFunction(lapack_ssygvd_ffi);
-    dict["lapack_dsygvd_ffi"] = EncapsulateFunction(lapack_dsygvd_ffi);
-    dict["lapack_chegvd_ffi"] = EncapsulateFunction(lapack_chegvd_ffi);
-    dict["lapack_zhegvd_ffi"] = EncapsulateFunction(lapack_zhegvd_ffi);
+    dict["lapack_ssygvd_ffi"] = EncapsulateFfiHandler(lapack_ssygvd_ffi);
+    dict["lapack_dsygvd_ffi"] = EncapsulateFfiHandler(lapack_dsygvd_ffi);
+    dict["lapack_chegvd_ffi"] = EncapsulateFfiHandler(lapack_chegvd_ffi);
+    dict["lapack_zhegvd_ffi"] = EncapsulateFfiHandler(lapack_zhegvd_ffi);
     return dict;
 }
 

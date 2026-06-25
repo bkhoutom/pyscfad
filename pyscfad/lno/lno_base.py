@@ -1565,7 +1565,7 @@ _sos_mp2_fragment_energy_from_df_lov.defvjp(
 
 def _nr_e2_mo_coeff_vjp_from_cderi_source_ybar_block_fn(
         cderi_source, mo_coeff, ybar_block_fn, ybar_shape,
-        orbs_slice, aosym='s2'):
+        orbs_slice, aosym='s2', max_memory=None):
     if cderi_source is None:
         raise NotImplementedError('Missing CDERI source for fused nr_e2 VJP.')
     if aosym not in ('s2', 's2ij'):
@@ -1579,22 +1579,24 @@ def _nr_e2_mo_coeff_vjp_from_cderi_source_ybar_block_fn(
         if not hasattr(eri1, 'shape'):
             raise NotImplementedError('Unsupported CDERI source for fused nr_e2 VJP.')
         npair = int(eri1.shape[1])
-        target_bytes = _domain_sos_mp2_ybar_block_mb() * 1024.0**2
-        row_bytes = max(npair + kc * lc, 1) * numpy.dtype(numpy.float64).itemsize
-        blksize = max(1, min(naux, int(target_bytes // row_bytes)))
+        blksize = max(
+            1,
+            min(
+                naux,
+                _cderi_vjp._df_jk_style_blockdim(
+                    max_memory, npair + kc * lc
+                ),
+            ),
+        )
 
         for p0 in range(0, naux, blksize):
             p1 = min(p0 + blksize, naux)
             cderi = numpy.asarray(eri1[p0:p1])
             ybar_blk = ybar_block_fn(p0, p1)
-
-            def fn(cderi_, mo_coeff_):
-                return _ao2mo.nr_e2(
-                    cderi_, mo_coeff_, orbs_slice, aosym=aosym, mosym='s1'
-                )
-
-            _, pullback = jax.vjp(fn, np.asarray(cderi), mo_coeff)
-            _, mo_coeff_bar_blk = pullback(np.asarray(ybar_blk))
+            mo_coeff_bar_blk = _ao2mo.nr_e2_mo_coeff_vjp(
+                cderi, mo_coeff, ybar_blk, orbs_slice,
+                aosym=aosym, mosym='s1',
+            )
             mo_coeff_bar = _tree_add(mo_coeff_bar, mo_coeff_bar_blk)
             cderi = ybar_blk = mo_coeff_bar_blk = None
     return mo_coeff_bar
@@ -1641,7 +1643,7 @@ def _outcore_full_nr_e2_bwd_from_ybar_block_fn(
         with _vjp_progress_section('fused SOS-MP2 DF AO2MO MO-coeff backward'):
             mo_coeff_bar = _nr_e2_mo_coeff_vjp_from_cderi_source_ybar_block_fn(
                 cderi_source, mo_coeff, block_fn, (naux, nkl),
-                orbs_slice, aosym='s2'
+                orbs_slice, aosym='s2', max_memory=max_memory
             )
 
         with _vjp_progress_section('fused SOS-MP2 DF integral derivative backward'):
@@ -1694,7 +1696,8 @@ def _outcore_full_nr_e2_bwd_from_dense_ybar(
     ybar = numpy.asarray(jax.device_get(ybar))
     with _vjp_progress_section('hybrid SOS-MP2 DF AO2MO MO-coeff backward'):
         mo_coeff_bar = _cderi_vjp.nr_e2_mo_coeff_vjp_from_cderi_source(
-            cderi_source, mo_coeff, ybar, orbs_slice, aosym='s2'
+            cderi_source, mo_coeff, ybar, orbs_slice, aosym='s2',
+            max_memory=max_memory,
         )
 
     try:
@@ -3359,7 +3362,7 @@ def _outcore_local_nr_e2_from_global_cderi_bwd(cderi_source, max_memory,
         with _vjp_progress_section('fragment DF AO2MO MO-coeff backward'):
             mo_coeff_bar = _cderi_vjp.nr_e2_mo_coeff_vjp_from_cderi_source(
                 cderi_source, mo_coeff, ybar, orbs_slice, aosym='s2',
-                pair_idx=pair_idx,
+                pair_idx=pair_idx, max_memory=max_memory,
             )
 
         ybar_np = numpy.asarray(jax.device_get(ybar))
@@ -3442,7 +3445,8 @@ def _outcore_nr_e2_bwd(cderi_source, max_memory, orbs_slice, aosym, res, ybar):
     try:
         with _vjp_progress_section('global DF AO2MO MO-coeff backward'):
             mo_coeff_bar = _cderi_vjp.nr_e2_mo_coeff_vjp_from_cderi_source(
-                cderi_source, mo_coeff, ybar, orbs_slice, aosym=aosym
+                cderi_source, mo_coeff, ybar, orbs_slice, aosym=aosym,
+                max_memory=max_memory,
             )
 
         ybar_np = numpy.asarray(jax.device_get(ybar))

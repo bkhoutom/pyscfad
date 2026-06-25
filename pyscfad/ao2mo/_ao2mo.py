@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import jax
 from pyscfad import numpy as np
 from pyscfad import config
 from ._ao2mo_opt import nr_e2 as nr_e2_opt
+from ._ao2mo_opt import nr_e2_mo_coeff_vjp as nr_e2_mo_coeff_vjp_opt
 
 def nr_e2(eri, mo_coeff, orbs_slice, aosym='s1', mosym='s1', out=None,
           ao_loc=None):
@@ -38,3 +40,21 @@ def nr_e2_gen(eri, mo_coeff, orbs_slice, aosym='s1'):
         eri = eri.reshape(-1,nao,nao)
     out = np.einsum('lpq,pi,qj->lij', eri, orb_k, orb_l).reshape(nrow,-1)
     return out
+
+
+def nr_e2_mo_coeff_vjp(eri, mo_coeff, ybar, orbs_slice, aosym='s1',
+                       mosym='s1', ao_loc=None):
+    if config.moleintor_opt:
+        try:
+            return nr_e2_mo_coeff_vjp_opt(
+                eri, mo_coeff, ybar, orbs_slice,
+                aosym=aosym, mosym=mosym, ao_loc=ao_loc,
+            )
+        except AttributeError:
+            pass
+
+    def fn(mo_coeff_):
+        return nr_e2_gen(eri, mo_coeff_, orbs_slice, aosym=aosym)
+
+    _, pullback = jax.vjp(fn, mo_coeff)
+    return pullback(ybar)[0]

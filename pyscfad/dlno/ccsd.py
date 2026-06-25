@@ -301,23 +301,6 @@ class DLNOCCSD(LNOCCSD):
         # ---------------- Per-fragment loop ----------------
 
         e_corr = jnp.float64(0.0)
-        full_mp2_correction = jnp.float64(0.0)
-        if include_mp2_correction and mp2_correction_scope == 'full':
-            t0 = time.perf_counter()
-            full_mp2_correction, full_mp2_vjp = jax.vjp(
-                lambda m: lno_base.full_system_mp2_correction(
-                    m, method=mp2_correction_method, c_os=sos_c_os
-                ),
-                mf,
-            )
-            grad_mf_full, = full_mp2_vjp(jnp.float64(1.0))
-            grad_mf = jax.tree_util.tree_map(
-                _add_cotangent, grad_mf, grad_mf_full
-            )
-            e_corr = e_corr + full_mp2_correction
-            log(f'  Full-system MP2 correction: {time.perf_counter() - t0:8.2f} s, '
-                f'e = {float(full_mp2_correction):+.10f}')
-
         for ifrag in range(nfrag):
             fraglo_idx = frag_lolist_static[ifrag]
             frag_prescreen = prescreen_data['fragment_data'][ifrag]
@@ -453,6 +436,24 @@ class DLNOCCSD(LNOCCSD):
                 log if verbose >= _VERBOSE_PROGRESS else None,
                 label=f'fragment {ifrag+1}/{nfrag}',
             )
+
+        if include_mp2_correction and mp2_correction_scope == 'full':
+            t0 = time.perf_counter()
+            full_mp2_correction, full_mp2_vjp = jax.vjp(
+                lambda m: lno_base.full_system_mp2_correction(
+                    m, method=mp2_correction_method, c_os=sos_c_os
+                ),
+                mf,
+            )
+            grad_mf_full, = full_mp2_vjp(jnp.float64(1.0))
+            grad_mf = jax.tree_util.tree_map(
+                _add_cotangent, grad_mf, grad_mf_full
+            )
+            e_corr = e_corr + full_mp2_correction
+            jax.block_until_ready((e_corr, grad_mf))
+            log(f'  Full-system MP2 correction: {time.perf_counter() - t0:8.2f} s, '
+                f'e = {float(full_mp2_correction):+.10f}')
+            del full_mp2_correction, full_mp2_vjp, grad_mf_full
 
         # ---------------- Close out outer-loop vjps ----------------
 

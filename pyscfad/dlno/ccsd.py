@@ -330,6 +330,11 @@ class DLNOCCSD(LNOCCSD):
                 cc_local.domain_mp2_method = mp2_correction_method
                 cc_local.domain_sos_mp2_c_os = sos_c_os
 
+                #jo changes
+                cc_local.use_dlno_prescreen = True
+                cc_local.dlno_prescreen_data = frag_prescreen
+                cc_local._current_ifrag = _ifrag
+
                 orbfragloc = lo_coeff_[:, _fraglo]
 
                 # Build the fragment eris in place, streaming the
@@ -341,6 +346,7 @@ class DLNOCCSD(LNOCCSD):
                     cc_local, stub_eris, _frag_prescreen,
                 )
 
+                t_fpno1 = time.perf_counter()
                 frzfrag, orbfrag, domain_pt2 = lno_base.make_fpno1(
                     cc_local, eris_fpno, orbfragloc, no_type,
                     lno_base.THRESH_INTERNAL,
@@ -348,6 +354,9 @@ class DLNOCCSD(LNOCCSD):
                     frag_prescreen=_frag_prescreen,
                     frozen_mask=cc_local.get_frozen_mask(),
                 )
+                if verbose >= _VERBOSE_PROGRESS:
+                    log(f'  [frag {_ifrag+1}/{nfrag}] make_fpno1:          '
+                        f'{time.perf_counter() - t_fpno1:8.2f} s')
 
                 if orbfrag is None:
                     # No PNOs survived the threshold; only the

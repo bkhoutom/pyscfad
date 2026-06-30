@@ -364,6 +364,9 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                 )
                 cc_local.domain_mp2_method = mp2_correction_method
                 cc_local.domain_sos_mp2_c_os = sos_c_os
+                
+                cc_local.use_dlno_prescreen = True
+                cc_local.dlno_prescreen_data = _frag_prescreen
 
                 orbfragloc = lo_coeff_[:, _fraglo]
                 stub_eris = _make_stub_eris(mf_)

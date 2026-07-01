@@ -347,6 +347,7 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
             weight = 1.0
 
             def per_frag_fn(mf_, lo_coeff_,
+                            _ifrag=ifrag,
                             _fraglo=fraglo_idx,
                             _frag_prescreen=frag_prescreen,
                             _weight=weight):
@@ -373,6 +374,7 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                 eris_fpno = lno_base.make_fragment_eris(
                     cc_local, stub_eris, _frag_prescreen,
                 )
+                t_fpno1 = time.perf_counter()
                 frzfrag, orbfrag, domain_pt2 = lno_base.make_fpno1(
                     cc_local, eris_fpno, orbfragloc, no_type,
                     lno_base.THRESH_INTERNAL,
@@ -380,6 +382,11 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                     frag_prescreen=_frag_prescreen,
                     frozen_mask=cc_local.get_frozen_mask(),
                 )
+                if verbose >= _VERBOSE_PROGRESS:
+                    print(f'  [rank {rank}] [frag {_ifrag+1}/{nfrag}] '
+                          f'make_fpno1:          '
+                          f'{time.perf_counter() - t_fpno1:8.2f} s',
+                          flush=True)
 
                 if orbfrag is None:
                     contribution = (

@@ -31,6 +31,7 @@ from pyscf.lib import (
 )
 
 from pyscfad import numpy as np
+from pyscfad.tools import resource_profile
 from pyscfadlib import libcc_vjp as libcc
 
 
@@ -144,6 +145,7 @@ def _ccsd_t_energy(mat, t1T, t2T, mo_energy, fvo,
     del profile_timing
     nvir, nocc = t1T.shape
     nmo = nocc + nvir
+    resource_start = resource_profile.start()
     profile_t0 = _profile_start('forward (T)', nocc, nvir)
 
     mat = numpy.asarray(mat, order='C')
@@ -182,6 +184,17 @@ def _ccsd_t_energy(mat, t1T, t2T, mo_energy, fvo,
     et_sum *= 2. / 3.
     et = et_sum[0].real
     _profile_done('forward (T)', profile_t0)
+    resource_profile.finish(
+        'triples.forward_contraction',
+        resource_start,
+        nocc=nocc,
+        nvir=nvir,
+        threads=num_threads(),
+        configured_memory_mib=max_memory + mem_now,
+        pyscf_current_memory_mib=mem_now,
+        virtual_block=bufsize,
+        vvop_mib=resource_profile.estimated_array_mib(vvop),
+    )
     return et
 
 
@@ -196,6 +209,7 @@ def _ccsd_t_energy_bwd(max_memory, profile_timing, res, et_bar):
 
     nvir, nocc = t1T.shape
     nmo = nocc + nvir
+    resource_start = resource_profile.start()
     profile_t0 = _profile_start('backward (T)', nocc, nvir,
                                 enabled=profile_timing)
 
@@ -303,6 +317,19 @@ def _ccsd_t_energy_bwd(max_memory, profile_timing, res, et_bar):
     ovvv_tril_bar = numpy.asarray(ovvv_bar[:,:,idx,idy])
 
     _profile_done('backward (T)', profile_t0)
+    resource_profile.finish(
+        'triples.backward_contraction',
+        resource_start,
+        nocc=nocc,
+        nvir=nvir,
+        threads=num_threads(),
+        configured_memory_mib=max_memory + mem_now,
+        pyscf_current_memory_mib=mem_now,
+        virtual_block=bufsize,
+        vvop_and_bar_mib=resource_profile.estimated_array_mib(
+            vvop, vvop_bar
+        ),
+    )
     return mat_bar, t1T_bar, t2T_bar, mo_energy_bar, fvo_bar, ovoo_bar, ovov_bar, ovvv_tril_bar
 
 _ccsd_t_energy.defvjp(_ccsd_t_energy_fwd, _ccsd_t_energy_bwd)

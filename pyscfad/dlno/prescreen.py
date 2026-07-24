@@ -21,6 +21,7 @@ from pyscfad.lo.orth import vec_lowdin
 from pyscfad import scipy
 from pyscfad.lno import lno_base
 from pyscfad.ops import stop_grad
+from pyscfad.tools import resource_profile
 
 try:
     from pyscfad.dlno import dlno as dlno_mod
@@ -72,10 +73,16 @@ def _maybe_asarray(x):
 @contextmanager
 def _topology_profile_section(rows, name):
     start = time.perf_counter()
+    profile_start = resource_profile.start()
     try:
         yield
     finally:
-        rows.append({'section': name, 'wall_s': time.perf_counter() - start})
+        wall_s = time.perf_counter() - start
+        rows.append({'section': name, 'wall_s': wall_s})
+        resource_profile.finish(
+            f'prescreen.{name}',
+            profile_start,
+        )
 
 
 def union_objects(obj_list):
@@ -831,20 +838,31 @@ def rebuild_dlno_prescreen_data(mf, lo_coeff, topology_data, *, frozen=None):
     occupied/virtual prescreen spaces are reconstructed from the current
     ``mf``/``lo_coeff`` so their first-order response remains differentiable.
     """
+    profile_total = resource_profile.start()
     mol = mf.mol
     if frozen is None:
         frozen = topology_data.get("frozen", None)
 
+    profile_setup = resource_profile.start()
     s1e = mol.intor_symmetric("int1e_ovlp")
     fock = mf.get_fock()
     pao_norm_thr = topology_data.get("pao_norm_thr", 1e-4)
     domain_pao_thr = topology_data.get("domain_pao_thr", 1e-4)
     pao_bp_domain_thr = topology_data.get("pao_bp_domain_thr", 0.98)
 
-    pao, ao2pao_map = _pao_space(mf, frozen=frozen, s1e=s1e, norm_thr=pao_norm_thr)
+    pao, ao2pao_map = _pao_space(
+        mf, frozen=frozen, s1e=s1e, norm_thr=pao_norm_thr
+    )
+    resource_profile.finish(
+        'prescreen.rebuild_overlap_fock_pao',
+        profile_setup,
+        pao_shape=tuple(pao.shape),
+        pao_mib=resource_profile.estimated_array_mib(pao),
+    )
 
     fragment_data = []
     for frag in topology_data["fragment_data"]:
+        profile_fragment = resource_profile.start()
         loidx = np.asarray(frag["lo_indices"], dtype=np.int32)
         frag_strong = np.asarray(frag["strong_lmo_indices"], dtype=np.int32)
         frag_ext_bp = np.asarray(frag["extended_bp_domain"], dtype=np.int32)
@@ -901,6 +919,18 @@ def rebuild_dlno_prescreen_data(mf, lo_coeff, topology_data, *, frozen=None):
                 "vir_prescreen_coeff": vir_prescreen,
             }
         )
+        resource_profile.finish(
+            'prescreen.rebuild_fragment_spaces',
+            profile_fragment,
+            frag=int(frag["fragment_index"]) + 1,
+            domain_atoms=int(frag_ext_primary.size),
+            domain_aos=int(ao_idx.size),
+            occ=int(occ_prescreen.shape[1]),
+            vir=int(vir_prescreen.shape[1]),
+            coeff_mib=resource_profile.estimated_array_mib(
+                occ_prescreen, vir_prescreen
+            ),
+        )
 
     data = dict(topology_data)
     data.update(
@@ -913,6 +943,11 @@ def rebuild_dlno_prescreen_data(mf, lo_coeff, topology_data, *, frozen=None):
             "ao2pao_map": ao2pao_map,
             "fragment_data": fragment_data,
         }
+    )
+    resource_profile.finish(
+        'prescreen.rebuild_total',
+        profile_total,
+        fragments=len(fragment_data),
     )
     return data
 

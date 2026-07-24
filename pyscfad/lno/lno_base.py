@@ -40,6 +40,7 @@ from pyscfad.df import incore as df_incore
 from pyscfad.df import _cderi_vjp
 from pyscfad.dlno import util as dlno_util
 from pyscfad.lno import _checkpointed
+from pyscfad.tools import resource_profile
 from pyscfad.lno.mp2_rdm import make_rdm1_vo, make_rdm1_vo_frag
 from pyscfad.lno.tools import autofrag, map_lo_to_frag
 from pyscfad.gto._mole_helper import setup_exp, setup_ctr_coeff
@@ -86,8 +87,15 @@ def _vjp_progress(msg):
 @contextmanager
 def _vjp_progress_section(name):
     prefix = _VJP_PROGRESS_PREFIX.get()
+    profile_start = resource_profile.start()
     if prefix is None:
-        yield
+        try:
+            yield
+        finally:
+            resource_profile.finish(
+                f'backward.{name}',
+                profile_start,
+            )
         return
     t0 = time.perf_counter()
     _vjp_progress(f'{name}: start')
@@ -95,6 +103,10 @@ def _vjp_progress_section(name):
         yield
     finally:
         _vjp_progress(f'{name}: {time.perf_counter() - t0:.2f} s')
+        resource_profile.finish(
+            f'backward.{name}',
+            profile_start,
+        )
 
 
 def clear_fragment_profile():
@@ -2180,7 +2192,33 @@ def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external
         ejb = eov
         Lia = eris.get_Ov(u)
         Ljb = Lov
+        profile_mp2_density = resource_profile.start()
         dmvv, dmoo = _checkpointed.make_mp2_rdm1_ie(Lia, Ljb, eia, ejb)
+        naux_mp2, nocc_frag_mp2, nvir_mp2 = Lia.shape
+        nocc_domain_mp2 = Ljb.shape[1]
+        itemsize_mp2 = int(Lia.dtype.itemsize)
+        resource_profile.finish(
+            'pno.mp2_density_matrices',
+            profile_mp2_density,
+            lia_shape=tuple(Lia.shape),
+            ljb_shape=tuple(Ljb.shape),
+            dmvv_shape=tuple(dmvv.shape),
+            dmoo_shape=tuple(dmoo.shape),
+            inputs_mib=resource_profile.estimated_array_mib(
+                Lia, Ljb, eia, ejb
+            ),
+            outputs_mib=resource_profile.estimated_array_mib(dmvv, dmoo),
+            scan_t2_temp_mib=(
+                nvir_mp2 * nocc_domain_mp2 * nvir_mp2
+                * itemsize_mp2 / 1024.0**2
+            ),
+            uncheckpointed_t2_mib=(
+                nocc_frag_mp2 * nvir_mp2
+                * nocc_domain_mp2 * nvir_mp2
+                * itemsize_mp2 / 1024.0**2
+            ),
+            naux=naux_mp2,
+        )
         if mfcc.dm_corr_frag is True:
             _dmov = make_rdm1_vo_frag(mfcc, dmoo, dmvv,
                                       Lia, Ljb, eia, ejb,
@@ -2274,6 +2312,7 @@ def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external
         dmoo = reduce(np.dot, (uocc2.T, dmoo, uocc2))
 
     if getattr(mfcc, 'compute_domain_pt2', False):
+        profile_domain_pt2 = resource_profile.start()
         domain_pt2 = _domain_mp2_fragment_energy(
             mfcc, eris, orbfragloc,
             orbfragocc1, moefragocc1,
@@ -2282,8 +2321,17 @@ def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external
             uocc2, uvir2, lovir,
             semicanonicalize_fn,
         )
+        resource_profile.finish(
+            'pno.domain_mp2_forward',
+            profile_domain_pt2,
+            lov_shape=tuple(eris.Lov.shape),
+            lov_mib=resource_profile.estimated_array_mib(eris.Lov),
+            occupied_external=int(uocc2.shape[-1]),
+            virtual_external=int(uvir2.shape[-1]),
+        )
 
     # Compress external space by PNO
+    profile_natorb = resource_profile.start()
     if frag_target_nocc is not None:
         frag_target_nocc -= orbfragocc1.shape[1]
     if no_type == 'osv':
@@ -2314,12 +2362,31 @@ def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external
                                                       uvir2, frag_target_nvir,
                                                       uuvir2_corr, mfcc.natorb_occdeg_thresh)
         if orbfragvir2.shape[-1] == 0:
+            resource_profile.finish(
+                'pno.natural_orbital_compression',
+                profile_natorb,
+                dmoo_shape=tuple(dmoo.shape),
+                dmvv_shape=tuple(dmvv.shape),
+                retained_occ=0,
+                retained_vir=0,
+            )
             warnings.warn('No virtual orbital is included for this fragment, '
                           'setting correlation energy to zero.')
             return None, None, domain_pt2
         else:
             orbfragvir12 = semicanonicalize_fn(fock, orbfragvir2)[1]
 
+    resource_profile.finish(
+        'pno.natural_orbital_compression',
+        profile_natorb,
+        dmoo_shape=tuple(dmoo.shape),
+        dmvv_shape=tuple(dmvv.shape),
+        retained_occ=int(orbfragocc12.shape[-1]),
+        retained_vir=int(orbfragvir12.shape[-1]),
+        density_matrices_mib=resource_profile.estimated_array_mib(
+            dmoo, dmvv
+        ),
+    )
     orbocc_outside = np.dot(orbocc1, uocc2_outside)
     orbvir_outside = np.dot(orbvir1, uvir2_outside)
 

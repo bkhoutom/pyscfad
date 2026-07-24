@@ -26,6 +26,7 @@ from pyscfad import config, config_update
 from pyscfad.ao2mo import _ao2mo
 from pyscfad.cc import ccsd, ccsd_lambda
 from pyscfad.lib import logger
+from pyscfad.tools import resource_profile
 
 _CCSD_OVVV_BLKSIZE = 32
 
@@ -298,17 +299,44 @@ def _dfccsd_kernel_custom_bwd(res, cotangent):
     Lagrangian ``bar_e * E_cc(t, eris) + lambda . Omega(t, eris)`` with
     ``Omega = update_amps(t, eris) - t``.
     """
+    profile_total = resource_profile.start()
+    profile_prepare = resource_profile.start()
     mycc, eris, t1, t2 = res
     _, bar_e, bar_t1, bar_t2 = cotangent
     eris = _coerce_eris_tensors_for_bwd(eris)
     t1 = np.asarray(t1)
     t2 = np.asarray(t2)
+    nocc, nvir = t1.shape
+    amplitudes_mib = resource_profile.estimated_array_mib(t1, t2)
+    eris_mib = resource_profile.estimated_array_mib(
+        *(getattr(eris, attr, None) for attr in (
+            'fock', 'mo_energy', 'oooo', 'ovoo', 'ovov', 'oovv',
+            'ovvo', 'ovvv', 'Lvv', 'Lov', 'mo_coeff',
+        ))
+    )
+    resource_profile.finish(
+        'ccsd_bwd.prepare_saved_tensors',
+        profile_prepare,
+        nocc=nocc,
+        nvir=nvir,
+        t1_shape=tuple(t1.shape),
+        t2_shape=tuple(t2.shape),
+        amplitudes_mib=amplitudes_mib,
+        saved_eris_mib=eris_mib,
+    )
 
     if (
         _is_zero_cotangent(bar_e)
         and _is_zero_cotangent(bar_t1)
         and _is_zero_cotangent(bar_t2)
     ):
+        resource_profile.finish(
+            'ccsd_bwd.total',
+            profile_total,
+            nocc=nocc,
+            nvir=nvir,
+            zero_cotangent=True,
+        )
         return None, None, None, None
 
     bar_e_val = 0.0 if _is_zero_cotangent(bar_e) else np.asarray(bar_e)
@@ -319,14 +347,39 @@ def _dfccsd_kernel_custom_bwd(res, cotangent):
         None if _is_zero_cotangent(bar_t2) else np.asarray(bar_t2)
     )
 
-    _, lambda_vec = ccsd_lambda.solve_response_lambda(
+    profile_lambda = resource_profile.start()
+    lambda_converged, lambda_vec = ccsd_lambda.solve_response_lambda(
         mycc, eris, t1, t2,
         bar_e_val, bar_t1_val, bar_t2_val,
         max_cycle=mycc.max_cycle,
         tol=mycc.conv_tol_normt,
         verbose=mycc.verbose,
     )
+    resource_profile.finish(
+        'ccsd_bwd.response_lambda',
+        profile_lambda,
+        nocc=nocc,
+        nvir=nvir,
+        response_vector_shape=tuple(lambda_vec.shape),
+        response_vector_mib=resource_profile.estimated_array_mib(lambda_vec),
+        converged=lambda_converged,
+    )
+    profile_lagrangian = resource_profile.start()
     eris_bar = lagrangian_grad(mycc, eris, t1, t2, bar_e_val, lambda_vec)
+    resource_profile.finish(
+        'ccsd_bwd.lagrangian_gradient',
+        profile_lagrangian,
+        nocc=nocc,
+        nvir=nvir,
+    )
+    resource_profile.finish(
+        'ccsd_bwd.total',
+        profile_total,
+        nocc=nocc,
+        nvir=nvir,
+        amplitudes_mib=amplitudes_mib,
+        saved_eris_mib=eris_mib,
+    )
     return None, eris_bar, None, None
 
 

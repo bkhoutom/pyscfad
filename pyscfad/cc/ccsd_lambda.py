@@ -18,6 +18,7 @@ from jax.interpreters import ad as jax_ad
 from pyscfad import numpy as np
 from pyscfad import lib
 from pyscfad.lib import logger
+from pyscfad.tools import resource_profile
 
 
 class _IMDS:
@@ -361,10 +362,12 @@ def solve_response_lambda(mycc, eris, t1, t2, bar_e, bar_t1, bar_t2,
     Picard iteration with optional DIIS acceleration.  Inputs are expected to
     be concrete arrays; the iteration uses a Python convergence check.
     """
+    profile_total = resource_profile.start()
     log = logger.new_logger(mycc, verbose)
     cput0 = (logger.process_clock(), logger.perf_counter())
 
     amp = mycc.amplitudes_to_vector(t1, t2)
+    nocc, nvir = t1.shape
 
     def update_fn(amp_):
         t1_, t2_ = mycc.vector_to_amplitudes(amp_)
@@ -373,9 +376,19 @@ def solve_response_lambda(mycc, eris, t1, t2, bar_e, bar_t1, bar_t2,
 
     # Linearize update_amps at the converged amplitudes; vjp_fn(u) returns
     # u @ d(update_amps)/dt.
+    profile_build_vjp = resource_profile.start()
     _, vjp_fn = jax.vjp(update_fn, amp)
+    resource_profile.finish(
+        'ccsd_response.build_update_vjp',
+        profile_build_vjp,
+        nocc=nocc,
+        nvir=nvir,
+        response_vector_shape=tuple(amp.shape),
+        response_vector_mib=resource_profile.estimated_array_mib(amp),
+    )
 
     # Build the source: bar_e * dE/dt + bar_t (all as a single vector).
+    profile_source = resource_profile.start()
     source = np.zeros_like(amp)
     if not _is_scalar_zero(bar_e):
         def scaled_energy(amp_):
@@ -389,6 +402,13 @@ def solve_response_lambda(mycc, eris, t1, t2, bar_e, bar_t1, bar_t2,
         if bar_t2 is None:
             bar_t2 = np.zeros_like(t2)
         source = source + _amplitudes_cotangent_to_vector(bar_t1, bar_t2)
+    resource_profile.finish(
+        'ccsd_response.build_source',
+        profile_source,
+        nocc=nocc,
+        nvir=nvir,
+        source_mib=resource_profile.estimated_array_mib(source),
+    )
 
     cput0 = log.timer(f'{mycc.__class__.__name__} response init', *cput0)
 
@@ -403,7 +423,17 @@ def solve_response_lambda(mycc, eris, t1, t2, bar_e, bar_t1, bar_t2,
     lambda_vec = np.array(amp, copy=True)
     conv = False
     for istep in range(max_cycle):
+        profile_iteration = resource_profile.start()
+        profile_iteration_vjp = resource_profile.start()
         (lambda_df,) = vjp_fn(lambda_vec)
+        resource_profile.finish(
+            'ccsd_response.iteration_vjp',
+            profile_iteration_vjp,
+            iteration=istep + 1,
+            nocc=nocc,
+            nvir=nvir,
+        )
+        profile_iteration_update = resource_profile.start()
         lambda_new = lambda_df + source
         diff = mycc.amplitudes_to_vector(
             *mycc.vector_to_amplitudes(lambda_new - lambda_vec)
@@ -416,6 +446,7 @@ def solve_response_lambda(mycc, eris, t1, t2, bar_e, bar_t1, bar_t2,
                 l1_iter, l2_iter, istep, normt, 0, adiis
             )
             lambda_vec = mycc.amplitudes_to_vector(l1_iter, l2_iter)
+        normt_val = None
         if not _has_tracer(normt):
             normt_val = float(normt)
             log.info(
@@ -425,10 +456,35 @@ def solve_response_lambda(mycc, eris, t1, t2, bar_e, bar_t1, bar_t2,
             cput0 = log.timer(
                 f'{mycc.__class__.__name__} response iter', *cput0,
             )
-            if normt_val < tol:
-                conv = True
-                break
+        resource_profile.finish(
+            'ccsd_response.iteration_update_diis',
+            profile_iteration_update,
+            iteration=istep + 1,
+            norm=normt_val,
+            diis=adiis is not None,
+        )
+        resource_profile.finish(
+            'ccsd_response.iteration_total',
+            profile_iteration,
+            iteration=istep + 1,
+            norm=normt_val,
+            response_vector_mib=resource_profile.estimated_array_mib(
+                lambda_vec
+            ),
+        )
+        if normt_val is not None and normt_val < tol:
+            conv = True
+            break
 
+    resource_profile.finish(
+        'ccsd_response.total',
+        profile_total,
+        nocc=nocc,
+        nvir=nvir,
+        iterations=istep + 1 if max_cycle else 0,
+        converged=conv,
+        response_vector_mib=resource_profile.estimated_array_mib(lambda_vec),
+    )
     return conv, lambda_vec
 
 

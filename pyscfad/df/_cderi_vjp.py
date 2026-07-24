@@ -34,6 +34,7 @@ from pyscfad import numpy as np
 from pyscfad.ao2mo import _ao2mo
 from pyscfad.df import _int3c_cross_opt
 from pyscfad.df import addons as df_addons
+from pyscfad.tools import resource_profile
 try:
     from pyscfadlib import libao2mo_vjp
 except (ImportError, OSError):
@@ -205,6 +206,7 @@ def nr_e2_mo_coeff_vjp_from_cderi_source(cderi_source, mo_coeff, ybar,
     if aosym not in ('s2', 's2ij'):
         raise NotImplementedError(f'Only packed s2 CDERI is supported, got {aosym}.')
 
+    resource_start = resource_profile.start()
     mo_coeff_bar = None
     ybar = numpy.asarray(jax.device_get(ybar))
     with df_addons.load(cderi_source, 'j3c') as eri1:
@@ -246,6 +248,17 @@ def nr_e2_mo_coeff_vjp_from_cderi_source(cderi_source, mo_coeff, ybar,
             )
             mo_coeff_bar = _tree_add(mo_coeff_bar, mo_coeff_bar_blk)
             cderi = mo_coeff_bar_blk = None
+    resource_profile.finish(
+        'df_vjp.mo_coeff_stream',
+        resource_start,
+        naux=naux,
+        pair_count=npair,
+        aux_block=blksize,
+        blocks=(naux + blksize - 1) // blksize,
+        ybar_mib=resource_profile.estimated_array_mib(ybar),
+        configured_memory_mib=max_memory,
+        pyscf_current_memory_mib=pyscf_lib.current_memory()[0],
+    )
     return mo_coeff_bar
 
 
@@ -414,6 +427,7 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
                                          aosym='s2ij'):
     """Back-propagate through Cholesky CDERI from AO-pair cotangent blocks."""
     t_total = time.perf_counter()
+    resource_total = resource_profile.start()
     _profile_msg('cholesky_eri_vjp_from_cderi_block_fn start')
     if aosym not in ('s2', 's2ij'):
         raise NotImplementedError(f'Only packed s2 CDERI is supported, got {aosym}.')
@@ -429,6 +443,7 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
     nao_pair = nao * (nao + 1) // 2
 
     t = time.perf_counter()
+    resource_phase = resource_profile.start()
     j2c = auxmol.intor(int2c, hermi=1)
     j2c_np = numpy.asarray(jax.device_get(j2c))
     try:
@@ -445,6 +460,13 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
         'cholesky_eri_vjp_from_cderi_block_fn metric setup done '
         f'{time.perf_counter() - t:.2f} s'
     )
+    resource_profile.finish(
+        'df_vjp.metric_cholesky_setup',
+        resource_phase,
+        nao=nao,
+        naux=naoaux,
+        metric_mib=resource_profile.estimated_array_mib(j2c_np, low),
+    )
 
     max_words = max(max_memory, 0) * 1e6 / 8 - low.size
     mem_buflen = max(int(max_words / max(naoaux, 1) / 3), 8)
@@ -457,6 +479,7 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
     low_bar = numpy.zeros_like(low)
 
     t = time.perf_counter()
+    resource_phase = resource_profile.start()
     nblocks = 0
     with df_addons.load(cderi_source, 'j3c') as feri:
         if int(feri.shape[0]) != naoaux or int(feri.shape[1]) != nao_pair:
@@ -506,6 +529,20 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
         'cholesky_eri_vjp_from_cderi_block_fn int3c block loop done '
         f'nblocks={nblocks} {time.perf_counter() - t:.2f} s'
     )
+    resource_profile.finish(
+        'df_vjp.int3c_derivative_block_loop',
+        resource_phase,
+        nao=nao,
+        naux=naoaux,
+        ao_pairs=nao_pair,
+        shell_blocks=nblocks,
+        target_pair_block=buflen,
+        est_three_block_mib=(
+            3.0 * naoaux * buflen * 8.0 / 1024.0**2
+        ),
+        configured_memory_mib=max_memory,
+        pyscf_current_memory_mib=pyscf_lib.current_memory()[0],
+    )
 
     if p1 != nao_pair:
         raise RuntimeError('CDERI VJP shell ranges did not cover all AO pairs.')
@@ -514,6 +551,7 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
         return jax_scipy.linalg.cholesky(auxmol_.intor(int2c, hermi=1), lower=True)
 
     t = time.perf_counter()
+    resource_phase = resource_profile.start()
     _, chol_pullback = jax.vjp(metric_cholesky, auxmol)
     aux_metric_bar = chol_pullback(np.asarray(numpy.tril(low_bar)))[0]
     auxmol_bar = _tree_add(auxmol_bar, aux_metric_bar)
@@ -521,9 +559,21 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
         'cholesky_eri_vjp_from_cderi_block_fn metric cholesky pullback done '
         f'{time.perf_counter() - t:.2f} s'
     )
+    resource_profile.finish(
+        'df_vjp.metric_cholesky_pullback',
+        resource_phase,
+        naux=naoaux,
+    )
     _profile_msg(
         'cholesky_eri_vjp_from_cderi_block_fn done '
         f'{time.perf_counter() - t_total:.2f} s'
+    )
+    resource_profile.finish(
+        'df_vjp.cholesky_total',
+        resource_total,
+        nao=nao,
+        naux=naoaux,
+        shell_blocks=nblocks,
     )
     return mol_bar, auxmol_bar
 

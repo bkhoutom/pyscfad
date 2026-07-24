@@ -34,6 +34,7 @@ from pyscfad.df import addons as df_addons
 from pyscfad.ops import is_array
 from pyscfad.lno import lno_base
 from pyscfad.lno import ccsd_t as ccsd_t_mod
+from pyscfad.tools import resource_profile
 
 
 # Toggle for the analytical (custom_vjp) mp2_fragment_energy path.
@@ -503,6 +504,21 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
                                                       orbactvir,orbfrzvir]]
     nlo = lo_coeff.shape[1]
     prjlo = reduce(np.dot, (lo_coeff.T, s1e, orbactocc))
+    frag_index = None
+    if frag_prescreen is not None:
+        frag_index = int(frag_prescreen.get('fragment_index', -1)) + 1
+    profile_solver = resource_profile.start()
+    resource_profile.checkpoint(
+        'solver.start',
+        frag=frag_index,
+        active_occ=int(nactocc),
+        active_vir=int(nactvir),
+        active_mo=int(nactocc + nactvir),
+        projected_lo=int(nlo),
+        est_t2_mib=(
+            nactocc * nactocc * nactvir * nactvir * 8.0 / 1024.0**2
+        ),
+    )
 
     log.info('    impsol:  %d LOs  %d/%d MOs  %d occ  %d vir',
              nlo, nactocc+nactvir, nmo, nactocc, nactvir)
@@ -526,23 +542,50 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
     )
     total_start = time.perf_counter()
     phase_start = time.perf_counter()
+    profile_phase = resource_profile.start()
     imp_eris = mcc.ao2mo(fockao=fock)
     phase_times = {'ao2mo_s': time.perf_counter() - phase_start}
+    resource_profile.finish(
+        'solver.df_ao2mo_and_eris',
+        profile_phase,
+        frag=frag_index,
+        eris_mib=resource_profile.estimated_array_mib(
+            *(vars(imp_eris).get(name) for name in (
+                'Loo', 'Lov', 'Lvv', 'oooo', 'ovoo', 'ovov', 'ovvv',
+            ))
+        ),
+    )
 
     # Method-matched PT2 reference energy.  DLNO correction subtracts this
     # value before adding the selected full/domain correction.
     phase_start = time.perf_counter()
+    profile_phase = resource_profile.start()
     t1, t2 = mcc.init_amps(eris=imp_eris)[1:]
     elcorr_pt2 = _pt2_fragment_energy(
         imp_eris, t2, prjlo, pt2_fragment_method, sos_c_os
     )
     phase_times['mp2_s'] = time.perf_counter() - phase_start
+    resource_profile.finish(
+        'solver.mp2_reference',
+        profile_phase,
+        frag=frag_index,
+        amplitudes_mib=resource_profile.estimated_array_mib(t1, t2),
+        method=pt2_fragment_method,
+    )
 
     # CCSD fragment energy
     phase_start = time.perf_counter()
+    profile_phase = resource_profile.start()
     t1, t2 = mcc.kernel(eris=imp_eris, t1=t1, t2=t2)[1:]
     elcorr_cc = ccsd_fragment_energy(imp_eris, t1, t2, prjlo)
     phase_times['ccsd_s'] = time.perf_counter() - phase_start
+    resource_profile.finish(
+        'solver.ccsd_iterations_and_energy',
+        profile_phase,
+        frag=frag_index,
+        amplitudes_mib=resource_profile.estimated_array_mib(t1, t2),
+        diis_space=diis_space,
+    )
 
     if ccsd_t and not dcsd:
         #for tests
@@ -553,8 +596,15 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
         #from pyscfad.cc import gccsd_t
         #elcorr_cc_t = gccsd_t.kernel(mcc, prjlo, t1=t1, t2=t2)
         phase_start = time.perf_counter()
+        profile_phase = resource_profile.start()
         elcorr_cc_t = ccsd_t_mod.kernel(mcc, imp_eris, prjlo, t1=t1, t2=t2, verbose=verbose_imp)
         phase_times['triples_s'] = time.perf_counter() - phase_start
+        resource_profile.finish(
+            'solver.perturbative_triples',
+            profile_phase,
+            frag=frag_index,
+            amplitudes_mib=resource_profile.estimated_array_mib(t1, t2),
+        )
         if (profile_pass != 'backward replay' and
                 (_should_print_forward_t_energy(verbose_imp, profile_pass) or
                  mcc.lno_ccsd_t_timing)):
@@ -570,6 +620,13 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
         profile_info['solver_mo'] = int(nactocc + nactvir)
         profile_info['phase_times'] = phase_times
 
+    resource_profile.finish(
+        'solver.total',
+        profile_solver,
+        frag=frag_index,
+        active_occ=int(nactocc),
+        active_vir=int(nactvir),
+    )
     t1 = t2 = imp_eris = mcc = None
     del log
     return (elcorr_pt2, elcorr_cc, elcorr_cc_t)

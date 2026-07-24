@@ -24,6 +24,7 @@ from pyscfad.ops import stop_trace
 from pyscfad.lno import lno_base
 from pyscfad.lno.ccsd import LNOCCSD, _impurity_solve_core
 from pyscfad.lno.tools import autofrag, map_lo_to_frag
+from pyscfad.tools import resource_profile
 from pyscfad.dlno.prescreen import (
     build_dlno_prescreen_data,
     rebuild_dlno_prescreen_data,
@@ -42,27 +43,32 @@ def _env_flag(name, default=False):
     return value.strip().lower() in ('1', 'true', 'yes', 'on')
 
 
-def _rss_gb():
-    try:
-        with open('/proc/self/status') as f:
-            for line in f:
-                if line.startswith('VmRSS:'):
-                    return int(line.split()[1]) / 1024.0**2
-    except OSError:
-        pass
-    return None
-
-
 def _cleanup_after_fragment(log=None, label=None):
+    resource_profile.checkpoint(
+        'fragment.cleanup_after_delete',
+        label=label,
+    )
     if _env_flag('PYSCFAD_DLNO_FRAGMENT_GC', True):
+        profile_gc = resource_profile.start()
         gc.collect()
+        resource_profile.finish(
+            'fragment.cleanup_python_gc',
+            profile_gc,
+            label=label,
+        )
     if _env_flag('PYSCFAD_DLNO_CLEAR_JAX_CACHES_PER_FRAGMENT', False):
+        profile_jax_clear = resource_profile.start()
         jax.clear_caches()
+        resource_profile.finish(
+            'fragment.cleanup_jax_caches',
+            profile_jax_clear,
+            label=label,
+        )
     if log is not None and _env_flag('PYSCFAD_DLNO_LOG_FRAGMENT_RSS', True):
-        rss = _rss_gb()
-        if rss is not None:
-            suffix = f' after {label}' if label else ''
-            log(f'  RSS{suffix}: {rss:.2f} GB')
+        resource_profile.checkpoint(
+            'fragment.cleanup_complete',
+            label=label,
+        )
 
 
 class DLNOCCSD(LNOCCSD):
@@ -222,21 +228,37 @@ class DLNOCCSD(LNOCCSD):
         verbose = int(getattr(mol, 'verbose', 0))
         log = (lambda msg: print(msg, flush=True)) if verbose >= _VERBOSE_PROGRESS else (lambda msg: None)
         t_overall = time.perf_counter()
+        profile_overall = resource_profile.start()
         log('DLNOCCSD.value_and_grad: start')
+        resource_profile.checkpoint(
+            'outer.start',
+            natm=getattr(mol, 'natm', None),
+            nao=getattr(mol, 'nao', None),
+            frozen=frozen,
+            ccsd_t=ccsd_t,
+        )
 
         # ---------------- Outside the fragment loop ----------------
 
         # SCF: 1× iteration, save CPHF backward for close-out at the end.
         t0 = time.perf_counter()
+        profile0 = resource_profile.start()
         mf, scf_vjp = jax.vjp(build_mf, mol)
         log(f'  SCF (build_mf + jax.vjp):   {time.perf_counter() - t0:8.2f} s')
+        resource_profile.finish(
+            'outer.scf_forward_trace',
+            profile0,
+            nmo=getattr(getattr(mf, 'mo_coeff', None), 'shape', (None, None))[1],
+        )
 
         # Seed the mf cotangent with the HF-energy contribution: the
         # final answer's e_total includes mf.e_tot, so its cotangent
         # (= 1.0 under jax.value_and_grad equivalence) flows back through
         # mf -> mol via scf_vjp at the end.
+        profile0 = resource_profile.start()
         e_hf, hf_vjp = jax.vjp(lambda m: m.e_tot, mf)
         grad_mf = hf_vjp(1.0)[0]
+        resource_profile.finish('outer.hf_energy_seed_vjp', profile0)
 
         # LO transform: 1× build, save its bwd for close-out.  Uses the
         # same ``cc.get_lo`` path as the existing kernel.
@@ -246,9 +268,16 @@ class DLNOCCSD(LNOCCSD):
             return cc_local.get_lo(lo_type=cc_local.lo_type)
 
         t0 = time.perf_counter()
+        profile0 = resource_profile.start()
         lo_coeff, lo_vjp = jax.vjp(_build_lo, mf)
         grad_lo = jax.tree_util.tree_map(jnp.zeros_like, lo_coeff)
         log(f'  LO transform + jax.vjp:     {time.perf_counter() - t0:8.2f} s')
+        resource_profile.finish(
+            'outer.lo_forward_trace',
+            profile0,
+            lo_shape=tuple(lo_coeff.shape),
+            lo_mib=resource_profile.estimated_array_mib(lo_coeff),
+        )
 
         # Fragment LO assignment + prescreen are built eagerly (concrete
         # numpy/JAX arrays).  Their construction reads mf state but the
@@ -265,10 +294,16 @@ class DLNOCCSD(LNOCCSD):
                 domain_pao_thr, pair_energy_thr, multipole_order,
             )
         t0 = time.perf_counter()
+        profile0 = resource_profile.start()
         frag_lolist_static, prescreen_data = stop_trace(
             _topo_builder
         )(mf, frag_lolist)
         log(f'  DLNO prescreen build:       {time.perf_counter() - t0:8.2f} s')
+        resource_profile.finish(
+            'outer.prescreen_total',
+            profile0,
+            fragments=len(frag_lolist_static),
+        )
 
         nfrag = len(frag_lolist_static)
         frag_wghtlist = [1.0] * nfrag
@@ -342,11 +377,22 @@ class DLNOCCSD(LNOCCSD):
                 # ``get_Lov(..., atmlst=...)``.  No global Lov is
                 # ever materialized.
                 stub_eris = _make_stub_eris(mf_)
+                profile_local_eris = resource_profile.start()
                 eris_fpno = lno_base.make_fragment_eris(
                     cc_local, stub_eris, _frag_prescreen,
                 )
+                resource_profile.finish(
+                    'fragment.local_df_ao2mo',
+                    profile_local_eris,
+                    frag=f'{_ifrag+1}/{nfrag}',
+                    lov_shape=tuple(eris_fpno.Lov.shape),
+                    lov_mib=resource_profile.estimated_array_mib(
+                        eris_fpno.Lov
+                    ),
+                )
 
                 t_fpno1 = time.perf_counter()
+                profile_fpno1 = resource_profile.start()
                 frzfrag, orbfrag, domain_pt2 = lno_base.make_fpno1(
                     cc_local, eris_fpno, orbfragloc, no_type,
                     lno_base.THRESH_INTERNAL,
@@ -357,6 +403,17 @@ class DLNOCCSD(LNOCCSD):
                 if verbose >= _VERBOSE_PROGRESS:
                     log(f'  [frag {_ifrag+1}/{nfrag}] make_fpno1:          '
                         f'{time.perf_counter() - t_fpno1:8.2f} s')
+                resource_profile.finish(
+                    'fragment.pno_lno_compression',
+                    profile_fpno1,
+                    frag=f'{_ifrag+1}/{nfrag}',
+                    retained_mo=(
+                        0 if orbfrag is None else int(orbfrag.shape[1])
+                    ),
+                    orbital_coeff_mib=resource_profile.estimated_array_mib(
+                        orbfrag
+                    ),
+                )
 
                 if orbfrag is None:
                     # No PNOs survived the threshold; only the
@@ -416,8 +473,14 @@ class DLNOCCSD(LNOCCSD):
                 log(f'  [frag {ifrag+1}/{nfrag}] domain={n_atoms} atoms, '
                     f'lo_size={len(fraglo_idx)}: starting fwd+bwd...')
 
+            profile_frag_forward = resource_profile.start()
             e_frag, vjp_fn, aux = jax.vjp(
                 per_frag_fn, mf, lo_coeff, has_aux=True,
+            )
+            resource_profile.finish(
+                'fragment.forward_trace',
+                profile_frag_forward,
+                frag=f'{ifrag+1}/{nfrag}',
             )
             e_corr = e_corr + e_frag
             if verbose >= _VERBOSE_PROGRESS:
@@ -426,12 +489,25 @@ class DLNOCCSD(LNOCCSD):
                 f'  [frag {ifrag+1}/{nfrag}] reverse VJP:'
                 if verbose >= _VERBOSE_PROGRESS else None
             ):
+                profile_frag_reverse = resource_profile.start()
                 g_mf_i, g_lo_i = vjp_fn(jnp.float64(1.0))
+                resource_profile.finish(
+                    'fragment.reverse_vjp',
+                    profile_frag_reverse,
+                    frag=f'{ifrag+1}/{nfrag}',
+                    call=1,
+                )
             if verbose >= _VERBOSE_PROGRESS:
                 log(f'  [frag {ifrag+1}/{nfrag}] reverse VJP: done')
+            profile_accumulate = resource_profile.start()
             grad_mf = jax.tree_util.tree_map(_add_cotangent, grad_mf, g_mf_i)
             grad_lo = jax.tree_util.tree_map(_add_cotangent, grad_lo, g_lo_i)
             jax.block_until_ready((e_corr, grad_mf, grad_lo))
+            resource_profile.finish(
+                'fragment.cotangent_accumulate',
+                profile_accumulate,
+                frag=f'{ifrag+1}/{nfrag}',
+            )
             # per-fragment t1, t2, PNOs, eris_fpno, transient cc all
             # freed at the end of this iteration.
             log(f'  [frag {ifrag+1}/{nfrag}] done in '
@@ -443,15 +519,26 @@ class DLNOCCSD(LNOCCSD):
                 + (f', domain_pt2={float(aux["domain_pt2"]):+.8f}'
                    if include_mp2_correction and mp2_correction_scope == 'domain' else '')
                 + ')')
+            profile_cleanup = resource_profile.start()
+            resource_profile.checkpoint(
+                'fragment.cleanup_before_delete',
+                frag=f'{ifrag+1}/{nfrag}',
+            )
             del e_frag, vjp_fn, aux, g_mf_i, g_lo_i, per_frag_fn
             del fraglo_idx, frag_prescreen
             _cleanup_after_fragment(
                 log if verbose >= _VERBOSE_PROGRESS else None,
                 label=f'fragment {ifrag+1}/{nfrag}',
             )
+            resource_profile.finish(
+                'fragment.cleanup',
+                profile_cleanup,
+                frag=f'{ifrag+1}/{nfrag}',
+            )
 
         if include_mp2_correction and mp2_correction_scope == 'full':
             t0 = time.perf_counter()
+            profile0 = resource_profile.start()
             full_mp2_correction, full_mp2_vjp = jax.vjp(
                 lambda m: lno_base.full_system_mp2_correction(
                     m, method=mp2_correction_method, c_os=sos_c_os
@@ -466,25 +553,38 @@ class DLNOCCSD(LNOCCSD):
             jax.block_until_ready((e_corr, grad_mf))
             log(f'  Full-system MP2 correction: {time.perf_counter() - t0:8.2f} s, '
                 f'e = {float(full_mp2_correction):+.10f}')
+            resource_profile.finish(
+                'outer.full_system_mp2_correction',
+                profile0,
+            )
             del full_mp2_correction, full_mp2_vjp, grad_mf_full
 
         # ---------------- Close out outer-loop vjps ----------------
 
         # LO contribution -> mf cotangent
         t0 = time.perf_counter()
+        profile0 = resource_profile.start()
         grad_mf_via_lo, = lo_vjp(grad_lo)
         grad_mf = jax.tree_util.tree_map(_add_cotangent, grad_mf, grad_mf_via_lo)
         log(f'  LO vjp close-out:           {time.perf_counter() - t0:8.2f} s')
+        resource_profile.finish('outer.lo_reverse_vjp', profile0)
 
         # SCF (CPHF) close-out: one solve, mol cotangent.
         t0 = time.perf_counter()
+        profile0 = resource_profile.start()
         grad_mol, = scf_vjp(grad_mf)
         log(f'  SCF (CPHF) vjp close-out:   {time.perf_counter() - t0:8.2f} s')
+        resource_profile.finish('outer.scf_cphf_reverse_vjp', profile0)
 
         e_total = e_hf + e_corr
         log(f'DLNOCCSD.value_and_grad: done in '
             f'{time.perf_counter() - t_overall:.2f} s total,  '
             f'e_total = {float(e_total):.10f}')
+        resource_profile.finish(
+            'outer.total',
+            profile_overall,
+            fragments=nfrag,
+        )
         return e_total, grad_mol
 
 
@@ -501,21 +601,35 @@ def _build_static_dlno_topology(mf, frag_lolist, frozen, lo_type,
     log = (lambda msg: print(msg, flush=True)) if verbose >= _VERBOSE_PROGRESS else (lambda msg: None)
 
     t0 = time.perf_counter()
+    profile0 = resource_profile.start()
     cc_local = LNOCCSD(mf, frozen=frozen)
     cc_local.lo_type = lo_type
     lo_coeff = cc_local.get_lo(lo_type=cc_local.lo_type)
     log(f'    [topology] get_lo:                  {time.perf_counter() - t0:8.2f} s')
+    resource_profile.finish(
+        'prescreen.topology_get_lo',
+        profile0,
+        lo_shape=tuple(lo_coeff.shape),
+        lo_mib=resource_profile.estimated_array_mib(lo_coeff),
+    )
 
     if frag_lolist is None:
         t0 = time.perf_counter()
+        profile0 = resource_profile.start()
         frag_atmlist = autofrag(mf.mol)
         frag_lolist = map_lo_to_frag(
             mf.mol, lo_coeff, frag_atmlist, verbose=0,
         )
         log(f'    [topology] autofrag+map_lo_to_frag: '
             f'{time.perf_counter() - t0:8.2f} s ({len(frag_lolist)} fragments)')
+        resource_profile.finish(
+            'prescreen.fragment_assignment',
+            profile0,
+            fragments=len(frag_lolist),
+        )
 
     t0 = time.perf_counter()
+    profile0 = resource_profile.start()
     topology = build_dlno_prescreen_data(
         mf, lo_coeff, frag_lolist, frozen=frozen,
         lmo_bp_domain_thr=lmo_bp_domain_thr,
@@ -526,13 +640,24 @@ def _build_static_dlno_topology(mf, frag_lolist, frozen, lo_type,
     )
     log(f'    [topology] build_dlno_prescreen_data:'
         f'{time.perf_counter() - t0:8.2f} s')
+    resource_profile.finish(
+        'prescreen.topology_build_total',
+        profile0,
+        fragments=len(frag_lolist),
+    )
 
     t0 = time.perf_counter()
+    profile0 = resource_profile.start()
     prescreen_data = rebuild_dlno_prescreen_data(
         mf, lo_coeff, topology, frozen=frozen,
     )
     log(f'    [topology] rebuild_dlno_prescreen_data:'
         f' {time.perf_counter() - t0:6.2f} s')
+    resource_profile.finish(
+        'prescreen.coefficient_rebuild_total',
+        profile0,
+        fragments=len(frag_lolist),
+    )
     return tuple(frag_lolist), prescreen_data
 
 

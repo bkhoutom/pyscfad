@@ -216,7 +216,7 @@ void AO2MOnr_e2_mo_coeff_vjp_drv(int (*fmmm)(),
     size_t ij_pair = (*fmmm)(NULL, NULL, NULL, NULL, NULL, &envs, OUTPUTIJ);
     size_t nao2 = (*fmmm)(NULL, NULL, NULL, NULL, NULL, &envs, INPUT_IJ);
 
-    double *mo_coeff_bar_bufs[MAX_THREADS];
+    double **mo_coeff_bar_bufs = calloc(omp_get_max_threads_safe(), sizeof(double *));
     #pragma omp parallel
     {
         int i;
@@ -232,7 +232,7 @@ void AO2MOnr_e2_mo_coeff_vjp_drv(int (*fmmm)(),
         mo_coeff_bar_bufs[thread_id] = mo_coeff_bar_priv;
         double *eri_bar_row = malloc(sizeof(double) * nao2);
         double *buf = malloc(sizeof(double) * (nao*nao*2 + nao*MIN(i_count, j_count)));
-        #pragma omp for schedule(dynamic)
+        #pragma omp for schedule(static)
         for (i = 0; i < nij; i++) {
             NPdunpack_tril(nao, eri + nao2*i, buf, 0);
             (*fmmm)(eri_bar_row, mo_coeff_bar_priv, buf,
@@ -246,6 +246,7 @@ void AO2MOnr_e2_mo_coeff_vjp_drv(int (*fmmm)(),
             free(mo_coeff_bar_priv);
         }
     }
+    free(mo_coeff_bar_bufs);
 }
 
 

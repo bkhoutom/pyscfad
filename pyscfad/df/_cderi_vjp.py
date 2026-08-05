@@ -15,7 +15,9 @@
 """Memory-conscious VJP helpers for out-of-core molecular DF CDERI."""
 
 from functools import lru_cache
+import contextvars
 import ctypes
+import json
 import os
 import time
 
@@ -74,6 +76,285 @@ def _profile_msg(msg):
         print(f'[profile][df.cderi_vjp] {msg}', flush=True)
 
 
+_DF_VJP_DETAILED_TIMING = contextvars.ContextVar(
+    'pyscfad_df_vjp_detailed_timing', default=None
+)
+
+_DF_VJP_TIMING_STAGES = (
+    ('metric_integral_initial_cholesky', 'complete_response', False, None),
+    ('ao_projection_total', 'outer_block_loop', False, None),
+    ('ao_projection_kernel', 'outer_block_loop', True,
+     'ao_projection_total'),
+    ('zero_check', 'outer_block_loop', False, None),
+    ('cderi_read', 'outer_block_loop', False, None),
+    ('triangular_solve', 'outer_block_loop', False, None),
+    ('low_bar_gemm', 'outer_block_loop', False, None),
+    ('int3c_primal_vjp_setup', 'outer_block_loop', False, None),
+    ('int3c_pullback', 'outer_block_loop', False, None),
+    ('gradient_accumulation', 'outer_block_loop', False, None),
+    ('unattributed_overhead', 'outer_block_loop', False, None),
+    ('outer_block_total', 'outer_block_loop', False, None),
+    ('metric_vjp_primal_creation', 'complete_response', False, None),
+    ('metric_cholesky_pullback', 'complete_response', False, None),
+    ('complete_response', 'complete_response', False, None),
+)
+
+_DF_VJP_OUTER_CHILDREN = (
+    'ao_projection_total',
+    'zero_check',
+    'cderi_read',
+    'triangular_solve',
+    'low_bar_gemm',
+    'int3c_primal_vjp_setup',
+    'int3c_pullback',
+    'gradient_accumulation',
+)
+
+
+def _new_df_vjp_detailed_timing():
+    """Allocate detailed timing state only for an enabled profile run."""
+    return {
+        'samples': {name: [] for name, _, _, _ in _DF_VJP_TIMING_STAGES},
+        'counters': {
+            'candidate_shell_blocks': 0,
+            'processed_nonzero_blocks': 0,
+            'skipped_zero_blocks': 0,
+            'global_pair_positions_encountered': 0,
+            'local_ao_pair_positions_projected': 0,
+            'projection_kernel_calls': 0,
+            'projection_kernel_pair_positions': 0,
+        },
+        'projection': {
+            'primary': {'calls': 0, 'pair_positions': 0},
+            'exchanged_offdiagonal': {'calls': 0, 'pair_positions': 0},
+            'native': {'calls': 0, 'pair_positions': 0},
+            'numpy': {'calls': 0, 'pair_positions': 0},
+        },
+        'projection_order': {
+            'requested_mode': _ao_projection_order_mode(),
+            'selected_calls': {'legacy': 0, 'swapped': 0},
+            'layouts': {},
+        },
+        'active_block_index': None,
+    }
+
+
+def _detailed_timing_start():
+    return time.perf_counter(), time.process_time()
+
+
+def _detailed_timing_elapsed(start):
+    wall = max(time.perf_counter() - start[0], 0.0)
+    cpu = max(time.process_time() - start[1], 0.0)
+    return wall, cpu
+
+
+def _record_detailed_timing(detail, stage, elapsed, block_index=None):
+    detail['samples'][stage].append(
+        (float(elapsed[0]), float(elapsed[1]), block_index)
+    )
+
+
+def _record_projection_kernel(detail, elapsed, role, backend, pair_positions):
+    block_index = detail['active_block_index']
+    _record_detailed_timing(
+        detail, 'ao_projection_kernel', elapsed, block_index=block_index
+    )
+    pair_positions = int(pair_positions)
+    detail['counters']['projection_kernel_calls'] += 1
+    detail['counters']['projection_kernel_pair_positions'] += pair_positions
+    detail['projection'][role]['calls'] += 1
+    detail['projection'][role]['pair_positions'] += pair_positions
+    detail['projection'][backend]['calls'] += 1
+    detail['projection'][backend]['pair_positions'] += pair_positions
+
+
+def _finish_outer_block_timing(detail, start, child_elapsed, block_index):
+    outer_elapsed = _detailed_timing_elapsed(start)
+    _record_detailed_timing(
+        detail, 'outer_block_total', outer_elapsed, block_index=block_index
+    )
+    child_wall = sum(value[0] for value in child_elapsed.values())
+    child_cpu = sum(value[1] for value in child_elapsed.values())
+    overhead = (
+        outer_elapsed[0] - child_wall,
+        outer_elapsed[1] - child_cpu,
+    )
+    _record_detailed_timing(
+        detail, 'unattributed_overhead', overhead, block_index=block_index
+    )
+
+
+def _summarize_detailed_timing_samples(samples):
+    if not samples:
+        return {
+            'call_count': 0,
+            'wall_total_s': 0.0,
+            'cpu_total_s': 0.0,
+            'mean_wall_s': None,
+            'median_wall_s': None,
+            'p95_wall_s': None,
+            'max_wall_s': None,
+            'mean_cpu_s': None,
+            'median_cpu_s': None,
+            'p95_cpu_s': None,
+            'max_cpu_s': None,
+            'first_block_index': None,
+            'first_block_wall_s': None,
+            'first_block_cpu_s': None,
+            'effective_cpu_cores': None,
+        }
+
+    wall = numpy.asarray([sample[0] for sample in samples], dtype=float)
+    cpu = numpy.asarray([sample[1] for sample in samples], dtype=float)
+    first_block_index = samples[0][2]
+    if first_block_index is None:
+        first_wall = float(wall[0])
+        first_cpu = float(cpu[0])
+    else:
+        first_samples = [
+            sample for sample in samples if sample[2] == first_block_index
+        ]
+        first_wall = float(sum(sample[0] for sample in first_samples))
+        first_cpu = float(sum(sample[1] for sample in first_samples))
+    wall_total = float(wall.sum())
+    cpu_total = float(cpu.sum())
+    return {
+        'call_count': int(wall.size),
+        'wall_total_s': wall_total,
+        'cpu_total_s': cpu_total,
+        'mean_wall_s': float(wall.mean()),
+        'median_wall_s': float(numpy.median(wall)),
+        'p95_wall_s': float(numpy.percentile(wall, 95)),
+        'max_wall_s': float(wall.max()),
+        'mean_cpu_s': float(cpu.mean()),
+        'median_cpu_s': float(numpy.median(cpu)),
+        'p95_cpu_s': float(numpy.percentile(cpu, 95)),
+        'max_cpu_s': float(cpu.max()),
+        'first_block_index': (
+            None if first_block_index is None else int(first_block_index)
+        ),
+        'first_block_wall_s': first_wall,
+        'first_block_cpu_s': first_cpu,
+        'effective_cpu_cores': (
+            cpu_total / wall_total if wall_total > 0.0 else None
+        ),
+    }
+
+
+def _emit_df_vjp_detailed_timing(detail):
+    outer_wall = sum(
+        sample[0] for sample in detail['samples']['outer_block_total']
+    )
+    complete_wall = sum(
+        sample[0] for sample in detail['samples']['complete_response']
+    )
+    denominator = {
+        'outer_block_loop': float(outer_wall),
+        'complete_response': float(complete_wall),
+    }
+    stages = {}
+    for name, scope, nested, parent in _DF_VJP_TIMING_STAGES:
+        summary = _summarize_detailed_timing_samples(detail['samples'][name])
+        scope_wall = denominator[scope]
+        summary.update({
+            'scope': scope,
+            'nested': nested,
+            'parent': parent,
+            'wall_percent_of_scope': (
+                100.0 * summary['wall_total_s'] / scope_wall
+                if scope_wall > 0.0 else 0.0
+            ),
+        })
+        if nested:
+            parent_wall = sum(
+                sample[0] for sample in detail['samples'][parent]
+            )
+            summary['wall_percent_of_parent'] = (
+                100.0 * summary['wall_total_s'] / parent_wall
+                if parent_wall > 0.0 else 0.0
+            )
+        stages[name] = summary
+
+    child_wall = sum(
+        stages[name]['wall_total_s'] for name in _DF_VJP_OUTER_CHILDREN
+    ) + stages['unattributed_overhead']['wall_total_s']
+    child_cpu = sum(
+        stages[name]['cpu_total_s'] for name in _DF_VJP_OUTER_CHILDREN
+    ) + stages['unattributed_overhead']['cpu_total_s']
+    payload = {
+        'schema_version': 1,
+        'scope': 'cholesky_eri_vjp_from_cderi_block_fn',
+        'clock_notes': {
+            'wall': 'time.perf_counter; synchronous CPU path; no explicit JAX sync',
+            'cpu': 'time.process_time; CPU/wall is effective core utilization',
+        },
+        'denominator_wall_s': denominator,
+        'counters': detail['counters'],
+        'projection_kernel_breakdown': detail['projection'],
+        'projection_contraction_order': detail['projection_order'],
+        'counter_notes': {
+            'local_ao_pair_positions_projected': (
+                'sum of selected packed pair positions passed to the projection; '
+                'exact local-position count for the LNO local block callback'
+            ),
+            'projection_kernel_pair_positions': (
+                'primary plus exchanged-offdiagonal kernel positions'
+            ),
+        },
+        'reconciliation': {
+            'nested_ao_projection_kernel_excluded': True,
+            'unattributed_overhead_is_signed': True,
+            'outer_children_plus_overhead_wall_s': float(child_wall),
+            'outer_children_plus_overhead_cpu_s': float(child_cpu),
+            'outer_block_total_wall_s': stages['outer_block_total']['wall_total_s'],
+            'outer_block_total_cpu_s': stages['outer_block_total']['cpu_total_s'],
+            'wall_residual_s': float(
+                stages['outer_block_total']['wall_total_s'] - child_wall
+            ),
+            'cpu_residual_s': float(
+                stages['outer_block_total']['cpu_total_s'] - child_cpu
+            ),
+        },
+        'stages': stages,
+    }
+
+    counters = detail['counters']
+    print(
+        '[df-vjp-detailed-timing] '
+        f"candidate_blocks={counters['candidate_shell_blocks']} "
+        f"processed_nonzero={counters['processed_nonzero_blocks']} "
+        f"skipped_zero={counters['skipped_zero_blocks']} "
+        f"global_pair_positions={counters['global_pair_positions_encountered']} "
+        f"local_pair_positions={counters['local_ao_pair_positions_projected']} "
+        f"projection_calls={counters['projection_kernel_calls']}",
+        flush=True,
+    )
+    for name, _, nested, parent in _DF_VJP_TIMING_STAGES:
+        stage = stages[name]
+        nested_text = f' nested=true parent={parent}' if nested else ' nested=false'
+        print(
+            '[df-vjp-detailed-timing] '
+            f"stage={name}{nested_text} calls={stage['call_count']} "
+            f"wall_s={stage['wall_total_s']:.6f} "
+            f"cpu_s={stage['cpu_total_s']:.6f} "
+            f"wall_pct_{stage['scope']}={stage['wall_percent_of_scope']:.3f} "
+            f"mean_wall_s={stage['mean_wall_s']} "
+            f"median_wall_s={stage['median_wall_s']} "
+            f"p95_wall_s={stage['p95_wall_s']} "
+            f"max_wall_s={stage['max_wall_s']} "
+            f"first_block_wall_s={stage['first_block_wall_s']} "
+            f"effective_cpu_cores={stage['effective_cpu_cores']}",
+            flush=True,
+        )
+    print(
+        '[df-vjp-timing-json] '
+        + json.dumps(payload, sort_keys=True, separators=(',', ':'),
+                     allow_nan=False),
+        flush=True,
+    )
+
+
 @lru_cache(maxsize=16)
 def _tril_indices(nao):
     return numpy.tril_indices(nao)
@@ -111,6 +392,93 @@ def _nr_e2_vjp_block_mb():
 
 def _cderi_bar_pair_block_mb():
     return _CDERI_BAR_PAIR_BLOCK_MB
+
+
+_AO_PROJECTION_ORDER_ENV = 'PYSCFAD_DF_AO_PROJECTION_ORDER'
+_AO_PROJECTION_ORDERS = ('legacy', 'swapped', 'auto')
+_AO_PROJECTION_ORDER_DEFAULT = 'auto'
+
+
+def _ao_projection_order_mode(order=None):
+    """Return the validated AO-projection contraction-order selector."""
+    if order is None:
+        order = os.environ.get(
+            _AO_PROJECTION_ORDER_ENV, _AO_PROJECTION_ORDER_DEFAULT
+        )
+    order = str(order).strip().lower()
+    if order not in _AO_PROJECTION_ORDERS:
+        choices = ', '.join(_AO_PROJECTION_ORDERS)
+        raise ValueError(
+            f'{_AO_PROJECTION_ORDER_ENV} must be one of {choices}; got {order!r}.'
+        )
+    return order
+
+
+def _select_ao_projection_order(ybar, mok_rows, mol_cols, order=None):
+    """Contract the larger MO dimension first without changing the result."""
+    mode = _ao_projection_order_mode(order)
+    if ybar.ndim != 3:
+        raise ValueError(f'ybar must be rank 3, got shape {ybar.shape}.')
+    _, kc, lc = ybar.shape
+    if mok_rows.shape != (mol_cols.shape[0], kc):
+        raise ValueError(
+            f'mok_rows has shape {mok_rows.shape}; expected '
+            f'{(mol_cols.shape[0], kc)}.'
+        )
+    if mol_cols.shape[1] != lc:
+        raise ValueError(
+            f'mol_cols has shape {mol_cols.shape}; expected second dimension {lc}.'
+        )
+
+    swap = mode == 'swapped' or (mode == 'auto' and lc > kc)
+    if swap:
+        return (
+            ybar.transpose(0, 2, 1),
+            mol_cols,
+            mok_rows,
+            mode,
+            'swapped',
+            kc,
+            lc,
+        )
+    return ybar, mok_rows, mol_cols, mode, 'legacy', kc, lc
+
+
+def _record_ao_projection_layout(mode, selected, original_kc, original_lc,
+                                 effective_kc, effective_lc, npos, blksize):
+    detail = _DF_VJP_DETAILED_TIMING.get()
+    if detail is None:
+        return
+    order_detail = detail['projection_order']
+    if order_detail['requested_mode'] != mode:
+        raise RuntimeError('AO-projection order changed during one DF response.')
+    order_detail['selected_calls'][selected] += 1
+    key = (
+        f'{original_kc}x{original_lc}->{effective_kc}x{effective_lc}:'
+        f'{selected}:block={blksize}'
+    )
+    layout = order_detail['layouts'].setdefault(key, {
+        'requested_mode': mode,
+        'selected_order': selected,
+        'original_kc': int(original_kc),
+        'original_lc': int(original_lc),
+        'effective_kc': int(effective_kc),
+        'effective_lc': int(effective_lc),
+        'python_pair_block': int(blksize),
+        'native_pair_block_per_thread_estimate': int(max(
+            (blksize + max(pyscf_lib.num_threads(), 1) - 1)
+            // max(pyscf_lib.num_threads(), 1),
+            1,
+        )),
+        'calls': 0,
+        'pair_positions': 0,
+        'npos_min': int(npos),
+        'npos_max': int(npos),
+    })
+    layout['calls'] += 1
+    layout['pair_positions'] += int(npos)
+    layout['npos_min'] = min(layout['npos_min'], int(npos))
+    layout['npos_max'] = max(layout['npos_max'], int(npos))
 
 
 def _int3c_mo_vjp_block_mb():
@@ -152,7 +520,7 @@ def _nr_e2_cderi_bar_project_native(ybar, mok_rows, mol_cols, blksize):
     return out
 
 
-def _nr_e2_cderi_bar_project(ybar, mok_rows, mol_cols):
+def _nr_e2_cderi_bar_project(ybar, mok_rows, mol_cols, order=None):
     """Project ``ybar[Lij]`` onto pair-specific MO rows.
 
     The direct expression ``einsum('Lij,pi,pj->Lp', ...)`` often dispatches to
@@ -160,15 +528,23 @@ def _nr_e2_cderi_bar_project(ybar, mok_rows, mol_cols):
     contraction makes the dominant ``i`` contraction a GEMM-shaped
     ``numpy.dot`` so threaded BLAS can do the heavy work.
     """
+    (ybar, mok_rows, mol_cols, mode, selected,
+     original_kc, original_lc) = _select_ao_projection_order(
+         ybar, mok_rows, mol_cols, order=order
+     )
     naux, kc, lc = ybar.shape
     npos = mok_rows.shape[0]
-    if npos == 0:
-        return numpy.zeros((naux, 0), dtype=ybar.dtype)
+    if npos == 0 or kc == 0 or lc == 0:
+        return numpy.zeros((naux, npos), dtype=ybar.dtype)
 
     target_bytes = _cderi_bar_pair_block_mb() * 1e6
     itemsize = numpy.dtype(ybar.dtype).itemsize
     blksize = max(int(target_bytes / max(naux * lc * itemsize, 1)), 1)
     blksize = min(blksize, npos)
+    _record_ao_projection_layout(
+        mode, selected, original_kc, original_lc,
+        kc, lc, npos, blksize,
+    )
 
     if _use_native_cderi_bar_project(ybar, mok_rows, mol_cols):
         return _nr_e2_cderi_bar_project_native(
@@ -273,6 +649,12 @@ def nr_e2_cderi_bar_packed_block(mo_coeff, ybar, orbs_slice, pair_positions):
     if pair_positions.size == 0:
         return numpy.zeros((naux, 0), dtype=numpy.asarray(ybar).dtype)
 
+    detail = _DF_VJP_DETAILED_TIMING.get()
+    if detail is not None:
+        detail['counters']['local_ao_pair_positions_projected'] += int(
+            pair_positions.size
+        )
+
     mo = numpy.asarray(jax.device_get(mo_coeff))
     ybar = numpy.asarray(jax.device_get(ybar))
     nao = mo.shape[0]
@@ -287,15 +669,50 @@ def nr_e2_cderi_bar_packed_block(mo_coeff, ybar, orbs_slice, pair_positions):
 
     mok_rows = mo[rows, k0:k1]
     mol_cols = mo[cols, l0:l1]
-    out = _nr_e2_cderi_bar_project(ybar, mok_rows, mol_cols)
+    if detail is None:
+        out = _nr_e2_cderi_bar_project(ybar, mok_rows, mol_cols)
+    else:
+        backend = (
+            'native' if _use_native_cderi_bar_project(
+                ybar, mok_rows, mol_cols
+            ) else 'numpy'
+        )
+        timing_start = _detailed_timing_start()
+        out = _nr_e2_cderi_bar_project(ybar, mok_rows, mol_cols)
+        _record_projection_kernel(
+            detail,
+            _detailed_timing_elapsed(timing_start),
+            'primary',
+            backend,
+            pair_positions.size,
+        )
 
     offdiag = rows != cols
     if numpy.any(offdiag):
         mok_cols = mo[cols[offdiag], k0:k1]
         mol_rows = mo[rows[offdiag], l0:l1]
-        out[:, offdiag] += _nr_e2_cderi_bar_project(
-            ybar, mok_cols, mol_rows
-        )
+        if detail is None:
+            out[:, offdiag] += _nr_e2_cderi_bar_project(
+                ybar, mok_cols, mol_rows
+            )
+        else:
+            backend = (
+                'native' if _use_native_cderi_bar_project(
+                    ybar, mok_cols, mol_rows
+                ) else 'numpy'
+            )
+            timing_start = _detailed_timing_start()
+            exchanged = _nr_e2_cderi_bar_project(
+                ybar, mok_cols, mol_rows
+            )
+            _record_projection_kernel(
+                detail,
+                _detailed_timing_elapsed(timing_start),
+                'exchanged_offdiagonal',
+                backend,
+                mok_cols.shape[0],
+            )
+            out[:, offdiag] += exchanged
     return out
 
 
@@ -427,6 +844,10 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
                                          aosym='s2ij'):
     """Back-propagate through Cholesky CDERI from AO-pair cotangent blocks."""
     t_total = time.perf_counter()
+    detail = _new_df_vjp_detailed_timing() if _profile_enabled() else None
+    complete_timing_start = (
+        (t_total, time.process_time()) if detail is not None else None
+    )
     resource_total = resource_profile.start()
     _profile_msg('cholesky_eri_vjp_from_cderi_block_fn start')
     if aosym not in ('s2', 's2ij'):
@@ -443,6 +864,9 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
     nao_pair = nao * (nao + 1) // 2
 
     t = time.perf_counter()
+    metric_timing_start = (
+        _detailed_timing_start() if detail is not None else None
+    )
     resource_phase = resource_profile.start()
     j2c = auxmol.intor(int2c, hermi=1)
     j2c_np = numpy.asarray(jax.device_get(j2c))
@@ -450,6 +874,12 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
         low = scipy.linalg.cholesky(j2c_np, lower=True, check_finite=False)
     except scipy.linalg.LinAlgError as err:
         raise NotImplementedError('2c metric Cholesky fallback is not implemented.') from err
+    if detail is not None:
+        _record_detailed_timing(
+            detail,
+            'metric_integral_initial_cholesky',
+            _detailed_timing_elapsed(metric_timing_start),
+        )
 
     naoaux = low.shape[0]
     if low.shape[0] != low.shape[1]:
@@ -481,50 +911,158 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
     t = time.perf_counter()
     resource_phase = resource_profile.start()
     nblocks = 0
-    with df_addons.load(cderi_source, 'j3c') as feri:
-        if int(feri.shape[0]) != naoaux or int(feri.shape[1]) != nao_pair:
-            raise NotImplementedError('CDERI source shape does not match mol/auxmol.')
+    detail_token = (
+        _DF_VJP_DETAILED_TIMING.set(detail) if detail is not None else None
+    )
+    try:
+        with df_addons.load(cderi_source, 'j3c') as feri:
+            if int(feri.shape[0]) != naoaux or int(feri.shape[1]) != nao_pair:
+                raise NotImplementedError('CDERI source shape does not match mol/auxmol.')
 
-        p1 = 0
-        for sh_range in shranges:
-            bstart, bend, _ = sh_range
-            shls_slice = (
-                bstart, bend,
-                0, mol.nbas,
-                mol.nbas, mol.nbas + auxmol.nbas,
-            )
+            p1 = 0
+            for block_index, sh_range in enumerate(shranges):
+                if detail is not None:
+                    detail['active_block_index'] = block_index
+                    detail['counters']['candidate_shell_blocks'] += 1
+                    outer_timing_start = _detailed_timing_start()
+                    child_elapsed = {}
 
-            p0, p1 = p1, p1 + sh_range[2]
-            cderi_bar_blk = numpy.asarray(cderi_bar_block_fn(p0, p1))
-            if cderi_bar_blk.shape != (naoaux, p1 - p0):
-                raise RuntimeError(
-                    'CDERI cotangent block has shape '
-                    f'{cderi_bar_blk.shape}, expected {(naoaux, p1 - p0)}.'
-            )
-            if not numpy.any(cderi_bar_blk):
-                continue
-            nblocks += 1
-
-            cderi_blk = numpy.asarray(feri[:, p0:p1])
-
-            ints_bar = scipy.linalg.solve_triangular(
-                low.T, cderi_bar_blk, lower=False, check_finite=False
-            )
-            low_bar -= ints_bar @ cderi_blk.T
-
-            def int3c_block(mol_, auxmol_):
-                ints = _int3c_cross_opt.int3c_cross(
-                    mol_, auxmol_, intor=int3c, comp=1,
-                    aosym='s2ij', shls_slice=shls_slice
+                bstart, bend, _ = sh_range
+                shls_slice = (
+                    bstart, bend,
+                    0, mol.nbas,
+                    mol.nbas, mol.nbas + auxmol.nbas,
                 )
-                return ints.reshape((-1, naoaux)).T
 
-            _, int3c_pullback = jax.vjp(int3c_block, mol, auxmol)
-            mol_blk_bar, auxmol_blk_bar = int3c_pullback(np.asarray(ints_bar))
-            mol_bar = _tree_add(mol_bar, mol_blk_bar)
-            auxmol_bar = _tree_add(auxmol_bar, auxmol_blk_bar)
-            cderi_bar_blk = cderi_blk = ints_bar = None
-            mol_blk_bar = auxmol_blk_bar = None
+                p0, p1 = p1, p1 + sh_range[2]
+                if detail is not None:
+                    detail['counters']['global_pair_positions_encountered'] += (
+                        p1 - p0
+                    )
+                    stage_timing_start = _detailed_timing_start()
+                cderi_bar_blk = numpy.asarray(cderi_bar_block_fn(p0, p1))
+                if detail is not None:
+                    elapsed = _detailed_timing_elapsed(stage_timing_start)
+                    child_elapsed['ao_projection_total'] = elapsed
+                    _record_detailed_timing(
+                        detail, 'ao_projection_total', elapsed,
+                        block_index=block_index,
+                    )
+                if cderi_bar_blk.shape != (naoaux, p1 - p0):
+                    raise RuntimeError(
+                        'CDERI cotangent block has shape '
+                        f'{cderi_bar_blk.shape}, expected {(naoaux, p1 - p0)}.'
+                    )
+
+                if detail is not None:
+                    stage_timing_start = _detailed_timing_start()
+                has_nonzero = numpy.any(cderi_bar_blk)
+                if detail is not None:
+                    elapsed = _detailed_timing_elapsed(stage_timing_start)
+                    child_elapsed['zero_check'] = elapsed
+                    _record_detailed_timing(
+                        detail, 'zero_check', elapsed,
+                        block_index=block_index,
+                    )
+                if not has_nonzero:
+                    if detail is not None:
+                        detail['counters']['skipped_zero_blocks'] += 1
+                        _finish_outer_block_timing(
+                            detail, outer_timing_start, child_elapsed,
+                            block_index,
+                        )
+                        detail['active_block_index'] = None
+                    continue
+                nblocks += 1
+                if detail is not None:
+                    detail['counters']['processed_nonzero_blocks'] += 1
+
+                if detail is not None:
+                    stage_timing_start = _detailed_timing_start()
+                cderi_blk = numpy.asarray(feri[:, p0:p1])
+                if detail is not None:
+                    elapsed = _detailed_timing_elapsed(stage_timing_start)
+                    child_elapsed['cderi_read'] = elapsed
+                    _record_detailed_timing(
+                        detail, 'cderi_read', elapsed,
+                        block_index=block_index,
+                    )
+
+                if detail is not None:
+                    stage_timing_start = _detailed_timing_start()
+                ints_bar = scipy.linalg.solve_triangular(
+                    low.T, cderi_bar_blk, lower=False, check_finite=False
+                )
+                if detail is not None:
+                    elapsed = _detailed_timing_elapsed(stage_timing_start)
+                    child_elapsed['triangular_solve'] = elapsed
+                    _record_detailed_timing(
+                        detail, 'triangular_solve', elapsed,
+                        block_index=block_index,
+                    )
+
+                if detail is not None:
+                    stage_timing_start = _detailed_timing_start()
+                low_bar -= ints_bar @ cderi_blk.T
+                if detail is not None:
+                    elapsed = _detailed_timing_elapsed(stage_timing_start)
+                    child_elapsed['low_bar_gemm'] = elapsed
+                    _record_detailed_timing(
+                        detail, 'low_bar_gemm', elapsed,
+                        block_index=block_index,
+                    )
+
+                def int3c_block(mol_, auxmol_):
+                    ints = _int3c_cross_opt.int3c_cross(
+                        mol_, auxmol_, intor=int3c, comp=1,
+                        aosym='s2ij', shls_slice=shls_slice
+                    )
+                    return ints.reshape((-1, naoaux)).T
+
+                if detail is not None:
+                    stage_timing_start = _detailed_timing_start()
+                _, int3c_pullback = jax.vjp(int3c_block, mol, auxmol)
+                if detail is not None:
+                    elapsed = _detailed_timing_elapsed(stage_timing_start)
+                    child_elapsed['int3c_primal_vjp_setup'] = elapsed
+                    _record_detailed_timing(
+                        detail, 'int3c_primal_vjp_setup', elapsed,
+                        block_index=block_index,
+                    )
+
+                if detail is not None:
+                    stage_timing_start = _detailed_timing_start()
+                mol_blk_bar, auxmol_blk_bar = int3c_pullback(np.asarray(ints_bar))
+                if detail is not None:
+                    elapsed = _detailed_timing_elapsed(stage_timing_start)
+                    child_elapsed['int3c_pullback'] = elapsed
+                    _record_detailed_timing(
+                        detail, 'int3c_pullback', elapsed,
+                        block_index=block_index,
+                    )
+
+                if detail is not None:
+                    stage_timing_start = _detailed_timing_start()
+                mol_bar = _tree_add(mol_bar, mol_blk_bar)
+                auxmol_bar = _tree_add(auxmol_bar, auxmol_blk_bar)
+                if detail is not None:
+                    elapsed = _detailed_timing_elapsed(stage_timing_start)
+                    child_elapsed['gradient_accumulation'] = elapsed
+                    _record_detailed_timing(
+                        detail, 'gradient_accumulation', elapsed,
+                        block_index=block_index,
+                    )
+                cderi_bar_blk = cderi_blk = ints_bar = None
+                mol_blk_bar = auxmol_blk_bar = None
+                if detail is not None:
+                    _finish_outer_block_timing(
+                        detail, outer_timing_start, child_elapsed, block_index
+                    )
+                    detail['active_block_index'] = None
+    finally:
+        if detail is not None:
+            detail['active_block_index'] = None
+            _DF_VJP_DETAILED_TIMING.reset(detail_token)
     _profile_msg(
         'cholesky_eri_vjp_from_cderi_block_fn int3c block loop done '
         f'nblocks={nblocks} {time.perf_counter() - t:.2f} s'
@@ -552,9 +1090,25 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
 
     t = time.perf_counter()
     resource_phase = resource_profile.start()
+    metric_vjp_timing_start = (
+        _detailed_timing_start() if detail is not None else None
+    )
     _, chol_pullback = jax.vjp(metric_cholesky, auxmol)
+    if detail is not None:
+        _record_detailed_timing(
+            detail,
+            'metric_vjp_primal_creation',
+            _detailed_timing_elapsed(metric_vjp_timing_start),
+        )
+        metric_pullback_timing_start = _detailed_timing_start()
     aux_metric_bar = chol_pullback(np.asarray(numpy.tril(low_bar)))[0]
     auxmol_bar = _tree_add(auxmol_bar, aux_metric_bar)
+    if detail is not None:
+        _record_detailed_timing(
+            detail,
+            'metric_cholesky_pullback',
+            _detailed_timing_elapsed(metric_pullback_timing_start),
+        )
     _profile_msg(
         'cholesky_eri_vjp_from_cderi_block_fn metric cholesky pullback done '
         f'{time.perf_counter() - t:.2f} s'
@@ -575,6 +1129,13 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
         naux=naoaux,
         shell_blocks=nblocks,
     )
+    if detail is not None:
+        _record_detailed_timing(
+            detail,
+            'complete_response',
+            _detailed_timing_elapsed(complete_timing_start),
+        )
+        _emit_df_vjp_detailed_timing(detail)
     return mol_bar, auxmol_bar
 
 

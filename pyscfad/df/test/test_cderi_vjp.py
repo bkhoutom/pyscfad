@@ -1,6 +1,7 @@
 import h5py
 import jax
 import numpy
+import pytest
 
 from pyscfad import config, gto
 from pyscfad import numpy as np
@@ -8,7 +9,10 @@ from pyscfad.ao2mo import _ao2mo
 from pyscfad.df import _cderi_vjp, addons, incore
 
 
-def test_nr_e2_cderi_bar_packed_blocks_match_full_vjp():
+@pytest.mark.parametrize('project_mode', ('legacy', 'swapped', 'auto'))
+def test_nr_e2_cderi_bar_packed_blocks_match_full_vjp(
+        monkeypatch, project_mode):
+    monkeypatch.setenv('PYSCFAD_DF_AO_PROJECTION_ORDER', project_mode)
     rng = numpy.random.default_rng(12)
     naux = 4
     nao = 5
@@ -41,6 +45,111 @@ def test_nr_e2_cderi_bar_packed_blocks_match_full_vjp():
     cderi_bar = numpy.concatenate(blocks, axis=1)
 
     assert numpy.allclose(cderi_bar, cderi_bar_ref, atol=1e-10, rtol=1e-10)
+
+
+def _assert_projection_close(actual, expected, tolerance=5e-12):
+    difference = numpy.asarray(actual) - numpy.asarray(expected)
+    scale = max(
+        1.0,
+        float(numpy.abs(actual).max(initial=0.0)),
+        float(numpy.abs(expected).max(initial=0.0)),
+    )
+    norm_scale = max(float(numpy.linalg.norm(expected)), 1.0)
+    assert float(numpy.abs(difference).max(initial=0.0)) / scale <= tolerance
+    assert float(numpy.linalg.norm(difference)) / norm_scale <= tolerance
+
+
+@pytest.mark.parametrize('backend', ('native', 'numpy'))
+@pytest.mark.parametrize('project_mode', ('legacy', 'swapped', 'auto'))
+@pytest.mark.parametrize(('kc', 'lc'), ((2, 7), (7, 2), (4, 4)))
+def test_nr_e2_cderi_bar_project_modes_noncontiguous(
+        monkeypatch, backend, project_mode, kc, lc):
+    if backend == 'native':
+        if not _cderi_vjp._NR_E2_CDERI_BAR_NATIVE:
+            pytest.skip('native AO projection kernel is unavailable')
+    else:
+        monkeypatch.setattr(_cderi_vjp, '_NR_E2_CDERI_BAR_NATIVE', False)
+
+    rng = numpy.random.default_rng(121)
+    naux = 5
+    npos = 11
+    ybar = rng.normal(size=(naux, kc, 2 * lc))[..., ::2]
+    mok_rows = rng.normal(size=(npos, 2 * kc))[:, ::2]
+    mol_cols = rng.normal(size=(npos, 2 * lc))[:, ::2]
+    assert not ybar.flags.c_contiguous
+    assert not mok_rows.flags.c_contiguous
+    assert not mol_cols.flags.c_contiguous
+
+    reference = numpy.einsum(
+        'Lij,pi,pj->Lp', ybar, mok_rows, mol_cols, optimize=True
+    )
+    result = _cderi_vjp._nr_e2_cderi_bar_project(
+        ybar, mok_rows, mol_cols, order=project_mode
+    )
+    _assert_projection_close(result, reference)
+
+
+@pytest.mark.parametrize('project_mode', ('legacy', 'swapped', 'auto'))
+def test_nr_e2_cderi_bar_packed_block_unsorted_duplicate_positions(
+        monkeypatch, project_mode):
+    monkeypatch.setenv('PYSCFAD_DF_AO_PROJECTION_ORDER', project_mode)
+    rng = numpy.random.default_rng(122)
+    naux, nao, nmo = 6, 5, 8
+    orbs_slice = (0, 2, 2, 8)
+    mo_coeff = rng.normal(size=(nao, nmo))
+    ybar = rng.normal(size=(naux, 12))
+    positions = numpy.asarray([8, 0, 4, 8, 14, 2, 1], dtype=numpy.int64)
+
+    rows, cols = numpy.tril_indices(nao)
+    y3 = ybar.reshape(naux, 2, 6)
+    reference = numpy.einsum(
+        'Lij,pi,pj->Lp',
+        y3,
+        mo_coeff[rows[positions], :2],
+        mo_coeff[cols[positions], 2:8],
+        optimize=True,
+    )
+    offdiag = rows[positions] != cols[positions]
+    reference[:, offdiag] += numpy.einsum(
+        'Lij,pi,pj->Lp',
+        y3,
+        mo_coeff[cols[positions[offdiag]], :2],
+        mo_coeff[rows[positions[offdiag]], 2:8],
+        optimize=True,
+    )
+    result = _cderi_vjp.nr_e2_cderi_bar_packed_block(
+        np.asarray(mo_coeff), np.asarray(ybar), orbs_slice, positions
+    )
+    _assert_projection_close(result, reference)
+
+    empty = _cderi_vjp.nr_e2_cderi_bar_packed_block(
+        np.asarray(mo_coeff), np.asarray(ybar), orbs_slice,
+        numpy.empty(0, dtype=numpy.int64),
+    )
+    assert empty.shape == (naux, 0)
+
+
+def test_ao_projection_order_resolution_default_and_invalid(monkeypatch):
+    monkeypatch.delenv('PYSCFAD_DF_AO_PROJECTION_ORDER', raising=False)
+    assert _cderi_vjp._ao_projection_order_mode() == 'auto'
+
+    ybar = numpy.zeros((3, 2, 7))
+    mok_rows = numpy.zeros((5, 2))
+    mol_cols = numpy.zeros((5, 7))
+
+    selected = _cderi_vjp._select_ao_projection_order(
+        ybar, mok_rows, mol_cols, order='auto'
+    )
+    assert selected[4] == 'swapped'
+    assert selected[0].shape == (3, 7, 2)
+    selected = _cderi_vjp._select_ao_projection_order(
+        ybar.transpose(0, 2, 1), mol_cols, mok_rows, order='auto'
+    )
+    assert selected[4] == 'legacy'
+
+    monkeypatch.setenv('PYSCFAD_DF_AO_PROJECTION_ORDER', 'invalid')
+    with pytest.raises(ValueError, match='must be one of'):
+        _cderi_vjp._ao_projection_order_mode()
 
 
 def test_nr_e2_mo_coeff_vjp_from_cderi_source_is_blocked(tmp_path):
@@ -120,7 +229,10 @@ def test_nr_e2_mo_coeff_vjp_from_local_cderi_source(tmp_path):
     assert numpy.allclose(mo_coeff_bar, mo_coeff_bar_ref, atol=1e-10, rtol=1e-10)
 
 
-def test_cholesky_eri_mo_deriv_vjp_matches_cderi_bar_path(tmp_path):
+@pytest.mark.parametrize('project_mode', ('legacy', 'swapped', 'auto'))
+def test_cholesky_eri_mo_deriv_vjp_matches_cderi_bar_path(
+        tmp_path, monkeypatch, project_mode):
+    monkeypatch.setenv('PYSCFAD_DF_AO_PROJECTION_ORDER', project_mode)
     rng = numpy.random.default_rng(15)
     mol = gto.Mole(
         atom='O 0 0 0; H 0 0 1; H 0 1 0',

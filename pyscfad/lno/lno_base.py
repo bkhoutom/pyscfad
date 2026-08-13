@@ -3397,6 +3397,106 @@ def _is_full_global_pair_idx(pair_idx, nao):
     )
 
 
+def _local_df_reverse_mode():
+    """Select the local CDERI coordinate-response implementation."""
+    mode = os.environ.get(
+        'PYSCFAD_LNO_DF_REVERSE_MODE',
+        getattr(__config__, 'lno_df_reverse_mode', 'auto'),
+    )
+    mode = str(mode).strip().lower().replace('_', '-')
+    aliases = {
+        '1': 'auto',
+        'true': 'auto',
+        'on': 'auto',
+        '0': 'pairwise',
+        'false': 'pairwise',
+        'off': 'pairwise',
+        'direct': 'factorized',
+        'packed': 'pairwise',
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in ('auto', 'factorized', 'pairwise'):
+        raise ValueError(
+            'PYSCFAD_LNO_DF_REVERSE_MODE must be auto, factorized, or '
+            f'pairwise; got {mode!r}.'
+        )
+    return mode
+
+
+def _recover_local_ao_indices(pair_idx, local_nao, global_nao):
+    """Recover and validate the AO rows inducing a local packed triangle.
+
+    ``pair_idx`` must be the complete lower triangle induced by a strictly
+    increasing subset of the global AO rows.  Regenerating all pair indices
+    after decoding the diagonal makes the backward-only scatter fail-safe if
+    the mapping convention ever changes.
+    """
+    local_nao = int(local_nao)
+    global_nao = int(global_nao)
+    if local_nao < 0 or global_nao < 0 or local_nao > global_nao:
+        raise ValueError(
+            f'Invalid AO dimensions local={local_nao}, global={global_nao}.'
+        )
+
+    pair_idx = numpy.asarray(pair_idx, dtype=numpy.int64).ravel()
+    expected_count = local_nao * (local_nao + 1) // 2
+    if pair_idx.size != expected_count:
+        raise ValueError(
+            f'pair_idx has {pair_idx.size} entries; expected {expected_count} '
+            f'for {local_nao} local AOs.'
+        )
+    if local_nao == 0:
+        return numpy.empty(0, dtype=numpy.int64)
+
+    global_pair_count = global_nao * (global_nao + 1) // 2
+    if numpy.any(pair_idx < 0) or numpy.any(pair_idx >= global_pair_count):
+        raise ValueError('pair_idx lies outside the global packed AO triangle.')
+    if numpy.any(numpy.diff(pair_idx) <= 0):
+        raise ValueError('pair_idx must be strictly increasing.')
+
+    local_rows = numpy.arange(local_nao, dtype=numpy.int64)
+    diagonal_positions = local_rows * (local_rows + 3) // 2
+    packed_diagonal = pair_idx[diagonal_positions]
+    global_rows = numpy.arange(global_nao + 1, dtype=numpy.int64)
+    row_starts = global_rows * (global_rows + 1) // 2
+    ao_idx = numpy.searchsorted(
+        row_starts, packed_diagonal, side='right'
+    ) - 1
+    diagonal_cols = packed_diagonal - row_starts[ao_idx]
+    if not numpy.array_equal(ao_idx, diagonal_cols):
+        raise ValueError(
+            'Local diagonal positions do not map to global AO diagonals.'
+        )
+    if numpy.any(numpy.diff(ao_idx) <= 0):
+        raise ValueError('Recovered local AO indices are not increasing.')
+
+    expected = _global_pair_indices_for_local_ao(ao_idx, global_nao)
+    if not numpy.array_equal(pair_idx, expected):
+        mismatch = int(numpy.flatnonzero(pair_idx != expected)[0])
+        raise ValueError(
+            'pair_idx is not the complete packed triangle induced by the '
+            f'recovered AO rows (first mismatch at pair {mismatch}).'
+        )
+    return ao_idx
+
+
+def _zero_pad_local_mo_coeff(mo_coeff, pair_idx, global_nao):
+    """Scatter local MO coefficient rows into the full AO row space."""
+    mo_local = numpy.asarray(jax.device_get(mo_coeff))
+    if mo_local.ndim != 2:
+        raise ValueError(
+            f'mo_coeff must be rank 2; got shape {mo_local.shape}.'
+        )
+    ao_idx = _recover_local_ao_indices(
+        pair_idx, mo_local.shape[0], global_nao
+    )
+    mo_full = numpy.zeros(
+        (int(global_nao), mo_local.shape[1]), dtype=mo_local.dtype
+    )
+    mo_full[ao_idx] = mo_local
+    return mo_full, ao_idx
+
+
 @partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 7))
 def _outcore_local_nr_e2_from_global_cderi(mol, auxmol, mo_coeff, cderi_source,
                                            max_memory, orbs_slice, aosym,
@@ -3424,6 +3524,7 @@ def _outcore_local_nr_e2_from_global_cderi_bwd(cderi_source, max_memory,
                                                orbs_slice, aosym, pair_idx,
                                                res, ybar):
     mol, auxmol, mo_coeff = res
+    mode = _local_df_reverse_mode()
     pair_idx = numpy.asarray(pair_idx, dtype=numpy.int64)
     try:
         with _vjp_progress_section('fragment DF AO2MO MO-coeff backward'):
@@ -3433,14 +3534,46 @@ def _outcore_local_nr_e2_from_global_cderi_bwd(cderi_source, max_memory,
             )
 
         ybar_np = numpy.asarray(jax.device_get(ybar))
-        if _is_full_global_pair_idx(pair_idx, mol.nao):
+        direct_mo_coeff = None
+        direct_route = None
+        mapping_error = None
+        if mode != 'pairwise':
+            if (
+                int(mo_coeff.shape[0]) == int(mol.nao)
+                and _is_full_global_pair_idx(pair_idx, mol.nao)
+            ):
+                direct_mo_coeff = numpy.asarray(jax.device_get(mo_coeff))
+                direct_route = 'full-global'
+            else:
+                try:
+                    direct_mo_coeff, _ = _zero_pad_local_mo_coeff(
+                        mo_coeff, pair_idx, mol.nao
+                    )
+                    direct_route = 'zero-padded-local'
+                except ValueError as err:
+                    mapping_error = err
+
+        if mapping_error is not None and mode == 'factorized':
+            raise RuntimeError(
+                'Factorized local DF reverse requires a complete induced '
+                'packed AO triangle.'
+            ) from mapping_error
+
+        if direct_mo_coeff is not None:
+            if _env_flag('PYSCFAD_PROFILE_BACKWARD_PHASES', False):
+                print(
+                    '[profile][lno.local_df_reverse] '
+                    f'mode={mode} route={direct_route} '
+                    f'local_nao={mo_coeff.shape[0]} global_nao={mol.nao}',
+                    flush=True,
+                )
             try:
                 with _vjp_progress_section('fragment DF integral derivative backward'):
                     mol_bar, auxmol_bar = _cderi_vjp.cholesky_eri_vjp_from_mo_coeff_ybar(
                         mol,
                         auxmol,
                         cderi_source,
-                        mo_coeff,
+                        direct_mo_coeff,
                         ybar_np,
                         orbs_slice,
                         max(max_memory, 4096),
@@ -3448,11 +3581,29 @@ def _outcore_local_nr_e2_from_global_cderi_bwd(cderi_source, max_memory,
                         int2c=mol._add_suffix('int2c2e'),
                         aosym='s2ij',
                     )
-            except NotImplementedError:
+            except NotImplementedError as err:
+                if mode == 'factorized':
+                    raise RuntimeError(
+                        'The requested factorized local DF reverse path is '
+                        'unsupported for this molecule/CDERI representation.'
+                    ) from err
                 mol_bar = auxmol_bar = None
             if mol_bar is not None:
                 return mol_bar, auxmol_bar, mo_coeff_bar
-        with _vjp_progress_section('fragment DF integral derivative backward'):
+
+        if _env_flag('PYSCFAD_PROFILE_BACKWARD_PHASES', False):
+            route = (
+                'pairwise-reference' if mode == 'pairwise'
+                else 'packed-fallback'
+            )
+            print(
+                '[profile][lno.local_df_reverse] '
+                f'mode={mode} route={route} '
+                f'local_nao={mo_coeff.shape[0]} global_nao={mol.nao}',
+                flush=True,
+            )
+        with _vjp_progress_section(
+                'fragment DF integral derivative backward (pairwise)'):
             mol_bar, auxmol_bar = _cderi_vjp.cholesky_eri_vjp_from_cderi_block_fn(
                 mol,
                 auxmol,

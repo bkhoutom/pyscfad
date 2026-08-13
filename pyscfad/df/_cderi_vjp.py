@@ -521,7 +521,7 @@ def _nr_e2_cderi_bar_project_native(ybar, mok_rows, mol_cols, blksize):
 
 
 def _nr_e2_cderi_bar_project(ybar, mok_rows, mol_cols, order=None):
-    """Project ``ybar[Lij]`` onto pair-specific MO rows.
+    """Project ``ybar[Lij]`` (B conj tensor) onto pair-specific MO rows.
 
     The direct expression ``einsum('Lij,pi,pj->Lp', ...)`` often dispatches to
     NumPy's generic ``c_einsum`` loop, which is single-threaded.  Splitting the
@@ -658,7 +658,7 @@ def nr_e2_cderi_bar_packed_block(mo_coeff, ybar, orbs_slice, pair_positions):
     mo = numpy.asarray(jax.device_get(mo_coeff))
     ybar = numpy.asarray(jax.device_get(ybar))
     nao = mo.shape[0]
-    k0, k1, l0, l1 = orbs_slice
+    k0, k1, l0, l1 = orbs_slice # k0:k1 (act occ) and l0:l1 (act vir) are the MO slices for the two AO indices of the pair
     kc = k1 - k0
     lc = l1 - l0
     ybar = ybar.reshape(naux, kc, lc)
@@ -1277,8 +1277,9 @@ def cholesky_eri_vjp_from_mo_coeff_ybar(mol, auxmol, cderi_source,
     """Back-propagate through CDERI using MO-basis int3c derivatives.
 
     This avoids materializing the large packed AO-pair cotangent
-    ``cderi_bar[naux, nao_pair]``.  It is currently limited to the full AO
-    basis; localized AO domains should keep using the block-function fallback.
+    ``cderi_bar[naux, nao_pair]``.  ``mo_coeff`` must have the full AO row
+    dimension.  A localized caller can satisfy that requirement by scattering
+    its local rows into a zero-padded full-AO coefficient matrix.
     """
     t_total = time.perf_counter()
     _profile_msg(

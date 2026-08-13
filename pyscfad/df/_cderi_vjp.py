@@ -14,13 +14,16 @@
 
 """Memory-conscious VJP helpers for out-of-core molecular DF CDERI."""
 
+from contextlib import contextmanager
 from functools import lru_cache
 import contextvars
 import ctypes
 import json
 import os
+import tempfile
 import time
 
+import h5py
 import numpy
 import scipy.linalg
 import jax
@@ -46,6 +49,8 @@ except (ImportError, OSError):
 _INT3C_VJP_TARGET_MB = 256.0
 _NR_E2_VJP_BLOCK_MB = 256.0
 _CDERI_BAR_PAIR_BLOCK_MB = 256.0
+_CDERI_BAR_AUX_BLOCK_MB = 256.0
+_CDERI_BAR_HDF_CHUNK_MB = 8.0
 _INT3C_MO_VJP_BLOCK_MB = 512.0
 _NR_E2_CDERI_BAR_NATIVE = (
     libao2mo_vjp is not None
@@ -64,6 +69,23 @@ if _NR_E2_CDERI_BAR_NATIVE:
         ctypes.c_int,
     ]
     libao2mo_vjp.AO2MOnr_e2_cderi_bar_project_omp.restype = None
+
+_NR_E2_CDERI_BAR_AUX_NATIVE = (
+    libao2mo_vjp is not None
+    and hasattr(libao2mo_vjp, 'AO2MOnr_e2_cderi_bar_pack_aux_block')
+)
+if _NR_E2_CDERI_BAR_AUX_NATIVE:
+    libao2mo_vjp.AO2MOnr_e2_cderi_bar_pack_aux_block.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    libao2mo_vjp.AO2MOnr_e2_cderi_bar_pack_aux_block.restype = ctypes.c_int
 
 
 def _profile_enabled():
@@ -394,6 +416,26 @@ def _cderi_bar_pair_block_mb():
     return _CDERI_BAR_PAIR_BLOCK_MB
 
 
+def _cderi_bar_aux_block_mb():
+    value = os.environ.get('PYSCFAD_DF_CDERI_BAR_AUX_BLOCK_MB')
+    if value is None:
+        return _CDERI_BAR_AUX_BLOCK_MB
+    try:
+        return max(float(value), 1.0)
+    except ValueError:
+        return _CDERI_BAR_AUX_BLOCK_MB
+
+
+def _cderi_bar_hdf_chunk_mb():
+    value = os.environ.get('PYSCFAD_DF_CDERI_BAR_HDF_CHUNK_MB')
+    if value is None:
+        return _CDERI_BAR_HDF_CHUNK_MB
+    try:
+        return max(float(value), 1.0)
+    except ValueError:
+        return _CDERI_BAR_HDF_CHUNK_MB
+
+
 _AO_PROJECTION_ORDER_ENV = 'PYSCFAD_DF_AO_PROJECTION_ORDER'
 _AO_PROJECTION_ORDERS = ('legacy', 'swapped', 'auto')
 _AO_PROJECTION_ORDER_DEFAULT = 'auto'
@@ -562,6 +604,268 @@ def _nr_e2_cderi_bar_project(ybar, mok_rows, mol_cols, order=None):
             axis=1,
         )
     return out
+
+
+def _use_native_cderi_bar_aux_block(ybar, mo_k, mo_l):
+    return (
+        _NR_E2_CDERI_BAR_AUX_NATIVE
+        and ybar.dtype == numpy.float64
+        and mo_k.dtype == numpy.float64
+        and mo_l.dtype == numpy.float64
+    )
+
+
+def _nr_e2_cderi_bar_packed_aux_block_native(ybar, mo_k, mo_l):
+    """Two-GEMM packed AO projection for one contiguous auxiliary slab."""
+    naux, kc, lc = ybar.shape
+    nao = mo_k.shape[0]
+    npair = nao * (nao + 1) // 2
+    y2 = numpy.asarray(
+        ybar.transpose(0, 2, 1).reshape(naux * lc, kc),
+        order='C',
+        dtype=numpy.double,
+    )
+    mo_k = numpy.asarray(mo_k, order='C', dtype=numpy.double)
+    mo_l = numpy.asarray(mo_l, order='C', dtype=numpy.double)
+    out = numpy.empty((naux, npair), order='C', dtype=numpy.double)
+    status = libao2mo_vjp.AO2MOnr_e2_cderi_bar_pack_aux_block(
+        out.ctypes.data_as(ctypes.c_void_p),
+        y2.ctypes.data_as(ctypes.c_void_p),
+        mo_k.ctypes.data_as(ctypes.c_void_p),
+        mo_l.ctypes.data_as(ctypes.c_void_p),
+        ctypes.c_int(naux),
+        ctypes.c_int(nao),
+        ctypes.c_int(kc),
+        ctypes.c_int(lc),
+    )
+    if status != 0:
+        raise MemoryError('Native packed AO-projection workspace allocation failed.')
+    return out
+
+
+def _nr_e2_cderi_bar_packed_aux_block_numpy(ybar, mo_k, mo_l):
+    """NumPy fallback for the two-GEMM auxiliary-slab projection."""
+    naux, kc, lc = ybar.shape
+    nao = mo_k.shape[0]
+    y2 = numpy.asarray(ybar.transpose(0, 2, 1).reshape(naux * lc, kc), order='C')
+    tmp = numpy.dot(y2, numpy.asarray(mo_k, order='C').T)
+    tmp = tmp.reshape(naux, lc, nao)
+
+    rows, cols = _tril_indices(nao)
+    offdiag = rows != cols
+    out = numpy.empty((naux, rows.size), dtype=numpy.result_type(
+        ybar.dtype, mo_k.dtype, mo_l.dtype
+    ))
+    mo_l_t = numpy.asarray(mo_l, order='C').T
+    for p in range(naux):
+        mat = numpy.dot(tmp[p].T, mo_l_t)
+        out[p] = mat[rows, cols]
+        out[p, offdiag] += mat[cols[offdiag], rows[offdiag]]
+    return out
+
+
+def _prepare_nr_e2_cderi_bar_aux_projection(
+        mo_coeff, ybar, orbs_slice, order=None):
+    """Validate the projection and prepare reusable coefficient blocks."""
+    mo = numpy.asarray(jax.device_get(mo_coeff))
+    ybar = numpy.asarray(jax.device_get(ybar))
+    if mo.ndim != 2:
+        raise ValueError(f'mo_coeff must be rank 2, got shape {mo.shape}.')
+
+    k0, k1, l0, l1 = map(int, orbs_slice)
+    if not (0 <= k0 <= k1 <= mo.shape[1] and 0 <= l0 <= l1 <= mo.shape[1]):
+        raise ValueError(
+            f'orbs_slice {orbs_slice} is incompatible with mo_coeff shape {mo.shape}.'
+        )
+    kc = k1 - k0
+    lc = l1 - l0
+    naux = int(ybar.shape[0])
+    if ybar.size != naux * kc * lc:
+        raise ValueError(
+            f'ybar has shape {ybar.shape}; expected {naux * kc * lc} values.'
+        )
+    ybar = ybar.reshape(naux, kc, lc)
+    mo_k = mo[:, k0:k1]
+    mo_l = mo[:, l0:l1]
+    ybar, mo_k, mo_l, _, _, _, _ = _select_ao_projection_order(
+        ybar, mo_k, mo_l, order=order
+    )
+    return (
+        ybar,
+        numpy.asarray(mo_k, order='C'),
+        numpy.asarray(mo_l, order='C'),
+    )
+
+
+def _nr_e2_cderi_bar_packed_aux_block_prepared(ybar, mo_k, mo_l):
+    """Project one auxiliary slab using prepared coefficient blocks."""
+    naux = int(ybar.shape[0])
+    nao = int(mo_k.shape[0])
+    npair = nao * (nao + 1) // 2
+    if naux == 0 or nao == 0 or ybar.shape[1] == 0 or ybar.shape[2] == 0:
+        return numpy.zeros((naux, npair), dtype=numpy.result_type(
+            ybar.dtype, mo_k.dtype, mo_l.dtype
+        ))
+    if _use_native_cderi_bar_aux_block(ybar, mo_k, mo_l):
+        return _nr_e2_cderi_bar_packed_aux_block_native(ybar, mo_k, mo_l)
+    return _nr_e2_cderi_bar_packed_aux_block_numpy(ybar, mo_k, mo_l)
+
+
+def nr_e2_cderi_bar_packed_aux_block(mo_coeff, ybar, orbs_slice, order=None):
+    """Build every packed AO-pair cotangent for one auxiliary slab.
+
+    Unlike :func:`nr_e2_cderi_bar_packed_block`, which evaluates selected AO
+    pairs independently, this routine forms the complete AO matrix with two
+    sequential GEMMs and packs it afterward.  Its cost for a slab of ``b``
+    auxiliary functions is
+
+    ``O(b * (nao*kc*lc + nao**2*min(kc,lc)))``
+
+    when the default automatic contraction order is used.
+    """
+    ybar, mo_k, mo_l = _prepare_nr_e2_cderi_bar_aux_projection(
+        mo_coeff, ybar, orbs_slice, order=order
+    )
+    return _nr_e2_cderi_bar_packed_aux_block_prepared(ybar, mo_k, mo_l)
+
+
+def _nr_e2_cderi_bar_aux_blksize(mo_coeff, ybar, orbs_slice, order=None):
+    """Choose an auxiliary slab size for the packed two-GEMM projection."""
+    naux = int(ybar.shape[0])
+    if naux == 0:
+        return 1
+    nao = int(mo_coeff.shape[0])
+    k0, k1, l0, l1 = map(int, orbs_slice)
+    kc = k1 - k0
+    lc = l1 - l0
+    mode = _ao_projection_order_mode(order)
+    effective_lc = kc if (mode == 'swapped' or (mode == 'auto' and lc > kc)) else lc
+    npair = nao * (nao + 1) // 2
+    itemsize = numpy.dtype(numpy.result_type(mo_coeff.dtype, ybar.dtype)).itemsize
+    target_bytes = _cderi_bar_aux_block_mb() * 1024.0**2
+    # Per auxiliary row, account for the packed output, the first-GEMM
+    # result, and the contiguous y2 view required by BLAS.  The second GEMM
+    # needs one dense AO matrix per active OpenMP thread; the native kernel
+    # caps that thread count at the number of rows in the slab.
+    bytes_per_aux = max(
+        (npair + nao * effective_lc + kc * lc) * itemsize,
+        1,
+    )
+    matrix_bytes = nao * nao * itemsize
+    max_threads = max(int(pyscf_lib.num_threads()), 1)
+    coeff_bytes = nao * (kc + lc) * itemsize
+    target_bytes = max(
+        target_bytes - coeff_bytes,
+        bytes_per_aux + matrix_bytes,
+    )
+
+    small_region = int(target_bytes // max(bytes_per_aux + matrix_bytes, 1))
+    if naux <= max_threads or small_region < max_threads:
+        return max(1, min(naux, small_region))
+
+    available = target_bytes - max_threads * matrix_bytes
+    large_region = int(available // bytes_per_aux)
+    return max(1, min(naux, large_region))
+
+
+@contextmanager
+def nr_e2_cderi_bar_packed_disk(mo_coeff, ybar, orbs_slice, order=None,
+                                directory=None, aux_blksize=None):
+    """Store a packed AO cotangent using aux writes and pair-oriented reads.
+
+    The HDF5 dataset has the natural ``(naux, nao_pair)`` shape and two-
+    dimensional chunks.  Auxiliary slabs are generated by
+    :func:`nr_e2_cderi_bar_packed_aux_block` and written directly as row slabs.
+    Consumers can subsequently read contiguous AO-pair column slabs without
+    materializing the complete array.  This layout avoids a full-slab
+    transpose copy on write while supporting both access directions.
+    """
+    mo = numpy.asarray(jax.device_get(mo_coeff))
+    ybar = numpy.asarray(jax.device_get(ybar))
+    if ybar.ndim == 0:
+        raise ValueError('ybar must have an auxiliary dimension.')
+    naux = int(ybar.shape[0])
+    nao = int(mo.shape[0])
+    npair = nao * (nao + 1) // 2
+    if aux_blksize is None:
+        aux_blksize = _nr_e2_cderi_bar_aux_blksize(
+            mo, ybar, orbs_slice, order=order
+        )
+    aux_blksize = max(1, min(max(naux, 1), int(aux_blksize)))
+    ybar_project, mo_k, mo_l = _prepare_nr_e2_cderi_bar_aux_projection(
+        mo, ybar, orbs_slice, order=order
+    )
+
+    if directory is None:
+        directory = (
+            os.environ.get('PYSCFAD_DF_CDERI_BAR_DISK_DIR')
+            or pyscf_lib.param.TMPDIR
+        )
+    fd, path = tempfile.mkstemp(
+        suffix='.h5', prefix='pyscfad_cderi_bar_', dir=directory
+    )
+    os.close(fd)
+    resource_start = None
+    resource_finished = False
+    h5file = None
+    try:
+        resource_start = resource_profile.start()
+        h5file = h5py.File(path, 'w')
+        create_kwargs = {}
+        if npair > 0 and naux > 0:
+            aux_chunk = min(naux, aux_blksize)
+            chunk_target = _cderi_bar_hdf_chunk_mb() * 1024.0**2
+            itemsize = numpy.dtype(numpy.result_type(mo.dtype, ybar.dtype)).itemsize
+            pair_chunk = max(1, int(chunk_target // max(aux_chunk * itemsize, 1)))
+            pair_chunk = min(npair, 1024, pair_chunk)
+            create_kwargs['chunks'] = (aux_chunk, pair_chunk)
+        dataset = h5file.create_dataset(
+            'cderi_bar',
+            shape=(naux, npair),
+            dtype=numpy.result_type(mo.dtype, ybar.dtype),
+            **create_kwargs,
+        )
+
+        for p0 in range(0, naux, aux_blksize):
+            p1 = min(p0 + aux_blksize, naux)
+            block = _nr_e2_cderi_bar_packed_aux_block_prepared(
+                ybar_project[p0:p1], mo_k, mo_l
+            )
+            dataset[p0:p1, :] = block
+            block = None
+        h5file.flush()
+        resource_profile.finish(
+            'df_vjp.cderi_bar_disk_build',
+            resource_start,
+            naux=naux,
+            local_nao=nao,
+            local_ao_pairs=npair,
+            aux_block=aux_blksize,
+            hdf_chunks=dataset.chunks,
+            disk_mib=(npair * naux * dataset.dtype.itemsize / 1024.0**2),
+        )
+        resource_finished = True
+        yield dataset
+    finally:
+        try:
+            if resource_start is not None and not resource_finished:
+                resource_profile.finish(
+                    'df_vjp.cderi_bar_disk_build_incomplete',
+                    resource_start,
+                    naux=naux,
+                    local_nao=nao,
+                    local_ao_pairs=npair,
+                    aux_block=aux_blksize,
+                )
+        finally:
+            try:
+                if h5file is not None:
+                    h5file.close()
+            finally:
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
 
 
 def _df_jk_style_blockdim(max_memory, row_width):

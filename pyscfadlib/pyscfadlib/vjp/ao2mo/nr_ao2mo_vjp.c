@@ -322,3 +322,103 @@ void AO2MOnr_e2_cderi_bar_project_omp(
         free(tmp);
     }
 }
+
+
+/*
+ * Transform one auxiliary slab of an MO-integral cotangent back to every
+ * packed AO pair.
+ *
+ * y2 is the C-contiguous view
+ *
+ *     ybar.transpose(0, 2, 1).reshape(naux * lc, kc)
+ *
+ * and mo_k/mo_l are C-contiguous (nao,kc)/(nao,lc) coefficient blocks.
+ * The caller may transpose ybar and exchange mo_k/mo_l before entering this
+ * routine so that lc = min(original_kc, original_lc).  For each auxiliary
+ * row P, the two BLAS contractions are
+ *
+ *     tmp[P,l,u] = sum_k ybar[P,k,l] * mo_k[u,k]
+ *     mat[P,u,v] = sum_l tmp[P,l,u] * mo_l[v,l].
+ *
+ * The packed s2 cotangent is mat[u,v] + mat[v,u] off diagonal and mat[u,u]
+ * on the diagonal.  This is the same symmetry convention as pack_tril, but
+ * values are assigned here (rather than accumulated) so ``out`` need not be
+ * initialized by the caller.
+ */
+int AO2MOnr_e2_cderi_bar_pack_aux_block(
+        double *out, const double *y2,
+        const double *mo_k, const double *mo_l,
+        int naux, int nao, int kc, int lc)
+{
+    if (naux <= 0 || nao <= 0 || kc <= 0 || lc <= 0) {
+        return 0;
+    }
+
+    const int m = naux * lc;
+    const size_t npair = (size_t)nao * (nao + 1) / 2;
+    const double D1 = 1.0;
+    const double D0 = 0.0;
+    const char TRANS_T = 'T';
+    const char TRANS_N = 'N';
+
+    /* Row-major tmp(m,nao) = y2(m,kc) * mo_k(nao,kc)^T. */
+    double *tmp = malloc(sizeof(double) * (size_t)m * nao);
+    if (tmp == NULL) {
+        return 1;
+    }
+    dgemm_(&TRANS_T, &TRANS_N,
+           &nao, &m, &kc,
+           &D1, mo_k, &kc,
+           y2, &kc,
+           &D0, tmp, &nao);
+
+    int allocation_failed = 0;
+    int nthreads = omp_get_max_threads_safe();
+    if (nthreads > naux) {
+        nthreads = naux;
+    }
+    if (nthreads < 1) {
+        nthreads = 1;
+    }
+#pragma omp parallel num_threads(nthreads)
+    {
+        double *mat = malloc(sizeof(double) * (size_t)nao * nao);
+        if (mat == NULL) {
+#pragma omp atomic write
+            allocation_failed = 1;
+        }
+
+#pragma omp for schedule(static)
+        for (int p = 0; p < naux; p++) {
+            if (mat == NULL) {
+                continue;
+            }
+
+            /*
+             * Row-major mat(nao,nao) = tmp[P](lc,nao)^T
+             *                              * mo_l(nao,lc)^T.
+             */
+            const double *tmp_p = tmp + (size_t)p * lc * nao;
+            dgemm_(&TRANS_T, &TRANS_T,
+                   &nao, &nao, &lc,
+                   &D1, mo_l, &lc,
+                   tmp_p, &nao,
+                   &D0, mat, &nao);
+
+            double *out_p = out + (size_t)p * npair;
+            size_t uv = 0;
+            for (int u = 0; u < nao; u++) {
+                for (int v = 0; v < u; v++, uv++) {
+                    out_p[uv] = mat[(size_t)u * nao + v]
+                              + mat[(size_t)v * nao + u];
+                }
+                out_p[uv] = mat[(size_t)u * nao + u];
+                uv++;
+            }
+        }
+
+        free(mat);
+    }
+    free(tmp);
+    return allocation_failed;
+}

@@ -3384,6 +3384,29 @@ def _nr_e2_local_cderi_bar_block(mo_coeff, ybar, orbs_slice, pair_idx, p0, p1):
     return block
 
 
+def _nr_e2_local_cderi_bar_disk_block(cderi_bar_h5, pair_idx, p0, p1):
+    """Read local packed cotangents into one global AO-pair block."""
+    pair_idx = numpy.asarray(pair_idx, dtype=numpy.int64).ravel()
+    naux = int(cderi_bar_h5.shape[0])
+    block = numpy.zeros((naux, p1 - p0), dtype=cderi_bar_h5.dtype)
+    if pair_idx.size == 0:
+        return block
+    if int(cderi_bar_h5.shape[1]) != pair_idx.size:
+        raise RuntimeError(
+            'Disk CDERI cotangent pair dimension does not match local pair map.'
+        )
+    if pair_idx.size > 1 and numpy.any(numpy.diff(pair_idx) <= 0):
+        raise RuntimeError('Local-to-global AO-pair map must be strictly increasing.')
+
+    i0 = int(numpy.searchsorted(pair_idx, p0, side='left'))
+    i1 = int(numpy.searchsorted(pair_idx, p1, side='left'))
+    if i0 == i1:
+        return block
+    global_positions = pair_idx[i0:i1]
+    block[:, global_positions - p0] = numpy.asarray(cderi_bar_h5[:, i0:i1])
+    return block
+
+
 def _is_full_global_pair_idx(pair_idx, nao):
     pair_idx = numpy.asarray(pair_idx, dtype=numpy.int64).ravel()
     npair = nao * (nao + 1) // 2
@@ -3433,7 +3456,8 @@ def _outcore_local_nr_e2_from_global_cderi_bwd(cderi_source, max_memory,
             )
 
         ybar_np = numpy.asarray(jax.device_get(ybar))
-        if _is_full_global_pair_idx(pair_idx, mol.nao):
+        full_pair_idx = _is_full_global_pair_idx(pair_idx, mol.nao)
+        if full_pair_idx:
             try:
                 with _vjp_progress_section('fragment DF integral derivative backward'):
                     mol_bar, auxmol_bar = _cderi_vjp.cholesky_eri_vjp_from_mo_coeff_ybar(
@@ -3452,19 +3476,47 @@ def _outcore_local_nr_e2_from_global_cderi_bwd(cderi_source, max_memory,
                 mol_bar = auxmol_bar = None
             if mol_bar is not None:
                 return mol_bar, auxmol_bar, mo_coeff_bar
-        with _vjp_progress_section('fragment DF integral derivative backward'):
-            mol_bar, auxmol_bar = _cderi_vjp.cholesky_eri_vjp_from_cderi_block_fn(
-                mol,
-                auxmol,
-                cderi_source,
-                lambda p0, p1: _nr_e2_local_cderi_bar_block(
-                    mo_coeff, ybar_np, orbs_slice, pair_idx, p0, p1
-                ),
-                max(max_memory, 4096),
-                int3c=mol._add_suffix('int3c2e'),
-                int2c=mol._add_suffix('int2c2e'),
-                aosym='s2ij',
+            # Preserve the established full-AO fallback.  The disk path below
+            # is specifically for a local AO domain and assumes its compact
+            # pair dimension maps into a larger global packed dimension.
+            with _vjp_progress_section('fragment DF integral derivative backward'):
+                mol_bar, auxmol_bar = _cderi_vjp.cholesky_eri_vjp_from_cderi_block_fn(
+                    mol,
+                    auxmol,
+                    cderi_source,
+                    lambda p0, p1: _nr_e2_local_cderi_bar_block(
+                        mo_coeff, ybar_np, orbs_slice, pair_idx, p0, p1
+                    ),
+                    max(max_memory, 4096),
+                    int3c=mol._add_suffix('int3c2e'),
+                    int2c=mol._add_suffix('int2c2e'),
+                    aosym='s2ij',
+                )
+            return mol_bar, auxmol_bar, mo_coeff_bar
+        expected_local_pairs = mo_coeff.shape[0] * (mo_coeff.shape[0] + 1) // 2
+        if pair_idx.size != expected_local_pairs:
+            raise RuntimeError(
+                f'Local AO-pair map has {pair_idx.size} entries; expected '
+                f'{expected_local_pairs} for {mo_coeff.shape[0]} local AOs.'
             )
+        with _vjp_progress_section('fragment DF integral derivative backward'):
+            # Build Bbar by auxiliary slabs with the dense two-GEMM native
+            # kernel.  The tiled HDF layout is then read by AO-pair slabs,
+            # which is the access order required by the L^{-T} solve below.
+            with _cderi_vjp.nr_e2_cderi_bar_packed_disk(
+                    mo_coeff, ybar_np, orbs_slice) as cderi_bar_h5:
+                mol_bar, auxmol_bar = _cderi_vjp.cholesky_eri_vjp_from_cderi_block_fn(
+                    mol,
+                    auxmol,
+                    cderi_source,
+                    lambda p0, p1: _nr_e2_local_cderi_bar_disk_block(
+                        cderi_bar_h5, pair_idx, p0, p1
+                    ),
+                    max(max_memory, 4096),
+                    int3c=mol._add_suffix('int3c2e'),
+                    int2c=mol._add_suffix('int2c2e'),
+                    aosym='s2ij',
+                )
         return mol_bar, auxmol_bar, mo_coeff_bar
     except NotImplementedError:
         pass

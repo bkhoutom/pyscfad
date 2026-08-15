@@ -32,6 +32,7 @@ from pyscfad.dlno.ccsd import (
     _add_cotangent,
     _build_static_dlno_topology,
     _cleanup_after_fragment,
+    _format_dlno_space_report,
     _make_stub_eris,
     _VERBOSE_PROGRESS,
 )
@@ -285,6 +286,10 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
         log = ((lambda msg: print(msg, flush=True))
                if (rank == 0 and verbose >= _VERBOSE_PROGRESS)
                else (lambda msg: None))
+        report_spaces = comm.bcast(
+            verbose >= _VERBOSE_PROGRESS if rank == 0 else None,
+            root=0,
+        )
         t_overall = time.perf_counter()
         profile_overall = resource_profile.start()
         log(f'DLNOCCSD.value_and_grad (MPI, nproc={nproc}): start')
@@ -343,6 +348,8 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                 profile0,
                 fragments=len(frag_lolist_static),
             )
+            if report_spaces:
+                log(_format_dlno_space_report(mol, prescreen_data))
         else:
             mf = scf_vjp = lo_vjp = lo_coeff = None
             frag_lolist_static = prescreen_data = None
@@ -509,6 +516,10 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                     (cc_local.thresh_occ, cc_local.thresh_vir),
                     frag_prescreen=_frag_prescreen,
                     frozen_mask=cc_local.get_frozen_mask(),
+                    space_label=(
+                        f'[rank {rank}] Fragment {_ifrag+1}/{nfrag}'
+                        if report_spaces else None
+                    ),
                 )
                 if verbose >= _VERBOSE_PROGRESS:
                     print(f'  [rank {rank}] [frag {_ifrag+1}/{nfrag}] '

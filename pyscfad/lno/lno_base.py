@@ -2031,9 +2031,33 @@ def _domain_mp2_fragment_energy(mfcc, eris, orbfragloc,
     )
 
 
+def _print_active_space_screening(space_label, frag_prescreen, nlo,
+                                  prescreen_nocc, prescreen_nvir,
+                                  screened_nocc, screened_nvir):
+    """Print the DLNO and PNO reductions known immediately before CCSD."""
+    fragment = frag_prescreen or {}
+    atoms = numpy.asarray(
+        fragment.get('extended_primary_domain', ())
+    ).size
+    domain_coeff = fragment.get('occ_prescreen_coeff')
+    if domain_coeff is None:
+        domain_coeff = fragment.get('vir_prescreen_coeff')
+    domain_aos = 0 if domain_coeff is None else domain_coeff.shape[0]
+    print(
+        f'  {space_label} active-space screening\n'
+        f'    Domain       : {atoms} atoms / {domain_aos} AOs; '
+        f'fragment LOs = {nlo}\n'
+        f'    Prescreened  : {prescreen_nocc} occ / {prescreen_nvir} vir '
+        f'({prescreen_nocc + prescreen_nvir} MOs)\n'
+        f'    PNO-screened : {screened_nocc} occ / {screened_nvir} vir '
+        f'({screened_nocc + screened_nvir} MOs)',
+        flush=True,
+    )
+
+
 def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external,
-               frag_prescreen=None,
-               frozen_mask=None, frag_target_nocc=None, frag_target_nvir=None):
+               frag_prescreen=None, frozen_mask=None, frag_target_nocc=None,
+               frag_target_nvir=None, space_label=None):
     mytimer = timer.Timer()
     use_checkpoint = (
         USE_CHECKPOINT
@@ -2159,6 +2183,12 @@ def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external
                                     uvir2,
                                     dlno_thresh_internal,
                                 )
+
+    prescreen_nocc = int(orbfragocc1.shape[1] + uocc2.shape[1])
+    prescreen_nvir = int(
+        (orbfragvir1.shape[1] if lovir else 0)
+        + (orbvir1.shape[1] if uvir2 is None else uvir2.shape[1])
+    )
 
     # augment virtual space
     uuocc2_corr = uuvir2_corr = None
@@ -2372,6 +2402,11 @@ def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external
             )
             warnings.warn('No virtual orbital is included for this fragment, '
                           'setting correlation energy to zero.')
+            if space_label is not None:
+                _print_active_space_screening(
+                    space_label, frag_prescreen, nlo,
+                    prescreen_nocc, prescreen_nvir, 0, 0,
+                )
             return None, None, domain_pt2
         else:
             orbfragvir12 = semicanonicalize_fn(fock, orbfragvir2)[1]
@@ -2387,6 +2422,12 @@ def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external
             dmoo, dmvv
         ),
     )
+    if space_label is not None:
+        _print_active_space_screening(
+            space_label, frag_prescreen, nlo,
+            prescreen_nocc, prescreen_nvir,
+            int(orbfragocc12.shape[-1]), int(orbfragvir12.shape[-1]),
+        )
     orbocc_outside = np.dot(orbocc1, uocc2_outside)
     orbvir_outside = np.dot(orbvir1, uvir2_outside)
 

@@ -18,6 +18,7 @@ import time
 
 import jax
 import jax.numpy as jnp
+import numpy
 
 from pyscfad import numpy as np
 from pyscfad.ops import stop_trace
@@ -34,6 +35,82 @@ from pyscfad.dlno.prescreen import (
 # Progress-print verbosity threshold (matches pyscf logger convention:
 # ``log.info`` = level 4).  Reads ``mol.verbose`` from the input mol.
 _VERBOSE_PROGRESS = 4
+
+
+def _count_domain_aos(mol, atom_indices):
+    """Count AO basis functions carried by the selected atoms."""
+    atoms = numpy.asarray(atom_indices, dtype=int).reshape(-1)
+    if atoms.size == 0:
+        return 0
+    aoslices = numpy.asarray(mol.aoslice_by_atom())
+    atoms = numpy.unique(atoms)
+    return int(numpy.sum(aoslices[atoms, 3] - aoslices[atoms, 2]))
+
+
+def _format_table(headers, rows):
+    """Return a compact, right-aligned plain-text table."""
+    rows = [[str(value) for value in row] for row in rows]
+    widths = [
+        max(len(header), *(len(row[i]) for row in rows))
+        for i, header in enumerate(headers)
+    ]
+
+    def format_row(row):
+        return '  '.join(value.rjust(width) for value, width in zip(row, widths))
+
+    lines = [format_row(headers), format_row(['-' * width for width in widths])]
+    lines.extend(format_row(row) for row in rows)
+    return '\n'.join(lines)
+
+
+def _format_dlno_space_report(mol, prescreen_data):
+    """Format domain and fragment dimensions available after prescreening."""
+    primary_domains = prescreen_data.get('lmo_primary_domain', ())
+    fragment_data = prescreen_data.get('fragment_data', ())
+
+    domain_rows = []
+    for domain_index, atoms in enumerate(primary_domains, start=1):
+        domain_rows.append((
+            domain_index,
+            numpy.asarray(atoms).size,
+            _count_domain_aos(mol, atoms),
+        ))
+
+    fragment_rows = []
+    for fragment_index, fragment in enumerate(fragment_data, start=1):
+        atoms = fragment.get('extended_primary_domain', ())
+        occ_coeff = fragment.get('occ_prescreen_coeff')
+        vir_coeff = fragment.get('vir_prescreen_coeff')
+        lo_indices = fragment.get('lo_indices', ())
+        fragment_rows.append((
+            fragment_index,
+            numpy.asarray(atoms).size,
+            _count_domain_aos(mol, atoms),
+            numpy.asarray(lo_indices).size,
+            0 if occ_coeff is None else occ_coeff.shape[1],
+            0 if vir_coeff is None else vir_coeff.shape[1],
+        ))
+
+    lines = [
+        '',
+        'DLNO space summary',
+        '==================',
+        f'Total atomic orbitals : {mol.nao}',
+        f'Orbital domains       : {len(primary_domains)}',
+        f'Fragments             : {len(fragment_data)}',
+        '',
+        'Primary orbital domains (before fragment merging)',
+        _format_table(('Domain', 'Atoms', 'AOs'), domain_rows),
+        '',
+        'Raw fragment prescreen vectors (before active-space projection)',
+        _format_table(
+            ('Fragment', 'Domain atoms', 'Domain AOs', 'Fragment LOs',
+             'Occ vectors', 'Vir vectors'),
+            fragment_rows,
+        ),
+        '',
+    ]
+    return '\n'.join(lines)
 
 
 def _env_flag(name, default=False):
@@ -304,6 +381,8 @@ class DLNOCCSD(LNOCCSD):
             profile0,
             fragments=len(frag_lolist_static),
         )
+        if verbose >= _VERBOSE_PROGRESS:
+            log(_format_dlno_space_report(mol, prescreen_data))
 
         nfrag = len(frag_lolist_static)
         frag_wghtlist = [1.0] * nfrag
@@ -399,6 +478,10 @@ class DLNOCCSD(LNOCCSD):
                     (cc_local.thresh_occ, cc_local.thresh_vir),
                     frag_prescreen=_frag_prescreen,
                     frozen_mask=cc_local.get_frozen_mask(),
+                    space_label=(
+                        f'Fragment {_ifrag+1}/{nfrag}'
+                        if verbose >= _VERBOSE_PROGRESS else None
+                    ),
                 )
                 if verbose >= _VERBOSE_PROGRESS:
                     log(f'  [frag {_ifrag+1}/{nfrag}] make_fpno1:          '

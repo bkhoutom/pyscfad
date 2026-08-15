@@ -5,7 +5,8 @@ import jax.numpy as jnp
 import numpy
 
 from pyscfad import config, df, gto, scf
-from pyscfad.lno import ccsd as lnoccsd
+from pyscfad.dlno import ccsd as dlno_ccsd
+from pyscfad.lno import ccsd as lnoccsd, lno_base
 from pyscfad.dlno.ccsd import DLNOCCSD
 from pyscfad.dlno.prescreen import build_dlno_prescreen_data, rebuild_dlno_prescreen_data
 from pyscfad.lno.tools import autofrag, map_lo_to_frag
@@ -83,6 +84,75 @@ def _make_solver(mf, thresh, dlno_data=None):
 class _FakeEris:
     def __init__(self, ovov):
         self.ovov = ovov
+
+
+class _ReportMol:
+    nao = 7
+
+    @staticmethod
+    def aoslice_by_atom():
+        return numpy.asarray([
+            [0, 0, 0, 2],
+            [0, 0, 2, 5],
+            [0, 0, 5, 7],
+        ])
+
+
+def test_dlno_space_report_contains_domain_and_fragment_dimensions():
+    prescreen_data = {
+        'lmo_primary_domain': (
+            numpy.asarray([0, 1]),
+            numpy.asarray([2]),
+        ),
+        'fragment_data': (
+            {
+                'lo_indices': numpy.asarray([0]),
+                'extended_primary_domain': numpy.asarray([0, 1]),
+                'occ_prescreen_coeff': numpy.zeros((5, 2)),
+                'vir_prescreen_coeff': numpy.zeros((5, 4)),
+            },
+            {
+                'lo_indices': numpy.asarray([1]),
+                'extended_primary_domain': numpy.asarray([2]),
+                'occ_prescreen_coeff': numpy.zeros((2, 1)),
+                'vir_prescreen_coeff': numpy.zeros((2, 3)),
+            },
+        ),
+    }
+
+    report = dlno_ccsd._format_dlno_space_report(
+        _ReportMol(), prescreen_data
+    )
+    rows = [line.split() for line in report.splitlines()]
+
+    assert 'Total atomic orbitals : 7' in report
+    assert 'Orbital domains       : 2' in report
+    assert 'Fragments             : 2' in report
+    assert 'Occ vectors' in report
+    assert 'Vir vectors' in report
+    assert ['1', '2', '5'] in rows
+    assert ['2', '1', '2'] in rows
+    assert ['1', '2', '5', '1', '2', '4'] in rows
+    assert ['2', '1', '2', '1', '1', '3'] in rows
+
+
+def test_active_space_screening_report(capsys):
+    fragment = {
+        'extended_primary_domain': numpy.asarray([0, 1]),
+        'occ_prescreen_coeff': numpy.zeros((5, 3)),
+    }
+
+    lno_base._print_active_space_screening(
+        'Fragment 1/2', fragment, 2,
+        prescreen_nocc=8, prescreen_nvir=20,
+        screened_nocc=6, screened_nvir=14,
+    )
+    output = capsys.readouterr().out
+
+    assert 'Fragment 1/2 active-space screening' in output
+    assert 'Domain       : 2 atoms / 5 AOs; fragment LOs = 2' in output
+    assert 'Prescreened  : 8 occ / 20 vir (28 MOs)' in output
+    assert 'PNO-screened : 6 occ / 14 vir (20 MOs)' in output
 
 
 def test_projected_sos_fragment_energy_matches_direct_os_term():

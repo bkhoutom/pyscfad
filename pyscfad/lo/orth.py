@@ -20,11 +20,76 @@ from pyscfad import numpy as np
 from pyscfad import ops
 from pyscfad import scipy
 
+
+def _lowdin_impl(s, thresh):
+    e, v = scipy.linalg.eigh(s)
+    active = e > thresh
+    safe_e = np.where(active, e, 1.0)
+    inv_sqrt = np.where(active, 1.0 / np.sqrt(safe_e), 0.0)
+    return np.dot(v * inv_sqrt[None, :], v.conj().T)
+
+
+@partial(ops.custom_jvp, nondiff_argnums=(1,))
+def _lowdin_ad(s, thresh):
+    """Hermitian inverse square root with its spectral Frechet derivative."""
+    return _lowdin_impl(s, thresh)
+
+
+@_lowdin_ad.defjvp
+def _lowdin_ad_jvp(thresh, primals, tangents):
+    s, = primals
+    ds, = tangents
+
+    e, v = scipy.linalg.eigh(s)
+    active = e > thresh
+    safe_e = np.where(active, e, 1.0)
+    sqrt_e = np.sqrt(safe_e)
+    inv_sqrt = np.where(active, 1.0 / sqrt_e, 0.0)
+    primal = np.dot(v * inv_sqrt[None, :], v.conj().T)
+
+    # For f(x) = x**(-1/2), the stable divided difference is
+    #
+    #   (f(x) - f(y)) / (x - y)
+    #       = -1 / (sqrt(x) sqrt(y) (sqrt(x) + sqrt(y))).
+    #
+    # Unlike an eigenvector-response formula, this remains finite and exact
+    # inside a degenerate retained eigenspace.  That response is essential:
+    # dropping rotations inside the block does not give the Frechet
+    # derivative of the inverse square root.
+    active_i = active[:, None]
+    active_j = active[None, :]
+    both_active = active_i & active_j
+    divided_active = -1.0 / (
+        sqrt_e[:, None]
+        * sqrt_e[None, :]
+        * (sqrt_e[:, None] + sqrt_e[None, :])
+    )
+
+    # Preserve the existing hard spectral cutoff.  Within either discarded
+    # block the derivative is zero.  Across a fixed retained/discarded
+    # boundary use the ordinary divided difference; the map is necessarily
+    # nonsmooth only when an eigenvalue itself crosses ``thresh``.
+    delta_e = e[:, None] - e[None, :]
+    crosses_cutoff = active_i != active_j
+    safe_delta_e = np.where(crosses_cutoff, delta_e, 1.0)
+    divided_cross = (
+        inv_sqrt[:, None] - inv_sqrt[None, :]
+    ) / safe_delta_e
+    divided = np.where(
+        both_active,
+        divided_active,
+        np.where(crosses_cutoff, divided_cross, 0.0),
+    )
+
+    ds = 0.5 * (ds + ds.conj().T)
+    ds_eigen = np.dot(v.conj().T, np.dot(ds, v))
+    tangent = np.dot(v, np.dot(divided * ds_eigen, v.conj().T))
+    return primal, tangent
+
+
 @partial(ops.jit, static_argnums=1)
 def lowdin(s, thresh=1e-15):
-    e, v = scipy.linalg.eigh(s)
-    e_sqrt = np.where(e>thresh, np.sqrt(e), np.inf)
-    return np.dot(v/e_sqrt[None,:], v.conj().T)
+    return _lowdin_ad(s, thresh)
 
 
 def _lowdin_numpy(s, thresh=1e-15):
@@ -53,4 +118,3 @@ def vec_lowdin(c, s=1):
         s_np = _onp.asarray(s)
         m = c_np.conj().T @ s_np @ c_np
     return c_np @ _lowdin_numpy(m)
-

@@ -40,10 +40,6 @@ from pyscfad.tools import resource_profile
 # Toggle for the analytical (custom_vjp) mp2_fragment_energy path.
 _USE_CUSTOM_VJP_MP2_FRAG = True
 
-_SOS_PT2_FRAGMENT_METHODS = (
-    'sos', 'sos-mp2', 'df-sos', 'df-sos-mp2', 'lt-sos', 'lt-sos-mp2',
-)
-
 # Toggle for wrapping the eris-tensor construction (post-transform_df_to_mo).
 _USE_CUSTOM_VJP_AO2MO_DF_ERIS = True
 
@@ -354,9 +350,7 @@ def _make_df_eris_incore(cc, mo_coeff=None, fockao=None):
 def impurity_solve(mf, mo_coeff, lo_coeff, eris=None, frozen=None,
                    frag_prescreen=None,
                    verbose_imp=0, ccsd_t=False, dcsd=False,
-                   profile_info=None, profile_pass=None,
-                   pt2_fragment_method='mp2',
-                   sos_c_os=lno_base.DOMAIN_SOS_MP2_C_OS):
+                   profile_info=None, profile_pass=None):
     r'''Solve impurity problem and calculate local correlation energy.
 
     Args:
@@ -374,12 +368,6 @@ def impurity_solve(mf, mo_coeff, lo_coeff, eris=None, frozen=None,
             Same syntax as ``frozen`` in MP2, CCSD, etc.
         verbose_imp : int
             Verbosity for impurity solver printing. Default is 0.
-        pt2_fragment_method : str
-            PT2 reference used for the local correction. Default is
-            conventional MP2.
-        sos_c_os : float
-            Opposite-spin scale for SOS-MP2 fragment references.
-
     Return:
         e_loc_corr_pt2, e_loc_corr_ccsd, e_loc_corr_ccsd_t:
             Local correlation energy at MP2, CCSD, and CCSD(T) levels. Note that
@@ -389,15 +377,12 @@ def impurity_solve(mf, mo_coeff, lo_coeff, eris=None, frozen=None,
         return _impurity_solve_jax(
             mf, mo_coeff, lo_coeff, eris.fock, eris.s1e, frag_prescreen,
             frozen, verbose_imp, ccsd_t, dcsd, profile_info, profile_pass,
-            pt2_fragment_method, sos_c_os,
         )
     return _impurity_solve_core(
         mf, mo_coeff, lo_coeff, eris.fock, eris.s1e,
         frozen=frozen, frag_prescreen=frag_prescreen,
         verbose_imp=verbose_imp, ccsd_t=ccsd_t, dcsd=dcsd,
         profile_info=profile_info, profile_pass=profile_pass,
-        pt2_fragment_method=pt2_fragment_method,
-        sos_c_os=sos_c_os,
     )
 
 
@@ -417,46 +402,39 @@ def impurity_solve(mf, mo_coeff, lo_coeff, eris=None, frozen=None,
 # the unregistered ``_LNOERIS`` Python class never enters JAX tracing.
 #
 # nondiff_argnums (frozen, verbose_imp, ccsd_t, dcsd, profile_info,
-# profile_pass, pt2_fragment_method, sos_c_os) are passed through unchanged;
+# profile_pass) are passed through unchanged;
 # profile_info is intentionally
 # set to None inside the bwd so the replay does not pollute the dict the
 # forward already filled in.
 # ---------------------------------------------------------------------------
 
-@partial(jax.custom_vjp, nondiff_argnums=(6, 7, 8, 9, 10, 11, 12, 13))
+@partial(jax.custom_vjp, nondiff_argnums=(6, 7, 8, 9, 10, 11))
 def _impurity_solve_jax(mf, mo_coeff, lo_coeff, fock, s1e, frag_prescreen,
                         frozen, verbose_imp, ccsd_t, dcsd,
-                        profile_info, profile_pass,
-                        pt2_fragment_method, sos_c_os):
+                        profile_info, profile_pass):
     return _impurity_solve_core(
         mf, mo_coeff, lo_coeff, fock, s1e,
         frozen=frozen, frag_prescreen=frag_prescreen,
         verbose_imp=verbose_imp, ccsd_t=ccsd_t, dcsd=dcsd,
         profile_info=profile_info, profile_pass=profile_pass,
-        pt2_fragment_method=pt2_fragment_method,
-        sos_c_os=sos_c_os,
     )
 
 
 def _impurity_solve_jax_fwd(mf, mo_coeff, lo_coeff, fock, s1e, frag_prescreen,
                             frozen, verbose_imp, ccsd_t, dcsd,
-                            profile_info, profile_pass,
-                            pt2_fragment_method, sos_c_os):
+                            profile_info, profile_pass):
     out = _impurity_solve_core(
         mf, mo_coeff, lo_coeff, fock, s1e,
         frozen=frozen, frag_prescreen=frag_prescreen,
         verbose_imp=verbose_imp, ccsd_t=ccsd_t, dcsd=dcsd,
         profile_info=profile_info, profile_pass=profile_pass,
-        pt2_fragment_method=pt2_fragment_method,
-        sos_c_os=sos_c_os,
     )
     res = (mf, mo_coeff, lo_coeff, fock, s1e, frag_prescreen)
     return out, res
 
 
 def _impurity_solve_jax_bwd(frozen, verbose_imp, ccsd_t, dcsd,
-                            profile_info, profile_pass,
-                            pt2_fragment_method, sos_c_os, res, ybar):
+                            profile_info, profile_pass, res, ybar):
     mf, mo_coeff, lo_coeff, fock, s1e, frag_prescreen = res
 
     def fn(mf_, mo_coeff_, lo_coeff_, fock_, s1e_, frag_prescreen_):
@@ -465,8 +443,6 @@ def _impurity_solve_jax_bwd(frozen, verbose_imp, ccsd_t, dcsd,
             frozen=frozen, frag_prescreen=frag_prescreen_,
             verbose_imp=verbose_imp, ccsd_t=ccsd_t, dcsd=dcsd,
             profile_info=None, profile_pass=profile_pass,
-            pt2_fragment_method=pt2_fragment_method,
-            sos_c_os=sos_c_os,
         )
 
     _, vjp_fn = jax.vjp(fn, mf, mo_coeff, lo_coeff, fock, s1e, frag_prescreen)
@@ -479,9 +455,7 @@ _impurity_solve_jax.defvjp(_impurity_solve_jax_fwd, _impurity_solve_jax_bwd)
 def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
                          frag_prescreen=None,
                          verbose_imp=0, ccsd_t=False, dcsd=False,
-                         profile_info=None, profile_pass=None,
-                         pt2_fragment_method='mp2',
-                         sos_c_os=lno_base.DOMAIN_SOS_MP2_C_OS):
+                         profile_info=None, profile_pass=None):
     '''Numerical core of :func:`impurity_solve`; see that function for docs.
 
     Takes ``fock`` and ``s1e`` directly (rather than the parent ``eris``
@@ -556,21 +530,20 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
         ),
     )
 
-    # Method-matched PT2 reference energy.  DLNO correction subtracts this
-    # value before adding the selected full/domain correction.
+    # The LIS truncation correction always subtracts the conventional
+    # full-spin MP2 fragment energy.  The molecule-wide IAO-DLNO-MP2
+    # correction is added separately by the outer DLNO driver.
     phase_start = time.perf_counter()
     profile_phase = resource_profile.start()
     t1, t2 = mcc.init_amps(eris=imp_eris)[1:]
-    elcorr_pt2 = _pt2_fragment_energy(
-        imp_eris, t2, prjlo, pt2_fragment_method, sos_c_os
-    )
+    elcorr_pt2 = mp2_fragment_energy(imp_eris, t2, prjlo)
     phase_times['mp2_s'] = time.perf_counter() - phase_start
     resource_profile.finish(
         'solver.mp2_reference',
         profile_phase,
         frag=frag_index,
         amplitudes_mib=resource_profile.estimated_array_mib(t1, t2),
-        method=pt2_fragment_method,
+        method='mp2',
     )
 
     # CCSD fragment energy
@@ -662,18 +635,6 @@ def _fragment_pq_contractions(amp, ovov):
     return 2.0 * (amp_flat @ ovov_qjab.T) - (amp_flat @ ovov_qjab_alt.T)
 
 
-def _is_sos_pt2_fragment_method(method):
-    method = str(method).lower().replace('_', '-')
-    return method in _SOS_PT2_FRAGMENT_METHODS
-
-
-def _pt2_fragment_energy(eris, t2, prj, method='mp2',
-                         sos_c_os=lno_base.DOMAIN_SOS_MP2_C_OS):
-    if _is_sos_pt2_fragment_method(method):
-        return sos_mp2_fragment_energy(eris, t2, prj, c_os=sos_c_os)
-    return mp2_fragment_energy(eris, t2, prj)
-
-
 def mp2_fragment_energy(eris, t2, prj):
     """Compute the MP2 fragment energy contribution.
 
@@ -687,18 +648,6 @@ def mp2_fragment_energy(eris, t2, prj):
     m = np.dot(prj.T, prj)
     eij = _fragment_pq_contractions(t2, ovov)
     return np.einsum('ij,ij', eij, m)
-
-
-def sos_mp2_fragment_energy(eris, t2, prj,
-                            c_os=lno_base.DOMAIN_SOS_MP2_C_OS):
-    """Compute the scaled opposite-spin MP2 fragment energy contribution.
-
-    eij[p,q] = c_os * einsum('pjab,qajb->pq', t2, ovov)
-    e2       = einsum('ij,ij', eij, prj.T @ prj)
-    """
-    ovov = np.asarray(eris.ovov)
-    return _sos_mp2_fragment_energy_jax(ovov, t2, prj, c_os)
-
 
 # ---------------------------------------------------------------------------
 # MP2 fragment energy wrapped as jax.custom_vjp.  Inputs are (ovov, t2, prj);
@@ -756,44 +705,6 @@ def _mp2_fragment_energy_jax_bwd(res, bar_e2):
 _mp2_fragment_energy_jax.defvjp(
     _mp2_fragment_energy_jax_fwd,
     _mp2_fragment_energy_jax_bwd,
-)
-
-
-@partial(custom_vjp, nondiff_argnums=(3,))
-def _sos_mp2_fragment_energy_jax(ovov, t2, prj, c_os):
-    m = np.dot(prj.T, prj)
-    eij = np.einsum('pjab,qajb->pq', t2, ovov)
-    return c_os * np.einsum('ij,ij', eij, m)
-
-
-def _sos_mp2_fragment_energy_jax_fwd(ovov, t2, prj, c_os):
-    m = np.dot(prj.T, prj)
-    eij = np.einsum('pjab,qajb->pq', t2, ovov)
-    e2 = c_os * np.einsum('ij,ij', eij, m)
-    return e2, (ovov, t2, prj, m, eij)
-
-
-def _sos_mp2_fragment_energy_jax_bwd(c_os, res, bar_e2):
-    ovov, t2, prj, m, eij = res
-    if _is_zero_cot(bar_e2):
-        return (np.zeros_like(ovov), np.zeros_like(t2), np.zeros_like(prj))
-    bar_e2 = np.asarray(bar_e2) * c_os
-
-    # e2/c_os = einsum('ij,ij', eij, m)
-    # eij[p,q] = sum_{j,a,b} t2[p,j,a,b] * ovov[q,a,j,b]
-    bar_eij = bar_e2 * m
-    bar_m = bar_e2 * eij
-
-    bar_t2 = np.einsum('pq,qajb->pjab', bar_eij, ovov)
-    bar_ovov = np.einsum('pq,pjab->qajb', bar_eij, t2)
-    bar_prj = np.dot(prj, bar_m + bar_m.T)
-
-    return bar_ovov, bar_t2, bar_prj
-
-
-_sos_mp2_fragment_energy_jax.defvjp(
-    _sos_mp2_fragment_energy_jax_fwd,
-    _sos_mp2_fragment_energy_jax_bwd,
 )
 
 _USE_CUSTOM_VJP_CCSD_FRAG = True
@@ -913,8 +824,6 @@ class LNOCCSD(lno_base.LNO):
         self.efrag_cc_t = None
         self.ccsd_t = False
         self.dcsd = False
-        self.pt2_fragment_method = 'mp2'
-        self.pt2_fragment_sos_c_os = lno_base.DOMAIN_SOS_MP2_C_OS
 
     def impurity_solve(self, mf, mo_coeff, lo_coeff, eris=None, frozen=None,
                        frag_prescreen=None, profile_info=None):
@@ -922,12 +831,7 @@ class LNOCCSD(lno_base.LNO):
                               frag_prescreen=frag_prescreen,
                               verbose_imp=self.verbose_imp, ccsd_t=self.ccsd_t,
                               dcsd=self.dcsd, profile_info=profile_info,
-                              profile_pass=getattr(self, 'profile_pass', None),
-                              pt2_fragment_method=getattr(
-                                  self, 'pt2_fragment_method', 'mp2'),
-                              sos_c_os=getattr(
-                                  self, 'pt2_fragment_sos_c_os',
-                                  lno_base.DOMAIN_SOS_MP2_C_OS))
+                              profile_pass=getattr(self, 'profile_pass', None))
 
     def _post_proc(self, frag_res, frag_wghtlist):
         ''' Post processing results returned by ``impurity_solve`` collected in ``frag_res``.

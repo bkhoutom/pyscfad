@@ -153,8 +153,8 @@ def _new_df_vjp_detailed_timing():
             'numpy': {'calls': 0, 'pair_positions': 0},
         },
         'projection_order': {
-            'requested_mode': _ao_projection_order_mode(),
-            'selected_calls': {'legacy': 0, 'swapped': 0},
+            'selection_policy': 'smaller_trailing_mo_dimension',
+            'selected_calls': {'as_given': 0, 'transposed': 0},
             'layouts': {},
         },
         'active_block_index': None,
@@ -436,29 +436,8 @@ def _cderi_bar_hdf_chunk_mb():
         return _CDERI_BAR_HDF_CHUNK_MB
 
 
-_AO_PROJECTION_ORDER_ENV = 'PYSCFAD_DF_AO_PROJECTION_ORDER'
-_AO_PROJECTION_ORDERS = ('legacy', 'swapped', 'auto')
-_AO_PROJECTION_ORDER_DEFAULT = 'auto'
-
-
-def _ao_projection_order_mode(order=None):
-    """Return the validated AO-projection contraction-order selector."""
-    if order is None:
-        order = os.environ.get(
-            _AO_PROJECTION_ORDER_ENV, _AO_PROJECTION_ORDER_DEFAULT
-        )
-    order = str(order).strip().lower()
-    if order not in _AO_PROJECTION_ORDERS:
-        choices = ', '.join(_AO_PROJECTION_ORDERS)
-        raise ValueError(
-            f'{_AO_PROJECTION_ORDER_ENV} must be one of {choices}; got {order!r}.'
-        )
-    return order
-
-
-def _select_ao_projection_order(ybar, mok_rows, mol_cols, order=None):
+def _select_ao_projection_order(ybar, mok_rows, mol_cols):
     """Contract the larger MO dimension first without changing the result."""
-    mode = _ao_projection_order_mode(order)
     if ybar.ndim != 3:
         raise ValueError(f'ybar must be rank 3, got shape {ybar.shape}.')
     _, kc, lc = ybar.shape
@@ -472,35 +451,31 @@ def _select_ao_projection_order(ybar, mok_rows, mol_cols, order=None):
             f'mol_cols has shape {mol_cols.shape}; expected second dimension {lc}.'
         )
 
-    swap = mode == 'swapped' or (mode == 'auto' and lc > kc)
-    if swap:
+    if lc > kc:
         return (
             ybar.transpose(0, 2, 1),
             mol_cols,
             mok_rows,
-            mode,
-            'swapped',
+            'transposed',
             kc,
             lc,
         )
-    return ybar, mok_rows, mol_cols, mode, 'legacy', kc, lc
+    return ybar, mok_rows, mol_cols, 'as_given', kc, lc
 
 
-def _record_ao_projection_layout(mode, selected, original_kc, original_lc,
+def _record_ao_projection_layout(selected, original_kc, original_lc,
                                  effective_kc, effective_lc, npos, blksize):
     detail = _DF_VJP_DETAILED_TIMING.get()
     if detail is None:
         return
     order_detail = detail['projection_order']
-    if order_detail['requested_mode'] != mode:
-        raise RuntimeError('AO-projection order changed during one DF response.')
     order_detail['selected_calls'][selected] += 1
     key = (
         f'{original_kc}x{original_lc}->{effective_kc}x{effective_lc}:'
         f'{selected}:block={blksize}'
     )
     layout = order_detail['layouts'].setdefault(key, {
-        'requested_mode': mode,
+        'selection_policy': order_detail['selection_policy'],
         'selected_order': selected,
         'original_kc': int(original_kc),
         'original_lc': int(original_lc),
@@ -562,7 +537,7 @@ def _nr_e2_cderi_bar_project_native(ybar, mok_rows, mol_cols, blksize):
     return out
 
 
-def _nr_e2_cderi_bar_project(ybar, mok_rows, mol_cols, order=None):
+def _nr_e2_cderi_bar_project(ybar, mok_rows, mol_cols):
     """Project ``ybar[Lij]`` onto pair-specific MO rows.
 
     The direct expression ``einsum('Lij,pi,pj->Lp', ...)`` often dispatches to
@@ -570,9 +545,9 @@ def _nr_e2_cderi_bar_project(ybar, mok_rows, mol_cols, order=None):
     contraction makes the dominant ``i`` contraction a GEMM-shaped
     ``numpy.dot`` so threaded BLAS can do the heavy work.
     """
-    (ybar, mok_rows, mol_cols, mode, selected,
+    (ybar, mok_rows, mol_cols, selected,
      original_kc, original_lc) = _select_ao_projection_order(
-         ybar, mok_rows, mol_cols, order=order
+         ybar, mok_rows, mol_cols
      )
     naux, kc, lc = ybar.shape
     npos = mok_rows.shape[0]
@@ -584,7 +559,7 @@ def _nr_e2_cderi_bar_project(ybar, mok_rows, mol_cols, order=None):
     blksize = max(int(target_bytes / max(naux * lc * itemsize, 1)), 1)
     blksize = min(blksize, npos)
     _record_ao_projection_layout(
-        mode, selected, original_kc, original_lc,
+        selected, original_kc, original_lc,
         kc, lc, npos, blksize,
     )
 
@@ -665,7 +640,7 @@ def _nr_e2_cderi_bar_packed_aux_block_numpy(ybar, mo_k, mo_l):
 
 
 def _prepare_nr_e2_cderi_bar_aux_projection(
-        mo_coeff, ybar, orbs_slice, order=None):
+        mo_coeff, ybar, orbs_slice):
     """Validate the projection and prepare reusable coefficient blocks."""
     mo = numpy.asarray(jax.device_get(mo_coeff))
     ybar = numpy.asarray(jax.device_get(ybar))
@@ -687,8 +662,8 @@ def _prepare_nr_e2_cderi_bar_aux_projection(
     ybar = ybar.reshape(naux, kc, lc)
     mo_k = mo[:, k0:k1]
     mo_l = mo[:, l0:l1]
-    ybar, mo_k, mo_l, _, _, _, _ = _select_ao_projection_order(
-        ybar, mo_k, mo_l, order=order
+    ybar, mo_k, mo_l, _, _, _ = _select_ao_projection_order(
+        ybar, mo_k, mo_l
     )
     return (
         ybar,
@@ -711,7 +686,7 @@ def _nr_e2_cderi_bar_packed_aux_block_prepared(ybar, mo_k, mo_l):
     return _nr_e2_cderi_bar_packed_aux_block_numpy(ybar, mo_k, mo_l)
 
 
-def nr_e2_cderi_bar_packed_aux_block(mo_coeff, ybar, orbs_slice, order=None):
+def nr_e2_cderi_bar_packed_aux_block(mo_coeff, ybar, orbs_slice):
     """Build every packed AO-pair cotangent for one auxiliary slab.
 
     Unlike :func:`nr_e2_cderi_bar_packed_block`, which evaluates selected AO
@@ -721,15 +696,15 @@ def nr_e2_cderi_bar_packed_aux_block(mo_coeff, ybar, orbs_slice, order=None):
 
     ``O(b * (nao*kc*lc + nao**2*min(kc,lc)))``
 
-    when the default automatic contraction order is used.
+    because the smaller trailing MO dimension is always selected.
     """
     ybar, mo_k, mo_l = _prepare_nr_e2_cderi_bar_aux_projection(
-        mo_coeff, ybar, orbs_slice, order=order
+        mo_coeff, ybar, orbs_slice
     )
     return _nr_e2_cderi_bar_packed_aux_block_prepared(ybar, mo_k, mo_l)
 
 
-def _nr_e2_cderi_bar_aux_blksize(mo_coeff, ybar, orbs_slice, order=None):
+def _nr_e2_cderi_bar_aux_blksize(mo_coeff, ybar, orbs_slice):
     """Choose an auxiliary slab size for the packed two-GEMM projection."""
     naux = int(ybar.shape[0])
     if naux == 0:
@@ -738,8 +713,7 @@ def _nr_e2_cderi_bar_aux_blksize(mo_coeff, ybar, orbs_slice, order=None):
     k0, k1, l0, l1 = map(int, orbs_slice)
     kc = k1 - k0
     lc = l1 - l0
-    mode = _ao_projection_order_mode(order)
-    effective_lc = kc if (mode == 'swapped' or (mode == 'auto' and lc > kc)) else lc
+    effective_lc = min(kc, lc)
     npair = nao * (nao + 1) // 2
     itemsize = numpy.dtype(numpy.result_type(mo_coeff.dtype, ybar.dtype)).itemsize
     target_bytes = _cderi_bar_aux_block_mb() * 1024.0**2
@@ -769,7 +743,7 @@ def _nr_e2_cderi_bar_aux_blksize(mo_coeff, ybar, orbs_slice, order=None):
 
 
 @contextmanager
-def nr_e2_cderi_bar_packed_disk(mo_coeff, ybar, orbs_slice, order=None,
+def nr_e2_cderi_bar_packed_disk(mo_coeff, ybar, orbs_slice,
                                 directory=None, aux_blksize=None):
     """Store a packed AO cotangent using aux writes and pair-oriented reads.
 
@@ -789,11 +763,11 @@ def nr_e2_cderi_bar_packed_disk(mo_coeff, ybar, orbs_slice, order=None,
     npair = nao * (nao + 1) // 2
     if aux_blksize is None:
         aux_blksize = _nr_e2_cderi_bar_aux_blksize(
-            mo, ybar, orbs_slice, order=order
+            mo, ybar, orbs_slice
         )
     aux_blksize = max(1, min(max(naux, 1), int(aux_blksize)))
     ybar_project, mo_k, mo_l = _prepare_nr_e2_cderi_bar_aux_projection(
-        mo, ybar, orbs_slice, order=order
+        mo, ybar, orbs_slice
     )
 
     if directory is None:
@@ -1485,6 +1459,41 @@ def _stream_nr_e2_from_cderi_source(cderi_source, mo_coeff, orbs_slice,
     return out
 
 
+def _int3c_ip1_mo_density_contraction(ints, mo_k, mo_l, z_blk):
+    """Contract AO-centre int3c derivatives through one symmetrized MO density.
+
+    For each auxiliary function, form
+
+    ``D[p,u,v] = sum(k,l) mo_k[u,k] * z[p,k,l] * mo_l[v,l]``.
+
+    The two AO-centre terms in the three-centre integral derivative then use
+    ``D + D.T``.  Building ``D`` in the order whose AO-square GEMM carries the
+    smaller of ``k`` and ``l`` avoids separately transforming the derivative
+    integrals through both orbital spaces.  In the local-MP2 path the virtual
+    dimension is typically an order of magnitude larger than the occupied
+    dimension, so this contraction order is material.
+
+    No conjugation is introduced here: this is algebraically identical to the
+    two contractions it replaces and therefore preserves their real/complex
+    convention.
+    """
+    kc = int(mo_k.shape[1])
+    lc = int(mo_l.shape[1])
+    if kc <= lc:
+        # Contract the large l space before forming the AO-square object, so
+        # the latter contraction is over k.
+        tmp = pyscf_lib.einsum('pkl,vl->pkv', z_blk, mo_l)
+        density = pyscf_lib.einsum('uk,pkv->puv', mo_k, tmp)
+    else:
+        # The transposed order makes the AO-square contraction run over l.
+        tmp = pyscf_lib.einsum('uk,pkl->pul', mo_k, z_blk)
+        density = pyscf_lib.einsum('pul,vl->puv', tmp, mo_l)
+    tmp = None
+
+    density = density + density.swapaxes(1, 2)
+    return numpy.einsum('puv,xuvp->ux', density, ints)
+
+
 def _int3c_mo_deriv_coords_vjp(mol, auxmol, mo_coeff, z,
                                orbs_slice, int3c='int3c2e',
                                aosym='s2ij'):
@@ -1511,9 +1520,13 @@ def _int3c_mo_deriv_coords_vjp(mol, auxmol, mo_coeff, z,
 
     target_words = _int3c_mo_vjp_block_mb() * 1024.0**2 / 8
     words_per_aux = (
-        3 * nao * nao
-        + 4 * nao * max(kc, 1)
-        + 4 * nao * max(lc, 1)
+        # AO-centre phase: the three derivative components plus the density
+        # and its symmetrized replacement can briefly coexist during D+D.T.
+        5 * nao * nao
+        + nao * max(min(kc, lc), 1)
+        # Auxiliary-centre phase: packed derivative integrals and their
+        # occupied-virtual transform.  The phases do not coexist, but summing
+        # their estimates leaves headroom for integral/BLAS workspaces.
         + 3 * npair
         + 3 * kl_count
     )
@@ -1531,23 +1544,18 @@ def _int3c_mo_deriv_coords_vjp(mol, auxmol, mo_coeff, z,
         shls_slice = (0, nbas, 0, nbas, nbas + shl0, nbas + shl1)
         z_blk = z[p0:p1]
 
-        # AO-center derivative.  Keep the MO transform factorized as
-        # d(mu nu|P) C_mu,k C_nu,l, and accumulate AO-center rows before
-        # summing to atoms.
+        # AO-center derivative.  Form the MO-weighted AO density once, choosing
+        # the contraction order whose AO-square step carries min(kc, lc), and
+        # use int3c symmetry to combine the two AO-center contributions.
         ints = _int3c_cross_opt.int3c_cross(
             mol, auxmol, intor=int3c_ip1, comp=3, aosym='s1',
             shls_slice=shls_slice,
         )
         ints = numpy.asarray(ints)
-        intbuf = pyscf_lib.einsum('xuvp,vl->xupl', ints, mo_l)
-        dm2buf = pyscf_lib.einsum('uk,pkl->upl', mo_k, z_blk)
-        mol_ao_bar -= numpy.einsum('upl,xupl->ux', dm2buf, intbuf)
-        intbuf = dm2buf = None
-
-        intbuf = pyscf_lib.einsum('xuvp,vk->xupk', ints, mo_k)
-        dm2buf = pyscf_lib.einsum('ul,pkl->upk', mo_l, z_blk)
-        mol_ao_bar -= numpy.einsum('upk,xupk->ux', dm2buf, intbuf)
-        ints = intbuf = dm2buf = None
+        mol_ao_bar -= _int3c_ip1_mo_density_contraction(
+            ints, mo_k, mo_l, z_blk
+        )
+        ints = None
 
         # Auxiliary-center derivative.  The derivative three-center rows are
         # batched as 3*naux_block ordinary packed AO rows, transformed by the

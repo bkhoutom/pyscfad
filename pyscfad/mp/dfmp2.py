@@ -145,11 +145,24 @@ def _contract_scan(Lov, mo_energy, nocc, nvir, with_t2=True):
 @partial(custom_vjp, nondiff_argnums=(3, 4, 5, 6))
 def _outcore_nr_e2(mol, auxmol, mo_coeff, cderi_source, max_memory,
                    ijslice, aosym):
-    del mol, auxmol, max_memory
-    with df_addons.load(cderi_source, 'j3c') as eri1:
-        if not is_array(eri1):
-            eri1 = numpy.asarray(eri1)
-        return _ao2mo.nr_e2(eri1, mo_coeff, ijslice, aosym=aosym)
+    del mol, auxmol
+    if numpy.dtype(mo_coeff.dtype) != numpy.dtype(numpy.float64):
+        # Preserve the generic backend (including its non-float64 support).
+        # The streamed PySCF C transform below is intentionally float64-only.
+        with df_addons.load(cderi_source, 'j3c') as eri1:
+            if not is_array(eri1):
+                eri1 = numpy.asarray(eri1)
+            return _ao2mo.nr_e2_gen(
+                eri1, mo_coeff, ijslice, aosym=aosym
+            )
+    # Keep only the transformed occupied-virtual factor in memory.  Loading
+    # the packed AO CDERI here defeats the purpose of attaching an out-of-core
+    # source and becomes the forward memory limit before the MP2 contraction
+    # itself.  This helper reads auxiliary slabs and writes them directly into
+    # the (naux, nocc*nvir) result.
+    return _cderi_vjp._stream_nr_e2_from_cderi_source(
+        cderi_source, mo_coeff, ijslice, max_memory, aosym=aosym
+    )
 
 
 def _outcore_nr_e2_fwd(mol, auxmol, mo_coeff, cderi_source, max_memory,
@@ -161,12 +174,77 @@ def _outcore_nr_e2_fwd(mol, auxmol, mo_coeff, cderi_source, max_memory,
 
 def _outcore_nr_e2_bwd(cderi_source, max_memory, ijslice, aosym, res, ybar):
     mol, auxmol, mo_coeff = res
+    effective_memory = max(max_memory, 4096)
+    use_direct_vjp = (
+        numpy.dtype(mo_coeff.dtype) == numpy.dtype(numpy.float64)
+        and numpy.dtype(ybar.dtype) == numpy.dtype(numpy.float64)
+    )
+    if use_direct_vjp:
+        try:
+            # The canonical transform uses the complete AO basis, so its two
+            # reverse contributions can both be evaluated without constructing
+            # the packed (naux, nao_pair) CDERI cotangent.  Stream auxiliary rows
+            # for the MO-coefficient cotangent, then contract the same Lov
+            # cotangent directly with the three-centre integral derivatives.
+            #
+            # Besides avoiding cderi_bar, this also avoids loading the complete
+            # primal CDERI merely to differentiate the AO-to-MO transform.  The
+            # fallback below is retained for unsupported symmetry/dtype cases.
+            mo_coeff_bar = (
+                _cderi_vjp.nr_e2_mo_coeff_vjp_from_cderi_source(
+                    cderi_source,
+                    mo_coeff,
+                    ybar,
+                    ijslice,
+                    aosym=aosym,
+                    max_memory=effective_memory,
+                )
+            )
+            mol_bar, auxmol_bar = (
+                _cderi_vjp.cholesky_eri_vjp_from_mo_coeff_ybar(
+                    mol,
+                    auxmol,
+                    cderi_source,
+                    mo_coeff,
+                    ybar,
+                    ijslice,
+                    effective_memory,
+                    int3c=mol._add_suffix('int3c2e'),
+                    int2c=mol._add_suffix('int2c2e'),
+                    aosym='s2ij',
+                )
+            )
+            return mol_bar, auxmol_bar, mo_coeff_bar
+        except NotImplementedError:
+            pass
+
     try:
-        cderi_bar, mo_coeff_bar = _cderi_vjp.nr_e2_vjp_from_cderi_source(
-            cderi_source, mo_coeff, ybar, ijslice, aosym=aosym
-        )
+        if use_direct_vjp:
+            cderi_bar, mo_coeff_bar = (
+                _cderi_vjp.nr_e2_vjp_from_cderi_source(
+                    cderi_source, mo_coeff, ybar, ijslice, aosym=aosym
+                )
+            )
+        else:
+            # The optimized global nr_e2 switch is float64-only.  Keep the
+            # legacy generic dtype support independent of that global setting
+            # in both the primal and its fallback pullback.
+            with df_addons.load(cderi_source, 'j3c') as eri1:
+                if not is_array(eri1):
+                    eri1 = numpy.asarray(eri1)
+                cderi = np.asarray(eri1)
+
+            def generic_transform(cderi_, mo_coeff_):
+                return _ao2mo.nr_e2_gen(
+                    cderi_, mo_coeff_, ijslice, aosym=aosym
+                )
+
+            _, generic_pullback = jax.vjp(
+                generic_transform, cderi, mo_coeff
+            )
+            cderi_bar, mo_coeff_bar = generic_pullback(ybar)
         mol_bar, auxmol_bar = _cderi_vjp.cholesky_eri_vjp_from_cderi_source(
-            mol, auxmol, cderi_source, cderi_bar, max(max_memory, 4096),
+            mol, auxmol, cderi_source, cderi_bar, effective_memory,
             int3c=mol._add_suffix('int3c2e'),
             int2c=mol._add_suffix('int2c2e'),
             aosym='s2ij',

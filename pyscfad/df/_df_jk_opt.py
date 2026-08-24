@@ -29,9 +29,20 @@ from pyscf.df import df_jk as pyscf_df_jk
 from pyscfadlib import libcvhf_vjp as libvhf
 from pyscfad.df import incore as df_incore
 from pyscfad.df import _cderi_vjp
+from pyscfad._src.implicit_diff import is_implicit_diff_solve_matvec
 
 libao2mo = lib.load_library('libao2mo')
 _FAST_EXCHANGE_DM_DATA = {}
+_DF_VK_DM_VJP = getattr(libvhf, 'df_vk_dm_vjp', None)
+if _DF_VK_DM_VJP is not None:
+    _DF_VK_DM_VJP.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    _DF_VK_DM_VJP.restype = None
 
 
 def _profile_enabled():
@@ -204,6 +215,7 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
     )
     dfobj, dm = res
     vj_bar, vk_bar = ybar
+    solution_only = is_implicit_diff_solve_matvec()
 
     if _has_tracer(dfobj, dm, vj_bar, vk_bar):
         _profile_msg('get_jk_bwd tracer fallback start')
@@ -261,8 +273,21 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
              null, ctypes.c_int(0))
     max_memory = dfobj.max_memory - lib.current_memory()[0]
     blksize = max(4, int(min(dfobj.blockdim, max_memory*.3e6/8/nao**2)))
-    buf = numpy.empty((blksize,nao,nao))
-    stream_eri_bar = (dfobj.auxmol is not None and not return_cderi_bar_leaf)
+    # The native density-only exchange transpose needs neither the forward
+    # ``L D`` buffer nor an auxiliary-integral cotangent.  Keep the old
+    # block-local fallback for an extension module built before
+    # ``df_vk_dm_vjp`` was added; it still avoids the global HDF5 cotangent
+    # and all nuclear/metric work.
+    need_full_vk_vjp = not solution_only or _DF_VK_DM_VJP is None
+    buf = (
+        numpy.empty((blksize,nao,nao))
+        if need_full_vk_vjp else None
+    )
+    stream_eri_bar = (
+        not solution_only
+        and dfobj.auxmol is not None
+        and not return_cderi_bar_leaf
+    )
     eri_bar = None
     eri_bar_file = None
     eri_bar_path = None
@@ -281,7 +306,7 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
             dtype=numpy.float64,
             chunks=(chunk_pair, chunk_aux),
         )
-    else:
+    elif not solution_only:
         eri_bar = numpy.zeros(eri_bar_shape)
 
     p1 = 0
@@ -295,7 +320,15 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
                     f'expected {nao_pair}.'
                 )
             p0, p1 = p1, p1 + naux
-            if stream_eri_bar:
+            if solution_only:
+                # Only needed by the compatibility fallback below.  It is
+                # bounded by one auxiliary block and is never written to
+                # disk or propagated to the DF object.
+                eri_bar_blk = (
+                    numpy.zeros((naux, nao_pair), dtype=eri1.dtype)
+                    if _DF_VK_DM_VJP is None else None
+                )
+            elif stream_eri_bar:
                 eri_bar_blk = numpy.zeros((naux, nao_pair), dtype=eri1.dtype)
             else:
                 eri_bar_blk = eri_bar[p0:p1]
@@ -304,11 +337,20 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
                 dmtril_bar = rho_bar @ eri1
                 dms_bar += lib.unpack_tril(dmtril_bar)
 
-                rho = dmtril @ eri1.T
-                eri_bar_blk += rho.T @ vj_bar_tril
-                eri_bar_blk += rho_bar.T @ dmtril
+                if not solution_only:
+                    rho = dmtril @ eri1.T
+                    eri_bar_blk += rho.T @ vj_bar_tril
+                    eri_bar_blk += rho_bar.T @ dmtril
 
             for k in range(nset):
+                if solution_only and _DF_VK_DM_VJP is not None:
+                    _DF_VK_DM_VJP(
+                        dms_bar[k].ctypes.data_as(ctypes.c_void_p),
+                        vk_bar[k].ctypes.data_as(ctypes.c_void_p),
+                        eri1.ctypes.data_as(ctypes.c_void_p),
+                        ctypes.c_int(naux), ctypes.c_int(nao),
+                    )
+                    continue
                 #TODO save buf1 on disk to avoid recomputation
                 buf1 = buf[:naux]
                 fdrv(ftrans, fmmm,
@@ -333,6 +375,12 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
         )
 
         dm_bar = numpy.asarray(dms_bar).reshape(dm_shape)
+        if solution_only:
+            _profile_msg(
+                'get_jk_bwd density-only implicit-solve matvec done '
+                f'{time.perf_counter() - t_bwd:.2f} s'
+            )
+            return (None, dm_bar)
         #TODO need a better way to add vjps for objects
         bar_leaves = []
         mol_bar = auxmol_bar = None

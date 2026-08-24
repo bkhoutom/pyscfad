@@ -1,13 +1,22 @@
-"""Domain-Local Natural Orbitals (DLNO) for pyscfad.
+"""Domain-local correlation with IAO-defined fragments.
 
-The user-facing entry points are the solver subclasses
-:class:`pyscfad.dlno.ccsd.DLNOCCSD` and :class:`pyscfad.dlno.mp2.DLNOMP2`,
-which extend their plain LNO counterparts with the prescreen attributes,
-and the prescreen orchestration in :mod:`pyscfad.dlno.prescreen`
-(``build_dlno_prescreen_data`` / ``rebuild_dlno_prescreen_data``).  The
-low-level primitives (PAO construction, domain selection, multipole pair
-energies, etc.) live in the sibling modules ``dlno``, ``domain``, ``mp2``,
-``multipole``, ``pao``, ``util``.
+The current MP2 entry point is
+:class:`pyscfad.dlno.iao_mp2.IAOFragmentMP2`.  It evaluates all strong
+extended-domain MP2 rows and every unordered weak multipole pair on a fixed
+discrete topology.  :class:`pyscfad.dlno.ccsd.DLNOCCSD` uses those same
+strong domains to build MP2 selection densities and local interacting spaces
+(LISs), then evaluates the unique corrected correlation energy
+
+``sum_F [CCSD(T)_F(LIS_F) - MP2_F(LIS_F)] + IAO-DLNO-MP2``.
+
+The LIS subtraction is conventional full-spin MP2; the final local-MP2 term
+contains both strong and weak contributions and is added exactly once.  There
+is no spin-opposite-scaled or domain-only correction switch.
+
+The fixed-rank LIS construction is exposed by :mod:`pyscfad.dlno.iao_lis`.
+The gauge-safe MPI implementation of the MP2 energy and gradient lives in
+:mod:`pyscfad.dlno.iao_mp2_mpi`.  Multi-rank CCSD(T) remains guarded until its
+gauge-bearing LIS frames can be streamed from rank zero.
 
 The solver subclasses are not re-exported here because
 :mod:`pyscfad.lno.lno_base` imports :mod:`pyscfad.dlno.util` during its
@@ -16,7 +25,8 @@ classes from this package circular.  Import the classes from their
 submodules instead::
 
     from pyscfad.dlno.ccsd import DLNOCCSD
-    from pyscfad.dlno.mp2 import DLNOMP2
+    from pyscfad.dlno.iao_mp2 import IAOFragmentMP2
+    from pyscfad.dlno.iao_mp2_mpi import IAOFragmentMP2 as MPIIAOFragmentMP2
 """
 from .util import (
     project_mo,

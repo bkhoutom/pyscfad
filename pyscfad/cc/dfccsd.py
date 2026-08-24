@@ -156,8 +156,10 @@ class _ChemistsERIs(ccsd._ChemistsERIs):
 
         Builds lazily from ``Lov`` and ``Lvv`` on first access and caches on
         ``self.ovvv``.  Forward DF-CCSD's ``update_amps`` no longer needs this
-        tensor (it builds tiles from ``Lov`` directly), so the packed form is
-        only materialized when the lambda or (T) paths actually need it.
+        tensor (it builds tiles from ``Lov`` directly).  The real, C1 (T)
+        path also builds its C-kernel caches from ``Lov/Lvv``.  The packed
+        form remains available for dense/symmetry fallbacks and callers that
+        explicitly request it.
         """
         if self.ovvv is not None:
             return self.ovvv
@@ -224,9 +226,10 @@ def _make_df_eris_incore(cc, mo_coeff=None):
     oovv = np.dot(np.transpose(Loo), Lvv)
     eris.oovv = lib.unpack_tril(oovv).reshape(nocc,nocc,nvir,nvir)
     # eris.ovvv is built lazily via eris.get_ovvv_packed() on first access so
-    # the forward DF-CCSD path (which builds tiles from Lov/Lvv directly) does
-    # not pay the persistent nocc*nvir*nvir_pair allocation.  The (T) and
-    # lambda paths trigger the build the first time they read eris.ovvv.
+    # the forward DF-CCSD and real C1 (T) paths (which build tiles/caches from
+    # Lov/Lvv directly) do not pay the persistent nocc*nvir*nvir_pair
+    # allocation.  Dense/symmetry fallbacks and explicit get_ovvv callers
+    # trigger the build the first time they read eris.ovvv.
     return eris
 
 

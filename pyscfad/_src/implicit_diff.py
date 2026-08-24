@@ -14,6 +14,8 @@
 
 import inspect
 import operator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import partial
 import jax
 from jax.tree_util import tree_map
@@ -21,6 +23,33 @@ from jax.scipy.sparse.linalg import gmres
 from pyscfad.backend import get_backend
 
 _Sub = partial(tree_map, operator.sub)
+
+
+# A reverse-mode root solve has two qualitatively different VJPs.  Krylov
+# matvecs differentiate the optimality condition with respect to the root
+# variable only, whereas the VJP after the solve differentiates with respect
+# to the external arguments.  Custom VJPs normally cannot tell that a primal
+# argument was closed over by ``fun_sol``: their backward rule is still asked
+# to return every input cotangent, even though JAX will discard the closed-
+# over ones.  Expensive primitives can consult this marker to omit those
+# provably unused argument cotangents during a Krylov matvec.
+_IMPLICIT_DIFF_SOLVE_MATVEC = ContextVar(
+    'pyscfad_implicit_diff_solve_matvec', default=False
+)
+
+
+def is_implicit_diff_solve_matvec():
+    """Whether only the implicit root-variable cotangent is being used."""
+    return bool(_IMPLICIT_DIFF_SOLVE_MATVEC.get())
+
+
+@contextmanager
+def _implicit_diff_solve_matvec():
+    token = _IMPLICIT_DIFF_SOLVE_MATVEC.set(True)
+    try:
+        yield
+    finally:
+        _IMPLICIT_DIFF_SOLVE_MATVEC.reset(token)
 
 def _Scalar_mul(scal, tree_x):
     return tree_map(lambda x: scal * x, tree_x)
@@ -55,7 +84,8 @@ def root_vjp(optimality_fun, sol, args, cotangent,
         _, vjp_fun_sol = jax.vjp(fun_sol, sol)
 
     def matvec(u):
-        return vjp_fun_sol(u)[0]
+        with _implicit_diff_solve_matvec():
+            return vjp_fun_sol(u)[0]
 
     v = _Scalar_mul(-1, cotangent)
     u = solve(matvec, v, M=M, **solver_kwargs)[0]

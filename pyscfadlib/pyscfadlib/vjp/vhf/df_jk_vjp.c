@@ -80,3 +80,62 @@ void df_vk_vjp(double *eri_tril_bar, double *dm_bar,
     }
     free(dm_bar_bufs);
 }
+
+
+// Density-only transpose used by implicit-SCF Krylov matvecs.  The DF
+// factors are closed-over constants in this operation, so constructing their
+// cotangent is wasted work.  This is the dm_bar half of _contract_vk above.
+static void _contract_vk_dm(double *dm_bar, double *vk_bar,
+                            double *eri_tril, int nao, double *cache)
+{
+    const double D0 = 0;
+    const double D1 = 1;
+    const char SIDE_L = 'L';
+    const char SIDE_R = 'R';
+    const char UPLO_U = 'U';
+    const size_t nao2 = (size_t)nao * nao;
+    double *eri = cache;
+    double *buf1_bar = eri + nao2;
+
+    NPdunpack_tril(nao, eri_tril, eri, 0);
+    dsymm_(&SIDE_R, &UPLO_U, &nao, &nao,
+           &D1, eri, &nao, vk_bar, &nao,
+           &D0, buf1_bar, &nao);
+    dsymm_(&SIDE_L, &UPLO_U, &nao, &nao,
+           &D1, eri, &nao, buf1_bar, &nao,
+           &D1, dm_bar, &nao);
+}
+
+
+void df_vk_dm_vjp(double *dm_bar, double *vk_bar, double *eri_tril,
+                  int naux, int nao)
+{
+    const size_t nao2 = (size_t)nao * nao;
+    const size_t nao_pair = (size_t)nao * (nao+1) / 2;
+    double **dm_bar_bufs = calloc(omp_get_max_threads_safe(), sizeof(double *));
+    #pragma omp parallel
+    {
+        int i;
+        int thread_id = omp_get_thread_num();
+        double *dm_bar_priv;
+        if (thread_id == 0) {
+            dm_bar_priv = dm_bar;
+        } else {
+            dm_bar_priv = calloc(nao2, sizeof(double));
+        }
+        dm_bar_bufs[thread_id] = dm_bar_priv;
+        double *cache = malloc(nao2*2 * sizeof(double));
+        #pragma omp for schedule(static)
+        for (i = 0; i < naux; i++) {
+            _contract_vk_dm(dm_bar_priv, vk_bar,
+                            eri_tril+i*nao_pair, nao, cache);
+        }
+        free(cache);
+
+        omp_dsum_reduce_inplace(dm_bar_bufs, nao2);
+        if (thread_id != 0) {
+            free(dm_bar_priv);
+        }
+    }
+    free(dm_bar_bufs);
+}

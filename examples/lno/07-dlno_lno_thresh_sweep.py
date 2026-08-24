@@ -1,11 +1,13 @@
-"""Sweep LNO truncation threshold and compare DLNO against LNO.
+"""Sweep LNO truncation in LNO and the legacy DLNO-prescreen variant.
 
-This script keeps the DLNO domain thresholds fixed and varies only the final
-LNO-space truncation threshold used by both the parent LNO solver and the DLNO
+This script keeps the historical PAO-domain thresholds fixed and varies only
+the final LNO-space truncation threshold used by the parent LNO solver and its
 prescreened variant.  It is intended to answer a narrow question:
 
-    How well does DLNO track LNO as the final local-natural-orbital threshold
-    is tightened or loosened?
+    How well does legacy prescreened LNO track LNO as the final
+    local-natural-orbital threshold is tightened or loosened?
+
+It does not use the current IAO-DLNO-CCSD(T) solver.
 
 Outputs:
 - CSV summary next to this script
@@ -26,7 +28,6 @@ import numpy as np
 
 from pyscfad import config, gto, mp, scf
 from pyscfad.lno import LNOCCSD, LNOMP2
-from pyscfad.dlno.ccsd import DLNOCCSD
 from pyscfad.dlno.mp2 import DLNOMP2
 from pyscfad.dlno.prescreen import build_dlno_prescreen_data, rebuild_dlno_prescreen_data
 from pyscfad.lno.tools import autofrag, map_lo_to_frag
@@ -104,11 +105,10 @@ def make_local_mp2_solver(mf, *, thresh, lo_type=LO_TYPE, dlno_data=None):
 
 def make_cc_solver(mf, *, thresh, lo_type=LO_TYPE, ccsd_t=False,
                    dlno_data=None):
-    if dlno_data is None:
-        mycc = LNOCCSD(mf, thresh=thresh, frozen=FROZEN)
-    else:
-        mycc = DLNOCCSD(mf, thresh=thresh, frozen=FROZEN,
-                        dlno_prescreen_data=dlno_data)
+    mycc = LNOCCSD(mf, thresh=thresh, frozen=FROZEN)
+    if dlno_data is not None:
+        mycc.use_dlno_prescreen = True
+        mycc.dlno_prescreen_data = dlno_data
     mycc.thresh_occ = mycc.thresh_vir = thresh
     mycc.lo_type, mycc.no_type, mycc.ccsd_t = lo_type, "ie", ccsd_t
     return mycc

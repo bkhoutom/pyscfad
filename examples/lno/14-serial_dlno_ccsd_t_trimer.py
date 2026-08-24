@@ -6,10 +6,11 @@ Run:
 import numpy
 from pyscfad import config, gto, scf
 from pyscfad.dlno.ccsd import DLNOCCSD
+from pyscfad.dlno.iao_mp2 import IAOFragmentMP2Thresholds
 
 config.update('pyscfad_moleintor_opt', True)
 config.update('pyscfad_scf_implicit_diff', True)
-config.update('pyscfad_scf_first_order_custom', True)
+config.update('pyscfad_scf_first_order_custom', False)
 
 mol = gto.Mole(atom='water_trimer.xyz', basis='ccpvdz', max_memory=4000)
 mol.verbose = 4
@@ -39,8 +40,10 @@ e_dlno, jac_dlno = DLNOCCSD.value_and_grad(
     mol,
     build_mf=build_mf,
     ccsd_t=True,
-    domain_pao_thr=thr,
-    pair_energy_thr=thr,
+    thresholds=IAOFragmentMP2Thresholds(
+        domain_pao=thr,
+        pair_energy=thr,
+    ),
     thresh_occ=1e-3,
     thresh_vir=1e-4,
 )

@@ -1,3 +1,9 @@
+"""Legacy DLNO-prescreen diagnostic for the first-order SCF response.
+
+This exercises the historical PAO-prescreened LNO implementation.  It does
+not use the current IAO-DLNO-CCSD(T) solver in :mod:`pyscfad.dlno.ccsd`.
+"""
+
 import warnings
 from pathlib import Path
 
@@ -8,7 +14,6 @@ from pyscfad import config, gto, scf
 from pyscfad.cc import dfccsd
 from pyscfad.lno import LNOMP2
 from pyscfad.lno import ccsd as lnoccsd
-from pyscfad.dlno.ccsd import DLNOCCSD
 from pyscfad.dlno.mp2 import DLNOMP2
 from pyscfad.dlno.prescreen import build_dlno_prescreen_data, rebuild_dlno_prescreen_data
 from pyscfad.lno.tools import autofrag, map_lo_to_frag
@@ -54,11 +59,12 @@ def build_local_orbitals_and_fragments(mf):
 
 
 def make_cc_solver(mf, dlno_data=None):
-    if dlno_data is None:
-        mycc = lnoccsd.LNOCCSD(mf, thresh=BUILD_THR, frozen=0)
-    else:
-        mycc = DLNOCCSD(mf, thresh=BUILD_THR, frozen=0,
-                        dlno_prescreen_data=dlno_data)
+    mycc = lnoccsd.LNOCCSD(mf, thresh=BUILD_THR, frozen=0)
+    if dlno_data is not None:
+        # Reproduce the historical DLNO wrapper explicitly.  The current
+        # pyscfad.dlno.ccsd solver instead uses IAO-MP2-selected LISs.
+        mycc.use_dlno_prescreen = True
+        mycc.dlno_prescreen_data = dlno_data
     mycc.thresh_occ = FINAL_THR
     mycc.thresh_vir = FINAL_THR
     mycc.lo_type = LO_TYPE

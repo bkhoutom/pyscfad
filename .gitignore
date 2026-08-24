@@ -130,3 +130,21 @@ dmypy.json
 
 # VSCode
 .vscode/*
+
+# Standalone Overleaf/GitHub manuscript checkout
+/notes/overleaf/
+
+# Local external-software installations
+/.local/
+
+# Repository-local generated output and scratch
+/output/
+/tmp/
+
+# Native build products generated in the source tree
+*.dylib
+/pyscfadlib/pyscfadlib/config.h
+/pyscfadlib/pyscfadlib/thirdparty/
+
+# Locally compiled manuscript copy
+/notes/dlno_ccsdt_notes.pdf

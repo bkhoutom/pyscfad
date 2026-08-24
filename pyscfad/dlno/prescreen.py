@@ -22,16 +22,15 @@ from pyscfad import scipy
 from pyscfad.lno import lno_base
 from pyscfad.ops import stop_grad
 from pyscfad.tools import resource_profile
+from pyscfad.dlno import multipole_numpy as static_multipole
 
 try:
     from pyscfad.dlno import dlno as dlno_mod
-    from pyscfad.dlno import mp2 as dlno_mp2
     from pyscfad.dlno import pao as dlno_pao
     from pyscfad.dlno import util as dlno_util
 except Exception:
     # Fall back to system-installed dlno if local copy not complete
     from dlno import dlno as dlno_mod
-    from dlno import mp2 as dlno_mp2
     from dlno import pao as dlno_pao
     from dlno import util as dlno_util
 
@@ -146,98 +145,10 @@ def _semicanonicalize_local(mol, mos, fock, atmlst):
     return w, mos_np @ v
 
 
-def _fake_multipole_mol(mol, atmlst):
-    return dlno_util.fake_mol_by_atom(mol, atmlst)
-
-
-def _dipole_op_numpy(mol, atmlst=None):
-    fake_mol = _fake_multipole_mol(mol, atmlst)
-    nao = fake_mol.nao
-    return onp.asarray(fake_mol.intor('int1e_r')).reshape(3, nao, nao)
-
-
-def _quadrupole_op_numpy(mol, R, atmlst=None):
-    fake_mol = _fake_multipole_mol(mol, atmlst)
-    nao = fake_mol.nao
-    with fake_mol.with_common_origin(onp.asarray(R)):
-        rr = onp.asarray(fake_mol.intor('int1e_rr')).reshape(3, 3, nao, nao)
-
-    r2 = onp.trace(rr)
-    rr *= 3.0
-    for x in range(3):
-        rr[x, x] -= r2
-    rr *= 0.5
-    return rr
-
-
-def _octupole_op_numpy(mol, R, atmlst=None):
-    fake_mol = _fake_multipole_mol(mol, atmlst)
-    nao = fake_mol.nao
-    with fake_mol.with_common_origin(onp.asarray(R)):
-        rrr = onp.asarray(fake_mol.intor('int1e_rrr')).reshape(3, 3, 3,
-                                                               nao, nao)
-
-    r2r_0 = onp.trace(rrr, axis1=1, axis2=2)
-    r2r_1 = onp.trace(rrr, axis1=2, axis2=0)
-    r2r_2 = onp.trace(rrr, axis1=0, axis2=1)
-
-    rrr *= 5.0
-    for x in range(3):
-        rrr[:, x, x] -= r2r_0
-        rrr[x, :, x] -= r2r_1
-        rrr[x, x, :] -= r2r_2
-    rrr *= 0.5
-    return rrr
-
-
-def _multipole_expectation_numpy(op, lmo):
-    op = onp.asarray(op)
-    lmo = onp.asarray(lmo).reshape(-1)
-    op_lmo = op.reshape(-1, lmo.size, lmo.size) @ lmo
-    return op_lmo @ lmo.conj()
-
-
-def _multipole_transition_numpy(op, lmo, pao):
-    op = onp.asarray(op)
-    lmo = onp.asarray(lmo).reshape(-1)
-    pao = onp.asarray(pao)
-    op_lmo = op.reshape(-1, lmo.size, lmo.size) @ lmo
-    return (op_lmo @ pao.conj()).reshape(*op.shape[:-2], pao.shape[1])
-
-
 def _multipole_pair_data_numpy(mol, lmo, pao, e_occ, e_vir, atmlst, order):
-    lmo = onp.asarray(lmo).reshape(-1)
-    pao = onp.asarray(pao)
-    e_occ = float(onp.asarray(e_occ).reshape(()))
-    e_vir = onp.asarray(e_vir)
-
-    Di = _dipole_op_numpy(mol, atmlst=atmlst)
-    Ri = _multipole_expectation_numpy(Di, lmo)
-    mu_i = _multipole_transition_numpy(Di, lmo, pao)
-
-    theta_i = None
-    theta_i_flat = None
-    if order > 2:
-        Qi = _quadrupole_op_numpy(mol, Ri, atmlst=atmlst)
-        theta_i = _multipole_transition_numpy(Qi, lmo, pao)
-        theta_i_flat = theta_i.reshape(9, -1)
-
-    omega_i = None
-    omega_i_flat = None
-    if order > 3:
-        Oi = _octupole_op_numpy(mol, Ri, atmlst=atmlst)
-        omega_i = _multipole_transition_numpy(Oi, lmo, pao)
-        omega_i_flat = omega_i.reshape(27, -1)
-
-    return {
-        'R': Ri,
-        'mu': mu_i,
-        'theta': theta_i,
-        'theta_flat': theta_i_flat,
-        'omega': omega_i,
-        'omega_flat': omega_i_flat,
-        'e': e_vir - e_occ,
-    }
+    return static_multipole.multipole_orbital_data(
+        mol, e_occ, lmo, e_vir, pao, atmlst=atmlst, order=order
+    )
 
 
 def _precompute_multipole_pair_data_numpy(mol, occ, vir, e_occ, e_vir,
@@ -250,86 +161,9 @@ def _precompute_multipole_pair_data_numpy(mol, occ, vir, e_occ, e_vir,
 
 
 def _pair_energy_from_multipole_data_numpy(pair_data, order):
-    nocc = len(pair_data)
-    pair_energy = onp.zeros((nocc, nocc), dtype=onp.float64)
-
-    for i in range(nocc):
-        data_i = pair_data[i]
-        Ri = data_i['R']
-        mu_ai = data_i['mu']
-        e_ai = data_i['e']
-        theta_ai = data_i['theta']
-        theta_ai_flat = data_i['theta_flat']
-        omega_ai = data_i['omega']
-        omega_ai_flat = data_i['omega_flat']
-
-        for j in range(i):
-            data_j = pair_data[j]
-            Rj = data_j['R']
-            R = onp.linalg.norm(Rj - Ri)
-            R_bar = (Rj - Ri) / R
-
-            mu_bj = data_j['mu']
-
-            aibj_2 = mu_ai.T @ mu_bj
-            tmp_ai = R_bar @ mu_ai
-            tmp_bj = R_bar @ mu_bj
-            aibj_2 -= onp.outer(tmp_ai, tmp_bj * 3.0)
-            aibj_2 /= R**3
-
-            aibj = aibj_2
-
-            if order > 2:
-                theta_bj = data_j['theta']
-                theta_bj_flat = data_j['theta_flat']
-                RR = onp.outer(R_bar, R_bar)
-
-                tmp1_ai = RR.ravel() @ theta_ai_flat
-                tmp1_bj = RR.ravel() @ theta_bj_flat
-                aibj_3 = onp.outer(tmp1_ai, tmp_bj * 5.0)
-                aibj_3 -= onp.outer(tmp_ai, tmp1_bj * 5.0)
-
-                mu_R_ai = (mu_ai[:, None, :] * R_bar[None, :, None]).reshape(9, -1)
-                mu_R_bj = (mu_bj[:, None, :] * R_bar[None, :, None]).reshape(9, -1)
-                aibj_3 += (2.0 * mu_R_ai.T) @ theta_bj_flat
-                aibj_3 -= theta_ai_flat.T @ (mu_R_bj * 2.0)
-                aibj_3 /= R**4
-                aibj = aibj + aibj_3
-
-            if order > 3:
-                omega_bj = data_j['omega']
-                omega_bj_flat = data_j['omega_flat']
-                RR = onp.outer(R_bar, R_bar)
-                RRR = (
-                    R_bar[:, None, None]
-                    * R_bar[None, :, None]
-                    * R_bar[None, None, :]
-                )
-
-                RR9 = RR * 9.0
-                omega_RR_bj = onp.tensordot(omega_bj, RR9, axes=([1, 2], [0, 1]))
-                omega_RR_ai = onp.tensordot(RR9, omega_ai, axes=([0, 1], [0, 1]))
-                aibj_4 = mu_ai.T @ omega_RR_bj
-                aibj_4 += omega_RR_ai.T @ mu_bj
-
-                omega_R3_ai = RRR.ravel() @ omega_ai_flat
-                omega_R3_bj = RRR.ravel() @ omega_bj_flat
-                aibj_4 -= onp.outer(tmp_ai, omega_R3_bj * 21.0)
-                aibj_4 -= onp.outer(omega_R3_ai, tmp_bj * 21.0)
-                aibj_4 += onp.outer(tmp1_ai, tmp1_bj * 35.0)
-
-                tmp2_ai = onp.tensordot(theta_ai, R_bar, axes=([1], [0]))
-                tmp2_bj = onp.tensordot(theta_bj, R_bar, axes=([1], [0]))
-                aibj_4 -= tmp2_ai.T @ (tmp2_bj * 20.0)
-                aibj_4 += theta_ai_flat.T @ (theta_bj_flat * 2.0)
-                aibj_4 /= 3.0 * R**5
-                aibj = aibj + aibj_4
-
-            e_bj = data_j['e']
-            aibj2 = aibj * aibj / (e_ai[:, None] + e_bj[None, :])
-            pair_energy[i, j] = -8.0 * onp.sum(aibj2)
-
-    return pair_energy + pair_energy.T
+    return static_multipole.multipole_pair_energy_matrix(
+        pair_data, order=order
+    )
 
 
 def _pair_energy_multipole_numpy(mol, e_occ, mo_occ, e_vir, mo_vir,
@@ -339,15 +173,9 @@ def _pair_energy_multipole_numpy(mol, e_occ, mo_occ, e_vir, mo_vir,
     if atmlst is None:
         atmlst = [None] * nocc
 
-    try:
-        pair_data = _precompute_multipole_pair_data_numpy(
-            mol, mo_occ, mo_vir, e_occ, e_vir, atmlst, order
-        )
-    except Exception:
-        return dlno_mp2.pair_energy_multipole(
-            mol, e_occ, mo_occ, e_vir, mo_vir, atmlst, order
-        )
-
+    pair_data = _precompute_multipole_pair_data_numpy(
+        mol, mo_occ, mo_vir, e_occ, e_vir, atmlst, order
+    )
     return _pair_energy_from_multipole_data_numpy(pair_data, order)
 
 

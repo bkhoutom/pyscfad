@@ -1,12 +1,14 @@
-"""Compare backprop and five-point directional finite differences vs lno_thresh.
+"""Compare backprop and directional finite differences vs ``lno_thresh``.
 
 For a fixed random direction in nuclear-coordinate space, this script compares
 the directional derivative obtained from backpropagation against a five-point
-central finite-difference stencil for LNO-CCSD and three DLNO-CCSD variants.
+central finite-difference stencil for LNO-CCSD and three legacy PAO-prescreened
+LNO-CCSD variants.
 
-The DLNO topology thresholds are defined locally in this script.  Only the
-final LNO truncation threshold is varied on the x-axis; the tight DLNO-MP2
-correction uses its own fixed tight LNO threshold.
+The legacy prescreen topology thresholds are defined locally in this script.
+Only the final LNO truncation threshold is varied on the x-axis; the tight
+DLNO-MP2 correction uses its own fixed tight LNO threshold.  This diagnostic
+does not use the current IAO-DLNO-CCSD(T) solver.
 
 Outputs:
 - CSV summary next to this script
@@ -26,7 +28,6 @@ import numpy as np
 
 from pyscfad import config, gto, mp, scf
 from pyscfad.lno import LNOCCSD, LNOMP2
-from pyscfad.dlno.ccsd import DLNOCCSD
 from pyscfad.dlno.mp2 import DLNOMP2
 from pyscfad.dlno.prescreen import build_dlno_prescreen_data, rebuild_dlno_prescreen_data
 from pyscfad.lno.tools import autofrag, map_lo_to_frag
@@ -115,11 +116,10 @@ def make_local_mp2_solver(mf, *, thresh, lo_type=LO_TYPE, dlno_data=None):
 
 def make_cc_solver(mf, *, thresh, lo_type=LO_TYPE, ccsd_t=False,
                    dlno_data=None):
-    if dlno_data is None:
-        cc = LNOCCSD(mf, thresh=thresh, frozen=FROZEN)
-    else:
-        cc = DLNOCCSD(mf, thresh=thresh, frozen=FROZEN,
-                      dlno_prescreen_data=dlno_data)
+    cc = LNOCCSD(mf, thresh=thresh, frozen=FROZEN)
+    if dlno_data is not None:
+        cc.use_dlno_prescreen = True
+        cc.dlno_prescreen_data = dlno_data
     cc.thresh_occ = cc.thresh_vir = thresh
     cc.lo_type, cc.no_type, cc.ccsd_t = lo_type, "ie", ccsd_t
     return cc

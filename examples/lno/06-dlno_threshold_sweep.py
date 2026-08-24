@@ -1,9 +1,12 @@
-"""Sweep DLNO domain thresholds and compare against LNO.
+"""Sweep legacy DLNO-prescreen thresholds and compare against LNO.
 
 For each threshold value it:
-1. Builds a fixed DLNO topology at the reference geometry.
-2. Rebuilds the current DLNO prescreen spaces on the differentiated path.
-3. Compares DLNO and LNO total energies and nuclear gradients.
+1. Builds a fixed PAO-based prescreen topology at the reference geometry.
+2. Rebuilds the legacy prescreen spaces on the differentiated path.
+3. Compares prescreened-LNO and LNO total energies and nuclear gradients.
+
+This is a diagnostic for the historical prescreen implementation, not the
+current IAO-DLNO-CCSD(T) solver in :mod:`pyscfad.dlno.ccsd`.
 
 Outputs:
 - CSV summary next to this script
@@ -24,7 +27,6 @@ import numpy as np
 
 from pyscfad import config, gto, mp, scf
 from pyscfad.lno import LNOCCSD, LNOMP2
-from pyscfad.dlno.ccsd import DLNOCCSD
 from pyscfad.dlno.mp2 import DLNOMP2
 from pyscfad.dlno.prescreen import build_dlno_prescreen_data, rebuild_dlno_prescreen_data
 from pyscfad.lno.tools import autofrag, map_lo_to_frag
@@ -103,11 +105,10 @@ def make_local_mp2_solver(mf, *, thresh=LNO_THRESH, lo_type=LO_TYPE,
 
 
 def make_cc_solver(mf, dlno_data=None):
-    if dlno_data is None:
-        cc = LNOCCSD(mf, thresh=LNO_THRESH, frozen=FROZEN)
-    else:
-        cc = DLNOCCSD(mf, thresh=LNO_THRESH, frozen=FROZEN,
-                      dlno_prescreen_data=dlno_data)
+    cc = LNOCCSD(mf, thresh=LNO_THRESH, frozen=FROZEN)
+    if dlno_data is not None:
+        cc.use_dlno_prescreen = True
+        cc.dlno_prescreen_data = dlno_data
     cc.thresh_occ = cc.thresh_vir = LNO_THRESH
     cc.lo_type, cc.no_type, cc.ccsd_t = LO_TYPE, "ie", False
     cc.verbose = 0

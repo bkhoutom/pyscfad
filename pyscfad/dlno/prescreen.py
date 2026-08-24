@@ -101,6 +101,86 @@ def strong_pair_lists(pair_energy, pair_energy_thr):
     ]
 
 
+def _build_full_domain_prescreen_data(
+    mf,
+    lo_coeff,
+    frag_lolist,
+    *,
+    frozen=None,
+    lmo_bp_domain_thr=0.999,
+    pao_bp_domain_thr=0.98,
+    domain_pao_thr=1e-4,
+    pair_energy_thr=1e-4,
+    pair_energy_model='multipole',
+    pao_norm_thr=1e-4,
+    multipole_order=4,
+):
+    """Build explicit all-atom metadata without running domain screens.
+
+    Full-domain mode deliberately avoids constructing and duplicating dense
+    occupied/virtual coefficient blocks for every fragment. The downstream
+    LNO builder detects the exact all-atom domain and uses the complete active
+    occupied and molecular virtual spaces directly from the current SCF
+    object. The integer dimensions recorded here make that bypass observable.
+    """
+    mol = mf.mol
+    full_atoms = onp.arange(mol.natm, dtype=onp.int32)
+    full_lmos = onp.arange(lo_coeff.shape[1], dtype=onp.int32)
+    nocc_total = int(onp.count_nonzero(onp.asarray(mf.mo_occ) > 0))
+    nocc_active = _active_nocc(mf, frozen)
+    nvir_full = int(mf.mo_coeff.shape[1] - nocc_total)
+
+    fragment_data = []
+    for ifrag, loidx in enumerate(frag_lolist):
+        fragment_data.append({
+            'fragment_index': ifrag,
+            'full_domain': True,
+            'domain_mode': 'full',
+            'lo_indices': onp.asarray(loidx, dtype=onp.int32),
+            'strong_lmo_indices': full_lmos.copy(),
+            'extended_bp_domain': full_atoms.copy(),
+            'extended_primary_domain': full_atoms.copy(),
+            'occ_prescreen_energies': None,
+            'occ_prescreen_coeff': None,
+            'vir_prescreen_energies': None,
+            'vir_prescreen_coeff': None,
+            'n_domain_atoms': int(mol.natm),
+            'n_domain_aos': int(mol.nao),
+            'n_strong_partners': int(full_lmos.size),
+            'n_occ_prescreen': nocc_active,
+            'n_vir_prescreen': nvir_full,
+        })
+
+    lmo_domains = tuple(full_atoms.copy() for _ in range(len(full_lmos)))
+    strong_pairs = tuple(full_lmos.copy() for _ in range(len(full_lmos)))
+    pair_energy = onp.zeros((len(full_lmos), len(full_lmos)))
+    return {
+        'full_domain': True,
+        'domain_mode': 'full',
+        'frozen': frozen,
+        'lo_coeff': lo_coeff,
+        'frag_lolist': tuple(frag_lolist),
+        'lmo_bp_domain_thr': lmo_bp_domain_thr,
+        'pao_bp_domain_thr': pao_bp_domain_thr,
+        'domain_pao_thr': domain_pao_thr,
+        'pair_energy_thr': pair_energy_thr,
+        'pair_energy_model': pair_energy_model,
+        'pao_norm_thr': pao_norm_thr,
+        'multipole_order': multipole_order,
+        'lmo_bp_domain': lmo_domains,
+        'pao_bp_domain': None,
+        'lmo_primary_domain': lmo_domains,
+        'pair_energy': pair_energy,
+        'strong_pairs': strong_pairs,
+        'extended_bp_domain': lmo_domains,
+        'extended_primary_domain': lmo_domains,
+        'fragment_data': fragment_data,
+        'topology_profile': [],
+        'n_active_occ': nocc_active,
+        'n_full_vir': nvir_full,
+    }
+
+
 def _int_frozen(frozen):
     if frozen is None:
         return 0
@@ -624,6 +704,8 @@ def _build_lo_indexed_prescreen_data(
             fragment_data.append(
                 {
                     'fragment_index': ifrag,
+                    'full_domain': False,
+                    'domain_mode': 'screened',
                     'lo_indices': loidx,
                     'strong_lmo_indices': frag_strong,
                     'extended_bp_domain': frag_ext_bp,
@@ -636,14 +718,19 @@ def _build_lo_indexed_prescreen_data(
             )
 
     return {
+        'full_domain': False,
+        'domain_mode': 'screened',
         'frozen': frozen,
         'lo_coeff': lo_coeff,
         'frag_lolist': frag_lolist,
         's1e': s1e,
         'fock': fock,
+        'lmo_bp_domain_thr': lmo_bp_domain_thr,
         'pao_norm_thr': pao_norm_thr,
         'domain_pao_thr': domain_pao_thr,
         'pao_bp_domain_thr': pao_bp_domain_thr,
+        'pair_energy_thr': pair_energy_thr,
+        'multipole_order': multipole_order,
         'lmo_bp_domain': lmo_bp_domain,
         'pao_bp_domain': pao_bp_domain,
         'lmo_primary_domain': lmo_primary_domain,
@@ -671,6 +758,7 @@ def build_dlno_prescreen_data(
     pair_energy_model='multipole',
     pao_norm_thr=1e-4,
     multipole_order=4,
+    full_domain=False,
 ):
     """Precompute DLNO metadata for use with LNO in pyscfad.
 
@@ -679,6 +767,21 @@ def build_dlno_prescreen_data(
     available it will be preferred; otherwise it falls back to an
     external `dlno` package if present.
     """
+    if full_domain:
+        return _build_full_domain_prescreen_data(
+            mf,
+            lo_coeff,
+            frag_lolist,
+            frozen=frozen,
+            lmo_bp_domain_thr=lmo_bp_domain_thr,
+            pao_bp_domain_thr=pao_bp_domain_thr,
+            domain_pao_thr=domain_pao_thr,
+            pair_energy_thr=pair_energy_thr,
+            pair_energy_model=pair_energy_model,
+            pao_norm_thr=pao_norm_thr,
+            multipole_order=multipole_order,
+        )
+
     if lo_coeff.shape[1] != _active_nocc(mf, frozen):
         return _build_lo_indexed_prescreen_data(
             mf,
@@ -701,6 +804,7 @@ def build_dlno_prescreen_data(
         dlno.lmo = lo_coeff
         dlno.lmo_bp_domain_thr = lmo_bp_domain_thr
         dlno.pao_bp_domain_thr = pao_bp_domain_thr
+        dlno.pao_norm_thr = pao_norm_thr
         dlno.domain_pao_thr = domain_pao_thr
         dlno.pair_energy_thr = pair_energy_thr
         dlno.multipole_order = multipole_order
@@ -791,6 +895,8 @@ def build_dlno_prescreen_data(
             fragment_data.append(
                 {
                     "fragment_index": ifrag,
+                    "full_domain": False,
+                    "domain_mode": "screened",
                     "lo_indices": loidx,
                     "strong_lmo_indices": frag_strong,
                     "extended_bp_domain": frag_ext_bp,
@@ -803,14 +909,20 @@ def build_dlno_prescreen_data(
             )
 
     return {
+        "full_domain": False,
+        "domain_mode": "screened",
         "frozen": frozen,
         "lo_coeff": lo_coeff,
         "frag_lolist": frag_lolist,
         "s1e": s1e,
         "fock": fock,
+        "lmo_bp_domain_thr": lmo_bp_domain_thr,
         "pao_norm_thr": pao_norm_thr,
         "domain_pao_thr": domain_pao_thr,
         "pao_bp_domain_thr": pao_bp_domain_thr,
+        "pair_energy_thr": pair_energy_thr,
+        "pair_energy_model": pair_energy_model,
+        "multipole_order": multipole_order,
         "lmo_bp_domain": lmo_bp_domain,
         "pao_bp_domain": pao_bp_domain,
         "lmo_primary_domain": lmo_primary_domain,
@@ -838,6 +950,23 @@ def rebuild_dlno_prescreen_data(mf, lo_coeff, topology_data, *, frozen=None):
     occupied/virtual prescreen spaces are reconstructed from the current
     ``mf``/``lo_coeff`` so their first-order response remains differentiable.
     """
+    if topology_data.get("full_domain", False):
+        if frozen is None:
+            frozen = topology_data.get("frozen", None)
+        return _build_full_domain_prescreen_data(
+            mf,
+            lo_coeff,
+            topology_data["frag_lolist"],
+            frozen=frozen,
+            lmo_bp_domain_thr=topology_data.get("lmo_bp_domain_thr", 0.999),
+            pao_bp_domain_thr=topology_data.get("pao_bp_domain_thr", 0.98),
+            domain_pao_thr=topology_data.get("domain_pao_thr", 1e-4),
+            pair_energy_thr=topology_data.get("pair_energy_thr", 1e-4),
+            pair_energy_model=topology_data.get("pair_energy_model", "multipole"),
+            pao_norm_thr=topology_data.get("pao_norm_thr", 1e-4),
+            multipole_order=topology_data.get("multipole_order", 4),
+        )
+
     profile_total = resource_profile.start()
     mol = mf.mol
     if frozen is None:
@@ -909,6 +1038,8 @@ def rebuild_dlno_prescreen_data(mf, lo_coeff, topology_data, *, frozen=None):
         fragment_data.append(
             {
                 "fragment_index": frag["fragment_index"],
+                "full_domain": False,
+                "domain_mode": "screened",
                 "lo_indices": loidx,
                 "strong_lmo_indices": frag_strong,
                 "extended_bp_domain": frag_ext_bp,
@@ -969,8 +1100,16 @@ def print_summary(data):
         print(f"  Strong LMOs                   : {frag['strong_lmo_indices'].tolist()}")
         print(f"  Extended BP domain atoms      : {frag['extended_bp_domain'].tolist()}")
         print(f"  Extended primary domain atoms : {frag['extended_primary_domain'].tolist()}")
-        print(f"  Occ prescreen size            : {frag['occ_prescreen_coeff'].shape[1]}")
-        print(f"  Vir prescreen size            : {frag['vir_prescreen_coeff'].shape[1]}")
+        occ_coeff = frag.get('occ_prescreen_coeff')
+        vir_coeff = frag.get('vir_prescreen_coeff')
+        nocc = frag.get(
+            'n_occ_prescreen', 0 if occ_coeff is None else occ_coeff.shape[1]
+        )
+        nvir = frag.get(
+            'n_vir_prescreen', 0 if vir_coeff is None else vir_coeff.shape[1]
+        )
+        print(f"  Occ prescreen size            : {nocc}")
+        print(f"  Vir prescreen size            : {nvir}")
         print()
 
 

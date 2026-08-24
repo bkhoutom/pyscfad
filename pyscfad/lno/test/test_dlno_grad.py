@@ -98,6 +98,68 @@ class _ReportMol:
         ])
 
 
+def test_impurity_prescreen_payload_excludes_metadata_and_preserves_domain():
+    fragment = {
+        'fragment_index': 3,
+        'extended_primary_domain': numpy.asarray([0, 2], dtype=numpy.int64),
+        'full_domain': True,
+        'domain_mode': 'full',
+        'strong_lmo_indices': numpy.asarray([0, 1]),
+        'occ_prescreen_coeff': numpy.zeros((4, 2)),
+    }
+    payload = lnoccsd._pack_impurity_prescreen(fragment)
+    restored = lnoccsd._unpack_impurity_prescreen(payload)
+    assert payload == (3, (0, 2))
+    assert hash(payload)
+    assert all(
+        not isinstance(leaf, str)
+        for leaf in jax.tree_util.tree_leaves(payload)
+    )
+    assert set(restored) == {'fragment_index', 'extended_primary_domain'}
+    assert restored['fragment_index'] == fragment['fragment_index']
+    assert numpy.array_equal(
+        restored['extended_primary_domain'],
+        fragment['extended_primary_domain'],
+    )
+    assert lnoccsd._pack_impurity_prescreen(None) is None
+    assert lnoccsd._unpack_impurity_prescreen(None) is None
+
+
+def test_impurity_custom_vjp_keeps_domain_payload_static(monkeypatch):
+    payload = lnoccsd._pack_impurity_prescreen({
+        'fragment_index': 4,
+        'extended_primary_domain': numpy.asarray([1, 2]),
+        'domain_mode': 'screened',
+    })
+    seen = []
+
+    def fake_core(mf, mo_coeff, lo_coeff, fock, s1e,
+                  *, frag_prescreen=None, **kwargs):
+        seen.append(frag_prescreen)
+        assert set(frag_prescreen) == {
+            'fragment_index', 'extended_primary_domain',
+        }
+        assert frag_prescreen['fragment_index'] == 4
+        assert numpy.array_equal(
+            frag_prescreen['extended_primary_domain'],
+            numpy.asarray([1, 2]),
+        )
+        return mf + mo_coeff + lo_coeff + fock + s1e
+
+    monkeypatch.setattr(lnoccsd, '_impurity_solve_core', fake_core)
+
+    def energy(x):
+        return lnoccsd._impurity_solve_jax(
+            x, 2*x, 3*x, 4*x, 5*x, payload,
+            None, 0, False, False, None, 'test', 'mp2', 1.3,
+        )
+
+    value, gradient = jax.value_and_grad(energy)(jnp.asarray(2.0))
+    assert abs(value - 30.0) < 1e-12
+    assert abs(gradient - 15.0) < 1e-12
+    assert seen
+
+
 def test_dlno_space_report_contains_domain_and_fragment_dimensions():
     prescreen_data = {
         'lmo_primary_domain': (
@@ -135,6 +197,57 @@ def test_dlno_space_report_contains_domain_and_fragment_dimensions():
     assert ['1', '2', '5', '1', '2', '4'] in rows
     assert ['2', '1', '2', '1', '1', '3'] in rows
 
+
+def test_explicit_full_domain_metadata_uses_all_atoms():
+    mol = _build_water()
+    mf = scf.RHF(mol).density_fit()
+    mf.kernel()
+    frozen = 1
+    nocc_total = int(numpy.count_nonzero(mf.mo_occ > 0))
+    nocc_active = nocc_total - frozen
+    lo_coeff = lnoccsd.LNOCCSD(
+        mf, frozen=frozen
+    ).get_lo(lo_type='iao')
+    frag_lolist = (numpy.arange(lo_coeff.shape[1], dtype=numpy.int32),)
+
+    data = build_dlno_prescreen_data(
+        mf,
+        lo_coeff,
+        frag_lolist,
+        frozen=frozen,
+        full_domain=True,
+    )
+    fragment = data['fragment_data'][0]
+
+    assert data['full_domain'] is True
+    assert data['domain_mode'] == 'full'
+    assert fragment['full_domain'] is True
+    assert fragment['domain_mode'] == 'full'
+    assert lo_coeff.shape[1] != nocc_active
+    assert data['n_active_occ'] == nocc_active
+    assert data['n_full_vir'] == mf.mo_coeff.shape[1] - nocc_total
+    assert numpy.array_equal(
+        fragment['extended_primary_domain'], numpy.arange(mol.natm),
+    )
+    assert numpy.array_equal(
+        fragment['strong_lmo_indices'], numpy.arange(lo_coeff.shape[1]),
+    )
+    assert fragment['n_domain_aos'] == mol.nao
+    assert fragment['n_occ_prescreen'] == nocc_active
+    assert fragment['n_vir_prescreen'] == mf.mo_coeff.shape[1] - nocc_total
+    fake_cc = type('FakeCC', (), {'mol': mol})()
+    assert lno_base._spans_full_molecule(fake_cc, fragment)
+    assert not lno_base._spans_full_molecule(
+        fake_cc,
+        {'extended_primary_domain': numpy.arange(mol.natm)},
+    )
+    assert not lno_base._spans_full_molecule(
+        fake_cc,
+        {
+            'full_domain': True,
+            'extended_primary_domain': numpy.asarray([0, 0, 2]),
+        },
+    )
 
 def test_active_space_screening_report(capsys):
     fragment = {
@@ -208,6 +321,7 @@ def _build_static_topology(mol, thresh, cderi_file):
         domain_pao_thr=0.0,
         pair_energy_thr=0.0,
         multipole_order=2,
+        full_domain=True,
     )
     return frag_lolist, topology
 
@@ -239,6 +353,7 @@ def test_full_scope_mp2_correction_is_method_consistent_for_full_domains(tmp_pat
         domain_pao_thr=0.0,
         pair_energy_thr=0.0,
         multipole_order=2,
+        full_domain=True,
     )
     e_uncorrected, _ = DLNOCCSD.value_and_grad(
         mol, include_mp2_correction=False, **common_kwargs

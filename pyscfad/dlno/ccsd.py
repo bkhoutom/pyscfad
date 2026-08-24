@@ -85,10 +85,16 @@ def _format_dlno_space_report(mol, prescreen_data):
         fragment_rows.append((
             fragment_index,
             numpy.asarray(atoms).size,
-            _count_domain_aos(mol, atoms),
+            fragment.get('n_domain_aos', _count_domain_aos(mol, atoms)),
             numpy.asarray(lo_indices).size,
-            0 if occ_coeff is None else occ_coeff.shape[1],
-            0 if vir_coeff is None else vir_coeff.shape[1],
+            fragment.get(
+                'n_occ_prescreen',
+                0 if occ_coeff is None else occ_coeff.shape[1],
+            ),
+            fragment.get(
+                'n_vir_prescreen',
+                0 if vir_coeff is None else vir_coeff.shape[1],
+            ),
         ))
 
     lines = [
@@ -111,6 +117,34 @@ def _format_dlno_space_report(mol, prescreen_data):
         '',
     ]
     return '\n'.join(lines)
+
+
+def _fragment_response_topology(prescreen_data, ifrag):
+    """Return one fragment's fixed discrete topology for AD rebuilding."""
+    fragment = prescreen_data['fragment_data'][ifrag]
+    if bool(fragment.get('full_domain', False)):
+        return None
+    discrete_keys = (
+        'fragment_index',
+        'full_domain',
+        'domain_mode',
+        'lo_indices',
+        'strong_lmo_indices',
+        'extended_bp_domain',
+        'extended_primary_domain',
+    )
+    discrete_fragment = {
+        key: fragment[key] for key in discrete_keys if key in fragment
+    }
+    return {
+        'full_domain': False,
+        'domain_mode': 'screened',
+        'frozen': prescreen_data.get('frozen'),
+        'pao_norm_thr': prescreen_data.get('pao_norm_thr', 1e-4),
+        'domain_pao_thr': prescreen_data.get('domain_pao_thr', 1e-4),
+        'pao_bp_domain_thr': prescreen_data.get('pao_bp_domain_thr', 0.98),
+        'fragment_data': (discrete_fragment,),
+    }
 
 
 def _env_flag(name, default=False):
@@ -169,6 +203,7 @@ class DLNOCCSD(LNOCCSD):
     pao_bp_domain_thr = 0.9
     domain_pao_thr = 1e-4
     pair_energy_thr = 1e-4
+    pao_norm_thr = 1e-4
     multipole_order = 4
 
     def __init__(self, mf, thresh=1e-4, frozen=None, fock=None, s1e=None,
@@ -214,7 +249,9 @@ class DLNOCCSD(LNOCCSD):
                        pao_bp_domain_thr=None,
                        domain_pao_thr=None,
                        pair_energy_thr=None,
-                       multipole_order=None):
+                       pao_norm_thr=None,
+                       multipole_order=None,
+                       full_domain=False):
         """Compute (total energy, mol-gradient) via per-fragment progressive AD.
 
         This is a classmethod, *not* an instance method — there is no
@@ -275,7 +312,7 @@ class DLNOCCSD(LNOCCSD):
                 CCSD-solver settings, mirror the like-named attributes on
                 ``LNOCCSD``.  Defaults match ``LNOCCSD``'s.
             lmo_bp_domain_thr, pao_bp_domain_thr, domain_pao_thr,
-            pair_energy_thr, multipole_order:
+            pair_energy_thr, pao_norm_thr, multipole_order:
                 Prescreen-build settings.  If ``None``, the class default
                 from ``cls`` is used (so e.g. ``DLNOCCSD.value_and_grad``
                 uses ``DLNOCCSD.domain_pao_thr = 1e-4``).
@@ -290,7 +327,9 @@ class DLNOCCSD(LNOCCSD):
         if pao_bp_domain_thr is None: pao_bp_domain_thr = cls.pao_bp_domain_thr
         if domain_pao_thr    is None: domain_pao_thr    = cls.domain_pao_thr
         if pair_energy_thr   is None: pair_energy_thr   = cls.pair_energy_thr
+        if pao_norm_thr      is None: pao_norm_thr      = cls.pao_norm_thr
         if multipole_order   is None: multipole_order   = cls.multipole_order
+        full_domain = bool(full_domain)
         if sos_c_os is None:
             sos_c_os = lno_base.DOMAIN_SOS_MP2_C_OS
         mp2_correction_scope = str(mp2_correction_scope).lower().replace('_', '-')
@@ -307,12 +346,16 @@ class DLNOCCSD(LNOCCSD):
         t_overall = time.perf_counter()
         profile_overall = resource_profile.start()
         log('DLNOCCSD.value_and_grad: start')
+        log(f'DOMAIN_MODE = {"FULL" if full_domain else "SCREENED"}')
         resource_profile.checkpoint(
             'outer.start',
             natm=getattr(mol, 'natm', None),
             nao=getattr(mol, 'nao', None),
             frozen=frozen,
             ccsd_t=ccsd_t,
+            domain_mode='full' if full_domain else 'screened',
+            pair_energy_thr=pair_energy_thr,
+            pao_norm_thr=pao_norm_thr,
         )
 
         # ---------------- Outside the fragment loop ----------------
@@ -356,19 +399,18 @@ class DLNOCCSD(LNOCCSD):
             lo_mib=resource_profile.estimated_array_mib(lo_coeff),
         )
 
-        # Fragment LO assignment + prescreen are built eagerly (concrete
-        # numpy/JAX arrays).  Their construction reads mf state but the
-        # *gradient* through them is intentionally dropped — they're
-        # treated as fixed metadata that pins the fragmentation topology
-        # to the reference geometry.  This is the same approximation as
-        # the "fixed LNO" mode in example 13.
+        # Freeze only combinatorial fragment/domain membership.  Each
+        # fragment's occupied/virtual prescreen coefficient spaces are rebuilt
+        # from the current traced SCF/LO state inside ``per_frag_fn`` so their
+        # continuous first-order response is retained.
         # stop_trace only accepts JAX-array / pytree inputs as positional
         # args; the string/scalar config is captured via closure.
         def _topo_builder(mf_, frag_lolist_):
             return _build_static_dlno_topology(
                 mf_, frag_lolist_, frozen, lo_type,
                 lmo_bp_domain_thr, pao_bp_domain_thr,
-                domain_pao_thr, pair_energy_thr, multipole_order,
+                domain_pao_thr, pair_energy_thr, pao_norm_thr,
+                multipole_order, full_domain=full_domain,
             )
         t0 = time.perf_counter()
         profile0 = resource_profile.start()
@@ -418,17 +460,27 @@ class DLNOCCSD(LNOCCSD):
         for ifrag in range(nfrag):
             fraglo_idx = frag_lolist_static[ifrag]
             frag_prescreen = prescreen_data['fragment_data'][ifrag]
+            response_topology = _fragment_response_topology(
+                prescreen_data, ifrag,
+            )
             weight = frag_wghtlist[ifrag]
 
             def per_frag_fn(mf_, lo_coeff_,
                             _ifrag=ifrag,
                             _fraglo=fraglo_idx,
                             _frag_prescreen=frag_prescreen,
+                            _response_topology=response_topology,
                             _weight=weight):
+                if _response_topology is None:
+                    current_prescreen = _frag_prescreen
+                else:
+                    current_prescreen = rebuild_dlno_prescreen_data(
+                        mf_, lo_coeff_, _response_topology, frozen=frozen,
+                    )['fragment_data'][0]
+
                 # Construct a transient plain LNOCCSD for this fragment.
-                # The DLNO behavior at the per-fragment level flows
-                # entirely through ``_frag_prescreen``; no DLNOCCSD-
-                # specific attributes are needed inside the body.
+                # The DLNO behavior at the per-fragment level flows entirely
+                # through ``current_prescreen``.
                 cc_local = LNOCCSD(mf_, frozen=frozen)
                 cc_local.thresh_occ = thresh_occ
                 cc_local.thresh_vir = thresh_vir
@@ -446,7 +498,7 @@ class DLNOCCSD(LNOCCSD):
 
                 #jo changes
                 cc_local.use_dlno_prescreen = True
-                cc_local.dlno_prescreen_data = frag_prescreen
+                cc_local.dlno_prescreen_data = current_prescreen
                 cc_local._current_ifrag = _ifrag
 
                 orbfragloc = lo_coeff_[:, _fraglo]
@@ -458,7 +510,7 @@ class DLNOCCSD(LNOCCSD):
                 stub_eris = _make_stub_eris(mf_)
                 profile_local_eris = resource_profile.start()
                 eris_fpno = lno_base.make_fragment_eris(
-                    cc_local, stub_eris, _frag_prescreen,
+                    cc_local, stub_eris, current_prescreen,
                 )
                 resource_profile.finish(
                     'fragment.local_df_ao2mo',
@@ -476,7 +528,7 @@ class DLNOCCSD(LNOCCSD):
                     cc_local, eris_fpno, orbfragloc, no_type,
                     lno_base.THRESH_INTERNAL,
                     (cc_local.thresh_occ, cc_local.thresh_vir),
-                    frag_prescreen=_frag_prescreen,
+                    frag_prescreen=current_prescreen,
                     frozen_mask=cc_local.get_frozen_mask(),
                     space_label=(
                         f'Fragment {_ifrag+1}/{nfrag}'
@@ -521,7 +573,7 @@ class DLNOCCSD(LNOCCSD):
                 res = _impurity_solve_core(
                     mf_, orbfrag, orbfragloc,
                     eris_fpno.fock, eris_fpno.s1e,
-                    frozen=frzfrag, frag_prescreen=_frag_prescreen,
+                    frozen=frzfrag, frag_prescreen=current_prescreen,
                     verbose_imp=cc_local.verbose_imp,
                     ccsd_t=cc_local.ccsd_t,
                     dcsd=cc_local.dcsd,
@@ -608,7 +660,7 @@ class DLNOCCSD(LNOCCSD):
                 frag=f'{ifrag+1}/{nfrag}',
             )
             del e_frag, vjp_fn, aux, g_mf_i, g_lo_i, per_frag_fn
-            del fraglo_idx, frag_prescreen
+            del fraglo_idx, frag_prescreen, response_topology
             _cleanup_after_fragment(
                 log if verbose >= _VERBOSE_PROGRESS else None,
                 label=f'fragment {ifrag+1}/{nfrag}',
@@ -675,7 +727,8 @@ class DLNOCCSD(LNOCCSD):
 def _build_static_dlno_topology(mf, frag_lolist, frozen, lo_type,
                                 lmo_bp_domain_thr, pao_bp_domain_thr,
                                 domain_pao_thr, pair_energy_thr,
-                                multipole_order):
+                                pao_norm_thr, multipole_order,
+                                full_domain=False):
     """Eager DLNO prescreen build.  Called under ``stop_trace`` from
     ``DLNOCCSD.value_and_grad`` so the gradient path treats the
     fragmentation topology as fixed metadata (no backprop through it).
@@ -719,29 +772,20 @@ def _build_static_dlno_topology(mf, frag_lolist, frozen, lo_type,
         pao_bp_domain_thr=pao_bp_domain_thr,
         domain_pao_thr=domain_pao_thr,
         pair_energy_thr=pair_energy_thr,
+        pao_norm_thr=pao_norm_thr,
         multipole_order=multipole_order,
+        full_domain=full_domain,
     )
     log(f'    [topology] build_dlno_prescreen_data:'
         f'{time.perf_counter() - t0:8.2f} s')
+    log(f'    DOMAIN_MODE = {"FULL" if full_domain else "SCREENED"}')
     resource_profile.finish(
         'prescreen.topology_build_total',
         profile0,
         fragments=len(frag_lolist),
     )
 
-    t0 = time.perf_counter()
-    profile0 = resource_profile.start()
-    prescreen_data = rebuild_dlno_prescreen_data(
-        mf, lo_coeff, topology, frozen=frozen,
-    )
-    log(f'    [topology] rebuild_dlno_prescreen_data:'
-        f' {time.perf_counter() - t0:6.2f} s')
-    resource_profile.finish(
-        'prescreen.coefficient_rebuild_total',
-        profile0,
-        fragments=len(frag_lolist),
-    )
-    return tuple(frag_lolist), prescreen_data
+    return tuple(frag_lolist), topology
 
 
 def _make_stub_eris(mf):

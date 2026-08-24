@@ -12,8 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
+from functools import wraps
 import os
+import sys
 import time
+import traceback
 
 from mpi4py import MPI
 import numpy
@@ -21,6 +25,7 @@ import jax
 import jax.numpy as jnp
 
 from pyscfad import numpy as np
+from pyscfad.df import addons as df_addons
 from pyscfad.ops import stop_trace
 from pyscfad.lno import lno_base_mpi as lno_base_mpi_mod
 from pyscfad.lno import lno_base
@@ -36,6 +41,81 @@ from pyscfad.dlno.ccsd import (
     _make_stub_eris,
     _VERBOSE_PROGRESS,
 )
+
+
+def _abort_mpi_on_exception(func):
+    """Abort all MPI ranks when an unhandled calculation error escapes.
+
+    A Python exception on one rank otherwise leaves surviving ranks blocked in
+    a later collective.  Single-rank calls retain ordinary Python exception
+    behavior so local debugging and unit tests are not terminated abruptly.
+    """
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        comm = MPI.COMM_WORLD
+        try:
+            return func(*args, **kwargs)
+        except Exception:
+            if comm.Get_size() > 1:
+                rank = comm.Get_rank()
+                print(
+                    f'[MPI-FAILFAST] rank {rank} failed in '
+                    f'{func.__qualname__}',
+                    file=sys.stderr,
+                    flush=True,
+                )
+                traceback.print_exc()
+                sys.stdout.flush()
+                sys.stderr.flush()
+                comm.Abort(1)
+            raise
+
+    return wrapped
+
+
+def _validate_fragment_mo_width(mf, orbfrag, *, rank, fragment):
+    """Require the fragment orbital layout to retain the canonical MO width."""
+    if orbfrag is None:
+        return
+    if getattr(orbfrag, 'ndim', None) != 2:
+        raise RuntimeError(
+            'Invalid fragment MO layout on '
+            f'rank {rank}, fragment {fragment}: expected a rank-2 array, '
+            f'got shape {getattr(orbfrag, "shape", None)}'
+        )
+
+    expected_nmo = int(mf.mo_coeff.shape[1])
+    actual_nmo = int(orbfrag.shape[1])
+    if actual_nmo != expected_nmo:
+        raise RuntimeError(
+            'Invalid fragment MO layout on '
+            f'rank {rank}, fragment {fragment}: expected '
+            f'{expected_nmo} MO columns, got {actual_nmo}'
+        )
+
+
+def _final_cderi_cache_context(mf, mode):
+    """Return the selected final-closeout CDERI source context."""
+    mode = str(mode).strip().lower()
+    if mode == 'disk':
+        return nullcontext(None)
+    if mode != 'memory':
+        raise ValueError(
+            "final_cderi_cache must be either 'disk' or 'memory', "
+            f'got {mode!r}'
+        )
+
+    with_df = getattr(mf, 'with_df', None)
+    if with_df is None:
+        raise RuntimeError(
+            'final_cderi_cache="memory" requires a density-fitted SCF object.'
+        )
+    get_source = getattr(with_df, '_get_cderi_source', None)
+    source = (
+        get_source() if get_source is not None
+        else getattr(with_df, '_cderi', None)
+    )
+    return df_addons.cderi_memory_cache(source, dataname='j3c')
 
 
 def _path_key(path):
@@ -175,11 +255,13 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
     """
 
     @classmethod
+    @_abort_mpi_on_exception
     def value_and_grad(cls, mol, *, build_mf, frag_lolist=None,
                        include_mp2_correction=True,
                        mp2_correction_method='sos',
                        mp2_correction_scope='domain',
                        sos_c_os=None,
+                       final_cderi_cache='memory',
                        # CCSD solver config
                        frozen=0,
                        thresh_occ=1e-4,
@@ -194,7 +276,9 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                        pao_bp_domain_thr=None,
                        domain_pao_thr=None,
                        pair_energy_thr=None,
-                       multipole_order=None):
+                       pao_norm_thr=None,
+                       multipole_order=None,
+                       full_domain=False):
         """MPI-parallel value_and_grad: rank-0 owns SCF + LO + prescreen +
         ``lo_vjp`` + ``scf_vjp``; non-root ranks only do fragment
         forward/backward; cotangents are gathered to rank 0 for the
@@ -262,13 +346,27 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
 
         The HF energy contribution is seeded into ``grad_mf`` on
         rank 0 only, so it appears exactly once.
+
+        ``final_cderi_cache`` controls how rank 0 reads CDERI during the final
+        ``scf_vjp`` closeout. ``'disk'`` preserves the out-of-core path;
+        ``'memory'`` preloads rank 0's one CDERI dataset and reuses it for all
+        repeated reverse calls in that closeout.
         """
+        final_cderi_cache = str(final_cderi_cache).strip().lower()
+        if final_cderi_cache not in ('disk', 'memory'):
+            raise ValueError(
+                "final_cderi_cache must be either 'disk' or 'memory', "
+                f'got {final_cderi_cache!r}'
+            )
+
         # Resolve prescreen defaults from the class
         if lmo_bp_domain_thr is None: lmo_bp_domain_thr = cls.lmo_bp_domain_thr
         if pao_bp_domain_thr is None: pao_bp_domain_thr = cls.pao_bp_domain_thr
         if domain_pao_thr    is None: domain_pao_thr    = cls.domain_pao_thr
         if pair_energy_thr   is None: pair_energy_thr   = cls.pair_energy_thr
+        if pao_norm_thr      is None: pao_norm_thr      = cls.pao_norm_thr
         if multipole_order   is None: multipole_order   = cls.multipole_order
+        full_domain = bool(full_domain)
         if sos_c_os is None:
             sos_c_os = lno_base.DOMAIN_SOS_MP2_C_OS
         mp2_correction_scope = str(mp2_correction_scope).lower().replace('_', '-')
@@ -293,6 +391,7 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
         t_overall = time.perf_counter()
         profile_overall = resource_profile.start()
         log(f'DLNOCCSD.value_and_grad (MPI, nproc={nproc}): start')
+        log(f'DOMAIN_MODE = {"FULL" if full_domain else "SCREENED"}')
         resource_profile.checkpoint(
             'mpi.outer_start',
             nproc=nproc,
@@ -300,6 +399,9 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
             nao=getattr(mol, 'nao', None),
             frozen=frozen,
             ccsd_t=ccsd_t,
+            domain_mode='full' if full_domain else 'screened',
+            pair_energy_thr=pair_energy_thr,
+            pao_norm_thr=pao_norm_thr,
         )
 
         # ---- Rank 0: full canonical setup (SCF + LO + prescreen) ----
@@ -337,7 +439,8 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                 return _build_static_dlno_topology(
                     mf_, frag_lolist_, frozen, lo_type,
                     lmo_bp_domain_thr, pao_bp_domain_thr,
-                    domain_pao_thr, pair_energy_thr, multipole_order,
+                    domain_pao_thr, pair_energy_thr, pao_norm_thr,
+                    multipole_order, full_domain=full_domain,
                 )
             t0 = time.perf_counter()
             profile0 = resource_profile.start()
@@ -467,13 +570,24 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
         for ifrag, profile_repeat_index in my_fragment_work:
             fraglo_idx = frag_lolist_static[ifrag]
             frag_prescreen = prescreen_data['fragment_data'][ifrag]
+            response_topology = dlno_ccsd._fragment_response_topology(
+                prescreen_data, ifrag,
+            )
             weight = 1.0
 
             def per_frag_fn(mf_, lo_coeff_,
                             _ifrag=ifrag,
                             _fraglo=fraglo_idx,
                             _frag_prescreen=frag_prescreen,
+                            _response_topology=response_topology,
                             _weight=weight):
+                if _response_topology is None:
+                    current_prescreen = _frag_prescreen
+                else:
+                    current_prescreen = dlno_ccsd.rebuild_dlno_prescreen_data(
+                        mf_, lo_coeff_, _response_topology, frozen=frozen,
+                    )['fragment_data'][0]
+
                 cc_local = LNOCCSD(mf_, frozen=frozen)
                 cc_local.thresh_occ = thresh_occ
                 cc_local.thresh_vir = thresh_vir
@@ -490,13 +604,13 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                 cc_local.domain_sos_mp2_c_os = sos_c_os
                 
                 cc_local.use_dlno_prescreen = True
-                cc_local.dlno_prescreen_data = _frag_prescreen
+                cc_local.dlno_prescreen_data = current_prescreen
 
                 orbfragloc = lo_coeff_[:, _fraglo]
                 stub_eris = _make_stub_eris(mf_)
                 profile_local_eris = resource_profile.start()
                 eris_fpno = lno_base.make_fragment_eris(
-                    cc_local, stub_eris, _frag_prescreen,
+                    cc_local, stub_eris, current_prescreen,
                 )
                 resource_profile.finish(
                     'fragment.local_df_ao2mo',
@@ -514,7 +628,7 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                     cc_local, eris_fpno, orbfragloc, no_type,
                     lno_base.THRESH_INTERNAL,
                     (cc_local.thresh_occ, cc_local.thresh_vir),
-                    frag_prescreen=_frag_prescreen,
+                    frag_prescreen=current_prescreen,
                     frozen_mask=cc_local.get_frozen_mask(),
                     space_label=(
                         f'[rank {rank}] Fragment {_ifrag+1}/{nfrag}'
@@ -538,6 +652,9 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                         orbfrag
                     ),
                 )
+                _validate_fragment_mo_width(
+                    mf_, orbfrag, rank=rank, fragment=_ifrag + 1,
+                )
 
                 if orbfrag is None:
                     contribution = (
@@ -560,7 +677,7 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                 res = _impurity_solve_core(
                     mf_, orbfrag, orbfragloc,
                     eris_fpno.fock, eris_fpno.s1e,
-                    frozen=frzfrag, frag_prescreen=_frag_prescreen,
+                    frozen=frzfrag, frag_prescreen=current_prescreen,
                     verbose_imp=cc_local.verbose_imp,
                     ccsd_t=cc_local.ccsd_t,
                     dcsd=cc_local.dcsd,
@@ -659,7 +776,7 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                 repeat=profile_repeat_index,
             )
             del e_frag, vjp_fn, aux, g_mf_i, g_lo_i, per_frag_fn
-            del fraglo_idx, frag_prescreen
+            del fraglo_idx, frag_prescreen, response_topology
             _cleanup_after_fragment(
                 log if verbose >= _VERBOSE_PROGRESS else None,
                 label=f'rank {rank} fragment {ifrag+1}/{nfrag}',
@@ -756,14 +873,48 @@ class DLNOCCSD(lno_base_mpi_mod.LNO, _DLNOCCSDSingle):
                 profile0,
             )
 
-            t0 = time.perf_counter()
-            profile0 = resource_profile.start()
-            grad_mol, = scf_vjp(grad_mf_root)
-            log(f'  SCF (CPHF) vjp close-out:   {time.perf_counter() - t0:8.2f} s')
-            resource_profile.finish(
-                'mpi.root_scf_cphf_reverse_vjp',
-                profile0,
+            cache_mode = final_cderi_cache
+            cache_context = _final_cderi_cache_context(mf, cache_mode)
+            cache_started = time.perf_counter()
+            cache_profile = (
+                resource_profile.start() if cache_mode == 'memory' else None
             )
+            try:
+                with cache_context as final_cderi:
+                    if final_cderi is not None:
+                        cache_elapsed = time.perf_counter() - cache_started
+                        cache_mib = final_cderi.nbytes / 1024.0**2
+                        log(
+                            '  Final CDERI memory preload: '
+                            f'{cache_elapsed:8.2f} s, {cache_mib:.1f} MiB'
+                        )
+                        resource_profile.finish(
+                            'mpi.root_final_cderi_memory_cache_load',
+                            cache_profile,
+                            cderi_mib=cache_mib,
+                            cderi_shape=tuple(final_cderi.shape),
+                        )
+                        cache_profile = None
+
+                    t0 = time.perf_counter()
+                    profile0 = resource_profile.start()
+                    grad_mol, = scf_vjp(grad_mf_root)
+                    log(
+                        '  SCF (CPHF) vjp close-out:   '
+                        f'{time.perf_counter() - t0:8.2f} s'
+                    )
+                    resource_profile.finish(
+                        'mpi.root_scf_cphf_reverse_vjp',
+                        profile0,
+                    )
+            except Exception:
+                if cache_profile is not None:
+                    resource_profile.finish(
+                        'mpi.root_final_cderi_memory_cache_load_incomplete',
+                        cache_profile,
+                    )
+                raise
+            del final_cderi
         else:
             grad_mol = None
 

@@ -1098,7 +1098,7 @@ def cholesky_eri_vjp_from_cderi_source(mol, auxmol, cderi_source, cderi_bar,
                 continue
             nblocks += 1
 
-            cderi_blk = numpy.asarray(feri[:, p0:p1])
+            cderi_blk = numpy.asarray(feri[:, p0:p1], order='C')
             ints_bar = scipy.linalg.solve_triangular(
                 low.T, cderi_bar_blk, lower=False, check_finite=False
             )
@@ -1283,7 +1283,7 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
 
                 if detail is not None:
                     stage_timing_start = _detailed_timing_start()
-                cderi_blk = numpy.asarray(feri[:, p0:p1])
+                cderi_blk = numpy.asarray(feri[:, p0:p1], order='C')
                 if detail is not None:
                     elapsed = _detailed_timing_elapsed(stage_timing_start)
                     child_elapsed['cderi_read'] = elapsed

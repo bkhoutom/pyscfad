@@ -351,6 +351,34 @@ def _make_df_eris_incore(cc, mo_coeff=None, fockao=None):
     return eris
 
 
+def _pack_impurity_prescreen(frag_prescreen):
+    """Return the discrete impurity metadata as a hashable static payload."""
+    if frag_prescreen is None:
+        return None
+    fragment_index = int(frag_prescreen.get('fragment_index', -1))
+    atmlst = frag_prescreen.get('extended_primary_domain')
+    if atmlst is not None:
+        atmlst = tuple(
+            int(atom_index)
+            for atom_index in numpy.asarray(atmlst, dtype=numpy.int32).reshape(-1)
+        )
+    return fragment_index, atmlst
+
+
+def _unpack_impurity_prescreen(frag_payload):
+    """Restore only the metadata consumed by the numerical impurity body."""
+    if frag_payload is None:
+        return None
+    fragment_index, atmlst = frag_payload
+    return {
+        'fragment_index': fragment_index,
+        'extended_primary_domain': (
+            None if atmlst is None
+            else numpy.asarray(atmlst, dtype=numpy.int32)
+        ),
+    }
+
+
 def impurity_solve(mf, mo_coeff, lo_coeff, eris=None, frozen=None,
                    frag_prescreen=None,
                    verbose_imp=0, ccsd_t=False, dcsd=False,
@@ -386,8 +414,9 @@ def impurity_solve(mf, mo_coeff, lo_coeff, eris=None, frozen=None,
             the CCSD(T) energy is 0 unless ``ccsd_t`` is set to True.
     '''
     if _USE_CUSTOM_VJP_IMPURITY_SOLVE and _mf_supports_impurity_solve_wrap(mf):
+        frag_payload = _pack_impurity_prescreen(frag_prescreen)
         return _impurity_solve_jax(
-            mf, mo_coeff, lo_coeff, eris.fock, eris.s1e, frag_prescreen,
+            mf, mo_coeff, lo_coeff, eris.fock, eris.s1e, frag_payload,
             frozen, verbose_imp, ccsd_t, dcsd, profile_info, profile_pass,
             pt2_fragment_method, sos_c_os,
         )
@@ -416,21 +445,24 @@ def impurity_solve(mf, mo_coeff, lo_coeff, eris=None, frozen=None,
 # rebuilds its own eris from cc._scf); they are passed as plain arrays so
 # the unregistered ``_LNOERIS`` Python class never enters JAX tracing.
 #
-# nondiff_argnums (frozen, verbose_imp, ccsd_t, dcsd, profile_info,
-# profile_pass, pt2_fragment_method, sos_c_os) are passed through unchanged;
-# profile_info is intentionally
+# The packed fragment/domain metadata is discrete topology and is also a
+# nondifferentiable argument.  The remaining nondiff_argnums (frozen,
+# verbose_imp, ccsd_t, dcsd, profile_info, profile_pass,
+# pt2_fragment_method, sos_c_os) are passed through unchanged.  profile_info
+# is intentionally
 # set to None inside the bwd so the replay does not pollute the dict the
 # forward already filled in.
 # ---------------------------------------------------------------------------
 
-@partial(jax.custom_vjp, nondiff_argnums=(6, 7, 8, 9, 10, 11, 12, 13))
-def _impurity_solve_jax(mf, mo_coeff, lo_coeff, fock, s1e, frag_prescreen,
+@partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 8, 9, 10, 11, 12, 13))
+def _impurity_solve_jax(mf, mo_coeff, lo_coeff, fock, s1e, frag_payload,
                         frozen, verbose_imp, ccsd_t, dcsd,
                         profile_info, profile_pass,
                         pt2_fragment_method, sos_c_os):
     return _impurity_solve_core(
         mf, mo_coeff, lo_coeff, fock, s1e,
-        frozen=frozen, frag_prescreen=frag_prescreen,
+        frozen=frozen,
+        frag_prescreen=_unpack_impurity_prescreen(frag_payload),
         verbose_imp=verbose_imp, ccsd_t=ccsd_t, dcsd=dcsd,
         profile_info=profile_info, profile_pass=profile_pass,
         pt2_fragment_method=pt2_fragment_method,
@@ -438,38 +470,40 @@ def _impurity_solve_jax(mf, mo_coeff, lo_coeff, fock, s1e, frag_prescreen,
     )
 
 
-def _impurity_solve_jax_fwd(mf, mo_coeff, lo_coeff, fock, s1e, frag_prescreen,
+def _impurity_solve_jax_fwd(mf, mo_coeff, lo_coeff, fock, s1e, frag_payload,
                             frozen, verbose_imp, ccsd_t, dcsd,
                             profile_info, profile_pass,
                             pt2_fragment_method, sos_c_os):
     out = _impurity_solve_core(
         mf, mo_coeff, lo_coeff, fock, s1e,
-        frozen=frozen, frag_prescreen=frag_prescreen,
+        frozen=frozen,
+        frag_prescreen=_unpack_impurity_prescreen(frag_payload),
         verbose_imp=verbose_imp, ccsd_t=ccsd_t, dcsd=dcsd,
         profile_info=profile_info, profile_pass=profile_pass,
         pt2_fragment_method=pt2_fragment_method,
         sos_c_os=sos_c_os,
     )
-    res = (mf, mo_coeff, lo_coeff, fock, s1e, frag_prescreen)
+    res = (mf, mo_coeff, lo_coeff, fock, s1e)
     return out, res
 
 
-def _impurity_solve_jax_bwd(frozen, verbose_imp, ccsd_t, dcsd,
+def _impurity_solve_jax_bwd(frag_payload, frozen, verbose_imp, ccsd_t, dcsd,
                             profile_info, profile_pass,
                             pt2_fragment_method, sos_c_os, res, ybar):
-    mf, mo_coeff, lo_coeff, fock, s1e, frag_prescreen = res
+    mf, mo_coeff, lo_coeff, fock, s1e = res
+    frag_prescreen = _unpack_impurity_prescreen(frag_payload)
 
-    def fn(mf_, mo_coeff_, lo_coeff_, fock_, s1e_, frag_prescreen_):
+    def fn(mf_, mo_coeff_, lo_coeff_, fock_, s1e_):
         return _impurity_solve_core(
             mf_, mo_coeff_, lo_coeff_, fock_, s1e_,
-            frozen=frozen, frag_prescreen=frag_prescreen_,
+            frozen=frozen, frag_prescreen=frag_prescreen,
             verbose_imp=verbose_imp, ccsd_t=ccsd_t, dcsd=dcsd,
             profile_info=None, profile_pass=profile_pass,
             pt2_fragment_method=pt2_fragment_method,
             sos_c_os=sos_c_os,
         )
 
-    _, vjp_fn = jax.vjp(fn, mf, mo_coeff, lo_coeff, fock, s1e, frag_prescreen)
+    _, vjp_fn = jax.vjp(fn, mf, mo_coeff, lo_coeff, fock, s1e)
     return vjp_fn(ybar)
 
 
@@ -577,6 +611,9 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
     phase_start = time.perf_counter()
     profile_phase = resource_profile.start()
     t1, t2 = mcc.kernel(eris=imp_eris, t1=t1, t2=t2)[1:]
+    if not mcc.converged:
+        label = 'unknown' if frag_index is None else str(frag_index)
+        raise RuntimeError(f'Fragment {label} CCSD amplitudes did not converge')
     elcorr_cc = ccsd_fragment_energy(imp_eris, t1, t2, prjlo)
     phase_times['ccsd_s'] = time.perf_counter() - phase_start
     resource_profile.finish(

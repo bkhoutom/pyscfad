@@ -364,6 +364,8 @@ def _dfccsd_kernel_custom_bwd(res, cotangent):
         response_vector_mib=resource_profile.estimated_array_mib(lambda_vec),
         converged=lambda_converged,
     )
+    if not lambda_converged:
+        raise RuntimeError('CCSD response lambda equation did not converge')
     profile_lagrangian = resource_profile.start()
     eris_bar = lagrangian_grad(mycc, eris, t1, t2, bar_e_val, lambda_vec)
     resource_profile.finish(

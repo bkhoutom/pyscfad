@@ -465,6 +465,19 @@ def test_cholesky_eri_mo_deriv_vjp_matches_cderi_bar_path(
         int2c=mol._add_suffix('int2c2e'),
         aosym='s2ij',
     )
+    with addons.cderi_memory_cache(str(cderi_file)):
+        mol_cached, aux_cached = (
+            _cderi_vjp.cholesky_eri_vjp_from_cderi_block_fn(
+                mol,
+                auxmol,
+                str(cderi_file),
+                cderi_bar_block,
+                1024,
+                int3c=mol._add_suffix('int3c2e'),
+                int2c=mol._add_suffix('int2c2e'),
+                aosym='s2ij',
+            )
+        )
     mol_test, aux_test = _cderi_vjp.cholesky_eri_vjp_from_mo_coeff_ybar(
         mol,
         auxmol,
@@ -478,6 +491,18 @@ def test_cholesky_eri_mo_deriv_vjp_matches_cderi_bar_path(
         aosym='s2ij',
     )
 
+    assert numpy.allclose(
+        numpy.asarray(mol_cached.coords),
+        numpy.asarray(mol_ref.coords),
+        atol=1e-8,
+        rtol=1e-8,
+    )
+    assert numpy.allclose(
+        numpy.asarray(aux_cached.coords),
+        numpy.asarray(aux_ref.coords),
+        atol=1e-8,
+        rtol=1e-8,
+    )
     assert numpy.allclose(
         numpy.asarray(mol_test.coords),
         numpy.asarray(mol_ref.coords),

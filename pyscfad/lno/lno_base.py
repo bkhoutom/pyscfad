@@ -630,35 +630,110 @@ def _fragment_diagnostic_info(mfcc, eris, frag_prescreen, orbfragloc,
 
 
 def _dlno_outside_space(full_space, selected_space, thresh):
-    """Build the frozen complement used only to preserve fragment MO layout.
+    """Build a frozen, fixed-width complement inside the full space.
 
-    The complement can become numerically null when DLNO screening is very tight.
-    Its SVD backward pass is then ill-conditioned, even though the selected
-    prescreen space itself is well behaved. Treat this bookkeeping complement
-    as frozen metadata.
+    The number of outside orbitals is defined by the input dimensions. A
+    complete QR avoids applying a rank-revealing SVD to a highly degenerate
+    projector residual, whose LAPACK failure could silently drop the entire
+    complement.
     """
     thresh = max(float(thresh), 1e-8)
-    if full_space is None or full_space.shape[1] == 0:
+    if full_space is None:
         return np.zeros((0, 0))
-    if selected_space is None or selected_space.shape[1] == 0:
-        return stop_grad(orthonormalize_colspace(full_space, thresh=thresh))
-    if selected_space.shape[1] >= full_space.shape[1]:
-        return np.zeros((full_space.shape[0], 0), dtype=full_space.dtype)
 
-    residual = full_space - np.dot(
-        stop_grad(selected_space),
-        np.dot(stop_grad(selected_space.T.conj()), stop_grad(full_space)),
+    full_space = stop_grad(np.asarray(full_space))
+    if full_space.ndim != 2:
+        raise ValueError('full_space must be a rank-2 array.')
+    nrow, nfull = full_space.shape
+    if nfull == 0:
+        return np.zeros((nrow, 0), dtype=full_space.dtype)
+    if nfull > nrow:
+        raise ValueError('full_space cannot have more columns than rows.')
+
+    if selected_space is None:
+        selected_space = np.zeros((nrow, 0), dtype=full_space.dtype)
+    else:
+        selected_space = stop_grad(np.asarray(selected_space))
+        if selected_space.ndim != 2 or selected_space.shape[0] != nrow:
+            raise ValueError('selected_space has incompatible shape.')
+    nselected = selected_space.shape[1]
+    if nselected > nfull:
+        raise ValueError('selected_space is wider than full_space.')
+
+    q_full, r_full = np.linalg.qr(full_space, mode='reduced')
+    selected_coordinates = np.dot(q_full.T.conj(), selected_space)
+    if nselected:
+        q_selected, r_selected = np.linalg.qr(
+            selected_coordinates, mode='complete',
+        )
+        outside = np.dot(q_full, q_selected[:, nselected:])
+    else:
+        r_selected = np.zeros((nfull, 0), dtype=full_space.dtype)
+        outside = q_full
+    outside = stop_grad(outside)
+
+    expected_shape = (nrow, nfull - nselected)
+    if outside.shape != expected_shape:
+        raise RuntimeError(
+            f'Invalid DLNO outside-space shape {outside.shape}; '
+            f'expected {expected_shape}.'
+        )
+
+    # Production vjp calls leave these frozen values concrete. Keep the
+    # construction traceable, and skip only the host-side diagnostics in jit.
+    arrays = (
+        full_space, selected_space, q_full, r_full, r_selected, outside,
     )
-    return stop_grad(orthonormalize_colspace(residual, thresh=thresh))
+    if not any(isinstance(value, jax.core.Tracer) for value in arrays):
+        full_h, selected_h, q_full_h, r_full_h, r_selected_h, outside_h = (
+            numpy.asarray(jax.device_get(value)) for value in arrays
+        )
+        if not all(numpy.isfinite(value).all() for value in (
+            full_h, selected_h, q_full_h, r_full_h, r_selected_h, outside_h,
+        )):
+            raise FloatingPointError(
+                'Non-finite value in DLNO outside-space construction.'
+            )
+        if numpy.min(numpy.abs(numpy.diag(r_full_h))) <= thresh:
+            raise RuntimeError(
+                'DLNO full space is numerically rank deficient.'
+            )
+        if nselected:
+            coordinates_h = numpy.asarray(
+                jax.device_get(selected_coordinates)
+            )
+            containment = selected_h - q_full_h @ coordinates_h
+            tolerance = max(10.0 * thresh, 1e-10)
+            if numpy.linalg.norm(containment) > tolerance * max(
+                numpy.linalg.norm(selected_h), 1.0,
+            ):
+                raise RuntimeError(
+                    'DLNO selected space is not contained in the full space.'
+                )
+            if numpy.min(
+                numpy.abs(numpy.diag(r_selected_h))
+            ) <= thresh:
+                raise RuntimeError(
+                    'DLNO selected space is numerically rank deficient.'
+                )
+
+    return outside
 
 
 def _spans_full_molecule(mfcc, frag_prescreen):
     if frag_prescreen is None:
         return False
+    if not bool(frag_prescreen.get('full_domain', False)):
+        return False
     atmlst = frag_prescreen.get('extended_primary_domain')
     if atmlst is None:
         return False
-    return len(numpy.asarray(atmlst).ravel()) >= mfcc.mol.natm
+    atoms = numpy.asarray(atmlst, dtype=numpy.int32).ravel()
+    expected = numpy.arange(mfcc.mol.natm, dtype=numpy.int32)
+    return (
+        atoms.size == expected.size
+        and numpy.array_equal(numpy.unique(atoms), expected)
+    )
 
 
 def _subspace_equivalent(full_space, trial_space, thresh, overlap_tol=1e-6):
@@ -2031,10 +2106,9 @@ def _domain_mp2_fragment_energy(mfcc, eris, orbfragloc,
     )
 
 
-def _print_active_space_screening(space_label, frag_prescreen, nlo,
-                                  prescreen_nocc, prescreen_nvir,
-                                  screened_nocc, screened_nvir):
-    """Print the DLNO and PNO reductions known immediately before CCSD."""
+def _active_space_info(frag_prescreen, nlo, prescreen_nocc, prescreen_nvir,
+                       screened_nocc, screened_nvir):
+    """Return the machine-readable dimensions known before CCSD."""
     fragment = frag_prescreen or {}
     atoms = numpy.asarray(
         fragment.get('extended_primary_domain', ())
@@ -2042,11 +2116,46 @@ def _print_active_space_screening(space_label, frag_prescreen, nlo,
     domain_coeff = fragment.get('occ_prescreen_coeff')
     if domain_coeff is None:
         domain_coeff = fragment.get('vir_prescreen_coeff')
-    domain_aos = 0 if domain_coeff is None else domain_coeff.shape[0]
+    domain_aos = fragment.get(
+        'n_domain_aos',
+        0 if domain_coeff is None else domain_coeff.shape[0],
+    )
+    strong = numpy.asarray(fragment.get('strong_lmo_indices', ()))
+    fragment_index = fragment.get('fragment_index')
+    return {
+        'fragment_id': (
+            None if fragment_index is None else int(fragment_index) + 1
+        ),
+        'lo_indices': [
+            int(value) for value in
+            numpy.asarray(fragment.get('lo_indices', ())).ravel()
+        ],
+        'full_domain': bool(fragment.get('full_domain', False)),
+        'domain_mode': fragment.get('domain_mode', 'screened'),
+        'n_domain_atoms': int(atoms),
+        'n_domain_aos': int(domain_aos),
+        'n_strong_partners': int(numpy.unique(strong).size),
+        'n_fragment_los': int(nlo),
+        'n_occ_prescreen': int(prescreen_nocc),
+        'n_vir_prescreen': int(prescreen_nvir),
+        'n_occ_lno': int(screened_nocc),
+        'n_vir_lno': int(screened_nvir),
+    }
+
+
+def _print_active_space_screening(space_label, frag_prescreen, nlo,
+                                  prescreen_nocc, prescreen_nvir,
+                                  screened_nocc, screened_nvir):
+    """Print the DLNO and PNO reductions known immediately before CCSD."""
+    info = _active_space_info(
+        frag_prescreen, nlo, prescreen_nocc, prescreen_nvir,
+        screened_nocc, screened_nvir,
+    )
     print(
         f'  {space_label} active-space screening\n'
-        f'    Domain       : {atoms} atoms / {domain_aos} AOs; '
-        f'fragment LOs = {nlo}\n'
+        f'    Domain       : {info["n_domain_atoms"]} atoms / '
+        f'{info["n_domain_aos"]} AOs; fragment LOs = {nlo}; '
+        f'strong partners = {info["n_strong_partners"]}\n'
         f'    Prescreened  : {prescreen_nocc} occ / {prescreen_nvir} vir '
         f'({prescreen_nocc + prescreen_nvir} MOs)\n'
         f'    PNO-screened : {screened_nocc} occ / {screened_nvir} vir '
@@ -2057,7 +2166,7 @@ def _print_active_space_screening(space_label, frag_prescreen, nlo,
 
 def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external,
                frag_prescreen=None, frozen_mask=None, frag_target_nocc=None,
-               frag_target_nvir=None, space_label=None):
+               frag_target_nvir=None, space_label=None, space_info=None):
     mytimer = timer.Timer()
     use_checkpoint = (
         USE_CHECKPOINT
@@ -2402,6 +2511,12 @@ def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external
             )
             warnings.warn('No virtual orbital is included for this fragment, '
                           'setting correlation energy to zero.')
+            info = _active_space_info(
+                frag_prescreen, nlo, prescreen_nocc, prescreen_nvir, 0, 0,
+            )
+            if space_info is not None:
+                space_info.clear()
+                space_info.update(info)
             if space_label is not None:
                 _print_active_space_screening(
                     space_label, frag_prescreen, nlo,
@@ -2422,6 +2537,13 @@ def make_fpno1(mfcc, eris, orbfragloc, no_type, thresh_internal, thresh_external
             dmoo, dmvv
         ),
     )
+    info = _active_space_info(
+        frag_prescreen, nlo, prescreen_nocc, prescreen_nvir,
+        int(orbfragocc12.shape[-1]), int(orbfragvir12.shape[-1]),
+    )
+    if space_info is not None:
+        space_info.clear()
+        space_info.update(info)
     if space_label is not None:
         _print_active_space_screening(
             space_label, frag_prescreen, nlo,

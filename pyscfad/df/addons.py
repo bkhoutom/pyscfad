@@ -12,15 +12,70 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager
+import contextvars
+import os
+
+import h5py
+import numpy
 from pyscf.df import addons as pyscf_addons
 from pyscfad import numpy as np
 from pyscfad import lib
 from pyscfad import ao2mo
 from pyscfad.gto._mole_helper import setup_exp, setup_ctr_coeff
 
+
+_CDERI_MEMORY_CACHE = contextvars.ContextVar(
+    'pyscfad_cderi_memory_cache', default=None
+)
+
+
+def _cderi_cache_key(source, dataname):
+    if isinstance(source, (str, os.PathLike)):
+        filename = os.fspath(source)
+    else:
+        filename = getattr(source, 'name', None)
+    if not isinstance(filename, (str, bytes)):
+        return None
+    return os.path.realpath(os.fsdecode(filename)), dataname
+
+
+@contextmanager
+def cderi_memory_cache(source, dataname='j3c'):
+    """Load one file-backed CDERI dataset and reuse it within this context.
+
+    The cache is process-local and scoped to the context. Calls to
+    :class:`load` for the same file and dataset return the resident NumPy array;
+    all other sources retain their normal behavior.
+    """
+    key = _cderi_cache_key(source, dataname)
+    if key is None:
+        raise TypeError('CDERI memory caching requires a file-backed source.')
+
+    with h5py.File(key[0], 'r') as h5f:
+        dataset = h5f[dataname]
+        resident = numpy.empty(dataset.shape, dtype=dataset.dtype)
+        dataset.read_direct(resident)
+
+    token = _CDERI_MEMORY_CACHE.set((key, resident))
+    try:
+        yield resident
+    finally:
+        _CDERI_MEMORY_CACHE.reset(token)
+
+
 class load(ao2mo.load):
     def __init__(self, eri, dataname='j3c'):
         ao2mo.load.__init__(self, eri, dataname)
+
+    def __enter__(self):
+        cached = _CDERI_MEMORY_CACHE.get()
+        if cached is not None:
+            key, resident = cached
+            if _cderi_cache_key(self.eri, self.dataname) == key:
+                return resident
+        return super().__enter__()
+
 
 def make_auxmol(mol, auxbasis=None):
     auxmol = pyscf_addons.make_auxmol(mol, auxbasis=auxbasis)

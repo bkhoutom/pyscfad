@@ -226,6 +226,7 @@ class DLNOCCSD(LNOCCSD):
         dcsd=False,
         verbose_imp=0,
         static_selections=None,
+        progress=False,
     ):
         """Return total energy and nuclear gradient with progressive AD."""
         from .iao_ccsd import value_and_grad
@@ -249,4 +250,5 @@ class DLNOCCSD(LNOCCSD):
             dcsd=dcsd,
             verbose_imp=verbose_imp,
             static_selections=static_selections,
+            progress=progress,
         )

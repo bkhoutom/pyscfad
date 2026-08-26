@@ -494,8 +494,18 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
         ),
     )
 
-    log.info('    impsol:  %d LOs  %d/%d MOs  %d occ  %d vir',
-             nlo, nactocc+nactvir, nmo, nactocc, nactvir)
+    if frag_index is None:
+        log.info(
+            '    [DLNO-CC] solver active space: target LOs=%d; '
+            'active MOs=%d/%d (occ=%d, vir=%d)',
+            nlo, nactocc+nactvir, nmo, nactocc, nactvir,
+        )
+    else:
+        log.info(
+            '    [DLNO-CC] fragment %d solver active space: '
+            'target LOs=%d; active MOs=%d/%d (occ=%d, vir=%d)',
+            frag_index, nlo, nactocc+nactvir, nmo, nactocc, nactvir,
+        )
 
     # solve impurity problem
     if dcsd:

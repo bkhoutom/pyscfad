@@ -15,8 +15,11 @@ is no spin-opposite-scaled or domain-only correction switch.
 
 The fixed-rank LIS construction is exposed by :mod:`pyscfad.dlno.iao_lis`.
 The gauge-safe MPI implementation of the MP2 energy and gradient lives in
-:mod:`pyscfad.dlno.iao_mp2_mpi`.  Multi-rank CCSD(T) remains guarded until its
-gauge-bearing LIS frames can be streamed from rank zero.
+:mod:`pyscfad.dlno.iao_mp2_mpi`.  The Option A fragment-parallel CCSD(T)
+energy-and-gradient driver lives in :mod:`pyscfad.dlno.ccsd_mpi`.  Every rank
+closes an entire fragment LIS/CC pullback locally before reducing cotangents,
+so no gauge-dependent LIS frame is communicated.  Fragment-owning ranks must
+provide a real, accessible density-fitting CDERI source.
 
 The solver subclasses are not re-exported here because
 :mod:`pyscfad.lno.lno_base` imports :mod:`pyscfad.dlno.util` during its
@@ -25,6 +28,7 @@ classes from this package circular.  Import the classes from their
 submodules instead::
 
     from pyscfad.dlno.ccsd import DLNOCCSD
+    from pyscfad.dlno.ccsd_mpi import DLNOCCSD as MPIDLNOCCSD
     from pyscfad.dlno.iao_mp2 import IAOFragmentMP2
     from pyscfad.dlno.iao_mp2_mpi import IAOFragmentMP2 as MPIIAOFragmentMP2
 """

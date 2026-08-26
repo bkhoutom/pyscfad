@@ -24,6 +24,16 @@ from pyscfad import config_update
 from pyscfad.lno.ccsd import _impurity_solve_core
 from pyscfad.ops import stop_trace
 
+from ._output import (
+    emit_lines,
+    energy_summary_lines,
+    fragment_energy_lines,
+    lis_active_space_lines,
+    lis_dimensions_from_static,
+    local_correlation_settings_lines,
+    mp2_prescreened_domain_lines,
+    nuclear_force_lines,
+)
 from .iao_lis import (
     IAO_LIS_INTERNAL_RANK_THRESHOLD,
     IAOFragmentLISStaticSelections,
@@ -63,6 +73,20 @@ class IAODLNOCCSDResult:
     e_ccsd_t: object
     lis_occupied: tuple[int, ...]
     lis_virtual: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _FragmentValueAndGradResult:
+    """One complete LIS/CC fragment primal and local pullback."""
+
+    value: object
+    e_mp2_lis: object
+    e_ccsd: object
+    e_ccsd_t: object
+    lis_occupied: int
+    lis_virtual: int
+    mf_bar: object
+    common_bar: object
 
 
 def _add_cotangent(left, right):
@@ -190,6 +214,74 @@ def _fragment_domain_metadata(lis_static, fragment_index):
     }
 
 
+def _fragment_value_and_grad(
+    mf,
+    common,
+    static_selections,
+    fragment_index,
+    *,
+    verbose_imp,
+    ccsd_t,
+    dcsd,
+):
+    """Differentiate one entire fragment in its locally constructed LIS.
+
+    The LIS build, CCSD(T) solve, and matching MP2 subtraction are enclosed in
+    one VJP.  Consequently every LIS-frame cotangent is closed into the shared
+    ``(mf, common)`` coordinates before this helper returns.  This is also the
+    safe unit of work for MPI fragment parallelism: no gauge-dependent LIS
+    coefficient or cotangent needs to cross a rank boundary.
+    """
+    fragment_index = int(fragment_index)
+    metadata = _fragment_domain_metadata(static_selections, fragment_index)
+
+    def fragment_term(mf_, common_):
+        # Raw IAOs retain any internal valence-virtual component, while their
+        # occupied overlap produces precisely the additive W_F.
+        (e_mp2_lis, e_cc, e_t), lis = _solve_fragment(
+            mf_,
+            common_,
+            static_selections,
+            fragment_index,
+            metadata,
+            verbose_imp=verbose_imp,
+            ccsd_t=ccsd_t,
+            dcsd=dcsd,
+        )
+        value = e_cc + e_t - e_mp2_lis
+        auxiliary = (
+            e_mp2_lis,
+            e_cc,
+            e_t,
+            lis.active_occupied_coeff.shape[1],
+            lis.active_virtual_coeff.shape[1],
+        )
+        return value, auxiliary
+
+    fragment_value, fragment_pullback, auxiliary = jax.vjp(
+        fragment_term, mf, common, has_aux=True
+    )
+    fragment_mf_bar, fragment_common_bar = fragment_pullback(
+        jnp.ones((), dtype=jnp.asarray(fragment_value).dtype)
+    )
+    e_mp2_lis, e_cc, e_t, lis_occupied, lis_virtual = auxiliary
+    jax.block_until_ready(
+        (fragment_value, fragment_mf_bar, fragment_common_bar)
+    )
+    result = _FragmentValueAndGradResult(
+        value=fragment_value,
+        e_mp2_lis=e_mp2_lis,
+        e_ccsd=e_cc,
+        e_ccsd_t=e_t,
+        lis_occupied=int(lis_occupied),
+        lis_virtual=int(lis_virtual),
+        mf_bar=fragment_mf_bar,
+        common_bar=fragment_common_bar,
+    )
+    del fragment_pullback, fragment_term, auxiliary
+    return result
+
+
 def kernel(
     mf,
     *,
@@ -294,6 +386,7 @@ def value_and_grad(
     dcsd=False,
     verbose_imp=0,
     static_selections=None,
+    progress=False,
 ):
     """Return the IAO-DLNO-CCSD(T) total energy and molecular gradient.
 
@@ -306,6 +399,9 @@ def value_and_grad(
     immediately; their common-frame cotangents are accumulated and the common
     VJP is closed once.  The resulting mean-field cotangent is finally passed
     through one standard implicit SCF response.
+
+    Set ``progress=True`` to print flushed, structured summaries independently
+    of PySC verbosity, or pass a callable that receives each formatted line.
     """
     _validate_solver_options(ccsd_t=ccsd_t, dcsd=dcsd)
     if (
@@ -320,12 +416,23 @@ def value_and_grad(
         thresholds = IAOFragmentMP2Thresholds()
 
     verbose = int(getattr(mol, "verbose", 0))
-    log = (
-        (lambda message: print(message, flush=True))
-        if verbose >= 4 else (lambda message: None)
+    if not callable(progress) and not isinstance(progress, (bool, onp.bool_)):
+        raise TypeError("progress must be a bool or callable")
+    if callable(progress):
+        progress_sink = progress
+    elif bool(progress) or verbose >= 4:
+        progress_sink = lambda message: print(message, flush=True)
+    else:
+        progress_sink = None
+    reporter = (
+        None
+        if progress_sink is None
+        else lambda message: progress_sink(f"[IAO-CC] {message}")
     )
+    log = reporter if reporter is not None else (lambda message: None)
+    method_label = "DCSD" if dcsd else ("CCSD(T)" if ccsd_t else "CCSD")
     started = time.perf_counter()
-    log("IAO-DLNO-CCSD(T): start")
+    log(f"IAO-DLNO-{method_label}: start")
 
     # The local-orbital cotangent is nonstationary.  It must be closed with
     # the converged fixed-point response, never the experimental finite SCF
@@ -361,6 +468,30 @@ def value_and_grad(
     common, common_pullback = jax.vjp(
         lambda mf_: rebuild_iao_mp2_common(mf_, mp2_static), mf
     )
+    if reporter is not None:
+        emit_lines(
+            reporter,
+            local_correlation_settings_lines(
+                static_selections,
+                ccsd_t=ccsd_t,
+                dcsd=dcsd,
+                nproc=1,
+                pair_energy_model=pair_energy_model,
+                force_full_domains=force_full_domains,
+            ),
+        )
+        emit_lines(
+            reporter, mp2_prescreened_domain_lines(static_selections)
+        )
+        fixed_lis_occ, fixed_lis_vir = lis_dimensions_from_static(
+            static_selections
+        )
+        emit_lines(
+            reporter,
+            lis_active_space_lines(
+                static_selections, fixed_lis_occ, fixed_lis_vir
+            ),
+        )
 
     e_hf, hf_pullback = jax.vjp(lambda mf_: mf_.e_tot, mf)
     mf_bar, = hf_pullback(jnp.ones((), dtype=jnp.asarray(e_hf).dtype))
@@ -369,53 +500,47 @@ def value_and_grad(
     e_cc_terms = []
     e_t_terms = []
     e_mp2_lis_terms = []
+    fragment_records = []
     nfragment = len(static_selections.fragments)
     for fragment_index in range(nfragment):
-        metadata = _fragment_domain_metadata(
-            static_selections, fragment_index
+        fragment_started = (
+            time.perf_counter() if reporter is not None else None
         )
-
-        def fragment_term(mf_, common_, _index=fragment_index,
-                          _metadata=metadata):
-            # Raw IAOs retain any internal valence-virtual component, while
-            # their occupied overlap produces precisely the additive W_F.
-            (e_mp2_lis, e_cc, e_t), _ = _solve_fragment(
-                mf_,
-                common_,
-                static_selections,
-                _index,
-                _metadata,
-                verbose_imp=verbose_imp,
-                ccsd_t=ccsd_t,
-                dcsd=dcsd,
-            )
-            value = e_cc + e_t - e_mp2_lis
-            return value, (e_mp2_lis, e_cc, e_t)
-
-        fragment_value, fragment_pullback, aux = jax.vjp(
-            fragment_term, mf, common, has_aux=True
-        )
-        fragment_mf_bar, fragment_common_bar = fragment_pullback(
-            jnp.ones((), dtype=jnp.asarray(fragment_value).dtype)
+        fragment = _fragment_value_and_grad(
+            mf,
+            common,
+            static_selections,
+            fragment_index,
+            verbose_imp=verbose_imp,
+            ccsd_t=ccsd_t,
+            dcsd=dcsd,
         )
         mf_bar = jax.tree_util.tree_map(
-            _add_cotangent, mf_bar, fragment_mf_bar
+            _add_cotangent, mf_bar, fragment.mf_bar
         )
         common_bar = jax.tree_util.tree_map(
-            _add_cotangent, common_bar, fragment_common_bar
+            _add_cotangent, common_bar, fragment.common_bar
         )
-        e_mp2_lis, e_cc, e_t = aux
-        e_mp2_lis_terms.append(e_mp2_lis)
-        e_cc_terms.append(e_cc)
-        e_t_terms.append(e_t)
-        jax.block_until_ready((fragment_value, mf_bar, common_bar))
-        log(
-            f"  fragment {fragment_index + 1}/{nfragment}: "
-            f"MP2(LIS)={float(e_mp2_lis):+.10f}, "
-            f"CC={float(e_cc):+.10f}, (T)={float(e_t):+.10f}"
-        )
-        del fragment_pullback, fragment_mf_bar, fragment_common_bar
-        del fragment_term, fragment_value, aux
+        e_mp2_lis_terms.append(fragment.e_mp2_lis)
+        e_cc_terms.append(fragment.e_ccsd)
+        e_t_terms.append(fragment.e_ccsd_t)
+        jax.block_until_ready((mf_bar, common_bar))
+        if reporter is not None:
+            fragment_wall = time.perf_counter() - fragment_started
+            fragment_records.append({
+                "fragment_index": fragment_index,
+                "worker_rank": None,
+                "e_mp2_lis": float(fragment.e_mp2_lis),
+                "e_ccsd": float(fragment.e_ccsd),
+                "e_ccsd_t": float(fragment.e_ccsd_t),
+                "wall_seconds": fragment_wall,
+            })
+            log(
+                f"fragment {fragment_index + 1}/{nfragment} complete: "
+                f"solver LIS occ/vir={fragment.lis_occupied}/"
+                f"{fragment.lis_virtual}; wall={fragment_wall:.1f} s"
+            )
+        del fragment
         gc.collect()
 
     e_iao_mp2, mp2_mf_bar, mp2_common_bar = (
@@ -445,11 +570,38 @@ def value_and_grad(
     energy = e_hf + correlation
     jax.block_until_ready((energy, mol_bar))
     log(
-        "  full IAO-DLNO-MP2 (strong+weak): "
-        f"{float(e_iao_mp2):+.10f}"
-    )
-    log(
-        f"IAO-DLNO-CCSD(T): done in {time.perf_counter() - started:.2f} s, "
+        f"IAO-DLNO-{method_label}: done in "
+        f"{time.perf_counter() - started:.2f} s, "
         f"E={float(energy):.12f}"
     )
+    if reporter is not None:
+        emit_lines(
+            reporter,
+            fragment_energy_lines(
+                fragment_records,
+                correlated_method="DCSD" if dcsd else "CCSD",
+                include_triples=ccsd_t,
+            ),
+        )
+        e_mp2_lis_total = jnp.sum(jnp.stack(e_mp2_lis_terms))
+        e_ccsd_total = jnp.sum(jnp.stack(e_cc_terms))
+        e_ccsd_t_total = jnp.sum(jnp.stack(e_t_terms))
+        emit_lines(
+            reporter,
+            energy_summary_lines(
+                e_hf=e_hf,
+                e_iao_mp2=e_iao_mp2,
+                e_mp2_lis=e_mp2_lis_total,
+                e_ccsd=e_ccsd_total,
+                e_ccsd_t=e_ccsd_t_total,
+                e_corr=correlation,
+                e_total=energy,
+                correlated_method="DCSD" if dcsd else "CCSD",
+                include_triples=ccsd_t,
+            ),
+        )
+        emit_lines(
+            reporter,
+            nuclear_force_lines(mol, onp.asarray(mol_bar.coords)),
+        )
     return energy, mol_bar

@@ -575,7 +575,7 @@ def correlation_value_and_grad(
                     if _array_tree_digest(rebuilt) != expected_digest:
                         raise RuntimeError(
                             "rank-0 strong-domain gauge changed while "
-                            f"replaying fragment {left}"
+                            f"replaying fragment {int(left) + 1}"
                         )
                     term_common_bar, = pullback(frame_bar)
                 else:
@@ -600,7 +600,8 @@ def correlation_value_and_grad(
                     ):
                         raise RuntimeError(
                             "rank-0 weak-screen gauge changed while "
-                            f"replaying pair ({left}, {right})"
+                            f"replaying pair ({int(left) + 1}, "
+                            f"{int(right) + 1})"
                         )
                     left_common_bar, = left_pullback(frame_bar[0])
                     right_common_bar, = right_pullback(frame_bar[1])
@@ -658,12 +659,15 @@ def correlation_value_and_grad(
                             fragment.strong_virtual.metric_keep
                         ).size
                         label = (
-                            f"strong ED fragment {left} "
+                            f"strong ED fragment {int(left) + 1} "
                             f"[atoms={n_atoms}, AO={n_ao}, "
                             f"occ={n_occ}, vir={n_vir}]"
                         )
                     else:
-                        label = f"weak pair ({left},{right})"
+                        label = (
+                            f"weak pair ({int(left) + 1},"
+                            f"{int(right) + 1})"
+                        )
                     _report_progress(
                         reporter,
                         f"term {term_number}/{len(work)} {label} "

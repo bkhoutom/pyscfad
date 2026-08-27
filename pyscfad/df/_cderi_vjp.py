@@ -390,6 +390,15 @@ def _tree_add(x, y):
     return tree_map(lambda a, b: a + b, x, y)
 
 
+def _zero_strict_upper_inplace(matrix):
+    """Zero a square matrix's strict upper triangle without index arrays."""
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError('matrix must be square')
+    for row in range(matrix.shape[0] - 1):
+        matrix[row, row + 1:] = 0
+    return matrix
+
+
 def nr_e2_vjp_from_cderi_source(cderi_source, mo_coeff, ybar,
                                 orbs_slice, aosym='s2', mosym='s1'):
     """Return CDERI and MO-coefficient cotangents using stored CDERI."""
@@ -499,7 +508,14 @@ def _record_ao_projection_layout(selected, original_kc, original_lc,
 
 
 def _int3c_mo_vjp_block_mb():
-    return _INT3C_MO_VJP_BLOCK_MB
+    """Memory target for direct MO-basis three-center derivative work."""
+    value = os.environ.get('PYSCFAD_DF_INT3C_MO_VJP_BLOCK_MB')
+    if value is None:
+        return _INT3C_MO_VJP_BLOCK_MB
+    try:
+        return max(float(value), 1.0)
+    except ValueError:
+        return _INT3C_MO_VJP_BLOCK_MB
 
 
 def _use_native_cderi_bar_project(ybar, mok_rows, mol_cols):
@@ -1039,6 +1055,7 @@ def cholesky_eri_vjp_from_cderi_source(mol, auxmol, cderi_source, cderi_bar,
         raise NotImplementedError(
             'Linear-dependent auxiliary metric fallback is not implemented.'
         )
+    del j2c, j2c_np
     _profile_msg(
         'cholesky_eri_vjp_from_cderi_source metric setup done '
         f'{time.perf_counter() - t:.2f} s'
@@ -1097,13 +1114,16 @@ def cholesky_eri_vjp_from_cderi_source(mol, auxmol, cderi_source, cderi_bar,
 
     if p1 != nao_pair:
         raise RuntimeError('CDERI VJP shell ranges did not cover all AO pairs.')
+    del cderi_bar, low
 
     def metric_cholesky(auxmol_):
         return jax_scipy.linalg.cholesky(auxmol_.intor(int2c, hermi=1), lower=True)
 
     t = time.perf_counter()
     _, chol_pullback = jax.vjp(metric_cholesky, auxmol)
-    aux_metric_bar = chol_pullback(np.asarray(numpy.tril(low_bar)))[0]
+    _zero_strict_upper_inplace(low_bar)
+    aux_metric_bar = chol_pullback(np.asarray(low_bar))[0]
+    del chol_pullback, low_bar
     auxmol_bar = _tree_add(auxmol_bar, aux_metric_bar)
     _profile_msg(
         'cholesky_eri_vjp_from_cderi_source metric cholesky pullback done '
@@ -1175,6 +1195,7 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
         naux=naoaux,
         metric_mib=resource_profile.estimated_array_mib(j2c_np, low),
     )
+    del j2c, j2c_np
 
     max_words = max(max_memory, 0) * 1e6 / 8 - low.size
     mem_buflen = max(int(max_words / max(naoaux, 1) / 3), 8)
@@ -1362,6 +1383,7 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
 
     if p1 != nao_pair:
         raise RuntimeError('CDERI VJP shell ranges did not cover all AO pairs.')
+    del low
 
     def metric_cholesky(auxmol_):
         return jax_scipy.linalg.cholesky(auxmol_.intor(int2c, hermi=1), lower=True)
@@ -1379,7 +1401,9 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
             _detailed_timing_elapsed(metric_vjp_timing_start),
         )
         metric_pullback_timing_start = _detailed_timing_start()
-    aux_metric_bar = chol_pullback(np.asarray(numpy.tril(low_bar)))[0]
+    _zero_strict_upper_inplace(low_bar)
+    aux_metric_bar = chol_pullback(np.asarray(low_bar))[0]
+    del chol_pullback, low_bar
     auxmol_bar = _tree_add(auxmol_bar, aux_metric_bar)
     if detail is not None:
         _record_detailed_timing(
@@ -1459,19 +1483,24 @@ def _stream_nr_e2_from_cderi_source(cderi_source, mo_coeff, orbs_slice,
     return out
 
 
-def _int3c_ip1_mo_density_contraction(ints, mo_k, mo_l, z_blk):
-    """Contract AO-centre int3c derivatives through one symmetrized MO density.
+def _int3c_ip1_mo_density_contractions(ints, mo_k, mo_l, z_blk):
+    """Contract one ``int3c_ip1`` block for both coordinate centres.
 
     For each auxiliary function, form
 
     ``D[p,u,v] = sum(k,l) mo_k[u,k] * z[p,k,l] * mo_l[v,l]``.
 
-    The two AO-centre terms in the three-centre integral derivative then use
-    ``D + D.T``.  Building ``D`` in the order whose AO-square GEMM carries the
-    smaller of ``k`` and ``l`` avoids separately transforming the derivative
-    integrals through both orbital spaces.  In the local-MP2 path the virtual
-    dimension is typically an order of magnitude larger than the occupied
-    dimension, so this contraction order is material.
+    The two AO-centre terms use ``D + D.T``.  Translational invariance of each
+    three-centre Coulomb integral gives
+
+    ``d/dR_aux = -(d/dR_AO1 + d/dR_AO2)``.
+
+    Retaining the auxiliary index until the last reduction therefore yields
+    both the AO-centre and auxiliary-centre contractions from ``int3c_ip1``.
+    This avoids a separate ``int3c_ip2`` integral build and AO-to-MO
+    transformation.  Building ``D`` in the order whose AO-square GEMM carries
+    the smaller of ``k`` and ``l`` remains important for local MP2, where the
+    virtual dimension is normally much larger than the occupied dimension.
 
     No conjugation is introduced here: this is algebraically identical to the
     two contractions it replaces and therefore preserves their real/complex
@@ -1491,12 +1520,20 @@ def _int3c_ip1_mo_density_contraction(ints, mo_k, mo_l, z_blk):
     tmp = None
 
     density = density + density.swapaxes(1, 2)
-    return numpy.einsum('puv,xuvp->ux', density, ints)
+    per_aux_ao = numpy.einsum('puv,xuvp->pux', density, ints)
+    return per_aux_ao.sum(axis=0), per_aux_ao.sum(axis=1)
+
+
+def _int3c_ip1_mo_density_contraction(ints, mo_k, mo_l, z_blk):
+    """Compatibility wrapper returning only the AO-centre contraction."""
+    return _int3c_ip1_mo_density_contractions(
+        ints, mo_k, mo_l, z_blk
+    )[0]
 
 
 def _int3c_mo_deriv_coords_vjp(mol, auxmol, mo_coeff, z,
                                orbs_slice, int3c='int3c2e',
-                               aosym='s2ij'):
+                               aosym='s2ij', block_memory_mb=None):
     if aosym not in ('s2', 's2ij'):
         raise NotImplementedError(f'Only packed s2 CDERI is supported, got {aosym}.')
     if mo_coeff.shape[0] != mol.nao:
@@ -1508,34 +1545,32 @@ def _int3c_mo_deriv_coords_vjp(mol, auxmol, mo_coeff, z,
     naux = auxmol.nao
     nbas = mol.nbas
     nauxbas = auxmol.nbas
-    npair = nao * (nao + 1) // 2
     k0, k1, l0, l1 = orbs_slice
     kc = k1 - k0
     lc = l1 - l0
-    kl_count = kc * lc
     mo_k = numpy.asarray(mo_coeff[:, k0:k1], order='F')
     mo_l = numpy.asarray(mo_coeff[:, l0:l1], order='F')
     z = numpy.asarray(z).reshape(naux, kc, lc)
-    z_flat = z.reshape(naux, kl_count)
 
-    target_words = _int3c_mo_vjp_block_mb() * 1024.0**2 / 8
+    if block_memory_mb is None:
+        block_memory_mb = _int3c_mo_vjp_block_mb()
+    else:
+        block_memory_mb = max(float(block_memory_mb), 1.0)
+    target_words = block_memory_mb * 1024.0**2 / 8
     words_per_aux = (
         # AO-centre phase: the three derivative components plus the density
         # and its symmetrized replacement can briefly coexist during D+D.T.
+        # The much smaller per-auxiliary AO contraction is retained only long
+        # enough to reduce its AO and auxiliary centre indices.
         5 * nao * nao
         + nao * max(min(kc, lc), 1)
-        # Auxiliary-centre phase: packed derivative integrals and their
-        # occupied-virtual transform.  The phases do not coexist, but summing
-        # their estimates leaves headroom for integral/BLAS workspaces.
-        + 3 * npair
-        + 3 * kl_count
+        + 3 * nao
     )
     blksize = max(1, min(naux, int(target_words // max(words_per_aux, 1))))
     aux_loc = auxmol.ao_loc
     aux_ranges = balance_partition(aux_loc, blksize)
 
     int3c_ip1 = int3c.replace('int3c2e', 'int3c2e_ip1')
-    int3c_ip2 = int3c.replace('int3c2e', 'int3c2e_ip2')
     mol_ao_bar = numpy.zeros((nao, 3), dtype=z.dtype)
     aux_ao_bar = numpy.zeros((naux, 3), dtype=z.dtype)
 
@@ -1552,28 +1587,16 @@ def _int3c_mo_deriv_coords_vjp(mol, auxmol, mo_coeff, z,
             shls_slice=shls_slice,
         )
         ints = numpy.asarray(ints)
-        mol_ao_bar -= _int3c_ip1_mo_density_contraction(
+        mol_contraction, aux_contraction = \
+            _int3c_ip1_mo_density_contractions(
             ints, mo_k, mo_l, z_blk
         )
+        mol_ao_bar -= mol_contraction
+        # The libcint ``ip1`` convention carries the same leading minus sign
+        # as the former explicit ``ip2`` path.  Translational invariance then
+        # reverses the sign of the auxiliary-centre contribution.
+        aux_ao_bar[p0:p1] += aux_contraction
         ints = None
-
-        # Auxiliary-center derivative.  The derivative three-center rows are
-        # batched as 3*naux_block ordinary packed AO rows, transformed by the
-        # same nr_e2 C kernel as the forward AO2MO, then dotted with Z.
-        ints = _int3c_cross_opt.int3c_cross(
-            mol, auxmol, intor=int3c_ip2, comp=3, aosym='s2ij',
-            shls_slice=shls_slice,
-        )
-        ints = numpy.ascontiguousarray(
-            numpy.asarray(ints).transpose(0, 2, 1).reshape(3 * (p1 - p0), npair)
-        )
-        ints_mo = pyscf_ao2mo.nr_e2(
-            ints, mo_coeff, orbs_slice, aosym='s2', mosym='s1'
-        ).reshape(3, p1 - p0, kl_count)
-        aux_ao_bar[p0:p1] -= numpy.einsum(
-            'pm,xpm->px', z_flat[p0:p1], ints_mo
-        )
-        ints = ints_mo = None
 
     mol_bar = _coords_tree_like(mol, _ao_to_atom_coords_bar(mol, mol_ao_bar))
     auxmol_bar = _coords_tree_like(
@@ -1640,6 +1663,7 @@ def cholesky_eri_vjp_from_mo_coeff_ybar(mol, auxmol, cderi_source,
     z = scipy.linalg.solve_triangular(
         low.T, ybar, lower=False, check_finite=False
     )
+    del j2c, j2c_np, low, ybar
     _profile_msg(
         'cholesky_eri_vjp_from_mo_coeff_ybar metric/z setup done '
         f'{time.perf_counter() - t:.2f} s'
@@ -1650,6 +1674,7 @@ def cholesky_eri_vjp_from_mo_coeff_ybar(mol, auxmol, cderi_source,
         cderi_source, mo_coeff, orbs_slice, max_memory, aosym='s2'
     )
     low_bar = -numpy.dot(z, y.T)
+    del y
     _profile_msg(
         'cholesky_eri_vjp_from_mo_coeff_ybar stream y/low_bar done '
         f'{time.perf_counter() - t:.2f} s'
@@ -1659,6 +1684,7 @@ def cholesky_eri_vjp_from_mo_coeff_ybar(mol, auxmol, cderi_source,
     mol_bar, auxmol_bar = _int3c_mo_deriv_coords_vjp(
         mol, auxmol, mo_coeff, z, orbs_slice, int3c=int3c, aosym=aosym
     )
+    del z
     _profile_msg(
         'cholesky_eri_vjp_from_mo_coeff_ybar int3c_mo_deriv done '
         f'{time.perf_counter() - t:.2f} s'
@@ -1669,7 +1695,9 @@ def cholesky_eri_vjp_from_mo_coeff_ybar(mol, auxmol, cderi_source,
 
     t = time.perf_counter()
     _, chol_pullback = jax.vjp(metric_cholesky, auxmol)
-    aux_metric_bar = chol_pullback(np.asarray(numpy.tril(low_bar)))[0]
+    _zero_strict_upper_inplace(low_bar)
+    aux_metric_bar = chol_pullback(np.asarray(low_bar))[0]
+    del chol_pullback, low_bar
     auxmol_bar = _tree_add(auxmol_bar, aux_metric_bar)
     _profile_msg(
         'cholesky_eri_vjp_from_mo_coeff_ybar metric cholesky pullback done '

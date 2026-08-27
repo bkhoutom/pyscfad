@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import jax
 import numpy
+import pytest
 
 from pyscfad import df, gto
 from pyscfad import numpy as np
@@ -96,6 +97,44 @@ def test_integral_direct_local_lov_preserves_coeff_and_coordinate_vjps():
         atol=1e-9,
         rtol=1e-9,
     )
+
+
+@pytest.mark.parametrize(
+    ("configured_mb", "expected_mb"),
+    ((None, 256.0), (7.0, 7.0)),
+)
+def test_integral_direct_coordinate_vjp_uses_forward_block_budget(
+    monkeypatch, configured_mb, expected_mb
+):
+    mol = _water_mol()
+    atmlst = numpy.asarray([0, 1], dtype=numpy.int32)
+    coeff = _local_coeff(mol, atmlst)
+    if configured_mb is None:
+        monkeypatch.delenv(
+            "PYSCFAD_LNO_LOCAL_DIRECT_INT3C_BLOCK_MB", raising=False
+        )
+    else:
+        monkeypatch.setenv(
+            "PYSCFAD_LNO_LOCAL_DIRECT_INT3C_BLOCK_MB",
+            str(configured_mb),
+        )
+
+    real_vjp = lno_base._cderi_vjp._int3c_mo_deriv_coords_vjp
+    seen = []
+
+    def checked_vjp(*args, **kwargs):
+        seen.append(kwargs.get("block_memory_mb"))
+        return real_vjp(*args, **kwargs)
+
+    monkeypatch.setattr(
+        lno_base._cderi_vjp,
+        "_int3c_mo_deriv_coords_vjp",
+        checked_vjp,
+    )
+    jax.value_and_grad(
+        lambda mol_: _lov_norm(mol_, coeff, atmlst, True)
+    )(mol)
+    assert seen == [expected_mb]
 
 
 def test_integral_direct_local_lov_general_cotangent_matches_coordinate_fd():

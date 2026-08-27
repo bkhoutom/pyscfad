@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import itertools
 import tempfile
 import numpy
 from pyscf import __config__
@@ -24,6 +25,7 @@ from pyscfad.ops import is_array
 from pyscfad.df import addons, incore, df_jk
 
 _OUTCORE_CDERI_PLACEHOLDER_SHAPE = (0, 0)
+_FAST_EXCHANGE_CACHE_TOKENS = itertools.count()
 
 @util.pytree_node(['mol', 'auxmol', '_cderi'], num_args=1)
 class DF(pyscf_df.DF):
@@ -33,6 +35,11 @@ class DF(pyscf_df.DF):
     def __init__(self, mol, auxbasis=None, incore=True, **kwargs):
         pyscf_df.DF.__init__(self, mol, auxbasis=auxbasis)
         self.incore = incore
+        # Unlike Python identity, this token survives JAX pytree
+        # flatten/unflatten.  It lets custom-VJP residual DF objects find the
+        # orbital data cached by their originating SCF calculation without
+        # aliasing a second DF object that happens to share the same CDERI.
+        self._fast_exchange_cache_token = next(_FAST_EXCHANGE_CACHE_TOKENS)
         self.__dict__.update(kwargs)
 
     def _has_outcore_cderi_placeholder(self):

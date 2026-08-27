@@ -85,7 +85,7 @@ def _mo_from_fock_eq78_jvp(primals, tangents):
     return (mo_energy_ref, mo_coeff_ref), (deps, dcoeff)
 
 
-def _stash_dfjk_mo_data(mf, mo_coeff, mo_occ):
+def _stash_dfjk_mo_data(mf, mo_coeff, mo_occ, s1e):
     with_df = getattr(mf, 'with_df', None)
     if with_df is None:
         return
@@ -94,6 +94,7 @@ def _stash_dfjk_mo_data(mf, mo_coeff, mo_occ):
         with_df,
         ops.to_numpy(mo_coeff),
         ops.to_numpy(mo_occ),
+        ops.to_numpy(s1e),
     )
 
 
@@ -102,7 +103,7 @@ def _scf_fixed_point(dm, mf, s1e, h1e):
     fock = mf.get_fock(h1e, s1e, vhf, dm)
     mo_energy, mo_coeff = mf.eig(fock, s1e)
     mo_occ = mf.get_occ(mo_energy, mo_coeff)
-    _stash_dfjk_mo_data(mf, mo_coeff, mo_occ)
+    _stash_dfjk_mo_data(mf, mo_coeff, mo_occ, s1e)
     dm = mf.make_rdm1(mo_coeff, mo_occ)
     del mo_energy, mo_occ
     return dm
@@ -123,7 +124,7 @@ def _scf(dm, mf, s1e, h1e, *,
         fock = mf.get_fock(h1e, s1e, vhf, dm, cycle, diis, fock_last=fock_last)
         mo_energy, mo_coeff = mf.eig(fock, s1e)
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
-        _stash_dfjk_mo_data(mf, mo_coeff, mo_occ)
+        _stash_dfjk_mo_data(mf, mo_coeff, mo_occ, s1e)
         dm = mf.make_rdm1(mo_coeff, mo_occ)
         vhf = mf.get_veff(mol, dm, dm_last, vhf, s1e=s1e)
         e_tot = mf.energy_tot(dm, h1e, vhf)
@@ -189,7 +190,7 @@ def _kernel_explicit_trace(mf, conv_tol=1e-10, conv_tol_grad=None,
         fock = mf.get_fock(h1e, s1e, vhf, dm)
         mo_energy, mo_coeff = mf.eig(fock, s1e)
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
-        _stash_dfjk_mo_data(mf, mo_coeff, mo_occ)
+        _stash_dfjk_mo_data(mf, mo_coeff, mo_occ, s1e)
         mo_energy = getattr(mo_energy, 'mo_energy', mo_energy)
         return False, e_tot, mo_energy, mo_coeff, mo_occ
 
@@ -221,7 +222,7 @@ def _kernel_explicit_trace(mf, conv_tol=1e-10, conv_tol_grad=None,
         fock = mf.get_fock(h1e, s1e, vhf, dm)
         mo_energy, mo_coeff = mf.eig(fock, s1e)
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
-        _stash_dfjk_mo_data(mf, mo_coeff, mo_occ)
+        _stash_dfjk_mo_data(mf, mo_coeff, mo_occ, s1e)
         dm, dm_last = mf.make_rdm1(mo_coeff, mo_occ), dm
         vhf = mf.get_veff(mol, dm, dm_last, vhf, s1e=s1e)
         e_tot = mf.energy_tot(dm, h1e, vhf)
@@ -502,7 +503,7 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         fock = mf.get_fock(h1e, s1e, vhf, dm)
         mo_energy, mo_coeff = mf.eig(fock, s1e)
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
-        _stash_dfjk_mo_data(mf, mo_coeff, mo_occ)
+        _stash_dfjk_mo_data(mf, mo_coeff, mo_occ, s1e)
         # hack for ROHF
         mo_energy = getattr(mo_energy, 'mo_energy', mo_energy)
         return scf_conv, e_tot, mo_energy, mo_coeff, mo_occ
@@ -568,7 +569,7 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         fock = mf.get_fock(h1e, s1e, vhf, dm)
         mo_energy, mo_coeff = mf.eig(fock, s1e)
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
-        _stash_dfjk_mo_data(mf, mo_coeff, mo_occ)
+        _stash_dfjk_mo_data(mf, mo_coeff, mo_occ, s1e)
         dm, dm_last = mf.make_rdm1(mo_coeff, mo_occ), dm
         vhf = mf.get_veff(mol, dm, dm_last, vhf, s1e=s1e)
         e_tot, last_hf_e = mf.energy_tot(dm, h1e, vhf), e_tot

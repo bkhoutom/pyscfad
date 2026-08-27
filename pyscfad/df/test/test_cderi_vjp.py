@@ -11,6 +11,34 @@ from pyscfad.ao2mo import _ao2mo
 from pyscfad.df import _cderi_vjp, addons, incore
 
 
+def test_zero_strict_upper_inplace_preserves_lower_triangle():
+    matrix = numpy.arange(25.0).reshape(5, 5)
+    lower = numpy.tril(matrix)
+    result = _cderi_vjp._zero_strict_upper_inplace(matrix)
+    assert result is matrix
+    numpy.testing.assert_array_equal(result, lower)
+
+
+def test_int3c_mo_vjp_block_mb_environment_priority(monkeypatch):
+    monkeypatch.delenv('PYSCFAD_DF_INT3C_MO_VJP_BLOCK_MB', raising=False)
+    assert (
+        _cderi_vjp._int3c_mo_vjp_block_mb()
+        == _cderi_vjp._INT3C_MO_VJP_BLOCK_MB
+    )
+
+    monkeypatch.setenv('PYSCFAD_DF_INT3C_MO_VJP_BLOCK_MB', '32')
+    assert _cderi_vjp._int3c_mo_vjp_block_mb() == 32.0
+
+    monkeypatch.setenv('PYSCFAD_DF_INT3C_MO_VJP_BLOCK_MB', '0.25')
+    assert _cderi_vjp._int3c_mo_vjp_block_mb() == 1.0
+
+    monkeypatch.setenv('PYSCFAD_DF_INT3C_MO_VJP_BLOCK_MB', 'invalid')
+    assert (
+        _cderi_vjp._int3c_mo_vjp_block_mb()
+        == _cderi_vjp._INT3C_MO_VJP_BLOCK_MB
+    )
+
+
 @pytest.mark.parametrize(('kc', 'lc'), ((2, 7), (7, 2), (4, 4)))
 @pytest.mark.parametrize('complex_data', (False, True))
 def test_int3c_ip1_mo_density_contraction_matches_einstein_reference(
@@ -44,11 +72,39 @@ def test_int3c_ip1_mo_density_contraction_matches_einstein_reference(
         ints,
         optimize=True,
     )
+    auxiliary_reference = numpy.einsum(
+        'pkl,uk,vl,xuvp->px',
+        z_blk,
+        mo_k,
+        mo_l,
+        ints,
+        optimize=True,
+    )
+    auxiliary_reference += numpy.einsum(
+        'pkl,vk,ul,xuvp->px',
+        z_blk,
+        mo_k,
+        mo_l,
+        ints,
+        optimize=True,
+    )
 
-    result = _cderi_vjp._int3c_ip1_mo_density_contraction(
+    result, auxiliary_result = \
+        _cderi_vjp._int3c_ip1_mo_density_contractions(
         ints, mo_k, mo_l, z_blk
     )
     numpy.testing.assert_allclose(result, reference, atol=2e-11, rtol=2e-11)
+    numpy.testing.assert_allclose(
+        auxiliary_result, auxiliary_reference, atol=2e-11, rtol=2e-11
+    )
+    numpy.testing.assert_allclose(
+        _cderi_vjp._int3c_ip1_mo_density_contraction(
+            ints, mo_k, mo_l, z_blk
+        ),
+        reference,
+        atol=2e-11,
+        rtol=2e-11,
+    )
 
 
 def test_nr_e2_cderi_bar_packed_blocks_match_full_vjp():

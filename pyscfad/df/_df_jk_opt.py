@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import OrderedDict
 from functools import partial
 import ctypes
 import tempfile
@@ -32,7 +33,7 @@ from pyscfad.df import _cderi_vjp
 from pyscfad._src.implicit_diff import is_implicit_diff_solve_matvec
 
 libao2mo = lib.load_library('libao2mo')
-_FAST_EXCHANGE_DM_DATA = {}
+_FAST_EXCHANGE_DM_DATA = OrderedDict()
 _DF_VK_DM_VJP = getattr(libvhf, 'df_vk_dm_vjp', None)
 if _DF_VK_DM_VJP is not None:
     _DF_VK_DM_VJP.argtypes = [
@@ -89,27 +90,273 @@ def _get_jk_gen_jax(dfobj, dm, hermi=1, with_j=True, with_k=True,
 
 
 def _fast_exchange_key(dfobj):
+    token = getattr(dfobj, '_fast_exchange_cache_token', None)
+    if token is not None:
+        return ('dfobj_token', token)
     cderi = getattr(dfobj, '_cderi', None)
     if cderi is not None:
         return ('cderi', id(cderi), tuple(cderi.shape))
     return ('dfobj', id(dfobj))
 
 
-def set_fast_exchange_dm_data(dfobj, mo_coeff, mo_occ):
-    _FAST_EXCHANGE_DM_DATA[_fast_exchange_key(dfobj)] = (mo_coeff, mo_occ)
+def _fast_exchange_cache_limit():
+    """Maximum number of eager SCF orbital frames retained process-wide."""
+    try:
+        return max(int(os.environ.get(
+            'PYSCFAD_SCF_FAST_EXCHANGE_CACHE_SIZE', '8'
+        )), 1)
+    except ValueError:
+        return 8
+
+
+def _fast_exchange_cache_get(dfobj):
+    key = _fast_exchange_key(dfobj)
+    data = _FAST_EXCHANGE_DM_DATA.get(key)
+    if data is not None:
+        _FAST_EXCHANGE_DM_DATA.move_to_end(key)
+    return data
+
+
+def set_fast_exchange_dm_data(dfobj, mo_coeff, mo_occ, s1e=None):
+    """Cache converged-orbital data used by the fast DF exchange paths."""
+    # This cache is an eager execution optimization.  Never retain tracers in
+    # process-global state during an explicitly traced SCF replay.
+    if _has_tracer(mo_coeff, mo_occ, s1e):
+        return
+    mo_coeff = numpy.asarray(mo_coeff)
+    mo_occ = numpy.asarray(mo_occ)
+    data = {
+        'mo_coeff': mo_coeff,
+        'mo_occ': mo_occ,
+        'dm_ref': None,
+        'occ_coeff': None,
+        'overlap_occ_coeff': None,
+    }
+    if (
+        s1e is not None
+        and mo_coeff.ndim == 2
+        and mo_occ.ndim == 1
+        and mo_coeff.shape[1] == mo_occ.size
+    ):
+        occupied = mo_occ > 0
+        if numpy.any(occupied) and numpy.any(~occupied):
+            occ_coeff = numpy.asarray(mo_coeff[:, occupied], order='F')
+            occupied_weights = numpy.asarray(mo_occ[occupied])
+            data['dm_ref'] = numpy.asarray(
+                (occ_coeff * occupied_weights) @ occ_coeff.conj().T
+            )
+            overlap_occ_coeff = numpy.asarray(
+                numpy.asarray(s1e) @ occ_coeff, order='F'
+            )
+            data['occ_coeff'] = occ_coeff
+            data['overlap_occ_coeff'] = overlap_occ_coeff
+    key = _fast_exchange_key(dfobj)
+    _FAST_EXCHANGE_DM_DATA.pop(key, None)
+    _FAST_EXCHANGE_DM_DATA[key] = data
+    while len(_FAST_EXCHANGE_DM_DATA) > _fast_exchange_cache_limit():
+        _FAST_EXCHANGE_DM_DATA.popitem(last=False)
 
 
 def _tag_dm_for_fast_exchange(dfobj, dm):
     if getattr(dm, 'mo_coeff', None) is not None:
         return dm
 
-    tagged = _FAST_EXCHANGE_DM_DATA.get(_fast_exchange_key(dfobj))
+    tagged = _fast_exchange_cache_get(dfobj)
     if tagged is None:
         return dm
-    mo_coeff, mo_occ = tagged
+    mo_coeff = tagged['mo_coeff']
+    mo_occ = tagged['mo_occ']
+    dm_ref = tagged.get('dm_ref')
 
     dm = numpy.asarray(dm)
+    if (
+        dm_ref is None
+        or dm.shape != dm_ref.shape
+        or not numpy.allclose(dm, dm_ref, atol=1e-10, rtol=1e-9)
+    ):
+        return dm
     return lib.tag_array(dm, mo_coeff=mo_coeff, mo_occ=mo_occ)
+
+
+def _implicit_lowrank_df_k_enabled():
+    value = os.environ.get('PYSCFAD_SCF_IMPLICIT_LOWRANK_DF_K', '1')
+    return value.strip().lower() not in ('0', 'false', 'no', 'off')
+
+
+def _implicit_lowrank_df_k_tolerance():
+    try:
+        return max(float(os.environ.get(
+            'PYSCFAD_SCF_IMPLICIT_LOWRANK_DF_K_TOL', '1e-8'
+        )), 0.0)
+    except ValueError:
+        return 1e-8
+
+
+def _implicit_lowrank_exchange_factors(dfobj, vj_bar, vk_bar, hermi,
+                                       with_j, with_k):
+    """Recover ``vk_bar = R Co.T + Co R.T`` for an RHF response matvec.
+
+    The fixed-point map returns an occupied projector.  Its Fock cotangent
+    therefore has only occupied--virtual blocks, even though generic AD has
+    materialized it as a dense AO matrix.  Recovering the thin factor here
+    lets the DF exchange transpose use forward-like occupied scaling without
+    changing the AO-density Krylov variable or any post-solve orbital VJP.
+    """
+    if not (
+        _implicit_lowrank_df_k_enabled()
+        and hermi == 1
+        and with_j
+        and with_k
+    ):
+        return None
+
+    data = _fast_exchange_cache_get(dfobj)
+    if data is None:
+        _profile_msg(
+            'implicit low-rank DF-K fallback: occupied-orbital cache miss '
+            f'key={_fast_exchange_key(dfobj)!r}'
+        )
+        return None
+    occ_coeff = data.get('occ_coeff')
+    overlap_occ_coeff = data.get('overlap_occ_coeff')
+    mo_occ = data.get('mo_occ')
+    if occ_coeff is None or overlap_occ_coeff is None:
+        _profile_msg(
+            'implicit low-rank DF-K fallback: occupied factors unavailable'
+        )
+        return None
+    if (
+        mo_occ.ndim != 1
+        or numpy.count_nonzero(mo_occ > 0) != occ_coeff.shape[1]
+        or not numpy.allclose(mo_occ[mo_occ > 0], 2.0)
+        or not numpy.allclose(mo_occ[mo_occ <= 0], 0.0)
+    ):
+        _profile_msg(
+            'implicit low-rank DF-K fallback: occupations are not closed-shell'
+        )
+        return None
+
+    vj_bar = numpy.asarray(vj_bar)
+    vk_bar = numpy.asarray(vk_bar)
+    if vj_bar.shape[0] != 1 or vk_bar.shape[0] != 1:
+        _profile_msg(
+            'implicit low-rank DF-K fallback: batched density cotangent'
+        )
+        return None
+    if (
+        vj_bar.ndim != 3
+        or vk_bar.ndim != 3
+        or vj_bar.shape != vk_bar.shape
+        or vj_bar.shape[1] != vj_bar.shape[2]
+        or occ_coeff.ndim != 2
+        or overlap_occ_coeff.shape != occ_coeff.shape
+        or occ_coeff.shape[0] != vk_bar.shape[-1]
+    ):
+        _profile_msg(
+            'implicit low-rank DF-K fallback: incompatible factor shapes'
+        )
+        return None
+    if any(numpy.iscomplexobj(array) for array in (
+            occ_coeff, overlap_occ_coeff, vj_bar, vk_bar)):
+        _profile_msg(
+            'implicit low-rank DF-K fallback: complex factors'
+        )
+        return None
+    if not all(numpy.all(numpy.isfinite(array)) for array in (
+            occ_coeff, overlap_occ_coeff, vj_bar, vk_bar)):
+        _profile_msg(
+            'implicit low-rank DF-K fallback: non-finite factors'
+        )
+        return None
+
+    # In RHF get_veff = J - K/2.  This relation makes the route specific to
+    # the SCF fixed-point response rather than to arbitrary implicit solves
+    # that happen to contain a DF get_jk call.
+    scale = max(float(numpy.linalg.norm(vk_bar[0])), 1.0)
+    relation_error = float(
+        numpy.linalg.norm(vk_bar[0] + 0.5 * vj_bar[0]) / scale
+    )
+    tol = _implicit_lowrank_df_k_tolerance()
+    if relation_error > tol:
+        _profile_msg(
+            'implicit low-rank DF-K fallback: J/K cotangent relation '
+            f'error={relation_error:.3e}'
+        )
+        return None
+
+    symmetry_error = max(
+        float(numpy.linalg.norm(vj_bar[0] - vj_bar[0].T) / scale),
+        float(numpy.linalg.norm(vk_bar[0] - vk_bar[0].T) / scale),
+    )
+    if symmetry_error > tol:
+        _profile_msg(
+            'implicit low-rank DF-K fallback: cotangent symmetry error='
+            f'{symmetry_error:.3e}'
+        )
+        return None
+
+    vk_symmetric = 0.5 * (vk_bar[0] + vk_bar[0].T)
+    response_coeff = vk_symmetric @ overlap_occ_coeff
+    occupied_block = overlap_occ_coeff.T @ response_coeff
+    response_coeff = numpy.asarray(
+        response_coeff - 0.5 * occ_coeff @ occupied_block, order='F'
+    )
+    reconstructed = (
+        response_coeff @ occ_coeff.T
+        + occ_coeff @ response_coeff.T
+    )
+    residual = float(
+        numpy.linalg.norm(vk_symmetric - reconstructed) / scale
+    )
+    if residual > tol:
+        _profile_msg(
+            'implicit low-rank DF-K fallback: occupied--virtual residual='
+            f'{residual:.3e}'
+        )
+        return None
+
+    _profile_msg(
+        'implicit low-rank DF-K factors '
+        f'rank={occ_coeff.shape[1]} residual={residual:.3e}'
+    )
+    return occ_coeff, response_coeff
+
+
+def _df_vk_dm_vjp_lowrank(dm_bar, eri1, occ_coeff, response_coeff,
+                          buf_occ, buf_response):
+    """Apply the DF exchange transpose from thin occupied/response factors."""
+    naux, _ = eri1.shape
+    nao, nocc = occ_coeff.shape
+    fmmm = libao2mo.AO2MOmmm_bra_nr_s2
+    fdrv = libao2mo.AO2MOnr_e2_drv
+    ftrans = libao2mo.AO2MOtranse2_nr_s2
+    null = lib.c_null_ptr()
+    rargs = (
+        ctypes.c_int(nao),
+        (ctypes.c_int * 4)(0, nocc, 0, nao),
+        null,
+        ctypes.c_int(0),
+    )
+
+    occ_block = buf_occ[:naux * nocc]
+    response_block = buf_response[:naux * nocc]
+    fdrv(
+        ftrans, fmmm,
+        occ_block.ctypes.data_as(ctypes.c_void_p),
+        eri1.ctypes.data_as(ctypes.c_void_p),
+        occ_coeff.ctypes.data_as(ctypes.c_void_p),
+        ctypes.c_int(naux), *rargs,
+    )
+    fdrv(
+        ftrans, fmmm,
+        response_block.ctypes.data_as(ctypes.c_void_p),
+        eri1.ctypes.data_as(ctypes.c_void_p),
+        response_coeff.ctypes.data_as(ctypes.c_void_p),
+        ctypes.c_int(naux), *rargs,
+    )
+    cross = lib.dot(occ_block.T, response_block)
+    dm_bar += cross
+    dm_bar += cross.T
 
 
 def _cderi_mol_aux_vjp(dfobj, eri_bar):
@@ -265,8 +512,14 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
     )
     dms_bar = [numpy.zeros((nao,nao), order='F'),] * nset
 
-    vk_bar = numpy.asarray(vk_bar).reshape(-1,nao,nao)
-    vk_bar = [numpy.asarray(x, order='F') for x in vk_bar]
+    vk_bar_array = numpy.asarray(vk_bar).reshape(-1,nao,nao)
+    lowrank_factors = None
+    if solution_only:
+        lowrank_factors = _implicit_lowrank_exchange_factors(
+            dfobj, vj_bar, vk_bar_array, hermi, with_j, with_k
+        )
+    use_lowrank_exchange = lowrank_factors is not None
+    vk_bar = [numpy.asarray(x, order='F') for x in vk_bar_array]
     dms = [numpy.asarray(x, order='F') for x in dms]
 
     rargs = (ctypes.c_int(nao), (ctypes.c_int*4)(0, nao, 0, nao),
@@ -278,11 +531,22 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
     # block-local fallback for an extension module built before
     # ``df_vk_dm_vjp`` was added; it still avoids the global HDF5 cotangent
     # and all nuclear/metric work.
-    need_full_vk_vjp = not solution_only or _DF_VK_DM_VJP is None
+    need_full_vk_vjp = (
+        not solution_only
+        or (not use_lowrank_exchange and _DF_VK_DM_VJP is None)
+    )
     buf = (
         numpy.empty((blksize,nao,nao))
         if need_full_vk_vjp else None
     )
+    if use_lowrank_exchange:
+        occ_coeff, response_coeff = lowrank_factors
+        response_rank = occ_coeff.shape[1]
+        lowrank_buf_occ = numpy.empty((blksize * response_rank, nao))
+        lowrank_buf_response = numpy.empty_like(lowrank_buf_occ)
+    else:
+        occ_coeff = response_coeff = None
+        lowrank_buf_occ = lowrank_buf_response = None
     stream_eri_bar = (
         not solution_only
         and dfobj.auxmol is not None
@@ -326,7 +590,10 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
                 # disk or propagated to the DF object.
                 eri_bar_blk = (
                     numpy.zeros((naux, nao_pair), dtype=eri1.dtype)
-                    if _DF_VK_DM_VJP is None else None
+                    if (
+                        not use_lowrank_exchange
+                        and _DF_VK_DM_VJP is None
+                    ) else None
                 )
             elif stream_eri_bar:
                 eri_bar_blk = numpy.zeros((naux, nao_pair), dtype=eri1.dtype)
@@ -343,6 +610,12 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
                     eri_bar_blk += rho_bar.T @ dmtril
 
             for k in range(nset):
+                if use_lowrank_exchange:
+                    _df_vk_dm_vjp_lowrank(
+                        dms_bar[k], eri1, occ_coeff, response_coeff,
+                        lowrank_buf_occ, lowrank_buf_response,
+                    )
+                    continue
                 if solution_only and _DF_VK_DM_VJP is not None:
                     _DF_VK_DM_VJP(
                         dms_bar[k].ctypes.data_as(ctypes.c_void_p),

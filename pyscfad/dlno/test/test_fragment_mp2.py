@@ -86,6 +86,206 @@ def test_jax_blocked_lov_energy_and_directional_derivative():
     )
 
 
+def test_jax_blocked_lov_pullback_retains_one_shared_lov():
+    """The remat tape must not retain one Lov slice per block pair."""
+
+    rng = np.random.default_rng(121)
+    naux, nocc, nvir = 7, 3, 7
+    lov = jnp.asarray(rng.normal(size=(naux, nocc, nvir)))
+    e_occ = jnp.asarray(-np.linspace(1.3, 0.7, nocc))
+    e_vir = jnp.asarray(np.linspace(0.2, 1.1, nvir))
+    target_factor = jnp.asarray(rng.normal(size=(2, nocc)))
+    partner_factor = rng.normal(size=(4, nocc))
+    partner_weight = jnp.asarray(partner_factor.T @ partner_factor)
+
+    def energy(*args):
+        return fragment_pair_energy_from_lov_jax(
+            *args, block_nvir=2
+        ).total
+
+    _, pullback = jax.vjp(
+        energy, lov, e_occ, e_vir, target_factor, partner_weight
+    )
+
+    # JAX exposes the arrays captured by a VJP in these two residual
+    # collections.  This is intentionally a memory-regression assertion: the
+    # former implementation contained two distinct (naux,nocc,block) buffers
+    # for every upper-triangular virtual-block pair.
+    residuals = []
+    for name in ("args_res", "opaque_residuals"):
+        residuals.extend(
+            value
+            for value in getattr(pullback, name, ())
+            if hasattr(value, "shape")
+        )
+    lov_residuals = [
+        value for value in residuals
+        if tuple(value.shape[:2]) == (naux, nocc) and value.ndim == 3
+    ]
+    assert [tuple(value.shape) for value in lov_residuals] == [lov.shape]
+
+    pullback(jnp.ones(()))
+
+
+def test_jax_blocked_lov_reverse_uses_scan_without_full_shape_pads():
+    rng = np.random.default_rng(122)
+    naux, nocc, nvir = 7, 3, 7
+    arguments = tuple(map(jnp.asarray, (
+        rng.normal(size=(naux, nocc, nvir)),
+        -np.linspace(1.3, 0.7, nocc),
+        np.linspace(0.2, 1.1, nvir),
+        rng.normal(size=(2, nocc)),
+        np.eye(nocc),
+    )))
+
+    def energy(*args):
+        return fragment_pair_energy_from_lov_jax(
+            *args, block_nvir=2
+        ).total
+
+    closed_jaxpr = jax.make_jaxpr(
+        jax.grad(energy, argnums=(0, 1, 2, 3, 4))
+    )(*arguments)
+    primitives = []
+    scatter_shapes = []
+    visited = set()
+
+    def visit(value):
+        if hasattr(value, "jaxpr") and not hasattr(value, "eqns"):
+            value = value.jaxpr
+        if hasattr(value, "eqns"):
+            if id(value) in visited:
+                return
+            visited.add(id(value))
+            for equation in value.eqns:
+                primitives.append(equation.primitive.name)
+                if equation.primitive.name == "scatter-add":
+                    scatter_shapes.extend(
+                        tuple(variable.aval.shape)
+                        for variable in equation.outvars
+                        if hasattr(variable.aval, "shape")
+                    )
+                visit(equation.params)
+        elif isinstance(value, dict):
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, (tuple, list)):
+            for item in value:
+                visit(item)
+
+    visit(closed_jaxpr)
+    assert primitives.count("scan") >= 2
+    assert "pad" not in primitives
+    assert scatter_shapes.count(arguments[0].shape) == 1
+
+
+@pytest.mark.parametrize(
+    "component", ("total", "opposite_spin", "same_spin")
+)
+def test_jax_blocked_lov_all_component_cotangents(component):
+    rng = np.random.default_rng(123)
+    naux, nocc, nvir = 6, 3, 5
+    partner_factor = rng.normal(size=(4, nocc))
+    host_arguments = (
+        rng.normal(scale=0.12, size=(naux, nocc, nvir)),
+        -np.linspace(1.3, 0.7, nocc),
+        np.linspace(0.2, 1.1, nvir),
+        rng.normal(scale=0.4, size=(2, nocc)),
+        partner_factor.T @ partner_factor,
+    )
+    directions = [rng.normal(size=value.shape) for value in host_arguments]
+    directions[-1] = 0.5 * (directions[-1] + directions[-1].T)
+    arguments = tuple(map(jnp.asarray, host_arguments))
+
+    def energy(block_nvir, *args):
+        result = fragment_pair_energy_from_lov_jax(
+            *args, block_nvir=block_nvir
+        )
+        return getattr(result, component)
+
+    value, gradients = jax.value_and_grad(
+        lambda *args: energy(2, *args), argnums=(0, 1, 2, 3, 4)
+    )(*arguments)
+    single_value, single_gradients = jax.value_and_grad(
+        lambda *args: energy(nvir, *args), argnums=(0, 1, 2, 3, 4)
+    )(*arguments)
+    target_weight = host_arguments[3].T @ host_arguments[3]
+    reference = fragment_pair_energy_from_lov(
+        host_arguments[0],
+        host_arguments[1],
+        host_arguments[2],
+        target_weight,
+        host_arguments[4],
+        target_factor=host_arguments[3],
+        block_nvir=2,
+    )
+    np.testing.assert_allclose(
+        value, getattr(reference, component), atol=2e-12
+    )
+    np.testing.assert_allclose(value, single_value, atol=2e-12)
+    for gradient, single_gradient in zip(gradients, single_gradients):
+        np.testing.assert_allclose(
+            gradient, single_gradient, rtol=2e-11, atol=2e-12
+        )
+
+    step = 2e-5
+    for index, (gradient, direction) in enumerate(zip(
+        gradients, directions
+    )):
+        plus = list(arguments)
+        minus = list(arguments)
+        plus[index] = jnp.asarray(host_arguments[index] + step * direction)
+        minus[index] = jnp.asarray(host_arguments[index] - step * direction)
+        finite_difference = float(
+            (energy(2, *plus) - energy(2, *minus)) / (2.0 * step)
+        )
+        analytic = float(np.vdot(np.asarray(gradient), direction).real)
+        np.testing.assert_allclose(
+            analytic, finite_difference, rtol=4e-7, atol=4e-9
+        )
+
+
+def test_jax_blocked_lov_analytic_vjp_matches_ad(monkeypatch):
+    """The handwritten block adjoint must reproduce every generic-AD bar."""
+    rng = np.random.default_rng(124)
+    naux, nocc, nvir = 8, 4, 7
+    arguments = tuple(map(jnp.asarray, (
+        rng.normal(scale=0.12, size=(naux, nocc, nvir)),
+        -np.linspace(1.4, 0.6, nocc),
+        np.linspace(0.15, 1.1, nvir),
+        rng.normal(scale=0.4, size=(3, nocc)),
+        # Deliberately nonsymmetric: the VJP must not silently symmetrize a
+        # general partner-weight cotangent.
+        rng.normal(scale=0.3, size=(nocc, nocc)),
+    )))
+    component_weights = (0.7, -0.2, 1.3)
+
+    def objective(*args):
+        result = fragment_pair_energy_from_lov_jax(
+            *args, block_nvir=3
+        )
+        return (
+            component_weights[0] * result.total
+            + component_weights[1] * result.opposite_spin
+            + component_weights[2] * result.same_spin
+        )
+
+    monkeypatch.setenv("PYSCFAD_DLNO_MP2_ANALYTIC_VJP", "0")
+    ad_value, ad_bars = jax.value_and_grad(
+        objective, argnums=(0, 1, 2, 3, 4)
+    )(*arguments)
+    monkeypatch.setenv("PYSCFAD_DLNO_MP2_ANALYTIC_VJP", "1")
+    analytic_value, analytic_bars = jax.value_and_grad(
+        objective, argnums=(0, 1, 2, 3, 4)
+    )(*arguments)
+
+    np.testing.assert_allclose(analytic_value, ad_value, atol=2e-12)
+    for analytic, reference in zip(analytic_bars, ad_bars):
+        np.testing.assert_allclose(
+            analytic, reference, rtol=3e-11, atol=3e-12
+        )
+
+
 def _iao_fragment_problem(seed=11):
     """Return a synthetic nonorthogonal-AO IAO/occupied partition."""
 

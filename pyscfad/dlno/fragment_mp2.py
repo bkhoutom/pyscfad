@@ -15,6 +15,8 @@ identities once the domain construction has been settled.
 """
 
 from dataclasses import dataclass
+from functools import partial
+import os
 
 import jax
 import jax.numpy as jnp
@@ -681,7 +683,7 @@ def fragment_pair_energy_from_lov(
     )
 
 
-def fragment_pair_energy_from_lov_jax(
+def _fragment_pair_energy_from_lov_jax_ad(
     lov,
     e_occ,
     e_vir,
@@ -699,10 +701,12 @@ def fragment_pair_energy_from_lov_jax(
     :math:`W_F=X_F^\dagger X_F`; ``partner_weight`` is the occupied weight of
     the fixed strong-partner set.  Both are differentiated.
 
-    Virtual indices are processed in upper-triangular blocks.  Each block is
-    wrapped in :func:`jax.checkpoint`, so reverse mode recomputes the local
-    rank-four intermediates instead of retaining every block from the forward
-    pass.  The full :math:`ovov` tensor is never formed.
+    Virtual indices are processed by a fixed-shape upper-triangular
+    :func:`jax.lax.scan`.  Its body is wrapped in :func:`jax.checkpoint`, so
+    reverse mode recomputes one local rank-four block and scatter-accumulates
+    its cotangent before advancing to the next block.  Only the shared full
+    inputs are retained; neither a full :math:`ovov` tensor nor one physical
+    ``Lov`` slice per block pair is stored.
     """
     lov = jnp.asarray(lov)
     e_occ = jnp.asarray(e_occ)
@@ -737,12 +741,18 @@ def fragment_pair_energy_from_lov_jax(
     exchange = jnp.zeros((), dtype=lov.dtype)
 
     def _block_energy(lov_a, lov_b, eia_a, eia_b, x_target, w_partner,
-                      include_transpose):
+                      include_transpose, valid_a, valid_b):
         integrals_ab = jnp.einsum(
             "Lia,Ljb->iajb", lov_a, lov_b, optimize=True
         )
         denominator = (
             eia_a[:, None, :, None] + eia_b[None, :, None, :]
+        )
+        denominator = jnp.where(
+            valid_a[None, None, :, None]
+            & valid_b[None, None, None, :],
+            denominator,
+            jnp.ones((), dtype=denominator.dtype),
         )
         amplitudes_ab = (
             integrals_ab.transpose(0, 2, 1, 3) / denominator
@@ -773,7 +783,7 @@ def fragment_pair_energy_from_lov_jax(
             optimize=True,
         )
 
-        if include_transpose:
+        def _transpose_energy(_):
             amplitudes_ba = amplitudes_ab.transpose(1, 0, 3, 2)
             weighted_ba = jnp.einsum(
                 "xp,prab->xrab", x_target.conj(), amplitudes_ba,
@@ -783,46 +793,443 @@ def fragment_pair_energy_from_lov_jax(
                 "xrab,rs->xsab", weighted_ba, w_partner,
                 optimize=True,
             )
-            block_direct = block_direct + jnp.einsum(
+            transpose_direct = jnp.einsum(
                 "xsab,xsab->", weighted_ba, direct_integrals_ba,
                 optimize=True,
             )
-            block_exchange = block_exchange + jnp.einsum(
+            transpose_exchange = jnp.einsum(
                 "xsab,xsba->", weighted_ba, direct_integrals_ab,
                 optimize=True,
             )
+            return transpose_direct, transpose_exchange
+
+        transpose_direct, transpose_exchange = jax.lax.cond(
+            include_transpose,
+            _transpose_energy,
+            lambda _: (
+                jnp.zeros((), dtype=block_direct.dtype),
+                jnp.zeros((), dtype=block_exchange.dtype),
+            ),
+            operand=None,
+        )
+        block_direct = block_direct + transpose_direct
+        block_exchange = block_exchange + transpose_exchange
         return block_direct, block_exchange
 
-    # The transpose flag is a Python/static value for each block.  Capturing
-    # it in a small closure avoids treating it as a differentiable argument.
-    for a0 in range(0, nvir, block_nvir):
-        a1 = min(a0 + block_nvir, nvir)
-        for b0 in range(a0, nvir, block_nvir):
-            b1 = min(b0 + block_nvir, nvir)
-            include_transpose = b0 != a0
+    if nvir:
+        nblock = (nvir + block_nvir - 1) // block_nvir
+        block_pairs = jnp.asarray(
+            [
+                (left_block, right_block)
+                for left_block in range(nblock)
+                for right_block in range(left_block, nblock)
+            ],
+            dtype=jnp.int32,
+        )
+        block_offsets = jnp.arange(block_nvir, dtype=jnp.int32)
 
-            def checkpointed_block(
-                lov_a, lov_b, eia_a, eia_b, x_target, w_partner,
-                _include_transpose=include_transpose,
-            ):
-                return _block_energy(
-                    lov_a, lov_b, eia_a, eia_b, x_target, w_partner,
-                    _include_transpose,
-                )
+        def _gather_virtual_block(array, block, axis):
+            """Gather one padded fixed-size block without padding ``array``."""
+            indices = block * block_nvir + block_offsets
+            valid = indices < nvir
+            safe_indices = jnp.minimum(indices, nvir - 1)
+            gathered = jnp.take(array, safe_indices, axis=axis)
+            mask_shape = [1] * gathered.ndim
+            mask_shape[axis] = block_nvir
+            return jnp.where(valid.reshape(mask_shape), gathered, 0), valid
 
-            block_direct, block_exchange = jax.checkpoint(
-                checkpointed_block
-            )(
-                lov[:, :, a0:a1],
-                lov[:, :, b0:b1],
-                eia[:, a0:a1],
-                eia[:, b0:b1],
+        def _scan_block(carry, pair):
+            left_block, right_block = pair
+            lov_left, valid_left = _gather_virtual_block(
+                lov, left_block, 2
+            )
+            lov_right, valid_right = _gather_virtual_block(
+                lov, right_block, 2
+            )
+            eia_left, _ = _gather_virtual_block(eia, left_block, 1)
+            eia_right, _ = _gather_virtual_block(eia, right_block, 1)
+            block_direct, block_exchange = _block_energy(
+                lov_left,
+                lov_right,
+                eia_left,
+                eia_right,
                 target_factor,
                 partner_weight,
+                left_block != right_block,
+                valid_left,
+                valid_right,
             )
-            direct = direct + block_direct
-            exchange = exchange + block_exchange
+            return (
+                carry[0] + block_direct,
+                carry[1] + block_exchange,
+            ), None
 
+        # ``scan`` threads one shared Lov/eia cotangent through the reverse
+        # loop.  Rematerializing its body recomputes just one fixed-shape pair
+        # at a time.  In contrast, an unrolled loop of checkpoints on sliced
+        # inputs retains O(nblock) copies of Lov and transposes each slice into
+        # a full-shape pad/add cotangent before it can be accumulated.
+        (direct, exchange), _ = jax.lax.scan(
+            jax.checkpoint(_scan_block),
+            (direct, exchange),
+            block_pairs,
+        )
+
+    opposite_spin = direct.real
+    same_spin = (direct - exchange).real
+    return FragmentPairEnergies(
+        total=opposite_spin + same_spin,
+        opposite_spin=opposite_spin,
+        same_spin=same_spin,
+    )
+
+
+def _fragment_mp2_orientation_vjp(amplitudes, integrals, target_factor,
+                                  partner_weight, direct_bar, exchange_bar):
+    """Analytic adjoint of one ordered virtual-block MP2 contribution.
+
+    ``amplitudes`` and ``integrals`` have axes ``(p,r,a,b)``.  This mirrors
+    the small-target forward contraction, but explicitly propagates its two
+    scalar cotangents so reverse mode does not need to synthesize and replay
+    the einsum graph.
+    """
+    exchanged_integrals = integrals.transpose(1, 0, 3, 2)
+    direct_projected = jnp.einsum(
+        "xq,qsab->xsab", target_factor, integrals, optimize=True
+    )
+    exchange_projected = jnp.einsum(
+        "xq,qsba->xsba", target_factor, exchanged_integrals,
+        optimize=True,
+    )
+    target_amplitudes = jnp.einsum(
+        "xp,prab->xrab", target_factor, amplitudes, optimize=True
+    )
+    weighted_amplitudes = jnp.einsum(
+        "xrab,rs->xsab", target_amplitudes, partner_weight,
+        optimize=True,
+    )
+
+    weighted_bar = (
+        direct_bar * direct_projected
+        + exchange_bar * exchange_projected.transpose(0, 1, 3, 2)
+    )
+    direct_projected_bar = direct_bar * weighted_amplitudes
+    exchange_projected_bar = (
+        exchange_bar * weighted_amplitudes.transpose(0, 1, 3, 2)
+    )
+
+    target_amplitudes_bar = jnp.einsum(
+        "xsab,rs->xrab", weighted_bar, partner_weight, optimize=True
+    )
+    partner_weight_bar = jnp.einsum(
+        "xrab,xsab->rs", target_amplitudes, weighted_bar, optimize=True
+    )
+    amplitudes_bar = jnp.einsum(
+        "xp,xrab->prab", target_factor, target_amplitudes_bar,
+        optimize=True,
+    )
+
+    target_factor_bar = jnp.einsum(
+        "xrab,prab->xp", target_amplitudes_bar, amplitudes,
+        optimize=True,
+    )
+    target_factor_bar += jnp.einsum(
+        "xsab,qsab->xq", direct_projected_bar, integrals,
+        optimize=True,
+    )
+    target_factor_bar += jnp.einsum(
+        "xsba,qsba->xq", exchange_projected_bar,
+        exchanged_integrals, optimize=True,
+    )
+
+    integrals_bar = jnp.einsum(
+        "xq,xsab->qsab", target_factor, direct_projected_bar,
+        optimize=True,
+    )
+    exchanged_bar = jnp.einsum(
+        "xq,xsba->qsba", target_factor, exchange_projected_bar,
+        optimize=True,
+    )
+    integrals_bar += exchanged_bar.transpose(1, 0, 3, 2)
+    return (
+        amplitudes_bar,
+        integrals_bar,
+        target_factor_bar,
+        partner_weight_bar,
+    )
+
+
+def _fragment_mp2_block_vjp(lov_a, lov_b, eia_a, eia_b,
+                            target_factor, partner_weight,
+                            include_transpose, valid_a, valid_b,
+                            direct_bar, exchange_bar):
+    """Recompute one DF-MP2 block and return all of its input cotangents."""
+    integrals = jnp.einsum(
+        "Lia,Ljb->ijab", lov_a, lov_b, optimize=True
+    )
+    denominator = (
+        eia_a[:, None, :, None] + eia_b[None, :, None, :]
+    )
+    denominator = jnp.where(
+        valid_a[None, None, :, None]
+        & valid_b[None, None, None, :],
+        denominator,
+        jnp.ones((), dtype=denominator.dtype),
+    )
+    amplitudes = integrals / denominator
+
+    bars = _fragment_mp2_orientation_vjp(
+        amplitudes,
+        integrals,
+        target_factor,
+        partner_weight,
+        direct_bar,
+        exchange_bar,
+    )
+    amplitudes_bar, integrals_bar, target_bar, partner_bar = bars
+
+    def _transpose_bars(_):
+        transposed = _fragment_mp2_orientation_vjp(
+            amplitudes.transpose(1, 0, 3, 2),
+            integrals.transpose(1, 0, 3, 2),
+            target_factor,
+            partner_weight,
+            direct_bar,
+            exchange_bar,
+        )
+        return (
+            transposed[0].transpose(1, 0, 3, 2),
+            transposed[1].transpose(1, 0, 3, 2),
+            transposed[2],
+            transposed[3],
+        )
+
+    transpose_bars = jax.lax.cond(
+        include_transpose,
+        _transpose_bars,
+        lambda _: (
+            jnp.zeros_like(amplitudes_bar),
+            jnp.zeros_like(integrals_bar),
+            jnp.zeros_like(target_bar),
+            jnp.zeros_like(partner_bar),
+        ),
+        operand=None,
+    )
+    amplitudes_bar += transpose_bars[0]
+    integrals_bar += transpose_bars[1]
+    target_bar += transpose_bars[2]
+    partner_bar += transpose_bars[3]
+
+    denominator_bar = -amplitudes_bar * integrals / denominator**2
+    integrals_bar += amplitudes_bar / denominator
+    eia_a_bar = jnp.sum(denominator_bar, axis=(1, 3))
+    eia_b_bar = jnp.sum(denominator_bar, axis=(0, 2))
+    lov_a_bar = jnp.einsum(
+        "ijab,Ljb->Lia", integrals_bar, lov_b, optimize=True
+    )
+    lov_b_bar = jnp.einsum(
+        "ijab,Lia->Ljb", integrals_bar, lov_a, optimize=True
+    )
+    return (
+        lov_a_bar,
+        lov_b_bar,
+        eia_a_bar,
+        eia_b_bar,
+        target_bar,
+        partner_bar,
+    )
+
+
+def _fragment_pair_energy_components_analytic_bwd(
+        lov, e_occ, e_vir, target_factor, partner_weight,
+        block_nvir, direct_bar, exchange_bar):
+    """Blockwise handwritten VJP of the real two-sided DF-MP2 energy."""
+    _, nocc, nvir = lov.shape
+    if nvir == 0 or nocc == 0:
+        return tuple(jnp.zeros_like(x) for x in (
+            lov, e_occ, e_vir, target_factor, partner_weight
+        ))
+
+    eia = e_occ[:, None] - e_vir[None, :]
+    nblock = (nvir + block_nvir - 1) // block_nvir
+    block_pairs = jnp.asarray(
+        [
+            (left_block, right_block)
+            for left_block in range(nblock)
+            for right_block in range(left_block, nblock)
+        ],
+        dtype=jnp.int32,
+    )
+    block_offsets = jnp.arange(block_nvir, dtype=jnp.int32)
+
+    def _gather(array, block, axis):
+        indices = block * block_nvir + block_offsets
+        valid = indices < nvir
+        safe_indices = jnp.minimum(indices, nvir - 1)
+        gathered = jnp.take(array, safe_indices, axis=axis)
+        mask_shape = [1] * gathered.ndim
+        mask_shape[axis] = block_nvir
+        mask = valid.reshape(mask_shape)
+        return jnp.where(mask, gathered, 0), valid, safe_indices, mask
+
+    initial = (
+        jnp.zeros_like(lov),
+        jnp.zeros_like(eia),
+        jnp.zeros_like(target_factor),
+        jnp.zeros_like(partner_weight),
+    )
+
+    def _scan_block(carry, pair):
+        left_block, right_block = pair
+        lov_a, valid_a, indices_a, mask_a = _gather(
+            lov, left_block, 2
+        )
+        lov_b, valid_b, indices_b, mask_b = _gather(
+            lov, right_block, 2
+        )
+        eia_a, _, _, eia_mask_a = _gather(eia, left_block, 1)
+        eia_b, _, _, eia_mask_b = _gather(eia, right_block, 1)
+        # Invalid padded denominators are arbitrary constants.  Setting their
+        # one-dimensional entries to zero keeps every valid denominator
+        # unchanged; the block cotangents are masked before scattering.
+        block_bars = _fragment_mp2_block_vjp(
+            lov_a,
+            lov_b,
+            eia_a,
+            eia_b,
+            target_factor,
+            partner_weight,
+            left_block != right_block,
+            valid_a,
+            valid_b,
+            direct_bar,
+            exchange_bar,
+        )
+        lov_a_bar = jnp.where(mask_a, block_bars[0], 0)
+        lov_b_bar = jnp.where(mask_b, block_bars[1], 0)
+        eia_a_bar = jnp.where(eia_mask_a, block_bars[2], 0)
+        eia_b_bar = jnp.where(eia_mask_b, block_bars[3], 0)
+
+        lov_bar, eia_bar, target_bar, partner_bar = carry
+        block_indices = jnp.concatenate((indices_a, indices_b))
+        lov_bar = lov_bar.at[:, :, block_indices].add(
+            jnp.concatenate((lov_a_bar, lov_b_bar), axis=2)
+        )
+        eia_bar = eia_bar.at[:, block_indices].add(
+            jnp.concatenate((eia_a_bar, eia_b_bar), axis=1)
+        )
+        return (
+            lov_bar,
+            eia_bar,
+            target_bar + block_bars[4],
+            partner_bar + block_bars[5],
+        ), None
+
+    (lov_bar, eia_bar, target_bar, partner_bar), _ = jax.lax.scan(
+        _scan_block, initial, block_pairs
+    )
+    return (
+        lov_bar,
+        jnp.sum(eia_bar, axis=1),
+        -jnp.sum(eia_bar, axis=0),
+        target_bar,
+        partner_bar,
+    )
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(5,))
+def _fragment_pair_energy_components_custom(
+        lov, e_occ, e_vir, target_factor, partner_weight, block_nvir):
+    result = _fragment_pair_energy_from_lov_jax_ad(
+        lov,
+        e_occ,
+        e_vir,
+        target_factor,
+        partner_weight,
+        block_nvir=block_nvir,
+    )
+    direct = result.opposite_spin
+    exchange = result.opposite_spin - result.same_spin
+    return direct, exchange
+
+
+def _fragment_pair_energy_components_custom_fwd(
+        lov, e_occ, e_vir, target_factor, partner_weight, block_nvir):
+    output = _fragment_pair_energy_components_custom(
+        lov, e_occ, e_vir, target_factor, partner_weight, block_nvir
+    )
+    return output, (lov, e_occ, e_vir, target_factor, partner_weight)
+
+
+def _fragment_pair_energy_components_custom_bwd(
+        block_nvir, res, output_bars):
+    return _fragment_pair_energy_components_analytic_bwd(
+        *res, block_nvir, *output_bars
+    )
+
+
+_fragment_pair_energy_components_custom.defvjp(
+    _fragment_pair_energy_components_custom_fwd,
+    _fragment_pair_energy_components_custom_bwd,
+)
+
+
+def _fragment_mp2_analytic_vjp_enabled():
+    value = os.environ.get('PYSCFAD_DLNO_MP2_ANALYTIC_VJP', '1')
+    return value.strip().lower() not in ('0', 'false', 'no', 'off')
+
+
+def fragment_pair_energy_from_lov_jax(
+    lov,
+    e_occ,
+    e_vir,
+    target_factor,
+    partner_weight,
+    *,
+    block_nvir=None,
+    max_memory_mb=256.0,
+):
+    """Differentiable blocked DF-MP2 energy with an analytic real VJP.
+
+    The primal and complex-valued fallback are implemented by
+    :func:`_fragment_pair_energy_from_lov_jax_ad`.  For real inputs the
+    custom rule recomputes and eliminates one upper-triangular virtual block
+    at a time while accumulating cotangents for ``lov``, orbital energies,
+    the target factor, and the partner weight.
+    """
+    if getattr(lov, 'ndim', None) != 3:
+        return _fragment_pair_energy_from_lov_jax_ad(
+            lov,
+            e_occ,
+            e_vir,
+            target_factor,
+            partner_weight,
+            block_nvir=block_nvir,
+            max_memory_mb=max_memory_mb,
+        )
+    if block_nvir is None:
+        block_nvir = _virtual_block_size(
+            lov, 1, 1, max_memory_mb
+        )
+    elif not isinstance(block_nvir, (int, np.integer)) or block_nvir <= 0:
+        raise ValueError("block_nvir must be a positive integer")
+    nvir = lov.shape[2] if getattr(lov, 'ndim', None) == 3 else 0
+    block_nvir = min(int(block_nvir), nvir) if nvir else 1
+
+    operands = (lov, e_occ, e_vir, target_factor, partner_weight)
+    use_analytic = (
+        _fragment_mp2_analytic_vjp_enabled()
+        and not any(jnp.issubdtype(jnp.asarray(x).dtype, jnp.complexfloating)
+                    for x in operands)
+    )
+    if not use_analytic:
+        return _fragment_pair_energy_from_lov_jax_ad(
+            *operands, block_nvir=block_nvir
+        )
+
+    direct, exchange = _fragment_pair_energy_components_custom(
+        *operands, block_nvir
+    )
     opposite_spin = direct.real
     same_spin = (direct - exchange).real
     return FragmentPairEnergies(

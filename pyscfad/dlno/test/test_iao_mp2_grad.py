@@ -298,7 +298,7 @@ def test_total_and_progressive_paths_evaluate_unordered_weak_pair_once(
     )
 
 
-def test_progressive_details_preserve_energy_and_cotangent_exactly():
+def test_progressive_details_preserve_energy_and_cotangent_to_roundoff():
     mol = _water_dimer(8.0)
     mf = _build_mf(mol)
     topology = build_iao_fragment_topology(
@@ -314,7 +314,7 @@ def test_progressive_details_preserve_energy_and_cotangent_exactly():
     )
 
     np.testing.assert_allclose(
-        profiled_energy, plain_energy, atol=0.0, rtol=0.0
+        profiled_energy, plain_energy, atol=5e-14, rtol=5e-14
     )
     plain_leaves, plain_tree = jax.tree_util.tree_flatten(
         plain_bar, is_leaf=lambda value: value is None
@@ -330,7 +330,8 @@ def test_progressive_details_preserve_energy_and_cotangent_exactly():
             assert profiled is None or profiled.dtype == jax.dtypes.float0
         else:
             np.testing.assert_allclose(
-                np.asarray(profiled), np.asarray(plain), atol=0.0, rtol=0.0
+                np.asarray(profiled), np.asarray(plain),
+                atol=5e-14, rtol=5e-14,
             )
 
     assert details.e_corr == float(profiled_energy)

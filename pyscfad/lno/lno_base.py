@@ -2698,6 +2698,7 @@ def _local_direct_nr_e2_fwd(mol, auxmol, mo_coeff, max_memory, orbs_slice):
 def _local_direct_nr_e2_bwd(max_memory, orbs_slice, res, fitted_mo_bar):
     del max_memory
     mol, auxmol, mo_coeff, fitted_mo = res
+    del res
     if mol.exp is not None or mol.ctr_coeff is not None or mol.r0 is not None:
         raise NotImplementedError(
             'Integral-direct local Lov currently supports coordinate and '
@@ -2724,6 +2725,7 @@ def _local_direct_nr_e2_bwd(max_memory, orbs_slice, res, fitted_mo_bar):
             'Integral-direct local Lov VJP does not yet support the '
             'linear-dependent auxiliary-metric eigenvalue fallback.'
         ) from err
+    del j2c
 
     fitted_mo_np = numpy.asarray(jax.device_get(fitted_mo))
     fitted_mo_bar_np = numpy.asarray(jax.device_get(fitted_mo_bar))
@@ -2733,6 +2735,12 @@ def _local_direct_nr_e2_bwd(max_memory, orbs_slice, res, fitted_mo_bar):
         lower=False,
         check_finite=False,
     )
+
+    # If Y = L^{-1} T and Z = L^{-T} Ybar, then Lbar = -Z Y^T.  Form this
+    # small auxiliary-metric cotangent before the streamed integral work so
+    # the much larger Y and Ybar buffers can reach their last use here.
+    low_bar = -numpy.dot(z, fitted_mo_np.T)
+    del fitted_mo_np, fitted_mo_bar_np, fitted_mo, fitted_mo_bar, low
 
     mo_coeff_bar = _local_direct_mo_coeff_vjp(
         mol, auxmol, mo_coeff, z, orbs_slice
@@ -2745,10 +2753,9 @@ def _local_direct_nr_e2_bwd(max_memory, orbs_slice, res, fitted_mo_bar):
         orbs_slice,
         int3c=mol._add_suffix('int3c2e'),
         aosym='s2ij',
+        block_memory_mb=_local_direct_int3c_block_mb(),
     )
-
-    # If Y = L^{-1} T and Z = L^{-T} Ybar, then Lbar = -Z Y^T.
-    low_bar = -numpy.dot(z, fitted_mo_np.T)
+    del z
 
     def metric_cholesky(auxmol_):
         return jsp_linalg.cholesky(
@@ -2757,7 +2764,11 @@ def _local_direct_nr_e2_bwd(max_memory, orbs_slice, res, fitted_mo_bar):
         )
 
     _, metric_pullback = jax.vjp(metric_cholesky, auxmol)
-    aux_metric_bar = metric_pullback(np.asarray(numpy.tril(low_bar)))[0]
+    # The Cholesky pullback consumes only the stored lower triangle.  Zero the
+    # unused half in place rather than allocating another naux-by-naux array.
+    _cderi_vjp._zero_strict_upper_inplace(low_bar)
+    aux_metric_bar = metric_pullback(np.asarray(low_bar))[0]
+    del metric_pullback, low_bar
     auxmol_bar = _tree_add(auxmol_bar, aux_metric_bar)
     return mol_bar, auxmol_bar, mo_coeff_bar
 

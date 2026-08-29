@@ -340,9 +340,10 @@ def _make_df_eris_incore(cc, mo_coeff=None, fockao=None):
         eris.ovvo = ovov.transpose(0, 1, 3, 2)
         oovv = np.dot(Loo.T, Lvv)
         eris.oovv = lib.unpack_tril(oovv).reshape(nocc, nocc, nvir, nvir)
-    # eris.ovvv is built lazily via eris.get_ovvv_packed() on first access so
-    # forward CCSD (which builds tiles from Lov/Lvv) doesn't pay the
-    # persistent allocation.  The (T) and lambda paths trigger it on demand.
+    # eris.ovvv is built lazily via eris.get_ovvv_packed() on first access.
+    # The real DF CCSD, lambda, and LNO-(T) paths all build bounded tiles from
+    # Lov/Lvv, so only unsupported dense fallbacks trigger the persistent
+    # packed-ovvv allocation.
     Lpq = None
     return eris
 

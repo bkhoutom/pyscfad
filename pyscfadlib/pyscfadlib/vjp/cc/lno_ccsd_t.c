@@ -94,6 +94,55 @@ static size_t lnoccsdt_gen_jobs(CacheJob *jobs, int nocc, int nvir,
         return m;
 }
 
+/* Generate the same (a,b,c) jobs as lnoccsdt_gen_jobs, but address four
+ * rectangular row/column caches instead of one global vvop tensor.  This
+ * layout is shared with the LNO-(T) pullback and permits the Python driver to
+ * form each cache directly from the DF Lov/Lvv factors. */
+static size_t lnoccsdt_gen_block_jobs(CacheJob *jobs, int nocc, int nvir,
+                                      int b0, int b1, int c0, int c1,
+                                      void *cache_row_b, void *cache_col_b,
+                                      void *cache_row_c, void *cache_col_c,
+                                      size_t stride)
+{
+        size_t nov = nocc * (nocc+nvir) * stride;
+        int db = b1 - b0;
+        int dc = c1 - c0;
+        size_t m, a, b, c;
+
+        if (c1 <= b0) {
+                m = 0;
+                for (a = 0; a < nvir; a++) {
+                for (b = b0; b < b1; b++) {
+                for (c = c0; c < c1; c++, m++) {
+                        jobs[m].a = a;
+                        jobs[m].b = b;
+                        jobs[m].c = c;
+                        jobs[m].cache[0] = cache_col_b + nov*(db*a+b-b0);
+                        jobs[m].cache[1] = cache_col_c + nov*(dc*a+c-c0);
+                        jobs[m].cache[2] = cache_row_b + nov*(nvir*(b-b0)+a);
+                        jobs[m].cache[3] = cache_row_b + nov*(nvir*(b-b0)+c);
+                        jobs[m].cache[4] = cache_row_c + nov*(nvir*(c-c0)+a);
+                        jobs[m].cache[5] = cache_row_c + nov*(nvir*(c-c0)+b);
+                } } }
+        } else {
+                m = 0;
+                for (a = 0; a < nvir; a++) {
+                for (b = b0; b < b1; b++) {
+                for (c = c0; c <= b; c++, m++) {
+                        jobs[m].a = a;
+                        jobs[m].b = b;
+                        jobs[m].c = c;
+                        jobs[m].cache[0] = cache_col_b + nov*(db*a+b-b0);
+                        jobs[m].cache[1] = cache_col_b + nov*(db*a+c-c0);
+                        jobs[m].cache[2] = cache_row_b + nov*(nvir*(b-b0)+a);
+                        jobs[m].cache[3] = cache_row_b + nov*(nvir*(b-b0)+c);
+                        jobs[m].cache[4] = cache_row_b + nov*(nvir*(c-c0)+a);
+                        jobs[m].cache[5] = cache_row_b + nov*(nvir*(c-c0)+b);
+                } } }
+        }
+        return m;
+}
+
 void lnoccsdt_contract(double *e_tot, double *mat,
                        double *mo_energy, double *t1T, double *t2T,
                        double *vooo, double *fvo,
@@ -131,6 +180,62 @@ void lnoccsdt_contract(double *e_tot, double *mat,
                 e += contract6(nocc, nvir, a, b, c, mat, mo_energy, t1Thalf, t2T,
                                fvohalf, vooo, cache1, jobs[k].cache, permute_idx,
                                1.0);
+        }
+        free(t1Thalf);
+        free(cache1);
+        e_bufs[thread_id] = e;
+}
+        int thread_id;
+        for (thread_id = 0; thread_id < max_threads; thread_id++) {
+                *e_tot += e_bufs[thread_id];
+        }
+        free(e_bufs);
+        free(permute_idx);
+        free(jobs);
+}
+
+void lnoccsdt_contract_df(double *e_tot, double *mat,
+                          double *mo_energy, double *t1T, double *t2T,
+                          double *vooo, double *fvo,
+                          int nocc, int nvir,
+                          int b0, int b1, int c0, int c1,
+                          void *cache_row_b, void *cache_col_b,
+                          void *cache_row_c, void *cache_col_c)
+{
+        int db = b1 - b0;
+        int dc = c1 - c0;
+        CacheJob *jobs = malloc(sizeof(CacheJob) * nvir*db*dc);
+        size_t njobs = lnoccsdt_gen_block_jobs(
+                jobs, nocc, nvir, b0, b1, c0, c1,
+                cache_row_b, cache_col_b, cache_row_c, cache_col_c,
+                sizeof(double));
+        int *permute_idx = malloc(sizeof(int) * nocc*nocc*nocc * 6);
+        _make_permute_indices(permute_idx, nocc);
+        const int max_threads = omp_get_max_threads_safe();
+        double *e_bufs = calloc(max_threads, sizeof(double));
+#pragma omp parallel default(none) \
+        shared(njobs, nocc, nvir, mat, mo_energy, t1T, t2T,\
+               vooo, fvo, jobs, permute_idx, e_bufs)
+{
+        int thread_id = omp_get_thread_num();
+        int a, b, c;
+        size_t k;
+        double *cache1 = malloc(sizeof(double) * (nocc*nocc*nocc*3+2));
+        double *t1Thalf = malloc(sizeof(double) * nvir*nocc * 2);
+        double *fvohalf = t1Thalf + nvir*nocc;
+        for (k = 0; k < nvir*nocc; k++) {
+                t1Thalf[k] = t1T[k] * .5;
+                fvohalf[k] = fvo[k] * .5;
+        }
+        double e = 0;
+#pragma omp for schedule (static, 4)
+        for (k = 0; k < njobs; k++) {
+                a = jobs[k].a;
+                b = jobs[k].b;
+                c = jobs[k].c;
+                e += contract6(nocc, nvir, a, b, c, mat, mo_energy,
+                               t1Thalf, t2T, fvohalf, vooo, cache1,
+                               jobs[k].cache, permute_idx, 1.0);
         }
         free(t1Thalf);
         free(cache1);

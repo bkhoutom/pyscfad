@@ -48,6 +48,8 @@ from __future__ import annotations
 
 import gc
 import hashlib
+from functools import wraps
+from pathlib import Path
 import time
 import traceback
 
@@ -62,7 +64,10 @@ from pyscfad.ops import stop_trace
 
 from .iao_mp2 import (
     IAOFragmentMP2 as _SerialIAOFragmentMP2,
+    IAOFragmentMP2Thresholds,
     IAOFragmentTopology,
+    _fix_restart_mo_phases,
+    _serial_restart_scientific_payload,
 )
 from .iao_mp2_grad import (
     IAOFragmentMP2StaticSelections,
@@ -70,6 +75,8 @@ from .iao_mp2_grad import (
     IAOMP2TermResult,
     _add_cotangent,
     _correlation_term_specs,
+    _details_from_restart_metadata,
+    _details_restart_metadata,
     _make_decomposition,
     build_strong_ed_domain,
     build_weak_multipole_screen,
@@ -77,12 +84,38 @@ from .iao_mp2_grad import (
     strong_domain_energy,
     weak_screen_pair_energy,
 )
+from ._restart import (
+    RestartManager,
+    df_source_fingerprint,
+    scientific_digest,
+)
 
 
 __all__ = [
     "IAOFragmentMP2",
     "correlation_value_and_grad",
 ]
+
+
+def _abort_collective_on_error(function):
+    """Prevent a rank-local Python error from stranding MPI peers."""
+
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        comm = kwargs.get("comm", MPI.COMM_WORLD)
+        if comm is None:
+            comm = MPI.COMM_WORLD
+        root = int(kwargs.get("root", 0))
+        try:
+            return function(*args, **kwargs)
+        except Exception:
+            if comm.Get_size() > 1:  # pragma: no cover - MPI failure path
+                if comm.Get_rank() == root:
+                    traceback.print_exc()
+                comm.Abort(1)
+            raise
+
+    return wrapped
 
 
 def _progress_enabled(progress):
@@ -111,6 +144,53 @@ def _progress_reporter(progress, *, rank, root):
 def _report_progress(reporter, message):
     if reporter is not None:
         reporter(f"[IAO-MP2] {message}")
+
+
+def _mpi_restart_scientific_payload(
+    mol,
+    mf,
+    *,
+    frag_lolist,
+    frag_atmlist,
+    frozen,
+    thresholds,
+    pair_energy_model,
+    force_full_domains,
+    include_hf,
+    nproc,
+    root,
+):
+    """Return the scientific and collective identity of an MPI restart."""
+
+    payload = _serial_restart_scientific_payload(
+        mol,
+        mf,
+        frag_lolist=frag_lolist,
+        frag_atmlist=frag_atmlist,
+        frozen=frozen,
+        thresholds=thresholds,
+        pair_energy_model=pair_energy_model,
+        force_full_domains=force_full_domains,
+        include_hf=include_hf,
+    )
+    payload["driver"] = "mpi-iao-dlno-mp2-gradient"
+    # Progressive MPI batch records contain rank-local cumulative bars, so a
+    # partial correlation restart currently requires the same collective
+    # layout.  The final pre-SCF state remains independent of scheduling, but
+    # keeping one strict manifest avoids accidentally mixing both contracts.
+    payload["mpi"] = {"size": int(nproc), "root": int(root)}
+    return payload
+
+
+def _zero_mf_cotangent(mf):
+    """Construct a live MF-shaped zero tree for checkpoint deserialization."""
+
+    dtype = jnp.asarray(mf.mo_coeff).dtype
+    _, pullback = jax.vjp(
+        lambda mf_: jnp.zeros((), dtype=dtype), mf
+    )
+    mf_bar, = pullback(jnp.ones((), dtype=dtype))
+    return mf_bar
 
 
 def _exception_text(stage):
@@ -227,11 +307,14 @@ def _semantic_tuple(value):
     return value
 
 
-def _verify_shared_gauge(comm, canonical, common, mf):
-    """Require byte-identical orbital, geometry, and basis data on all ranks."""
+def _verify_shared_reference(
+    comm, canonical, mf, *, verify_df_source=False
+):
+    """Require identical canonical, molecular, and DF metadata on all ranks."""
+
     mol = mf.mol
     auxmol = getattr(getattr(mf, "with_df", None), "auxmol", None)
-    local = _array_tree_digest((canonical, common))
+    local = _array_tree_digest(canonical)
     digests = comm.allgather(local)
     if len(set(digests)) != 1:
         details = ", ".join(
@@ -239,15 +322,21 @@ def _verify_shared_gauge(comm, canonical, common, mf):
             for rank, value in enumerate(digests)
         )
         raise RuntimeError(
-            "broadcast IAO-MP2 orbital gauges differ across MPI ranks ("
+            "broadcast canonical orbital gauges differ across MPI ranks ("
             + details + ")"
         )
     system_signature = (
         int(mol.natm),
         int(mol.nao),
+        int(mol.charge),
+        int(mol.spin),
+        bool(getattr(mol, "cart", False)),
         tuple(mol.atom_symbol(index) for index in range(mol.natm)),
+        _semantic_tuple(numpy.asarray(mol.atom_charges()).tolist()),
         _semantic_tuple(numpy.asarray(mol.atom_coords()).tolist()),
         _semantic_tuple(getattr(mol, "_basis", None)),
+        _semantic_tuple(getattr(mol, "_ecp", None)),
+        _semantic_tuple(getattr(mol, "_pseudo", None)),
         None if auxmol is None else int(auxmol.nao),
         _semantic_tuple(
             getattr(getattr(mf, "with_df", None), "auxbasis", None)
@@ -259,6 +348,42 @@ def _verify_shared_gauge(comm, canonical, common, mf):
         raise RuntimeError(
             "molecular geometry or orbital/auxiliary bases differ across "
             "MPI ranks"
+        )
+    if verify_df_source:
+        # Shape-compatible but scientifically different CDERI files are a
+        # particularly dangerous MPI failure mode: fragment energies remain
+        # finite while belonging to different Hamiltonians.  Hash logical
+        # HDF5 contents (or the in-memory factors) once before distributed
+        # correlation/response work and require exact agreement with root.
+        df_digest = scientific_digest(df_source_fingerprint(mf))
+        df_digests = comm.allgather(df_digest)
+        if len(set(df_digests)) != 1:
+            details = ", ".join(
+                f"rank {rank}: {value[:12]}"
+                for rank, value in enumerate(df_digests)
+            )
+            raise RuntimeError(
+                "density-fitting integral contents differ across MPI ranks "
+                f"({details})"
+            )
+
+
+def _verify_shared_gauge(comm, canonical, common, mf):
+    """Require a shared reference and byte-identical common orbital frame."""
+
+    _verify_shared_reference(
+        comm, canonical, mf, verify_df_source=True
+    )
+    local = _array_tree_digest(common)
+    digests = comm.allgather(local)
+    if len(set(digests)) != 1:
+        details = ", ".join(
+            f"rank {rank}: {value[:12]}"
+            for rank, value in enumerate(digests)
+        )
+        raise RuntimeError(
+            "broadcast IAO-MP2 common orbital gauges differ across MPI "
+            f"ranks ({details})"
         )
 
 
@@ -272,6 +397,7 @@ def _zero_term_cotangents(mf, common):
     return pullback(jnp.ones((), dtype=common.s1e.dtype))
 
 
+@_abort_collective_on_error
 def correlation_value_and_grad(
     mf,
     static,
@@ -280,6 +406,7 @@ def correlation_value_and_grad(
     root=0,
     return_details=False,
     progress=False,
+    restart=None,
 ):
     """Return the full MPI IAO-DLNO-MP2 correlation energy and ``mf`` bar.
 
@@ -308,8 +435,79 @@ def correlation_value_and_grad(
     if len(set(progress_flags)) != 1:
         raise ValueError("progress must be enabled consistently on all ranks")
     reporter = _progress_reporter(progress, rank=rank, root=root)
-    collect_timing = return_details or progress_enabled
+    restart_enabled = bool(
+        restart is not None and getattr(restart, "enabled", False)
+    )
+    restart_state = (
+        restart_enabled,
+        None if not restart_enabled else str(restart.path),
+        False if not restart_enabled else bool(restart.resume),
+    )
+    if len(set(comm.allgather(restart_state))) != 1:
+        raise ValueError(
+            "MPI correlation restart path/mode must be identical on all ranks"
+        )
+    collect_timing = return_details or progress_enabled or restart_enabled
     total_start = time.perf_counter() if collect_timing else None
+
+    # A common-closed record is self-contained in the canonical MF gauge.  It
+    # therefore supersedes all frame construction and worker term VJPs, while
+    # still leaving the final SCF response to the outer driver.
+    closed = None
+    closed_payload = None
+    closed_error = None
+    if rank == root and restart_enabled and restart.resume:
+        try:
+            zero_mf_bar = _zero_mf_cotangent(mf)
+            closed = restart.load_record(
+                "mpi_correlation_closed",
+                templates={"mf_bar": zero_mf_bar},
+                missing_ok=True,
+            )
+            del zero_mf_bar
+            if closed is not None:
+                closed_payload = (
+                    float(closed.scalars["energy"]),
+                    closed.metadata,
+                )
+        except Exception:
+            closed_error = _exception_text(
+                "root MPI correlation restart load"
+            )
+    closed_error = comm.bcast(closed_error, root=root)
+    if closed_error is not None:
+        raise RuntimeError(closed_error)
+    closed_payload = comm.bcast(closed_payload, root=root)
+    if closed_payload is not None:
+        corr_energy, closed_metadata = closed_payload
+        _report_progress(
+            reporter,
+            "restart: loaded completed common-closed correlation cotangent",
+        )
+        if return_details:
+            details_error = None
+            details = None
+            if rank == root:
+                try:
+                    details = _details_from_restart_metadata(
+                        static, corr_energy, closed_metadata
+                    )
+                except Exception:
+                    details_error = _exception_text(
+                        "root restarted MPI correlation diagnostics"
+                    )
+            details_error = comm.bcast(details_error, root=root)
+            if details_error is not None:
+                raise RuntimeError(details_error)
+            details = comm.bcast(
+                details, root=root
+            )
+            return corr_energy, (
+                closed.trees["mf_bar"] if rank == root else None
+            ), details
+        return corr_energy, (
+            closed.trees["mf_bar"] if rank == root else None
+        )
 
     if rank == root:
         if not isinstance(static, IAOFragmentMP2StaticSelections):
@@ -735,6 +933,7 @@ def correlation_value_and_grad(
                 "common-orbital pullback: done in "
                 f"{common_reverse_seconds:.1f} s",
             )
+    details = None
     if collect_timing:
         total_seconds = comm.allreduce(
             time.perf_counter() - total_start, op=MPI.MAX
@@ -776,17 +975,42 @@ def correlation_value_and_grad(
                 f"correlation pullback: complete; E_corr="
                 f"{corr_energy:+.10f} Eh; wall={total_seconds:.1f} s",
             )
-        if return_details:
-            if rank == root:
+            if return_details or restart_enabled:
                 details = _make_decomposition(
                     static, corr_energy, term_results_root, timing
                 )
-            else:
-                details = None
+
+    checkpoint_error = None
+    if rank == root and restart_enabled:
+        try:
+            if details is None:
+                raise RuntimeError(
+                    "restart-enabled MPI correlation did not collect "
+                    "term diagnostics"
+                )
+            restart.save_record(
+                "mpi_correlation_closed",
+                scalars={"energy": float(corr_energy)},
+                trees={"mf_bar": mf_bar_root},
+                metadata=_details_restart_metadata(details),
+            )
+            _report_progress(
+                reporter,
+                "restart: saved completed common-closed correlation "
+                "cotangent",
+            )
+        except Exception:
+            checkpoint_error = _exception_text(
+                "root MPI correlation checkpoint write"
+            )
+    checkpoint_error = comm.bcast(checkpoint_error, root=root)
+    if checkpoint_error is not None:
+        raise RuntimeError(checkpoint_error)
+
+    if return_details:
+        if collect_timing:
             details = comm.bcast(details, root=root)
             return corr_energy, mf_bar_root, details
-    if return_details:
-        # ``collect_timing`` is necessarily true in this branch.
         raise AssertionError("unreachable return_details state")
     return corr_energy, mf_bar_root
 
@@ -795,6 +1019,7 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
     """MPI-parallel fixed-topology IAO-fragment MP2 driver."""
 
     @classmethod
+    @_abort_collective_on_error
     def value_and_grad(
         cls,
         mol,
@@ -813,6 +1038,8 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
         root=0,
         return_details=False,
         progress=False,
+        checkpoint_dir=None,
+        resume=False,
     ):
         """Return full IAO-DLNO-MP2 energy and gradient using MPI.
 
@@ -854,6 +1081,13 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
         SCF, topology, correlation terms, common-orbital pullback, and final
         SCF response.  A callable may be supplied to receive those formatted
         lines instead.  Pass the same setting on every MPI rank.
+
+        ``checkpoint_dir`` must name storage shared read/write by every rank.
+        Set ``resume=True`` on all ranks to reuse it.  Partial MPI records are
+        tied to the same ``comm`` size and ``root``; the manifest rejects a
+        different layout.  One checkpoint directory may be used by only one
+        running MPI job at a time.  A checkpoint-seeded ``build_mf`` must
+        represent the same converged implicit DF-RHF response map.
         """
         rank = comm.Get_rank()
         nproc = comm.Get_size()
@@ -864,15 +1098,22 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
             bool(include_hf),
             bool(return_details),
             progress_enabled,
+            None if checkpoint_dir is None else str(
+                Path(checkpoint_dir).expanduser().resolve()
+            ),
+            bool(resume),
         )
         schedules = comm.allgather(local_schedule)
         if len(set(schedules)) != 1:
             raise ValueError(
-                "root, parallel_scf_jk, include_hf, return_details, and "
-                "progress must be consistent on all MPI ranks"
+                "root, parallel_scf_jk, include_hf, return_details, progress, "
+                "checkpoint_dir, and resume must be consistent on all MPI "
+                "ranks"
             )
         if root < 0 or root >= nproc:
             raise ValueError(f"root={root} is invalid for {nproc} MPI ranks")
+        if resume and checkpoint_dir is None:
+            raise ValueError("resume=True requires checkpoint_dir")
         parallel_scf_jk = bool(parallel_scf_jk) and nproc > 1
         reporter = _progress_reporter(progress, rank=rank, root=root)
         overall_start = time.perf_counter()
@@ -885,6 +1126,13 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
                 "coordinates only; build mol with trace_exp=False and "
                 "trace_ctr_coeff=False"
             )
+        if thresholds is None:
+            thresholds = IAOFragmentMP2Thresholds()
+
+        scf_builder = build_mf
+        if checkpoint_dir is not None:
+            def scf_builder(mol_):
+                return _fix_restart_mo_phases(build_mf(mol_))
 
         scf_executor = None
         if parallel_scf_jk:
@@ -947,10 +1195,10 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
                 ):
                     if parallel_scf_jk:
                         with scf_executor.root_session(final=False):
-                            mf, scf_pullback = jax.vjp(build_mf, mol)
+                            mf, scf_pullback = jax.vjp(scf_builder, mol)
                             jax.block_until_ready(mf.e_tot)
                     else:
-                        mf, scf_pullback = jax.vjp(build_mf, mol)
+                        mf, scf_pullback = jax.vjp(scf_builder, mol)
                         jax.block_until_ready(mf.e_tot)
             except Exception:
                 if scf_executor is not None:
@@ -964,11 +1212,71 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
                     f"{time.perf_counter() - scf_start:.1f} s; "
                     f"E_HF={float(mf.e_tot):+.10f} Eh",
                 )
+                canonical = {
+                    "mo_coeff": numpy.asarray(mf.mo_coeff),
+                    "mo_energy": numpy.asarray(mf.mo_energy),
+                    "mo_occ": numpy.asarray(mf.mo_occ),
+                    "e_tot": float(mf.e_tot),
+                }
+                restart_payload = _mpi_restart_scientific_payload(
+                    mol,
+                    mf,
+                    frag_lolist=frag_lolist,
+                    frag_atmlist=frag_atmlist,
+                    frozen=frozen,
+                    thresholds=thresholds,
+                    pair_energy_model=pair_energy_model,
+                    force_full_domains=force_full_domains,
+                    include_hf=include_hf,
+                    nproc=nproc,
+                    root=root,
+                )
+                restart = RestartManager(
+                    checkpoint_dir,
+                    resume=resume,
+                    method="mpi-dlno-mp2",
+                    scientific_payload=restart_payload,
+                    initialize=True,
+                )
+                if topology is not None and not isinstance(
+                    topology,
+                    (IAOFragmentTopology, IAOFragmentMP2StaticSelections),
+                ):
+                    raise TypeError(
+                        "topology must be IAOFragmentTopology or "
+                        "IAOFragmentMP2StaticSelections"
+                    )
                 topology_start = time.perf_counter()
                 _report_progress(
                     reporter, "fixed IAO fragment topology: starting"
                 )
-                if topology is None:
+                saved_topology = None
+                if resume and restart.enabled:
+                    saved_topology = restart.load_static(
+                        expected_type=IAOFragmentMP2StaticSelections
+                    )
+                if saved_topology is not None:
+                    if isinstance(
+                        topology, IAOFragmentMP2StaticSelections
+                    ):
+                        restart.bind_static(topology)
+                    elif isinstance(topology, IAOFragmentTopology):
+                        from .iao_mp2_grad import (
+                            build_iao_mp2_static_selections,
+                        )
+
+                        supplied_static = stop_trace(
+                            lambda mf_: build_iao_mp2_static_selections(
+                                mf_, topology
+                            )
+                        )(mf)
+                        restart.bind_static(supplied_static)
+                    fixed_topology = saved_topology
+                    _report_progress(
+                        reporter,
+                        "restart: loaded fixed IAO fragment topology",
+                    )
+                elif topology is None:
                     fixed_topology = stop_trace(
                         lambda mf_: cls.build_static_topology(
                             mf_,
@@ -995,6 +1303,8 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
                         "topology must be IAOFragmentTopology or "
                         "IAOFragmentMP2StaticSelections"
                     )
+                if restart.enabled and saved_topology is None:
+                    restart.save_static(fixed_topology)
 
                 term_specs = _correlation_term_specs(fixed_topology)
                 nstrong_terms = sum(
@@ -1015,18 +1325,11 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
                     f"strong/weak pairs={nstrong_pairs}/{nweak_terms}, "
                     f"correlation terms={len(term_specs)}",
                 )
-
-                canonical = {
-                    "mo_coeff": numpy.asarray(mf.mo_coeff),
-                    "mo_energy": numpy.asarray(mf.mo_energy),
-                    "mo_occ": numpy.asarray(mf.mo_occ),
-                    "e_tot": float(mf.e_tot),
-                }
             except Exception:  # pragma: no cover - multi-rank failure path
                 topology_error = _exception_text(
                     "root IAO fragment topology setup"
                 )
-                fixed_topology = canonical = None
+                fixed_topology = canonical = restart = restart_payload = None
         else:
             if parallel_scf_jk:
                 service_exit = scf_executor.serve(mf.with_df)
@@ -1039,6 +1342,7 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
                 mf = None
             scf_pullback = fixed_topology = None
             canonical = None
+            restart_payload = None
             topology_error = None
 
         topology_error = comm.bcast(topology_error, root=root)
@@ -1047,6 +1351,40 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
                 scf_executor.close_local()
             raise RuntimeError(topology_error)
         canonical = comm.bcast(canonical, root=root)
+        restart_payload = comm.bcast(restart_payload, root=root)
+
+        pre_scf = None
+        pre_scf_error = None
+        e_hf = hf_bar = None
+        if rank == root:
+            try:
+                e_hf, hf_pullback = jax.vjp(lambda mf_: mf_.e_tot, mf)
+                hf_bar, = hf_pullback(
+                    jnp.ones((), dtype=jnp.asarray(e_hf).dtype)
+                )
+                if resume and restart.enabled:
+                    pre_scf = restart.load_record(
+                        "pre_scf",
+                        templates={"mf_bar": hf_bar},
+                        missing_ok=True,
+                    )
+            except Exception:
+                pre_scf_error = _exception_text(
+                    "root pre-SCF restart load"
+                )
+        pre_scf_error = comm.bcast(pre_scf_error, root=root)
+        if pre_scf_error is not None:
+            if scf_executor is not None:
+                scf_executor.close_local()
+            raise RuntimeError(pre_scf_error)
+        pre_scf_payload = None
+        if rank == root and pre_scf is not None:
+            pre_scf_payload = (
+                float(pre_scf.scalars["energy"]),
+                float(pre_scf.scalars["corr_energy"]),
+            )
+        pre_scf_payload = comm.bcast(pre_scf_payload, root=root)
+
         if rank != root:
             if parallel_scf_jk:
                 mf.mo_coeff = canonical["mo_coeff"]
@@ -1054,7 +1392,7 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
                 mf.mo_occ = canonical["mo_occ"]
                 mf.e_tot = canonical["e_tot"]
                 mf.converged = True
-            else:
+            elif pre_scf_payload is None:
                 try:
                     mf = build_mf(
                         mol,
@@ -1070,35 +1408,123 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
                         "must not run SCF"
                     ) from error
 
-        _report_progress(reporter, "MPI correlation energy/gradient: starting")
-        corr_result = correlation_value_and_grad(
-            mf,
-            fixed_topology,
-            comm=comm,
-            root=root,
-            return_details=return_details,
-            progress=progress,
-        )
-        corr_energy, mf_bar_root = corr_result[:2]
+        restart_error = None
+        if rank != root and pre_scf_payload is None:
+            try:
+                restart = RestartManager(
+                    checkpoint_dir,
+                    resume=resume,
+                    method="mpi-dlno-mp2",
+                    scientific_payload=restart_payload,
+                    initialize=False,
+                )
+            except Exception:
+                restart_error = _exception_text(
+                    f"MPI restart setup on rank {rank}"
+                )
+        _raise_if_any_rank_failed(comm, restart_error)
+        if pre_scf_payload is None or parallel_scf_jk:
+            _verify_shared_reference(
+                comm,
+                canonical,
+                mf,
+                verify_df_source=parallel_scf_jk,
+            )
+
+        if pre_scf_payload is not None:
+            energy, corr_energy = pre_scf_payload
+            mf_bar_root = (
+                pre_scf.trees["mf_bar"] if rank == root else None
+            )
+            _report_progress(
+                reporter,
+                "restart: loaded pre-SCF total cotangent; all local MP2 "
+                "work is skipped",
+            )
+            if return_details:
+                closed = None
+                details_error = None
+                if rank == root:
+                    try:
+                        closed = restart.load_record(
+                            "mpi_correlation_closed",
+                            templates={"mf_bar": _zero_mf_cotangent(mf)},
+                            missing_ok=False,
+                        )
+                        details = _details_from_restart_metadata(
+                            fixed_topology,
+                            corr_energy,
+                            closed.metadata,
+                        )
+                    except Exception:
+                        details_error = _exception_text(
+                            "root restarted MP2 diagnostics load"
+                        )
+                        details = None
+                details_error = comm.bcast(details_error, root=root)
+                if details_error is not None:
+                    raise RuntimeError(details_error)
+                details = comm.bcast(details, root=root)
+                corr_result = (corr_energy, mf_bar_root, details)
+            else:
+                corr_result = (corr_energy, mf_bar_root)
+        else:
+            _report_progress(
+                reporter, "MPI correlation energy/gradient: starting"
+            )
+            corr_result = correlation_value_and_grad(
+                mf,
+                fixed_topology,
+                comm=comm,
+                root=root,
+                return_details=return_details,
+                progress=progress,
+                restart=restart,
+            )
+            corr_energy, mf_bar_root = corr_result[:2]
+            checkpoint_error = None
+            if rank == root:
+                try:
+                    if include_hf:
+                        _report_progress(
+                            reporter, "adding the Hartree-Fock energy seed"
+                        )
+                        mf_bar_root = jax.tree_util.tree_map(
+                            _add_cotangent, mf_bar_root, hf_bar
+                        )
+                        energy = float(e_hf) + corr_energy
+                    else:
+                        energy = corr_energy
+                    jax.block_until_ready(mf_bar_root)
+                    if restart.enabled:
+                        restart.save_record(
+                            "pre_scf",
+                            scalars={
+                                "energy": float(energy),
+                                "corr_energy": float(corr_energy),
+                            },
+                            trees={"mf_bar": mf_bar_root},
+                            metadata={"include_hf": bool(include_hf)},
+                        )
+                        _report_progress(
+                            reporter,
+                            "restart: saved pre-SCF total cotangent",
+                        )
+                except Exception:
+                    checkpoint_error = _exception_text(
+                        "root pre-SCF checkpoint write"
+                    )
+            checkpoint_error = comm.bcast(checkpoint_error, root=root)
+            if checkpoint_error is not None:
+                raise RuntimeError(checkpoint_error)
+            energy = comm.bcast(
+                energy if rank == root else None, root=root
+            )
 
         response_setup_error = None
         mol_bar = None
         if rank == root:
             try:
-                if include_hf:
-                    _report_progress(
-                        reporter, "adding the Hartree-Fock energy seed"
-                    )
-                    e_hf, hf_pullback = jax.vjp(lambda mf_: mf_.e_tot, mf)
-                    hf_bar, = hf_pullback(
-                        jnp.ones((), dtype=jnp.asarray(e_hf).dtype)
-                    )
-                    mf_bar_root = jax.tree_util.tree_map(
-                        _add_cotangent, mf_bar_root, hf_bar
-                    )
-                    energy = float(e_hf) + corr_energy
-                else:
-                    energy = corr_energy
                 _report_progress(
                     reporter,
                     "implicit SCF response for the total orbital "
@@ -1114,10 +1540,7 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
                     "root implicit SCF response setup"
                 )
         else:
-            energy = (
-                canonical["e_tot"] + corr_energy
-                if include_hf else corr_energy
-            )
+            energy = float(energy)
 
         response_setup_error = comm.bcast(
             response_setup_error, root=root

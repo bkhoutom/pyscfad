@@ -1,6 +1,7 @@
 """Restart the C16H34 IAO-DLNO-MP2 gradient from example 24.
 
-This run reads both the converged SCF checkpoint and the saved DF integrals.
+This run reads the converged SCF checkpoint and saved DF integrals, then
+resumes the progressive DLNO energy/cotangent checkpoint.
 From the repository root, run example 24 once before running
 
     .venv/bin/python -u examples/lno/25-c16_dlno_mp2_gradient_restart.py
@@ -19,14 +20,21 @@ HERE = Path(__file__).resolve().parent
 SAVE_DIR = HERE.parents[1] / "output" / "c16_dlno_mp2"
 SCF_CHK = SAVE_DIR / "c16_ccpvdz_rhf.chk"
 CDERI = SAVE_DIR / "c16_ccpvdz_cderi.h5"
+DLNO_RESTART = SAVE_DIR / "c16_dlno_mp2.restart"
 
 BASIS = "cc-pvdz"
 AUXBASIS = "cc-pvdz-ri"
 FROZEN = 16
+SCF_CONV_TOL = 1e-12
+SCF_CONV_TOL_GRAD = 1e-10
 
 config.update("pyscfad_moleintor_opt", True)
 
-if not SCF_CHK.is_file() or not CDERI.is_file():
+if (
+    not SCF_CHK.is_file()
+    or not CDERI.is_file()
+    or not (DLNO_RESTART / "run.json").is_file()
+):
     raise FileNotFoundError(
         "Run 24-c16_dlno_mp2_gradient.py first to create the checkpoint "
         "and DF integral files."
@@ -59,8 +67,11 @@ def build_mf(mol_):
     mf.with_df.max_memory = mol_.max_memory
     mf.with_df.attach_outcore_cderi(str(CDERI))
     mf.chkfile = None
-    mf.conv_tol = 1e-10
-    mf.conv_tol_grad = 1e-6
+    # Match example 24 exactly.  Restarted local-orbital cotangents are tied
+    # to the canonical MO gauge, so the fresh SCF response must converge to
+    # the same orbitals rather than merely to the same total energy.
+    mf.conv_tol = SCF_CONV_TOL
+    mf.conv_tol_grad = SCF_CONV_TOL_GRAD
     mf.max_cycle = 100
     mf.kernel(dm0=dm0, dump_chk=False)
     if not mf.converged:
@@ -77,6 +88,8 @@ energy, mol_bar, details = IAOFragmentMP2.value_and_grad(
     pair_energy_model="multipole",
     include_hf=True,
     return_details=True,
+    checkpoint_dir=DLNO_RESTART,
+    resume=True,
 )
 
 print(f"Total energy       {float(energy):+.12f} Eh")

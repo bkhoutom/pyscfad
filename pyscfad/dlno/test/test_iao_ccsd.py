@@ -6,6 +6,7 @@ separated graph with two strong self domains plus one unordered weak pair.
 """
 
 import inspect
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -15,8 +16,11 @@ import pytest
 from pyscfad import config_update, gto, scf
 from pyscfad.cc import dfccsd
 from pyscfad.dlno.ccsd import DLNOCCSD
+from pyscfad.dlno import iao_ccsd as iao_ccsd_module
+from pyscfad.dlno import _restart as restart_module
 from pyscfad.dlno.iao_ccsd import (
     _assemble_iao_dlno_correlation,
+    _fragment_value_and_grad,
     build_iao_dlno_ccsd_static_selections,
 )
 from pyscfad.dlno.iao_mp2 import (
@@ -67,6 +71,222 @@ def test_correction_bookkeeping_and_cotangent_seeds_are_unique():
     np.testing.assert_array_equal(gradients[1], np.ones(3))
     np.testing.assert_array_equal(gradients[2], -np.ones(3))
     np.testing.assert_array_equal(gradients[3], np.asarray(1.0))
+
+
+def test_fragment_forward_restart_replays_lazy_triples_pullback(monkeypatch):
+    """A saved triples primal skips its energy but preserves its VJP."""
+
+    @jax.custom_vjp
+    def lazy_triples(mf_value, common_value):
+        return jnp.zeros((), dtype=mf_value.dtype)
+
+    def lazy_fwd(mf_value, common_value):
+        del common_value
+        return jnp.zeros((), dtype=mf_value.dtype), None
+
+    def lazy_bwd(_residual, cotangent):
+        return 7.0 * cotangent, 11.0 * cotangent
+
+    lazy_triples.defvjp(lazy_fwd, lazy_bwd)
+    passes = []
+
+    def fake_solve(
+        mf_value,
+        common_value,
+        _static,
+        _fragment_index,
+        _metadata,
+        *,
+        profile_pass=None,
+        **_kwargs,
+    ):
+        passes.append(profile_pass)
+        e_mp2 = 2.0 * mf_value + 3.0 * common_value
+        e_ccsd = 5.0 * mf_value - common_value
+        e_t = (
+            lazy_triples(mf_value, common_value)
+            if profile_pass == "backward replay"
+            else 7.0 * mf_value + 11.0 * common_value
+        )
+        lis = SimpleNamespace(
+            active_occupied_coeff=jnp.zeros((1, 2)),
+            active_virtual_coeff=jnp.zeros((1, 3)),
+        )
+        return (e_mp2, e_ccsd, e_t), lis
+
+    monkeypatch.setattr(iao_ccsd_module, "_solve_fragment", fake_solve)
+    static = SimpleNamespace(
+        mp2_static=SimpleNamespace(
+            fragments=(SimpleNamespace(extended_atoms=np.asarray([0])),)
+        )
+    )
+    saved = []
+    direct = _fragment_value_and_grad(
+        jnp.asarray(0.4),
+        jnp.asarray(-0.2),
+        static,
+        0,
+        verbose_imp=0,
+        ccsd_t=True,
+        dcsd=False,
+        save_forward=saved.append,
+    )
+    assert len(saved) == 1
+    replay = _fragment_value_and_grad(
+        jnp.asarray(0.4),
+        jnp.asarray(-0.2),
+        static,
+        0,
+        verbose_imp=0,
+        ccsd_t=True,
+        dcsd=False,
+        forward_record=saved[0],
+    )
+
+    assert passes == [None, "backward replay"]
+    np.testing.assert_allclose(replay.value, direct.value, atol=0.0, rtol=0.0)
+    np.testing.assert_allclose(
+        [replay.e_mp2_lis, replay.e_ccsd, replay.e_ccsd_t],
+        [direct.e_mp2_lis, direct.e_ccsd, direct.e_ccsd_t],
+        atol=0.0,
+        rtol=0.0,
+    )
+    np.testing.assert_allclose(replay.mf_bar, direct.mf_bar, atol=0.0, rtol=0.0)
+    np.testing.assert_allclose(
+        replay.common_bar, direct.common_bar, atol=0.0, rtol=0.0
+    )
+    np.testing.assert_allclose(replay.mf_bar, 10.0, atol=0.0, rtol=0.0)
+    np.testing.assert_allclose(replay.common_bar, 7.0, atol=0.0, rtol=0.0)
+
+
+def test_serial_cc_restart_after_fragment_and_from_pre_scf_high_cost(
+    tmp_path, monkeypatch
+):
+    """Durable CC progress and pre-SCF records skip completed work."""
+
+    mol = gto.Mole(
+        atom="""
+        O  0.0000000000  0.0000000000  0.0000000000
+        H  0.0000000000 -0.7570000000  0.5870000000
+        H  0.0000000000  0.7570000000  0.5870000000
+        """,
+        unit="Angstrom",
+        basis="6-31g",
+        verbose=0,
+        max_memory=500,
+    )
+    mol.build(trace_exp=False, trace_ctr_coeff=False)
+
+    def build_mf(mol_):
+        mf = scf.RHF(mol_).density_fit(auxbasis="weigend")
+        mf.conv_tol = 1e-12
+        mf.conv_tol_grad = 1e-10
+        mf.kernel()
+        return mf
+
+    kwargs = dict(
+        build_mf=build_mf,
+        thresh_occ=1.0,
+        thresh_vir=1.0,
+        ccsd_t=True,
+    )
+    reference_energy, reference_bar = DLNOCCSD.value_and_grad(
+        mol, **kwargs
+    )
+
+    class InjectedStop(RuntimeError):
+        pass
+
+    def stop_after_forward(stage, key, path):
+        del key, path
+        if stage == "fragment_forward":
+            raise InjectedStop("durable triples forward reached")
+
+    def stop_after_cc(stage, key, path):
+        del key, path
+        if stage == "cc_progress":
+            raise InjectedStop("durable CC prefix reached")
+
+    checkpoint_dir = tmp_path / "serial-cc-restart"
+    monkeypatch.setattr(
+        restart_module, "_CHECKPOINT_EVENT_HOOK", stop_after_forward
+    )
+    with pytest.raises(InjectedStop, match="durable triples forward"):
+        DLNOCCSD.value_and_grad(
+            mol, checkpoint_dir=checkpoint_dir, **kwargs
+        )
+    forward_path = checkpoint_dir / "records" / "fragment_forward" / "0.h5"
+    handle, metadata, reader = restart_module._read_hdf5(forward_path)
+    try:
+        forward_scalars = restart_module._decode_value(
+            metadata["scalars"], reader
+        )
+    finally:
+        handle.close()
+    assert int(forward_scalars["lis_virtual"]) > 0
+    assert abs(float(forward_scalars["e_ccsd_t"])) > 1e-12
+
+    replay_messages = []
+    monkeypatch.setattr(
+        restart_module, "_CHECKPOINT_EVENT_HOOK", stop_after_cc
+    )
+    with pytest.raises(InjectedStop, match="durable CC prefix"):
+        DLNOCCSD.value_and_grad(
+            mol,
+            checkpoint_dir=checkpoint_dir,
+            resume=True,
+            progress=replay_messages.append,
+            **kwargs,
+        )
+    assert any(
+        "saved (T) forward energy" in line for line in replay_messages
+    )
+
+    messages = []
+    monkeypatch.setattr(restart_module, "_CHECKPOINT_EVENT_HOOK", None)
+    resumed_energy, resumed_bar = DLNOCCSD.value_and_grad(
+        mol,
+        checkpoint_dir=checkpoint_dir,
+        resume=True,
+        progress=messages.append,
+        **kwargs,
+    )
+    assert any(
+        "loaded cumulative CC fragment progress 1/1" in line
+        for line in messages
+    )
+    np.testing.assert_allclose(
+        resumed_energy, reference_energy, atol=2e-11, rtol=0.0
+    )
+    np.testing.assert_allclose(
+        np.asarray(resumed_bar.coords),
+        np.asarray(reference_bar.coords),
+        atol=2e-10,
+        rtol=0.0,
+    )
+
+    def forbidden_common(*_args, **_kwargs):
+        raise AssertionError("pre-SCF restart rebuilt the common orbitals")
+
+    monkeypatch.setattr(
+        iao_ccsd_module, "rebuild_iao_mp2_common", forbidden_common
+    )
+    messages.clear()
+    final_energy, final_bar = DLNOCCSD.value_and_grad(
+        mol,
+        checkpoint_dir=checkpoint_dir,
+        resume=True,
+        progress=messages.append,
+        **kwargs,
+    )
+    assert any("loaded pre-SCF total cotangent" in line for line in messages)
+    np.testing.assert_allclose(final_energy, resumed_energy, atol=0.0, rtol=0.0)
+    np.testing.assert_allclose(
+        np.asarray(final_bar.coords),
+        np.asarray(resumed_bar.coords),
+        atol=2e-12,
+        rtol=0.0,
+    )
 
 
 def test_dlno_ccsd_public_api_has_no_legacy_mp2_correction_switches():

@@ -43,6 +43,7 @@ import pytest
 from pyscfad import config_update, gto, scf
 from pyscfad.df.mpi_df_jk import MPIDFJKExecutor
 from pyscfad.df.mpi_outcore import build_cderi
+from pyscfad.dlno import _restart as restart_module
 from pyscfad.dlno.ccsd import DLNOCCSD as SerialDLNOCCSD
 from pyscfad.dlno import ccsd_mpi as ccsd_mpi_module
 from pyscfad.dlno.ccsd_mpi import DLNOCCSD as MPIDLNOCCSD
@@ -56,7 +57,7 @@ warnings.filterwarnings(
 )
 
 
-def _water(*, dimer: bool, separated: bool = True):
+def _water(*, dimer: bool, separated: bool = True, basis="sto-3g"):
     first = """
     O  0.0000000000  0.0000000000  0.0000000000
     H  0.0000000000 -0.7570000000  0.5870000000
@@ -82,7 +83,7 @@ def _water(*, dimer: bool, separated: bool = True):
     mol = gto.Mole(
         atom=atom,
         unit="Angstrom",
-        basis="sto-3g",
+        basis=basis,
         verbose=0,
         max_memory=1000,
     )
@@ -207,6 +208,134 @@ def test_comm_self_matches_serial_value_and_grad():
         atol=1e-8,
         rtol=0.0,
     )
+
+
+def test_comm_self_ccsdt_restart_at_fragment_boundaries_and_pre_scf(
+    tmp_path, monkeypatch
+):
+    """Triples-forward, fragment-complete, and pre-SCF restarts compose."""
+
+    mol = _water(dimer=False, basis="6-31g")
+    kwargs = dict(
+        build_mf=_build_mf,
+        thresholds=_full_domain_thresholds(),
+        pair_energy_model="all",
+        force_full_domains=True,
+        thresh_occ=1.0,
+        thresh_vir=1.0,
+        ccsd_t=True,
+        comm=MPI.COMM_SELF,
+        root=0,
+        return_details=True,
+    )
+    with _gradient_options():
+        reference_energy, reference_bar, reference_details = (
+            MPIDLNOCCSD.value_and_grad(mol, **kwargs)
+        )
+        assert reference_details.fragments[0].lis_virtual > 0
+        assert abs(reference_details.e_ccsd_t) > 1e-12
+
+        class InjectedStop(RuntimeError):
+            pass
+
+        def stop_after_forward(stage, key, path):
+            del key, path
+            if stage == "fragment_forward":
+                raise InjectedStop("durable MPI triples forward reached")
+
+        def stop_after_fragment(stage, key, path):
+            del key, path
+            if stage == "mpi_cc_progress":
+                raise InjectedStop("durable MPI fragment reached")
+
+        def stop_after_cc_closed(stage, key, path):
+            del key, path
+            if stage == "mpi_cc_closed":
+                raise InjectedStop("durable common-closed MPI CC reached")
+
+        checkpoint_dir = tmp_path / "mpi-ccsdt-restart"
+        monkeypatch.setattr(
+            restart_module, "_CHECKPOINT_EVENT_HOOK", stop_after_forward
+        )
+        with pytest.raises(RuntimeError, match="MPI triples forward"):
+            MPIDLNOCCSD.value_and_grad(
+                mol, checkpoint_dir=checkpoint_dir, **kwargs
+            )
+
+        replay_messages = []
+        monkeypatch.setattr(
+            restart_module, "_CHECKPOINT_EVENT_HOOK", stop_after_fragment
+        )
+        with pytest.raises(RuntimeError, match="durable MPI fragment"):
+            MPIDLNOCCSD.value_and_grad(
+                mol,
+                checkpoint_dir=checkpoint_dir,
+                resume=True,
+                progress=replay_messages.append,
+                **kwargs,
+            )
+        assert any("using backward replay" in line
+                   for line in replay_messages)
+
+        close_messages = []
+        monkeypatch.setattr(
+            restart_module, "_CHECKPOINT_EVENT_HOOK", stop_after_cc_closed
+        )
+        with pytest.raises(RuntimeError, match="common-closed MPI CC"):
+            MPIDLNOCCSD.value_and_grad(
+                mol,
+                checkpoint_dir=checkpoint_dir,
+                resume=True,
+                progress=close_messages.append,
+                **kwargs,
+            )
+        assert any("loaded 1/1 completed fragment pullbacks" in line
+                   for line in close_messages)
+
+        messages = []
+        monkeypatch.setattr(restart_module, "_CHECKPOINT_EVENT_HOOK", None)
+        resumed_energy, resumed_bar, _ = MPIDLNOCCSD.value_and_grad(
+            mol,
+            checkpoint_dir=checkpoint_dir,
+            resume=True,
+            progress=messages.append,
+            **kwargs,
+        )
+        assert any("loaded completed common-closed CC fragment" in line
+                   for line in messages)
+        np.testing.assert_allclose(
+            resumed_energy, reference_energy, atol=2e-11, rtol=0.0
+        )
+        np.testing.assert_allclose(
+            np.asarray(resumed_bar.coords),
+            np.asarray(reference_bar.coords),
+            atol=2e-10,
+            rtol=0.0,
+        )
+
+        def forbidden_common(*_args, **_kwargs):
+            raise AssertionError("pre-SCF restart rebuilt common orbitals")
+
+        monkeypatch.setattr(
+            ccsd_mpi_module, "rebuild_iao_mp2_common", forbidden_common
+        )
+        messages.clear()
+        final_energy, final_bar, _ = MPIDLNOCCSD.value_and_grad(
+            mol,
+            checkpoint_dir=checkpoint_dir,
+            resume=True,
+            progress=messages.append,
+            **kwargs,
+        )
+        assert any("loaded pre-SCF total cotangent" in line
+                   for line in messages)
+        np.testing.assert_allclose(final_energy, resumed_energy, atol=0.0)
+        np.testing.assert_allclose(
+            np.asarray(final_bar.coords),
+            np.asarray(resumed_bar.coords),
+            atol=2e-12,
+            rtol=0.0,
+        )
 
 
 def _run_world_driver(output: Path):

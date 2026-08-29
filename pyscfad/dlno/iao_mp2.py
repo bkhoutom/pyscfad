@@ -60,6 +60,104 @@ __all__ = [
 ]
 
 
+def _serial_restart_scientific_payload(
+    mol,
+    mf,
+    *,
+    frag_lolist,
+    frag_atmlist,
+    frozen,
+    thresholds,
+    pair_energy_model,
+    force_full_domains,
+    include_hf,
+):
+    """Return the gauge-defining inputs for a serial MP2 restart."""
+
+    import numpy as onp
+    from ._restart import df_source_fingerprint
+
+    with_df = getattr(mf, "with_df", None)
+    auxmol = None if with_df is None else getattr(with_df, "auxmol", None)
+
+    # A restarted SCF cleanup can differ from the original convergence by a
+    # few ulps even when it reads the same density and integral checkpoint.
+    # Hashing those raw bytes would reject a scientifically identical run.
+    # The driver fixes the arbitrary MO phases before reaching this helper;
+    # retaining the phase-fixed coefficients in the fingerprint still rejects
+    # permutations or rotations that would make a saved orbital cotangent
+    # unsafe to reuse.
+    def scf_fingerprint(value):
+        rounded = onp.round(onp.asarray(value), decimals=10)
+        # LAPACK phase choices can leave signed zeros after canonicalization.
+        # They compare numerically equal but have different byte digests.
+        return onp.where(rounded == 0, onp.zeros_like(rounded), rounded)
+
+    return {
+        "driver": "serial-iao-dlno-mp2-gradient",
+        "system": {
+            "coords_bohr": onp.asarray(mol.atom_coords()),
+            "atom_symbols": tuple(
+                mol.atom_symbol(index) for index in range(mol.natm)
+            ),
+            "atom_charges": onp.asarray(mol.atom_charges()),
+            "charge": int(mol.charge),
+            "spin": int(mol.spin),
+            "basis": getattr(mol, "_basis", None),
+            "ecp": getattr(mol, "_ecp", None),
+            "pseudo": getattr(mol, "_pseudo", None),
+            "cart": bool(getattr(mol, "cart", False)),
+            "nucmod": getattr(mol, "nucmod", None),
+        },
+        "scf": {
+            "class": f"{type(mf).__module__}.{type(mf).__qualname__}",
+            "mo_coeff": scf_fingerprint(mf.mo_coeff),
+            "mo_energy": scf_fingerprint(mf.mo_energy),
+            "mo_occ": onp.asarray(mf.mo_occ),
+            "e_tot": float(onp.round(float(mf.e_tot), decimals=10)),
+            "auxbasis": (
+                None if with_df is None else getattr(with_df, "auxbasis", None)
+            ),
+            "auxmol_basis": (
+                None if auxmol is None else getattr(auxmol, "_basis", None)
+            ),
+            "df_source": df_source_fingerprint(mf),
+        },
+        "local_correlation": {
+            "frag_lolist": frag_lolist,
+            "frag_atmlist": frag_atmlist,
+            "frozen": frozen,
+            "thresholds": thresholds,
+            "pair_energy_model": str(pair_energy_model),
+            "force_full_domains": bool(force_full_domains),
+            "include_hf": bool(include_hf),
+        },
+    }
+
+
+def _fix_restart_mo_phases(mf):
+    """Put canonical MOs in a deterministic phase gauge inside the SCF VJP."""
+
+    import jax.numpy as jnp
+
+    coeff = jnp.asarray(mf.mo_coeff)
+    coeff_abs = jnp.abs(coeff)
+    largest = jnp.max(coeff_abs, axis=0)
+    # Symmetry-related AO coefficients can tie.  Treat values within numerical
+    # SCF noise as the same maximum and choose the first AO deterministically.
+    near_largest = coeff_abs >= (largest[None, :] * (1.0 - 1e-10))
+    pivot_rows = jnp.argmax(near_largest, axis=0)
+    pivot = coeff[pivot_rows, jnp.arange(coeff.shape[1])]
+    pivot_abs = jnp.abs(pivot)
+    phase = jnp.where(
+        pivot_abs > 0,
+        jnp.conj(pivot) / pivot_abs,
+        jnp.ones_like(pivot),
+    )
+    mf.mo_coeff = coeff * phase[None, :]
+    return mf
+
+
 class IAOFragmentMP2:
     """Fixed-topology IAO-fragment MP2 energy and nuclear gradient.
 
@@ -95,13 +193,16 @@ class IAOFragmentMP2:
 
     @staticmethod
     def correlation_value_and_grad(
-        mf, topology, *, return_details=False
+        mf, topology, *, return_details=False, restart=None
     ):
         """Return ``(E_corr, mf_bar[, details])`` for fixed topology."""
         from .iao_mp2_grad import correlation_value_and_grad
 
         return correlation_value_and_grad(
-            mf, topology, return_details=return_details
+            mf,
+            topology,
+            return_details=return_details,
+            restart=restart,
         )
 
     @staticmethod
@@ -133,6 +234,8 @@ class IAOFragmentMP2:
         topology=None,
         include_hf=True,
         return_details=False,
+        checkpoint_dir=None,
+        resume=False,
     ):
         """Return the fixed-topology local-MP2 energy and nuclear gradient.
 
@@ -163,6 +266,18 @@ class IAOFragmentMP2:
             the strong/weak split, term counts, ED dimensions, and timings.
             The records contain host scalars only; progressive AD tapes are
             still released one term at a time.
+        checkpoint_dir
+            Optional directory for an atomic progressive restart.  The fixed
+            topology, cumulative completed-term cotangent, common-orbital
+            closed cotangent, and final pre-SCF cotangent are retained.
+        resume
+            Resume a compatible calculation from ``checkpoint_dir``.  The
+            converged SCF VJP is always recreated, because a Python pullback
+            closure cannot be serialized.  A completed pre-SCF record then
+            proceeds directly to that one implicit SCF response.  The fresh
+            builder may read an SCF checkpoint, but it must represent the same
+            converged implicit DF-RHF map; compatibility permits only tiny
+            post-checkpoint SCF cleanup noise in the phase-fixed orbitals.
 
         Notes
         -----
@@ -192,6 +307,7 @@ class IAOFragmentMP2:
 
         from pyscfad import config_update
         from pyscfad.ops import stop_trace
+        from ._restart import RestartManager
         from .iao_mp2_grad import (
             IAOFragmentMP2StaticSelections,
             build_iao_mp2_static_selections,
@@ -207,13 +323,73 @@ class IAOFragmentMP2:
                 "and trace_ctr_coeff=False"
             )
 
+        if thresholds is None:
+            thresholds = IAOFragmentMP2Thresholds()
+
+        if resume and checkpoint_dir is None:
+            raise ValueError("resume=True requires checkpoint_dir")
+
+        scf_builder = build_mf
+        if checkpoint_dir is not None:
+            # Orbital cotangents are gauge covariant, so a phase flip between
+            # the original SCF and its restart cannot be ignored.  Make the
+            # phase convention deterministic inside the SCF VJP itself: the
+            # largest AO coefficient of every MO is real and nonnegative.
+            # This keeps both the saved cotangent and the fresh pullback in
+            # the same gauge without serializing a live Python closure.
+            def scf_builder(mol_):
+                return _fix_restart_mo_phases(build_mf(mol_))
+
         with (
             config_update("pyscfad_scf_implicit_diff", True),
             config_update("pyscfad_scf_first_order_custom", False),
         ):
-            mf, scf_pullback = jax.vjp(build_mf, mol)
+            mf, scf_pullback = jax.vjp(scf_builder, mol)
 
-        if topology is None:
+        restart = RestartManager(
+            checkpoint_dir,
+            resume=resume,
+            method="dlno-mp2",
+            scientific_payload=_serial_restart_scientific_payload(
+                mol,
+                mf,
+                frag_lolist=frag_lolist,
+                frag_atmlist=frag_atmlist,
+                frozen=frozen,
+                thresholds=thresholds,
+                pair_energy_model=pair_energy_model,
+                force_full_domains=force_full_domains,
+                include_hf=include_hf,
+            ),
+            initialize=True,
+        )
+
+        if topology is not None and not isinstance(
+            topology,
+            (IAOFragmentTopology, IAOFragmentMP2StaticSelections),
+        ):
+            raise TypeError(
+                "topology must be IAOFragmentTopology or "
+                "IAOFragmentMP2StaticSelections"
+            )
+
+        saved_topology = None
+        if resume and restart.enabled:
+            saved_topology = restart.load_static(
+                expected_type=IAOFragmentMP2StaticSelections
+            )
+        if saved_topology is not None:
+            if isinstance(topology, IAOFragmentMP2StaticSelections):
+                restart.bind_static(topology)
+            elif isinstance(topology, IAOFragmentTopology):
+                supplied_static = stop_trace(
+                    lambda mf_: build_iao_mp2_static_selections(
+                        mf_, topology
+                    )
+                )(mf)
+                restart.bind_static(supplied_static)
+            fixed_topology = saved_topology
+        elif topology is None:
             def build_static(mf_):
                 reference = build_iao_fragment_topology(
                     mf_,
@@ -239,16 +415,53 @@ class IAOFragmentMP2:
                 "IAOFragmentMP2StaticSelections"
             )
 
+        if restart.enabled and saved_topology is None:
+            restart.save_static(fixed_topology)
+
+        # Build the HF seed before looking for the pre-SCF boundary.  Besides
+        # supplying the optional reference contribution, ``hf_bar`` is the
+        # live MF-shaped template used to deserialize a saved total cotangent.
+        e_hf, hf_pullback = jax.vjp(lambda mf_: mf_.e_tot, mf)
+        hf_bar, = hf_pullback(
+            jnp.ones((), dtype=jnp.asarray(e_hf).dtype)
+        )
+        pre_scf = None
+        if resume and restart.enabled:
+            pre_scf = restart.load_record(
+                "pre_scf",
+                templates={"mf_bar": hf_bar},
+                missing_ok=True,
+            )
+        if pre_scf is not None:
+            energy = jnp.asarray(
+                pre_scf.scalars["energy"], dtype=jnp.asarray(e_hf).dtype
+            )
+            mf_bar = pre_scf.trees["mf_bar"]
+            details = None
+            if return_details:
+                # This is a disk-only reconstruction from correlation_closed;
+                # no local MP2 term is reevaluated in a valid pre-SCF restart.
+                closed_result = cls.correlation_value_and_grad(
+                    mf,
+                    fixed_topology,
+                    return_details=True,
+                    restart=restart,
+                )
+                details = closed_result[2]
+            mol_bar, = scf_pullback(mf_bar)
+            jax.block_until_ready((energy, mol_bar))
+            if return_details:
+                return energy, mol_bar, details
+            return energy, mol_bar
+
         corr_result = cls.correlation_value_and_grad(
-            mf, fixed_topology, return_details=return_details
+            mf,
+            fixed_topology,
+            return_details=return_details,
+            restart=restart,
         )
         e_corr, mf_bar = corr_result[:2]
         if include_hf:
-            e_hf, hf_pullback = jax.vjp(lambda mf_: mf_.e_tot, mf)
-            hf_bar, = hf_pullback(
-                jnp.ones((), dtype=jnp.asarray(e_hf).dtype)
-            )
-
             def add_cotangent(left, right):
                 if left is None:
                     return right
@@ -273,6 +486,14 @@ class IAOFragmentMP2:
         else:
             energy = e_corr
 
+        jax.block_until_ready((energy, mf_bar))
+        if restart.enabled:
+            restart.save_record(
+                "pre_scf",
+                scalars={"energy": float(jax.device_get(energy))},
+                trees={"mf_bar": mf_bar},
+                metadata={"include_hf": bool(include_hf)},
+            )
         mol_bar, = scf_pullback(mf_bar)
         jax.block_until_ready((energy, mol_bar))
         if return_details:

@@ -1382,8 +1382,107 @@ def _add_cotangent(left, right):
     return left + right
 
 
+def _restart_is_enabled(restart):
+    return restart is not None and bool(getattr(restart, "enabled", False))
+
+
+def _restart_is_resuming(restart):
+    return _restart_is_enabled(restart) and bool(
+        getattr(restart, "resume", False)
+    )
+
+
+def _term_result_metadata(term):
+    return {
+        "kind": str(term.kind),
+        "left_fragment": int(term.left_fragment),
+        "right_fragment": (
+            None
+            if term.right_fragment is None
+            else int(term.right_fragment)
+        ),
+        "energy": float(term.energy),
+        "forward_seconds": float(term.forward_seconds),
+        "reverse_seconds": float(term.reverse_seconds),
+        "frame_build_seconds": float(term.frame_build_seconds),
+        "frame_replay_seconds": float(term.frame_replay_seconds),
+        "worker_rank": int(term.worker_rank),
+    }
+
+
+def _term_result_from_metadata(row):
+    return IAOMP2TermResult(
+        kind=str(row["kind"]),
+        left_fragment=int(row["left_fragment"]),
+        right_fragment=(
+            None
+            if row.get("right_fragment") is None
+            else int(row["right_fragment"])
+        ),
+        energy=float(row["energy"]),
+        forward_seconds=float(row["forward_seconds"]),
+        reverse_seconds=float(row["reverse_seconds"]),
+        frame_build_seconds=float(row.get("frame_build_seconds", 0.0)),
+        frame_replay_seconds=float(row.get("frame_replay_seconds", 0.0)),
+        worker_rank=int(row.get("worker_rank", 0)),
+    )
+
+
+def _timing_metadata(timing):
+    return {
+        name: float(getattr(timing, name))
+        for name in IAOMP2GradientTiming.__dataclass_fields__
+    }
+
+
+def _timing_from_metadata(row):
+    return IAOMP2GradientTiming(**{
+        name: float(row.get(name, 0.0))
+        for name in IAOMP2GradientTiming.__dataclass_fields__
+    })
+
+
+def _details_restart_metadata(details):
+    return {
+        "term_results": [
+            _term_result_metadata(term) for term in details.terms
+        ],
+        "timing": _timing_metadata(details.timing),
+    }
+
+
+def _details_from_restart_metadata(static, energy, metadata):
+    terms = tuple(
+        _term_result_from_metadata(row)
+        for row in metadata.get("term_results", ())
+    )
+    timing = _timing_from_metadata(metadata.get("timing", {}))
+    return _make_decomposition(static, energy, terms, timing)
+
+
+def _zero_mf_cotangent(mf, dtype):
+    """Return a live MF-shaped zero tree for restart deserialization."""
+
+    _, pullback = jax.vjp(
+        lambda mf_: np.zeros((), dtype=dtype), mf
+    )
+    mf_bar, = pullback(np.ones((), dtype=dtype))
+    return mf_bar
+
+
+def _zero_term_cotangents(mf, common):
+    """Return live zero trees matching one MP2 term's two inputs."""
+
+    _, pullback = jax.vjp(
+        lambda mf_, common_: np.zeros((), dtype=common_.s1e.dtype),
+        mf,
+        common,
+    )
+    return pullback(np.ones((), dtype=common.s1e.dtype))
+
+
 def _progressive_correlation_pullback(
-    mf, common, static, *, return_details=False
+    mf, common, static, *, return_details=False, restart=None
 ):
     """Return correlation energy plus cotangents of ``mf`` and ``common``.
 
@@ -1394,13 +1493,60 @@ def _progressive_correlation_pullback(
     partners even though the pair energies are independent.  Immediate
     pullback and collection keep the peak tied to one ED or one weak pair.
     """
+    work = _correlation_term_specs(static)
     energy = np.zeros((), dtype=common.s1e.dtype)
     mf_bar = None
     common_bar = None
     term_results = []
+    completed_count = 0
+    previous_elapsed = 0.0
     total_start = time.perf_counter() if return_details else None
 
-    def accumulate_term(term, spec):
+    if _restart_is_resuming(restart):
+        zero_mf_bar, zero_common_bar = _zero_term_cotangents(mf, common)
+        progress = restart.load_record(
+            "correlation_progress",
+            templates={
+                "mf_bar": zero_mf_bar,
+                "common_bar": zero_common_bar,
+            },
+            missing_ok=True,
+        )
+        if progress is not None:
+            completed_count = int(progress.scalars["completed_count"])
+            if completed_count < 0 or completed_count > len(work):
+                raise RuntimeError(
+                    "serial MP2 restart completed-term count is invalid"
+                )
+            saved_specs = tuple(
+                (str(row[0]), int(row[1]), int(row[2]))
+                for row in progress.metadata.get("completed_specs", ())
+            )
+            if saved_specs != work[:completed_count]:
+                raise RuntimeError(
+                    "serial MP2 restart term prefix does not match the "
+                    "fixed topology"
+                )
+            energy = np.asarray(
+                progress.scalars["energy"], dtype=common.s1e.dtype
+            )
+            mf_bar = progress.trees["mf_bar"]
+            common_bar = progress.trees["common_bar"]
+            previous_elapsed = float(
+                progress.scalars.get("elapsed_seconds", 0.0)
+            )
+            if return_details:
+                term_results = [
+                    _term_result_from_metadata(row)
+                    for row in progress.metadata.get("term_results", ())
+                ]
+                if len(term_results) != completed_count:
+                    raise RuntimeError(
+                        "serial MP2 restart term diagnostics are incomplete"
+                    )
+        del zero_mf_bar, zero_common_bar
+
+    def accumulate_term(term, spec, term_index):
         nonlocal energy, mf_bar, common_bar
         forward_start = time.perf_counter() if return_details else None
         term_energy, pullback = jax.vjp(term, mf, common)
@@ -1436,6 +1582,31 @@ def _progressive_correlation_pullback(
                 forward_seconds=float(forward_seconds),
                 reverse_seconds=float(reverse_seconds),
             ))
+        if _restart_is_enabled(restart):
+            elapsed_seconds = previous_elapsed
+            if return_details:
+                elapsed_seconds += time.perf_counter() - total_start
+            restart.save_record(
+                "correlation_progress",
+                scalars={
+                    "energy": float(jax.device_get(energy)),
+                    "completed_count": int(term_index + 1),
+                    "elapsed_seconds": float(elapsed_seconds),
+                },
+                trees={
+                    "mf_bar": mf_bar,
+                    "common_bar": common_bar,
+                },
+                metadata={
+                    "completed_specs": [
+                        [str(kind), int(left), int(right)]
+                        for kind, left, right in work[:term_index + 1]
+                    ],
+                    "term_results": [
+                        _term_result_metadata(item) for item in term_results
+                    ] if return_details else [],
+                },
+            )
         del pullback, term_mf_bar, term_common_bar
         # Saved JAX pullbacks contain reference cycles.  Waiting for the
         # generational collector lets several independent multipole tapes
@@ -1443,13 +1614,15 @@ def _progressive_correlation_pullback(
         # mark.  Collection here is cheap relative to an order-four pair VJP.
         gc.collect()
 
-    for spec in _correlation_term_specs(static):
+    for term_index, spec in enumerate(
+        work[completed_count:], start=completed_count
+    ):
         def term(mf_, common_, _spec=spec):
             return _correlation_term_energy(
                 mf_, common_, static, _spec
             )
 
-        accumulate_term(term, spec)
+        accumulate_term(term, spec, term_index)
     if mf_bar is None:
         raise ValueError("fixed topology must contain at least one fragment")
     if return_details:
@@ -1472,7 +1645,9 @@ def _progressive_correlation_pullback(
             weak_reverse_seconds=sum(
                 item.reverse_seconds for item in weak_results
             ),
-            total_seconds=time.perf_counter() - total_start,
+            total_seconds=(
+                previous_elapsed + time.perf_counter() - total_start
+            ),
         )
         details = _make_decomposition(
             static, energy, term_results, timing
@@ -1482,7 +1657,7 @@ def _progressive_correlation_pullback(
 
 
 def correlation_value_and_grad_from_common(
-    mf, common, static, *, return_details=False
+    mf, common, static, *, return_details=False, restart=None
 ):
     """Return the local-MP2 energy and open ``mf``/``common`` cotangents.
 
@@ -1494,7 +1669,11 @@ def correlation_value_and_grad_from_common(
     a grouped reverse-mode tape.
     """
     result = _progressive_correlation_pullback(
-        mf, common, static, return_details=return_details
+        mf,
+        common,
+        static,
+        return_details=return_details,
+        restart=restart,
     )
     energy, mf_bar, common_bar = result[:3]
     jax.block_until_ready((energy, mf_bar, common_bar))
@@ -1503,7 +1682,9 @@ def correlation_value_and_grad_from_common(
     return energy, mf_bar, common_bar
 
 
-def correlation_value_and_grad(mf, static, *, return_details=False):
+def correlation_value_and_grad(
+    mf, static, *, return_details=False, restart=None
+):
     """Return ``(E_corr, mf_bar)`` with progressive fixed-topology AD.
 
     IAOs and other common continuous arrays are rebuilt once under a saved
@@ -1515,25 +1696,50 @@ def correlation_value_and_grad(mf, static, *, return_details=False):
     first-order replay backend is not valid for this general, nonstationary
     local-orbital cotangent.
     """
-    total_start = time.perf_counter() if return_details else None
-    common_start = time.perf_counter() if return_details else None
+    if _restart_is_resuming(restart):
+        zero_mf_bar = _zero_mf_cotangent(mf, np.asarray(mf.e_tot).dtype)
+        closed = restart.load_record(
+            "correlation_closed",
+            templates={"mf_bar": zero_mf_bar},
+            missing_ok=True,
+        )
+        del zero_mf_bar
+        if closed is not None:
+            energy = np.asarray(
+                closed.scalars["energy"], dtype=np.asarray(mf.e_tot).dtype
+            )
+            mf_bar = closed.trees["mf_bar"]
+            jax.block_until_ready((energy, mf_bar))
+            if return_details:
+                details = _details_from_restart_metadata(
+                    static, energy, closed.metadata
+                )
+                return energy, mf_bar, details
+            return energy, mf_bar
+
+    collect_details = return_details or _restart_is_enabled(restart)
+    common_start = time.perf_counter() if collect_details else None
     common, common_pullback = jax.vjp(
         lambda mf_: rebuild_iao_mp2_common(mf_, static), mf
     )
-    if return_details:
+    if collect_details:
         jax.block_until_ready(common)
         common_forward_seconds = time.perf_counter() - common_start
     result = correlation_value_and_grad_from_common(
-        mf, common, static, return_details=return_details
+        mf,
+        common,
+        static,
+        return_details=collect_details,
+        restart=restart,
     )
     energy, mf_bar, common_bar = result[:3]
-    common_reverse_start = time.perf_counter() if return_details else None
+    common_reverse_start = time.perf_counter() if collect_details else None
     common_mf_bar, = common_pullback(common_bar)
     mf_bar = jax.tree_util.tree_map(
         _add_cotangent, mf_bar, common_mf_bar
     )
     jax.block_until_ready((energy, mf_bar))
-    if return_details:
+    if collect_details:
         common_reverse_seconds = (
             time.perf_counter() - common_reverse_start
         )
@@ -1544,10 +1750,22 @@ def correlation_value_and_grad(mf, static, *, return_details=False):
                 details.timing,
                 common_forward_seconds=common_forward_seconds,
                 common_reverse_seconds=common_reverse_seconds,
-                total_seconds=time.perf_counter() - total_start,
+                total_seconds=(
+                    details.timing.total_seconds
+                    + common_forward_seconds
+                    + common_reverse_seconds
+                ),
             ),
         )
-        return energy, mf_bar, details
+        if _restart_is_enabled(restart):
+            restart.save_record(
+                "correlation_closed",
+                scalars={"energy": float(jax.device_get(energy))},
+                trees={"mf_bar": mf_bar},
+                metadata=_details_restart_metadata(details),
+            )
+        if return_details:
+            return energy, mf_bar, details
     return energy, mf_bar
 
 

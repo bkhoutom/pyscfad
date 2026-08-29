@@ -50,6 +50,7 @@ from .ccsd import DLNOCCSD as _SerialDLNOCCSD
 from .iao_ccsd import (
     _add_cotangent,
     _fragment_value_and_grad,
+    _restart_scientific_payload,
     _validate_solver_options,
     build_iao_dlno_ccsd_domain_selections,
 )
@@ -59,17 +60,19 @@ from .iao_lis import (
     IAOFragmentLISStaticSelections,
     build_iao_lis_fragment_static_selection,
 )
-from .iao_mp2 import IAOFragmentMP2Thresholds
+from .iao_mp2 import IAOFragmentMP2Thresholds, _fix_restart_mo_phases
 from .iao_mp2_grad import build_strong_ed_domain, rebuild_iao_mp2_common
 from .iao_mp2_mpi import (
     _progress_enabled,
     _to_device_leaf,
     _to_host_leaf,
     _tree_sum_to_root,
+    _verify_shared_reference,
     _verify_shared_gauge,
     _zero_term_cotangents,
     correlation_value_and_grad as _mp2_correlation_value_and_grad,
 )
+from ._restart import RestartManager
 
 
 __all__ = [
@@ -109,6 +112,32 @@ class IAODLNOCCSDMPIResult:
     total_seconds: float
 
 
+def _fragment_record_metadata(record):
+    return {
+        "fragment_index": int(record.fragment_index),
+        "worker_rank": int(record.worker_rank),
+        "e_mp2_lis": float(record.e_mp2_lis),
+        "e_ccsd": float(record.e_ccsd),
+        "e_ccsd_t": float(record.e_ccsd_t),
+        "lis_occupied": int(record.lis_occupied),
+        "lis_virtual": int(record.lis_virtual),
+        "wall_seconds": float(record.wall_seconds),
+    }
+
+
+def _fragment_record_from_metadata(row):
+    return IAODLNOCCSDMPIFragmentResult(
+        fragment_index=int(row["fragment_index"]),
+        worker_rank=int(row["worker_rank"]),
+        e_mp2_lis=float(row["e_mp2_lis"]),
+        e_ccsd=float(row["e_ccsd"]),
+        e_ccsd_t=float(row["e_ccsd_t"]),
+        lis_occupied=int(row["lis_occupied"]),
+        lis_virtual=int(row["lis_virtual"]),
+        wall_seconds=float(row["wall_seconds"]),
+    )
+
+
 def _progress_reporter(progress, *, rank, root):
     enabled = _progress_enabled(progress)
     if not enabled or rank != root:
@@ -131,6 +160,48 @@ def _report_summary(reporter, lines):
     if reporter is None:
         return
     emit_lines(lambda line: _report_progress(reporter, line), lines)
+
+
+def _mpi_restart_scientific_payload(
+    mol,
+    mf,
+    *,
+    frag_lolist,
+    frag_atmlist,
+    frozen,
+    thresholds,
+    pair_energy_model,
+    force_full_domains,
+    thresh_occ,
+    thresh_vir,
+    internal_rank_threshold,
+    ccsd_t,
+    dcsd,
+    nproc,
+    root,
+):
+    """Return the scientific identity of an MPI CC gradient restart."""
+
+    payload = _restart_scientific_payload(
+        mol,
+        mf,
+        frag_lolist=frag_lolist,
+        frag_atmlist=frag_atmlist,
+        frozen=frozen,
+        thresholds=thresholds,
+        pair_energy_model=pair_energy_model,
+        force_full_domains=force_full_domains,
+        thresh_occ=thresh_occ,
+        thresh_vir=thresh_vir,
+        internal_rank_threshold=internal_rank_threshold,
+        ccsd_t=ccsd_t,
+        dcsd=dcsd,
+    )
+    payload["driver_schema"] = "mpi-iao-dlno-gradient-v1"
+    # Rank-local cumulative CC states use the current round-robin ownership.
+    # A partial restart therefore deliberately requires the same layout.
+    payload["mpi"] = {"size": int(nproc), "root": int(root)}
+    return payload
 
 
 def _exception_text(stage):
@@ -283,6 +354,244 @@ def _assemble_lis_static_selections(
     )
 
 
+def _finish_value_and_grad(
+    mol,
+    *,
+    mf,
+    scf_pullback,
+    scf_executor,
+    parallel_scf_jk,
+    total_mf_bar,
+    energy,
+    canonical,
+    e_iao_mp2,
+    components,
+    e_corr,
+    records,
+    ccsd_t,
+    dcsd,
+    comm,
+    root,
+    reporter,
+    started,
+    return_details,
+):
+    """Apply the one final SCF response and assemble collective outputs."""
+
+    rank = comm.Get_rank()
+    nproc = comm.Get_size()
+    response_setup_error = None
+    mol_bar = None
+    if rank == root:
+        try:
+            _report_progress(
+                reporter,
+                "single implicit SCF response: " + (
+                    "starting with MPI-parallel DF J/K and coordinate VJP"
+                    if parallel_scf_jk else "starting on root"
+                ),
+            )
+            response_started = time.perf_counter()
+        except Exception:  # pragma: no cover - multi-rank failure path
+            response_setup_error = _exception_text(
+                "root implicit SCF response setup"
+            )
+    response_setup_error = comm.bcast(response_setup_error, root=root)
+    if response_setup_error is not None:
+        if scf_executor is not None:
+            scf_executor.close_local()
+        raise RuntimeError(response_setup_error)
+
+    response_error = None
+    if rank == root:
+        try:
+            if parallel_scf_jk:
+                with scf_executor.root_session(final=True):
+                    mol_bar, = scf_pullback(total_mf_bar)
+                    jax.block_until_ready(mol_bar)
+            else:
+                mol_bar, = scf_pullback(total_mf_bar)
+                jax.block_until_ready(mol_bar)
+            gradient_norm = float(numpy.linalg.norm(
+                numpy.asarray(mol_bar.coords)
+            ))
+            _report_progress(
+                reporter,
+                "single implicit SCF response: done in "
+                f"{time.perf_counter() - response_started:.1f} s; "
+                f"|gradient|={gradient_norm:.6e} Eh/bohr",
+            )
+        except Exception:  # pragma: no cover - multi-rank failure path
+            response_error = _exception_text("root implicit SCF response")
+    elif parallel_scf_jk:
+        try:
+            service_exit = scf_executor.serve(mf.with_df)
+            if service_exit is not ServiceExit.STOPPED:
+                raise RuntimeError(
+                    "MPI DF-J/K reverse worker service paused before the "
+                    "SCF pullback completed"
+                )
+        except Exception:
+            response_error = _exception_text(
+                f"implicit SCF response worker rank {rank}"
+            )
+    _raise_if_any_rank_failed(comm, response_error)
+
+    total_seconds = comm.allreduce(
+        time.perf_counter() - started, op=MPI.MAX
+    )
+    _report_progress(
+        reporter,
+        f"complete: E={energy:.12f} Eh; wall={total_seconds:.1f} s",
+    )
+    if rank == root and reporter is not None:
+        _report_summary(
+            reporter,
+            energy_summary_lines(
+                e_hf=canonical["e_tot"],
+                e_iao_mp2=e_iao_mp2,
+                e_mp2_lis=components["e_mp2_lis"],
+                e_ccsd=components["e_ccsd"],
+                e_ccsd_t=components["e_ccsd_t"],
+                e_corr=e_corr,
+                e_total=energy,
+                correlated_method="DCSD" if dcsd else "CCSD",
+                include_triples=ccsd_t,
+            ),
+        )
+        _report_summary(
+            reporter,
+            nuclear_force_lines(mol, numpy.asarray(mol_bar.coords)),
+        )
+    if return_details:
+        if rank == root:
+            details = IAODLNOCCSDMPIResult(
+                e_hf=float(canonical["e_tot"]),
+                e_iao_mp2=float(e_iao_mp2),
+                e_mp2_lis=float(components["e_mp2_lis"]),
+                e_ccsd=float(components["e_ccsd"]),
+                e_ccsd_t=float(components["e_ccsd_t"]),
+                e_corr=float(e_corr),
+                e_total=float(energy),
+                fragments=tuple(records),
+                nproc=int(nproc),
+                total_seconds=float(total_seconds),
+            )
+        else:
+            details = None
+        details = comm.bcast(details, root=root)
+        return energy, mol_bar, details
+    return energy, mol_bar
+
+
+def _complete_after_cc(
+    mol,
+    *,
+    mf,
+    scf_pullback,
+    scf_executor,
+    parallel_scf_jk,
+    cc_mf_bar_root,
+    hf_bar,
+    canonical,
+    static_selections,
+    components,
+    records,
+    restart,
+    ccsd_t,
+    dcsd,
+    comm,
+    root,
+    reporter,
+    progress,
+    started,
+    return_details,
+):
+    """Add/resume global MP2, save the pre-SCF bar, and finish response."""
+
+    rank = comm.Get_rank()
+    _report_progress(reporter, "molecule-wide MPI IAO-DLNO-MP2: starting")
+    e_iao_mp2, mp2_mf_bar_root = _mp2_correlation_value_and_grad(
+        mf,
+        static_selections.mp2_static,
+        comm=comm,
+        root=root,
+        return_details=False,
+        progress=progress,
+        restart=restart,
+    )
+    e_iao_mp2 = float(e_iao_mp2)
+    e_corr = (
+        components["e_ccsd"]
+        + components["e_ccsd_t"]
+        - components["e_mp2_lis"]
+        + e_iao_mp2
+    )
+    energy = float(canonical["e_tot"]) + e_corr
+
+    response_setup_error = None
+    total_mf_bar = None
+    if rank == root:
+        try:
+            total_mf_bar = jax.tree_util.tree_map(
+                _add_cotangent, cc_mf_bar_root, mp2_mf_bar_root
+            )
+            total_mf_bar = jax.tree_util.tree_map(
+                _add_cotangent, total_mf_bar, hf_bar
+            )
+            jax.block_until_ready(total_mf_bar)
+            if restart.enabled:
+                restart.save_record(
+                    "pre_scf",
+                    scalars={
+                        "e_iao_mp2": float(e_iao_mp2),
+                        "e_mp2_lis": float(components["e_mp2_lis"]),
+                        "e_ccsd": float(components["e_ccsd"]),
+                        "e_ccsd_t": float(components["e_ccsd_t"]),
+                        "e_corr": float(e_corr),
+                        "e_total": float(energy),
+                    },
+                    trees={"mf_bar": total_mf_bar},
+                    metadata={
+                        "fragment_records": [
+                            _fragment_record_metadata(record)
+                            for record in records
+                        ]
+                    },
+                )
+                _report_progress(
+                    reporter,
+                    "restart: saved total pre-SCF energy and mean-field "
+                    "cotangent",
+                )
+        except Exception:  # pragma: no cover - multi-rank failure path
+            response_setup_error = _exception_text(
+                "root pre-SCF cotangent assembly/checkpoint"
+            )
+    _raise_if_root_failed(comm, response_setup_error, root=root)
+    return _finish_value_and_grad(
+        mol,
+        mf=mf,
+        scf_pullback=scf_pullback,
+        scf_executor=scf_executor,
+        parallel_scf_jk=parallel_scf_jk,
+        total_mf_bar=total_mf_bar,
+        energy=energy,
+        canonical=canonical,
+        e_iao_mp2=e_iao_mp2,
+        components=components,
+        e_corr=e_corr,
+        records=records,
+        ccsd_t=ccsd_t,
+        dcsd=dcsd,
+        comm=comm,
+        root=root,
+        reporter=reporter,
+        started=started,
+        return_details=return_details,
+    )
+
+
 def _value_and_grad(
     mol,
     *,
@@ -305,6 +614,8 @@ def _value_and_grad(
     root=0,
     return_details=False,
     progress=False,
+    checkpoint_dir=None,
+    resume=False,
 ):
     """Implementation body for :meth:`DLNOCCSD.value_and_grad`."""
     rank = comm.Get_rank()
@@ -313,17 +624,26 @@ def _value_and_grad(
     if root < 0 or root >= nproc:
         raise ValueError(f"root={root} is invalid for {nproc} MPI ranks")
     _validate_solver_options(ccsd_t=ccsd_t, dcsd=dcsd)
+    if resume and checkpoint_dir is None:
+        raise ValueError("resume=True requires checkpoint_dir")
     progress_enabled = _progress_enabled(progress)
     schedules = comm.allgather((
         root,
         bool(return_details),
         progress_enabled,
         bool(parallel_scf_jk),
+        bool(ccsd_t),
+        bool(dcsd),
+        None if checkpoint_dir is None else str(
+            os.path.abspath(os.path.expanduser(os.fspath(checkpoint_dir)))
+        ),
+        bool(resume),
     ))
     if len(set(schedules)) != 1:
         raise ValueError(
-            "root, return_details, progress, and parallel_scf_jk must be "
-            "consistent on all ranks"
+            "root, return_details, progress, parallel_scf_jk, "
+            "ccsd_t, dcsd, checkpoint_dir, and resume must be consistent "
+            "on all ranks"
         )
     parallel_scf_jk = bool(parallel_scf_jk) and nproc > 1
     reporter = _progress_reporter(progress, rank=rank, root=root)
@@ -340,6 +660,11 @@ def _value_and_grad(
         )
     if thresholds is None:
         thresholds = IAOFragmentMP2Thresholds()
+
+    scf_builder = build_mf
+    if checkpoint_dir is not None:
+        def scf_builder(mol_):
+            return _fix_restart_mo_phases(build_mf(mol_))
 
     scf_executor = None
     mf = None
@@ -398,10 +723,10 @@ def _value_and_grad(
             ):
                 if parallel_scf_jk:
                     with scf_executor.root_session(final=False):
-                        mf, scf_pullback = jax.vjp(build_mf, mol)
+                        mf, scf_pullback = jax.vjp(scf_builder, mol)
                         jax.block_until_ready(mf.e_tot)
                 else:
-                    mf, scf_pullback = jax.vjp(build_mf, mol)
+                    mf, scf_pullback = jax.vjp(scf_builder, mol)
                     jax.block_until_ready(mf.e_tot)
             canonical = {
                 "mo_coeff": numpy.asarray(mf.mo_coeff),
@@ -415,13 +740,43 @@ def _value_and_grad(
                 f"{time.perf_counter() - scf_started:.1f} s; "
                 f"E_HF={canonical['e_tot']:+.10f} Eh",
             )
+            restart_payload = _mpi_restart_scientific_payload(
+                mol,
+                mf,
+                frag_lolist=frag_lolist,
+                frag_atmlist=frag_atmlist,
+                frozen=frozen,
+                thresholds=thresholds,
+                pair_energy_model=pair_energy_model,
+                force_full_domains=force_full_domains,
+                thresh_occ=thresh_occ,
+                thresh_vir=thresh_vir,
+                internal_rank_threshold=internal_rank_threshold,
+                ccsd_t=ccsd_t,
+                dcsd=dcsd,
+                nproc=nproc,
+                root=root,
+            )
+            restart = RestartManager(
+                checkpoint_dir,
+                resume=resume,
+                method=(
+                    "mpi-iao-dlno-dcsd-gradient" if dcsd else
+                    "mpi-iao-dlno-ccsd-t-gradient" if ccsd_t else
+                    "mpi-iao-dlno-ccsd-gradient"
+                ),
+                scientific_payload=restart_payload,
+                initialize=True,
+            )
         except Exception:  # pragma: no cover - multi-rank failure path
             if scf_executor is not None:
                 scf_executor.stop_workers()
             setup_error = _exception_text("root SCF/VJP setup")
             mf = scf_pullback = canonical = None
+            restart = restart_payload = None
     else:
         scf_pullback = canonical = None
+        restart = restart_payload = None
         if parallel_scf_jk:
             try:
                 service_exit = scf_executor.serve(mf.with_df)
@@ -442,6 +797,52 @@ def _value_and_grad(
             scf_executor.close_local()
         raise RuntimeError("\n".join(setup_errors))
     canonical = comm.bcast(canonical, root=root)
+    restart_payload = comm.bcast(restart_payload, root=root)
+
+    # Probe the final pre-SCF boundary before non-root CC/DF skeleton setup.
+    # Without MPI-parallel SCF response those skeletons are not used at all by
+    # a completed restart; with it, workers already own the paused DF service
+    # object created above and only need root's canonical state installed.
+    pre_scf = None
+    pre_scf_payload = None
+    pre_scf_error = None
+    e_hf = hf_pullback = hf_bar = None
+    if rank == root:
+        try:
+            e_hf, hf_pullback = jax.vjp(lambda mf_: mf_.e_tot, mf)
+            hf_bar, = hf_pullback(
+                jnp.ones((), dtype=jnp.asarray(e_hf).dtype)
+            )
+            if resume and restart.enabled:
+                if static_selections is not None:
+                    if not isinstance(
+                        static_selections,
+                        IAOFragmentLISStaticSelections,
+                    ):
+                        raise TypeError(
+                            "static_selections must be "
+                            "IAOFragmentLISStaticSelections"
+                        )
+                    restart.bind_static(static_selections)
+                pre_scf = restart.load_record(
+                    "pre_scf",
+                    templates={"mf_bar": hf_bar},
+                    missing_ok=True,
+                )
+                if pre_scf is not None:
+                    pre_scf_payload = (
+                        dict(pre_scf.scalars),
+                        tuple(
+                            _fragment_record_from_metadata(row)
+                            for row in pre_scf.metadata.get(
+                                "fragment_records", ()
+                            )
+                        ),
+                    )
+        except Exception:
+            pre_scf_error = _exception_text("root pre-SCF restart load")
+    _raise_if_root_failed(comm, pre_scf_error, root=root)
+    pre_scf_payload = comm.bcast(pre_scf_payload, root=root)
 
     worker_error = None
     if rank != root:
@@ -451,7 +852,7 @@ def _value_and_grad(
             mf.mo_occ = canonical["mo_occ"]
             mf.e_tot = canonical["e_tot"]
             mf.converged = True
-        else:
+        elif pre_scf_payload is None:
             try:
                 mf = build_mf(
                     mol,
@@ -473,6 +874,57 @@ def _value_and_grad(
                     f"non-root build_mf on MPI rank {rank}"
                 )
     _raise_if_any_rank_failed(comm, worker_error)
+    if pre_scf_payload is None or parallel_scf_jk:
+        _verify_shared_reference(
+            comm,
+            canonical,
+            mf,
+            verify_df_source=parallel_scf_jk,
+        )
+
+    # The fully accumulated pre-SCF cotangent is the last restart boundary.
+    # Check it before rebuilding the common IAO/PAO frame or touching LIS
+    # domains: a restart at this point should pay only for recreating the SCF
+    # VJP (and the rank-local DF skeleton needed by an MPI SCF response).
+    if pre_scf_payload is not None:
+        scalars, records = pre_scf_payload
+        components = {
+            "e_mp2_lis": float(scalars["e_mp2_lis"]),
+            "e_ccsd": float(scalars["e_ccsd"]),
+            "e_ccsd_t": float(scalars["e_ccsd_t"]),
+        }
+        e_iao_mp2 = float(scalars["e_iao_mp2"])
+        e_corr = float(scalars["e_corr"])
+        energy = float(scalars["e_total"])
+        total_mf_bar = (
+            pre_scf.trees["mf_bar"] if rank == root else None
+        )
+        _report_progress(
+            reporter,
+            "restart: loaded pre-SCF total cotangent; common/LIS, fragment, "
+            "and molecule-wide MP2 work is skipped",
+        )
+        return _finish_value_and_grad(
+            mol,
+            mf=mf,
+            scf_pullback=scf_pullback,
+            scf_executor=scf_executor,
+            parallel_scf_jk=parallel_scf_jk,
+            total_mf_bar=total_mf_bar,
+            energy=energy,
+            canonical=canonical,
+            e_iao_mp2=e_iao_mp2,
+            components=components,
+            e_corr=e_corr,
+            records=records,
+            ccsd_t=ccsd_t,
+            dcsd=dcsd,
+            comm=comm,
+            root=root,
+            reporter=reporter,
+            started=started,
+            return_details=return_details,
+        )
 
     # Root owns the discrete fragment/ED topology, the ED orbital frames, and
     # the saved common-orbital VJP.  Only the expensive target-conditioned
@@ -483,6 +935,20 @@ def _value_and_grad(
     if rank == root:
         try:
             prebuilt_static = static_selections
+            saved_static = None
+            if resume and restart.enabled:
+                saved_static = restart.load_static(
+                    expected_type=IAOFragmentLISStaticSelections
+                )
+            if prebuilt_static is None and saved_static is not None:
+                prebuilt_static = saved_static
+                _report_progress(
+                    reporter,
+                    "restart: loaded fixed fragment topology and LIS "
+                    "selections",
+                )
+            elif prebuilt_static is not None:
+                restart.bind_static(prebuilt_static)
             _report_progress(
                 reporter,
                 "fixed fragment/ED domain topology on root rank "
@@ -497,7 +963,7 @@ def _value_and_grad(
                 thresholds=thresholds,
                 pair_energy_model=pair_energy_model,
                 force_full_domains=force_full_domains,
-                static_selections=static_selections,
+                static_selections=prebuilt_static,
             )
             common_original, common_pullback = jax.vjp(
                 lambda mf_: rebuild_iao_mp2_common(mf_, mp2_static), mf
@@ -716,6 +1182,109 @@ def _value_and_grad(
     if rank == root:
         del common_original
 
+    checkpoint_error = None
+    if rank == root:
+        try:
+            restart.bind_static(static_selections)
+            if restart.enabled and not restart.static_path.is_file():
+                restart.save_static(static_selections)
+                _report_progress(
+                    reporter,
+                    "restart: saved fixed fragment topology and LIS "
+                    "selections",
+                )
+        except Exception:
+            checkpoint_error = _exception_text(
+                "root fixed-selection checkpoint write"
+            )
+    _raise_if_root_failed(comm, checkpoint_error, root=root)
+
+    restart_error = None
+    if rank != root:
+        try:
+            restart = RestartManager(
+                checkpoint_dir,
+                resume=resume,
+                method=(
+                    "mpi-iao-dlno-dcsd-gradient" if dcsd else
+                    "mpi-iao-dlno-ccsd-t-gradient" if ccsd_t else
+                    "mpi-iao-dlno-ccsd-gradient"
+                ),
+                scientific_payload=restart_payload,
+                initialize=False,
+            )
+        except Exception:
+            restart_error = _exception_text(
+                f"MPI restart setup on rank {rank}"
+            )
+    _raise_if_any_rank_failed(comm, restart_error)
+
+    cc_closed = None
+    cc_closed_payload = None
+    cc_closed_error = None
+    if rank == root and resume and restart.enabled:
+        try:
+            cc_closed = restart.load_record(
+                "mpi_cc_closed",
+                templates={"mf_bar": hf_bar},
+                missing_ok=True,
+            )
+            if cc_closed is not None:
+                cc_closed_payload = (
+                    dict(cc_closed.scalars),
+                    tuple(
+                        _fragment_record_from_metadata(row)
+                        for row in cc_closed.metadata.get(
+                            "fragment_records", ()
+                        )
+                    ),
+                )
+        except Exception:
+            cc_closed_error = _exception_text(
+                "root common-closed CC restart load"
+            )
+    _raise_if_root_failed(comm, cc_closed_error, root=root)
+    cc_closed_payload = comm.bcast(cc_closed_payload, root=root)
+    if cc_closed_payload is not None:
+        components, records = cc_closed_payload
+        components = {
+            name: float(value) for name, value in components.items()
+        }
+        cc_mf_bar_root = (
+            cc_closed.trees["mf_bar"] if rank == root else None
+        )
+        _report_progress(
+            reporter,
+            "restart: loaded completed common-closed CC fragment "
+            "cotangent; rank fragment checkpoints are skipped",
+        )
+        del common
+        if rank == root:
+            del common_pullback
+        gc.collect()
+        return _complete_after_cc(
+            mol,
+            mf=mf,
+            scf_pullback=scf_pullback,
+            scf_executor=scf_executor,
+            parallel_scf_jk=parallel_scf_jk,
+            cc_mf_bar_root=cc_mf_bar_root,
+            hf_bar=hf_bar,
+            canonical=canonical,
+            static_selections=static_selections,
+            components=components,
+            records=records,
+            restart=restart,
+            ccsd_t=ccsd_t,
+            dcsd=dcsd,
+            comm=comm,
+            root=root,
+            reporter=reporter,
+            progress=progress,
+            started=started,
+            return_details=return_details,
+        )
+
     if reporter is not None:
         _report_summary(
             reporter,
@@ -763,13 +1332,89 @@ def _value_and_grad(
     )
     local_mf_bar, local_common_bar = _zero_term_cotangents(mf, common)
     local_records = []
+    completed_local = set()
+    rank_progress_error = None
+    try:
+        if resume and restart.enabled:
+            rank_progress = restart.load_record(
+                "mpi_cc_progress",
+                key=f"rank-{rank:06d}",
+                templates={
+                    "mf_bar": local_mf_bar,
+                    "common_bar": local_common_bar,
+                },
+                missing_ok=True,
+            )
+            if rank_progress is not None:
+                completed_ids = tuple(
+                    int(value) for value in
+                    rank_progress.metadata.get("completed_ids", ())
+                )
+                expected_ids = tuple(local_indices[:len(completed_ids)])
+                if completed_ids != expected_ids:
+                    raise RuntimeError(
+                        f"MPI rank {rank} CC restart does not contain its "
+                        "round-robin fragment prefix"
+                    )
+                local_records = [
+                    _fragment_record_from_metadata(row)
+                    for row in rank_progress.metadata.get(
+                        "fragment_records", ()
+                    )
+                ]
+                if tuple(
+                    record.fragment_index for record in local_records
+                ) != completed_ids:
+                    raise RuntimeError(
+                        f"MPI rank {rank} CC restart diagnostics do not "
+                        "match its completed fragment IDs"
+                    )
+                local_mf_bar = rank_progress.trees["mf_bar"]
+                local_common_bar = rank_progress.trees["common_bar"]
+                completed_local.update(completed_ids)
+                _report_progress(
+                    reporter,
+                    f"restart: rank {rank} loaded {len(completed_ids)}/"
+                    f"{len(local_indices)} completed fragment pullbacks",
+                )
+    except Exception:
+        rank_progress_error = _exception_text(
+            f"MPI CC progress restart load on rank {rank}"
+        )
+    _raise_if_any_rank_failed(comm, rank_progress_error)
     nbatch = (nfragment + nproc - 1) // nproc
     for batch_index in range(nbatch):
         fragment_index = batch_index * nproc + rank
         fragment_error = None
-        if fragment_index < nfragment:
+        if (
+            fragment_index < nfragment
+            and fragment_index not in completed_local
+        ):
             try:
                 fragment_started = time.perf_counter()
+                forward_record = None
+                if resume and restart.enabled and ccsd_t:
+                    saved_forward = restart.load_record(
+                        "fragment_forward",
+                        key=fragment_index,
+                        templates={},
+                        missing_ok=True,
+                    )
+                    if saved_forward is not None:
+                        forward_record = dict(saved_forward.scalars)
+                        _report_progress(
+                            reporter,
+                            f"restart: fragment {fragment_index + 1} has a "
+                            "saved (T) forward energy; using backward replay",
+                        )
+
+                def save_forward(values, _index=fragment_index):
+                    restart.save_record(
+                        "fragment_forward",
+                        key=_index,
+                        scalars=values,
+                    )
+
                 fragment = _fragment_value_and_grad(
                     mf,
                     common,
@@ -778,6 +1423,12 @@ def _value_and_grad(
                     verbose_imp=verbose_imp,
                     ccsd_t=ccsd_t,
                     dcsd=dcsd,
+                    forward_record=forward_record,
+                    save_forward=(
+                        save_forward
+                        if restart.enabled and ccsd_t
+                        and forward_record is None else None
+                    ),
                 )
                 local_mf_bar = jax.tree_util.tree_map(
                     _add_cotangent, local_mf_bar, fragment.mf_bar
@@ -798,6 +1449,23 @@ def _value_and_grad(
                         time.perf_counter() - fragment_started
                     ),
                 ))
+                completed_local.add(int(fragment_index))
+                if restart.enabled:
+                    restart.save_record(
+                        "mpi_cc_progress",
+                        key=f"rank-{rank:06d}",
+                        trees={
+                            "mf_bar": local_mf_bar,
+                            "common_bar": local_common_bar,
+                        },
+                        metadata={
+                            "completed_ids": sorted(completed_local),
+                            "fragment_records": [
+                                _fragment_record_metadata(record)
+                                for record in local_records
+                            ],
+                        },
+                    )
                 del fragment
                 gc.collect()
             except Exception:  # pragma: no cover - MPI failure jobs
@@ -865,145 +1533,55 @@ def _value_and_grad(
         )
         jax.block_until_ready(cc_mf_bar_root)
         del common_mf_bar, cc_common_bar_root, common_pullback
+    checkpoint_error = None
+    if rank == root and restart.enabled:
+        try:
+            restart.save_record(
+                "mpi_cc_closed",
+                scalars=components,
+                trees={"mf_bar": cc_mf_bar_root},
+                metadata={
+                    "fragment_records": [
+                        _fragment_record_metadata(record)
+                        for record in records
+                    ]
+                },
+            )
+            _report_progress(
+                reporter,
+                "restart: saved completed common-closed CC fragment "
+                "cotangent",
+            )
+        except Exception:
+            checkpoint_error = _exception_text(
+                "root CC checkpoint write"
+            )
+    _raise_if_root_failed(comm, checkpoint_error, root=root)
     del local_mf_bar, local_common_bar, common
     gc.collect()
 
-    # The complete strong+weak MP2 correction has its own bounded, gauge-safe
-    # MPI pullback and returns an already common-closed mf cotangent on root.
-    _report_progress(reporter, "molecule-wide MPI IAO-DLNO-MP2: starting")
-    mp2_result = _mp2_correlation_value_and_grad(
-        mf,
-        static_selections.mp2_static,
+    return _complete_after_cc(
+        mol,
+        mf=mf,
+        scf_pullback=scf_pullback,
+        scf_executor=scf_executor,
+        parallel_scf_jk=parallel_scf_jk,
+        cc_mf_bar_root=cc_mf_bar_root,
+        hf_bar=hf_bar,
+        canonical=canonical,
+        static_selections=static_selections,
+        components=components,
+        records=records,
+        restart=restart,
+        ccsd_t=ccsd_t,
+        dcsd=dcsd,
         comm=comm,
         root=root,
-        return_details=False,
+        reporter=reporter,
         progress=progress,
+        started=started,
+        return_details=return_details,
     )
-    e_iao_mp2, mp2_mf_bar_root = mp2_result
-    e_iao_mp2 = float(e_iao_mp2)
-
-    e_corr = (
-        components["e_ccsd"]
-        + components["e_ccsd_t"]
-        - components["e_mp2_lis"]
-        + e_iao_mp2
-    )
-    energy = float(canonical["e_tot"]) + e_corr
-
-    response_setup_error = None
-    mol_bar = None
-    total_mf_bar = None
-    if rank == root:
-        try:
-            e_hf, hf_pullback = jax.vjp(lambda mf_: mf_.e_tot, mf)
-            hf_bar, = hf_pullback(
-                jnp.ones((), dtype=jnp.asarray(e_hf).dtype)
-            )
-            total_mf_bar = jax.tree_util.tree_map(
-                _add_cotangent, cc_mf_bar_root, mp2_mf_bar_root
-            )
-            total_mf_bar = jax.tree_util.tree_map(
-                _add_cotangent, total_mf_bar, hf_bar
-            )
-            _report_progress(
-                reporter,
-                "single implicit SCF response: " + (
-                    "starting with MPI-parallel DF J/K and coordinate VJP"
-                    if parallel_scf_jk else "starting on root"
-                ),
-            )
-            response_started = time.perf_counter()
-        except Exception:  # pragma: no cover - multi-rank failure path
-            response_setup_error = _exception_text(
-                "root implicit SCF response setup"
-            )
-    response_setup_error = comm.bcast(response_setup_error, root=root)
-    if response_setup_error is not None:
-        if scf_executor is not None:
-            scf_executor.close_local()
-        raise RuntimeError(response_setup_error)
-
-    response_error = None
-    if rank == root:
-        try:
-            if parallel_scf_jk:
-                with scf_executor.root_session(final=True):
-                    mol_bar, = scf_pullback(total_mf_bar)
-                    jax.block_until_ready(mol_bar)
-            else:
-                mol_bar, = scf_pullback(total_mf_bar)
-                jax.block_until_ready(mol_bar)
-            gradient_norm = float(numpy.linalg.norm(
-                numpy.asarray(mol_bar.coords)
-            ))
-            _report_progress(
-                reporter,
-                "single implicit SCF response: done in "
-                f"{time.perf_counter() - response_started:.1f} s; "
-                f"|gradient|={gradient_norm:.6e} Eh/bohr",
-            )
-            del hf_pullback, hf_bar, total_mf_bar
-        except Exception:  # pragma: no cover - multi-rank failure path
-            response_error = _exception_text("root implicit SCF response")
-    elif parallel_scf_jk:
-        try:
-            service_exit = scf_executor.serve(mf.with_df)
-            if service_exit is not ServiceExit.STOPPED:
-                raise RuntimeError(
-                    "MPI DF-J/K reverse worker service paused before the "
-                    "SCF pullback completed"
-                )
-        except Exception:
-            response_error = _exception_text(
-                f"implicit SCF response worker rank {rank}"
-            )
-    _raise_if_any_rank_failed(comm, response_error)
-
-    total_seconds = comm.allreduce(
-        time.perf_counter() - started, op=MPI.MAX
-    )
-    _report_progress(
-        reporter,
-        f"complete: E={energy:.12f} Eh; wall={total_seconds:.1f} s",
-    )
-    if rank == root and reporter is not None:
-        _report_summary(
-            reporter,
-            energy_summary_lines(
-                e_hf=canonical["e_tot"],
-                e_iao_mp2=e_iao_mp2,
-                e_mp2_lis=components["e_mp2_lis"],
-                e_ccsd=components["e_ccsd"],
-                e_ccsd_t=components["e_ccsd_t"],
-                e_corr=e_corr,
-                e_total=energy,
-                correlated_method="DCSD" if dcsd else "CCSD",
-                include_triples=ccsd_t,
-            ),
-        )
-        _report_summary(
-            reporter,
-            nuclear_force_lines(mol, numpy.asarray(mol_bar.coords)),
-        )
-    if return_details:
-        if rank == root:
-            details = IAODLNOCCSDMPIResult(
-                e_hf=float(canonical["e_tot"]),
-                e_iao_mp2=e_iao_mp2,
-                e_mp2_lis=float(components["e_mp2_lis"]),
-                e_ccsd=float(components["e_ccsd"]),
-                e_ccsd_t=float(components["e_ccsd_t"]),
-                e_corr=float(e_corr),
-                e_total=float(energy),
-                fragments=records,
-                nproc=int(nproc),
-                total_seconds=float(total_seconds),
-            )
-        else:
-            details = None
-        details = comm.bcast(details, root=root)
-        return energy, mol_bar, details
-    return energy, mol_bar
 
 
 class DLNOCCSD(_SerialDLNOCCSD):
@@ -1033,6 +1611,8 @@ class DLNOCCSD(_SerialDLNOCCSD):
         root=0,
         return_details=False,
         progress=False,
+        checkpoint_dir=None,
+        resume=False,
     ):
         """Return total energy on all ranks and the nuclear gradient on root.
 
@@ -1053,6 +1633,13 @@ class DLNOCCSD(_SerialDLNOCCSD):
         DF-SCF J/K builds, implicit density response, and distributed
         three-centre coordinate VJP before fragment work and during the final
         SCF pullback.
+
+        ``checkpoint_dir`` must be shared read/write storage visible at the
+        same path on every rank.  ``resume=True`` must be passed collectively,
+        and partial rank records require the same communicator size and root.
+        Do not run two calculations concurrently in one checkpoint directory.
+        A checkpoint-seeded ``build_mf`` must retain the same converged
+        implicit DF-RHF response map as the original run.
         """
         if comm is None:
             comm = MPI.COMM_WORLD
@@ -1078,6 +1665,8 @@ class DLNOCCSD(_SerialDLNOCCSD):
                 root=root,
                 return_details=return_details,
                 progress=progress,
+                checkpoint_dir=checkpoint_dir,
+                resume=resume,
             )
         except Exception:
             if comm.Get_size() > 1:  # pragma: no cover - MPI failure path

@@ -1,6 +1,7 @@
 """C16H34 IAO-DLNO-MP2 energy and nuclear gradient.
 
-This first run writes the DF integrals and SCF checkpoint used by example 25.
+This first run writes the DF integrals, SCF checkpoint, and progressive DLNO
+restart directory used by example 25.
 Run from the repository root with
 
     .venv/bin/python -u examples/lno/24-c16_dlno_mp2_gradient.py
@@ -18,10 +19,13 @@ HERE = Path(__file__).resolve().parent
 SAVE_DIR = HERE.parents[1] / "output" / "c16_dlno_mp2"
 SCF_CHK = SAVE_DIR / "c16_ccpvdz_rhf.chk"
 CDERI = SAVE_DIR / "c16_ccpvdz_cderi.h5"
+DLNO_RESTART = SAVE_DIR / "c16_dlno_mp2.restart"
 
 BASIS = "cc-pvdz"
 AUXBASIS = "cc-pvdz-ri"
 FROZEN = 16
+SCF_CONV_TOL = 1e-12
+SCF_CONV_TOL_GRAD = 1e-10
 
 config.update("pyscfad_moleintor_opt", True)
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
@@ -42,11 +46,14 @@ df_builder.build()
 del df_builder
 
 def build_mf(mol_):
-    """Converge DF-RHF and save the checkpoint used by example 25."""
+    """Converge DF-RHF and save the SCF checkpoint used by example 25."""
     mf = scf.RHF(mol_).density_fit(auxbasis=AUXBASIS)
     mf.with_df.max_memory = mol_.max_memory
     mf.with_df.attach_outcore_cderi(str(CDERI))
     mf.chkfile = str(SCF_CHK)
+    mf.conv_tol = SCF_CONV_TOL
+    mf.conv_tol_grad = SCF_CONV_TOL_GRAD
+    mf.max_cycle = 100
     mf.kernel()
     if not mf.converged:
         raise RuntimeError("DF-RHF did not converge")
@@ -63,6 +70,7 @@ energy, mol_bar, details = IAOFragmentMP2.value_and_grad(
     pair_energy_model="multipole",
     include_hf=True,
     return_details=True,
+    checkpoint_dir=DLNO_RESTART,
 )
 
 print(f"Total energy       {float(energy):+.12f} Eh")

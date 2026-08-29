@@ -227,8 +227,16 @@ class DLNOCCSD(LNOCCSD):
         verbose_imp=0,
         static_selections=None,
         progress=False,
+        checkpoint_dir=None,
+        resume=False,
     ):
-        """Return total energy and nuclear gradient with progressive AD."""
+        """Return total energy and nuclear gradient with progressive AD.
+
+        ``checkpoint_dir`` enables atomic restart records for the fixed
+        topology, fragment forward/reverse work, the local-MP2 correction,
+        and the final pre-SCF cotangent.  Set ``resume=True`` to reuse a
+        scientifically compatible partial calculation from that directory.
+        """
         from .iao_ccsd import value_and_grad
 
         if ccsd_t and dcsd:
@@ -251,4 +259,6 @@ class DLNOCCSD(LNOCCSD):
             verbose_imp=verbose_imp,
             static_selections=static_selections,
             progress=progress,
+            checkpoint_dir=checkpoint_dir,
+            resume=resume,
         )

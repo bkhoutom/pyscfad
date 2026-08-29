@@ -2,8 +2,11 @@ import warnings
 
 from mpi4py import MPI
 import numpy as np
+import pytest
 
 from pyscfad import config_update, gto, scf
+from pyscfad.dlno import _restart as restart_module
+from pyscfad.dlno import iao_mp2_mpi as iao_mp2_mpi_module
 from pyscfad.dlno.iao_mp2 import (
     IAOFragmentMP2 as SerialIAOFragmentMP2,
     IAOFragmentMP2Thresholds,
@@ -139,3 +142,108 @@ def test_comm_self_matches_serial_energy_and_gradient_to_roundoff():
                for line in progress_messages)
     assert any("implicit SCF response: done" in line
                for line in progress_messages)
+
+
+def test_comm_self_restart_after_correlation_and_from_pre_scf(
+    tmp_path, monkeypatch
+):
+    """The MPI wrapper resumes both common-closed and pre-SCF records."""
+
+    mol = _water()
+    kwargs = dict(
+        build_mf=_build_mf,
+        thresholds=_full_domain_thresholds(),
+        pair_energy_model="all",
+        force_full_domains=True,
+        comm=MPI.COMM_SELF,
+        return_details=True,
+    )
+    with (
+        config_update("pyscfad_moleintor_opt", True),
+        config_update("pyscfad_scf_implicit_diff", True),
+        config_update("pyscfad_scf_first_order_custom", False),
+    ):
+        reference_energy, reference_bar, reference_details = (
+            MPIIAOFragmentMP2.value_and_grad(mol, **kwargs)
+        )
+
+        class InjectedStop(RuntimeError):
+            pass
+
+        def stop_after_correlation(stage, key, path):
+            del key, path
+            if stage == "mpi_correlation_closed":
+                raise InjectedStop("durable MPI correlation reached")
+
+        checkpoint_dir = tmp_path / "mpi-mp2-restart"
+        monkeypatch.setattr(
+            restart_module,
+            "_CHECKPOINT_EVENT_HOOK",
+            stop_after_correlation,
+        )
+        with pytest.raises(RuntimeError, match="durable MPI correlation"):
+            MPIIAOFragmentMP2.value_and_grad(
+                mol, checkpoint_dir=checkpoint_dir, **kwargs
+            )
+
+        messages = []
+        monkeypatch.setattr(restart_module, "_CHECKPOINT_EVENT_HOOK", None)
+        resumed_energy, resumed_bar, resumed_details = (
+            MPIIAOFragmentMP2.value_and_grad(
+                mol,
+                checkpoint_dir=checkpoint_dir,
+                resume=True,
+                progress=messages.append,
+                **kwargs,
+            )
+        )
+        assert any(
+            "loaded completed common-closed correlation cotangent" in line
+            for line in messages
+        )
+        np.testing.assert_allclose(
+            resumed_energy, reference_energy, atol=2e-11, rtol=0.0
+        )
+        np.testing.assert_allclose(
+            np.asarray(resumed_bar.coords),
+            np.asarray(reference_bar.coords),
+            atol=2e-10,
+            rtol=0.0,
+        )
+        np.testing.assert_allclose(
+            resumed_details.e_corr,
+            reference_details.e_corr,
+            atol=2e-11,
+            rtol=0.0,
+        )
+
+        def forbidden_correlation(*_args, **_kwargs):
+            raise AssertionError("pre-SCF restart repeated MPI correlation")
+
+        monkeypatch.setattr(
+            iao_mp2_mpi_module,
+            "correlation_value_and_grad",
+            forbidden_correlation,
+        )
+        messages.clear()
+        final_energy, final_bar, final_details = (
+            MPIIAOFragmentMP2.value_and_grad(
+                mol,
+                checkpoint_dir=checkpoint_dir,
+                resume=True,
+                progress=messages.append,
+                **kwargs,
+            )
+        )
+        assert any("loaded pre-SCF total cotangent" in line
+                   for line in messages)
+        np.testing.assert_allclose(final_energy, resumed_energy, atol=0.0)
+        np.testing.assert_allclose(
+            np.asarray(final_bar.coords),
+            np.asarray(resumed_bar.coords),
+            atol=2e-12,
+            rtol=0.0,
+        )
+        np.testing.assert_allclose(
+            final_details.e_corr, resumed_details.e_corr, atol=0.0
+        )

@@ -55,6 +55,18 @@ def _water():
     return mol
 
 
+def _hydrogen_molecule():
+    mol = gto.Mole(
+        atom="H 0 0 0; H 0 0 1.4",
+        unit="Bohr",
+        basis="sto-3g",
+        verbose=0,
+        max_memory=1000,
+    )
+    mol.build(trace_exp=False, trace_ctr_coeff=False)
+    return mol
+
+
 def _build_mf(mol):
     mf = scf.RHF(mol).density_fit()
     mf.conv_tol = 1e-12
@@ -428,4 +440,174 @@ def test_external_iao_pullback_matches_internal_rebuild():
         np.asarray(internal_mol_bar.coords),
         atol=2e-8,
         rtol=2e-7,
+    )
+
+
+def test_serial_restart_from_pre_scf_avoids_local_mp2(tmp_path, monkeypatch):
+    """A completed correlation checkpoint needs only the fresh SCF response."""
+
+    checkpoint_dir = tmp_path / "mp2-restart"
+    kwargs = dict(
+        build_mf=_build_mf,
+        thresholds=_full_domain_thresholds(),
+        pair_energy_model="all",
+        force_full_domains=True,
+        checkpoint_dir=checkpoint_dir,
+    )
+    reference_energy, reference_bar = IAOFragmentMP2.value_and_grad(
+        _water(), **kwargs
+    )
+
+    def forbidden_term(*_args, **_kwargs):
+        raise AssertionError("a pre-SCF restart reevaluated local MP2")
+
+    monkeypatch.setattr(
+        iao_mp2_grad_module, "_correlation_term_energy", forbidden_term
+    )
+    resumed_energy, resumed_bar = IAOFragmentMP2.value_and_grad(
+        _water(), resume=True, **kwargs
+    )
+    np.testing.assert_allclose(resumed_energy, reference_energy, atol=0, rtol=0)
+    np.testing.assert_allclose(
+        np.asarray(resumed_bar.coords),
+        np.asarray(reference_bar.coords),
+        atol=2e-12,
+        rtol=2e-12,
+    )
+
+
+def test_serial_restart_accepts_fresh_scf_vjp_from_chk_and_cderi(
+    tmp_path, monkeypatch
+):
+    """A new process-style SCF/CDERI builder reuses the pre-SCF bar."""
+
+    from pyscf.scf import chkfile as pyscf_scf_chkfile
+
+    mol = _water()
+    checkpoint_dir = tmp_path / "dlno-restart"
+    scf_chk = tmp_path / "rhf.chk"
+    cderi = tmp_path / "cderi.h5"
+
+    df_builder = scf.RHF(mol).density_fit(auxbasis="weigend").with_df
+    df_builder._cderi_to_save = str(cderi)
+    df_builder.build()
+
+    def first_build_mf(mol_):
+        mf = scf.RHF(mol_).density_fit(auxbasis="weigend")
+        mf.with_df.attach_outcore_cderi(str(cderi))
+        mf.chkfile = str(scf_chk)
+        mf.conv_tol = 1e-12
+        mf.conv_tol_grad = 1e-10
+        mf.kernel()
+        assert mf.converged
+        return mf
+
+    kwargs = dict(
+        thresholds=_full_domain_thresholds(),
+        pair_energy_model="all",
+        force_full_domains=True,
+        checkpoint_dir=checkpoint_dir,
+    )
+    reference_energy, reference_bar = IAOFragmentMP2.value_and_grad(
+        mol, build_mf=first_build_mf, **kwargs
+    )
+
+    _, scf_data = pyscf_scf_chkfile.load_scf(str(scf_chk))
+    coeff = np.asarray(scf_data["mo_coeff"])
+    occ = np.asarray(scf_data["mo_occ"])
+    dm0 = np.einsum(
+        "pi,i,qi->pq", coeff, occ, coeff.conj(), optimize=True
+    )
+
+    def restart_build_mf(mol_):
+        mf = scf.RHF(mol_).density_fit(auxbasis="weigend")
+        mf.with_df.attach_outcore_cderi(str(cderi))
+        mf.chkfile = None
+        mf.conv_tol = 1e-12
+        mf.conv_tol_grad = 1e-10
+        mf.kernel(dm0=dm0, dump_chk=False)
+        assert mf.converged
+        return mf
+
+    def forbidden_term(*_args, **_kwargs):
+        raise AssertionError("SCF/CDERI restart reevaluated local MP2")
+
+    monkeypatch.setattr(
+        iao_mp2_grad_module, "_correlation_term_energy", forbidden_term
+    )
+    resumed_energy, resumed_bar = IAOFragmentMP2.value_and_grad(
+        mol, build_mf=restart_build_mf, resume=True, **kwargs
+    )
+    np.testing.assert_allclose(
+        resumed_energy, reference_energy, atol=0.0, rtol=0.0
+    )
+    np.testing.assert_allclose(
+        np.asarray(resumed_bar.coords),
+        np.asarray(reference_bar.coords),
+        atol=2e-10,
+        rtol=0.0,
+    )
+
+
+def test_serial_restart_resumes_after_one_completed_term(tmp_path, monkeypatch):
+    """The durable cumulative bar skips every committed prefix term."""
+
+    from pyscfad.dlno import _restart
+
+    checkpoint_dir = tmp_path / "mp2-partial"
+    kwargs = dict(
+        build_mf=_build_mf,
+        frag_lolist=((0,), (1,)),
+        frag_atmlist=((0,), (1,)),
+        thresholds=_full_domain_thresholds(),
+        pair_energy_model="all",
+        force_full_domains=True,
+        checkpoint_dir=checkpoint_dir,
+    )
+    reference_kwargs = dict(kwargs)
+    reference_kwargs.pop("checkpoint_dir")
+    reference_energy, reference_bar = IAOFragmentMP2.value_and_grad(
+        _hydrogen_molecule(), **reference_kwargs
+    )
+
+    class ExpectedStop(RuntimeError):
+        pass
+
+    def stop_after_first_term(stage, key, path):
+        del key, path
+        if stage == "correlation_progress":
+            raise ExpectedStop
+
+    monkeypatch.setattr(
+        _restart, "_CHECKPOINT_EVENT_HOOK", stop_after_first_term
+    )
+    with pytest.raises(ExpectedStop):
+        IAOFragmentMP2.value_and_grad(_hydrogen_molecule(), **kwargs)
+
+    monkeypatch.setattr(_restart, "_CHECKPOINT_EVENT_HOOK", None)
+    completed_specs = []
+    real_term = iao_mp2_grad_module._correlation_term_energy
+
+    def counted_term(mf, common, static, spec):
+        completed_specs.append(tuple(spec))
+        return real_term(mf, common, static, spec)
+
+    monkeypatch.setattr(
+        iao_mp2_grad_module, "_correlation_term_energy", counted_term
+    )
+    resumed_energy, resumed_bar = IAOFragmentMP2.value_and_grad(
+        _hydrogen_molecule(), resume=True, **kwargs
+    )
+
+    # The first fixed-topology term was atomically committed before the stop.
+    assert ("strong", 0, -1) not in completed_specs
+    assert completed_specs
+    np.testing.assert_allclose(
+        resumed_energy, reference_energy, atol=2e-11, rtol=0.0
+    )
+    np.testing.assert_allclose(
+        np.asarray(resumed_bar.coords),
+        np.asarray(reference_bar.coords),
+        atol=2e-10,
+        rtol=0.0,
     )

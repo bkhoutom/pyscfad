@@ -13,8 +13,9 @@ correction switch.  The molecule-wide IAO-DLNO-MP2 term is evaluated once.
 from __future__ import annotations
 
 import gc
+import hashlib
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 
 import jax
 import jax.numpy as jnp
@@ -24,6 +25,7 @@ from pyscfad import config_update
 from pyscfad.lno.ccsd import _impurity_solve_core
 from pyscfad.ops import stop_trace
 
+from ._restart import RestartManager, df_source_fingerprint
 from ._output import (
     emit_lines,
     energy_summary_lines,
@@ -42,6 +44,7 @@ from .iao_lis import (
 )
 from .iao_mp2 import (
     IAOFragmentMP2Thresholds,
+    _fix_restart_mo_phases,
     build_iao_fragment_topology,
 )
 from .iao_mp2_grad import (
@@ -99,7 +102,142 @@ def _add_cotangent(left, right):
         return right
     if hasattr(right, "dtype") and right.dtype == jax.dtypes.float0:
         return left
+    # A few PySCFAD primitives represent a scalar parameter as a length-one
+    # array in their local VJP.  Letting NumPy broadcasting choose the result
+    # shape would turn an initially scalar live cotangent into shape ``(1,)``;
+    # that cannot later be deserialized against the scalar MF template.  The
+    # two objects contain the same single degree of freedom, so retain the
+    # accumulator's (primal-compatible) shape explicitly.  No higher-rank
+    # reinterpretation is valid: equal element counts do not make two
+    # cotangent spaces interchangeable.
+    left_shape = getattr(left, "shape", None)
+    right_shape = getattr(right, "shape", None)
+    if left_shape != right_shape:
+        left_size = getattr(left, "size", None)
+        right_size = getattr(right, "size", None)
+        if left_size == right_size == 1:
+            right = jnp.reshape(right, left_shape)
+        else:
+            raise ValueError(
+                "incompatible cotangent leaf shapes: "
+                f"{left_shape} and {right_shape}"
+            )
     return left + right
+
+
+def _restart_jsonable(value):
+    """Convert scientific settings to a deterministic JSON-compatible tree."""
+
+    if is_dataclass(value):
+        return _restart_jsonable(asdict(value))
+    if isinstance(value, dict):
+        return {
+            str(key): _restart_jsonable(value[key])
+            for key in sorted(value, key=str)
+        }
+    if isinstance(value, (tuple, list)):
+        return [_restart_jsonable(item) for item in value]
+    if isinstance(value, onp.ndarray):
+        return value.tolist()
+    if isinstance(value, onp.generic):
+        return value.item()
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    try:
+        array = onp.asarray(jax.device_get(value))
+    except Exception:
+        return repr(value)
+    if array.shape == ():
+        return array.item()
+    return array.tolist()
+
+
+def _restart_array_digest(value, *, decimals=10):
+    array = onp.ascontiguousarray(onp.asarray(jax.device_get(value)))
+    # A restarted SCF seeded from its chkfile may finish one cleanup cycle a
+    # few ulps away from the original orbitals.  Quantize only the canonical
+    # SCF fingerprint (not coordinates or saved cotangents) so that harmless
+    # 1e-13 noise is accepted while sign changes and occupied/virtual gauge
+    # rotations remain decisively incompatible.
+    if array.dtype.kind in "fc":
+        array = onp.ascontiguousarray(onp.round(array, decimals=decimals))
+        array = onp.ascontiguousarray(
+            onp.where(array == 0, onp.zeros_like(array), array)
+        )
+    digest = hashlib.sha256()
+    digest.update(str(array.dtype).encode("ascii"))
+    digest.update(repr(tuple(array.shape)).encode("ascii"))
+    digest.update(array.view(onp.uint8))
+    return digest.hexdigest()
+
+
+def _restart_scientific_payload(
+    mol,
+    mf,
+    *,
+    frag_lolist,
+    frag_atmlist,
+    frozen,
+    thresholds,
+    pair_energy_model,
+    force_full_domains,
+    thresh_occ,
+    thresh_vir,
+    internal_rank_threshold,
+    ccsd_t,
+    dcsd,
+):
+    """Return the compatibility identity for a serial gradient restart."""
+
+    threshold_payload = asdict(thresholds)
+    with_df = getattr(mf, "with_df", None)
+    auxmol = None if with_df is None else getattr(with_df, "auxmol", None)
+    return {
+        "driver_schema": "iao-dlno-gradient-v1",
+        "molecule": {
+            "charge": int(mol.charge),
+            "spin": int(mol.spin),
+            "nelectron": int(mol.nelectron),
+            "natm": int(mol.natm),
+            "nao": int(mol.nao),
+            "atom_charges": _restart_jsonable(mol.atom_charges()),
+            "atom_coords_bohr": _restart_jsonable(
+                mol.atom_coords(unit="Bohr")
+            ),
+            "basis": _restart_jsonable(getattr(mol, "_basis", mol.basis)),
+            "ecp": _restart_jsonable(getattr(mol, "_ecp", None)),
+            "pseudo": _restart_jsonable(getattr(mol, "_pseudo", None)),
+            "cart": bool(getattr(mol, "cart", False)),
+            "nucmod": _restart_jsonable(getattr(mol, "nucmod", None)),
+        },
+        "reference_scf": {
+            "class": f"{type(mf).__module__}.{type(mf).__qualname__}",
+            "mo_coeff_sha256": _restart_array_digest(mf.mo_coeff),
+            "mo_energy_sha256": _restart_array_digest(mf.mo_energy),
+            "mo_occ_sha256": _restart_array_digest(mf.mo_occ),
+            "e_tot_rounded": round(float(jax.device_get(mf.e_tot)), 10),
+            "auxbasis": _restart_jsonable(
+                None if with_df is None else getattr(with_df, "auxbasis", None)
+            ),
+            "auxmol_basis": _restart_jsonable(
+                None if auxmol is None else getattr(auxmol, "_basis", None)
+            ),
+            "df_source": df_source_fingerprint(mf),
+        },
+        "settings": {
+            "frag_lolist": _restart_jsonable(frag_lolist),
+            "frag_atmlist": _restart_jsonable(frag_atmlist),
+            "frozen": _restart_jsonable(frozen),
+            "thresholds": _restart_jsonable(threshold_payload),
+            "pair_energy_model": str(pair_energy_model),
+            "force_full_domains": bool(force_full_domains),
+            "thresh_occ": float(thresh_occ),
+            "thresh_vir": float(thresh_vir),
+            "internal_rank_threshold": float(internal_rank_threshold),
+            "ccsd_t": bool(ccsd_t),
+            "dcsd": bool(dcsd),
+        },
+    }
 
 
 def _assemble_iao_dlno_correlation(
@@ -140,6 +278,7 @@ def _solve_fragment(
     verbose_imp,
     ccsd_t,
     dcsd,
+    profile_pass=None,
 ):
     """Build one LIS and solve it, treating an empty excitation space as zero."""
 
@@ -163,7 +302,7 @@ def _solve_fragment(
         ccsd_t=ccsd_t,
         dcsd=dcsd,
         profile_info=None,
-        profile_pass=None,
+        profile_pass=profile_pass,
     )
     return values, lis
 
@@ -247,6 +386,8 @@ def _fragment_value_and_grad(
     verbose_imp,
     ccsd_t,
     dcsd,
+    forward_record=None,
+    save_forward=None,
 ):
     """Differentiate one entire fragment in its locally constructed LIS.
 
@@ -258,6 +399,8 @@ def _fragment_value_and_grad(
     """
     fragment_index = int(fragment_index)
     metadata = _fragment_domain_metadata(static_selections, fragment_index)
+
+    replay_forward = forward_record is not None
 
     def fragment_term(mf_, common_):
         # Raw IAOs retain any internal valence-virtual component, while their
@@ -271,6 +414,9 @@ def _fragment_value_and_grad(
             verbose_imp=verbose_imp,
             ccsd_t=ccsd_t,
             dcsd=dcsd,
+            profile_pass=(
+                "backward replay" if replay_forward else None
+            ),
         )
         value = e_cc + e_t - e_mp2_lis
         auxiliary = (
@@ -285,10 +431,48 @@ def _fragment_value_and_grad(
     fragment_value, fragment_pullback, auxiliary = jax.vjp(
         fragment_term, mf, common, has_aux=True
     )
+    e_mp2_lis, e_cc, e_t, lis_occupied, lis_virtual = auxiliary
+    jax.block_until_ready((fragment_value, e_mp2_lis, e_cc, e_t))
+
+    # A JAX pullback closure is process-local and cannot be serialized.  The
+    # useful checkpoint immediately after the primal is therefore deliberately
+    # tiny: component energies and fixed dimensions only.  On restart we
+    # rebuild the CC tape, but ask the custom triples primitive for its lazy
+    # ``backward replay`` primal.  That skips the expensive real (T) energy
+    # contraction while retaining the exact factor-direct triples pullback.
+    if save_forward is not None and not replay_forward:
+        save_forward({
+            "fragment_index": fragment_index,
+            "e_mp2_lis": float(jax.device_get(e_mp2_lis)),
+            "e_ccsd": float(jax.device_get(e_cc)),
+            "e_ccsd_t": float(jax.device_get(e_t)),
+            "lis_occupied": int(lis_occupied),
+            "lis_virtual": int(lis_virtual),
+        })
+
     fragment_mf_bar, fragment_common_bar = fragment_pullback(
         jnp.ones((), dtype=jnp.asarray(fragment_value).dtype)
     )
-    e_mp2_lis, e_cc, e_t, lis_occupied, lis_virtual = auxiliary
+    if replay_forward:
+        if int(forward_record["fragment_index"]) != fragment_index:
+            raise ValueError(
+                "fragment forward checkpoint index does not match the "
+                f"requested fragment: {forward_record['fragment_index']} "
+                f"!= {fragment_index}"
+            )
+        if (
+            int(forward_record["lis_occupied"]) != int(lis_occupied)
+            or int(forward_record["lis_virtual"]) != int(lis_virtual)
+        ):
+            raise ValueError(
+                "fragment forward checkpoint LIS dimensions do not match "
+                "the replayed fixed selections"
+            )
+        dtype = jnp.asarray(fragment_value).dtype
+        e_mp2_lis = jnp.asarray(forward_record["e_mp2_lis"], dtype=dtype)
+        e_cc = jnp.asarray(forward_record["e_ccsd"], dtype=dtype)
+        e_t = jnp.asarray(forward_record["e_ccsd_t"], dtype=dtype)
+        fragment_value = e_cc + e_t - e_mp2_lis
     jax.block_until_ready(
         (fragment_value, fragment_mf_bar, fragment_common_bar)
     )
@@ -411,6 +595,8 @@ def value_and_grad(
     verbose_imp=0,
     static_selections=None,
     progress=False,
+    checkpoint_dir=None,
+    resume=False,
 ):
     """Return the IAO-DLNO-CCSD(T) total energy and molecular gradient.
 
@@ -426,8 +612,17 @@ def value_and_grad(
 
     Set ``progress=True`` to print flushed, structured summaries independently
     of PySC verbosity, or pass a callable that receives each formatted line.
+
+    If ``checkpoint_dir`` is supplied, fixed selections, a tiny forward
+    record for each perturbative-triples fragment, cumulative fragment
+    cotangents, molecule-wide MP2 progress, and the final pre-SCF cotangent
+    are written atomically.  ``resume=True`` reuses compatible records.  A
+    restart may seed SCF from disk, but ``build_mf`` must still implement the
+    same converged implicit DF-RHF response map.
     """
     _validate_solver_options(ccsd_t=ccsd_t, dcsd=dcsd)
+    if resume and checkpoint_dir is None:
+        raise ValueError("resume=True requires checkpoint_dir")
     if (
         getattr(mol, "exp", None) is not None
         or getattr(mol, "ctr_coeff", None) is not None
@@ -458,6 +653,11 @@ def value_and_grad(
     started = time.perf_counter()
     log(f"IAO-DLNO-{method_label}: start")
 
+    scf_builder = build_mf
+    if checkpoint_dir is not None:
+        def scf_builder(mol_):
+            return _fix_restart_mo_phases(build_mf(mol_))
+
     # The local-orbital cotangent is nonstationary.  It must be closed with
     # the converged fixed-point response, never the experimental finite SCF
     # replay backend.
@@ -465,9 +665,48 @@ def value_and_grad(
         config_update("pyscfad_scf_implicit_diff", True),
         config_update("pyscfad_scf_first_order_custom", False),
     ):
-        mf, scf_pullback = jax.vjp(build_mf, mol)
+        mf, scf_pullback = jax.vjp(scf_builder, mol)
 
-    if static_selections is None:
+    restart = RestartManager(
+        checkpoint_dir,
+        resume=resume,
+        method=f"iao-dlno-{method_label.lower()}-gradient",
+        scientific_payload=_restart_scientific_payload(
+            mol,
+            mf,
+            frag_lolist=frag_lolist,
+            frag_atmlist=frag_atmlist,
+            frozen=frozen,
+            thresholds=thresholds,
+            pair_energy_model=pair_energy_model,
+            force_full_domains=force_full_domains,
+            thresh_occ=thresh_occ,
+            thresh_vir=thresh_vir,
+            internal_rank_threshold=internal_rank_threshold,
+            ccsd_t=ccsd_t,
+            dcsd=dcsd,
+        ),
+    )
+    if restart.enabled:
+        log(
+            f"restart {'resume' if resume else 'checkpoint'} directory: "
+            f"{restart.path}"
+        )
+
+    saved_static = (
+        restart.load_static(expected_type=IAOFragmentLISStaticSelections)
+        if resume else None
+    )
+    if static_selections is not None and not isinstance(
+        static_selections, IAOFragmentLISStaticSelections
+    ):
+        raise TypeError(
+            "static_selections must be IAOFragmentLISStaticSelections"
+        )
+    if static_selections is None and saved_static is not None:
+        static_selections = saved_static
+        log("restart: loaded fixed fragment topology and LIS selections")
+    elif static_selections is None:
         def static_builder(mf_):
             return build_iao_dlno_ccsd_static_selections(
                 mf_,
@@ -483,15 +722,19 @@ def value_and_grad(
             )
 
         static_selections = stop_trace(static_builder)(mf)
-    elif not isinstance(static_selections, IAOFragmentLISStaticSelections):
-        raise TypeError(
-            "static_selections must be IAOFragmentLISStaticSelections"
-        )
+        if restart.enabled:
+            restart.save_static(static_selections)
+            log("restart: saved fixed fragment topology and LIS selections")
+    # An explicitly supplied selection must agree with an existing
+    # checkpoint.  ``bind_static`` performs that scientific identity check
+    # without replacing the saved topology.
+    if restart.enabled:
+        restart.bind_static(static_selections)
+        if not restart.static_path.is_file():
+            restart.save_static(static_selections)
+            log("restart: saved supplied fixed topology and LIS selections")
 
     mp2_static = static_selections.mp2_static
-    common, common_pullback = jax.vjp(
-        lambda mf_: rebuild_iao_mp2_common(mf_, mp2_static), mf
-    )
     if reporter is not None:
         emit_lines(
             reporter,
@@ -518,38 +761,154 @@ def value_and_grad(
         )
 
     e_hf, hf_pullback = jax.vjp(lambda mf_: mf_.e_tot, mf)
-    mf_bar, = hf_pullback(jnp.ones((), dtype=jnp.asarray(e_hf).dtype))
-    common_bar = jax.tree_util.tree_map(jnp.zeros_like, common)
+    hf_bar, = hf_pullback(jnp.ones((), dtype=jnp.asarray(e_hf).dtype))
 
-    e_cc_terms = []
-    e_t_terms = []
-    e_mp2_lis_terms = []
-    fragment_records = []
-    nfragment = len(static_selections.fragments)
-    for fragment_index in range(nfragment):
-        fragment_started = (
-            time.perf_counter() if reporter is not None else None
+    pre_scf = (
+        restart.load_record(
+            "pre_scf",
+            templates={"mf_bar": hf_bar},
+            on_corrupt="raise",
         )
-        fragment = _fragment_value_and_grad(
-            mf,
-            common,
-            static_selections,
-            fragment_index,
-            verbose_imp=verbose_imp,
-            ccsd_t=ccsd_t,
-            dcsd=dcsd,
+        if resume else None
+    )
+    if pre_scf is not None:
+        mf_bar = pre_scf.trees["mf_bar"]
+        components = dict(pre_scf.scalars)
+        fragment_records = list(
+            pre_scf.metadata.get("fragment_records", ())
         )
-        mf_bar = jax.tree_util.tree_map(
-            _add_cotangent, mf_bar, fragment.mf_bar
+        dtype = jnp.asarray(e_hf).dtype
+        e_iao_mp2 = jnp.asarray(components["e_iao_mp2"], dtype=dtype)
+        e_mp2_lis_total = jnp.asarray(
+            components["e_mp2_lis"], dtype=dtype
         )
-        common_bar = jax.tree_util.tree_map(
-            _add_cotangent, common_bar, fragment.common_bar
+        e_ccsd_total = jnp.asarray(components["e_ccsd"], dtype=dtype)
+        e_ccsd_t_total = jnp.asarray(
+            components["e_ccsd_t"], dtype=dtype
         )
-        e_mp2_lis_terms.append(fragment.e_mp2_lis)
-        e_cc_terms.append(fragment.e_ccsd)
-        e_t_terms.append(fragment.e_ccsd_t)
-        jax.block_until_ready((mf_bar, common_bar))
-        if reporter is not None:
+        correlation = jnp.asarray(components["e_corr"], dtype=dtype)
+        energy = jnp.asarray(components["e_total"], dtype=dtype)
+        log(
+            "restart: loaded pre-SCF total cotangent; skipping common "
+            "orbital construction, fragment solves, and local MP2"
+        )
+    else:
+        common, common_pullback = jax.vjp(
+            lambda mf_: rebuild_iao_mp2_common(mf_, mp2_static), mf
+        )
+        mf_bar = hf_bar
+        common_bar = jax.tree_util.tree_map(jnp.zeros_like, common)
+
+        e_cc_terms = []
+        e_t_terms = []
+        e_mp2_lis_terms = []
+        fragment_records = []
+        nfragment = len(static_selections.fragments)
+        cc_progress = (
+            restart.load_record(
+                "cc_progress",
+                templates={
+                    "mf_bar": mf_bar,
+                    "common_bar": common_bar,
+                },
+                on_corrupt="raise",
+            )
+            if resume else None
+        )
+        completed_count = 0
+        if cc_progress is not None:
+            completed_count = int(
+                cc_progress.scalars["completed_count"]
+            )
+            fragment_records = list(
+                cc_progress.metadata.get("fragment_records", ())
+            )
+            completed_ids = tuple(
+                int(value) for value in
+                cc_progress.metadata.get("completed_ids", ())
+            )
+            expected_ids = tuple(range(completed_count))
+            if (
+                completed_count < 0
+                or completed_count > nfragment
+                or completed_ids != expected_ids
+                or len(fragment_records) != completed_count
+            ):
+                raise ValueError(
+                    "cumulative CC restart record is not a complete "
+                    "serial fragment prefix"
+                )
+            mf_bar = cc_progress.trees["mf_bar"]
+            common_bar = cc_progress.trees["common_bar"]
+            for record in fragment_records:
+                e_mp2_lis_terms.append(jnp.asarray(
+                    record["e_mp2_lis"], dtype=common.s1e.dtype
+                ))
+                e_cc_terms.append(jnp.asarray(
+                    record["e_ccsd"], dtype=common.s1e.dtype
+                ))
+                e_t_terms.append(jnp.asarray(
+                    record["e_ccsd_t"], dtype=common.s1e.dtype
+                ))
+            log(
+                "restart: loaded cumulative CC fragment progress "
+                f"{completed_count}/{nfragment}"
+            )
+
+        for fragment_index in range(completed_count, nfragment):
+            fragment_started = time.perf_counter()
+            forward_record = None
+            if resume and ccsd_t:
+                saved_forward = restart.load_record(
+                    "fragment_forward",
+                    key=fragment_index,
+                    templates={},
+                    on_corrupt="raise",
+                )
+                if saved_forward is not None:
+                    forward_record = dict(saved_forward.scalars)
+                    log(
+                        f"restart: fragment {fragment_index + 1}/"
+                        f"{nfragment} has saved (T) forward energy; "
+                        "replaying only its differentiable backward path"
+                    )
+
+            def save_forward(values, _index=fragment_index):
+                restart.save_record(
+                    "fragment_forward",
+                    key=_index,
+                    scalars=values,
+                )
+                log(
+                    f"restart: saved fragment {_index + 1}/{nfragment} "
+                    "forward scalar checkpoint"
+                )
+
+            fragment = _fragment_value_and_grad(
+                mf,
+                common,
+                static_selections,
+                fragment_index,
+                verbose_imp=verbose_imp,
+                ccsd_t=ccsd_t,
+                dcsd=dcsd,
+                forward_record=forward_record,
+                save_forward=(
+                    save_forward
+                    if restart.enabled and ccsd_t and forward_record is None
+                    else None
+                ),
+            )
+            mf_bar = jax.tree_util.tree_map(
+                _add_cotangent, mf_bar, fragment.mf_bar
+            )
+            common_bar = jax.tree_util.tree_map(
+                _add_cotangent, common_bar, fragment.common_bar
+            )
+            e_mp2_lis_terms.append(fragment.e_mp2_lis)
+            e_cc_terms.append(fragment.e_ccsd)
+            e_t_terms.append(fragment.e_ccsd_t)
+            jax.block_until_ready((mf_bar, common_bar))
             fragment_wall = time.perf_counter() - fragment_started
             fragment_records.append({
                 "fragment_index": fragment_index,
@@ -557,41 +916,82 @@ def value_and_grad(
                 "e_mp2_lis": float(fragment.e_mp2_lis),
                 "e_ccsd": float(fragment.e_ccsd),
                 "e_ccsd_t": float(fragment.e_ccsd_t),
+                "lis_occupied": int(fragment.lis_occupied),
+                "lis_virtual": int(fragment.lis_virtual),
                 "wall_seconds": fragment_wall,
             })
+            if restart.enabled:
+                restart.save_record(
+                    "cc_progress",
+                    scalars={"completed_count": fragment_index + 1},
+                    trees={
+                        "mf_bar": mf_bar,
+                        "common_bar": common_bar,
+                    },
+                    metadata={
+                        "completed_ids": list(range(fragment_index + 1)),
+                        "fragment_records": fragment_records,
+                    },
+                )
+                log(
+                    "restart: saved cumulative CC fragment progress "
+                    f"{fragment_index + 1}/{nfragment}"
+                )
             log(
                 f"fragment {fragment_index + 1}/{nfragment} complete: "
                 f"solver LIS occ/vir={fragment.lis_occupied}/"
                 f"{fragment.lis_virtual}; wall={fragment_wall:.1f} s"
             )
-        del fragment
-        gc.collect()
+            del fragment
+            gc.collect()
 
-    e_iao_mp2, mp2_mf_bar, mp2_common_bar = (
-        correlation_value_and_grad_from_common(
-            mf, common, mp2_static
+        e_iao_mp2, mp2_mf_bar, mp2_common_bar = (
+            correlation_value_and_grad_from_common(
+                mf, common, mp2_static, restart=restart
+            )
         )
-    )
-    mf_bar = jax.tree_util.tree_map(
-        _add_cotangent, mf_bar, mp2_mf_bar
-    )
-    common_bar = jax.tree_util.tree_map(
-        _add_cotangent, common_bar, mp2_common_bar
-    )
+        mf_bar = jax.tree_util.tree_map(
+            _add_cotangent, mf_bar, mp2_mf_bar
+        )
+        common_bar = jax.tree_util.tree_map(
+            _add_cotangent, common_bar, mp2_common_bar
+        )
 
-    common_mf_bar, = common_pullback(common_bar)
-    mf_bar = jax.tree_util.tree_map(
-        _add_cotangent, mf_bar, common_mf_bar
-    )
+        common_mf_bar, = common_pullback(common_bar)
+        mf_bar = jax.tree_util.tree_map(
+            _add_cotangent, mf_bar, common_mf_bar
+        )
+        e_mp2_lis_total = jnp.sum(jnp.stack(e_mp2_lis_terms))
+        e_ccsd_total = jnp.sum(jnp.stack(e_cc_terms))
+        e_ccsd_t_total = jnp.sum(jnp.stack(e_t_terms))
+        correlation = _assemble_iao_dlno_correlation(
+            jnp.stack(e_cc_terms),
+            jnp.stack(e_t_terms),
+            jnp.stack(e_mp2_lis_terms),
+            e_iao_mp2,
+        )
+        energy = e_hf + correlation
+        jax.block_until_ready((mf_bar, energy))
+        if restart.enabled:
+            restart.save_record(
+                "pre_scf",
+                scalars={
+                    "e_iao_mp2": float(e_iao_mp2),
+                    "e_mp2_lis": float(e_mp2_lis_total),
+                    "e_ccsd": float(e_ccsd_total),
+                    "e_ccsd_t": float(e_ccsd_t_total),
+                    "e_corr": float(correlation),
+                    "e_total": float(energy),
+                },
+                trees={"mf_bar": mf_bar},
+                metadata={"fragment_records": fragment_records},
+            )
+            log(
+                "restart: saved total pre-SCF energy and mean-field "
+                "cotangent"
+            )
+
     mol_bar, = scf_pullback(mf_bar)
-
-    correlation = _assemble_iao_dlno_correlation(
-        jnp.stack(e_cc_terms),
-        jnp.stack(e_t_terms),
-        jnp.stack(e_mp2_lis_terms),
-        e_iao_mp2,
-    )
-    energy = e_hf + correlation
     jax.block_until_ready((energy, mol_bar))
     log(
         f"IAO-DLNO-{method_label}: done in "
@@ -607,9 +1007,6 @@ def value_and_grad(
                 include_triples=ccsd_t,
             ),
         )
-        e_mp2_lis_total = jnp.sum(jnp.stack(e_mp2_lis_terms))
-        e_ccsd_total = jnp.sum(jnp.stack(e_cc_terms))
-        e_ccsd_t_total = jnp.sum(jnp.stack(e_t_terms))
         emit_lines(
             reporter,
             energy_summary_lines(

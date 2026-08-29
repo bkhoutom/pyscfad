@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextvars import ContextVar
 from functools import wraps
 from jax.interpreters import ad as jax_ad
 from jax.tree_util import tree_flatten
@@ -21,6 +22,12 @@ from pyscfad import numpy as np
 from pyscfad import pytree
 from .addons import restore
 from ._df_jk_opt import get_jk as get_jk_opt
+
+
+# Optional process-local override used by the root-owned MPI DF-J/K service.
+# Keeping the hook here avoids importing mpi4py (or the MPI implementation)
+# from ordinary serial PySCFAD density-fitting code.
+_MPI_GET_JK_HOOK = ContextVar("pyscfad_mpi_df_jk_hook", default=None)
 
 
 def _has_jvp_tracer(*xs):
@@ -52,6 +59,11 @@ def _has_outcore_cderi(dfobj):
 
 
 def get_jk(dfobj, dm, hermi=1, with_j=True, with_k=True, direct_scf_tol=1e-13):
+    mpi_hook = _MPI_GET_JK_HOOK.get()
+    if mpi_hook is not None:
+        return mpi_hook(
+            dfobj, dm, hermi, with_j, with_k, direct_scf_tol
+        )
     # When CDERI lives on disk (outcore placeholder), always route through the
     # custom_vjp opt path: its forward streams cderi blocks from disk via
     # ``dfobj.loop()`` and its backward computes mol/auxmol cotangents

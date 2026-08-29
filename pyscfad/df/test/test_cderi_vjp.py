@@ -566,6 +566,33 @@ def test_cholesky_eri_mo_deriv_vjp_matches_cderi_bar_path(
         int2c=mol._add_suffix('int2c2e'),
         aosym='s2ij',
     )
+    dispatched_blocks = []
+
+    def dispatched_int3c_vjp(block_index, shls_slice, ints_bar):
+        dispatched_blocks.append(block_index)
+        return _cderi_vjp._int3c_coordinate_vjp_block(
+            mol,
+            auxmol,
+            ints_bar,
+            int3c=mol._add_suffix('int3c2e'),
+            shls_slice=shls_slice,
+            naoaux=auxmol.nao,
+        )
+
+    mol_dispatched, aux_dispatched = (
+        _cderi_vjp.cholesky_eri_vjp_from_cderi_block_fn(
+            mol,
+            auxmol,
+            str(cderi_file),
+            cderi_bar_block,
+            1024,
+            int3c=mol._add_suffix('int3c2e'),
+            int2c=mol._add_suffix('int2c2e'),
+            aosym='s2ij',
+            int3c_block_vjp=dispatched_int3c_vjp,
+            max_pair_block=8,
+        )
+    )
     mol_test, aux_test = _cderi_vjp.cholesky_eri_vjp_from_mo_coeff_ybar(
         mol,
         auxmol,
@@ -577,6 +604,21 @@ def test_cholesky_eri_mo_deriv_vjp_matches_cderi_bar_path(
         int3c=mol._add_suffix('int3c2e'),
         int2c=mol._add_suffix('int2c2e'),
         aosym='s2ij',
+    )
+
+    assert len(dispatched_blocks) > 1
+    assert dispatched_blocks == list(range(len(dispatched_blocks)))
+    numpy.testing.assert_allclose(
+        numpy.asarray(mol_dispatched.coords),
+        numpy.asarray(mol_ref.coords),
+        atol=2e-9,
+        rtol=2e-10,
+    )
+    numpy.testing.assert_allclose(
+        numpy.asarray(aux_dispatched.coords),
+        numpy.asarray(aux_ref.coords),
+        atol=2e-9,
+        rtol=2e-10,
     )
 
     assert numpy.allclose(

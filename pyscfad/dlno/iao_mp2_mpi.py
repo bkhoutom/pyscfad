@@ -49,6 +49,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import time
+import traceback
 
 import jax
 import jax.numpy as jnp
@@ -56,6 +57,7 @@ import numpy
 from mpi4py import MPI
 
 from pyscfad import config_update
+from pyscfad.df.mpi_df_jk import MPIDFJKExecutor, ServiceExit
 from pyscfad.ops import stop_trace
 
 from .iao_mp2 import (
@@ -109,6 +111,17 @@ def _progress_reporter(progress, *, rank, root):
 def _report_progress(reporter, message):
     if reporter is not None:
         reporter(f"[IAO-MP2] {message}")
+
+
+def _exception_text(stage):
+    return f"{stage} failed on an MPI rank:\n{traceback.format_exc()}"
+
+
+def _raise_if_any_rank_failed(comm, local_error):
+    errors = comm.allgather(local_error)
+    failures = [error for error in errors if error is not None]
+    if failures:
+        raise RuntimeError("\n".join(failures))
 
 
 def _to_host_leaf(leaf):
@@ -795,6 +808,7 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
         force_full_domains=False,
         topology=None,
         include_hf=True,
+        parallel_scf_jk=False,
         comm=MPI.COMM_WORLD,
         root=0,
         return_details=False,
@@ -816,6 +830,20 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
         standard implicit SCF pullback.  The energy is returned on all ranks;
         the Mole-shaped gradient is returned on root and ``None`` elsewhere.
 
+        With ``parallel_scf_jk=True`` and more than one rank, workers also
+        serve disjoint auxiliary-function blocks while root evaluates the
+        forward DF-SCF J/K builds and the density-response part of the SCF
+        pullback.  In the final CDERI-to-coordinate pullback, AO-pair shell
+        blocks of the three-centre integral derivative are also distributed;
+        root retains the coupled whitening algebra and two-centre metric
+        derivative.
+        Before the forward service starts, workers call the existing
+        ``build_mf`` reconstruction path with a dummy closed-shell canonical
+        state.  Thus no additional builder API is required, but that path
+        must attach the same rank-accessible CDERI source as root.  After the
+        forward service, the dummy state is replaced by root's converged
+        canonical orbitals before the ordinary correlation work begins.
+
         With ``return_details=True``, a third return value contains the
         strong/weak energy split, unordered pair counts, ED dimensions, and
         scalar timings collected by these same one-term-at-a-time pullbacks.
@@ -829,9 +857,23 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
         """
         rank = comm.Get_rank()
         nproc = comm.Get_size()
+        progress_enabled = _progress_enabled(progress)
+        local_schedule = (
+            int(root),
+            bool(parallel_scf_jk),
+            bool(include_hf),
+            bool(return_details),
+            progress_enabled,
+        )
+        schedules = comm.allgather(local_schedule)
+        if len(set(schedules)) != 1:
+            raise ValueError(
+                "root, parallel_scf_jk, include_hf, return_details, and "
+                "progress must be consistent on all MPI ranks"
+            )
         if root < 0 or root >= nproc:
             raise ValueError(f"root={root} is invalid for {nproc} MPI ranks")
-        _progress_enabled(progress)
+        parallel_scf_jk = bool(parallel_scf_jk) and nproc > 1
         reporter = _progress_reporter(progress, rank=rank, root=root)
         overall_start = time.perf_counter()
         if (
@@ -844,98 +886,189 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
                 "trace_ctr_coeff=False"
             )
 
-        if rank == root:
-            _report_progress(reporter, "DF-RHF SCF and VJP setup: starting")
-            scf_start = time.perf_counter()
-            with (
-                config_update("pyscfad_scf_implicit_diff", True),
-                config_update("pyscfad_scf_first_order_custom", False),
-            ):
-                mf, scf_pullback = jax.vjp(build_mf, mol)
-            jax.block_until_ready(mf.e_tot)
-            _report_progress(
-                reporter,
-                f"DF-RHF SCF and VJP setup: done in "
-                f"{time.perf_counter() - scf_start:.1f} s; "
-                f"E_HF={float(mf.e_tot):+.10f} Eh",
+        scf_executor = None
+        if parallel_scf_jk:
+            if int(mol.nelectron) % 2 or int(mol.spin) != 0:
+                raise NotImplementedError(
+                    "parallel_scf_jk currently supports spin-zero, "
+                    "closed-shell RHF only"
+                )
+            scf_executor = MPIDFJKExecutor(comm=comm, root=root)
+            worker_setup_error = None
+            if rank != root:
+                try:
+                    nao = int(mol.nao)
+                    dummy_occ = numpy.zeros(nao)
+                    dummy_occ[:int(mol.nelectron) // 2] = 2.0
+                    mf = build_mf(
+                        mol,
+                        mo_coeff_init=numpy.eye(nao),
+                        mo_energy_init=numpy.zeros(nao),
+                        mo_occ_init=dummy_occ,
+                        e_tot_init=0.0,
+                    )
+                    if getattr(mf, "with_df", None) is None:
+                        raise TypeError(
+                            "worker build_mf did not return a density-fitted "
+                            "SCF object"
+                        )
+                    # The reconstruction path is allowed to return a lazy DF
+                    # skeleton.  Materialize its rank-local in-core CDERI, or
+                    # validate/attach the prebuilt outcore source, before the
+                    # root can issue its first distributed J/K request.
+                    mf.with_df.build()
+                except Exception as error:  # collective preflight below
+                    worker_setup_error = (
+                        f"rank {rank}: {type(error).__name__}: {error}"
+                    )
+            worker_setup_errors = comm.allgather(worker_setup_error)
+            worker_setup_errors = tuple(
+                error for error in worker_setup_errors if error is not None
             )
-
-            topology_start = time.perf_counter()
-            _report_progress(reporter, "fixed IAO fragment topology: starting")
-            if topology is None:
-                fixed_topology = stop_trace(
-                    lambda mf_: cls.build_static_topology(
-                        mf_,
-                        frozen=frozen,
-                        frag_lolist=frag_lolist,
-                        frag_atmlist=frag_atmlist,
-                        thresholds=thresholds,
-                        pair_energy_model=pair_energy_model,
-                        force_full_domains=force_full_domains,
-                    )
-                )(mf)
-            elif isinstance(topology, IAOFragmentTopology):
-                from .iao_mp2_grad import build_iao_mp2_static_selections
-
-                fixed_topology = stop_trace(
-                    lambda mf_: build_iao_mp2_static_selections(
-                        mf_, topology
-                    )
-                )(mf)
-            elif isinstance(topology, IAOFragmentMP2StaticSelections):
-                fixed_topology = topology
-            else:
-                raise TypeError(
-                    "topology must be IAOFragmentTopology or "
-                    "IAOFragmentMP2StaticSelections"
+            if worker_setup_errors:
+                scf_executor.close_local()
+                raise RuntimeError(
+                    "parallel_scf_jk worker setup failed; the existing "
+                    "mo_*_init build_mf path must construct a no-SCF DF "
+                    "skeleton backed by the same prebuilt CDERI source as "
+                    "root:\n" + "\n".join(worker_setup_errors)
                 )
 
-            term_specs = _correlation_term_specs(fixed_topology)
-            nstrong_terms = sum(
-                spec[0] == "strong" for spec in term_specs
-            )
-            nweak_terms = len(term_specs) - nstrong_terms
-            strong_mask = numpy.asarray(
-                fixed_topology.strong_mask, dtype=bool
-            )
-            nstrong_pairs = int(numpy.count_nonzero(
-                numpy.triu(strong_mask, k=1)
-            ))
-            _report_progress(
-                reporter,
-                f"fixed IAO fragment topology: done in "
-                f"{time.perf_counter() - topology_start:.1f} s; "
-                f"fragments={len(fixed_topology.fragments)}, "
-                f"strong/weak pairs={nstrong_pairs}/{nweak_terms}, "
-                f"correlation terms={len(term_specs)}",
-            )
+        if rank == root:
+            scf_label = "MPI DF-RHF" if parallel_scf_jk else "DF-RHF"
+            try:
+                _report_progress(
+                    reporter, f"{scf_label} SCF and VJP setup: starting"
+                )
+                scf_start = time.perf_counter()
+                with (
+                    config_update("pyscfad_scf_implicit_diff", True),
+                    config_update("pyscfad_scf_first_order_custom", False),
+                ):
+                    if parallel_scf_jk:
+                        with scf_executor.root_session(final=False):
+                            mf, scf_pullback = jax.vjp(build_mf, mol)
+                            jax.block_until_ready(mf.e_tot)
+                    else:
+                        mf, scf_pullback = jax.vjp(build_mf, mol)
+                        jax.block_until_ready(mf.e_tot)
+            except Exception:
+                if scf_executor is not None:
+                    scf_executor.stop_workers()
+                raise
+            topology_error = None
+            try:
+                _report_progress(
+                    reporter,
+                    f"{scf_label} SCF and VJP setup: done in "
+                    f"{time.perf_counter() - scf_start:.1f} s; "
+                    f"E_HF={float(mf.e_tot):+.10f} Eh",
+                )
+                topology_start = time.perf_counter()
+                _report_progress(
+                    reporter, "fixed IAO fragment topology: starting"
+                )
+                if topology is None:
+                    fixed_topology = stop_trace(
+                        lambda mf_: cls.build_static_topology(
+                            mf_,
+                            frozen=frozen,
+                            frag_lolist=frag_lolist,
+                            frag_atmlist=frag_atmlist,
+                            thresholds=thresholds,
+                            pair_energy_model=pair_energy_model,
+                            force_full_domains=force_full_domains,
+                        )
+                    )(mf)
+                elif isinstance(topology, IAOFragmentTopology):
+                    from .iao_mp2_grad import build_iao_mp2_static_selections
 
-            canonical = {
-                "mo_coeff": numpy.asarray(mf.mo_coeff),
-                "mo_energy": numpy.asarray(mf.mo_energy),
-                "mo_occ": numpy.asarray(mf.mo_occ),
-                "e_tot": float(mf.e_tot),
-            }
+                    fixed_topology = stop_trace(
+                        lambda mf_: build_iao_mp2_static_selections(
+                            mf_, topology
+                        )
+                    )(mf)
+                elif isinstance(topology, IAOFragmentMP2StaticSelections):
+                    fixed_topology = topology
+                else:
+                    raise TypeError(
+                        "topology must be IAOFragmentTopology or "
+                        "IAOFragmentMP2StaticSelections"
+                    )
+
+                term_specs = _correlation_term_specs(fixed_topology)
+                nstrong_terms = sum(
+                    spec[0] == "strong" for spec in term_specs
+                )
+                nweak_terms = len(term_specs) - nstrong_terms
+                strong_mask = numpy.asarray(
+                    fixed_topology.strong_mask, dtype=bool
+                )
+                nstrong_pairs = int(numpy.count_nonzero(
+                    numpy.triu(strong_mask, k=1)
+                ))
+                _report_progress(
+                    reporter,
+                    f"fixed IAO fragment topology: done in "
+                    f"{time.perf_counter() - topology_start:.1f} s; "
+                    f"fragments={len(fixed_topology.fragments)}, "
+                    f"strong/weak pairs={nstrong_pairs}/{nweak_terms}, "
+                    f"correlation terms={len(term_specs)}",
+                )
+
+                canonical = {
+                    "mo_coeff": numpy.asarray(mf.mo_coeff),
+                    "mo_energy": numpy.asarray(mf.mo_energy),
+                    "mo_occ": numpy.asarray(mf.mo_occ),
+                    "e_tot": float(mf.e_tot),
+                }
+            except Exception:  # pragma: no cover - multi-rank failure path
+                topology_error = _exception_text(
+                    "root IAO fragment topology setup"
+                )
+                fixed_topology = canonical = None
         else:
-            mf = scf_pullback = fixed_topology = None
+            if parallel_scf_jk:
+                service_exit = scf_executor.serve(mf.with_df)
+                if service_exit is not ServiceExit.PAUSED:
+                    raise RuntimeError(
+                        "MPI DF-J/K forward worker service stopped before "
+                        "the SCF completed"
+                    )
+            else:
+                mf = None
+            scf_pullback = fixed_topology = None
             canonical = None
+            topology_error = None
 
+        topology_error = comm.bcast(topology_error, root=root)
+        if topology_error is not None:
+            if scf_executor is not None:
+                scf_executor.close_local()
+            raise RuntimeError(topology_error)
         canonical = comm.bcast(canonical, root=root)
         if rank != root:
-            try:
-                mf = build_mf(
-                    mol,
-                    mo_coeff_init=canonical["mo_coeff"],
-                    mo_energy_init=canonical["mo_energy"],
-                    mo_occ_init=canonical["mo_occ"],
-                    e_tot_init=canonical["e_tot"],
-                )
-            except TypeError as error:
-                raise TypeError(
-                    "non-root build_mf must accept mo_coeff_init, "
-                    "mo_energy_init, mo_occ_init, and e_tot_init and must "
-                    "not run SCF"
-                ) from error
+            if parallel_scf_jk:
+                mf.mo_coeff = canonical["mo_coeff"]
+                mf.mo_energy = canonical["mo_energy"]
+                mf.mo_occ = canonical["mo_occ"]
+                mf.e_tot = canonical["e_tot"]
+                mf.converged = True
+            else:
+                try:
+                    mf = build_mf(
+                        mol,
+                        mo_coeff_init=canonical["mo_coeff"],
+                        mo_energy_init=canonical["mo_energy"],
+                        mo_occ_init=canonical["mo_occ"],
+                        e_tot_init=canonical["e_tot"],
+                    )
+                except TypeError as error:
+                    raise TypeError(
+                        "non-root build_mf must accept mo_coeff_init, "
+                        "mo_energy_init, mo_occ_init, and e_tot_init and "
+                        "must not run SCF"
+                    ) from error
 
         _report_progress(reporter, "MPI correlation energy/gradient: starting")
         corr_result = correlation_value_and_grad(
@@ -948,43 +1081,90 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
         )
         corr_energy, mf_bar_root = corr_result[:2]
 
+        response_setup_error = None
+        mol_bar = None
         if rank == root:
-            if include_hf:
-                _report_progress(reporter, "adding the Hartree-Fock energy seed")
-                e_hf, hf_pullback = jax.vjp(lambda mf_: mf_.e_tot, mf)
-                hf_bar, = hf_pullback(
-                    jnp.ones((), dtype=jnp.asarray(e_hf).dtype)
+            try:
+                if include_hf:
+                    _report_progress(
+                        reporter, "adding the Hartree-Fock energy seed"
+                    )
+                    e_hf, hf_pullback = jax.vjp(lambda mf_: mf_.e_tot, mf)
+                    hf_bar, = hf_pullback(
+                        jnp.ones((), dtype=jnp.asarray(e_hf).dtype)
+                    )
+                    mf_bar_root = jax.tree_util.tree_map(
+                        _add_cotangent, mf_bar_root, hf_bar
+                    )
+                    energy = float(e_hf) + corr_energy
+                else:
+                    energy = corr_energy
+                _report_progress(
+                    reporter,
+                    "implicit SCF response for the total orbital "
+                    "cotangent: " + (
+                        "starting with MPI-parallel DF J/K response"
+                        if parallel_scf_jk
+                        else "starting on rank 0 (this is the long serial tail)"
+                    ),
                 )
-                mf_bar_root = jax.tree_util.tree_map(
-                    _add_cotangent, mf_bar_root, hf_bar
+                response_start = time.perf_counter()
+            except Exception:  # pragma: no cover - multi-rank failure path
+                response_setup_error = _exception_text(
+                    "root implicit SCF response setup"
                 )
-                energy = float(e_hf) + corr_energy
-            else:
-                energy = corr_energy
-            _report_progress(
-                reporter,
-                "implicit SCF response for the total orbital cotangent: "
-                "starting on rank 0 (this is the long serial tail)",
-            )
-            response_start = time.perf_counter()
-            mol_bar, = scf_pullback(mf_bar_root)
-            jax.block_until_ready(mol_bar)
-            gradient_norm = float(numpy.linalg.norm(
-                numpy.asarray(mol_bar.coords)
-            ))
-            _report_progress(
-                reporter,
-                "implicit SCF response: done in "
-                f"{time.perf_counter() - response_start:.1f} s; "
-                f"|gradient|={gradient_norm:.6e} Eh/bohr; "
-                f"total elapsed={time.perf_counter() - overall_start:.1f} s",
-            )
         else:
             energy = (
                 canonical["e_tot"] + corr_energy
                 if include_hf else corr_energy
             )
-            mol_bar = None
+
+        response_setup_error = comm.bcast(
+            response_setup_error, root=root
+        )
+        if response_setup_error is not None:
+            if scf_executor is not None:
+                scf_executor.close_local()
+            raise RuntimeError(response_setup_error)
+
+        response_error = None
+        if rank == root:
+            try:
+                if parallel_scf_jk:
+                    with scf_executor.root_session(final=True):
+                        mol_bar, = scf_pullback(mf_bar_root)
+                        jax.block_until_ready(mol_bar)
+                else:
+                    mol_bar, = scf_pullback(mf_bar_root)
+                    jax.block_until_ready(mol_bar)
+                gradient_norm = float(numpy.linalg.norm(
+                    numpy.asarray(mol_bar.coords)
+                ))
+                _report_progress(
+                    reporter,
+                    "implicit SCF response: done in "
+                    f"{time.perf_counter() - response_start:.1f} s; "
+                    f"|gradient|={gradient_norm:.6e} Eh/bohr; "
+                    f"total elapsed="
+                    f"{time.perf_counter() - overall_start:.1f} s",
+                )
+            except Exception:  # pragma: no cover - multi-rank failure path
+                response_error = _exception_text(
+                    "root implicit SCF response"
+                )
+        elif parallel_scf_jk:
+            try:
+                service_exit = scf_executor.serve(mf.with_df)
+                if service_exit is not ServiceExit.STOPPED:
+                    raise RuntimeError(
+                        "MPI DF-J/K reverse worker service paused before "
+                        "the SCF pullback completed"
+                    )
+            except Exception:  # pragma: no cover - multi-rank failure path
+                response_error = _exception_text(
+                    f"implicit SCF response worker rank {rank}"
+                )
+        _raise_if_any_rank_failed(comm, response_error)
         if return_details:
             return energy, mol_bar, corr_result[2]
         return energy, mol_bar

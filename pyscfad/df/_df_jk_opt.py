@@ -405,7 +405,9 @@ def _cderi_mol_aux_vjp(dfobj, eri_bar):
     return mol_bar, auxmol_bar
 
 
-def _cderi_mol_aux_vjp_from_block_fn(dfobj, eri_bar_block_fn):
+def _cderi_mol_aux_vjp_from_block_fn(dfobj, eri_bar_block_fn, *,
+                                      int3c_block_vjp=None,
+                                      max_pair_block=None):
     auxmol = dfobj.auxmol
     if auxmol is None:
         return None, None
@@ -423,6 +425,8 @@ def _cderi_mol_aux_vjp_from_block_fn(dfobj, eri_bar_block_fn):
         int3c=dfobj.mol._add_suffix('int3c2e'),
         int2c=dfobj.mol._add_suffix('int2c2e'),
         aosym='s2ij',
+        int3c_block_vjp=int3c_block_vjp,
+        max_pair_block=max_pair_block,
     )
     mol_bar_leaves = tree_flatten(mol_bar)[0]
     auxmol_bar_leaves = tree_flatten(auxmol_bar)[0]
@@ -455,7 +459,7 @@ def get_jk_fwd(dfobj, dm, hermi, with_j, with_k, direct_scf_tol):
 
 
 def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
-               res, ybar):
+               res, ybar, *, coordinate_vjp=None):
     t_bwd = time.perf_counter()
     _profile_msg(
         f'get_jk_bwd start hermi={hermi} with_j={with_j} with_k={with_k}'
@@ -666,11 +670,21 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
                 def eri_bar_block_fn(q0, q1):
                     return numpy.asarray(eri_bar_h5[q0:q1, :]).T
 
-                mol_bar, auxmol_bar = _cderi_mol_aux_vjp_from_block_fn(
-                    dfobj, eri_bar_block_fn
-                )
+                if coordinate_vjp is None:
+                    mol_bar, auxmol_bar = _cderi_mol_aux_vjp_from_block_fn(
+                        dfobj, eri_bar_block_fn
+                    )
+                else:
+                    mol_bar, auxmol_bar = coordinate_vjp(
+                        dfobj, eri_bar_block_fn
+                    )
             else:
-                mol_bar, auxmol_bar = _cderi_mol_aux_vjp(dfobj, eri_bar)
+                if coordinate_vjp is None:
+                    mol_bar, auxmol_bar = _cderi_mol_aux_vjp(dfobj, eri_bar)
+                else:
+                    mol_bar, auxmol_bar = coordinate_vjp(
+                        dfobj, lambda p0, p1: eri_bar[:, p0:p1]
+                    )
             _profile_msg(
                 'get_jk_bwd cderi mol/aux vjp done '
                 f'{time.perf_counter() - t_cderi:.2f} s'

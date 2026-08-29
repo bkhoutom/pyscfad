@@ -66,7 +66,7 @@ def _full_domain_thresholds():
     )
 
 
-def test_comm_self_matches_serial_energy_and_gradient_exactly():
+def test_comm_self_matches_serial_energy_and_gradient_to_roundoff():
     mol = _water()
     progress_messages = []
     kwargs = dict(
@@ -95,22 +95,37 @@ def test_comm_self_matches_serial_energy_and_gradient_exactly():
             )
         )
 
-    np.testing.assert_allclose(mpi_energy, serial_energy, atol=0.0, rtol=0.0)
+    # These are two independent SCF convergences.  BLAS reduction order can
+    # move energies/gradients by a few last bits.  The discrete correlation
+    # decomposition below must still be structurally identical.
+    np.testing.assert_allclose(
+        mpi_energy, serial_energy, atol=5e-13, rtol=0.0
+    )
     np.testing.assert_allclose(
         np.asarray(mpi_bar.coords),
         np.asarray(serial_bar.coords),
-        atol=0.0,
+        atol=5e-12,
         rtol=0.0,
     )
-    assert mpi_details.e_corr == serial_details.e_corr
-    assert mpi_details.e_strong == serial_details.e_strong
-    assert mpi_details.e_weak == serial_details.e_weak
+    np.testing.assert_allclose(
+        [mpi_details.e_corr, mpi_details.e_strong, mpi_details.e_weak],
+        [
+            serial_details.e_corr,
+            serial_details.e_strong,
+            serial_details.e_weak,
+        ],
+        atol=5e-13,
+        rtol=0.0,
+    )
     assert mpi_details.n_fragments == serial_details.n_fragments
     assert mpi_details.n_strong_pairs == serial_details.n_strong_pairs
     assert mpi_details.n_weak_pairs == serial_details.n_weak_pairs
-    assert [term.energy for term in mpi_details.terms] == [
-        term.energy for term in serial_details.terms
-    ]
+    np.testing.assert_allclose(
+        [term.energy for term in mpi_details.terms],
+        [term.energy for term in serial_details.terms],
+        atol=5e-13,
+        rtol=0.0,
+    )
     assert all(
         term.worker_rank == 0 for term in mpi_details.terms
     )

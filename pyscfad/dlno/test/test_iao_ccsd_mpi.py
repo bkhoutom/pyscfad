@@ -23,6 +23,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import traceback
 import warnings
 
 # Establish conservative thread defaults before importing NumPy/JAX/PySCF.
@@ -39,6 +40,8 @@ import numpy as np
 import pytest
 
 from pyscfad import config_update, gto, scf
+from pyscfad.df.mpi_df_jk import MPIDFJKExecutor
+from pyscfad.df.mpi_outcore import build_cderi
 from pyscfad.dlno.ccsd import DLNOCCSD as SerialDLNOCCSD
 from pyscfad.dlno.ccsd_mpi import DLNOCCSD as MPIDLNOCCSD
 from pyscfad.dlno.iao_mp2 import IAOFragmentMP2Thresholds
@@ -167,7 +170,8 @@ def test_comm_self_matches_serial_value_and_grad():
     assert len(details.fragments) == 1
     assert details.fragments[0].fragment_index == 0
     assert details.fragments[0].worker_rank == 0
-    assert details.fragments[0].lis_virtual == 0
+    assert details.fragments[0].lis_occupied == 5
+    assert details.fragments[0].lis_virtual == 2
     np.testing.assert_allclose(
         details.e_hf + details.e_iao_mp2 + details.e_ccsd
         + details.e_ccsd_t - details.e_mp2_lis,
@@ -189,23 +193,87 @@ def _run_world_driver(output: Path):
     rank = comm.Get_rank()
     size = comm.Get_size()
     mol = _water(dimer=True, separated=True)
+    cderi_path = output.with_suffix(".cderi.h5")
+    build_cderi(
+        mol,
+        cderi_path,
+        auxbasis="weigend",
+        comm=comm,
+        overwrite=True,
+        progress=False,
+    )
+
+    def build_outcore_mf(
+        mol_,
+        *,
+        mo_coeff_init=None,
+        mo_energy_init=None,
+        mo_occ_init=None,
+        e_tot_init=None,
+    ):
+        mf = scf.RHF(mol_).density_fit(auxbasis="weigend")
+        mf.conv_tol = 1e-12
+        mf.conv_tol_grad = 1e-10
+        mf.with_df.attach_outcore_cderi(str(cderi_path))
+        if mo_coeff_init is None:
+            mf.kernel()
+        else:
+            mf.mo_coeff = mo_coeff_init
+            mf.mo_energy = mo_energy_init
+            mf.mo_occ = mo_occ_init
+            mf.e_tot = e_tot_init
+            mf.converged = True
+        return mf
+
     kwargs = dict(
-        build_mf=_build_mf,
+        build_mf=build_outcore_mf,
         thresholds=IAOFragmentMP2Thresholds(pair_energy=1e-4),
         pair_energy_model="multipole",
         thresh_occ=1e-3,
         thresh_vir=1e-3,
         ccsd_t=False,
     )
-    with _gradient_options():
-        energy, mol_bar, details = MPIDLNOCCSD.value_and_grad(
-            mol,
-            comm=comm,
-            root=0,
-            return_details=True,
-            progress=False,
-            **kwargs,
+    operation_counts = {
+        "forward": 0,
+        "density_vjp": 0,
+        "coordinate_vjp_blocks": 0,
+    }
+    original_forward = MPIDFJKExecutor._execute_forward
+    original_density_vjp = MPIDFJKExecutor._execute_density_vjp
+    original_coordinate_vjp = MPIDFJKExecutor._execute_coordinate_vjp_block
+
+    def counted_forward(self, dfobj, payload):
+        operation_counts["forward"] += 1
+        return original_forward(self, dfobj, payload)
+
+    def counted_density_vjp(self, dfobj, payload):
+        operation_counts["density_vjp"] += 1
+        return original_density_vjp(self, dfobj, payload)
+
+    def counted_coordinate_vjp(self, dfobj, payload, shls_slice, ints_bar):
+        operation_counts["coordinate_vjp_blocks"] += 1
+        return original_coordinate_vjp(
+            self, dfobj, payload, shls_slice, ints_bar
         )
+
+    MPIDFJKExecutor._execute_forward = counted_forward
+    MPIDFJKExecutor._execute_density_vjp = counted_density_vjp
+    MPIDFJKExecutor._execute_coordinate_vjp_block = counted_coordinate_vjp
+    try:
+        with _gradient_options():
+            energy, mol_bar, details = MPIDLNOCCSD.value_and_grad(
+                mol,
+                comm=comm,
+                root=0,
+                parallel_scf_jk=True,
+                return_details=True,
+                progress=False,
+                **kwargs,
+            )
+    finally:
+        MPIDFJKExecutor._execute_forward = original_forward
+        MPIDFJKExecutor._execute_density_vjp = original_density_vjp
+        MPIDFJKExecutor._execute_coordinate_vjp_block = original_coordinate_vjp
     jax.block_until_ready(energy)
 
     energies = comm.allgather(float(energy))
@@ -218,48 +286,78 @@ def _run_world_driver(output: Path):
             for record in details.fragments
         ),
     ))
+    all_operation_counts = comm.allgather(operation_counts)
+    root_error = None
     if rank == 0:
-        if has_gradient != [True] + [False] * (size - 1):
-            raise AssertionError(
-                "gradient ownership must be root-only; got "
-                f"{has_gradient}"
+        try:
+            if has_gradient != [True] + [False] * (size - 1):
+                raise AssertionError(
+                    "gradient ownership must be root-only; got "
+                    f"{has_gradient}"
+                )
+            np.testing.assert_allclose(
+                energies, energies[0], atol=0.0, rtol=0.0
             )
-        np.testing.assert_allclose(energies, energies[0], atol=0.0, rtol=0.0)
-        assert all(summary == detail_summaries[0]
-                   for summary in detail_summaries)
-        assert details.nproc == size
-        ownership = tuple(
-            (record.fragment_index, record.worker_rank)
-            for record in details.fragments
-        )
-        assert ownership == tuple(
-            (fragment_index, fragment_index % size)
-            for fragment_index in range(len(details.fragments))
-        )
-        np.testing.assert_allclose(
-            details.e_hf + details.e_iao_mp2 + details.e_ccsd
-            + details.e_ccsd_t - details.e_mp2_lis,
-            details.e_total,
-            atol=1e-12,
-            rtol=0.0,
-        )
-        gradient = np.asarray(mol_bar.coords)
-        if not np.all(np.isfinite(gradient)):
-            raise AssertionError("root gradient contains a non-finite value")
-        output.write_text(
-            json.dumps(
-                {
-                    "size": size,
-                    "energy": energies[0],
-                    "gradient": gradient.tolist(),
-                    "ownership": ownership,
-                },
-                indent=2,
+            assert all(summary == detail_summaries[0]
+                       for summary in detail_summaries)
+            assert details.nproc == size
+            ownership = tuple(
+                (record.fragment_index, record.worker_rank)
+                for record in details.fragments
             )
-            + "\n",
-            encoding="utf-8",
+            assert ownership == tuple(
+                (fragment_index, fragment_index % size)
+                for fragment_index in range(len(details.fragments))
+            )
+            if size > 1:
+                for worker_rank, counts in enumerate(all_operation_counts):
+                    if counts["forward"] <= 0 or counts["density_vjp"] <= 0:
+                        raise AssertionError(
+                            "MPI CCSD rank did not serve DF J/K "
+                            "forward/reverse: "
+                            f"rank={worker_rank}, counts={counts}"
+                        )
+                    if (
+                        worker_rank != 0
+                        and counts["coordinate_vjp_blocks"] <= 0
+                    ):
+                        raise AssertionError(
+                            "MPI CCSD worker did not execute a DF coordinate "
+                            f"block: rank={worker_rank}, counts={counts}"
+                        )
+            np.testing.assert_allclose(
+                details.e_hf + details.e_iao_mp2 + details.e_ccsd
+                + details.e_ccsd_t - details.e_mp2_lis,
+                details.e_total,
+                atol=1e-12,
+                rtol=0.0,
+            )
+            gradient = np.asarray(mol_bar.coords)
+            if not np.all(np.isfinite(gradient)):
+                raise AssertionError(
+                    "root gradient contains a non-finite value"
+                )
+            output.write_text(
+                json.dumps(
+                    {
+                        "size": size,
+                        "energy": energies[0],
+                        "gradient": gradient.tolist(),
+                        "ownership": ownership,
+                        "operation_counts": all_operation_counts,
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        except Exception:
+            root_error = traceback.format_exc()
+    root_error = comm.bcast(root_error, root=0)
+    if root_error is not None:
+        raise AssertionError(
+            "root MPI-driver validation failed:\n" + root_error
         )
-    comm.Barrier()
 
 
 def _mpi_launcher():

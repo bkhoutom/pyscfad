@@ -26,6 +26,7 @@ import numpy
 from mpi4py import MPI
 
 from pyscfad import config_update
+from pyscfad.df.mpi_df_jk import MPIDFJKExecutor, ServiceExit
 from pyscfad.ops import stop_trace
 
 from ._output import (
@@ -215,6 +216,7 @@ def _value_and_grad(
     dcsd=False,
     verbose_imp=0,
     static_selections=None,
+    parallel_scf_jk=False,
     comm=MPI.COMM_WORLD,
     root=0,
     return_details=False,
@@ -228,9 +230,18 @@ def _value_and_grad(
         raise ValueError(f"root={root} is invalid for {nproc} MPI ranks")
     _validate_solver_options(ccsd_t=ccsd_t, dcsd=dcsd)
     progress_enabled = _progress_enabled(progress)
-    progress_flags = comm.allgather(progress_enabled)
-    if len(set(progress_flags)) != 1:
-        raise ValueError("progress must be enabled consistently on all ranks")
+    schedules = comm.allgather((
+        root,
+        bool(return_details),
+        progress_enabled,
+        bool(parallel_scf_jk),
+    ))
+    if len(set(schedules)) != 1:
+        raise ValueError(
+            "root, return_details, progress, and parallel_scf_jk must be "
+            "consistent on all ranks"
+        )
+    parallel_scf_jk = bool(parallel_scf_jk) and nproc > 1
     reporter = _progress_reporter(progress, rank=rank, root=root)
     started = time.perf_counter()
 
@@ -246,19 +257,68 @@ def _value_and_grad(
     if thresholds is None:
         thresholds = IAOFragmentMP2Thresholds()
 
+    scf_executor = None
+    mf = None
+    if parallel_scf_jk:
+        if int(mol.nelectron) % 2 or int(mol.spin) != 0:
+            raise NotImplementedError(
+                "parallel_scf_jk currently supports spin-zero, "
+                "closed-shell RHF only"
+            )
+        scf_executor = MPIDFJKExecutor(comm=comm, root=root)
+        worker_setup_error = None
+        if rank != root:
+            try:
+                nao = int(mol.nao)
+                dummy_occ = numpy.zeros(nao)
+                dummy_occ[:int(mol.nelectron) // 2] = 2.0
+                mf = build_mf(
+                    mol,
+                    mo_coeff_init=numpy.eye(nao),
+                    mo_energy_init=numpy.zeros(nao),
+                    mo_occ_init=dummy_occ,
+                    e_tot_init=0.0,
+                )
+                if getattr(mf, "with_df", None) is None:
+                    raise TypeError(
+                        "worker build_mf did not return a density-fitted "
+                        "SCF object"
+                    )
+                mf.with_df.build()
+                _validate_cc_cderi(mf, rank)
+            except Exception:
+                worker_setup_error = _exception_text(
+                    f"MPI DF-J/K worker setup on rank {rank}"
+                )
+        worker_setup_errors = tuple(
+            error for error in comm.allgather(worker_setup_error)
+            if error is not None
+        )
+        if worker_setup_errors:
+            scf_executor.close_local()
+            raise RuntimeError("\n".join(worker_setup_errors))
+
     # Root alone owns the converged SCF tape.  Workers receive its exact
     # canonical orbitals and construct an otherwise equivalent DF skeleton.
     setup_error = None
     if rank == root:
         try:
-            _report_progress(reporter, "DF-RHF SCF and VJP setup: starting")
+            scf_label = "MPI DF-RHF" if parallel_scf_jk else "DF-RHF"
+            _report_progress(
+                reporter, f"{scf_label} SCF and VJP setup: starting"
+            )
             scf_started = time.perf_counter()
             with (
                 config_update("pyscfad_scf_implicit_diff", True),
                 config_update("pyscfad_scf_first_order_custom", False),
             ):
-                mf, scf_pullback = jax.vjp(build_mf, mol)
-            jax.block_until_ready(mf.e_tot)
+                if parallel_scf_jk:
+                    with scf_executor.root_session(final=False):
+                        mf, scf_pullback = jax.vjp(build_mf, mol)
+                        jax.block_until_ready(mf.e_tot)
+                else:
+                    mf, scf_pullback = jax.vjp(build_mf, mol)
+                    jax.block_until_ready(mf.e_tot)
             canonical = {
                 "mo_coeff": numpy.asarray(mf.mo_coeff),
                 "mo_energy": numpy.asarray(mf.mo_energy),
@@ -267,40 +327,67 @@ def _value_and_grad(
             }
             _report_progress(
                 reporter,
-                "DF-RHF SCF and VJP setup: done in "
+                f"{scf_label} SCF and VJP setup: done in "
                 f"{time.perf_counter() - scf_started:.1f} s; "
                 f"E_HF={canonical['e_tot']:+.10f} Eh",
             )
         except Exception:  # pragma: no cover - multi-rank failure path
+            if scf_executor is not None:
+                scf_executor.stop_workers()
             setup_error = _exception_text("root SCF/VJP setup")
             mf = scf_pullback = canonical = None
     else:
-        mf = scf_pullback = canonical = None
-    _raise_if_root_failed(comm, setup_error, root=root)
+        scf_pullback = canonical = None
+        if parallel_scf_jk:
+            try:
+                service_exit = scf_executor.serve(mf.with_df)
+                if service_exit is not ServiceExit.PAUSED:
+                    raise RuntimeError(
+                        "MPI DF-J/K forward worker service stopped before "
+                        "the SCF completed"
+                    )
+            except Exception:
+                setup_error = _exception_text(
+                    f"MPI DF-J/K forward worker rank {rank}"
+                )
+    setup_errors = tuple(
+        error for error in comm.allgather(setup_error) if error is not None
+    )
+    if setup_errors:
+        if scf_executor is not None:
+            scf_executor.close_local()
+        raise RuntimeError("\n".join(setup_errors))
     canonical = comm.bcast(canonical, root=root)
 
     worker_error = None
     if rank != root:
-        try:
-            mf = build_mf(
-                mol,
-                mo_coeff_init=canonical["mo_coeff"],
-                mo_energy_init=canonical["mo_energy"],
-                mo_occ_init=canonical["mo_occ"],
-                e_tot_init=canonical["e_tot"],
-            )
-        except TypeError:
-            worker_error = (
-                f"non-root build_mf failed on MPI rank {rank}; it must "
-                "accept mo_coeff_init, mo_energy_init, mo_occ_init, and "
-                "e_tot_init, must not run SCF, and must attach a real "
-                "rank-accessible CDERI source:\n"
-                + traceback.format_exc()
-            )
-        except Exception:
-            worker_error = _exception_text(
-                f"non-root build_mf on MPI rank {rank}"
-            )
+        if parallel_scf_jk:
+            mf.mo_coeff = canonical["mo_coeff"]
+            mf.mo_energy = canonical["mo_energy"]
+            mf.mo_occ = canonical["mo_occ"]
+            mf.e_tot = canonical["e_tot"]
+            mf.converged = True
+        else:
+            try:
+                mf = build_mf(
+                    mol,
+                    mo_coeff_init=canonical["mo_coeff"],
+                    mo_energy_init=canonical["mo_energy"],
+                    mo_occ_init=canonical["mo_occ"],
+                    e_tot_init=canonical["e_tot"],
+                )
+            except TypeError:
+                worker_error = (
+                    f"non-root build_mf failed on MPI rank {rank}; it must "
+                    "accept mo_coeff_init, mo_energy_init, mo_occ_init, and "
+                    "e_tot_init, must not run SCF, and must attach a real "
+                    "rank-accessible CDERI source:\n"
+                    + traceback.format_exc()
+                )
+            except Exception:
+                worker_error = _exception_text(
+                    f"non-root build_mf on MPI rank {rank}"
+                )
     _raise_if_any_rank_failed(comm, worker_error)
 
     # Root makes every discrete topology/rank decision and owns the saved
@@ -540,8 +627,9 @@ def _value_and_grad(
     )
     energy = float(canonical["e_tot"]) + e_corr
 
-    response_error = None
+    response_setup_error = None
     mol_bar = None
+    total_mf_bar = None
     if rank == root:
         try:
             e_hf, hf_pullback = jax.vjp(lambda mf_: mf_.e_tot, mf)
@@ -555,11 +643,33 @@ def _value_and_grad(
                 _add_cotangent, total_mf_bar, hf_bar
             )
             _report_progress(
-                reporter, "single implicit SCF response: starting on root"
+                reporter,
+                "single implicit SCF response: " + (
+                    "starting with MPI-parallel DF J/K and coordinate VJP"
+                    if parallel_scf_jk else "starting on root"
+                ),
             )
             response_started = time.perf_counter()
-            mol_bar, = scf_pullback(total_mf_bar)
-            jax.block_until_ready(mol_bar)
+        except Exception:  # pragma: no cover - multi-rank failure path
+            response_setup_error = _exception_text(
+                "root implicit SCF response setup"
+            )
+    response_setup_error = comm.bcast(response_setup_error, root=root)
+    if response_setup_error is not None:
+        if scf_executor is not None:
+            scf_executor.close_local()
+        raise RuntimeError(response_setup_error)
+
+    response_error = None
+    if rank == root:
+        try:
+            if parallel_scf_jk:
+                with scf_executor.root_session(final=True):
+                    mol_bar, = scf_pullback(total_mf_bar)
+                    jax.block_until_ready(mol_bar)
+            else:
+                mol_bar, = scf_pullback(total_mf_bar)
+                jax.block_until_ready(mol_bar)
             gradient_norm = float(numpy.linalg.norm(
                 numpy.asarray(mol_bar.coords)
             ))
@@ -572,7 +682,19 @@ def _value_and_grad(
             del hf_pullback, hf_bar, total_mf_bar
         except Exception:  # pragma: no cover - multi-rank failure path
             response_error = _exception_text("root implicit SCF response")
-    _raise_if_root_failed(comm, response_error, root=root)
+    elif parallel_scf_jk:
+        try:
+            service_exit = scf_executor.serve(mf.with_df)
+            if service_exit is not ServiceExit.STOPPED:
+                raise RuntimeError(
+                    "MPI DF-J/K reverse worker service paused before the "
+                    "SCF pullback completed"
+                )
+        except Exception:
+            response_error = _exception_text(
+                f"implicit SCF response worker rank {rank}"
+            )
+    _raise_if_any_rank_failed(comm, response_error)
 
     total_seconds = comm.allreduce(
         time.perf_counter() - started, op=MPI.MAX
@@ -643,6 +765,7 @@ class DLNOCCSD(_SerialDLNOCCSD):
         dcsd=False,
         verbose_imp=0,
         static_selections=None,
+        parallel_scf_jk=False,
         comm=None,
         root=0,
         return_details=False,
@@ -663,6 +786,10 @@ class DLNOCCSD(_SerialDLNOCCSD):
         a third, immutable decomposition object is broadcast to every rank.
         ``progress`` follows the same root-only bool/callable convention as
         :mod:`pyscfad.dlno.iao_mp2_mpi` and must be consistent on all ranks.
+        With ``parallel_scf_jk=True``, workers additionally serve the forward
+        DF-SCF J/K builds, implicit density response, and distributed
+        three-centre coordinate VJP before fragment work and during the final
+        SCF pullback.
         """
         if comm is None:
             comm = MPI.COMM_WORLD
@@ -683,6 +810,7 @@ class DLNOCCSD(_SerialDLNOCCSD):
                 dcsd=dcsd,
                 verbose_imp=verbose_imp,
                 static_selections=static_selections,
+                parallel_scf_jk=parallel_scf_jk,
                 comm=comm,
                 root=root,
                 return_details=return_details,

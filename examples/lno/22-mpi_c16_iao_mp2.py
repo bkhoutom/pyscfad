@@ -1,8 +1,13 @@
 """MPI IAO-local-MP2 energy and gradient for C16H34/cc-pVTZ.
 
-Rank 0 defines the common orbital gauge; workers adopt its MO state.  Run as
+The three-centre DF build and the SCF J/K contractions run across all ranks.
+Rank 0 defines the common orbital gauge; workers adopt its MO state. Run as
 
     mpirun -np 2 .venv/bin/python examples/lno/22-mpi_c16_iao_mp2.py
+
+For a multi-node run, set ``PYSCFAD_MPI_SHARED_SCRATCH`` to a directory
+visible at the same path on every node. The default temporary directory is
+appropriate for a single host.
 """
 
 import os
@@ -12,16 +17,17 @@ import time
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
-os.environ.setdefault("PYSCFAD_LNO_LOCAL_DIRECT_INT3C_BLOCK_MB", "128")
-os.environ.setdefault("PYSCFAD_DF_CDERI_BAR_AUX_BLOCK_MB", "128")
+#os.environ.setdefault("OMP_NUM_THREADS", "1")
+#os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+#os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+#os.environ.setdefault("PYSCFAD_LNO_LOCAL_DIRECT_INT3C_BLOCK_MB", "128")
+#os.environ.setdefault("PYSCFAD_DF_CDERI_BAR_AUX_BLOCK_MB", "128")
 
 import numpy
 from mpi4py import MPI
 
 from pyscfad import config, gto, scf
+from pyscfad.df.mpi_outcore import build_cderi
 from pyscfad.dlno.iao_mp2 import IAOFragmentMP2Thresholds
 from pyscfad.dlno.iao_mp2_mpi import IAOFragmentMP2
 
@@ -33,14 +39,32 @@ config.update("pyscfad_moleintor_opt", True)
 
 BASIS = "cc-pvtz"
 AUXBASIS = "cc-pvtz-ri"
-FROZEN = 16  # carbon 1s
+FROZEN = 16  # one C 1s orbital per carbon
 PAIR_THRESHOLD = 1e-4
 
-scratch = tempfile.TemporaryDirectory(prefix="pyscfad-c16-mp2-") \
-    if rank == 0 else None
-CDERI_PATH = comm.bcast(
-    str(Path(scratch.name) / "cderi.h5") if rank == 0 else None, root=0
+scratch = None
+scratch_error = None
+if rank == 0:
+    try:
+        shared_scratch = os.environ.get("PYSCFAD_MPI_SHARED_SCRATCH")
+        if shared_scratch:
+            Path(shared_scratch).mkdir(parents=True, exist_ok=True)
+        scratch = tempfile.TemporaryDirectory(
+            prefix="pyscfad-c16-mp2-",
+            dir=shared_scratch,
+        )
+    except Exception as error:
+        scratch_error = repr(error)
+scratch_error, CDERI_PATH = comm.bcast(
+    (
+        scratch_error,
+        str(Path(scratch.name) / "cderi.h5")
+        if scratch is not None else None,
+    ),
+    root=0,
 )
+if scratch_error is not None:
+    raise RuntimeError(f"shared CDERI scratch setup failed: {scratch_error}")
 
 mol = gto.Mole(
     atom=str(Path(__file__).with_name("c16h34.xyz")),
@@ -59,20 +83,16 @@ if rank == 0:
         f"pair threshold={PAIR_THRESHOLD:.1e}, MPI ranks={comm.Get_size()}",
         flush=True,
     )
-    print("[C16] out-of-core CDERI build: starting", flush=True)
-    start = time.perf_counter()
-    df_builder = scf.RHF(mol).density_fit(auxbasis=AUXBASIS).with_df
-    df_builder.max_memory = mol.max_memory
-    df_builder._cderi_to_save = CDERI_PATH
-    df_builder.build()
-    timing["cderi"] = time.perf_counter() - start
-    print(
-        f"[C16] out-of-core CDERI build: done in "
-        f"{timing['cderi']:.1f} s; naux={df_builder.auxmol.nao_nr()}",
-        flush=True,
-    )
-    del df_builder
-comm.Barrier()
+cderi = build_cderi(
+    mol,
+    CDERI_PATH,
+    auxbasis=AUXBASIS,
+    comm=comm,
+    root=0,
+    max_memory=mol.max_memory,
+    progress=True,
+)
+timing["cderi"] = cderi.wall_seconds
 
 
 def build_mf(mol_, *, mo_coeff_init=None, mo_energy_init=None,
@@ -80,8 +100,6 @@ def build_mf(mol_, *, mo_coeff_init=None, mo_energy_init=None,
     mf = scf.RHF(mol_).density_fit(auxbasis=AUXBASIS)
     mf.with_df.max_memory = mol_.max_memory
     mf.with_df.attach_outcore_cderi(CDERI_PATH)
-    mf.conv_tol = 1e-10
-    mf.conv_tol_grad = 1e-5
     mf.max_cycle = 100
     if mo_coeff_init is None:
         start = time.perf_counter()
@@ -110,7 +128,7 @@ thresholds = IAOFragmentMP2Thresholds(
 energy, mol_bar, details = IAOFragmentMP2.value_and_grad(
     mol, build_mf=build_mf, frozen=FROZEN, thresholds=thresholds,
     pair_energy_model="multipole", include_hf=True, comm=comm,
-    return_details=True, progress=True,
+    parallel_scf_jk=True, return_details=True, progress=True,
 )
 
 if rank == 0:
@@ -159,6 +177,14 @@ if rank == 0:
     print(f"  correlation gradient      {t.total_seconds:.2f}")
     print(f"  remaining setup/response  {total_seconds - accounted:.2f}")
     print(f"  total wall                {total_seconds:.2f}")
+
+    print("\nParallel CDERI work")
+    print("  rank   AO-pair columns   shell blocks   integral time / s")
+    for item in cderi.manifests:
+        print(
+            f"  {item.rank:4d} {item.pair_columns:17d} "
+            f"{item.block_count:14d} {item.integral_seconds:19.2f}"
+        )
 
     print("\nGradient (Hartree/Bohr):")
     print(gradient)

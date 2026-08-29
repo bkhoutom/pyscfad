@@ -1136,10 +1136,42 @@ def cholesky_eri_vjp_from_cderi_source(mol, auxmol, cderi_source, cderi_bar,
     return mol_bar, auxmol_bar
 
 
+def _int3c_coordinate_vjp_block(mol, auxmol, ints_bar, *, int3c,
+                                shls_slice, naoaux):
+    """Return the coordinate VJP for one packed AO-pair shell block.
+
+    Keeping this operation separate from the Cholesky-whitening algebra lets
+    the latter stream blocks on one process while independent three-centre
+    integral derivatives are evaluated by MPI workers.  ``ints_bar`` is the
+    cotangent after the :math:`L^{-T}` triangular solve and therefore has
+    shape ``(naoaux, packed_pair_block)``.
+    """
+
+    ints_bar = numpy.asarray(ints_bar)
+    naoaux = int(naoaux)
+    if ints_bar.ndim != 2 or ints_bar.shape[0] != naoaux:
+        raise ValueError(
+            'three-centre integral cotangent has shape '
+            f'{ints_bar.shape}, expected ({naoaux}, packed_pair_block)'
+        )
+
+    def int3c_block(mol_, auxmol_):
+        ints = _int3c_cross_opt.int3c_cross(
+            mol_, auxmol_, intor=int3c, comp=1,
+            aosym='s2ij', shls_slice=tuple(shls_slice)
+        )
+        return ints.reshape((-1, naoaux)).T
+
+    _, int3c_pullback = jax.vjp(int3c_block, mol, auxmol)
+    return int3c_pullback(np.asarray(ints_bar))
+
+
 def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
                                          cderi_bar_block_fn, max_memory,
                                          int3c=None, int2c=None,
-                                         aosym='s2ij'):
+                                         aosym='s2ij',
+                                         int3c_block_vjp=None,
+                                         max_pair_block=None):
     """Back-propagate through Cholesky CDERI from AO-pair cotangent blocks."""
     t_total = time.perf_counter()
     detail = _new_df_vjp_detailed_timing() if _profile_enabled() else None
@@ -1201,6 +1233,11 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
     mem_buflen = max(int(max_words / max(naoaux, 1) / 3), 8)
     target_buflen = max(int(_INT3C_VJP_TARGET_MB * 1e6 / 8 / max(naoaux, 1) / 3), 8)
     buflen = min(nao_pair, mem_buflen, target_buflen)
+    if max_pair_block is not None:
+        max_pair_block = int(max_pair_block)
+        if max_pair_block <= 0:
+            raise ValueError('max_pair_block must be positive')
+        buflen = min(buflen, max(max_pair_block, 8))
     shranges = _guess_shell_ranges(mol, buflen, aosym)
 
     mol_bar = None
@@ -1311,16 +1348,18 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
                         block_index=block_index,
                     )
 
-                def int3c_block(mol_, auxmol_):
-                    ints = _int3c_cross_opt.int3c_cross(
-                        mol_, auxmol_, intor=int3c, comp=1,
-                        aosym='s2ij', shls_slice=shls_slice
-                    )
-                    return ints.reshape((-1, naoaux)).T
-
                 if detail is not None:
                     stage_timing_start = _detailed_timing_start()
-                _, int3c_pullback = jax.vjp(int3c_block, mol, auxmol)
+                int3c_pullback = None
+                if int3c_block_vjp is None:
+                    def int3c_block(mol_, auxmol_):
+                        ints = _int3c_cross_opt.int3c_cross(
+                            mol_, auxmol_, intor=int3c, comp=1,
+                            aosym='s2ij', shls_slice=shls_slice
+                        )
+                        return ints.reshape((-1, naoaux)).T
+
+                    _, int3c_pullback = jax.vjp(int3c_block, mol, auxmol)
                 if detail is not None:
                     elapsed = _detailed_timing_elapsed(stage_timing_start)
                     child_elapsed['int3c_primal_vjp_setup'] = elapsed
@@ -1331,7 +1370,14 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
 
                 if detail is not None:
                     stage_timing_start = _detailed_timing_start()
-                mol_blk_bar, auxmol_blk_bar = int3c_pullback(np.asarray(ints_bar))
+                if int3c_block_vjp is None:
+                    mol_blk_bar, auxmol_blk_bar = int3c_pullback(
+                        np.asarray(ints_bar)
+                    )
+                else:
+                    mol_blk_bar, auxmol_blk_bar = int3c_block_vjp(
+                        block_index, shls_slice, ints_bar
+                    )
                 if detail is not None:
                     elapsed = _detailed_timing_elapsed(stage_timing_start)
                     child_elapsed['int3c_pullback'] = elapsed

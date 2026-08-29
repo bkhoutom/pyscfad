@@ -69,6 +69,7 @@ __all__ = [
     "strong_domain_mp2_density_from_lov",
     "strong_domain_mp2_density",
     "strong_domain_prescreen",
+    "build_iao_lis_fragment_static_selection",
     "build_iao_lis_static_selections",
     "build_fragment_lis",
 ]
@@ -568,6 +569,71 @@ def _reference_fragment_selection(
     )
 
 
+def build_iao_lis_fragment_static_selection(
+    mf,
+    mp2_static,
+    fragment_index,
+    *,
+    common=None,
+    domain=None,
+    thresh_occ=1e-4,
+    thresh_vir=1e-5,
+    internal_rank_threshold=IAO_LIS_INTERNAL_RANK_THRESHOLD,
+):
+    """Select the fixed LIS ranks for one fragment.
+
+    ``domain`` may be supplied by a caller that constructs ED orbital frames
+    separately from the target-conditioned MP2-density calculation.  This is
+    the boundary used by the MPI driver: its root rank owns all discrete domain
+    construction, while independent ranks evaluate this fragment-local
+    operation.  Supplying a domain does not change the serial equations or
+    any retained-rank decision.
+    """
+
+    if not isinstance(mp2_static, IAOFragmentMP2StaticSelections):
+        raise TypeError("mp2_static must be IAOFragmentMP2StaticSelections")
+    fragment_index = int(fragment_index)
+    if fragment_index < 0 or fragment_index >= len(mp2_static.fragments):
+        raise IndexError(
+            f"fragment_index={fragment_index} is outside "
+            f"[0, {len(mp2_static.fragments)})"
+        )
+    for name, value in (
+        ("thresh_occ", thresh_occ),
+        ("thresh_vir", thresh_vir),
+        ("internal_rank_threshold", internal_rank_threshold),
+    ):
+        if float(value) < 0.0:
+            raise ValueError(f"{name} must be non-negative")
+    if common is None:
+        common = rebuild_iao_mp2_common(mf, mp2_static)
+    if not isinstance(common, IAOFragmentMP2ContinuousData):
+        raise TypeError("common must be IAOFragmentMP2ContinuousData")
+    if domain is None:
+        domain = build_strong_ed_domain(
+            common, mp2_static, fragment_index
+        )
+    if not isinstance(domain, IAOMP2StrongDomain):
+        raise TypeError("domain must be IAOMP2StrongDomain")
+
+    density = strong_domain_mp2_density(
+        mf, domain, mp2_static, fragment_index
+    )
+    dmoo_active, dmvv_active = _domain_density_in_active_spaces(
+        common, mp2_static, fragment_index, domain, density
+    )
+    return _reference_fragment_selection(
+        common,
+        mp2_static,
+        fragment_index,
+        dmoo_active,
+        dmvv_active,
+        thresh_occ=thresh_occ,
+        thresh_vir=thresh_vir,
+        internal_rank_threshold=internal_rank_threshold,
+    )
+
+
 def build_iao_lis_static_selections(
     mf,
     mp2_static,
@@ -593,34 +659,25 @@ def build_iao_lis_static_selections(
     if not isinstance(common, IAOFragmentMP2ContinuousData):
         raise TypeError("common must be IAOFragmentMP2ContinuousData")
 
-    fragments = []
-    for fragment_index in range(len(mp2_static.fragments)):
-        domain = build_strong_ed_domain(
-            common, mp2_static, fragment_index
-        )
-        density = strong_domain_mp2_density(
-            mf, domain, mp2_static, fragment_index
-        )
-        dmoo_active, dmvv_active = _domain_density_in_active_spaces(
-            common, mp2_static, fragment_index, domain, density
-        )
-        fragments.append(_reference_fragment_selection(
-            common,
+    fragments = tuple(
+        build_iao_lis_fragment_static_selection(
+            mf,
             mp2_static,
             fragment_index,
-            dmoo_active,
-            dmvv_active,
+            common=common,
             thresh_occ=thresh_occ,
             thresh_vir=thresh_vir,
             internal_rank_threshold=internal_rank_threshold,
-        ))
+        )
+        for fragment_index in range(len(mp2_static.fragments))
+    )
 
     return IAOFragmentLISStaticSelections(
         mp2_static=mp2_static,
         thresh_occ=float(thresh_occ),
         thresh_vir=float(thresh_vir),
         internal_rank_threshold=float(internal_rank_threshold),
-        fragments=tuple(fragments),
+        fragments=fragments,
     )
 
 

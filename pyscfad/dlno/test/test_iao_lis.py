@@ -6,6 +6,7 @@ import pytest
 from pyscfad import gto, scf
 from pyscfad.dlno.iao_lis import (
     build_fragment_lis,
+    build_iao_lis_fragment_static_selection,
     build_iao_lis_static_selections,
     strong_domain_mp2_density_from_lov,
     strong_domain_prescreen,
@@ -17,6 +18,7 @@ from pyscfad.dlno.iao_mp2 import (
 )
 from pyscfad.dlno.iao_mp2_grad import (
     build_iao_mp2_static_selections,
+    build_strong_ed_domain,
     rebuild_iao_mp2_common,
 )
 
@@ -134,6 +136,27 @@ def _water_mf(frozen=None):
     return mf
 
 
+def _water_dimer_mf():
+    mol = gto.Mole(
+        atom="""
+        O  0.0000000000  0.0000000000  0.0000000000
+        H  0.0000000000 -0.7570000000  0.5870000000
+        H  0.0000000000  0.7570000000  0.5870000000
+        O  0.0000000000  0.0000000000  8.0000000000
+        H  0.0000000000 -0.7570000000  8.5870000000
+        H  0.0000000000  0.7570000000  8.5870000000
+        """,
+        basis="sto-3g",
+        verbose=0,
+        max_memory=1000,
+    )
+    mol.build(trace_exp=False, trace_ctr_coeff=False)
+    mf = scf.RHF(mol).density_fit()
+    mf.conv_tol = 1e-12
+    mf.kernel()
+    return mf
+
+
 def _full_domain_thresholds():
     return IAOFragmentMP2Thresholds(
         pao_norm=1e-10,
@@ -213,3 +236,69 @@ def test_zero_lno_threshold_recovers_full_active_hf_spaces(frozen):
     assert prescreen["orbfragloc"] is not None
     assert prescreen["occ_prescreen_coeff"].shape[1] == nocc_active
     assert prescreen["vir_prescreen_coeff"].shape[1] == nvir_active
+
+
+def test_fragment_static_selection_matches_serial_builder(monkeypatch):
+    mf = _water_dimer_mf()
+    topology = build_iao_fragment_topology(
+        mf,
+        thresholds=_full_domain_thresholds(),
+        pair_energy_model="all",
+        force_full_domains=True,
+    )
+    assert len(topology.frag_lolist) == 2
+    mp2_static = build_iao_mp2_static_selections(mf, topology)
+    common = rebuild_iao_mp2_common(mf, mp2_static)
+    thresholds = {
+        "thresh_occ": 2e-4,
+        "thresh_vir": 3e-5,
+        "internal_rank_threshold": 3e-7,
+    }
+    serial = build_iao_lis_static_selections(
+        mf,
+        mp2_static,
+        common=common,
+        **thresholds,
+    )
+    domains = tuple(
+        build_strong_ed_domain(common, mp2_static, fragment_index)
+        for fragment_index in range(len(mp2_static.fragments))
+    )
+
+    def fail_if_domain_is_rebuilt(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("the supplied ED domain must be reused")
+
+    monkeypatch.setattr(
+        "pyscfad.dlno.iao_lis.build_strong_ed_domain",
+        fail_if_domain_is_rebuilt,
+    )
+    independent = tuple(
+        build_iao_lis_fragment_static_selection(
+            mf,
+            mp2_static,
+            fragment_index,
+            common=common,
+            domain=domains[fragment_index],
+            **thresholds,
+        )
+        for fragment_index in range(len(mp2_static.fragments))
+    )
+
+    assert len(independent) == len(serial.fragments)
+    for actual, expected in zip(independent, serial.fragments):
+        assert actual.fragment_index == expected.fragment_index
+        assert actual.full_occupied_space == expected.full_occupied_space
+        assert actual.full_virtual_space == expected.full_virtual_space
+        np.testing.assert_array_equal(
+            actual.internal_occ_keep, expected.internal_occ_keep
+        )
+        np.testing.assert_array_equal(
+            actual.internal_vir_keep, expected.internal_vir_keep
+        )
+        np.testing.assert_array_equal(
+            actual.occupied_lno_keep, expected.occupied_lno_keep
+        )
+        np.testing.assert_array_equal(
+            actual.virtual_lno_keep, expected.virtual_lno_keep
+        )

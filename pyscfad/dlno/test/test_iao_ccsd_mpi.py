@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import traceback
+from types import SimpleNamespace
 import warnings
 
 # Establish conservative thread defaults before importing NumPy/JAX/PySCF.
@@ -43,6 +44,7 @@ from pyscfad import config_update, gto, scf
 from pyscfad.df.mpi_df_jk import MPIDFJKExecutor
 from pyscfad.df.mpi_outcore import build_cderi
 from pyscfad.dlno.ccsd import DLNOCCSD as SerialDLNOCCSD
+from pyscfad.dlno import ccsd_mpi as ccsd_mpi_module
 from pyscfad.dlno.ccsd_mpi import DLNOCCSD as MPIDLNOCCSD
 from pyscfad.dlno.iao_mp2 import IAOFragmentMP2Thresholds
 
@@ -134,6 +136,26 @@ def _gradient_options():
         config_update("pyscfad_ccsd_implicit_diff", True),
     ):
         yield
+
+
+def test_lis_fragment_owners_are_deterministic_and_cost_weighted():
+    def fragment(nvir):
+        return SimpleNamespace(
+            strong_occ_metric_keep=np.arange(1),
+            strong_virtual=SimpleNamespace(metric_keep=np.arange(nvir)),
+        )
+
+    uneven = SimpleNamespace(
+        fragments=tuple(fragment(nvir) for nvir in (10, 9, 6, 5))
+    )
+    assert ccsd_mpi_module._lis_fragment_owners(
+        uneven, 2, root=0
+    ) == (0, 1, 1, 0)
+
+    two_equal = SimpleNamespace(fragments=(fragment(4), fragment(4)))
+    assert ccsd_mpi_module._lis_fragment_owners(
+        two_equal, 4, root=2
+    ) == (2, 3)
 
 
 def test_comm_self_matches_serial_value_and_grad():
@@ -238,9 +260,15 @@ def _run_world_driver(output: Path):
         "density_vjp": 0,
         "coordinate_vjp_blocks": 0,
     }
+    lis_static_fragments = []
+    lis_domain_fragments = []
     original_forward = MPIDFJKExecutor._execute_forward
     original_density_vjp = MPIDFJKExecutor._execute_density_vjp
     original_coordinate_vjp = MPIDFJKExecutor._execute_coordinate_vjp_block
+    original_lis_static_fragment = (
+        ccsd_mpi_module.build_iao_lis_fragment_static_selection
+    )
+    original_lis_domain = ccsd_mpi_module.build_strong_ed_domain
 
     def counted_forward(self, dfobj, payload):
         operation_counts["forward"] += 1
@@ -256,9 +284,23 @@ def _run_world_driver(output: Path):
             self, dfobj, payload, shls_slice, ints_bar
         )
 
+    def counted_lis_static_fragment(*args, **kwargs):
+        selection = original_lis_static_fragment(*args, **kwargs)
+        lis_static_fragments.append(int(selection.fragment_index))
+        return selection
+
+    def counted_lis_domain(common, static, fragment_index):
+        domain = original_lis_domain(common, static, fragment_index)
+        lis_domain_fragments.append(int(fragment_index))
+        return domain
+
     MPIDFJKExecutor._execute_forward = counted_forward
     MPIDFJKExecutor._execute_density_vjp = counted_density_vjp
     MPIDFJKExecutor._execute_coordinate_vjp_block = counted_coordinate_vjp
+    ccsd_mpi_module.build_iao_lis_fragment_static_selection = (
+        counted_lis_static_fragment
+    )
+    ccsd_mpi_module.build_strong_ed_domain = counted_lis_domain
     try:
         with _gradient_options():
             energy, mol_bar, details = MPIDLNOCCSD.value_and_grad(
@@ -274,6 +316,10 @@ def _run_world_driver(output: Path):
         MPIDFJKExecutor._execute_forward = original_forward
         MPIDFJKExecutor._execute_density_vjp = original_density_vjp
         MPIDFJKExecutor._execute_coordinate_vjp_block = original_coordinate_vjp
+        ccsd_mpi_module.build_iao_lis_fragment_static_selection = (
+            original_lis_static_fragment
+        )
+        ccsd_mpi_module.build_strong_ed_domain = original_lis_domain
     jax.block_until_ready(energy)
 
     energies = comm.allgather(float(energy))
@@ -287,6 +333,12 @@ def _run_world_driver(output: Path):
         ),
     ))
     all_operation_counts = comm.allgather(operation_counts)
+    all_lis_static_fragments = comm.allgather(
+        tuple(lis_static_fragments)
+    )
+    all_lis_domain_fragments = comm.allgather(
+        tuple(lis_domain_fragments)
+    )
     root_error = None
     if rank == 0:
         try:
@@ -307,6 +359,31 @@ def _run_world_driver(output: Path):
             )
             assert ownership == tuple(
                 (fragment_index, fragment_index % size)
+                for fragment_index in range(len(details.fragments))
+            )
+            lis_static_ownership = tuple(sorted(
+                (fragment_index, worker_rank)
+                for worker_rank, fragment_indices
+                in enumerate(all_lis_static_fragments)
+                for fragment_index in fragment_indices
+            ))
+            assert tuple(
+                fragment_index
+                for fragment_index, _ in lis_static_ownership
+            ) == tuple(range(len(details.fragments)))
+            if size > 1:
+                assert {
+                    worker_rank
+                    for _, worker_rank in lis_static_ownership
+                } == set(range(size))
+            lis_domain_ownership = tuple(sorted(
+                (fragment_index, worker_rank)
+                for worker_rank, fragment_indices
+                in enumerate(all_lis_domain_fragments)
+                for fragment_index in fragment_indices
+            ))
+            assert lis_domain_ownership == tuple(
+                (fragment_index, 0)
                 for fragment_index in range(len(details.fragments))
             )
             if size > 1:
@@ -344,6 +421,8 @@ def _run_world_driver(output: Path):
                         "energy": energies[0],
                         "gradient": gradient.tolist(),
                         "ownership": ownership,
+                        "lis_static_ownership": lis_static_ownership,
+                        "lis_domain_ownership": lis_domain_ownership,
                         "operation_counts": all_operation_counts,
                     },
                     indent=2,
@@ -402,6 +481,10 @@ def test_mpiexec_np1_np2_high_cost(tmp_path):
     np2 = json.loads(np2_path.read_text(encoding="utf-8"))
     assert np1["size"] == 1
     assert np2["size"] == 2
+    assert np1["lis_static_ownership"] == [[0, 0], [1, 0]]
+    assert np2["lis_static_ownership"] == [[0, 0], [1, 1]]
+    assert np1["lis_domain_ownership"] == [[0, 0], [1, 0]]
+    assert np2["lis_domain_ownership"] == [[0, 0], [1, 0]]
     np.testing.assert_allclose(
         np2["energy"], np1["energy"], atol=1e-9, rtol=0.0
     )

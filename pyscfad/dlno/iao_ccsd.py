@@ -54,6 +54,7 @@ from .iao_mp2_grad import correlation_energy as iao_mp2_correlation_energy
 
 __all__ = [
     "IAODLNOCCSDResult",
+    "build_iao_dlno_ccsd_domain_selections",
     "build_iao_dlno_ccsd_static_selections",
     "kernel",
     "value_and_grad",
@@ -167,6 +168,32 @@ def _solve_fragment(
     return values, lis
 
 
+def build_iao_dlno_ccsd_domain_selections(
+    mf,
+    *,
+    frag_lolist=None,
+    frag_atmlist=None,
+    frozen=None,
+    thresholds=None,
+    pair_energy_model="multipole",
+    force_full_domains=False,
+):
+    """Build the fixed IAO-MP2 fragment and ED-domain topology."""
+
+    if thresholds is None:
+        thresholds = IAOFragmentMP2Thresholds()
+    reference = build_iao_fragment_topology(
+        mf,
+        frozen=frozen,
+        frag_lolist=frag_lolist,
+        frag_atmlist=frag_atmlist,
+        thresholds=thresholds,
+        pair_energy_model=pair_energy_model,
+        force_full_domains=force_full_domains,
+    )
+    return build_iao_mp2_static_selections(mf, reference)
+
+
 def build_iao_dlno_ccsd_static_selections(
     mf,
     *,
@@ -181,18 +208,15 @@ def build_iao_dlno_ccsd_static_selections(
     internal_rank_threshold=IAO_LIS_INTERNAL_RANK_THRESHOLD,
 ):
     """Build fixed IAO-MP2 topology and fixed LIS rank selections."""
-    if thresholds is None:
-        thresholds = IAOFragmentMP2Thresholds()
-    reference = build_iao_fragment_topology(
+    mp2_static = build_iao_dlno_ccsd_domain_selections(
         mf,
-        frozen=frozen,
         frag_lolist=frag_lolist,
         frag_atmlist=frag_atmlist,
+        frozen=frozen,
         thresholds=thresholds,
         pair_energy_model=pair_energy_model,
         force_full_domains=force_full_domains,
     )
-    mp2_static = build_iao_mp2_static_selections(mf, reference)
     common = rebuild_iao_mp2_common(mf, mp2_static)
     return build_iao_lis_static_selections(
         mf,

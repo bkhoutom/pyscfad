@@ -10,6 +10,13 @@ constructed fragment gauges do not need to be aligned between ranks.
 The molecule-wide IAO-DLNO-MP2 correction is evaluated by the existing
 gauge-safe MPI implementation.  Root then combines the fragment, MP2, and HF
 mean-field cotangents and applies exactly one implicit SCF pullback.
+
+For fixed LIS selection, the root rank alone fixes the fragment/ED topology
+and constructs ED orbital frames.  It streams at most one frame per MPI rank
+in each batch; the ranks independently form the target-conditioned MP2
+density and select the fixed LIS labels.  Only those small label records are
+gathered, so neither ED frames nor MP2-density intermediates accumulate over
+all fragments.
 """
 
 from __future__ import annotations
@@ -44,14 +51,16 @@ from .iao_ccsd import (
     _add_cotangent,
     _fragment_value_and_grad,
     _validate_solver_options,
-    build_iao_dlno_ccsd_static_selections,
+    build_iao_dlno_ccsd_domain_selections,
 )
 from .iao_lis import (
     IAO_LIS_INTERNAL_RANK_THRESHOLD,
+    IAOLISFragmentStaticSelection,
     IAOFragmentLISStaticSelections,
+    build_iao_lis_fragment_static_selection,
 )
 from .iao_mp2 import IAOFragmentMP2Thresholds
-from .iao_mp2_grad import rebuild_iao_mp2_common
+from .iao_mp2_grad import build_strong_ed_domain, rebuild_iao_mp2_common
 from .iao_mp2_mpi import (
     _progress_enabled,
     _to_device_leaf,
@@ -163,7 +172,7 @@ def _validate_cc_cderi(mf, rank):
             )
 
 
-def _build_static_selections(
+def _build_mp2_static_selections(
     mf,
     *,
     frag_lolist,
@@ -172,14 +181,11 @@ def _build_static_selections(
     thresholds,
     pair_energy_model,
     force_full_domains,
-    thresh_occ,
-    thresh_vir,
-    internal_rank_threshold,
     static_selections,
 ):
     if static_selections is None:
         return stop_trace(
-            lambda mf_: build_iao_dlno_ccsd_static_selections(
+            lambda mf_: build_iao_dlno_ccsd_domain_selections(
                 mf_,
                 frag_lolist=frag_lolist,
                 frag_atmlist=frag_atmlist,
@@ -187,16 +193,94 @@ def _build_static_selections(
                 thresholds=thresholds,
                 pair_energy_model=pair_energy_model,
                 force_full_domains=force_full_domains,
-                thresh_occ=thresh_occ,
-                thresh_vir=thresh_vir,
-                internal_rank_threshold=internal_rank_threshold,
             )
         )(mf)
     if not isinstance(static_selections, IAOFragmentLISStaticSelections):
         raise TypeError(
             "static_selections must be IAOFragmentLISStaticSelections"
         )
-    return static_selections
+    return static_selections.mp2_static
+
+
+def _lis_fragment_cost(mp2_static, fragment_index):
+    """Return a deterministic MP2-density work estimate for one ED."""
+
+    fragment = mp2_static.fragments[int(fragment_index)]
+    nocc = max(int(fragment.strong_occ_metric_keep.size), 1)
+    nvir = max(int(fragment.strong_virtual.metric_keep.size), 1)
+    return nocc * nocc * nvir * nvir
+
+
+def _lis_fragment_owners(mp2_static, nproc, *, root):
+    """Assign fragment MP2 densities by greedy cost-weighted scheduling."""
+
+    nproc = int(nproc)
+    root = int(root)
+    if nproc <= 0:
+        raise ValueError("nproc must be positive")
+    ranks = tuple((root + offset) % nproc for offset in range(nproc))
+    rank_order = {rank: offset for offset, rank in enumerate(ranks)}
+    loads = [0] * nproc
+    owners = [-1] * len(mp2_static.fragments)
+    jobs = sorted(
+        range(len(mp2_static.fragments)),
+        key=lambda index: (-_lis_fragment_cost(mp2_static, index), index),
+    )
+    for fragment_index in jobs:
+        owner = min(
+            ranks,
+            key=lambda rank: (loads[rank], rank_order[rank]),
+        )
+        owners[fragment_index] = owner
+        loads[owner] += _lis_fragment_cost(mp2_static, fragment_index)
+    return tuple(owners)
+
+
+def _assemble_lis_static_selections(
+    mp2_static,
+    gathered_records,
+    *,
+    thresh_occ,
+    thresh_vir,
+    internal_rank_threshold,
+):
+    """Validate and order the small per-fragment MPI selection records."""
+
+    records = [
+        record
+        for rank_records in gathered_records
+        for record in rank_records
+    ]
+    records.sort(key=lambda record: int(record[0]))
+    indices = tuple(int(record[0]) for record in records)
+    expected = tuple(range(len(mp2_static.fragments)))
+    if indices != expected:
+        raise RuntimeError(
+            "MPI LIS rank selection did not cover every fragment exactly "
+            f"once; expected={expected}, received={indices}"
+        )
+    fragments = []
+    for fragment_index, selection in records:
+        fragment_index = int(fragment_index)
+        if not isinstance(selection, IAOLISFragmentStaticSelection):
+            raise TypeError(
+                "MPI LIS worker returned a non-LIS selection for fragment "
+                f"{fragment_index}"
+            )
+        if int(selection.fragment_index) != fragment_index:
+            raise RuntimeError(
+                "MPI LIS worker returned a mismatched fragment index: "
+                f"record={fragment_index}, selection="
+                f"{selection.fragment_index}"
+            )
+        fragments.append(selection)
+    return IAOFragmentLISStaticSelections(
+        mp2_static=mp2_static,
+        thresh_occ=float(thresh_occ),
+        thresh_vir=float(thresh_vir),
+        internal_rank_threshold=float(internal_rank_threshold),
+        fragments=tuple(fragments),
+    )
 
 
 def _value_and_grad(
@@ -390,17 +474,22 @@ def _value_and_grad(
                 )
     _raise_if_any_rank_failed(comm, worker_error)
 
-    # Root makes every discrete topology/rank decision and owns the saved
-    # common-orbital VJP.  The exact continuous common value is then copied to
-    # every rank, including root, before fragment differentiation.
+    # Root owns the discrete fragment/ED topology, the ED orbital frames, and
+    # the saved common-orbital VJP.  Only the expensive target-conditioned
+    # MP2 densities and the resulting fixed LIS rank selections are
+    # distributed.  The exact continuous common value is copied to every rank
+    # so those independent selections use one shared orbital gauge.
     static_error = None
     if rank == root:
         try:
+            prebuilt_static = static_selections
             _report_progress(
-                reporter, "fixed fragment topology and LIS ranks: starting"
+                reporter,
+                "fixed fragment/ED domain topology on root rank "
+                f"{root}: starting",
             )
             static_started = time.perf_counter()
-            static_selections = _build_static_selections(
+            mp2_static = _build_mp2_static_selections(
                 mf,
                 frag_lolist=frag_lolist,
                 frag_atmlist=frag_atmlist,
@@ -408,58 +497,38 @@ def _value_and_grad(
                 thresholds=thresholds,
                 pair_energy_model=pair_energy_model,
                 force_full_domains=force_full_domains,
-                thresh_occ=thresh_occ,
-                thresh_vir=thresh_vir,
-                internal_rank_threshold=internal_rank_threshold,
                 static_selections=static_selections,
             )
-            mp2_static = static_selections.mp2_static
             common_original, common_pullback = jax.vjp(
                 lambda mf_: rebuild_iao_mp2_common(mf_, mp2_static), mf
             )
+            common_host = jax.tree_util.tree_map(
+                _to_host_leaf, common_original
+            )
+            if prebuilt_static is None:
+                lis_owners = _lis_fragment_owners(
+                    mp2_static, nproc, root=root
+                )
+            else:
+                lis_owners = None
             payload = (
-                static_selections,
-                jax.tree_util.tree_map(_to_host_leaf, common_original),
+                mp2_static,
+                common_host,
+                lis_owners,
+                prebuilt_static,
+                (
+                    float(thresh_occ),
+                    float(thresh_vir),
+                    float(internal_rank_threshold),
+                ),
             )
             _report_progress(
                 reporter,
-                "fixed fragment topology and LIS ranks: done in "
+                "fixed fragment/ED domain topology on root rank "
+                f"{root}: done in "
                 f"{time.perf_counter() - static_started:.1f} s; "
-                f"fragments={len(static_selections.fragments)}",
+                f"fragments={len(mp2_static.fragments)}",
             )
-            if reporter is not None:
-                _report_summary(
-                    reporter,
-                    local_correlation_settings_lines(
-                        static_selections,
-                        ccsd_t=ccsd_t,
-                        dcsd=dcsd,
-                        nproc=nproc,
-                        pair_energy_model=pair_energy_model,
-                        force_full_domains=force_full_domains,
-                    ),
-                )
-                _report_summary(
-                    reporter,
-                    mp2_prescreened_domain_lines(static_selections),
-                )
-                fixed_lis_occ, fixed_lis_vir = lis_dimensions_from_static(
-                    static_selections
-                )
-                _report_summary(
-                    reporter,
-                    lis_active_space_lines(
-                        static_selections,
-                        fixed_lis_occ,
-                        fixed_lis_vir,
-                        worker_ranks=tuple(
-                            fragment_index % nproc
-                            for fragment_index in range(
-                                len(static_selections.fragments)
-                            )
-                        ),
-                    ),
-                )
         except Exception:  # pragma: no cover - multi-rank failure path
             static_error = _exception_text(
                 "root fragment topology/common-orbital setup"
@@ -468,10 +537,18 @@ def _value_and_grad(
     else:
         common_pullback = payload = None
     _raise_if_root_failed(comm, static_error, root=root)
-    static_selections, common_host = comm.bcast(payload, root=root)
+    (
+        mp2_static,
+        common_host,
+        lis_owners,
+        prebuilt_static,
+        lis_cutoffs,
+    ) = comm.bcast(payload, root=root)
+    thresh_occ, thresh_vir, internal_rank_threshold = lis_cutoffs
     common = jax.tree_util.tree_map(_to_device_leaf, common_host)
+    del common_host
     if rank == root:
-        del common_original, payload
+        del payload
 
     local_canonical = (
         numpy.asarray(mf.mo_coeff),
@@ -481,7 +558,7 @@ def _value_and_grad(
     _verify_shared_gauge(comm, local_canonical, common, mf)
     _report_progress(reporter, "shared SCF/common orbital gauge verified")
 
-    nfragment = len(static_selections.fragments)
+    nfragment = len(mp2_static.fragments)
     local_indices = tuple(range(rank, nfragment, nproc))
     cderi_error = None
     if local_indices:
@@ -492,6 +569,192 @@ def _value_and_grad(
                 f"CDERI preflight on MPI rank {rank}"
             )
     _raise_if_any_rank_failed(comm, cderi_error)
+
+    if prebuilt_static is None:
+        lis_queues = tuple(
+            tuple(sorted(
+                (
+                    fragment_index
+                    for fragment_index, owner in enumerate(lis_owners)
+                    if owner == worker
+                ),
+                key=lambda fragment_index: (
+                    -_lis_fragment_cost(mp2_static, fragment_index),
+                    fragment_index,
+                ),
+            ))
+            for worker in range(nproc)
+        )
+        assignment_counts = tuple(map(len, lis_queues))
+        nbatch = max(assignment_counts, default=0)
+        _report_progress(
+            reporter,
+            "MPI LIS MP2 density/rank selection: starting; "
+            f"fragments={len(mp2_static.fragments)}; "
+            f"cost-weighted counts/rank={assignment_counts}; "
+            f"bounded batches={nbatch}",
+        )
+        lis_started = time.perf_counter()
+        local_lis_seconds = 0.0
+        local_lis_records = []
+        for batch_index in range(nbatch):
+            domain_error = None
+            if rank == root:
+                domain_batch = [None] * nproc
+                try:
+                    for worker, queue in enumerate(lis_queues):
+                        if batch_index >= len(queue):
+                            continue
+                        fragment_index = queue[batch_index]
+                        domain = stop_trace(
+                            lambda common_: build_strong_ed_domain(
+                                common_, mp2_static, fragment_index
+                            )
+                        )(common_original)
+                        domain_batch[worker] = (
+                            fragment_index,
+                            jax.tree_util.tree_map(_to_host_leaf, domain),
+                        )
+                        del domain
+                except Exception:  # pragma: no cover - MPI failure path
+                    domain_error = _exception_text(
+                        f"root ED construction for LIS batch {batch_index}"
+                    )
+                    domain_batch = None
+            else:
+                domain_batch = None
+            _raise_if_root_failed(comm, domain_error, root=root)
+            local_domain = comm.scatter(domain_batch, root=root)
+            if rank == root:
+                del domain_batch
+
+            lis_error = None
+            if local_domain is not None:
+                local_lis_started = time.perf_counter()
+                domain_host = domain = selection = None
+                try:
+                    fragment_index, domain_host = local_domain
+                    domain = jax.tree_util.tree_map(
+                        _to_device_leaf, domain_host
+                    )
+                    selection = stop_trace(
+                        lambda mf_, common_, domain_: (
+                            build_iao_lis_fragment_static_selection(
+                                mf_,
+                                mp2_static,
+                                fragment_index,
+                                common=common_,
+                                domain=domain_,
+                                thresh_occ=thresh_occ,
+                                thresh_vir=thresh_vir,
+                                internal_rank_threshold=(
+                                    internal_rank_threshold
+                                ),
+                            )
+                        )
+                    )(mf, common, domain)
+                    local_lis_records.append((fragment_index, selection))
+                except Exception:  # pragma: no cover - MPI failure path
+                    lis_error = _exception_text(
+                        f"LIS MP2 rank selection on MPI rank {rank}"
+                    )
+                local_lis_seconds += (
+                    time.perf_counter() - local_lis_started
+                )
+                del domain_host, domain, selection
+            del local_domain
+            _raise_if_any_rank_failed(comm, lis_error)
+            completed = tuple(
+                queue[batch_index] + 1
+                if batch_index < len(queue) else None
+                for queue in lis_queues
+            )
+            _report_progress(
+                reporter,
+                f"MPI LIS batch {batch_index + 1}/{nbatch}: "
+                f"completed fragment numbers/rank={completed}",
+            )
+
+        gathered_lis_records = comm.allgather(tuple(local_lis_records))
+        lis_stats = comm.allgather((
+            len(local_lis_records),
+            local_lis_seconds,
+        ))
+        assembly_error = None
+        try:
+            static_selections = _assemble_lis_static_selections(
+                mp2_static,
+                gathered_lis_records,
+                thresh_occ=thresh_occ,
+                thresh_vir=thresh_vir,
+                internal_rank_threshold=internal_rank_threshold,
+            )
+        except Exception:  # pragma: no cover - multi-rank failure path
+            assembly_error = _exception_text(
+                f"LIS selection assembly on MPI rank {rank}"
+            )
+            static_selections = None
+        _raise_if_any_rank_failed(comm, assembly_error)
+        if rank == root:
+            rank_timing = ", ".join(
+                f"r{worker}:{count}/{seconds:.1f}s"
+                for worker, (count, seconds) in enumerate(lis_stats)
+            )
+            _report_progress(
+                reporter,
+                "MPI LIS MP2 density/rank selection: done in "
+                f"{time.perf_counter() - lis_started:.1f} s; "
+                f"rank fragments/work={rank_timing}",
+            )
+        del gathered_lis_records, lis_queues, local_lis_records
+    else:
+        static_selections = prebuilt_static
+        _report_progress(
+            reporter,
+            "using supplied fixed LIS rank selections; MPI LIS setup skipped",
+        )
+    if rank == root:
+        del common_original
+
+    if reporter is not None:
+        _report_summary(
+            reporter,
+            local_correlation_settings_lines(
+                static_selections,
+                ccsd_t=ccsd_t,
+                dcsd=dcsd,
+                nproc=nproc,
+                pair_energy_model=pair_energy_model,
+                force_full_domains=force_full_domains,
+            ),
+        )
+        _report_summary(
+            reporter,
+            mp2_prescreened_domain_lines(static_selections),
+        )
+        fixed_lis_occ, fixed_lis_vir = lis_dimensions_from_static(
+            static_selections
+        )
+        _report_summary(
+            reporter,
+            lis_active_space_lines(
+                static_selections,
+                fixed_lis_occ,
+                fixed_lis_vir,
+                worker_ranks=tuple(
+                    fragment_index % nproc
+                    for fragment_index in range(
+                        len(static_selections.fragments)
+                    )
+                ),
+            ),
+        )
+
+    if len(static_selections.fragments) != nfragment:
+        raise RuntimeError(
+            "LIS selections and MP2 domain topology have different "
+            "fragment counts"
+        )
 
     _report_progress(
         reporter,
@@ -602,7 +865,7 @@ def _value_and_grad(
         )
         jax.block_until_ready(cc_mf_bar_root)
         del common_mf_bar, cc_common_bar_root, common_pullback
-    del local_mf_bar, local_common_bar, common, common_host
+    del local_mf_bar, local_common_bar, common
     gc.collect()
 
     # The complete strong+weak MP2 correction has its own bounded, gauge-safe

@@ -5,6 +5,8 @@ import pytest
 
 from pyscfad import gto, scf
 from pyscfad.dlno.iao_lis import (
+    _density_from_target_amplitude_block,
+    _density_from_target_amplitudes,
     build_fragment_lis,
     build_iao_lis_fragment_static_selection,
     build_iao_lis_static_selections,
@@ -21,6 +23,40 @@ from pyscfad.dlno.iao_mp2_grad import (
     build_strong_ed_domain,
     rebuild_iao_mp2_common,
 )
+
+
+def test_target_amplitude_block_density_matches_dense_complex_contraction():
+    rng = np.random.default_rng(1907)
+    u = rng.normal(size=(2, 3, 5, 5)) + 1j * rng.normal(size=(2, 3, 5, 5))
+    dense = _density_from_target_amplitudes(jnp.asarray(u))
+
+    occupied = np.zeros((3, 3), dtype=complex)
+    virtual = np.zeros((5, 5), dtype=complex)
+    for start in range(0, 5, 2):
+        stop = min(start + 2, 5)
+        a_block = u[:, :, :, start:stop]
+        b_block = u[:, :, start:stop, :].transpose(0, 1, 3, 2)
+        contribution = _density_from_target_amplitude_block(
+            jnp.asarray(a_block), jnp.asarray(b_block)
+        )
+        occupied += np.asarray(contribution.occupied)
+        virtual += np.asarray(contribution.virtual)
+
+    occupied = 0.5 * (occupied + occupied.T.conj())
+    virtual = 0.5 * (virtual + virtual.T.conj())
+    np.testing.assert_allclose(occupied, np.asarray(dense.occupied), atol=2e-12)
+    np.testing.assert_allclose(virtual, np.asarray(dense.virtual), atol=2e-12)
+
+
+def test_target_amplitude_block_density_validates_rank_and_shapes():
+    with pytest.raises(ValueError, match="rank-4"):
+        _density_from_target_amplitude_block(
+            jnp.zeros((2, 3, 5)), jnp.zeros((2, 3, 5))
+        )
+    with pytest.raises(ValueError, match="identical"):
+        _density_from_target_amplitude_block(
+            jnp.zeros((2, 3, 5, 2)), jnp.zeros((2, 3, 4, 2))
+        )
 
 
 def _manual_ie_density(target_amplitudes):

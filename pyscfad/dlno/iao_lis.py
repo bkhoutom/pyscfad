@@ -244,6 +244,50 @@ def _density_from_target_amplitudes(target_amplitudes):
     return IAOMP2Density(_hermitize(dmoo), _hermitize(dmvv))
 
 
+def _density_from_target_amplitude_block(a_block, b_block):
+    """Return one contracted-virtual-block contribution to Doo and Dvv."""
+
+    a_block = np.asarray(a_block)
+    b_block = np.asarray(b_block)
+    if a_block.ndim != 4 or b_block.ndim != 4:
+        raise ValueError("amplitude blocks must have rank-4 shapes")
+    if a_block.shape != b_block.shape:
+        raise ValueError("amplitude blocks must have identical shapes")
+
+    # Put the two full virtual indices first and last, respectively.  The
+    # supplied B block has already exchanged those virtual indices.
+    a = a_block.transpose(0, 2, 1, 3)
+    b = b_block.transpose(0, 2, 1, 3)
+    b_first = b.swapaxes(1, 3)
+
+    dmvv = np.dot(
+        a.transpose(1, 0, 2, 3).reshape(a.shape[1], -1),
+        a.conj().transpose(1, 0, 2, 3).reshape(a.shape[1], -1).T,
+    )
+    dmvv = dmvv - 0.5 * np.einsum(
+        "iajc,icjb->ab", a, b_first.conj()
+    )
+    dmvv = dmvv + np.dot(
+        b_first.reshape(-1, b.shape[1]).T,
+        b_first.conj().reshape(-1, b.shape[1]),
+    )
+    dmvv = dmvv - 0.5 * np.einsum(
+        "icja,ibjc->ab", b_first, a.conj()
+    )
+
+    dmoo = np.einsum("ixpc,ixqc->pq", a, a.conj())
+    dmoo = dmoo - 0.5 * np.einsum(
+        "ixpc,icqx->pq", a, b_first.conj()
+    )
+    dmoo = dmoo + np.einsum(
+        "icpx,icqx->pq", b_first, b_first.conj()
+    )
+    dmoo = dmoo - 0.5 * np.einsum(
+        "icpx,ixqc->pq", b_first, a.conj()
+    )
+    return IAOMP2Density(dmoo, dmvv)
+
+
 def target_conditioned_mp2_density_from_amplitudes(
     amplitudes,
     target_projection,

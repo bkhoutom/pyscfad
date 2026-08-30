@@ -72,26 +72,13 @@ def _serial_restart_scientific_payload(
     force_full_domains,
     include_hf,
 ):
-    """Return the gauge-defining inputs for a serial MP2 restart."""
+    """Return the stable scientific inputs for a serial MP2 restart."""
 
     import numpy as onp
     from ._restart import df_source_fingerprint
 
     with_df = getattr(mf, "with_df", None)
     auxmol = None if with_df is None else getattr(with_df, "auxmol", None)
-
-    # A restarted SCF cleanup can differ from the original convergence by a
-    # few ulps even when it reads the same density and integral checkpoint.
-    # Hashing those raw bytes would reject a scientifically identical run.
-    # The driver fixes the arbitrary MO phases before reaching this helper;
-    # retaining the phase-fixed coefficients in the fingerprint still rejects
-    # permutations or rotations that would make a saved orbital cotangent
-    # unsafe to reuse.
-    def scf_fingerprint(value):
-        rounded = onp.round(onp.asarray(value), decimals=10)
-        # LAPACK phase choices can leave signed zeros after canonicalization.
-        # They compare numerically equal but have different byte digests.
-        return onp.where(rounded == 0, onp.zeros_like(rounded), rounded)
 
     return {
         "driver": "serial-iao-dlno-mp2-gradient",
@@ -111,10 +98,10 @@ def _serial_restart_scientific_payload(
         },
         "scf": {
             "class": f"{type(mf).__module__}.{type(mf).__qualname__}",
-            "mo_coeff": scf_fingerprint(mf.mo_coeff),
-            "mo_energy": scf_fingerprint(mf.mo_energy),
             "mo_occ": onp.asarray(mf.mo_occ),
-            "e_tot": float(onp.round(float(mf.e_tot), decimals=10)),
+            # MO coefficients and orbital energies are intentionally omitted:
+            # tiny SCF rerun noise is not a reliable exact restart identity.
+            "e_tot": float(onp.round(float(mf.e_tot), decimals=8)),
             "auxbasis": (
                 None if with_df is None else getattr(with_df, "auxbasis", None)
             ),

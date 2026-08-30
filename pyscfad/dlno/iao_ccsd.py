@@ -13,7 +13,6 @@ correction switch.  The molecule-wide IAO-DLNO-MP2 term is evaluated once.
 from __future__ import annotations
 
 import gc
-import hashlib
 import time
 from dataclasses import asdict, dataclass, is_dataclass
 
@@ -152,25 +151,6 @@ def _restart_jsonable(value):
     return array.tolist()
 
 
-def _restart_array_digest(value, *, decimals=10):
-    array = onp.ascontiguousarray(onp.asarray(jax.device_get(value)))
-    # A restarted SCF seeded from its chkfile may finish one cleanup cycle a
-    # few ulps away from the original orbitals.  Quantize only the canonical
-    # SCF fingerprint (not coordinates or saved cotangents) so that harmless
-    # 1e-13 noise is accepted while sign changes and occupied/virtual gauge
-    # rotations remain decisively incompatible.
-    if array.dtype.kind in "fc":
-        array = onp.ascontiguousarray(onp.round(array, decimals=decimals))
-        array = onp.ascontiguousarray(
-            onp.where(array == 0, onp.zeros_like(array), array)
-        )
-    digest = hashlib.sha256()
-    digest.update(str(array.dtype).encode("ascii"))
-    digest.update(repr(tuple(array.shape)).encode("ascii"))
-    digest.update(array.view(onp.uint8))
-    return digest.hexdigest()
-
-
 def _restart_scientific_payload(
     mol,
     mf,
@@ -212,10 +192,12 @@ def _restart_scientific_payload(
         },
         "reference_scf": {
             "class": f"{type(mf).__module__}.{type(mf).__qualname__}",
-            "mo_coeff_sha256": _restart_array_digest(mf.mo_coeff),
-            "mo_energy_sha256": _restart_array_digest(mf.mo_energy),
-            "mo_occ_sha256": _restart_array_digest(mf.mo_occ),
-            "e_tot_rounded": round(float(jax.device_get(mf.e_tot)), 10),
+            # The deterministic phase convention in _fix_restart_mo_phases
+            # keeps fresh pullbacks consistent.  Do not fingerprint floating-
+            # point MO coefficients or energies: harmless SCF rerun noise can
+            # straddle any quantization boundary and spuriously change a hash.
+            "mo_occ": _restart_jsonable(mf.mo_occ),
+            "e_tot_rounded": round(float(jax.device_get(mf.e_tot)), 8),
             "auxbasis": _restart_jsonable(
                 None if with_df is None else getattr(with_df, "auxbasis", None)
             ),

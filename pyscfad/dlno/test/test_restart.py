@@ -15,6 +15,8 @@ from pyscfad.dlno._restart import (
     RestartMismatchError,
     df_source_fingerprint,
 )
+from pyscfad.dlno.iao_ccsd import _restart_scientific_payload
+from pyscfad.dlno.iao_mp2 import _serial_restart_scientific_payload
 from pyscfad.dlno.iao_mp2 import IAOFragmentMP2Thresholds
 
 
@@ -47,6 +49,165 @@ def _manager(path, *, resume=False, payload=None, initialize=True):
         scientific_payload=payload,
         initialize=initialize,
     )
+
+
+def _restart_test_molecule():
+    coords = np.asarray([[0.0, 0.0, 0.0], [0.0, 0.0, 1.4]])
+    return SimpleNamespace(
+        charge=0,
+        spin=0,
+        nelectron=2,
+        natm=2,
+        nao=2,
+        basis="test-basis",
+        _basis={"H": "test-basis"},
+        _ecp={},
+        _pseudo={},
+        cart=False,
+        nucmod={},
+        atom_charges=lambda: np.asarray([1, 1]),
+        atom_coords=lambda unit=None: coords,
+        atom_symbol=lambda _index: "H",
+    )
+
+
+def _restart_test_mf(*, coeff_shift=0.0, e_tot=-1.0, mo_occ=None):
+    if mo_occ is None:
+        mo_occ = np.asarray([2.0, 0.0])
+    return SimpleNamespace(
+        mo_coeff=np.asarray([
+            [0.100000000049 + coeff_shift, 0.0],
+            [0.0, 1.0 - coeff_shift],
+        ]),
+        mo_energy=np.asarray([-0.5 + coeff_shift, 0.2 - coeff_shift]),
+        mo_occ=np.asarray(mo_occ),
+        e_tot=e_tot,
+        with_df=None,
+    )
+
+
+def _mp2_restart_payload(mol, mf):
+    return _serial_restart_scientific_payload(
+        mol,
+        mf,
+        frag_lolist=None,
+        frag_atmlist=None,
+        frozen=None,
+        thresholds=IAOFragmentMP2Thresholds(),
+        pair_energy_model="multipole",
+        force_full_domains=False,
+        include_hf=True,
+    )
+
+
+def _cc_restart_payload(mol, mf):
+    return _restart_scientific_payload(
+        mol,
+        mf,
+        frag_lolist=None,
+        frag_atmlist=None,
+        frozen=None,
+        thresholds=IAOFragmentMP2Thresholds(),
+        pair_energy_model="multipole",
+        force_full_domains=False,
+        thresh_occ=1e-4,
+        thresh_vir=1e-5,
+        internal_rank_threshold=1e-6,
+        ccsd_t=True,
+        dcsd=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "payload_builder", (_mp2_restart_payload, _cc_restart_payload),
+    ids=("mp2", "cc"),
+)
+def test_restart_accepts_changed_scf_orbital_values(
+    tmp_path, payload_builder
+):
+    """MO values are not a hard compatibility key for a guarded restart."""
+
+    mol = _restart_test_molecule()
+    original = RestartManager(
+        tmp_path,
+        method="test-dlno",
+        scientific_payload=payload_builder(mol, _restart_test_mf()),
+    )
+    original.close()
+
+    resumed = RestartManager(
+        tmp_path,
+        resume=True,
+        method="test-dlno",
+        scientific_payload=payload_builder(
+            mol, _restart_test_mf(coeff_shift=2e-10)
+        ),
+    )
+    resumed.close()
+
+
+@pytest.mark.parametrize(
+    "payload_builder", (_mp2_restart_payload, _cc_restart_payload),
+    ids=("mp2", "cc"),
+)
+def test_restart_accepts_scf_total_energy_roundoff(
+    tmp_path, payload_builder
+):
+    """Sub-nanohartree SCF cleanup noise is not a hard restart mismatch."""
+
+    mol = _restart_test_molecule()
+    original = RestartManager(
+        tmp_path,
+        method="test-dlno",
+        scientific_payload=payload_builder(mol, _restart_test_mf()),
+    )
+    original.close()
+
+    resumed = RestartManager(
+        tmp_path,
+        resume=True,
+        method="test-dlno",
+        scientific_payload=payload_builder(
+            mol, _restart_test_mf(e_tot=-1.0 + 2e-10)
+        ),
+    )
+    resumed.close()
+
+
+@pytest.mark.parametrize(
+    "payload_builder", (_mp2_restart_payload, _cc_restart_payload),
+    ids=("mp2", "cc"),
+)
+@pytest.mark.parametrize(
+    "changed_mf",
+    (
+        {"mo_occ": np.asarray([1.0, 1.0])},
+        {"e_tot": -1.0 + 2e-7},
+    ),
+    ids=("occupation", "total-energy"),
+)
+def test_restart_rejects_changed_scf_state(
+    tmp_path, payload_builder, changed_mf
+):
+    """Stable occupation and energy guards still reject a different SCF."""
+
+    mol = _restart_test_molecule()
+    original = RestartManager(
+        tmp_path,
+        method="test-dlno",
+        scientific_payload=payload_builder(mol, _restart_test_mf()),
+    )
+    original.close()
+
+    with pytest.raises(RestartMismatchError, match="base_digest"):
+        RestartManager(
+            tmp_path,
+            resume=True,
+            method="test-dlno",
+            scientific_payload=payload_builder(
+                mol, _restart_test_mf(**changed_mf)
+            ),
+        )
 
 
 def test_manifest_creation_resume_worker_and_mismatch(tmp_path):

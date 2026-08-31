@@ -303,29 +303,36 @@ def test_blocked_lov_density_uses_nested_scans_without_full_amplitudes():
                 yield from nested_values(item)
 
     forward_jaxpr = jax.make_jaxpr(scalar)(*arguments)
-    scan_bodies = []
-    for jaxpr in nested_values(forward_jaxpr):
-        for equation in jaxpr.eqns:
-            if equation.primitive.name == "scan":
-                scan_bodies.append(equation.params["jaxpr"])
 
     def jaxpr_equations(value):
         if hasattr(value, "jaxpr") and not hasattr(value, "eqns"):
             value = value.jaxpr
         return value.eqns
 
-    assert any(
-        any(
-            equation.primitive.name.startswith("remat")
-            and any(
-                nested_equation.primitive.name == "scan"
-                for nested in nested_values(equation.params)
-                for nested_equation in jaxpr_equations(nested)
-            )
-            for equation in jaxpr_equations(body)
-        )
-        for body in scan_bodies
-    )
+    nblock = (nvir + block_nvir - 1) // block_nvir
+    outer_scan, = [
+        equation
+        for equation in jaxpr_equations(forward_jaxpr)
+        if equation.primitive.name == "scan"
+        and equation.params["length"] == nblock
+    ]
+    outer_remat, = [
+        equation
+        for equation in jaxpr_equations(outer_scan.params["jaxpr"])
+        if equation.primitive.name.startswith("remat")
+    ]
+    inner_scans = [
+        equation
+        for nested in nested_values(outer_remat.params)
+        for equation in jaxpr_equations(nested)
+        if equation.primitive.name == "scan"
+        and equation.params["length"] == nocc
+    ]
+    assert len(inner_scans) == 1
+    inner_scan = inner_scans[0]
+    inner_body = jaxpr_equations(inner_scan.params["jaxpr"])
+    assert len(inner_body) == 1
+    assert inner_body[0].primitive.name.startswith("remat")
 
     gradient_jaxpr = jax.make_jaxpr(
         jax.grad(scalar, argnums=(0, 1, 2, 3))
@@ -368,7 +375,8 @@ def test_blocked_lov_density_uses_nested_scans_without_full_amplitudes():
         for value in residuals
     )
     assert not any(
-        tuple(value.shape) == (nocc, ntarget, nvir, block_nvir)
+        value.ndim >= 4
+        and tuple(value.shape[-4:]) == (nocc, ntarget, nvir, block_nvir)
         for value in residuals
     )
     pullback(jnp.ones(()))

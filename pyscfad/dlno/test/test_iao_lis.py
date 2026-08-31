@@ -209,15 +209,30 @@ def test_strong_domain_density_forwards_memory_and_profiles_lov_and_density(
 
     events.clear()
     call_kwargs.clear()
+
+    def diagnostics_touched(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("disabled profiling must not evaluate diagnostics")
+
     monkeypatch.setattr(iao_lis.resource_profile, "start", lambda: None)
+    monkeypatch.setattr(
+        iao_lis.resource_profile, "finish", diagnostics_touched
+    )
+    monkeypatch.setattr(
+        iao_lis.resource_profile, "estimated_array_mib", diagnostics_touched
+    )
+    monkeypatch.setattr(
+        iao_lis.lno_base, "_local_direct_int3c_block_mb", diagnostics_touched
+    )
+    monkeypatch.setattr(
+        iao_lis, "_mp2_density_virtual_block_size", diagnostics_touched
+    )
     disabled_density = iao_lis.strong_domain_mp2_density(
         sentinel_mf, domain, static, 0
     )
     assert disabled_density is expected_density
     assert call_kwargs == [{"max_memory_mb": max_memory_mb}]
-    assert [event[0] for event in events] == [
-        "lov", "finish", "density", "finish",
-    ]
+    assert [event[0] for event in events] == ["lov", "density"]
 
 
 def _manual_ie_density(target_amplitudes):

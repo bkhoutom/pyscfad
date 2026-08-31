@@ -105,52 +105,273 @@ def test_target_conditioned_density_matches_ie_contractions_and_rotation():
     )
 
 
-def test_lov_density_matches_dense_amplitudes_and_has_finite_adjoint():
+def _dense_lov_density(lov, occupied_energy, virtual_energy, target):
+    integrals = jnp.einsum("Lpa,Lrb->prab", lov, lov, optimize=True)
+    denominator = (
+        occupied_energy[:, None, None, None]
+        + occupied_energy[None, :, None, None]
+        - virtual_energy[None, None, :, None]
+        - virtual_energy[None, None, None, :]
+    )
+    return target_conditioned_mp2_density_from_amplitudes(
+        integrals / denominator, target
+    )
+
+
+@pytest.mark.parametrize("block_nvir", [1, 2, 3, 8])
+def test_blocked_lov_density_matches_dense_amplitudes(block_nvir):
     rng = np.random.default_rng(291)
     naux, nocc, nvir, ntarget = 8, 4, 5, 3
-    lov = rng.normal(scale=0.12, size=(naux, nocc, nvir))
-    e_occ = -np.linspace(1.5, 0.7, nocc)
-    e_vir = np.linspace(0.2, 1.3, nvir)
-    target = rng.normal(scale=0.3, size=(ntarget, nocc))
+    lov = jnp.asarray(rng.normal(scale=0.12, size=(naux, nocc, nvir)))
+    e_occ = jnp.asarray(-np.linspace(1.5, 0.7, nocc))
+    e_vir = jnp.asarray(np.linspace(0.2, 1.3, nvir))
+    target = jnp.asarray(rng.normal(scale=0.3, size=(ntarget, nocc)))
 
-    integrals = np.einsum("Lpa,Lrb->prab", lov, lov)
-    denominator = (
-        e_occ[:, None, None, None]
-        + e_occ[None, :, None, None]
-        - e_vir[None, None, :, None]
-        - e_vir[None, None, None, :]
-    )
-    dense = target_conditioned_mp2_density_from_amplitudes(
-        jnp.asarray(integrals / denominator), jnp.asarray(target)
-    )
+    dense = _dense_lov_density(lov, e_occ, e_vir, target)
     blocked = strong_domain_mp2_density_from_lov(
-        jnp.asarray(lov),
-        jnp.asarray(e_occ),
-        jnp.asarray(e_vir),
-        jnp.asarray(target),
+        lov, e_occ, e_vir, target, block_nvir=block_nvir
     )
-    np.testing.assert_allclose(blocked.occupied, dense.occupied, atol=3e-13)
-    np.testing.assert_allclose(blocked.virtual, dense.virtual, atol=3e-13)
+    np.testing.assert_allclose(blocked.occupied, dense.occupied, atol=3e-12)
+    np.testing.assert_allclose(blocked.virtual, dense.virtual, atol=3e-12)
 
-    def scalar(lov_):
-        density = strong_domain_mp2_density_from_lov(
-            lov_, e_occ, e_vir, target
+
+def _density_scalar(density, occupied_weight, virtual_weight):
+    return (
+        jnp.sum(occupied_weight * density.occupied)
+        + jnp.sum(virtual_weight * density.virtual)
+    )
+
+
+def _symmetric_weight(rng, size):
+    weight = rng.normal(size=(size, size))
+    return jnp.asarray(0.5 * (weight + weight.T))
+
+
+def test_blocked_lov_density_value_and_grad_matches_dense_reference():
+    rng = np.random.default_rng(977)
+    naux, nocc, nvir, ntarget = 6, 3, 5, 2
+    arguments = tuple(map(jnp.asarray, (
+        rng.normal(scale=0.12, size=(naux, nocc, nvir)),
+        -np.linspace(1.4, 0.6, nocc),
+        np.linspace(0.2, 1.1, nvir),
+        rng.normal(scale=0.3, size=(ntarget, nocc)),
+    )))
+    occupied_weight = _symmetric_weight(rng, nocc)
+    virtual_weight = _symmetric_weight(rng, nvir)
+
+    def dense_scalar(*inputs):
+        return _density_scalar(
+            _dense_lov_density(*inputs), occupied_weight, virtual_weight
         )
-        return jnp.trace(density.occupied) + jnp.trace(density.virtual)
 
-    gradient = jax.grad(scalar)(jnp.asarray(lov))
-    assert np.all(np.isfinite(np.asarray(gradient)))
+    def blocked_scalar(*inputs):
+        return _density_scalar(
+            strong_domain_mp2_density_from_lov(
+                *inputs, block_nvir=2
+            ), occupied_weight, virtual_weight
+        )
 
-    direction = rng.normal(size=lov.shape)
-    analytic = float(jnp.vdot(gradient, direction))
+    dense_value, dense_gradient = jax.value_and_grad(
+        dense_scalar, argnums=(0, 1, 2, 3)
+    )(*arguments)
+    blocked_value, blocked_gradient = jax.value_and_grad(
+        blocked_scalar, argnums=(0, 1, 2, 3)
+    )(*arguments)
+    np.testing.assert_allclose(blocked_value, dense_value, rtol=3e-10, atol=3e-11)
+    for actual, expected in zip(blocked_gradient, dense_gradient):
+        np.testing.assert_allclose(actual, expected, rtol=3e-10, atol=3e-11)
+
+
+def test_blocked_lov_density_combined_directional_finite_difference():
+    rng = np.random.default_rng(978)
+    naux, nocc, nvir, ntarget = 6, 3, 5, 2
+    arguments = tuple(map(jnp.asarray, (
+        rng.normal(scale=0.12, size=(naux, nocc, nvir)),
+        -np.linspace(1.4, 0.6, nocc),
+        np.linspace(0.2, 1.1, nvir),
+        rng.normal(scale=0.3, size=(ntarget, nocc)),
+    )))
+    directions = tuple(map(jnp.asarray, (
+        rng.normal(size=(naux, nocc, nvir)),
+        rng.normal(size=nocc),
+        rng.normal(size=nvir),
+        rng.normal(size=(ntarget, nocc)),
+    )))
+    occupied_weight = _symmetric_weight(rng, nocc)
+    virtual_weight = _symmetric_weight(rng, nvir)
+
+    def scalar(*inputs):
+        return _density_scalar(
+            strong_domain_mp2_density_from_lov(
+                *inputs, block_nvir=2
+            ), occupied_weight, virtual_weight
+        )
+
+    gradient = jax.grad(scalar, argnums=(0, 1, 2, 3))(*arguments)
+    analytic = sum(jnp.vdot(value, direction)
+                   for value, direction in zip(gradient, directions))
     step = 2e-5
-    finite_difference = float(
-        (scalar(lov + step * direction) - scalar(lov - step * direction))
-        / (2.0 * step)
-    )
+    finite_difference = (
+        scalar(*(value + step * direction
+                 for value, direction in zip(arguments, directions)))
+        - scalar(*(value - step * direction
+                   for value, direction in zip(arguments, directions)))
+    ) / (2.0 * step)
     np.testing.assert_allclose(
-        analytic, finite_difference, atol=2e-8, rtol=3e-7
+        analytic, finite_difference, rtol=5e-7, atol=5e-9
     )
+
+
+def test_blocked_lov_density_handles_zero_sizes_and_validates_blocks():
+    zero_target = strong_domain_mp2_density_from_lov(
+        jnp.zeros((2, 3, 4)), jnp.arange(3.0), jnp.arange(4.0),
+        jnp.zeros((0, 3)), block_nvir=2,
+    )
+    assert zero_target.occupied.shape == (3, 3)
+    assert zero_target.virtual.shape == (4, 4)
+    np.testing.assert_array_equal(zero_target.occupied, 0)
+    np.testing.assert_array_equal(zero_target.virtual, 0)
+
+    zero_occupied = strong_domain_mp2_density_from_lov(
+        jnp.zeros((2, 0, 4)), jnp.zeros((0,)), jnp.arange(4.0),
+        jnp.zeros((2, 0)), block_nvir=2,
+    )
+    assert zero_occupied.occupied.shape == (0, 0)
+    assert zero_occupied.virtual.shape == (4, 4)
+    np.testing.assert_array_equal(zero_occupied.virtual, 0)
+
+    zero_virtual = strong_domain_mp2_density_from_lov(
+        jnp.zeros((2, 3, 0)), jnp.arange(3.0), jnp.zeros((0,)),
+        jnp.zeros((2, 3)), block_nvir=2,
+    )
+    assert zero_virtual.occupied.shape == (3, 3)
+    assert zero_virtual.virtual.shape == (0, 0)
+    np.testing.assert_array_equal(zero_virtual.occupied, 0)
+
+    inputs = (
+        jnp.zeros((2, 3, 4)),
+        -jnp.arange(3.0) - 1.0,
+        jnp.arange(4.0) + 0.2,
+        jnp.zeros((2, 3)),
+    )
+    for max_memory_mb in (0.0, -1.0):
+        with pytest.raises(ValueError, match="max_memory_mb"):
+            strong_domain_mp2_density_from_lov(
+                *inputs, max_memory_mb=max_memory_mb
+            )
+    for block_nvir in (0, -1, 1.5):
+        with pytest.raises(ValueError, match="block_nvir"):
+            strong_domain_mp2_density_from_lov(*inputs, block_nvir=block_nvir)
+
+    clamped = strong_domain_mp2_density_from_lov(*inputs, block_nvir=99)
+    reference = _dense_lov_density(*inputs)
+    np.testing.assert_allclose(clamped.occupied, reference.occupied)
+    np.testing.assert_allclose(clamped.virtual, reference.virtual)
+
+
+def test_blocked_lov_density_uses_nested_scans_without_full_amplitudes():
+    rng = np.random.default_rng(979)
+    ntarget, naux, nocc, nvir, block_nvir = 2, 7, 3, 7, 2
+    arguments = tuple(map(jnp.asarray, (
+        rng.normal(size=(naux, nocc, nvir)),
+        -np.linspace(1.3, 0.7, nocc),
+        np.linspace(0.2, 1.2, nvir),
+        rng.normal(size=(ntarget, nocc)),
+    )))
+    occupied_weight = _symmetric_weight(rng, nocc)
+    virtual_weight = _symmetric_weight(rng, nvir)
+
+    def scalar(*inputs):
+        return _density_scalar(
+            strong_domain_mp2_density_from_lov(
+                *inputs, block_nvir=block_nvir
+            ), occupied_weight, virtual_weight
+        )
+
+    def nested_values(value):
+        if hasattr(value, "jaxpr") and not hasattr(value, "eqns"):
+            value = value.jaxpr
+        if hasattr(value, "eqns"):
+            yield value
+            for equation in value.eqns:
+                yield from nested_values(equation.params)
+        elif isinstance(value, dict):
+            for item in value.values():
+                yield from nested_values(item)
+        elif isinstance(value, (tuple, list)):
+            for item in value:
+                yield from nested_values(item)
+
+    forward_jaxpr = jax.make_jaxpr(scalar)(*arguments)
+    scan_bodies = []
+    for jaxpr in nested_values(forward_jaxpr):
+        for equation in jaxpr.eqns:
+            if equation.primitive.name == "scan":
+                scan_bodies.append(equation.params["jaxpr"])
+
+    def jaxpr_equations(value):
+        if hasattr(value, "jaxpr") and not hasattr(value, "eqns"):
+            value = value.jaxpr
+        return value.eqns
+
+    assert any(
+        any(
+            equation.primitive.name.startswith("remat")
+            and any(
+                nested_equation.primitive.name == "scan"
+                for nested in nested_values(equation.params)
+                for nested_equation in jaxpr_equations(nested)
+            )
+            for equation in jaxpr_equations(body)
+        )
+        for body in scan_bodies
+    )
+
+    gradient_jaxpr = jax.make_jaxpr(
+        jax.grad(scalar, argnums=(0, 1, 2, 3))
+    )(*arguments)
+    all_array_shapes = {
+        tuple(variable.aval.shape)
+        for jaxpr in nested_values(gradient_jaxpr)
+        for equation in jaxpr.eqns
+        for variable in (*equation.invars, *equation.outvars)
+        if hasattr(variable, "aval") and hasattr(variable.aval, "shape")
+    }
+    forbidden_amplitude_shapes = (
+        (ntarget, nocc, nvir, nvir),
+        (nocc, nocc, nvir, nvir),
+    )
+    for forbidden_shape in forbidden_amplitude_shapes:
+        assert not any(
+            shape == forbidden_shape
+            or (len(shape) > len(forbidden_shape)
+                and shape[-len(forbidden_shape):] == forbidden_shape)
+            for shape in all_array_shapes
+        )
+
+    _, pullback = jax.vjp(scalar, *arguments)
+    residuals = [
+        value
+        for name in ("args_res", "opaque_residuals")
+        for value in getattr(pullback, name, ())
+        if hasattr(value, "shape")
+    ]
+    lov_residuals = [
+        value for value in residuals if tuple(value.shape) == arguments[0].shape
+    ]
+    assert len(lov_residuals) <= 1
+    assert not any(tuple(value.shape) == (nocc, naux, nvir)
+                   for value in residuals)
+    assert not any(
+        value.ndim >= 5
+        and tuple(value.shape[-4:]) == (ntarget, nocc, nvir, block_nvir)
+        for value in residuals
+    )
+    assert not any(
+        tuple(value.shape) == (nocc, ntarget, nvir, block_nvir)
+        for value in residuals
+    )
+    pullback(jnp.ones(()))
 
 
 def _water_mf(frozen=None):

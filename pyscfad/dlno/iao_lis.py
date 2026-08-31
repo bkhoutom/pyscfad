@@ -322,18 +322,31 @@ def target_conditioned_mp2_density_from_amplitudes(
     return _density_from_target_amplitudes(target_amplitudes)
 
 
+def _mp2_density_virtual_block_size(lov, ntarget, max_memory_mb):
+    itemsize = onp.dtype(lov.dtype).itemsize
+    nocc = lov.shape[1]
+    nvir = lov.shape[2]
+    bytes_per_c = itemsize * nocc * nvir * max(2 * ntarget + 6, 1)
+    budget = float(max_memory_mb) * 1024.0**2
+    block_nvir = int(budget // max(bytes_per_c, 1))
+    return max(1, min(nvir, block_nvir))
+
+
 def strong_domain_mp2_density_from_lov(
     lov,
     occupied_energy,
     virtual_energy,
     target_projection,
+    *,
+    block_nvir=None,
+    max_memory_mb=256.0,
 ):
     """Build the target-conditioned ED density directly from DF factors.
 
-    A scan over the first occupied index accumulates ``U[I,r,a,b]`` without
-    retaining the full ``T[p,r,a,b]`` tensor.  Peak amplitude storage is thus
-    ``O(ntarget*nocc*nvir**2)`` rather than ``O(nocc**2*nvir**2)``.  Each scan
-    step is checkpointed for a bounded reverse tape.
+    The contracted virtual index is processed in fixed-size blocks.  Peak
+    target-amplitude storage is ``O(ntarget*nocc*nvir*block_nvir)``.  Nested
+    checkpointed scans reconstruct each temporary block during reverse mode
+    instead of retaining the complete MP2 or target-amplitude tensor.
     """
 
     lov = np.asarray(lov)
@@ -350,40 +363,89 @@ def strong_domain_mp2_density_from_lov(
     if target_projection.ndim != 2 or target_projection.shape[1] != nocc:
         raise ValueError("target_projection must have shape (ntarget,nocc)")
 
+    if max_memory_mb <= 0:
+        raise ValueError("max_memory_mb must be positive")
+    ntarget = target_projection.shape[0]
+    if block_nvir is None:
+        block_nvir = _mp2_density_virtual_block_size(
+            lov, ntarget, max_memory_mb
+        )
+    elif (
+        not isinstance(block_nvir, (int, onp.integer))
+        or isinstance(block_nvir, bool)
+        or block_nvir <= 0
+    ):
+        raise ValueError("block_nvir must be a positive integer")
+    block_nvir = min(int(block_nvir), nvir) if nvir else 1
+
+    dmoo0 = np.zeros((nocc, nocc), dtype=lov.dtype)
+    dmvv0 = np.zeros((nvir, nvir), dtype=lov.dtype)
+    if ntarget == 0 or nocc == 0 or nvir == 0:
+        return IAOMP2Density(dmoo0, dmvv0)
+
     eia = occupied_energy[:, None] - virtual_energy[None, :]
-    flat_lov = lov.reshape(naux, nocc * nvir)
-    target0 = np.zeros(
-        (target_projection.shape[0], nocc, nvir, nvir), dtype=lov.dtype
-    )
+    nblock = (nvir + block_nvir - 1) // block_nvir
+    block_ids = np.arange(nblock, dtype=onp.int32)
+    block_offsets = np.arange(block_nvir, dtype=onp.int32)
+    occupied_ids = np.arange(nocc, dtype=onp.int32)
 
     @jax.checkpoint
-    def occupied_slice(la, eia_p, target_column):
-        integrals = np.dot(la.T, flat_lov).reshape(nvir, nocc, nvir)
-        integrals = integrals.transpose(1, 0, 2)
-        denominator = eia_p[None, :, None] + eia[:, None, :]
-        amplitudes = integrals / denominator
-        return np.einsum(
-            "I,rab->Irab", target_column.conj(), amplitudes,
-            optimize=True,
-        )
+    def virtual_block_body(carry, block_id):
+        dmoo, dmvv = carry
+        indices = block_id * block_nvir + block_offsets
+        valid = indices < nvir
+        safe_indices = np.minimum(indices, nvir - 1)
+        lov_c = np.take(lov, safe_indices, axis=2)
+        eia_c = np.take(eia, safe_indices, axis=1)
+        lov_c = np.where(valid[None, None, :], lov_c, 0)
+        a0 = np.zeros((ntarget, nocc, nvir, block_nvir), dtype=lov.dtype)
 
-    def scan_body(target_amplitudes, inputs):
-        la, eia_p, target_column = inputs
+        @jax.checkpoint
+        def occupied_slice(p):
+            la = lov[:, p, :]
+            eia_p = eia[p]
+            target_column = target_projection[:, p]
+            integrals = np.einsum(
+                "La,Lrc->rac", la, lov_c, optimize=True
+            )
+            denominator = eia_p[None, :, None] + eia_c[:, None, :]
+            denominator = np.where(
+                valid[None, None, :],
+                denominator,
+                np.ones((), dtype=denominator.dtype),
+            )
+            amplitudes = integrals / denominator
+            amplitudes = np.where(
+                valid[None, None, :], amplitudes, 0
+            )
+            a_increment = np.einsum(
+                "I,rac->Irac", target_column.conj(), amplitudes,
+                optimize=True,
+            )
+            b_row = np.einsum(
+                "Ir,rac->Iac", target_projection.conj(), amplitudes,
+                optimize=True,
+            )
+            return a_increment, b_row
+
+        def occupied_scan_body(a_block, p):
+            a_increment, b_row = occupied_slice(p)
+            return a_block + a_increment, b_row
+
+        a_block, b_rows = jax.lax.scan(
+            jax.checkpoint(occupied_scan_body), a0, occupied_ids
+        )
+        b_block = b_rows.transpose(1, 0, 2, 3)
+        contribution = _density_from_target_amplitude_block(a_block, b_block)
         return (
-            target_amplitudes
-            + occupied_slice(la, eia_p, target_column),
-            None,
-        )
+            dmoo + contribution.occupied,
+            dmvv + contribution.virtual,
+        ), None
 
-    if nocc:
-        target_amplitudes, _ = jax.lax.scan(
-            scan_body,
-            target0,
-            (lov.transpose(1, 0, 2), eia, target_projection.T),
-        )
-    else:
-        target_amplitudes = target0
-    return _density_from_target_amplitudes(target_amplitudes)
+    (dmoo, dmvv), _ = jax.lax.scan(
+        jax.checkpoint(virtual_block_body), (dmoo0, dmvv0), block_ids
+    )
+    return IAOMP2Density(_hermitize(dmoo), _hermitize(dmvv))
 
 
 def strong_domain_mp2_density(mf, domain, static, fragment_index):

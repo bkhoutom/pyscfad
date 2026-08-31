@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from pyscfad import gto, scf
+from pyscfad.dlno import iao_lis
 from pyscfad.dlno.iao_lis import (
     _density_from_target_amplitude_block,
     _density_from_target_amplitudes,
@@ -19,6 +20,10 @@ from pyscfad.dlno.iao_mp2 import (
     build_iao_fragment_topology,
 )
 from pyscfad.dlno.iao_mp2_grad import (
+    FixedPAOSubspaceSelection,
+    IAOFragmentMP2StaticSelections,
+    IAOMP2FragmentStaticSelection,
+    IAOMP2StrongDomain,
     build_iao_mp2_static_selections,
     build_strong_ed_domain,
     rebuild_iao_mp2_common,
@@ -57,6 +62,162 @@ def test_target_amplitude_block_density_validates_rank_and_shapes():
         _density_from_target_amplitude_block(
             jnp.zeros((2, 3, 5, 2)), jnp.zeros((2, 3, 4, 2))
         )
+
+
+def test_strong_domain_density_forwards_memory_and_profiles_lov_and_density(
+    monkeypatch,
+):
+    empty = np.zeros((0,), dtype=np.int32)
+    empty_selection = FixedPAOSubspaceSelection(
+        empty, empty, empty, empty, empty, empty
+    )
+    fragment = IAOMP2FragmentStaticSelection(
+        fragment_index=0,
+        iao_indices=empty,
+        fragment_atoms=np.asarray([0], dtype=np.int32),
+        strong_fragments=np.asarray([0], dtype=np.int32),
+        extended_atoms=np.asarray([0, 1], dtype=np.int32),
+        extended_ao_indices=empty,
+        pao_center_atoms=empty,
+        strong_occ_union_keep=empty,
+        strong_occ_metric_keep=empty,
+        strong_virtual=empty_selection,
+        primary_atoms=empty,
+        primary_ao_indices=empty,
+        primary_bp_atoms=empty,
+        weak_weight_eigen_indices=empty,
+        weak_weight_degenerate_blocks=(),
+        weak_occ_norm_keep=empty,
+        weak_occ_span_metric_keep=empty,
+        weak_virtual=None,
+    )
+    lov = np.arange(12.0).reshape(2, 2, 3)
+    itemsize = lov.dtype.itemsize
+    bytes_per_c = itemsize * 2 * 3 * (2 * 2 + 6)
+    max_memory_mb = 2.5 * bytes_per_c / 1024.0**2
+    static = IAOFragmentMP2StaticSelections(
+        frozen=None,
+        thresholds=IAOFragmentMP2Thresholds(
+            mp2_block_memory_mb=max_memory_mb,
+        ),
+        active_occ_indices=empty,
+        active_vir_indices=empty,
+        pao_projected_out_indices=empty,
+        pao_parent_ao_indices=empty,
+        ao2pao_map=empty,
+        frag_lolist=(empty,),
+        frag_atmlist=(None,),
+        strong_mask=np.zeros((1, 1), dtype=bool),
+        fragments=(fragment,),
+    )
+    domain = IAOMP2StrongDomain(
+        occupied_coeff=np.arange(8.0).reshape(4, 2),
+        virtual_coeff=np.arange(12.0).reshape(4, 3),
+        occupied_energy=np.asarray([-1.2, -0.8]),
+        virtual_energy=np.asarray([0.2, 0.7, 1.1]),
+        target_projection=np.asarray([[0.8, 0.1], [0.2, 0.6]]),
+        target_weight=np.eye(2),
+        partner_weight=np.eye(2),
+    )
+    expected_density = iao_lis.IAOMP2Density(
+        np.eye(2), 2.0 * np.eye(3)
+    )
+    events = []
+    call_kwargs = []
+    starts = [object(), object()]
+
+    def fake_start():
+        token = starts.pop(0)
+        events.append(("start", token))
+        return token
+
+    def fake_finish(phase, before, **details):
+        events.append(("finish", phase, before, details))
+
+    def fake_local_lov(mf, coeff, nocc, atoms, *, integral_direct):
+        assert mf is sentinel_mf
+        assert coeff.shape == (4, 5)
+        assert nocc == 2
+        np.testing.assert_array_equal(atoms, np.asarray([0, 1]))
+        assert integral_direct
+        events.append(("lov",))
+        return lov
+
+    def fake_density(*args, **kwargs):
+        events.append(("density",))
+        call_kwargs.append(kwargs)
+        np.testing.assert_array_equal(args[0], lov)
+        return expected_density
+
+    sentinel_mf = object()
+    monkeypatch.setattr(iao_lis.resource_profile, "start", fake_start)
+    monkeypatch.setattr(iao_lis.resource_profile, "finish", fake_finish)
+    monkeypatch.setattr(iao_lis.lno_base, "get_local_Lov", fake_local_lov)
+    monkeypatch.setattr(
+        iao_lis, "strong_domain_mp2_density_from_lov", fake_density
+    )
+
+    density = iao_lis.strong_domain_mp2_density(
+        sentinel_mf, domain, static, 0
+    )
+
+    assert density is expected_density
+    assert call_kwargs == [{"max_memory_mb": max_memory_mb}]
+    assert [event[0] for event in events] == [
+        "start", "lov", "finish", "start", "density", "finish",
+    ]
+    lov_finish, density_finish = (
+        event for event in events if event[0] == "finish"
+    )
+    assert lov_finish[1] == "iao_lis.strong_domain_local_lov"
+    assert density_finish[1] == "iao_lis.strong_domain_mp2_density"
+    assert lov_finish[2] is not density_finish[2]
+
+    lov_mib = 2 * 2 * 3 * itemsize / 1024.0**2
+    common_details = {
+        "fragment_index": 0,
+        "coeff_shape": (4, 5),
+        "lov_shape": (2, 2, 3),
+        "naux": 2,
+        "nocc": 2,
+        "nvir": 3,
+        "ntarget": 2,
+        "lov_mib": lov_mib,
+    }
+    assert lov_finish[3] == {
+        **common_details,
+        "local_direct_block_mb": (
+            iao_lis.lno_base._local_direct_int3c_block_mb()
+        ),
+    }
+    assert density_finish[3] == {
+        **common_details,
+        "block_nvir": 2,
+        "nblock": 2,
+        "max_memory_mb": max_memory_mb,
+        "full_target_amplitudes_mib": 2 * 2 * 3 * 3 * itemsize / 1024.0**2,
+        "block_target_amplitudes_mib": (
+            2 * 2 * 2 * 3 * 2 * itemsize / 1024.0**2
+        ),
+        "estimated_block_workspace_mib": (
+            itemsize * 2 * 3 * (2 * 2 + 6) * 2 / 1024.0**2
+        ),
+        "occupied_density_shape": (2, 2),
+        "virtual_density_shape": (3, 3),
+        "density_mib": (2 * 2 + 3 * 3) * itemsize / 1024.0**2,
+    }
+
+    events.clear()
+    call_kwargs.clear()
+    monkeypatch.setattr(iao_lis.resource_profile, "start", lambda: None)
+    disabled_density = iao_lis.strong_domain_mp2_density(
+        sentinel_mf, domain, static, 0
+    )
+    assert disabled_density is expected_density
+    assert call_kwargs == [{"max_memory_mb": max_memory_mb}]
+    assert [event[0] for event in events] == [
+        "lov", "finish", "density", "finish",
+    ]
 
 
 def _manual_ie_density(target_amplitudes):

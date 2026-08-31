@@ -49,6 +49,7 @@ import scipy.linalg as onp_scipy_linalg
 from pyscfad import numpy as np
 from pyscfad import scipy
 from pyscfad.lno import lno_base
+from pyscfad.tools import resource_profile
 
 from .iao_mp2_grad import (
     IAOFragmentMP2ContinuousData,
@@ -461,19 +462,81 @@ def strong_domain_mp2_density(mf, domain, static, fragment_index):
     coeff = np.concatenate(
         (domain.occupied_coeff, domain.virtual_coeff), axis=1
     )
+    nvir = domain.virtual_coeff.shape[1]
+    ntarget = domain.target_projection.shape[0]
+    profile_lov = resource_profile.start()
     lov = lno_base.get_local_Lov(
         mf,
         coeff,
         nocc,
         fragment.extended_atoms,
         integral_direct=True,
-    ).reshape((-1, nocc, domain.virtual_coeff.shape[1]))
-    return strong_domain_mp2_density_from_lov(
+    ).reshape((-1, nocc, nvir))
+    resource_profile.finish(
+        "iao_lis.strong_domain_local_lov",
+        profile_lov,
+        fragment_index=fragment_index,
+        coeff_shape=tuple(coeff.shape),
+        lov_shape=tuple(lov.shape),
+        naux=lov.shape[0],
+        nocc=nocc,
+        nvir=nvir,
+        ntarget=ntarget,
+        lov_mib=resource_profile.estimated_array_mib(lov),
+        local_direct_block_mb=lno_base._local_direct_int3c_block_mb(),
+    )
+
+    naux = lov.shape[0]
+    lov_mib = resource_profile.estimated_array_mib(lov)
+    profile_details = {
+        "fragment_index": fragment_index,
+        "coeff_shape": tuple(coeff.shape),
+        "lov_shape": tuple(lov.shape),
+        "naux": naux,
+        "nocc": nocc,
+        "nvir": nvir,
+        "ntarget": ntarget,
+        "lov_mib": lov_mib,
+    }
+
+    max_memory_mb = static.thresholds.mp2_block_memory_mb
+    block_nvir = _mp2_density_virtual_block_size(
+        lov, ntarget, max_memory_mb
+    )
+    nblock = (nvir + block_nvir - 1) // block_nvir
+    itemsize = onp.dtype(lov.dtype).itemsize
+    profile_density = resource_profile.start()
+    density = strong_domain_mp2_density_from_lov(
         lov,
         domain.occupied_energy,
         domain.virtual_energy,
         domain.target_projection,
+        max_memory_mb=max_memory_mb,
     )
+    resource_profile.finish(
+        "iao_lis.strong_domain_mp2_density",
+        profile_density,
+        **profile_details,
+        block_nvir=block_nvir,
+        nblock=nblock,
+        max_memory_mb=max_memory_mb,
+        full_target_amplitudes_mib=(
+            ntarget * nocc * nvir * nvir * itemsize / 1024.0**2
+        ),
+        block_target_amplitudes_mib=(
+            2 * ntarget * nocc * nvir * block_nvir * itemsize / 1024.0**2
+        ),
+        estimated_block_workspace_mib=(
+            itemsize * nocc * nvir * max(2 * ntarget + 6, 1)
+            * block_nvir / 1024.0**2
+        ),
+        occupied_density_shape=tuple(density.occupied.shape),
+        virtual_density_shape=tuple(density.virtual.shape),
+        density_mib=resource_profile.estimated_array_mib(
+            density.occupied, density.virtual
+        ),
+    )
+    return density
 
 
 def _union_partner_iao_indices(static, fragment_index):

@@ -621,14 +621,14 @@ def _strong_domain_mp2_density_h5_primal(
                 c1 = min(c0 + block_nvir, nvir)
                 width = c1 - c0
                 lov_c_host = onp.empty((naux, nocc, width), dtype=dtype)
-                read_start = time.perf_counter()
                 for r in range(nocc):
-                    pair_rows = onp.asarray(
-                        lov_h5[r * nvir + c0:r * nvir + c1, :]
-                    )
-                    lov_c_host[:, r, :] = pair_rows.T
+                    read_start = time.perf_counter()
+                    pair_rows = lov_h5[
+                        r * nvir + c0:r * nvir + c1, :
+                    ]
+                    hdf5_read_s += time.perf_counter() - read_start
+                    lov_c_host[:, r, :] = onp.asarray(pair_rows).T
                     del pair_rows
-                hdf5_read_s += time.perf_counter() - read_start
                 bytes_read += nocc * naux * width * itemsize
 
                 lov_c = np.asarray(lov_c_host)
@@ -640,10 +640,11 @@ def _strong_domain_mp2_density_h5_primal(
                 b_rows = []
                 for p in range(nocc):
                     read_start = time.perf_counter()
-                    lov_p_host = onp.asarray(
-                        lov_h5[p * nvir:(p + 1) * nvir, :]
-                    )
+                    lov_p_host = lov_h5[
+                        p * nvir:(p + 1) * nvir, :
+                    ]
                     hdf5_read_s += time.perf_counter() - read_start
+                    lov_p_host = onp.asarray(lov_p_host)
                     bytes_read += naux * nvir * itemsize
 
                     kernel_start = time.perf_counter()
@@ -673,7 +674,10 @@ def _strong_domain_mp2_density_h5_primal(
                 jax.block_until_ready((dmoo, dmvv))
                 mp2_kernel_s += time.perf_counter() - kernel_start
 
+    kernel_start = time.perf_counter()
     density = IAOMP2Density(_hermitize(dmoo), _hermitize(dmvv))
+    jax.block_until_ready(density)
+    mp2_kernel_s += time.perf_counter() - kernel_start
     if profile is not None:
         resource_profile.finish(
             "iao_lis.strong_domain_mp2_density_h5_primal",

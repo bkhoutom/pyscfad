@@ -587,6 +587,122 @@ def test_h5_primal_profiles_exact_io_and_kernel_timing(monkeypatch, tmp_path):
     assert details["mp2_kernel_s"] >= 0.0
 
 
+def test_h5_primal_read_timing_excludes_host_transpose_and_assignment(
+    monkeypatch, tmp_path
+):
+    rng = np.random.default_rng(1295)
+    naux, nocc, nvir, block_nvir = 3, 2, 3, 2
+    lov = rng.normal(size=(naux, nocc, nvir))
+    path = tmp_path / "timed-lov.h5"
+    _write_pair_major_lov(path, lov)
+    original_getitem = h5py.Dataset.__getitem__
+    original_empty = iao_lis.onp.empty
+    clock = [0.0]
+    finished = []
+
+    class DestinationWithCostlyAssignment(np.ndarray):
+        def __setitem__(self, key, value):
+            clock[0] += 100.0
+            return super().__setitem__(key, value)
+
+    class FakeTime:
+        @staticmethod
+        def perf_counter():
+            return clock[0]
+
+    def tracked_getitem(dataset, key):
+        result = original_getitem(dataset, key)
+        if dataset.name == "/lov":
+            clock[0] += 2.0
+        return result
+
+    def tracked_empty(*args, **kwargs):
+        return original_empty(*args, **kwargs).view(
+            DestinationWithCostlyAssignment
+        )
+
+    class TrackedNumpy:
+        integer = np.integer
+        empty = staticmethod(tracked_empty)
+        asarray = staticmethod(np.asarray)
+
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", tracked_getitem)
+    monkeypatch.setattr(iao_lis, "onp", TrackedNumpy)
+    monkeypatch.setattr(iao_lis, "time", FakeTime)
+    monkeypatch.setattr(iao_lis.resource_profile, "start", lambda: object())
+    monkeypatch.setattr(
+        iao_lis.resource_profile, "finish",
+        lambda phase, before, **details: finished.append(details),
+    )
+
+    iao_lis._strong_domain_mp2_density_h5_primal(
+        str(path),
+        -np.linspace(1.3, 0.7, nocc),
+        np.linspace(0.2, 1.0, nvir),
+        rng.normal(size=(1, nocc)),
+        naux=naux, nocc=nocc, nvir=nvir, block_nvir=block_nvir,
+    )
+
+    nblock = (nvir + block_nvir - 1) // block_nvir
+    nreads = 2 * nocc * nblock
+    assert finished[0]["hdf5_read_s"] == 2.0 * nreads
+
+
+def test_h5_primal_times_hermitization_and_synchronizes_return(
+    monkeypatch, tmp_path
+):
+    rng = np.random.default_rng(1296)
+    naux, nocc, nvir = 3, 2, 3
+    lov = rng.normal(size=(naux, nocc, nvir))
+    path = tmp_path / "synchronized-lov.h5"
+    _write_pair_major_lov(path, lov)
+    original_hermitize = iao_lis._hermitize
+    original_block_until_ready = jax.block_until_ready
+    original_perf_counter = iao_lis.time.perf_counter
+    events = []
+    synchronized = []
+
+    def tracked_hermitize(array):
+        events.append("hermitize")
+        return original_hermitize(array)
+
+    def tracked_block_until_ready(value):
+        events.append("block_until_ready")
+        synchronized.append(value)
+        return original_block_until_ready(value)
+
+    def tracked_perf_counter():
+        events.append("perf_counter")
+        return original_perf_counter()
+
+    monkeypatch.setattr(iao_lis, "_hermitize", tracked_hermitize)
+    monkeypatch.setattr(jax, "block_until_ready", tracked_block_until_ready)
+    monkeypatch.setattr(iao_lis.time, "perf_counter", tracked_perf_counter)
+    monkeypatch.setattr(iao_lis.resource_profile, "start", lambda: object())
+    monkeypatch.setattr(
+        iao_lis.resource_profile, "finish",
+        lambda phase, before, **details: events.append("profile_finish"),
+    )
+
+    density = iao_lis._strong_domain_mp2_density_h5_primal(
+        str(path),
+        -np.linspace(1.2, 0.8, nocc),
+        np.linspace(0.2, 1.0, nvir),
+        rng.normal(size=(1, nocc)),
+        naux=naux, nocc=nocc, nvir=nvir, block_nvir=2,
+    )
+
+    assert events[-6:] == [
+        "perf_counter",
+        "hermitize",
+        "hermitize",
+        "block_until_ready",
+        "perf_counter",
+        "profile_finish",
+    ]
+    assert synchronized[-1] is density
+
+
 def _density_scalar(density, occupied_weight, virtual_weight):
     return (
         jnp.sum(occupied_weight * density.occupied)

@@ -2774,24 +2774,36 @@ def _build_local_Lov_h5_impl(
     os.close(fd)
     try:
         with h5py.File(staging_path, 'w') as h5file:
-            output = _LocalLovH5Output(h5file)
-            holder = SimpleNamespace(mol=fake_mol, auxmol=auxmol)
-            effective_memory = _local_direct_h5_effective_max_memory(
-                max_memory
-            )
-            _run_local_direct_h5_producer(
-                _init_mp_df_eris_direct,
-                holder,
-                mo_coeff[:, k0:k1],
-                mo_coeff[:, l0:l1],
-                effective_memory,
-                output,
-                pyscf_lib.logger.new_logger(fake_mol),
-            )
-            if output.dataset is None:
-                raise RuntimeError("PySCF did not create the fitted Lov dataset")
-            naux = int(output.dataset.shape[1])
-            dtype = str(output.dataset.dtype)
+            if nocc == 0 or nvir == 0:
+                lov = h5file.create_dataset(
+                    'lov',
+                    shape=(0, int(auxmol.nao)),
+                    dtype=mo_coeff.dtype,
+                    chunks=None,
+                    compression=None,
+                )
+            else:
+                output = _LocalLovH5Output(h5file)
+                holder = SimpleNamespace(mol=fake_mol, auxmol=auxmol)
+                effective_memory = _local_direct_h5_effective_max_memory(
+                    max_memory
+                )
+                _run_local_direct_h5_producer(
+                    _init_mp_df_eris_direct,
+                    holder,
+                    mo_coeff[:, k0:k1],
+                    mo_coeff[:, l0:l1],
+                    effective_memory,
+                    output,
+                    pyscf_lib.logger.new_logger(fake_mol),
+                )
+                if output.dataset is None:
+                    raise RuntimeError(
+                        "PySCF did not create the fitted Lov dataset"
+                    )
+                lov = output.dataset
+            naux = int(lov.shape[1])
+            dtype = str(lov.dtype)
         os.replace(staging_path, path)
     except BaseException:
         try:

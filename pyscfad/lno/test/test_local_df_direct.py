@@ -226,6 +226,57 @@ def test_build_local_lov_h5_matches_integral_direct_pair_major(tmp_path):
         )
 
 
+def test_build_local_lov_h5_supports_zero_occupied_orbitals(tmp_path):
+    mol = _water_mol()
+    atmlst = numpy.asarray([0, 1], dtype=numpy.int32)
+    coeff = _local_coeff(mol, atmlst)
+    reference = lno_base.get_local_Lov(
+        _df_holder(mol), coeff, 0, atmlst, integral_direct=True
+    )
+    path = tmp_path / "zero-occ.h5"
+
+    info = lno_base.build_local_Lov_h5(
+        _df_holder(mol), coeff, 0, atmlst, path
+    )
+
+    assert info.naux == reference.shape[0]
+    assert info.nocc == 0
+    assert info.nvir == coeff.shape[1]
+    assert info.dtype == str(reference.dtype)
+    with h5py.File(path, "r") as h5file:
+        lov = h5file["lov"]
+        assert lov.shape == (0, reference.shape[0])
+        assert lov.dtype == numpy.dtype(reference.dtype)
+        assert lov.chunks is None
+        assert lov.compression is None
+
+
+def test_build_local_lov_h5_supports_zero_virtual_orbitals(tmp_path):
+    mol = _water_mol()
+    atmlst = numpy.asarray([0, 1], dtype=numpy.int32)
+    coeff = _local_coeff(mol, atmlst)
+    nocc = coeff.shape[1]
+    reference = lno_base.get_local_Lov(
+        _df_holder(mol), coeff, nocc, atmlst, integral_direct=True
+    )
+    path = tmp_path / "zero-vir.h5"
+
+    info = lno_base.build_local_Lov_h5(
+        _df_holder(mol), coeff, nocc, atmlst, path
+    )
+
+    assert info.naux == reference.shape[0]
+    assert info.nocc == nocc
+    assert info.nvir == 0
+    assert info.dtype == str(reference.dtype)
+    with h5py.File(path, "r") as h5file:
+        lov = h5file["lov"]
+        assert lov.shape == (0, reference.shape[0])
+        assert lov.dtype == numpy.dtype(reference.dtype)
+        assert lov.chunks is None
+        assert lov.compression is None
+
+
 def test_build_local_lov_h5_rejects_insufficient_scratch_space(
     monkeypatch, tmp_path
 ):

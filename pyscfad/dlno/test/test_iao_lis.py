@@ -74,12 +74,19 @@ def test_resolve_mp2_density_block_nvir_precedence_and_dimension_scaling():
         configured_memory_mb=None,
         configured_block_nvir=None,
     )
-    larger_dimensions, _, _ = resolve(
-        **{**common, "naux": 2000, "nocc": 8, "nvir": 4000, "ntarget": 6},
-        mf_max_memory_mb=1000.0,
-        configured_memory_mb=None,
-        configured_block_nvir=None,
-    )
+    with pytest.warns(RuntimeWarning, match="one-virtual-block"):
+        larger_dimensions, _, _ = resolve(
+            **{
+                **common,
+                "naux": 2000,
+                "nocc": 8,
+                "nvir": 4000,
+                "ntarget": 6,
+            },
+            mf_max_memory_mb=1000.0,
+            configured_memory_mb=None,
+            configured_block_nvir=None,
+        )
     manual_budget, budget_mode, budget_target = resolve(
         **common,
         mf_max_memory_mb=1000.0,

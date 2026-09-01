@@ -1,3 +1,4 @@
+import h5py
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -382,6 +383,15 @@ def _dense_lov_density(lov, occupied_energy, virtual_energy, target):
     )
 
 
+def _write_pair_major_lov(path, lov):
+    naux, nocc, nvir = lov.shape
+    pair_major = np.asarray(lov).transpose(1, 2, 0).reshape(
+        nocc * nvir, naux
+    )
+    with h5py.File(path, "w") as h5file:
+        h5file.create_dataset("lov", data=pair_major)
+
+
 @pytest.mark.parametrize("block_nvir", [1, 2, 3, 8])
 def test_blocked_lov_density_matches_dense_amplitudes(block_nvir):
     rng = np.random.default_rng(291)
@@ -397,6 +407,184 @@ def test_blocked_lov_density_matches_dense_amplitudes(block_nvir):
     )
     np.testing.assert_allclose(blocked.occupied, dense.occupied, atol=3e-12)
     np.testing.assert_allclose(blocked.virtual, dense.virtual, atol=3e-12)
+
+
+@pytest.mark.parametrize("block_nvir", [1, 2, 3, 7])
+def test_h5_primal_lov_density_matches_in_memory_blocks(tmp_path, block_nvir):
+    rng = np.random.default_rng(1291)
+    naux, nocc, nvir, ntarget = 7, 3, 5, 2
+    lov = rng.normal(scale=0.12, size=(naux, nocc, nvir))
+    e_occ = -np.linspace(1.5, 0.7, nocc)
+    e_vir = np.linspace(0.2, 1.3, nvir)
+    target = rng.normal(scale=0.3, size=(ntarget, nocc))
+    path = tmp_path / "lov.h5"
+    _write_pair_major_lov(path, lov)
+
+    reference = strong_domain_mp2_density_from_lov(
+        lov, e_occ, e_vir, target, block_nvir=block_nvir
+    )
+    actual = iao_lis._strong_domain_mp2_density_h5_primal(
+        str(path), e_occ, e_vir, target,
+        naux=naux, nocc=nocc, nvir=nvir, block_nvir=block_nvir,
+    )
+
+    assert isinstance(actual, iao_lis.IAOMP2Density)
+    np.testing.assert_allclose(actual.occupied, reference.occupied, atol=3e-12)
+    np.testing.assert_allclose(actual.virtual, reference.virtual, atol=3e-12)
+
+
+def test_h5_primal_lov_density_preserves_complex_algebra(tmp_path):
+    rng = np.random.default_rng(1292)
+    naux, nocc, nvir, ntarget = 6, 3, 5, 2
+    lov = (
+        rng.normal(scale=0.09, size=(naux, nocc, nvir))
+        + 1j * rng.normal(scale=0.09, size=(naux, nocc, nvir))
+    )
+    e_occ = -np.linspace(1.4, 0.6, nocc)
+    e_vir = np.linspace(0.3, 1.1, nvir)
+    target = (
+        rng.normal(scale=0.2, size=(ntarget, nocc))
+        + 1j * rng.normal(scale=0.2, size=(ntarget, nocc))
+    )
+    path = tmp_path / "complex-lov.h5"
+    _write_pair_major_lov(path, lov)
+
+    reference = strong_domain_mp2_density_from_lov(
+        lov, e_occ, e_vir, target, block_nvir=2
+    )
+    actual = iao_lis._strong_domain_mp2_density_h5_primal(
+        str(path), e_occ, e_vir, target,
+        naux=naux, nocc=nocc, nvir=nvir, block_nvir=2,
+    )
+
+    np.testing.assert_allclose(actual.occupied, reference.occupied, atol=3e-12)
+    np.testing.assert_allclose(actual.virtual, reference.virtual, atol=3e-12)
+
+
+@pytest.mark.parametrize(
+    "naux,nocc,nvir,ntarget,occupied_shape,virtual_shape",
+    [
+        (0, 2, 3, 1, (2, 2), (3, 3)),
+        (2, 0, 3, 1, (0, 0), (3, 3)),
+        (2, 2, 0, 1, (2, 2), (0, 0)),
+        (2, 2, 3, 0, (2, 2), (3, 3)),
+    ],
+)
+def test_h5_primal_lov_density_handles_empty_dimensions(
+    tmp_path, naux, nocc, nvir, ntarget, occupied_shape, virtual_shape
+):
+    lov = np.zeros((naux, nocc, nvir))
+    path = tmp_path / f"empty-{naux}-{nocc}-{nvir}-{ntarget}.h5"
+    _write_pair_major_lov(path, lov)
+
+    density = iao_lis._strong_domain_mp2_density_h5_primal(
+        str(path),
+        -np.arange(nocc, dtype=float) - 1.0,
+        np.arange(nvir, dtype=float) + 0.2,
+        np.zeros((ntarget, nocc)),
+        naux=naux, nocc=nocc, nvir=nvir, block_nvir=2,
+    )
+
+    assert density.occupied.shape == occupied_shape
+    assert density.virtual.shape == virtual_shape
+    np.testing.assert_array_equal(density.occupied, 0)
+    np.testing.assert_array_equal(density.virtual, 0)
+
+
+def test_h5_primal_reads_only_contiguous_pair_major_slabs(
+    monkeypatch, tmp_path
+):
+    rng = np.random.default_rng(1293)
+    naux, nocc, nvir, ntarget, block_nvir = 4, 3, 5, 2, 2
+    lov = rng.normal(scale=0.1, size=(naux, nocc, nvir))
+    path = tmp_path / "tracked-lov.h5"
+    _write_pair_major_lov(path, lov)
+    original_array = h5py.Dataset.__array__
+    original_getitem = h5py.Dataset.__getitem__
+    selections = []
+
+    def forbidden_array(dataset, *args, **kwargs):
+        if dataset.name == "/lov":
+            raise AssertionError("the complete /lov dataset was converted")
+        return original_array(dataset, *args, **kwargs)
+
+    def tracked_getitem(dataset, key):
+        if dataset.name == "/lov":
+            selections.append(key)
+        return original_getitem(dataset, key)
+
+    monkeypatch.setattr(h5py.Dataset, "__array__", forbidden_array)
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", tracked_getitem)
+
+    iao_lis._strong_domain_mp2_density_h5_primal(
+        str(path),
+        -np.linspace(1.3, 0.7, nocc),
+        np.linspace(0.2, 1.2, nvir),
+        rng.normal(size=(ntarget, nocc)),
+        naux=naux, nocc=nocc, nvir=nvir, block_nvir=block_nvir,
+    )
+
+    nblock = (nvir + block_nvir - 1) // block_nvir
+    selected_rows = 0
+    for key in selections:
+        assert isinstance(key, tuple) and len(key) == 2
+        row_slice, aux_slice = key
+        assert isinstance(row_slice, slice)
+        assert row_slice.step in (None, 1)
+        assert aux_slice == slice(None)
+        row_count = row_slice.stop - row_slice.start
+        assert row_count <= max(nvir, block_nvir)
+        selected_rows += row_count
+    assert len(selections) == 2 * nocc * nblock
+    assert selected_rows * naux * lov.dtype.itemsize == (
+        nocc * naux * nvir * (nblock + 1) * lov.dtype.itemsize
+    )
+
+
+def test_h5_primal_profiles_exact_io_and_kernel_timing(monkeypatch, tmp_path):
+    rng = np.random.default_rng(1294)
+    naux, nocc, nvir, ntarget, block_nvir = 4, 2, 5, 3, 2
+    lov = rng.normal(size=(naux, nocc, nvir))
+    path = tmp_path / "profiled-lov.h5"
+    _write_pair_major_lov(path, lov)
+    token = object()
+    finished = []
+    monkeypatch.setattr(iao_lis.resource_profile, "start", lambda: token)
+    monkeypatch.setattr(
+        iao_lis.resource_profile, "finish",
+        lambda phase, before, **details: finished.append(
+            (phase, before, details)
+        ),
+    )
+
+    iao_lis._strong_domain_mp2_density_h5_primal(
+        str(path),
+        -np.linspace(1.4, 0.8, nocc),
+        np.linspace(0.2, 1.2, nvir),
+        rng.normal(size=(ntarget, nocc)),
+        naux=naux, nocc=nocc, nvir=nvir, block_nvir=block_nvir,
+    )
+
+    assert len(finished) == 1
+    phase, before, details = finished[0]
+    nblock = (nvir + block_nvir - 1) // block_nvir
+    assert phase == "iao_lis.strong_domain_mp2_density_h5_primal"
+    assert before is token
+    expected_details = {
+        "lov_file_bytes": path.stat().st_size,
+        "naux": naux,
+        "nocc": nocc,
+        "nvir": nvir,
+        "ntarget": ntarget,
+        "block_nvir": block_nvir,
+        "nblock": nblock,
+        "bytes_read": nocc * naux * nvir * (nblock + 1) * lov.dtype.itemsize,
+        "bytes_written": 0,
+    }
+    assert {key: details[key] for key in expected_details} == expected_details
+    assert set(details) == {*expected_details, "hdf5_read_s", "mp2_kernel_s"}
+    assert details["hdf5_read_s"] >= 0.0
+    assert details["mp2_kernel_s"] >= 0.0
 
 
 def _density_scalar(density, occupied_weight, virtual_weight):

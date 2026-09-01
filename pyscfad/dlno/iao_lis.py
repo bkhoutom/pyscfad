@@ -41,8 +41,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import NamedTuple
+import os
+import time
 import warnings
 
+import h5py
 import jax
 import numpy as onp
 import scipy.linalg as onp_scipy_linalg
@@ -529,6 +532,165 @@ def strong_domain_mp2_density_from_lov(
         jax.checkpoint(virtual_block_body), (dmoo0, dmvv0), block_ids
     )
     return IAOMP2Density(_hermitize(dmoo), _hermitize(dmvv))
+
+
+def _target_amplitude_block_from_lov_occupied_slice(
+    lov_p,
+    lov_c,
+    eia_p,
+    eia_c,
+    target_column,
+    target_projection,
+):
+    """Return one occupied slice of the blocked A/B amplitudes."""
+
+    integrals = np.einsum("La,Lrc->rac", lov_p, lov_c, optimize=True)
+    denominator = eia_p[None, :, None] + eia_c[:, None, :]
+    amplitudes = integrals / denominator
+    a_increment = np.einsum(
+        "I,rac->Irac", target_column.conj(), amplitudes, optimize=True
+    )
+    b_row = np.einsum(
+        "Ir,rac->Iac", target_projection.conj(), amplitudes, optimize=True
+    )
+    return a_increment, b_row
+
+
+def _strong_domain_mp2_density_h5_primal(
+    h5_path: str,
+    occupied_energy,
+    virtual_energy,
+    target_projection,
+    *,
+    naux: int,
+    nocc: int,
+    nvir: int,
+    block_nvir: int,
+) -> IAOMP2Density:
+    """Evaluate Doo/Dvv while reading only bounded pair-major Lov slices."""
+
+    dimensions = {"naux": naux, "nocc": nocc, "nvir": nvir}
+    for name, value in dimensions.items():
+        if (
+            not isinstance(value, (int, onp.integer))
+            or isinstance(value, bool)
+            or value < 0
+        ):
+            raise ValueError(f"{name} must be a nonnegative integer")
+    if (
+        not isinstance(block_nvir, (int, onp.integer))
+        or isinstance(block_nvir, bool)
+        or block_nvir <= 0
+    ):
+        raise ValueError("block_nvir must be a positive integer")
+    naux, nocc, nvir = int(naux), int(nocc), int(nvir)
+    block_nvir = min(int(block_nvir), nvir) if nvir else 1
+
+    occupied_energy = np.asarray(occupied_energy)
+    virtual_energy = np.asarray(virtual_energy)
+    target_projection = np.asarray(target_projection)
+    if occupied_energy.shape != (nocc,):
+        raise ValueError("occupied_energy must have shape (nocc,)")
+    if virtual_energy.shape != (nvir,):
+        raise ValueError("virtual_energy must have shape (nvir,)")
+    if target_projection.ndim != 2 or target_projection.shape[1] != nocc:
+        raise ValueError("target_projection must have shape (ntarget,nocc)")
+
+    ntarget = int(target_projection.shape[0])
+    nblock = (nvir + block_nvir - 1) // block_nvir
+    profile = resource_profile.start()
+    hdf5_read_s = 0.0
+    mp2_kernel_s = 0.0
+    bytes_read = 0
+
+    with h5py.File(h5_path, "r") as h5file:
+        lov_h5 = h5file["lov"]
+        expected_shape = (nocc * nvir, naux)
+        if lov_h5.shape != expected_shape:
+            raise ValueError(
+                f"/lov must have shape {expected_shape}, got {lov_h5.shape}"
+            )
+        dtype = lov_h5.dtype
+        itemsize = int(dtype.itemsize)
+        dmoo = np.zeros((nocc, nocc), dtype=dtype)
+        dmvv = np.zeros((nvir, nvir), dtype=dtype)
+
+        if ntarget != 0 and nocc != 0 and nvir != 0:
+            eia = occupied_energy[:, None] - virtual_energy[None, :]
+            for c0 in range(0, nvir, block_nvir):
+                c1 = min(c0 + block_nvir, nvir)
+                width = c1 - c0
+                lov_c_host = onp.empty((naux, nocc, width), dtype=dtype)
+                read_start = time.perf_counter()
+                for r in range(nocc):
+                    pair_rows = onp.asarray(
+                        lov_h5[r * nvir + c0:r * nvir + c1, :]
+                    )
+                    lov_c_host[:, r, :] = pair_rows.T
+                    del pair_rows
+                hdf5_read_s += time.perf_counter() - read_start
+                bytes_read += nocc * naux * width * itemsize
+
+                lov_c = np.asarray(lov_c_host)
+                del lov_c_host
+                eia_c = eia[:, c0:c1]
+                a_block = np.zeros(
+                    (ntarget, nocc, nvir, width), dtype=dtype
+                )
+                b_rows = []
+                for p in range(nocc):
+                    read_start = time.perf_counter()
+                    lov_p_host = onp.asarray(
+                        lov_h5[p * nvir:(p + 1) * nvir, :]
+                    )
+                    hdf5_read_s += time.perf_counter() - read_start
+                    bytes_read += naux * nvir * itemsize
+
+                    kernel_start = time.perf_counter()
+                    a_increment, b_row = (
+                        _target_amplitude_block_from_lov_occupied_slice(
+                            np.asarray(lov_p_host.T),
+                            lov_c,
+                            eia[p],
+                            eia_c,
+                            target_projection[:, p],
+                            target_projection,
+                        )
+                    )
+                    a_block = a_block + a_increment
+                    jax.block_until_ready((a_block, b_row))
+                    mp2_kernel_s += time.perf_counter() - kernel_start
+                    b_rows.append(b_row)
+                    del lov_p_host, a_increment
+
+                kernel_start = time.perf_counter()
+                b_block = np.stack(b_rows, axis=1)
+                contribution = _density_from_target_amplitude_block(
+                    a_block, b_block
+                )
+                dmoo = dmoo + contribution.occupied
+                dmvv = dmvv + contribution.virtual
+                jax.block_until_ready((dmoo, dmvv))
+                mp2_kernel_s += time.perf_counter() - kernel_start
+
+    density = IAOMP2Density(_hermitize(dmoo), _hermitize(dmvv))
+    if profile is not None:
+        resource_profile.finish(
+            "iao_lis.strong_domain_mp2_density_h5_primal",
+            profile,
+            lov_file_bytes=os.path.getsize(h5_path),
+            naux=naux,
+            nocc=nocc,
+            nvir=nvir,
+            ntarget=ntarget,
+            block_nvir=block_nvir,
+            nblock=nblock,
+            bytes_read=bytes_read,
+            bytes_written=0,
+            hdf5_read_s=hdf5_read_s,
+            mp2_kernel_s=mp2_kernel_s,
+        )
+    return density
 
 
 def strong_domain_mp2_density(mf, domain, static, fragment_index):

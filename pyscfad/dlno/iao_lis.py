@@ -40,6 +40,7 @@ rebuilt on the differentiable path by :func:`build_fragment_lis`.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import NamedTuple
 import os
 import time
@@ -47,6 +48,7 @@ import warnings
 
 import h5py
 import jax
+from jax.interpreters import ad as jax_ad
 import numpy as onp
 import scipy.linalg as onp_scipy_linalg
 
@@ -695,6 +697,553 @@ def _strong_domain_mp2_density_h5_primal(
             mp2_kernel_s=mp2_kernel_s,
         )
     return density
+
+
+def _validate_strong_domain_mp2_density_h5_inputs(
+    local_coeff,
+    occupied_energy,
+    virtual_energy,
+    target_projection,
+    nocc,
+    block_nvir,
+):
+    """Validate the real-float64 contract of the fused disk reverse."""
+
+    if (
+        not isinstance(nocc, (int, onp.integer))
+        or isinstance(nocc, bool)
+        or nocc < 0
+    ):
+        raise ValueError("nocc must be a nonnegative integer")
+    if (
+        not isinstance(block_nvir, (int, onp.integer))
+        or isinstance(block_nvir, bool)
+        or block_nvir <= 0
+    ):
+        raise ValueError("block_nvir must be a positive integer")
+    if local_coeff.ndim != 2 or nocc > local_coeff.shape[1]:
+        raise ValueError("local_coeff and nocc define an invalid orbital split")
+    nvir = int(local_coeff.shape[1]) - int(nocc)
+    if occupied_energy.shape != (int(nocc),):
+        raise ValueError("occupied_energy must have shape (nocc,)")
+    if virtual_energy.shape != (nvir,):
+        raise ValueError("virtual_energy must have shape (nvir,)")
+    if (
+        target_projection.ndim != 2
+        or target_projection.shape[1] != int(nocc)
+    ):
+        raise ValueError("target_projection must have shape (ntarget,nocc)")
+    arrays = {
+        "local_coeff": local_coeff,
+        "occupied_energy": occupied_energy,
+        "virtual_energy": virtual_energy,
+        "target_projection": target_projection,
+    }
+    incompatible = {
+        name: onp.dtype(value.dtype)
+        for name, value in arrays.items()
+        if onp.dtype(value.dtype) != onp.dtype(onp.float64)
+    }
+    if incompatible:
+        details = ", ".join(
+            f"{name}={dtype}" for name, dtype in incompatible.items()
+        )
+        raise ValueError(
+            "Fused HDF5 MP2 density reverse requires real float64 inputs; "
+            f"got {details}"
+        )
+    return nvir
+
+
+def _materialize_density_output_bar(bar, shape, dtype):
+    """Turn an absent/AD-zero output cotangent into a concrete array."""
+
+    if bar is None or isinstance(bar, jax_ad.Zero):
+        return np.zeros(shape, dtype=dtype)
+    bar = np.asarray(bar)
+    if bar.shape != shape:
+        raise ValueError(
+            f"density cotangent has shape {bar.shape}, expected {shape}"
+        )
+    return bar
+
+
+def _h5_density_hermitized_output_bars(
+    density_bar, *, nocc, nvir, dtype
+):
+    """Apply the adjoint of the final occupied/virtual hermitization."""
+
+    if isinstance(density_bar, jax_ad.Zero):
+        occupied_bar = virtual_bar = None
+    else:
+        occupied_bar = getattr(density_bar, "occupied", None)
+        virtual_bar = getattr(density_bar, "virtual", None)
+    occupied_bar = _materialize_density_output_bar(
+        occupied_bar, (nocc, nocc), dtype
+    )
+    virtual_bar = _materialize_density_output_bar(
+        virtual_bar, (nvir, nvir), dtype
+    )
+    return IAOMP2Density(
+        _hermitize(occupied_bar), _hermitize(virtual_bar)
+    )
+
+
+def _read_h5_lov_virtual_block(
+    lov_h5, *, naux, nocc, nvir, c0, c1
+):
+    """Read one contracted-virtual block into auxiliary-first layout."""
+
+    width = c1 - c0
+    lov_c_host = onp.empty((naux, nocc, width), dtype=lov_h5.dtype)
+    for r in range(nocc):
+        lov_c_host[:, r, :] = onp.asarray(
+            lov_h5[r * nvir + c0:r * nvir + c1, :]
+        ).T
+    return lov_c_host
+
+
+def _reconstruct_h5_target_amplitude_block(
+    lov_h5,
+    lov_c,
+    eia,
+    target_projection,
+    *,
+    naux,
+    nocc,
+    nvir,
+    c0,
+    c1,
+):
+    """Replay one bounded A/B block without retaining occupied pullbacks."""
+
+    width = c1 - c0
+    ntarget = int(target_projection.shape[0])
+    a_block = np.zeros(
+        (ntarget, nocc, nvir, width), dtype=lov_h5.dtype
+    )
+    b_block_host = onp.empty(
+        (ntarget, nocc, nvir, width), dtype=lov_h5.dtype
+    )
+    eia_c = eia[:, c0:c1]
+    for p in range(nocc):
+        lov_p_host = onp.asarray(
+            lov_h5[p * nvir:(p + 1) * nvir, :]
+        )
+        a_increment, b_row = (
+            _target_amplitude_block_from_lov_occupied_slice(
+                np.asarray(lov_p_host.T),
+                lov_c,
+                eia[p],
+                eia_c,
+                target_projection[:, p],
+                target_projection,
+            )
+        )
+        a_block = a_block + a_increment
+        jax.block_until_ready((a_block, b_row))
+        b_block_host[:, p, :, :] = onp.asarray(jax.device_get(b_row))
+        del lov_p_host, a_increment, b_row
+    return a_block, np.asarray(b_block_host)
+
+
+def _remove_h5_density_derivative_datasets(h5_path):
+    """Best-effort removal of derivative-only datasets after a failure."""
+
+    try:
+        with h5py.File(os.fspath(h5_path), "r+") as h5file:
+            changed = False
+            for name in ("lov_bar", "z"):
+                if name in h5file:
+                    del h5file[name]
+                    changed = True
+            if changed:
+                h5file.flush()
+    except (FileNotFoundError, OSError):
+        pass
+
+
+def _strong_domain_mp2_density_h5_lov_bwd(
+    h5_path,
+    occupied_energy,
+    virtual_energy,
+    target_projection,
+    density_bar,
+    *,
+    naux,
+    nocc,
+    nvir,
+    block_nvir,
+):
+    """Write pair-major ``/lov_bar`` and return energy/projection bars."""
+
+    h5_path = os.fspath(h5_path)
+    naux, nocc, nvir = int(naux), int(nocc), int(nvir)
+    if min(naux, nocc, nvir) < 0:
+        raise ValueError("HDF5 Lov dimensions must be nonnegative")
+    if (
+        not isinstance(block_nvir, (int, onp.integer))
+        or isinstance(block_nvir, bool)
+        or block_nvir <= 0
+    ):
+        raise ValueError("block_nvir must be a positive integer")
+    block_nvir = min(int(block_nvir), nvir) if nvir else 1
+    occupied_energy = np.asarray(occupied_energy)
+    virtual_energy = np.asarray(virtual_energy)
+    target_projection = np.asarray(target_projection)
+    if occupied_energy.shape != (nocc,):
+        raise ValueError("occupied_energy must have shape (nocc,)")
+    if virtual_energy.shape != (nvir,):
+        raise ValueError("virtual_energy must have shape (nvir,)")
+    if target_projection.ndim != 2 or target_projection.shape[1] != nocc:
+        raise ValueError("target_projection must have shape (ntarget,nocc)")
+
+    occupied_bar_host = onp.zeros_like(
+        onp.asarray(jax.device_get(occupied_energy))
+    )
+    virtual_bar_host = onp.zeros_like(
+        onp.asarray(jax.device_get(virtual_energy))
+    )
+    target_bar_host = onp.zeros_like(
+        onp.asarray(jax.device_get(target_projection))
+    )
+    npair = nocc * nvir
+    try:
+        with h5py.File(h5_path, "r+") as h5file:
+            if "lov" not in h5file:
+                raise ValueError("HDF5 density reverse requires /lov")
+            lov_h5 = h5file["lov"]
+            expected_shape = (npair, naux)
+            if lov_h5.ndim != 2 or tuple(lov_h5.shape) != expected_shape:
+                raise ValueError(
+                    f"/lov must have shape {expected_shape}, got "
+                    f"{lov_h5.shape}"
+                )
+            if onp.dtype(lov_h5.dtype) != onp.dtype(onp.float64):
+                raise ValueError(
+                    "Fused HDF5 MP2 density reverse requires real float64 "
+                    f"/lov; got {lov_h5.dtype}"
+                )
+            for name in ("lov_bar", "z"):
+                if name in h5file:
+                    del h5file[name]
+            lov_bar_h5 = h5file.create_dataset(
+                "lov_bar",
+                shape=expected_shape,
+                dtype=lov_h5.dtype,
+                chunks=None,
+                compression=None,
+                fillvalue=0.0,
+            )
+            hermitized_bar = _h5_density_hermitized_output_bars(
+                density_bar, nocc=nocc, nvir=nvir, dtype=lov_h5.dtype
+            )
+
+            ntarget = int(target_projection.shape[0])
+            if ntarget != 0 and nocc != 0 and nvir != 0:
+                eia = occupied_energy[:, None] - virtual_energy[None, :]
+                for c0 in reversed(range(0, nvir, block_nvir)):
+                    c1 = min(c0 + block_nvir, nvir)
+                    width = c1 - c0
+                    lov_c_host = _read_h5_lov_virtual_block(
+                        lov_h5,
+                        naux=naux,
+                        nocc=nocc,
+                        nvir=nvir,
+                        c0=c0,
+                        c1=c1,
+                    )
+                    lov_c = np.asarray(lov_c_host)
+                    del lov_c_host
+                    a_block, b_block = (
+                        _reconstruct_h5_target_amplitude_block(
+                            lov_h5,
+                            lov_c,
+                            eia,
+                            target_projection,
+                            naux=naux,
+                            nocc=nocc,
+                            nvir=nvir,
+                            c0=c0,
+                            c1=c1,
+                        )
+                    )
+                    _, density_pullback = jax.vjp(
+                        _density_from_target_amplitude_block,
+                        a_block,
+                        b_block,
+                    )
+                    a_bar, b_bar = density_pullback(hermitized_bar)
+                    jax.block_until_ready((a_bar, b_bar))
+                    del density_pullback, a_block, b_block
+
+                    lov_c_bar_host = onp.zeros(
+                        (naux, nocc, width), dtype=lov_h5.dtype
+                    )
+                    eia_c = eia[:, c0:c1]
+                    for p in range(nocc):
+                        lov_p_host = onp.asarray(
+                            lov_h5[p * nvir:(p + 1) * nvir, :]
+                        )
+                        slice_inputs = (
+                            np.asarray(lov_p_host.T),
+                            lov_c,
+                            eia[p],
+                            eia_c,
+                            target_projection[:, p],
+                            target_projection,
+                        )
+                        _, slice_pullback = jax.vjp(
+                            _target_amplitude_block_from_lov_occupied_slice,
+                            *slice_inputs,
+                        )
+                        slice_bars = slice_pullback(
+                            (a_bar, b_bar[:, p, :, :])
+                        )
+                        slice_bars_host = tuple(
+                            onp.asarray(jax.device_get(bar))
+                            for bar in slice_bars
+                        )
+                        jax.block_until_ready(slice_bars)
+                        del slice_pullback, slice_inputs, slice_bars
+                        (
+                            lov_p_bar,
+                            lov_c_bar,
+                            eia_p_bar,
+                            eia_c_bar,
+                            target_column_bar,
+                            target_projection_bar,
+                        ) = slice_bars_host
+
+                        pair0, pair1 = p * nvir, (p + 1) * nvir
+                        lov_bar_row = onp.asarray(
+                            lov_bar_h5[pair0:pair1, :]
+                        )
+                        lov_bar_row += lov_p_bar.T
+                        lov_bar_h5[pair0:pair1, :] = lov_bar_row
+                        lov_c_bar_host += lov_c_bar
+                        occupied_bar_host[p] += onp.sum(eia_p_bar)
+                        virtual_bar_host -= eia_p_bar
+                        occupied_bar_host += onp.sum(eia_c_bar, axis=1)
+                        virtual_bar_host[c0:c1] -= onp.sum(
+                            eia_c_bar, axis=0
+                        )
+                        target_bar_host[:, p] += target_column_bar
+                        target_bar_host += target_projection_bar
+                        del (
+                            lov_p_host,
+                            slice_bars_host,
+                            lov_p_bar,
+                            lov_c_bar,
+                            eia_p_bar,
+                            eia_c_bar,
+                            target_column_bar,
+                            target_projection_bar,
+                            lov_bar_row,
+                        )
+
+                    for r in range(nocc):
+                        pair0 = r * nvir + c0
+                        pair1 = r * nvir + c1
+                        lov_bar_block = onp.asarray(
+                            lov_bar_h5[pair0:pair1, :]
+                        )
+                        lov_bar_block += lov_c_bar_host[:, r, :].T
+                        lov_bar_h5[pair0:pair1, :] = lov_bar_block
+                    del (
+                        a_bar,
+                        b_bar,
+                        lov_c,
+                        lov_c_bar_host,
+                    )
+            h5file.flush()
+    except BaseException:
+        _remove_h5_density_derivative_datasets(h5_path)
+        raise
+
+    return (
+        np.asarray(occupied_bar_host),
+        np.asarray(virtual_bar_host),
+        np.asarray(target_bar_host),
+    )
+
+
+def _strong_domain_mp2_density_h5_impl(
+    fake_mol,
+    auxmol,
+    local_coeff,
+    occupied_energy,
+    virtual_energy,
+    target_projection,
+    nocc,
+    h5_path,
+    max_memory,
+    block_nvir,
+):
+    """Build disk Lov and evaluate its blocked density eagerly."""
+
+    h5_path = os.fspath(h5_path)
+    max_memory = float(max_memory)
+    local_coeff = np.asarray(local_coeff)
+    occupied_energy = np.asarray(occupied_energy)
+    virtual_energy = np.asarray(virtual_energy)
+    target_projection = np.asarray(target_projection)
+    nvir = _validate_strong_domain_mp2_density_h5_inputs(
+        local_coeff,
+        occupied_energy,
+        virtual_energy,
+        target_projection,
+        nocc,
+        block_nvir,
+    )
+    nocc = int(nocc)
+    block_nvir = int(block_nvir)
+    if local_coeff.shape[0] != fake_mol.nao:
+        raise ValueError("local_coeff rows must match the local AO basis")
+    info = lno_base._build_local_Lov_h5_impl(
+        fake_mol,
+        auxmol,
+        local_coeff,
+        (0, nocc, nocc, local_coeff.shape[1]),
+        h5_path,
+        max_memory,
+    )
+    if (info.naux, info.nocc, info.nvir) != (auxmol.nao, nocc, nvir):
+        raise RuntimeError("direct HDF5 Lov metadata is inconsistent")
+    return _strong_domain_mp2_density_h5_primal(
+        h5_path,
+        occupied_energy,
+        virtual_energy,
+        target_projection,
+        naux=info.naux,
+        nocc=info.nocc,
+        nvir=info.nvir,
+        block_nvir=block_nvir,
+    )
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(6, 7, 8, 9))
+def _strong_domain_mp2_density_h5(
+    fake_mol,
+    auxmol,
+    local_coeff,
+    occupied_energy,
+    virtual_energy,
+    target_projection,
+    nocc,
+    h5_path,
+    max_memory,
+    block_nvir,
+):
+    """Fused eager local-Lov construction and disk-backed MP2 density."""
+
+    return _strong_domain_mp2_density_h5_impl(
+        fake_mol,
+        auxmol,
+        local_coeff,
+        occupied_energy,
+        virtual_energy,
+        target_projection,
+        nocc,
+        h5_path,
+        max_memory,
+        block_nvir,
+    )
+
+
+def _strong_domain_mp2_density_h5_fwd(
+    fake_mol,
+    auxmol,
+    local_coeff,
+    occupied_energy,
+    virtual_energy,
+    target_projection,
+    nocc,
+    h5_path,
+    max_memory,
+    block_nvir,
+):
+    density = _strong_domain_mp2_density_h5(
+        fake_mol,
+        auxmol,
+        local_coeff,
+        occupied_energy,
+        virtual_energy,
+        target_projection,
+        nocc,
+        h5_path,
+        max_memory,
+        block_nvir,
+    )
+    residual = (
+        fake_mol,
+        auxmol,
+        local_coeff,
+        occupied_energy,
+        virtual_energy,
+        target_projection,
+    )
+    return density, residual
+
+
+def _strong_domain_mp2_density_h5_bwd(
+    nocc,
+    h5_path,
+    max_memory,
+    block_nvir,
+    residual,
+    density_bar,
+):
+    del max_memory
+    (
+        fake_mol,
+        auxmol,
+        local_coeff,
+        occupied_energy,
+        virtual_energy,
+        target_projection,
+    ) = residual
+    nocc = int(nocc)
+    nvir = int(local_coeff.shape[1]) - nocc
+    orbs_slice = (0, nocc, nocc, local_coeff.shape[1])
+    try:
+        energy_projection_bars = (
+            _strong_domain_mp2_density_h5_lov_bwd(
+                h5_path,
+                occupied_energy,
+                virtual_energy,
+                target_projection,
+                density_bar,
+                naux=auxmol.nao,
+                nocc=nocc,
+                nvir=nvir,
+                block_nvir=block_nvir,
+            )
+        )
+        fake_mol_bar, auxmol_bar, local_coeff_bar = (
+            lno_base._local_direct_nr_e2_h5_bwd(
+                fake_mol,
+                auxmol,
+                local_coeff,
+                orbs_slice,
+                h5_path,
+            )
+        )
+    except BaseException:
+        _remove_h5_density_derivative_datasets(h5_path)
+        raise
+    return (
+        fake_mol_bar,
+        auxmol_bar,
+        local_coeff_bar,
+        *energy_projection_bars,
+    )
+
+
+_strong_domain_mp2_density_h5.defvjp(
+    _strong_domain_mp2_density_h5_fwd,
+    _strong_domain_mp2_density_h5_bwd,
+)
 
 
 def strong_domain_mp2_density(mf, domain, static, fragment_index):

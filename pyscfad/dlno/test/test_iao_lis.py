@@ -715,6 +715,519 @@ def _symmetric_weight(rng, size):
     return jnp.asarray(0.5 * (weight + weight.T))
 
 
+def _general_weight(rng, size):
+    return jnp.asarray(rng.normal(size=(size, size)))
+
+
+def _weighted_density_objective(density, occupied_weight, virtual_weight):
+    return jnp.real(
+        jnp.vdot(occupied_weight, density.occupied)
+        + jnp.vdot(virtual_weight, density.virtual)
+    )
+
+
+def _assert_pytree_allclose(actual, expected, **kwargs):
+    actual_leaves = jax.tree_util.tree_leaves(actual)
+    expected_leaves = jax.tree_util.tree_leaves(expected)
+    assert len(actual_leaves) == len(expected_leaves)
+    for actual_leaf, expected_leaf in zip(actual_leaves, expected_leaves):
+        np.testing.assert_allclose(
+            np.asarray(actual_leaf), np.asarray(expected_leaf), **kwargs
+        )
+
+
+def _actual_h5_custom_density_problem(path):
+    mol = gto.Mole(
+        atom="O 0 0 0; H 0 0 1; H 0 1 0",
+        basis="sto-3g",
+        verbose=0,
+        max_memory=200,
+    )
+    mol.build(trace_exp=False, trace_ctr_coeff=False)
+    atmlst = np.asarray([0, 1], dtype=np.int32)
+    fake_mol = iao_lis.lno_base.make_local_mol(mol, atmlst)
+    auxmol = iao_lis.lno_base.df_addons.make_auxmol(
+        fake_mol, "weigend"
+    )
+    rng = np.random.default_rng(1401)
+    nocc = 2
+    nvir = 3
+    local_coeff = jnp.asarray(
+        rng.normal(scale=0.2, size=(fake_mol.nao, nocc + nvir))
+    )
+    occupied_energy = jnp.asarray([-1.3, -0.8])
+    virtual_energy = jnp.asarray([0.2, 0.7, 1.1])
+    target_projection = jnp.asarray(
+        rng.normal(scale=0.3, size=(2, nocc))
+    )
+    differentiable = (
+        fake_mol,
+        auxmol,
+        local_coeff,
+        occupied_energy,
+        virtual_energy,
+        target_projection,
+    )
+    static = (nocc, str(path), float(mol.max_memory), 2)
+    return differentiable, static
+
+
+def _h5_custom_density(differentiable, static):
+    return iao_lis._strong_domain_mp2_density_h5(
+        *differentiable, *static
+    )
+
+
+def _in_memory_direct_density(differentiable, static):
+    (
+        fake_mol,
+        auxmol,
+        local_coeff,
+        occupied_energy,
+        virtual_energy,
+        target_projection,
+    ) = differentiable
+    nocc, _, max_memory, block_nvir = static
+    nvir = local_coeff.shape[1] - nocc
+    lov = iao_lis.lno_base._local_direct_nr_e2(
+        fake_mol,
+        auxmol,
+        local_coeff,
+        max_memory,
+        (0, nocc, nocc, local_coeff.shape[1]),
+    ).reshape(auxmol.nao, nocc, nvir)
+    return strong_domain_mp2_density_from_lov(
+        lov,
+        occupied_energy,
+        virtual_energy,
+        target_projection,
+        block_nvir=block_nvir,
+    )
+
+
+@pytest.mark.parametrize("block_nvir", [1, 2, 5])
+def test_h5_custom_density_weighted_value_and_all_bars_match_in_memory(
+    tmp_path, block_nvir
+):
+    differentiable, static = _actual_h5_custom_density_problem(
+        tmp_path / f"weighted-block-{block_nvir}.h5"
+    )
+    static = (*static[:3], block_nvir)
+    rng = np.random.default_rng(1402)
+    occupied_weight = _symmetric_weight(rng, 2)
+    virtual_weight = _symmetric_weight(rng, 3)
+
+    def disk_objective(*args):
+        return _weighted_density_objective(
+            _h5_custom_density(args, static),
+            occupied_weight,
+            virtual_weight,
+        )
+
+    def memory_objective(*args):
+        return _weighted_density_objective(
+            _in_memory_direct_density(args, static),
+            occupied_weight,
+            virtual_weight,
+        )
+
+    argnums = tuple(range(len(differentiable)))
+    disk_value, disk_bars = jax.value_and_grad(
+        disk_objective, argnums=argnums
+    )(*differentiable)
+    memory_value, memory_bars = jax.value_and_grad(
+        memory_objective, argnums=argnums
+    )(*differentiable)
+
+    np.testing.assert_allclose(
+        disk_value, memory_value, rtol=3e-10, atol=3e-11
+    )
+    for disk_bar, memory_bar in zip(disk_bars, memory_bars):
+        _assert_pytree_allclose(
+            disk_bar, memory_bar, rtol=3e-10, atol=3e-11
+        )
+
+
+def test_h5_custom_density_combined_directional_finite_difference(tmp_path):
+    differentiable, static = _actual_h5_custom_density_problem(
+        tmp_path / "directional.h5"
+    )
+    fake_mol, auxmol, *array_arguments = differentiable
+    rng = np.random.default_rng(1403)
+    directions = tuple(
+        jnp.asarray(rng.normal(size=value.shape))
+        for value in array_arguments
+    )
+    occupied_weight = _symmetric_weight(rng, 2)
+    virtual_weight = _symmetric_weight(rng, 3)
+
+    def objective(*arrays):
+        return _weighted_density_objective(
+            _h5_custom_density((fake_mol, auxmol, *arrays), static),
+            occupied_weight,
+            virtual_weight,
+        )
+
+    argnums = tuple(range(len(array_arguments)))
+    gradient = jax.grad(objective, argnums=argnums)(*array_arguments)
+    analytic = sum(
+        jnp.real(jnp.vdot(bar, direction))
+        for bar, direction in zip(gradient, directions)
+    )
+    step = 2e-5
+    plus = tuple(
+        value + step * direction
+        for value, direction in zip(array_arguments, directions)
+    )
+    minus = tuple(
+        value - step * direction
+        for value, direction in zip(array_arguments, directions)
+    )
+    finite_difference = (objective(*plus) - objective(*minus)) / (2 * step)
+    np.testing.assert_allclose(
+        analytic, finite_difference, rtol=5e-7, atol=5e-9
+    )
+
+
+def test_h5_custom_density_parent_coordinate_chain_and_one_output_bar(
+    tmp_path,
+):
+    path = tmp_path / "parent-coordinate.h5"
+    differentiable, static = _actual_h5_custom_density_problem(path)
+    parent_mol = differentiable[0]
+    _, _, local_coeff, occupied_energy, virtual_energy, target_projection = (
+        differentiable
+    )
+    atmlst = np.arange(parent_mol.natm, dtype=np.int32)
+    occupied_weight = _general_weight(np.random.default_rng(1408), 2)
+
+    def local_arguments(mol):
+        fake_mol = iao_lis.lno_base.make_local_mol(mol, atmlst)
+        auxmol = iao_lis.lno_base.df_addons.make_auxmol(
+            fake_mol, "weigend"
+        )
+        return (
+            fake_mol,
+            auxmol,
+            local_coeff,
+            occupied_energy,
+            virtual_energy,
+            target_projection,
+        )
+
+    def disk_objective(mol):
+        density = _h5_custom_density(local_arguments(mol), static)
+        return jnp.real(jnp.vdot(occupied_weight, density.occupied))
+
+    def memory_objective(mol):
+        density = _in_memory_direct_density(local_arguments(mol), static)
+        return jnp.real(jnp.vdot(occupied_weight, density.occupied))
+
+    disk_value, disk_bar = jax.value_and_grad(disk_objective)(parent_mol)
+    memory_value, memory_bar = jax.value_and_grad(memory_objective)(parent_mol)
+    np.testing.assert_allclose(
+        disk_value, memory_value, rtol=3e-10, atol=3e-11
+    )
+    np.testing.assert_allclose(
+        disk_bar.coords, memory_bar.coords, rtol=3e-9, atol=3e-10
+    )
+
+
+def test_h5_density_lov_backward_matches_dense_gradient_with_tail_block(
+    tmp_path,
+):
+    rng = np.random.default_rng(1404)
+    naux, nocc, nvir, ntarget, block_nvir = 5, 3, 5, 2, 2
+    lov = jnp.asarray(
+        rng.normal(scale=0.12, size=(naux, nocc, nvir))
+    )
+    occupied_energy = jnp.asarray(-np.linspace(1.5, 0.7, nocc))
+    virtual_energy = jnp.asarray(np.linspace(0.2, 1.3, nvir))
+    target_projection = jnp.asarray(
+        rng.normal(scale=0.3, size=(ntarget, nocc))
+    )
+    occupied_weight = _general_weight(rng, nocc)
+    virtual_weight = _general_weight(rng, nvir)
+    path = tmp_path / "lov-backward.h5"
+    _write_pair_major_lov(path, lov)
+
+    def reference_objective(*args):
+        return _weighted_density_objective(
+            strong_domain_mp2_density_from_lov(
+                *args, block_nvir=block_nvir
+            ),
+            occupied_weight,
+            virtual_weight,
+        )
+
+    reference_bars = jax.grad(
+        reference_objective, argnums=(0, 1, 2, 3)
+    )(lov, occupied_energy, virtual_energy, target_projection)
+    actual_energy_projection_bars = (
+        iao_lis._strong_domain_mp2_density_h5_lov_bwd(
+            str(path),
+            occupied_energy,
+            virtual_energy,
+            target_projection,
+            iao_lis.IAOMP2Density(occupied_weight, virtual_weight),
+            naux=naux,
+            nocc=nocc,
+            nvir=nvir,
+            block_nvir=block_nvir,
+        )
+    )
+    with h5py.File(path, "r") as h5file:
+        lov_bar = jnp.asarray(h5file["lov_bar"][:]).reshape(
+            nocc, nvir, naux
+        ).transpose(2, 0, 1)
+
+    np.testing.assert_allclose(
+        lov_bar, reference_bars[0], rtol=3e-10, atol=3e-11
+    )
+    for actual, expected in zip(
+        actual_energy_projection_bars, reference_bars[1:]
+    ):
+        np.testing.assert_allclose(
+            actual, expected, rtol=3e-10, atol=3e-11
+        )
+
+
+def test_h5_density_lov_backward_uses_only_rows_and_virtual_blocks(
+    monkeypatch, tmp_path
+):
+    rng = np.random.default_rng(1405)
+    naux, nocc, nvir, ntarget, block_nvir = 4, 3, 5, 2, 2
+    lov = rng.normal(size=(naux, nocc, nvir))
+    path = tmp_path / "bounded-density-backward.h5"
+    _write_pair_major_lov(path, lov)
+    original_array = h5py.Dataset.__array__
+    original_getitem = h5py.Dataset.__getitem__
+    original_setitem = h5py.Dataset.__setitem__
+    reads = {"/lov": [], "/lov_bar": []}
+    writes = {"/lov_bar": []}
+
+    def forbidden_array(dataset, *args, **kwargs):
+        if dataset.name in reads:
+            raise AssertionError(f"complete conversion of {dataset.name}")
+        return original_array(dataset, *args, **kwargs)
+
+    def tracked_getitem(dataset, key):
+        if dataset.name in reads:
+            reads[dataset.name].append(key)
+        return original_getitem(dataset, key)
+
+    def tracked_setitem(dataset, key, value):
+        if dataset.name in writes:
+            writes[dataset.name].append(key)
+        return original_setitem(dataset, key, value)
+
+    monkeypatch.setattr(h5py.Dataset, "__array__", forbidden_array)
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", tracked_getitem)
+    monkeypatch.setattr(h5py.Dataset, "__setitem__", tracked_setitem)
+
+    iao_lis._strong_domain_mp2_density_h5_lov_bwd(
+        str(path),
+        -jnp.linspace(1.4, 0.8, nocc),
+        jnp.linspace(0.2, 1.1, nvir),
+        jnp.asarray(rng.normal(size=(ntarget, nocc))),
+        iao_lis.IAOMP2Density(
+            _symmetric_weight(rng, nocc),
+            _symmetric_weight(rng, nvir),
+        ),
+        naux=naux,
+        nocc=nocc,
+        nvir=nvir,
+        block_nvir=block_nvir,
+    )
+
+    npair = nocc * nvir
+    assert reads["/lov"]
+    assert reads["/lov_bar"]
+    assert writes["/lov_bar"]
+    for selections in (*reads.values(), *writes.values()):
+        for key in selections:
+            assert isinstance(key, tuple) and len(key) == 2
+            row_slice, aux_slice = key
+            assert isinstance(row_slice, slice)
+            assert row_slice.step in (None, 1)
+            assert aux_slice == slice(None)
+            row_count = np.arange(npair)[row_slice].size
+            assert row_count <= nvir
+            assert row_count < npair
+
+
+def test_h5_density_lov_backward_flushes_only_after_all_virtual_blocks(
+    monkeypatch, tmp_path
+):
+    rng = np.random.default_rng(1409)
+    naux, nocc, nvir, block_nvir = 4, 3, 5, 2
+    path = tmp_path / "single-flush-density-backward.h5"
+    _write_pair_major_lov(
+        path, rng.normal(size=(naux, nocc, nvir))
+    )
+    original_flush = h5py.File.flush
+    flushes = []
+
+    def tracked_flush(h5file):
+        if h5file.filename == str(path):
+            flushes.append(tuple(h5file.keys()))
+        return original_flush(h5file)
+
+    monkeypatch.setattr(h5py.File, "flush", tracked_flush)
+    iao_lis._strong_domain_mp2_density_h5_lov_bwd(
+        str(path),
+        -jnp.linspace(1.4, 0.8, nocc),
+        jnp.linspace(0.2, 1.1, nvir),
+        jnp.asarray(rng.normal(size=(2, nocc))),
+        iao_lis.IAOMP2Density(
+            _general_weight(rng, nocc), _general_weight(rng, nvir)
+        ),
+        naux=naux,
+        nocc=nocc,
+        nvir=nvir,
+        block_nvir=block_nvir,
+    )
+
+    assert flushes == [("lov", "lov_bar")]
+
+
+def test_h5_density_lov_backward_zero_target_writes_zero_bar(tmp_path):
+    rng = np.random.default_rng(1406)
+    naux, nocc, nvir = 3, 2, 4
+    path = tmp_path / "zero-target-backward.h5"
+    _write_pair_major_lov(
+        path, rng.normal(size=(naux, nocc, nvir))
+    )
+    bars = iao_lis._strong_domain_mp2_density_h5_lov_bwd(
+        str(path),
+        -jnp.linspace(1.2, 0.8, nocc),
+        jnp.linspace(0.2, 1.0, nvir),
+        jnp.zeros((0, nocc)),
+        iao_lis.IAOMP2Density(jnp.ones((nocc, nocc)),
+                              jnp.ones((nvir, nvir))),
+        naux=naux,
+        nocc=nocc,
+        nvir=nvir,
+        block_nvir=3,
+    )
+    with h5py.File(path, "r") as h5file:
+        np.testing.assert_array_equal(h5file["lov_bar"][:], 0)
+    for bar in bars:
+        np.testing.assert_array_equal(bar, 0)
+
+
+def test_h5_custom_density_residual_is_bounded_and_pullback_is_repeatable(
+    tmp_path,
+):
+    path = tmp_path / "repeatable.h5"
+    differentiable, static = _actual_h5_custom_density_problem(path)
+
+    def density_fn(*args):
+        return _h5_custom_density(args, static)
+
+    density, pullback = jax.vjp(density_fn, *differentiable)
+    residual_arrays = [
+        value
+        for name in ("args_res", "opaque_residuals")
+        for value in jax.tree_util.tree_leaves(getattr(pullback, name, ()))
+        if hasattr(value, "shape")
+    ]
+    assert residual_arrays
+    nocc = static[0]
+    nvir = differentiable[2].shape[1] - nocc
+    naux = differentiable[1].nao
+    assert all(value.size < naux * nocc * nvir
+               for value in residual_arrays)
+    ntarget = differentiable[5].shape[0]
+    block_nvir = min(static[3], nvir)
+    nblock = (nvir + block_nvir - 1) // block_nvir
+    amplitude_block_shape = (ntarget, nocc, nvir, block_nvir)
+    assert not any(
+        value.ndim >= 5
+        and tuple(value.shape[-4:]) == amplitude_block_shape
+        and np.prod(value.shape[:-4]) >= nblock
+        for value in residual_arrays
+    )
+
+    rng = np.random.default_rng(1407)
+    density_bar = iao_lis.IAOMP2Density(
+        _symmetric_weight(rng, density.occupied.shape[0]),
+        _symmetric_weight(rng, density.virtual.shape[0]),
+    )
+    first_bars = pullback(density_bar)
+    with h5py.File(path, "r") as h5file:
+        first_lov_bar = h5file["lov_bar"][:]
+        assert set(h5file) == {"lov", "lov_bar", "z"}
+    second_bars = pullback(
+        iao_lis.IAOMP2Density(
+            2 * density_bar.occupied, 2 * density_bar.virtual
+        )
+    )
+    with h5py.File(path, "r") as h5file:
+        second_lov_bar = h5file["lov_bar"][:]
+        assert set(h5file) == {"lov", "lov_bar", "z"}
+
+    np.testing.assert_allclose(
+        second_lov_bar, 2 * first_lov_bar, rtol=3e-10, atol=3e-11
+    )
+    for second_bar, first_bar in zip(second_bars, first_bars):
+        _assert_pytree_allclose(
+            second_bar, jax.tree_util.tree_map(lambda value: 2 * value,
+                                               first_bar),
+            rtol=3e-9, atol=3e-10,
+        )
+
+
+def test_h5_custom_density_failed_pullback_removes_derivative_datasets(
+    monkeypatch, tmp_path
+):
+    path = tmp_path / "failed-pullback.h5"
+    differentiable, static = _actual_h5_custom_density_problem(path)
+
+    def density_fn(*args):
+        return _h5_custom_density(args, static)
+
+    density, pullback = jax.vjp(density_fn, *differentiable)
+
+    def fail_local_reverse(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("injected local reverse failure")
+
+    monkeypatch.setattr(
+        iao_lis.lno_base,
+        "_local_direct_nr_e2_h5_bwd",
+        fail_local_reverse,
+    )
+    with pytest.raises(RuntimeError, match="injected local reverse failure"):
+        pullback(
+            iao_lis.IAOMP2Density(
+                jnp.ones_like(density.occupied),
+                jnp.ones_like(density.virtual),
+            )
+        )
+    with h5py.File(path, "r") as h5file:
+        assert set(h5file) == {"lov"}
+
+
+@pytest.mark.parametrize(
+    ("static_index", "invalid_value", "name", "expected_message"),
+    (
+        (0, 1.5, "nocc", "nocc must be a nonnegative integer"),
+        (3, 1.5, "block_nvir", "block_nvir must be a positive integer"),
+    ),
+)
+def test_h5_custom_density_rejects_fractional_static_controls(
+    tmp_path, static_index, invalid_value, name, expected_message
+):
+    differentiable, static = _actual_h5_custom_density_problem(
+        tmp_path / f"invalid-{name}.h5"
+    )
+    static = list(static)
+    static[static_index] = invalid_value
+    with pytest.raises(ValueError, match=expected_message):
+        _h5_custom_density(differentiable, tuple(static))
+
+
 def test_blocked_lov_density_value_and_grad_matches_dense_reference():
     rng = np.random.default_rng(977)
     naux, nocc, nvir, ntarget = 6, 3, 5, 2

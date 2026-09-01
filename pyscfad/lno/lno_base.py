@@ -2854,6 +2854,52 @@ def build_local_Lov_h5(
     )
 
 
+def _local_lov_h5_pair_tile_size(
+    naux: int,
+    npair: int,
+    dtype,
+    target_mb: float = 256.0,
+) -> int:
+    """Choose a pair tile accounting for Lov, Lov-bar, and z storage."""
+    if not isinstance(naux, (int, numpy.integer)) or int(naux) <= 0:
+        raise ValueError('naux must be a positive integer')
+    if not isinstance(npair, (int, numpy.integer)) or int(npair) < 0:
+        raise ValueError('npair must be a nonnegative integer')
+    try:
+        dtype = numpy.dtype(dtype)
+    except TypeError as err:
+        raise ValueError('dtype must be a fixed-width numeric dtype') from err
+    if dtype.hasobject or dtype.itemsize <= 0:
+        raise ValueError('dtype must be a fixed-width numeric dtype')
+    if not numpy.issubdtype(dtype, numpy.number):
+        raise ValueError('dtype must be numeric')
+    try:
+        target_mb = float(target_mb)
+    except (TypeError, ValueError) as err:
+        raise ValueError('target_mb must be positive and finite') from err
+    if not numpy.isfinite(target_mb) or target_mb <= 0:
+        raise ValueError('target_mb must be positive and finite')
+    if int(npair) == 0:
+        return 1
+    bytes_per_pair = 3 * int(naux) * dtype.itemsize
+    tile_size = int(target_mb * 1024.0**2 // bytes_per_pair)
+    return max(1, min(int(npair), tile_size))
+
+
+def _local_lov_h5_z_chunks(naux, npair, dtype, pair_tile_size):
+    """Choose internal 2-D z chunks near 8 MiB for both access axes."""
+    if npair == 0:
+        return None
+    dtype = numpy.dtype(dtype)
+    target_items = max(1, int(8.0 * 1024.0**2 // dtype.itemsize))
+    pair_chunk = int(
+        numpy.sqrt(target_items * float(npair) / max(float(naux), 1.0))
+    )
+    pair_chunk = max(1, min(int(npair), int(pair_tile_size), pair_chunk))
+    aux_chunk = max(1, min(int(naux), target_items // pair_chunk))
+    return aux_chunk, pair_chunk
+
+
 def _local_direct_raw_int3c_blocks(mol, auxmol):
     """Yield ``(auxiliary AO slice, raw packed int3c block)`` pairs."""
     npair = mol.nao * (mol.nao + 1) // 2
@@ -2883,22 +2929,186 @@ def _local_direct_raw_int3c_blocks(mol, auxmol):
         yield p0, p1, numpy.asarray(jax.device_get(ints)).T
 
 
-def _local_direct_mo_coeff_vjp(mol, auxmol, mo_coeff, z, orbs_slice):
-    """MO-coefficient pullback streamed over raw auxiliary-shell blocks."""
+def _local_direct_mo_coeff_vjp_from_z_reader(
+        mol, auxmol, mo_coeff, read_z_aux_block, orbs_slice):
+    """MO-coefficient pullback with one z read per raw-integral block."""
     mo_coeff_bar = numpy.zeros_like(numpy.asarray(jax.device_get(mo_coeff)))
-    z = numpy.asarray(jax.device_get(z))
+    k0, k1, l0, l1 = map(int, orbs_slice)
+    kl_count = (k1 - k0) * (l1 - l0)
+    if kl_count == 0:
+        return np.asarray(mo_coeff_bar)
     for p0, p1, raw_ints in _local_direct_raw_int3c_blocks(mol, auxmol):
+        z_block = numpy.asarray(read_z_aux_block(p0, p1))
+        expected_shape = (p1 - p0, kl_count)
+        if z_block.size != expected_shape[0] * expected_shape[1]:
+            raise ValueError(
+                'z auxiliary block has incompatible shape: '
+                f'got {z_block.shape}, expected {expected_shape}'
+            )
+        z_block = z_block.reshape(expected_shape)
         mo_coeff_bar += numpy.asarray(
             _ao2mo.nr_e2_mo_coeff_vjp(
                 raw_ints,
                 mo_coeff,
-                z[p0:p1],
+                z_block,
                 orbs_slice,
                 aosym='s2',
                 mosym='s1',
             )
         )
     return np.asarray(mo_coeff_bar)
+
+
+def _local_direct_mo_coeff_vjp(mol, auxmol, mo_coeff, z, orbs_slice):
+    """MO-coefficient pullback from a full z array or auxiliary reader."""
+    if callable(z):
+        read_z_aux_block = z
+    else:
+        k0, k1, l0, l1 = map(int, orbs_slice)
+        z_array = numpy.asarray(jax.device_get(z)).reshape(
+            auxmol.nao, (k1 - k0) * (l1 - l0)
+        )
+        read_z_aux_block = lambda p0, p1: z_array[p0:p1, :]
+    return _local_direct_mo_coeff_vjp_from_z_reader(
+        mol, auxmol, mo_coeff, read_z_aux_block, orbs_slice
+    )
+
+
+def _local_direct_nr_e2_h5_bwd(
+    mol,
+    auxmol,
+    mo_coeff,
+    orbs_slice,
+    h5_path: str,
+):
+    """Consume pair-major Lov/Lov-bar datasets without materializing z."""
+    if mol.exp is not None or mol.ctr_coeff is not None or mol.r0 is not None:
+        raise NotImplementedError(
+            'Integral-direct local Lov currently supports coordinate and '
+            'MO-coefficient derivatives, but not AO basis-parameter derivatives.'
+        )
+    if (
+        auxmol.exp is not None
+        or auxmol.ctr_coeff is not None
+        or auxmol.r0 is not None
+    ):
+        raise NotImplementedError(
+            'Integral-direct local Lov currently supports coordinate and '
+            'MO-coefficient derivatives, but not auxiliary basis-parameter '
+            'derivatives.'
+        )
+
+    mo_coeff = np.asarray(mo_coeff)
+    if mo_coeff.ndim != 2 or mo_coeff.shape[0] != mol.nao:
+        raise ValueError('mo_coeff shape does not match the molecular AO basis')
+    k0, k1, l0, l1 = map(int, orbs_slice)
+    if not (0 <= k0 <= k1 <= mo_coeff.shape[1]):
+        raise ValueError('Invalid first-orbital slice for direct local AO2MO')
+    if not (0 <= l0 <= l1 <= mo_coeff.shape[1]):
+        raise ValueError('Invalid second-orbital slice for direct local AO2MO')
+    naux = int(auxmol.nao)
+    npair = (k1 - k0) * (l1 - l0)
+
+    def metric_cholesky(auxmol_):
+        return jsp_linalg.cholesky(
+            auxmol_.intor(auxmol_._add_suffix('int2c2e'), hermi=1),
+            lower=True,
+        )
+
+    with h5py.File(os.fspath(h5_path), 'r+') as h5file:
+        if 'lov' not in h5file or 'lov_bar' not in h5file:
+            raise ValueError('HDF5 reverse requires /lov and /lov_bar datasets')
+        lov = h5file['lov']
+        lov_bar = h5file['lov_bar']
+        expected_shape = (npair, naux)
+        if lov.ndim != 2 or tuple(lov.shape) != expected_shape:
+            raise ValueError(
+                f'/lov shape {lov.shape} does not match {expected_shape}'
+            )
+        if lov_bar.ndim != 2 or tuple(lov_bar.shape) != expected_shape:
+            raise ValueError(
+                f'/lov_bar shape {lov_bar.shape} does not match {expected_shape}'
+            )
+        if not numpy.issubdtype(lov.dtype, numpy.number):
+            raise ValueError('/lov must have a numeric dtype')
+        if not numpy.issubdtype(lov_bar.dtype, numpy.number):
+            raise ValueError('/lov_bar must have a numeric dtype')
+
+        low_ad, metric_pullback = jax.vjp(metric_cholesky, auxmol)
+        low = numpy.asarray(jax.device_get(low_ad))
+        if (
+            low.shape != (naux, naux)
+            or not numpy.all(numpy.isfinite(low))
+            or numpy.any(numpy.diag(low) <= 0)
+        ):
+            raise NotImplementedError(
+                'Integral-direct local Lov VJP does not yet support the '
+                'linear-dependent auxiliary-metric eigenvalue fallback.'
+            )
+
+        z_dtype = numpy.result_type(low.dtype, lov_bar.dtype)
+        pair_tile_size = _local_lov_h5_pair_tile_size(
+            naux, npair, z_dtype
+        )
+        z_created = False
+        try:
+            if 'z' in h5file:
+                del h5file['z']
+            z = h5file.create_dataset(
+                'z',
+                shape=(naux, npair),
+                dtype=z_dtype,
+                chunks=_local_lov_h5_z_chunks(
+                    naux, npair, z_dtype, pair_tile_size
+                ),
+                compression=None,
+            )
+            z_created = True
+            low_bar = numpy.zeros(
+                (naux, naux),
+                dtype=numpy.result_type(low.dtype, lov.dtype, z_dtype),
+            )
+            for pair0 in range(0, npair, pair_tile_size):
+                pair1 = min(pair0 + pair_tile_size, npair)
+                lov_tile = numpy.asarray(lov[pair0:pair1, :])
+                lov_bar_tile = numpy.asarray(lov_bar[pair0:pair1, :])
+                z_tile = scipy_linalg.solve_triangular(
+                    low.T,
+                    lov_bar_tile.T,
+                    lower=False,
+                    check_finite=False,
+                )
+                low_bar -= z_tile @ lov_tile
+                z[:, pair0:pair1] = z_tile
+            h5file.flush()
+
+            def read_z_aux_block(p0, p1):
+                return z[p0:p1, :]
+
+            mo_coeff_bar = _local_direct_mo_coeff_vjp(
+                mol, auxmol, mo_coeff, read_z_aux_block, orbs_slice
+            )
+            mol_bar, auxmol_bar = \
+                _cderi_vjp._int3c_mo_deriv_coords_vjp(
+                    mol,
+                    auxmol,
+                    mo_coeff,
+                    read_z_aux_block,
+                    orbs_slice,
+                    int3c=mol._add_suffix('int3c2e'),
+                    aosym='s2ij',
+                    block_memory_mb=_local_direct_int3c_block_mb(),
+                )
+
+            _cderi_vjp._zero_strict_upper_inplace(low_bar)
+            aux_metric_bar = metric_pullback(np.asarray(low_bar))[0]
+            auxmol_bar = _tree_add(auxmol_bar, aux_metric_bar)
+            return mol_bar, auxmol_bar, mo_coeff_bar
+        except BaseException:
+            if z_created and 'z' in h5file:
+                del h5file['z']
+                h5file.flush()
+            raise
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(3, 4))

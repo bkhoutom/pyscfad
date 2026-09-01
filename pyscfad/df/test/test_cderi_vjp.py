@@ -635,6 +635,52 @@ def test_cholesky_eri_mo_deriv_vjp_matches_cderi_bar_path(
     )
 
 
+def test_int3c_mo_deriv_coords_vjp_accepts_one_read_per_aux_block(monkeypatch):
+    rng = numpy.random.default_rng(1501)
+    mol = gto.Mole(
+        atom='O 0 0 0; H 0 0 1; H 0 1 0',
+        basis='sto-3g',
+        verbose=0,
+    )
+    mol.build(trace_exp=False, trace_ctr_coeff=False)
+    auxmol = addons.make_auxmol(mol, 'weigend')
+    mo_coeff = rng.normal(size=(mol.nao, 5))
+    orbs_slice = (0, 2, 2, 5)
+    z = rng.normal(size=(auxmol.nao, 6))
+    ranges = [
+        (sh0, sh0 + 1, int(auxmol.ao_loc[sh0 + 1] - auxmol.ao_loc[sh0]))
+        for sh0 in range(auxmol.nbas)
+    ]
+    monkeypatch.setattr(
+        _cderi_vjp, 'balance_partition', lambda unused_loc, unused_size: ranges
+    )
+    reference = _cderi_vjp._int3c_mo_deriv_coords_vjp(
+        mol, auxmol, mo_coeff, z, orbs_slice
+    )
+    calls = []
+
+    def read_z_aux_block(p0, p1):
+        calls.append((int(p0), int(p1)))
+        return z[p0:p1, :]
+
+    result = _cderi_vjp._int3c_mo_deriv_coords_vjp(
+        mol, auxmol, mo_coeff, read_z_aux_block, orbs_slice
+    )
+
+    assert calls == [
+        (int(auxmol.ao_loc[sh0]), int(auxmol.ao_loc[sh1]))
+        for sh0, sh1, _ in ranges
+    ]
+    numpy.testing.assert_allclose(
+        numpy.asarray(result[0].coords), numpy.asarray(reference[0].coords),
+        atol=2e-11, rtol=2e-11,
+    )
+    numpy.testing.assert_allclose(
+        numpy.asarray(result[1].coords), numpy.asarray(reference[1].coords),
+        atol=2e-11, rtol=2e-11,
+    )
+
+
 def test_local_disk_cderi_bar_cholesky_vjp_matches_pairwise_path(tmp_path):
     from pyscfad.lno import lno_base
 

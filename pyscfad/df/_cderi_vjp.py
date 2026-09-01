@@ -1577,9 +1577,11 @@ def _int3c_ip1_mo_density_contraction(ints, mo_k, mo_l, z_blk):
     )[0]
 
 
-def _int3c_mo_deriv_coords_vjp(mol, auxmol, mo_coeff, z,
-                               orbs_slice, int3c='int3c2e',
-                               aosym='s2ij', block_memory_mb=None):
+def _int3c_mo_deriv_coords_vjp_from_z_reader(
+        mol, auxmol, mo_coeff, read_z_aux_block, orbs_slice,
+        int3c='int3c2e', aosym='s2ij', block_memory_mb=None,
+        z_dtype=None):
+    """Coordinate pullback with one ``z`` read per auxiliary-shell block."""
     if aosym not in ('s2', 's2ij'):
         raise NotImplementedError(f'Only packed s2 CDERI is supported, got {aosym}.')
     if mo_coeff.shape[0] != mol.nao:
@@ -1590,13 +1592,24 @@ def _int3c_mo_deriv_coords_vjp(mol, auxmol, mo_coeff, z,
     nao = mol.nao
     naux = auxmol.nao
     nbas = mol.nbas
-    nauxbas = auxmol.nbas
     k0, k1, l0, l1 = orbs_slice
     kc = k1 - k0
     lc = l1 - l0
     mo_k = numpy.asarray(mo_coeff[:, k0:k1], order='F')
     mo_l = numpy.asarray(mo_coeff[:, l0:l1], order='F')
-    z = numpy.asarray(z).reshape(naux, kc, lc)
+    if kc == 0 or lc == 0:
+        if z_dtype is None:
+            z_dtype = numpy.asarray(mo_coeff).dtype
+        mol_ao_bar = numpy.zeros((nao, 3), dtype=z_dtype)
+        aux_ao_bar = numpy.zeros((naux, 3), dtype=z_dtype)
+        return (
+            _coords_tree_like(
+                mol, _ao_to_atom_coords_bar(mol, mol_ao_bar)
+            ),
+            _coords_tree_like(
+                auxmol, _ao_to_atom_coords_bar(auxmol, aux_ao_bar)
+            ),
+        )
 
     if block_memory_mb is None:
         block_memory_mb = _int3c_mo_vjp_block_mb()
@@ -1617,13 +1630,23 @@ def _int3c_mo_deriv_coords_vjp(mol, auxmol, mo_coeff, z,
     aux_ranges = balance_partition(aux_loc, blksize)
 
     int3c_ip1 = int3c.replace('int3c2e', 'int3c2e_ip1')
-    mol_ao_bar = numpy.zeros((nao, 3), dtype=z.dtype)
-    aux_ao_bar = numpy.zeros((naux, 3), dtype=z.dtype)
+    mol_ao_bar = None
+    aux_ao_bar = None
 
     for shl0, shl1, _ in aux_ranges:
-        p0, p1 = aux_loc[shl0], aux_loc[shl1]
+        p0, p1 = int(aux_loc[shl0]), int(aux_loc[shl1])
         shls_slice = (0, nbas, 0, nbas, nbas + shl0, nbas + shl1)
-        z_blk = z[p0:p1]
+        z_blk = numpy.asarray(read_z_aux_block(p0, p1))
+        expected_size = (p1 - p0) * kc * lc
+        if z_blk.size != expected_size:
+            raise ValueError(
+                'z auxiliary block has incompatible shape: '
+                f'got {z_blk.shape}, expected {(p1 - p0, kc * lc)}'
+            )
+        z_blk = z_blk.reshape(p1 - p0, kc, lc)
+        if mol_ao_bar is None:
+            mol_ao_bar = numpy.zeros((nao, 3), dtype=z_blk.dtype)
+            aux_ao_bar = numpy.zeros((naux, 3), dtype=z_blk.dtype)
 
         # AO-center derivative.  Form the MO-weighted AO density once, choosing
         # the contraction order whose AO-square step carries min(kc, lc), and
@@ -1644,11 +1667,44 @@ def _int3c_mo_deriv_coords_vjp(mol, auxmol, mo_coeff, z,
         aux_ao_bar[p0:p1] += aux_contraction
         ints = None
 
+    if mol_ao_bar is None:
+        if z_dtype is None:
+            z_dtype = numpy.asarray(mo_coeff).dtype
+        mol_ao_bar = numpy.zeros((nao, 3), dtype=z_dtype)
+        aux_ao_bar = numpy.zeros((naux, 3), dtype=z_dtype)
+
     mol_bar = _coords_tree_like(mol, _ao_to_atom_coords_bar(mol, mol_ao_bar))
     auxmol_bar = _coords_tree_like(
         auxmol, _ao_to_atom_coords_bar(auxmol, aux_ao_bar)
     )
     return mol_bar, auxmol_bar
+
+
+def _int3c_mo_deriv_coords_vjp(mol, auxmol, mo_coeff, z,
+                               orbs_slice, int3c='int3c2e',
+                               aosym='s2ij', block_memory_mb=None):
+    """Coordinate pullback from a full ``z`` array or auxiliary-block reader."""
+    if callable(z):
+        read_z_aux_block = z
+        z_dtype = None
+    else:
+        k0, k1, l0, l1 = orbs_slice
+        z_array = numpy.asarray(z).reshape(
+            auxmol.nao, (k1 - k0) * (l1 - l0)
+        )
+        read_z_aux_block = lambda p0, p1: z_array[p0:p1, :]
+        z_dtype = z_array.dtype
+    return _int3c_mo_deriv_coords_vjp_from_z_reader(
+        mol,
+        auxmol,
+        mo_coeff,
+        read_z_aux_block,
+        orbs_slice,
+        int3c=int3c,
+        aosym=aosym,
+        block_memory_mb=block_memory_mb,
+        z_dtype=z_dtype,
+    )
 
 
 def cholesky_eri_vjp_from_mo_coeff_ybar(mol, auxmol, cderi_source,

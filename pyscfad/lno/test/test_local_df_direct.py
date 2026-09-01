@@ -5,6 +5,7 @@ import h5py
 import jax
 import numpy
 import pytest
+import scipy.linalg
 from pyscf import lib as pyscf_lib
 from pyscf.mp import dfmp2
 
@@ -45,6 +46,31 @@ def _lov_norm(mol, coeff, atmlst, integral_direct):
         integral_direct=integral_direct,
     )
     return np.einsum("Lia,Lia->", lov, lov)
+
+
+def _direct_local_problem(nocc=2):
+    mol = _water_mol()
+    atmlst = numpy.asarray([0, 1], dtype=numpy.int32)
+    coeff = _local_coeff(mol, atmlst)
+    fake_mol = lno_base.make_local_mol(mol, atmlst)
+    auxmol = lno_base.df_addons.make_auxmol(
+        fake_mol, _df_holder(mol).with_df.auxbasis
+    )
+    orbs_slice = (0, nocc, nocc, coeff.shape[1])
+    lov = lno_base._local_direct_nr_e2_impl(
+        fake_mol, auxmol, coeff, mol.max_memory, orbs_slice
+    )
+    return mol, fake_mol, auxmol, coeff, orbs_slice, lov
+
+
+def _assert_tree_allclose(actual, expected, **kwargs):
+    actual_leaves = jax.tree_util.tree_leaves(actual)
+    expected_leaves = jax.tree_util.tree_leaves(expected)
+    assert len(actual_leaves) == len(expected_leaves)
+    for actual_leaf, expected_leaf in zip(actual_leaves, expected_leaves):
+        numpy.testing.assert_allclose(
+            numpy.asarray(actual_leaf), numpy.asarray(expected_leaf), **kwargs
+        )
 
 
 def test_integral_direct_local_lov_matches_cderi_without_building_local_df(
@@ -408,3 +434,243 @@ def test_build_local_lov_h5_never_converts_complete_lov_dataset(
     assert lov_reads == []
     assert lov_write_sizes
     assert max(lov_write_sizes) < 2 * (coeff.shape[1] - 2) * info.naux
+
+
+def test_local_lov_h5_pair_tile_size_accounts_for_all_reverse_tiles():
+    naux = 37
+    npair = 101
+    target_mb = 0.01
+    target_bytes = target_mb * 1024.0**2
+    expected = int(target_bytes // (3 * naux * numpy.dtype('float64').itemsize))
+
+    assert lno_base._local_lov_h5_pair_tile_size(
+        naux, npair, numpy.float64, target_mb=target_mb
+    ) == max(1, min(npair, expected))
+    assert lno_base._local_lov_h5_pair_tile_size(
+        naux, 0, numpy.float64, target_mb=target_mb
+    ) == 1
+
+    for args in (
+        (-1, npair, numpy.float64, target_mb),
+        (naux, -1, numpy.float64, target_mb),
+        (naux, npair, numpy.float64, 0.0),
+        (naux, npair, numpy.dtype('O'), target_mb),
+    ):
+        with pytest.raises(ValueError):
+            lno_base._local_lov_h5_pair_tile_size(
+                args[0], args[1], args[2], target_mb=args[3]
+            )
+
+
+def test_local_lov_h5_z_chunks_are_two_dimensional_and_near_eight_mib():
+    chunks = lno_base._local_lov_h5_z_chunks(
+        naux=10_000,
+        npair=100_000,
+        dtype=numpy.float64,
+        pair_tile_size=1_118,
+    )
+    chunk_bytes = numpy.prod(chunks) * numpy.dtype(numpy.float64).itemsize
+
+    assert len(chunks) == 2
+    assert chunks[0] < 10_000
+    assert chunks[1] < 100_000
+    assert 4 * 1024**2 <= chunk_bytes <= 16 * 1024**2
+
+
+def test_local_direct_mo_coeff_vjp_accepts_one_read_per_raw_block(monkeypatch):
+    _, fake_mol, auxmol, coeff, orbs_slice, lov = _direct_local_problem()
+    z = numpy.random.default_rng(183).normal(size=numpy.asarray(lov).shape)
+    real_blocks = lno_base._local_direct_raw_int3c_blocks
+    block_ranges = []
+
+    def tracked_blocks(*args, **kwargs):
+        for p0, p1, raw_ints in real_blocks(*args, **kwargs):
+            block_ranges.append((p0, p1))
+            yield p0, p1, raw_ints
+
+    monkeypatch.setattr(
+        lno_base, '_local_direct_raw_int3c_blocks', tracked_blocks
+    )
+    reference = lno_base._local_direct_mo_coeff_vjp(
+        fake_mol, auxmol, coeff, z, orbs_slice
+    )
+    block_ranges.clear()
+    calls = []
+
+    def read_z_aux_block(p0, p1):
+        calls.append((p0, p1))
+        return z[p0:p1, :]
+
+    result = lno_base._local_direct_mo_coeff_vjp(
+        fake_mol, auxmol, coeff, read_z_aux_block, orbs_slice
+    )
+
+    assert calls == block_ranges
+    numpy.testing.assert_allclose(
+        numpy.asarray(result), numpy.asarray(reference),
+        atol=2e-11, rtol=2e-11,
+    )
+
+
+def test_local_direct_nr_e2_h5_bwd_matches_full_general_cotangent(tmp_path):
+    mol, fake_mol, auxmol, coeff, orbs_slice, lov = _direct_local_problem()
+    lov = numpy.asarray(lov)
+    rng = numpy.random.default_rng(184)
+    lov_bar = rng.normal(size=lov.shape)
+    reference = lno_base._local_direct_nr_e2_bwd(
+        mol.max_memory,
+        orbs_slice,
+        (fake_mol, auxmol, coeff, np.asarray(lov)),
+        np.asarray(lov_bar),
+    )
+    path = tmp_path / 'reverse.h5'
+    with h5py.File(path, 'w') as h5file:
+        h5file.create_dataset('lov', data=lov.T)
+        h5file.create_dataset('lov_bar', data=lov_bar.T)
+
+    result = lno_base._local_direct_nr_e2_h5_bwd(
+        fake_mol, auxmol, coeff, orbs_slice, path
+    )
+
+    _assert_tree_allclose(result[0], reference[0], atol=2e-9, rtol=2e-9)
+    _assert_tree_allclose(result[1], reference[1], atol=2e-9, rtol=2e-9)
+    numpy.testing.assert_allclose(
+        numpy.asarray(result[2]), numpy.asarray(reference[2]),
+        atol=2e-10, rtol=2e-10,
+    )
+    j2c = numpy.asarray(
+        auxmol.intor(auxmol._add_suffix('int2c2e'), hermi=1)
+    )
+    low = scipy.linalg.cholesky(j2c, lower=True, check_finite=False)
+    z_reference = scipy.linalg.solve_triangular(
+        low.T, lov_bar, lower=False, check_finite=False
+    )
+    with h5py.File(path, 'r') as h5file:
+        assert h5file['z'].shape == lov.shape
+        assert h5file['z'].chunks is not None
+        assert len(h5file['z'].chunks) == 2
+        numpy.testing.assert_allclose(
+            h5file['z'][:], z_reference, atol=2e-11, rtol=2e-11
+        )
+
+
+def test_local_direct_nr_e2_h5_bwd_uses_bounded_dataset_slices(
+    monkeypatch, tmp_path
+):
+    _, fake_mol, auxmol, coeff, orbs_slice, lov = _direct_local_problem()
+    lov = numpy.asarray(lov)
+    lov_bar = numpy.random.default_rng(185).normal(size=lov.shape)
+    path = tmp_path / 'bounded-reverse.h5'
+    with h5py.File(path, 'w') as h5file:
+        h5file.create_dataset('lov', data=lov.T)
+        h5file.create_dataset('lov_bar', data=lov_bar.T)
+
+    monkeypatch.setattr(
+        lno_base, '_local_lov_h5_pair_tile_size', lambda *args, **kwargs: 2
+    )
+    monkeypatch.setattr(
+        lno_base, '_local_direct_int3c_block_mb', lambda: 1e-6
+    )
+    monkeypatch.setattr(
+        lno_base._cderi_vjp,
+        'balance_partition',
+        lambda ao_loc, unused_size: [
+            (sh0, sh0 + 1, int(ao_loc[sh0 + 1] - ao_loc[sh0]))
+            for sh0 in range(len(ao_loc) - 1)
+        ],
+    )
+    original_array = h5py.Dataset.__array__
+    original_getitem = h5py.Dataset.__getitem__
+    reads = {'/lov': [], '/lov_bar': [], '/z': []}
+
+    def forbidden_array(dataset, *args, **kwargs):
+        if dataset.name in reads:
+            raise AssertionError(f'complete conversion of {dataset.name}')
+        return original_array(dataset, *args, **kwargs)
+
+    def tracked_getitem(dataset, key):
+        if dataset.name in reads:
+            reads[dataset.name].append(key)
+        return original_getitem(dataset, key)
+
+    monkeypatch.setattr(h5py.Dataset, '__array__', forbidden_array)
+    monkeypatch.setattr(h5py.Dataset, '__getitem__', tracked_getitem)
+
+    lno_base._local_direct_nr_e2_h5_bwd(
+        fake_mol, auxmol, coeff, orbs_slice, path
+    )
+
+    npair, naux = lov.T.shape
+    for name in ('/lov', '/lov_bar'):
+        assert len(reads[name]) == (npair + 1) // 2
+        assert all(isinstance(key, tuple) and len(key) == 2 for key in reads[name])
+        selected = [
+            numpy.arange(npair)[key[0]].size * naux for key in reads[name]
+        ]
+        assert max(selected) <= 2 * naux
+        assert max(selected) < npair * naux
+    assert len(reads['/z']) > 1
+    assert all(isinstance(key, tuple) and len(key) == 2 for key in reads['/z'])
+    assert all(key[1] == slice(None) for key in reads['/z'])
+    assert all(
+        numpy.arange(naux)[key[0]].size < naux for key in reads['/z']
+    )
+
+
+def test_local_direct_nr_e2_h5_bwd_recreates_z_and_cleans_failed_z(
+    monkeypatch, tmp_path
+):
+    _, fake_mol, auxmol, coeff, orbs_slice, lov = _direct_local_problem()
+    lov = numpy.asarray(lov)
+    path = tmp_path / 'repeat-reverse.h5'
+    first_bar = numpy.random.default_rng(186).normal(size=lov.shape)
+    second_bar = numpy.random.default_rng(187).normal(size=lov.shape)
+    with h5py.File(path, 'w') as h5file:
+        h5file.create_dataset('lov', data=lov.T)
+        h5file.create_dataset('lov_bar', data=first_bar.T)
+
+    lno_base._local_direct_nr_e2_h5_bwd(
+        fake_mol, auxmol, coeff, orbs_slice, path
+    )
+    with h5py.File(path, 'r+') as h5file:
+        first_z = h5file['z'][:]
+        h5file['lov_bar'][:] = second_bar.T
+    lno_base._local_direct_nr_e2_h5_bwd(
+        fake_mol, auxmol, coeff, orbs_slice, path
+    )
+    with h5py.File(path, 'r') as h5file:
+        assert not numpy.allclose(h5file['z'][:], first_z)
+
+    def fail_after_z(*unused_args, **unused_kwargs):
+        raise RuntimeError('downstream failure')
+
+    monkeypatch.setattr(
+        lno_base, '_local_direct_mo_coeff_vjp', fail_after_z
+    )
+    with pytest.raises(RuntimeError, match='downstream failure'):
+        lno_base._local_direct_nr_e2_h5_bwd(
+            fake_mol, auxmol, coeff, orbs_slice, path
+        )
+    with h5py.File(path, 'r') as h5file:
+        assert set(h5file) == {'lov', 'lov_bar'}
+
+
+def test_local_direct_nr_e2_h5_bwd_supports_empty_pair_dimension(tmp_path):
+    _, fake_mol, auxmol, coeff, _, _ = _direct_local_problem()
+    orbs_slice = (0, 0, 0, coeff.shape[1])
+    path = tmp_path / 'empty-reverse.h5'
+    with h5py.File(path, 'w') as h5file:
+        h5file.create_dataset('lov', shape=(0, auxmol.nao), dtype=numpy.float64)
+        h5file.create_dataset(
+            'lov_bar', shape=(0, auxmol.nao), dtype=numpy.float64
+        )
+
+    mol_bar, auxmol_bar, coeff_bar = lno_base._local_direct_nr_e2_h5_bwd(
+        fake_mol, auxmol, coeff, orbs_slice, path
+    )
+
+    assert numpy.all(numpy.asarray(mol_bar.coords) == 0)
+    assert numpy.all(numpy.asarray(auxmol_bar.coords) == 0)
+    assert numpy.all(numpy.asarray(coeff_bar) == 0)
+    with h5py.File(path, 'r') as h5file:
+        assert h5file['z'].shape == (auxmol.nao, 0)

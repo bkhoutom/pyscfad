@@ -41,6 +41,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import NamedTuple
+import warnings
 
 import jax
 import numpy as onp
@@ -323,6 +324,87 @@ def target_conditioned_mp2_density_from_amplitudes(
     return _density_from_target_amplitudes(target_amplitudes)
 
 
+def _automatic_workspace_mb(mf_max_memory_mb: float) -> float:
+    """Choose the default MP2-density workspace target from SCF memory."""
+    candidate = max(256.0, 0.10 * float(mf_max_memory_mb))
+    candidate = min(candidate, 8192.0)
+    return max(1.0, min(candidate, 0.25 * float(mf_max_memory_mb)))
+
+
+def _resolve_mp2_density_block_nvir(
+    *,
+    naux: int,
+    nocc: int,
+    nvir: int,
+    ntarget: int,
+    dtype,
+    mf_max_memory_mb: float,
+    configured_memory_mb: float | None,
+    configured_block_nvir: int | None,
+) -> tuple[int, str, float]:
+    """Return ``(block_nvir, mode, workspace_target_mb)`` for MP2 density."""
+    naux = int(naux)
+    nocc = int(nocc)
+    nvir = int(nvir)
+    ntarget = int(ntarget)
+    if configured_memory_mb is not None and configured_memory_mb <= 0.0:
+        raise ValueError("mp2_block_memory_mb must be positive")
+    if configured_block_nvir is not None and (
+        not isinstance(configured_block_nvir, (int, onp.integer))
+        or isinstance(configured_block_nvir, bool)
+        or configured_block_nvir <= 0
+    ):
+        raise ValueError("mp2_block_nvir must be a positive integer")
+
+    automatic_target_mb = _automatic_workspace_mb(mf_max_memory_mb)
+    if configured_block_nvir is not None:
+        workspace_target_mb = automatic_target_mb
+        mode = "manual_width"
+    elif configured_memory_mb is not None:
+        workspace_target_mb = float(configured_memory_mb)
+        mode = "manual_budget"
+    else:
+        workspace_target_mb = automatic_target_mb
+        mode = "auto"
+
+    itemsize = onp.dtype(dtype).itemsize
+    fixed_elements = (
+        2 * naux * nvir
+        + nocc * nocc
+        + nvir * nvir
+    )
+    per_c_elements = (
+        4 * ntarget * nocc * nvir
+        + 4 * nocc * nvir
+        + 2 * naux * nocc
+    )
+    available_bytes = workspace_target_mb * 1024.0**2 - itemsize * fixed_elements
+    modeled_block_nvir = int(
+        available_bytes // max(itemsize * per_c_elements, 1)
+    )
+    modeled_block_nvir = max(1, min(max(nvir, 1), modeled_block_nvir))
+
+    if configured_block_nvir is not None:
+        block_nvir = min(int(configured_block_nvir), max(nvir, 1))
+        if block_nvir > modeled_block_nvir:
+            warnings.warn(
+                "manual MP2 density block width exceeds the modeled "
+                "workspace target; honoring the requested width",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+    else:
+        block_nvir = modeled_block_nvir
+        if available_bytes < itemsize * per_c_elements:
+            warnings.warn(
+                "MP2 density workspace target is below the conservative "
+                "one-virtual-block model; using block_nvir=1",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+    return block_nvir, mode, workspace_target_mb
+
+
 def _mp2_density_virtual_block_size(lov, ntarget, max_memory_mb):
     itemsize = onp.dtype(lov.dtype).itemsize
     nocc = lov.shape[1]
@@ -486,22 +568,30 @@ def strong_domain_mp2_density(mf, domain, static, fragment_index):
             local_direct_block_mb=lno_base._local_direct_int3c_block_mb(),
         )
 
-    max_memory_mb = static.thresholds.mp2_block_memory_mb
+    block_nvir, block_mode, workspace_target_mb = (
+        _resolve_mp2_density_block_nvir(
+            naux=lov.shape[0],
+            nocc=nocc,
+            nvir=nvir,
+            ntarget=domain.target_projection.shape[0],
+            dtype=lov.dtype,
+            mf_max_memory_mb=getattr(mf, "max_memory", 256.0),
+            configured_memory_mb=static.thresholds.mp2_block_memory_mb,
+            configured_block_nvir=static.thresholds.mp2_block_nvir,
+        )
+    )
     profile_density = resource_profile.start()
     density = strong_domain_mp2_density_from_lov(
         lov,
         domain.occupied_energy,
         domain.virtual_energy,
         domain.target_projection,
-        max_memory_mb=max_memory_mb,
+        block_nvir=block_nvir,
     )
     if profile_density is not None:
         ntarget = domain.target_projection.shape[0]
         naux = lov.shape[0]
         lov_mib = resource_profile.estimated_array_mib(lov)
-        block_nvir = _mp2_density_virtual_block_size(
-            lov, ntarget, max_memory_mb
-        )
         itemsize = onp.dtype(lov.dtype).itemsize
         resource_profile.finish(
             "iao_lis.strong_domain_mp2_density",
@@ -516,7 +606,8 @@ def strong_domain_mp2_density(mf, domain, static, fragment_index):
             lov_mib=lov_mib,
             block_nvir=block_nvir,
             nblock=(nvir + block_nvir - 1) // block_nvir,
-            max_memory_mb=max_memory_mb,
+            block_mode=block_mode,
+            workspace_target_mb=workspace_target_mb,
             full_target_amplitudes_mib=(
                 ntarget * nocc * nvir * nvir * itemsize / 1024.0**2
             ),
@@ -524,8 +615,19 @@ def strong_domain_mp2_density(mf, domain, static, fragment_index):
                 2 * ntarget * nocc * nvir * block_nvir * itemsize / 1024.0**2
             ),
             estimated_block_workspace_mib=(
-                itemsize * nocc * nvir * max(2 * ntarget + 6, 1)
-                * block_nvir / 1024.0**2
+                itemsize
+                * (
+                    2 * naux * nvir
+                    + nocc * nocc
+                    + nvir * nvir
+                    + block_nvir
+                    * (
+                        4 * ntarget * nocc * nvir
+                        + 4 * nocc * nvir
+                        + 2 * naux * nocc
+                    )
+                )
+                / 1024.0**2
             ),
             occupied_density_shape=tuple(density.occupied.shape),
             virtual_density_shape=tuple(density.virtual.shape),

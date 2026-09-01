@@ -239,13 +239,25 @@ def test_disabled_manager_and_invalid_resume():
         _manager(None, resume=True)
 
 
-def test_static_dataclass_round_trip_and_unbound_manifest_recovery(tmp_path):
+@pytest.mark.parametrize(
+    "static",
+    [
+        IAOFragmentMP2Thresholds(
+            pair_energy=3.25e-7,
+            multipole_order=3,
+        ),
+        IAOFragmentMP2Thresholds(
+            pair_energy=3.25e-7,
+            multipole_order=3,
+            mp2_block_memory_mb=19.5,
+            mp2_block_nvir=17,
+        ),
+    ],
+)
+def test_static_dataclass_round_trip_and_unbound_manifest_recovery(
+    tmp_path, static
+):
     manager = _manager(tmp_path)
-    static = IAOFragmentMP2Thresholds(
-        pair_energy=3.25e-7,
-        multipole_order=3,
-        mp2_block_memory_mb=19.5,
-    )
     digest = manager.save_static(static)
     assert manager.load_static(expected_type=IAOFragmentMP2Thresholds) == static
 

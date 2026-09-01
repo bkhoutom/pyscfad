@@ -1190,7 +1190,11 @@ def strong_domain_energy(mf, domain, static, fragment_index):
         domain.virtual_energy,
         domain.target_projection,
         domain.partner_weight,
-        max_memory_mb=static.thresholds.mp2_block_memory_mb,
+        max_memory_mb=(
+            256.0
+            if static.thresholds.mp2_block_memory_mb is None
+            else static.thresholds.mp2_block_memory_mb
+        ),
     )
 
 

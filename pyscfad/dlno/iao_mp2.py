@@ -21,6 +21,7 @@ must not be substituted for these weights.
 
 from dataclasses import dataclass, replace
 from functools import reduce
+import numbers
 import time
 
 import numpy as np
@@ -524,7 +525,26 @@ class IAOFragmentMP2Thresholds:
     pair_energy: float = 1.5e-5
     near_pair_distance: float = 3.5
     multipole_order: int = 4
-    mp2_block_memory_mb: float = 256.0
+    # The MP2 selection-density block width is automatic unless an advanced
+    # workspace target or an exact width is requested explicitly.
+    mp2_block_memory_mb: float | None = None
+    mp2_block_nvir: int | None = None
+
+    def __post_init__(self):
+        if (
+            self.mp2_block_memory_mb is not None
+            and self.mp2_block_memory_mb <= 0.0
+        ):
+            raise ValueError("mp2_block_memory_mb must be positive")
+        if (
+            self.mp2_block_nvir is not None
+            and (
+                not isinstance(self.mp2_block_nvir, numbers.Integral)
+                or isinstance(self.mp2_block_nvir, bool)
+                or self.mp2_block_nvir <= 0
+            )
+        ):
+            raise ValueError("mp2_block_nvir must be a positive integer")
 
 
 @dataclass(frozen=True)
@@ -1070,7 +1090,10 @@ def build_iao_fragment_topology(
         thresholds.near_pair_distance,
     ) < 0.0:
         raise ValueError("domain and pair cutoffs must be non-negative")
-    if thresholds.mp2_block_memory_mb <= 0.0:
+    if (
+        thresholds.mp2_block_memory_mb is not None
+        and thresholds.mp2_block_memory_mb <= 0.0
+    ):
         raise ValueError("mp2_block_memory_mb must be positive")
     if thresholds.multipole_order not in (2, 3, 4):
         raise ValueError("multipole_order must be 2, 3, or 4")
@@ -1248,7 +1271,11 @@ def build_iao_fragment_topology(
         _, pair_energy = _exact_global_fragment_pairs(
             pt,
             occupied_data,
-            max_memory_mb=thresholds.mp2_block_memory_mb,
+            max_memory_mb=(
+                256.0
+                if thresholds.mp2_block_memory_mb is None
+                else thresholds.mp2_block_memory_mb
+            ),
         )
         weak_pair_energy, forced_strong = _multipole_fragment_pairs(mf, base)
         strong_mask = (
@@ -1482,7 +1509,11 @@ def evaluate_iao_fragment_mp2(mf, topology):
             domain["target_weight"],
             domain["partner_weight"],
             target_factor=domain["target_projection"],
-            max_memory_mb=topology.thresholds.mp2_block_memory_mb,
+            max_memory_mb=(
+                256.0
+                if topology.thresholds.mp2_block_memory_mb is None
+                else topology.thresholds.mp2_block_memory_mb
+            ),
         )
         weighted_ed_mp2_seconds = time.perf_counter() - stage_start
 

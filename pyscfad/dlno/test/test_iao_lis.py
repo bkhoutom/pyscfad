@@ -30,6 +30,86 @@ from pyscfad.dlno.iao_mp2_grad import (
 )
 
 
+def test_mp2_density_block_threshold_defaults_overrides_and_validation():
+    """Configuration accepts only positive optional density block settings."""
+    defaults = IAOFragmentMP2Thresholds()
+    assert defaults.mp2_block_memory_mb is None
+    assert defaults.mp2_block_nvir is None
+
+    exact = IAOFragmentMP2Thresholds(mp2_block_nvir=192)
+    assert exact.mp2_block_nvir == 192
+
+    budget = IAOFragmentMP2Thresholds(mp2_block_memory_mb=4096.0)
+    assert budget.mp2_block_memory_mb == 4096.0
+
+    for kwargs, field in (
+        ({"mp2_block_memory_mb": 0.0}, "mp2_block_memory_mb"),
+        ({"mp2_block_nvir": 0}, "mp2_block_nvir"),
+        ({"mp2_block_nvir": -1}, "mp2_block_nvir"),
+    ):
+        with pytest.raises(ValueError, match=field):
+            IAOFragmentMP2Thresholds(**kwargs)
+
+
+def test_resolve_mp2_density_block_nvir_precedence_and_dimension_scaling():
+    """The resolver makes a positive, dimension-aware block choice."""
+    resolve = iao_lis._resolve_mp2_density_block_nvir
+    common = dict(
+        naux=100,
+        nocc=4,
+        nvir=2000,
+        ntarget=3,
+        dtype=np.float64,
+    )
+
+    automatic, mode, target = resolve(
+        **common,
+        mf_max_memory_mb=1000.0,
+        configured_memory_mb=None,
+        configured_block_nvir=None,
+    )
+    larger_automatic, larger_mode, larger_target = resolve(
+        **common,
+        mf_max_memory_mb=4000.0,
+        configured_memory_mb=None,
+        configured_block_nvir=None,
+    )
+    larger_dimensions, _, _ = resolve(
+        **{**common, "naux": 2000, "nocc": 8, "nvir": 4000, "ntarget": 6},
+        mf_max_memory_mb=1000.0,
+        configured_memory_mb=None,
+        configured_block_nvir=None,
+    )
+    manual_budget, budget_mode, budget_target = resolve(
+        **common,
+        mf_max_memory_mb=1000.0,
+        configured_memory_mb=600.0,
+        configured_block_nvir=None,
+    )
+
+    assert 1 <= automatic <= common["nvir"]
+    assert mode == "auto"
+    assert target == 250.0
+    assert larger_mode == "auto"
+    assert larger_target == 400.0
+    assert larger_automatic > automatic
+    assert larger_dimensions < automatic
+    assert budget_mode == "manual_budget"
+    assert budget_target == 600.0
+    assert manual_budget > automatic
+
+    with pytest.warns(RuntimeWarning, match="manual MP2 density block width"):
+        manual_width, width_mode, width_target = resolve(
+            **common,
+            mf_max_memory_mb=1000.0,
+            configured_memory_mb=600.0,
+            configured_block_nvir=9999,
+        )
+    assert manual_width == common["nvir"]
+    assert width_mode == "manual_width"
+    assert width_target == 250.0
+
+
 def test_target_amplitude_block_density_matches_dense_complex_contraction():
     rng = np.random.default_rng(1907)
     u = rng.normal(size=(2, 3, 5, 5)) + 1j * rng.normal(size=(2, 3, 5, 5))
@@ -162,7 +242,7 @@ def test_strong_domain_density_forwards_memory_and_profiles_lov_and_density(
     )
 
     assert density is expected_density
-    assert call_kwargs == [{"max_memory_mb": max_memory_mb}]
+    assert call_kwargs == [{"block_nvir": 1}]
     assert [event[0] for event in events] == [
         "start", "lov", "finish", "start", "density", "finish",
     ]
@@ -192,15 +272,16 @@ def test_strong_domain_density_forwards_memory_and_profiles_lov_and_density(
     }
     assert density_finish[3] == {
         **common_details,
-        "block_nvir": 2,
-        "nblock": 2,
-        "max_memory_mb": max_memory_mb,
+        "block_nvir": 1,
+        "nblock": 3,
+        "block_mode": "manual_budget",
+        "workspace_target_mb": max_memory_mb,
         "full_target_amplitudes_mib": 2 * 2 * 3 * 3 * itemsize / 1024.0**2,
         "block_target_amplitudes_mib": (
-            2 * 2 * 2 * 3 * 2 * itemsize / 1024.0**2
+            2 * 2 * 2 * 3 * 1 * itemsize / 1024.0**2
         ),
         "estimated_block_workspace_mib": (
-            itemsize * 2 * 3 * (2 * 2 + 6) * 2 / 1024.0**2
+            itemsize * (2 * 2 * 3 + 2 * 2 + 3 * 3 + 1 * (4 * 2 * 2 * 3 + 4 * 2 * 3 + 2 * 2 * 2)) / 1024.0**2
         ),
         "occupied_density_shape": (2, 2),
         "virtual_density_shape": (3, 3),
@@ -231,7 +312,7 @@ def test_strong_domain_density_forwards_memory_and_profiles_lov_and_density(
         sentinel_mf, domain, static, 0
     )
     assert disabled_density is expected_density
-    assert call_kwargs == [{"max_memory_mb": max_memory_mb}]
+    assert call_kwargs == [{"block_nvir": 1}]
     assert [event[0] for event in events] == ["lov", "density"]
 
 

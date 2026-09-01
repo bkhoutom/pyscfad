@@ -14,13 +14,15 @@
 
 import warnings
 import os
+import shutil
 import time
 import tempfile
-from types import SimpleNamespace
+from types import FunctionType, SimpleNamespace
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from functools import partial, reduce
+import h5py
 import numpy
 import jax
 import jax.scipy.linalg as jsp_linalg
@@ -70,6 +72,18 @@ DOMAIN_MP2_USE_LT = getattr(__config__, 'lno_domain_mp2_use_lt', False)
 DOMAIN_MP2_LT_NLAP = getattr(__config__, 'lno_domain_mp2_lt_nlap', 9)
 DOMAIN_MP2_LT_QUADRATURE = getattr(__config__, 'lno_domain_mp2_lt_quadrature', 'fit')
 DOMAIN_MP2_LT_FIT_RATIO = getattr(__config__, 'lno_domain_mp2_lt_fit_ratio', 64.0)
+
+
+@dataclass(frozen=True)
+class LocalLovH5Info:
+    path: str
+    naux: int
+    nocc: int
+    nvir: int
+    dtype: str
+    lov_dataset: str = "lov"
+    lov_bar_dataset: str = "lov_bar"
+    z_dataset: str = "z"
 
 
 @contextmanager
@@ -2632,6 +2646,200 @@ def _local_direct_nr_e2_impl(mol, auxmol, mo_coeff, max_memory, orbs_slice):
         log=pyscf_lib.logger.new_logger(mol),
     )
     return np.asarray(numpy.asarray(ovl.T))
+
+
+class _LocalLovH5Output:
+    """Map PySCF's out-of-core ``ovL`` request onto contiguous ``/lov``."""
+
+    def __init__(self, h5file):
+        self.h5file = h5file
+        self.dataset = None
+
+    def create_dataset(self, name, shape, dtype=None, **unused_options):
+        if name != 'ovL':
+            raise ValueError(f"Unexpected PySCF output dataset {name!r}")
+        if self.dataset is not None:
+            raise ValueError("PySCF requested the fitted Lov dataset twice")
+        self.dataset = self.h5file.create_dataset(
+            'lov', shape=shape, dtype=dtype, chunks=None, compression=None
+        )
+        return self.dataset
+
+
+class _PyscfLibScratchProxy:
+    """Delegate PySCF lib calls while making H5TmpFile's directory explicit."""
+
+    def __init__(self, scratch_dir):
+        self.scratch_dir = os.fspath(scratch_dir)
+        self.temporary_files = []
+
+    def __getattr__(self, name):
+        return getattr(pyscf_lib, name)
+
+    def H5TmpFile(self, *args, **kwargs):
+        kwargs.setdefault('dir', self.scratch_dir)
+        h5tmp = pyscf_lib.H5TmpFile(*args, **kwargs)
+        self.temporary_files.append(h5tmp)
+        return h5tmp
+
+    def close_temporary_files(self):
+        for h5tmp in reversed(self.temporary_files):
+            h5tmp.close()
+        self.temporary_files.clear()
+
+
+def _run_local_direct_h5_producer(
+    producer, holder, coeff_occ, coeff_vir, max_memory, output, log
+):
+    """Run a PySCF producer with a call-local scratch-file factory.
+
+    PySCF's ``H5TmpFile`` captures its default directory when ``pyscf.lib`` is
+    imported.  Cloning this private producer with one substituted global keeps
+    the override local to this call, avoiding process-global monkeypatching.
+    """
+    scratch_lib = _PyscfLibScratchProxy(pyscf_lib.param.TMPDIR)
+    if isinstance(producer, FunctionType):
+        producer_globals = dict(producer.__globals__)
+        producer_globals['lib'] = scratch_lib
+        call_producer = FunctionType(
+            producer.__code__,
+            producer_globals,
+            producer.__name__,
+            producer.__defaults__,
+            producer.__closure__,
+        )
+        call_producer.__kwdefaults__ = producer.__kwdefaults__
+    else:
+        call_producer = producer
+    try:
+        return call_producer(
+            holder,
+            coeff_occ,
+            coeff_vir,
+            max_memory,
+            h5obj=output,
+            log=log,
+        )
+    finally:
+        scratch_lib.close_temporary_files()
+
+
+def _local_direct_h5_effective_max_memory(max_memory):
+    """Cap raw integral buffers when the fitted Lov itself is on disk."""
+    current_mb = float(pyscf_lib.current_memory()[0])
+    requested_mb = current_mb + _local_direct_int3c_block_mb() / 0.7
+    return max(current_mb, min(float(max_memory), requested_mb))
+
+
+def _build_local_Lov_h5_impl(
+    fake_mol,
+    auxmol,
+    mo_coeff,
+    orbs_slice,
+    path,
+    max_memory,
+):
+    """Run the direct producer for an already prepared local domain."""
+    from pyscf.mp.dfmp2 import _init_mp_df_eris_direct
+
+    path = os.fspath(path)
+    mo_coeff = numpy.asarray(jax.device_get(mo_coeff), order='F')
+    k0, k1, l0, l1 = map(int, orbs_slice)
+    if not (0 <= k0 <= k1 <= mo_coeff.shape[1]):
+        raise ValueError('Invalid first-orbital slice for direct local AO2MO')
+    if not (0 <= l0 <= l1 <= mo_coeff.shape[1]):
+        raise ValueError('Invalid second-orbital slice for direct local AO2MO')
+    nocc = k1 - k0
+    nvir = l1 - l0
+    lov_bytes = (
+        int(auxmol.nao)
+        * int(nocc)
+        * int(nvir)
+        * mo_coeff.dtype.itemsize
+    )
+    required_bytes = int(3.25 * lov_bytes) + 1024**3
+    destination_dir = os.path.dirname(os.path.abspath(path)) or os.curdir
+    free_bytes = int(shutil.disk_usage(destination_dir).free)
+    if free_bytes < required_bytes:
+        raise OSError(
+            f"Insufficient scratch space for {path}: free bytes={free_bytes}, "
+            f"required bytes={required_bytes}"
+        )
+
+    fd, staging_path = tempfile.mkstemp(
+        prefix=f'.{os.path.basename(path)}.',
+        suffix='.tmp',
+        dir=destination_dir,
+    )
+    os.close(fd)
+    try:
+        with h5py.File(staging_path, 'w') as h5file:
+            output = _LocalLovH5Output(h5file)
+            holder = SimpleNamespace(mol=fake_mol, auxmol=auxmol)
+            effective_memory = _local_direct_h5_effective_max_memory(
+                max_memory
+            )
+            _run_local_direct_h5_producer(
+                _init_mp_df_eris_direct,
+                holder,
+                mo_coeff[:, k0:k1],
+                mo_coeff[:, l0:l1],
+                effective_memory,
+                output,
+                pyscf_lib.logger.new_logger(fake_mol),
+            )
+            if output.dataset is None:
+                raise RuntimeError("PySCF did not create the fitted Lov dataset")
+            naux = int(output.dataset.shape[1])
+            dtype = str(output.dataset.dtype)
+        os.replace(staging_path, path)
+    except BaseException:
+        try:
+            os.unlink(staging_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+    return LocalLovH5Info(
+        path=path,
+        naux=naux,
+        nocc=int(nocc),
+        nvir=int(nvir),
+        dtype=dtype,
+    )
+
+
+def build_local_Lov_h5(
+    mf,
+    mo_coeff_local,
+    nocc: int,
+    atmlst,
+    path: str | os.PathLike,
+) -> LocalLovH5Info:
+    """Write fitted local Lov directly to a contiguous HDF5 dataset."""
+    atmlst = numpy.asarray(atmlst, dtype=numpy.int32).ravel()
+    ao_idx = dlno_util.ao_index_by_atom(mf.mol, atmlst)
+    mo_coeff_local = numpy.asarray(
+        jax.device_get(mo_coeff_local), order='F'
+    )
+    if mo_coeff_local.ndim != 2 or mo_coeff_local.shape[0] != ao_idx.size:
+        raise ValueError(
+            'mo_coeff_local must have one row for each AO in atmlst'
+        )
+    nmo = mo_coeff_local.shape[1]
+    if not 0 <= nocc <= nmo:
+        raise ValueError('nocc must lie between zero and the local MO count')
+
+    fake_mol = make_local_mol(mf.mol, atmlst)
+    auxmol = df_addons.make_auxmol(fake_mol, mf.with_df.auxbasis)
+    return _build_local_Lov_h5_impl(
+        fake_mol,
+        auxmol,
+        mo_coeff_local,
+        (0, nocc, nocc, nmo),
+        path,
+        mf.with_df.max_memory,
+    )
 
 
 def _local_direct_raw_int3c_blocks(mol, auxmol):

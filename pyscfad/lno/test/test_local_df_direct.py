@@ -1,8 +1,12 @@
+from pathlib import Path
 from types import SimpleNamespace
 
+import h5py
 import jax
 import numpy
 import pytest
+from pyscf import lib as pyscf_lib
+from pyscf.mp import dfmp2
 
 from pyscfad import df, gto
 from pyscfad import numpy as np
@@ -182,3 +186,174 @@ def test_integral_direct_local_lov_general_cotangent_matches_coordinate_fd():
     numpy.testing.assert_allclose(
         analytic, finite_difference, atol=2e-8, rtol=2e-8
     )
+
+
+def test_build_local_lov_h5_matches_integral_direct_pair_major(tmp_path):
+    mol = _water_mol()
+    atmlst = numpy.asarray([0, 1], dtype=numpy.int32)
+    coeff = _local_coeff(mol, atmlst)
+    nocc = 2
+    reference = lno_base.get_local_Lov(
+        _df_holder(mol), coeff, nocc, atmlst, integral_direct=True
+    )
+    path = tmp_path / "local-lov.h5"
+
+    info = lno_base.build_local_Lov_h5(
+        _df_holder(mol), coeff, nocc, atmlst, path
+    )
+
+    reference_array = numpy.asarray(reference)
+    naux = reference_array.shape[0]
+    nvir = reference_array.shape[2]
+    assert info == lno_base.LocalLovH5Info(
+        path=str(path),
+        naux=naux,
+        nocc=nocc,
+        nvir=nvir,
+        dtype=str(reference_array.dtype),
+    )
+    with h5py.File(path, "r") as h5file:
+        assert set(h5file) == {"lov"}
+        assert h5file["lov"].shape == (nocc * nvir, naux)
+        assert h5file["lov"].dtype == numpy.dtype(reference_array.dtype)
+        assert h5file["lov"].chunks is None
+        assert h5file["lov"].compression is None
+        numpy.testing.assert_allclose(
+            h5file["lov"][:],
+            reference_array.reshape(naux, -1).T,
+            rtol=2e-11,
+            atol=2e-12,
+        )
+
+
+def test_build_local_lov_h5_rejects_insufficient_scratch_space(
+    monkeypatch, tmp_path
+):
+    mol = _water_mol()
+    atmlst = numpy.asarray([0, 1], dtype=numpy.int32)
+    coeff = _local_coeff(mol, atmlst)
+    nocc = 2
+    nvir = coeff.shape[1] - nocc
+    fake_mol = lno_base.make_local_mol(mol, atmlst)
+    auxmol = lno_base.df_addons.make_auxmol(
+        fake_mol, _df_holder(mol).with_df.auxbasis
+    )
+    required = int(3.25 * auxmol.nao * nocc * nvir * 8) + 1024**3
+    path = tmp_path / "too-large.h5"
+    monkeypatch.setattr(
+        lno_base.shutil,
+        "disk_usage",
+        lambda unused: SimpleNamespace(free=required - 1),
+    )
+
+    with pytest.raises(OSError) as excinfo:
+        lno_base.build_local_Lov_h5(
+            _df_holder(mol), coeff, nocc, atmlst, path
+        )
+
+    message = str(excinfo.value)
+    assert str(path) in message
+    assert f"free bytes={required - 1}" in message
+    assert f"required bytes={required}" in message
+    assert not path.exists()
+
+
+def test_build_local_lov_h5_uses_configured_tmpdir_and_removes_raw_store(
+    monkeypatch, tmp_path
+):
+    mol = _water_mol()
+    atmlst = numpy.asarray([0, 1], dtype=numpy.int32)
+    coeff = _local_coeff(mol, atmlst)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    raw_paths = []
+    real_h5tmp = pyscf_lib.H5TmpFile
+
+    def tracked_h5tmp(*args, **kwargs):
+        raw_file = real_h5tmp(*args, **kwargs)
+        raw_paths.append(Path(raw_file.filename))
+        return raw_file
+
+    monkeypatch.setattr(pyscf_lib.param, "TMPDIR", str(scratch))
+    monkeypatch.setattr(pyscf_lib, "H5TmpFile", tracked_h5tmp)
+
+    lno_base.build_local_Lov_h5(
+        _df_holder(mol), coeff, 2, atmlst, tmp_path / "local-lov.h5"
+    )
+
+    assert raw_paths
+    assert all(raw_path.parent == scratch for raw_path in raw_paths)
+    assert all(not raw_path.exists() for raw_path in raw_paths)
+
+
+def test_build_local_lov_h5_removes_partial_target_after_failure(
+    monkeypatch, tmp_path
+):
+    mol = _water_mol()
+    atmlst = numpy.asarray([0, 1], dtype=numpy.int32)
+    coeff = _local_coeff(mol, atmlst)
+    path = tmp_path / "failed.h5"
+
+    def failing_producer(with_df, occ_coeff, vir_coeff, max_memory,
+                         h5obj=None, log=None):
+        del with_df, max_memory, log
+        h5obj.create_dataset(
+            "ovL",
+            (occ_coeff.shape[1] * vir_coeff.shape[1], 4),
+            dtype=numpy.float64,
+            chunks=(1, 4),
+        )
+        raise RuntimeError("producer failed")
+
+    monkeypatch.setattr(dfmp2, "_init_mp_df_eris_direct", failing_producer)
+
+    with pytest.raises(RuntimeError, match="producer failed"):
+        lno_base.build_local_Lov_h5(
+            _df_holder(mol), coeff, 2, atmlst, path
+        )
+
+    assert not path.exists()
+    assert not list(tmp_path.glob(".*failed.h5.*"))
+
+
+def test_build_local_lov_h5_never_converts_complete_lov_dataset(
+    monkeypatch, tmp_path
+):
+    mol = _water_mol()
+    atmlst = numpy.asarray([0, 1], dtype=numpy.int32)
+    coeff = _local_coeff(mol, atmlst)
+    path = tmp_path / "local-lov.h5"
+    original_array = h5py.Dataset.__array__
+    original_getitem = h5py.Dataset.__getitem__
+    original_setitem = h5py.Dataset.__setitem__
+    lov_reads = []
+    lov_write_sizes = []
+
+    def forbidden_array(dataset, *args, **kwargs):
+        if dataset.name == "/lov":
+            raise AssertionError("the complete /lov dataset was converted")
+        return original_array(dataset, *args, **kwargs)
+
+    def tracked_getitem(dataset, key):
+        if dataset.name == "/lov":
+            lov_reads.append(key)
+        return original_getitem(dataset, key)
+
+    def tracked_setitem(dataset, key, value):
+        if dataset.name == "/lov":
+            row_key = key[0] if isinstance(key, tuple) else key
+            selected_rows = numpy.arange(dataset.shape[0])[row_key]
+            lov_write_sizes.append(selected_rows.size * dataset.shape[1])
+        return original_setitem(dataset, key, value)
+
+    monkeypatch.setattr(h5py.Dataset, "__array__", forbidden_array)
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", tracked_getitem)
+    monkeypatch.setattr(h5py.Dataset, "__setitem__", tracked_setitem)
+
+    info = lno_base.build_local_Lov_h5(
+        _df_holder(mol), coeff, 2, atmlst, path
+    )
+
+    assert lov_reads == []
+    assert lov_write_sizes
+    assert max(lov_write_sizes) < 2 * (coeff.shape[1] - 2) * info.naux

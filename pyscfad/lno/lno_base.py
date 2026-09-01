@@ -72,6 +72,7 @@ DOMAIN_MP2_USE_LT = getattr(__config__, 'lno_domain_mp2_use_lt', False)
 DOMAIN_MP2_LT_NLAP = getattr(__config__, 'lno_domain_mp2_lt_nlap', 9)
 DOMAIN_MP2_LT_QUADRATURE = getattr(__config__, 'lno_domain_mp2_lt_quadrature', 'fit')
 DOMAIN_MP2_LT_FIT_RATIO = getattr(__config__, 'lno_domain_mp2_lt_fit_ratio', 64.0)
+_LOCAL_LOV_H5_Z_AUX_READ_TARGET_MB = 64.0
 
 
 @dataclass(frozen=True)
@@ -2886,6 +2887,11 @@ def _local_lov_h5_pair_tile_size(
     return max(1, min(int(npair), tile_size))
 
 
+def _local_lov_h5_reverse_dtype(low_dtype, lov_dtype, lov_bar_dtype):
+    """Return the widest dtype resident in each three-tile reverse step."""
+    return numpy.result_type(low_dtype, lov_dtype, lov_bar_dtype)
+
+
 def _local_lov_h5_z_chunks(naux, npair, dtype, pair_tile_size):
     """Choose internal 2-D z chunks near 8 MiB for both access axes."""
     if npair == 0:
@@ -2900,8 +2906,23 @@ def _local_lov_h5_z_chunks(naux, npair, dtype, pair_tile_size):
     return aux_chunk, pair_chunk
 
 
-def _local_direct_raw_int3c_blocks(mol, auxmol):
-    """Yield ``(auxiliary AO slice, raw packed int3c block)`` pairs."""
+def _local_lov_h5_z_aux_read_rows(naux, npair, dtype):
+    """Bound HDF5 z reads while keeping nontrivial reads strictly partial."""
+    naux = int(naux)
+    npair = int(npair)
+    if naux <= 0 or npair < 0:
+        raise ValueError('z dimensions must be nonnegative with positive naux')
+    if npair == 0 or naux == 1:
+        return naux
+    row_bytes = npair * numpy.dtype(dtype).itemsize
+    target_bytes = _LOCAL_LOV_H5_Z_AUX_READ_TARGET_MB * 1024.0**2
+    rows = max(1, int(target_bytes // max(row_bytes, 1)))
+    return min(rows, naux - 1)
+
+
+def _local_direct_raw_int3c_blocks(
+        mol, auxmol, z_aux_block_max_rows=None):
+    """Yield disjoint ``(auxiliary AO slice, raw int3c block)`` triples."""
     npair = mol.nao * (mol.nao + 1) // 2
     target_bytes = _local_direct_int3c_block_mb() * 1024.0**2
     aux_blksize = max(
@@ -2911,6 +2932,11 @@ def _local_direct_raw_int3c_blocks(mol, auxmol):
             int(target_bytes // max(npair * numpy.dtype(numpy.float64).itemsize, 1)),
         ),
     )
+    if z_aux_block_max_rows is not None:
+        z_aux_block_max_rows = int(z_aux_block_max_rows)
+        if z_aux_block_max_rows <= 0:
+            raise ValueError('z_aux_block_max_rows must be positive')
+        aux_blksize = min(aux_blksize, z_aux_block_max_rows)
     for shl0, shl1, _ in balance_partition(auxmol.ao_loc, aux_blksize):
         p0 = int(auxmol.ao_loc[shl0])
         p1 = int(auxmol.ao_loc[shl1])
@@ -2926,26 +2952,37 @@ def _local_direct_raw_int3c_blocks(mol, auxmol):
             aosym='s2ij',
             shls_slice=shls_slice,
         )
-        yield p0, p1, numpy.asarray(jax.device_get(ints)).T
+        raw_ints = numpy.asarray(jax.device_get(ints)).T
+        if z_aux_block_max_rows is None or p1 - p0 <= z_aux_block_max_rows:
+            yield p0, p1, raw_ints
+        else:
+            # A single shell may contain more AOs than the requested cap.
+            # Generate it once and expose bounded, disjoint logical blocks.
+            for read0, read1 in _cderi_vjp._iter_auxiliary_subranges(
+                    p0, p1, z_aux_block_max_rows):
+                raw0 = read0 - p0
+                raw1 = read1 - p0
+                yield read0, read1, raw_ints[raw0:raw1]
 
 
 def _local_direct_mo_coeff_vjp_from_z_reader(
-        mol, auxmol, mo_coeff, read_z_aux_block, orbs_slice):
-    """MO-coefficient pullback with one z read per raw-integral block."""
+        mol, auxmol, mo_coeff, read_z_aux_block, orbs_slice,
+        z_aux_block_max_rows=None):
+    """MO-coefficient pullback with bounded z reads per integral block."""
     mo_coeff_bar = numpy.zeros_like(numpy.asarray(jax.device_get(mo_coeff)))
     k0, k1, l0, l1 = map(int, orbs_slice)
     kl_count = (k1 - k0) * (l1 - l0)
     if kl_count == 0:
         return np.asarray(mo_coeff_bar)
-    for p0, p1, raw_ints in _local_direct_raw_int3c_blocks(mol, auxmol):
+    for p0, p1, raw_ints in _local_direct_raw_int3c_blocks(
+            mol, auxmol, z_aux_block_max_rows=z_aux_block_max_rows):
         z_block = numpy.asarray(read_z_aux_block(p0, p1))
         expected_shape = (p1 - p0, kl_count)
-        if z_block.size != expected_shape[0] * expected_shape[1]:
+        if z_block.shape != expected_shape:
             raise ValueError(
                 'z auxiliary block has incompatible shape: '
                 f'got {z_block.shape}, expected {expected_shape}'
             )
-        z_block = z_block.reshape(expected_shape)
         mo_coeff_bar += numpy.asarray(
             _ao2mo.nr_e2_mo_coeff_vjp(
                 raw_ints,
@@ -2959,7 +2996,9 @@ def _local_direct_mo_coeff_vjp_from_z_reader(
     return np.asarray(mo_coeff_bar)
 
 
-def _local_direct_mo_coeff_vjp(mol, auxmol, mo_coeff, z, orbs_slice):
+def _local_direct_mo_coeff_vjp(
+        mol, auxmol, mo_coeff, z, orbs_slice,
+        z_aux_block_max_rows=None):
     """MO-coefficient pullback from a full z array or auxiliary reader."""
     if callable(z):
         read_z_aux_block = z
@@ -2970,7 +3009,12 @@ def _local_direct_mo_coeff_vjp(mol, auxmol, mo_coeff, z, orbs_slice):
         )
         read_z_aux_block = lambda p0, p1: z_array[p0:p1, :]
     return _local_direct_mo_coeff_vjp_from_z_reader(
-        mol, auxmol, mo_coeff, read_z_aux_block, orbs_slice
+        mol,
+        auxmol,
+        mo_coeff,
+        read_z_aux_block,
+        orbs_slice,
+        z_aux_block_max_rows=z_aux_block_max_rows,
     )
 
 
@@ -3029,10 +3073,24 @@ def _local_direct_nr_e2_h5_bwd(
             raise ValueError(
                 f'/lov_bar shape {lov_bar.shape} does not match {expected_shape}'
             )
-        if not numpy.issubdtype(lov.dtype, numpy.number):
-            raise ValueError('/lov must have a numeric dtype')
-        if not numpy.issubdtype(lov_bar.dtype, numpy.number):
-            raise ValueError('/lov_bar must have a numeric dtype')
+        required_dtype = numpy.dtype(numpy.float64)
+        reverse_dtypes = {
+            '/lov': numpy.dtype(lov.dtype),
+            '/lov_bar': numpy.dtype(lov_bar.dtype),
+            'mo_coeff': numpy.dtype(mo_coeff.dtype),
+        }
+        incompatible = {
+            name: dtype for name, dtype in reverse_dtypes.items()
+            if dtype != required_dtype
+        }
+        if incompatible:
+            details = ', '.join(
+                f'{name}={dtype}' for name, dtype in incompatible.items()
+            )
+            raise ValueError(
+                'Direct local HDF5 Lov reverse requires compatible real '
+                f'float64 inputs; got {details}'
+            )
 
         low_ad, metric_pullback = jax.vjp(metric_cholesky, auxmol)
         low = numpy.asarray(jax.device_get(low_ad))
@@ -3046,7 +3104,12 @@ def _local_direct_nr_e2_h5_bwd(
                 'linear-dependent auxiliary-metric eigenvalue fallback.'
             )
 
-        z_dtype = numpy.result_type(low.dtype, lov_bar.dtype)
+        z_dtype = _local_lov_h5_reverse_dtype(
+            low.dtype, lov.dtype, lov_bar.dtype
+        )
+        z_aux_block_max_rows = _local_lov_h5_z_aux_read_rows(
+            naux, npair, z_dtype
+        )
         pair_tile_size = _local_lov_h5_pair_tile_size(
             naux, npair, z_dtype
         )
@@ -3086,7 +3149,12 @@ def _local_direct_nr_e2_h5_bwd(
                 return z[p0:p1, :]
 
             mo_coeff_bar = _local_direct_mo_coeff_vjp(
-                mol, auxmol, mo_coeff, read_z_aux_block, orbs_slice
+                mol,
+                auxmol,
+                mo_coeff,
+                read_z_aux_block,
+                orbs_slice,
+                z_aux_block_max_rows=z_aux_block_max_rows,
             )
             mol_bar, auxmol_bar = \
                 _cderi_vjp._int3c_mo_deriv_coords_vjp(
@@ -3098,6 +3166,7 @@ def _local_direct_nr_e2_h5_bwd(
                     int3c=mol._add_suffix('int3c2e'),
                     aosym='s2ij',
                     block_memory_mb=_local_direct_int3c_block_mb(),
+                    z_aux_block_max_rows=z_aux_block_max_rows,
                 )
 
             _cderi_vjp._zero_strict_upper_inplace(low_bar)

@@ -681,6 +681,93 @@ def test_int3c_mo_deriv_coords_vjp_accepts_one_read_per_aux_block(monkeypatch):
     )
 
 
+def test_int3c_mo_deriv_coords_vjp_rejects_transposed_reader_block():
+    rng = numpy.random.default_rng(1502)
+    mol = gto.Mole(
+        atom='O 0 0 0; H 0 0 1; H 0 1 0',
+        basis='sto-3g',
+        verbose=0,
+    )
+    mol.build(trace_exp=False, trace_ctr_coeff=False)
+    auxmol = addons.make_auxmol(mol, 'weigend')
+    mo_coeff = rng.normal(size=(mol.nao, 5))
+    orbs_slice = (0, 2, 2, 5)
+    z = rng.normal(size=(auxmol.nao, 6))
+
+    def transposed_z_aux_block(p0, p1):
+        return z[p0:p1, :].T
+
+    with pytest.raises(ValueError, match='z auxiliary block.*shape'):
+        _cderi_vjp._int3c_mo_deriv_coords_vjp(
+            mol, auxmol, mo_coeff, transposed_z_aux_block, orbs_slice
+        )
+
+
+def test_int3c_mo_deriv_coords_vjp_oversized_shell_fallback_is_disjoint(
+    monkeypatch,
+):
+    rng = numpy.random.default_rng(1503)
+    mol = gto.Mole(
+        atom='O 0 0 0; H 0 0 1; H 0 1 0',
+        basis='sto-3g',
+        verbose=0,
+    )
+    mol.build(trace_exp=False, trace_ctr_coeff=False)
+    auxmol = addons.make_auxmol(mol, 'weigend')
+    mo_coeff = rng.normal(size=(mol.nao, 5))
+    orbs_slice = (0, 2, 2, 5)
+    z = rng.normal(size=(auxmol.nao, 6))
+    reference = _cderi_vjp._int3c_mo_deriv_coords_vjp(
+        mol, auxmol, mo_coeff, z, orbs_slice
+    )
+    real_int3c_cross = _cderi_vjp._int3c_cross_opt.int3c_cross
+    integral_ranges = []
+
+    def tracked_int3c_cross(*args, **kwargs):
+        shls_slice = kwargs['shls_slice']
+        shl0 = shls_slice[4] - mol.nbas
+        shl1 = shls_slice[5] - mol.nbas
+        integral_ranges.append(
+            (int(auxmol.ao_loc[shl0]), int(auxmol.ao_loc[shl1]))
+        )
+        return real_int3c_cross(*args, **kwargs)
+
+    monkeypatch.setattr(
+        _cderi_vjp._int3c_cross_opt, 'int3c_cross', tracked_int3c_cross
+    )
+    read_ranges = []
+
+    def read_z_aux_block(p0, p1):
+        read_ranges.append((p0, p1))
+        return z[p0:p1, :]
+
+    result = _cderi_vjp._int3c_mo_deriv_coords_vjp(
+        mol,
+        auxmol,
+        mo_coeff,
+        read_z_aux_block,
+        orbs_slice,
+        z_aux_block_max_rows=1,
+    )
+
+    assert read_ranges == [(p0, p0 + 1) for p0 in range(auxmol.nao)]
+    assert all(
+        left[1] == right[0]
+        for left, right in zip(integral_ranges, integral_ranges[1:])
+    )
+    assert integral_ranges[0][0] == 0
+    assert integral_ranges[-1][1] == auxmol.nao
+    assert len(integral_ranges) < len(read_ranges)
+    numpy.testing.assert_allclose(
+        numpy.asarray(result[0].coords), numpy.asarray(reference[0].coords),
+        atol=2e-10, rtol=2e-10,
+    )
+    numpy.testing.assert_allclose(
+        numpy.asarray(result[1].coords), numpy.asarray(reference[1].coords),
+        atol=2e-10, rtol=2e-10,
+    )
+
+
 def test_local_disk_cderi_bar_cholesky_vjp_matches_pairwise_path(tmp_path):
     from pyscfad.lno import lno_base
 

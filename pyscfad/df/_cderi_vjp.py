@@ -1577,11 +1577,20 @@ def _int3c_ip1_mo_density_contraction(ints, mo_k, mo_l, z_blk):
     )[0]
 
 
+def _iter_auxiliary_subranges(p0, p1, max_rows):
+    """Yield disjoint bounded AO ranges for an oversized single shell."""
+    max_rows = int(max_rows)
+    if max_rows <= 0:
+        raise ValueError('z_aux_block_max_rows must be positive')
+    for read0 in range(int(p0), int(p1), max_rows):
+        yield read0, min(read0 + max_rows, int(p1))
+
+
 def _int3c_mo_deriv_coords_vjp_from_z_reader(
         mol, auxmol, mo_coeff, read_z_aux_block, orbs_slice,
         int3c='int3c2e', aosym='s2ij', block_memory_mb=None,
-        z_dtype=None):
-    """Coordinate pullback with one ``z`` read per auxiliary-shell block."""
+        z_dtype=None, z_aux_block_max_rows=None):
+    """Coordinate pullback with bounded z reads per auxiliary-shell block."""
     if aosym not in ('s2', 's2ij'):
         raise NotImplementedError(f'Only packed s2 CDERI is supported, got {aosym}.')
     if mo_coeff.shape[0] != mol.nao:
@@ -1626,6 +1635,11 @@ def _int3c_mo_deriv_coords_vjp_from_z_reader(
         + 3 * nao
     )
     blksize = max(1, min(naux, int(target_words // max(words_per_aux, 1))))
+    if z_aux_block_max_rows is not None:
+        z_aux_block_max_rows = int(z_aux_block_max_rows)
+        if z_aux_block_max_rows <= 0:
+            raise ValueError('z_aux_block_max_rows must be positive')
+        blksize = min(blksize, z_aux_block_max_rows)
     aux_loc = auxmol.ao_loc
     aux_ranges = balance_partition(aux_loc, blksize)
 
@@ -1633,38 +1647,50 @@ def _int3c_mo_deriv_coords_vjp_from_z_reader(
     mol_ao_bar = None
     aux_ao_bar = None
 
-    for shl0, shl1, _ in aux_ranges:
-        p0, p1 = int(aux_loc[shl0]), int(aux_loc[shl1])
-        shls_slice = (0, nbas, 0, nbas, nbas + shl0, nbas + shl1)
-        z_blk = numpy.asarray(read_z_aux_block(p0, p1))
-        expected_size = (p1 - p0) * kc * lc
-        if z_blk.size != expected_size:
+    def contract_aux_range(read0, read1, ints):
+        nonlocal mol_ao_bar, aux_ao_bar
+        z_blk = numpy.asarray(read_z_aux_block(read0, read1))
+        expected_shape = (read1 - read0, kc * lc)
+        if z_blk.shape != expected_shape:
             raise ValueError(
                 'z auxiliary block has incompatible shape: '
-                f'got {z_blk.shape}, expected {(p1 - p0, kc * lc)}'
+                f'got {z_blk.shape}, expected {expected_shape}'
             )
-        z_blk = z_blk.reshape(p1 - p0, kc, lc)
+        z_blk = z_blk.reshape(read1 - read0, kc, lc)
         if mol_ao_bar is None:
             mol_ao_bar = numpy.zeros((nao, 3), dtype=z_blk.dtype)
             aux_ao_bar = numpy.zeros((naux, 3), dtype=z_blk.dtype)
+        mol_contraction, aux_contraction = \
+            _int3c_ip1_mo_density_contractions(
+                ints, mo_k, mo_l, z_blk
+            )
+        mol_ao_bar -= mol_contraction
+        # The libcint ``ip1`` convention carries the same leading minus sign
+        # as the former explicit ``ip2`` path.  Translational invariance
+        # reverses the auxiliary-centre contribution.
+        aux_ao_bar[read0:read1] += aux_contraction
 
-        # AO-center derivative.  Form the MO-weighted AO density once, choosing
-        # the contraction order whose AO-square step carries min(kc, lc), and
-        # use int3c symmetry to combine the two AO-center contributions.
+    for shl0, shl1, _ in aux_ranges:
+        p0, p1 = int(aux_loc[shl0]), int(aux_loc[shl1])
+        shls_slice = (0, nbas, 0, nbas, nbas + shl0, nbas + shl1)
         ints = _int3c_cross_opt.int3c_cross(
             mol, auxmol, intor=int3c_ip1, comp=3, aosym='s1',
             shls_slice=shls_slice,
         )
         ints = numpy.asarray(ints)
-        mol_contraction, aux_contraction = \
-            _int3c_ip1_mo_density_contractions(
-            ints, mo_k, mo_l, z_blk
-        )
-        mol_ao_bar -= mol_contraction
-        # The libcint ``ip1`` convention carries the same leading minus sign
-        # as the former explicit ``ip2`` path.  Translational invariance then
-        # reverses the sign of the auxiliary-centre contribution.
-        aux_ao_bar[p0:p1] += aux_contraction
+        if z_aux_block_max_rows is None or p1 - p0 <= z_aux_block_max_rows:
+            contract_aux_range(p0, p1, ints)
+        else:
+            # Shell granularity can exceed the requested row cap.  The shell
+            # integral is still generated once, then sliced into disjoint
+            # logical blocks paired one-for-one with bounded z reads.
+            for read0, read1 in _iter_auxiliary_subranges(
+                    p0, p1, z_aux_block_max_rows):
+                int0 = read0 - p0
+                int1 = read1 - p0
+                contract_aux_range(
+                    read0, read1, ints[..., int0:int1]
+                )
         ints = None
 
     if mol_ao_bar is None:
@@ -1682,7 +1708,8 @@ def _int3c_mo_deriv_coords_vjp_from_z_reader(
 
 def _int3c_mo_deriv_coords_vjp(mol, auxmol, mo_coeff, z,
                                orbs_slice, int3c='int3c2e',
-                               aosym='s2ij', block_memory_mb=None):
+                               aosym='s2ij', block_memory_mb=None,
+                               z_aux_block_max_rows=None):
     """Coordinate pullback from a full ``z`` array or auxiliary-block reader."""
     if callable(z):
         read_z_aux_block = z
@@ -1704,6 +1731,7 @@ def _int3c_mo_deriv_coords_vjp(mol, auxmol, mo_coeff, z,
         aosym=aosym,
         block_memory_mb=block_memory_mb,
         z_dtype=z_dtype,
+        z_aux_block_max_rows=z_aux_block_max_rows,
     )
 
 

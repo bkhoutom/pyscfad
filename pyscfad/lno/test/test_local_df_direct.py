@@ -73,6 +73,14 @@ def _assert_tree_allclose(actual, expected, **kwargs):
         )
 
 
+def _assert_disjoint_aux_coverage(ranges, naux):
+    assert ranges
+    assert ranges[0][0] == 0
+    assert ranges[-1][1] == naux
+    assert all(left[1] == right[0] for left, right in zip(ranges, ranges[1:]))
+    assert all(p0 < p1 for p0, p1 in ranges)
+
+
 def test_integral_direct_local_lov_matches_cderi_without_building_local_df(
     monkeypatch,
 ):
@@ -477,6 +485,28 @@ def test_local_lov_h5_z_chunks_are_two_dimensional_and_near_eight_mib():
     assert 4 * 1024**2 <= chunk_bytes <= 16 * 1024**2
 
 
+def test_local_lov_h5_z_aux_reads_are_memory_bounded_and_strictly_partial():
+    small_rows = lno_base._local_lov_h5_z_aux_read_rows(
+        naux=71, npair=6, dtype=numpy.float64
+    )
+    large_rows = lno_base._local_lov_h5_z_aux_read_rows(
+        naux=1_000, npair=100_000, dtype=numpy.float64
+    )
+
+    assert small_rows == 70
+    assert 1 <= large_rows < 1_000
+    assert large_rows * 100_000 * 8 <= 64 * 1024**2
+
+
+def test_local_lov_h5_reverse_dtype_includes_every_tile_participant():
+    assert lno_base._local_lov_h5_reverse_dtype(
+        numpy.float64, numpy.complex128, numpy.float32
+    ) == numpy.dtype(numpy.complex128)
+    assert lno_base._local_lov_h5_reverse_dtype(
+        numpy.float64, numpy.float32, numpy.float32
+    ) == numpy.dtype(numpy.float64)
+
+
 def test_local_direct_mo_coeff_vjp_accepts_one_read_per_raw_block(monkeypatch):
     _, fake_mol, auxmol, coeff, orbs_slice, lov = _direct_local_problem()
     z = numpy.random.default_rng(183).normal(size=numpy.asarray(lov).shape)
@@ -509,6 +539,72 @@ def test_local_direct_mo_coeff_vjp_accepts_one_read_per_raw_block(monkeypatch):
     numpy.testing.assert_allclose(
         numpy.asarray(result), numpy.asarray(reference),
         atol=2e-11, rtol=2e-11,
+    )
+
+
+def test_local_direct_mo_coeff_vjp_rejects_transposed_reader_block():
+    _, fake_mol, auxmol, coeff, orbs_slice, lov = _direct_local_problem()
+    z = numpy.random.default_rng(182).normal(size=numpy.asarray(lov).shape)
+
+    def transposed_z_aux_block(p0, p1):
+        return z[p0:p1, :].T
+
+    with pytest.raises(ValueError, match='z auxiliary block.*shape'):
+        lno_base._local_direct_mo_coeff_vjp(
+            fake_mol, auxmol, coeff, transposed_z_aux_block, orbs_slice
+        )
+
+
+def test_local_direct_mo_coeff_vjp_oversized_shell_fallback_is_disjoint(
+    monkeypatch,
+):
+    _, fake_mol, auxmol, coeff, orbs_slice, lov = _direct_local_problem()
+    z = numpy.random.default_rng(181).normal(size=numpy.asarray(lov).shape)
+    reference = lno_base._local_direct_mo_coeff_vjp(
+        fake_mol, auxmol, coeff, z, orbs_slice
+    )
+    real_blocks = lno_base._local_direct_raw_int3c_blocks
+    real_int3c_cross = lno_base._int3c_cross_opt.int3c_cross
+    logical_ranges = []
+    integral_calls = []
+
+    def tracked_blocks(*args, **kwargs):
+        for p0, p1, raw_ints in real_blocks(*args, **kwargs):
+            logical_ranges.append((p0, p1))
+            yield p0, p1, raw_ints
+
+    def tracked_int3c_cross(*args, **kwargs):
+        integral_calls.append(kwargs['shls_slice'])
+        return real_int3c_cross(*args, **kwargs)
+
+    monkeypatch.setattr(
+        lno_base, '_local_direct_raw_int3c_blocks', tracked_blocks
+    )
+    monkeypatch.setattr(
+        lno_base._int3c_cross_opt, 'int3c_cross', tracked_int3c_cross
+    )
+    read_ranges = []
+
+    def read_z_aux_block(p0, p1):
+        read_ranges.append((p0, p1))
+        return z[p0:p1, :]
+
+    result = lno_base._local_direct_mo_coeff_vjp(
+        fake_mol,
+        auxmol,
+        coeff,
+        read_z_aux_block,
+        orbs_slice,
+        z_aux_block_max_rows=1,
+    )
+
+    assert read_ranges == logical_ranges
+    _assert_disjoint_aux_coverage(logical_ranges, auxmol.nao)
+    assert all(p1 - p0 == 1 for p0, p1 in logical_ranges)
+    assert len(integral_calls) < len(logical_ranges)
+    numpy.testing.assert_allclose(
+        numpy.asarray(result), numpy.asarray(reference),
+        atol=2e-10, rtol=2e-10,
     )
 
 
@@ -568,20 +664,11 @@ def test_local_direct_nr_e2_h5_bwd_uses_bounded_dataset_slices(
     monkeypatch.setattr(
         lno_base, '_local_lov_h5_pair_tile_size', lambda *args, **kwargs: 2
     )
-    monkeypatch.setattr(
-        lno_base, '_local_direct_int3c_block_mb', lambda: 1e-6
-    )
-    monkeypatch.setattr(
-        lno_base._cderi_vjp,
-        'balance_partition',
-        lambda ao_loc, unused_size: [
-            (sh0, sh0 + 1, int(ao_loc[sh0 + 1] - ao_loc[sh0]))
-            for sh0 in range(len(ao_loc) - 1)
-        ],
-    )
     original_array = h5py.Dataset.__array__
     original_getitem = h5py.Dataset.__getitem__
+    original_int3c_cross = lno_base._int3c_cross_opt.int3c_cross
     reads = {'/lov': [], '/lov_bar': [], '/z': []}
+    integral_ranges = []
 
     def forbidden_array(dataset, *args, **kwargs):
         if dataset.name in reads:
@@ -593,8 +680,24 @@ def test_local_direct_nr_e2_h5_bwd_uses_bounded_dataset_slices(
             reads[dataset.name].append(key)
         return original_getitem(dataset, key)
 
+    def tracked_int3c_cross(*args, **kwargs):
+        shls_slice = kwargs['shls_slice']
+        shl0 = shls_slice[4] - fake_mol.nbas
+        shl1 = shls_slice[5] - fake_mol.nbas
+        integral_ranges.append(
+            (
+                kwargs['intor'],
+                int(auxmol.ao_loc[shl0]),
+                int(auxmol.ao_loc[shl1]),
+            )
+        )
+        return original_int3c_cross(*args, **kwargs)
+
     monkeypatch.setattr(h5py.Dataset, '__array__', forbidden_array)
     monkeypatch.setattr(h5py.Dataset, '__getitem__', tracked_getitem)
+    monkeypatch.setattr(
+        lno_base._int3c_cross_opt, 'int3c_cross', tracked_int3c_cross
+    )
 
     lno_base._local_direct_nr_e2_h5_bwd(
         fake_mol, auxmol, coeff, orbs_slice, path
@@ -609,12 +712,53 @@ def test_local_direct_nr_e2_h5_bwd_uses_bounded_dataset_slices(
         ]
         assert max(selected) <= 2 * naux
         assert max(selected) < npair * naux
-    assert len(reads['/z']) > 1
+    raw_ranges = [
+        (p0, p1) for intor, p0, p1 in integral_ranges if 'ip1' not in intor
+    ]
+    ip1_ranges = [
+        (p0, p1) for intor, p0, p1 in integral_ranges if 'ip1' in intor
+    ]
+    z_ranges = [(key[0].start, key[0].stop) for key in reads['/z']]
+    _assert_disjoint_aux_coverage(raw_ranges, naux)
+    _assert_disjoint_aux_coverage(ip1_ranges, naux)
+    assert z_ranges == raw_ranges + ip1_ranges
     assert all(isinstance(key, tuple) and len(key) == 2 for key in reads['/z'])
     assert all(key[1] == slice(None) for key in reads['/z'])
     assert all(
         numpy.arange(naux)[key[0]].size < naux for key in reads['/z']
     )
+
+
+@pytest.mark.parametrize(
+    ('lov_dtype', 'lov_bar_dtype', 'coeff_dtype'),
+    (
+        (numpy.complex128, numpy.float64, numpy.float64),
+        (numpy.int64, numpy.float64, numpy.float64),
+        (numpy.float64, numpy.float32, numpy.float64),
+        (numpy.float64, numpy.float64, numpy.float32),
+    ),
+)
+def test_local_direct_nr_e2_h5_bwd_rejects_non_float64_contract(
+    tmp_path, lov_dtype, lov_bar_dtype, coeff_dtype
+):
+    _, fake_mol, auxmol, coeff, orbs_slice, lov = _direct_local_problem()
+    lov = numpy.asarray(lov)
+    lov_bar = numpy.random.default_rng(188).normal(size=lov.shape)
+    path = tmp_path / 'unsupported-dtype.h5'
+    with h5py.File(path, 'w') as h5file:
+        h5file.create_dataset('lov', data=lov.T.astype(lov_dtype))
+        h5file.create_dataset(
+            'lov_bar', data=lov_bar.T.astype(lov_bar_dtype)
+        )
+
+    with pytest.raises(ValueError, match='real float64'):
+        lno_base._local_direct_nr_e2_h5_bwd(
+            fake_mol,
+            auxmol,
+            np.asarray(numpy.asarray(coeff).astype(coeff_dtype)),
+            orbs_slice,
+            path,
+        )
 
 
 def test_local_direct_nr_e2_h5_bwd_recreates_z_and_cleans_failed_z(

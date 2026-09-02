@@ -13,12 +13,14 @@ correction switch.  The molecule-wide IAO-DLNO-MP2 term is evaluated once.
 from __future__ import annotations
 
 import gc
+import tempfile
 import time
 from dataclasses import asdict, dataclass, is_dataclass
 
 import jax
 import jax.numpy as jnp
 import numpy as onp
+from pyscf import lib as pyscf_lib
 
 from pyscfad import config_update
 from pyscfad.lno.ccsd import _impurity_solve_core
@@ -260,12 +262,17 @@ def _solve_fragment(
     verbose_imp,
     ccsd_t,
     dcsd,
+    lov_scratch_dir,
     profile_pass=None,
 ):
     """Build one LIS and solve it, treating an empty excitation space as zero."""
 
     lis = build_fragment_lis(
-        mf, common, static_selections, fragment_index
+        mf,
+        common,
+        static_selections,
+        fragment_index,
+        lov_scratch_dir=lov_scratch_dir,
     )
     if (
         lis.active_occupied_coeff.shape[1] == 0
@@ -381,95 +388,104 @@ def _fragment_value_and_grad(
     """
     fragment_index = int(fragment_index)
     metadata = _fragment_domain_metadata(static_selections, fragment_index)
-
     replay_forward = forward_record is not None
 
-    def fragment_term(mf_, common_):
-        # Raw IAOs retain any internal valence-virtual component, while their
-        # occupied overlap produces precisely the additive W_F.
-        (e_mp2_lis, e_cc, e_t), lis = _solve_fragment(
-            mf_,
-            common_,
-            static_selections,
-            fragment_index,
-            metadata,
-            verbose_imp=verbose_imp,
-            ccsd_t=ccsd_t,
-            dcsd=dcsd,
-            profile_pass=(
-                "backward replay" if replay_forward else None
-            ),
-        )
-        value = e_cc + e_t - e_mp2_lis
-        auxiliary = (
-            e_mp2_lis,
-            e_cc,
-            e_t,
-            lis.active_occupied_coeff.shape[1],
-            lis.active_virtual_coeff.shape[1],
-        )
-        return value, auxiliary
-
-    fragment_value, fragment_pullback, auxiliary = jax.vjp(
-        fragment_term, mf, common, has_aux=True
-    )
-    e_mp2_lis, e_cc, e_t, lis_occupied, lis_virtual = auxiliary
-    jax.block_until_ready((fragment_value, e_mp2_lis, e_cc, e_t))
-
-    # A JAX pullback closure is process-local and cannot be serialized.  The
-    # useful checkpoint immediately after the primal is therefore deliberately
-    # tiny: component energies and fixed dimensions only.  On restart we
-    # rebuild the CC tape, but ask the custom triples primitive for its lazy
-    # ``backward replay`` primal.  That skips the expensive real (T) energy
-    # contraction while retaining the exact factor-direct triples pullback.
-    if save_forward is not None and not replay_forward:
-        save_forward({
-            "fragment_index": fragment_index,
-            "e_mp2_lis": float(jax.device_get(e_mp2_lis)),
-            "e_ccsd": float(jax.device_get(e_cc)),
-            "e_ccsd_t": float(jax.device_get(e_t)),
-            "lis_occupied": int(lis_occupied),
-            "lis_virtual": int(lis_virtual),
-        })
-
-    fragment_mf_bar, fragment_common_bar = fragment_pullback(
-        jnp.ones((), dtype=jnp.asarray(fragment_value).dtype)
-    )
-    if replay_forward:
-        if int(forward_record["fragment_index"]) != fragment_index:
-            raise ValueError(
-                "fragment forward checkpoint index does not match the "
-                f"requested fragment: {forward_record['fragment_index']} "
-                f"!= {fragment_index}"
+    def run_in_workspace(lov_scratch_dir):
+        def fragment_term(mf_, common_):
+            # Raw IAOs retain any internal valence-virtual component, while
+            # their occupied overlap produces precisely the additive W_F.
+            (e_mp2_lis, e_cc, e_t), lis = _solve_fragment(
+                mf_,
+                common_,
+                static_selections,
+                fragment_index,
+                metadata,
+                verbose_imp=verbose_imp,
+                ccsd_t=ccsd_t,
+                dcsd=dcsd,
+                lov_scratch_dir=lov_scratch_dir,
+                profile_pass=(
+                    "backward replay" if replay_forward else None
+                ),
             )
-        if (
-            int(forward_record["lis_occupied"]) != int(lis_occupied)
-            or int(forward_record["lis_virtual"]) != int(lis_virtual)
-        ):
-            raise ValueError(
-                "fragment forward checkpoint LIS dimensions do not match "
-                "the replayed fixed selections"
+            value = e_cc + e_t - e_mp2_lis
+            auxiliary = (
+                e_mp2_lis,
+                e_cc,
+                e_t,
+                lis.active_occupied_coeff.shape[1],
+                lis.active_virtual_coeff.shape[1],
             )
-        dtype = jnp.asarray(fragment_value).dtype
-        e_mp2_lis = jnp.asarray(forward_record["e_mp2_lis"], dtype=dtype)
-        e_cc = jnp.asarray(forward_record["e_ccsd"], dtype=dtype)
-        e_t = jnp.asarray(forward_record["e_ccsd_t"], dtype=dtype)
-        fragment_value = e_cc + e_t - e_mp2_lis
-    jax.block_until_ready(
-        (fragment_value, fragment_mf_bar, fragment_common_bar)
-    )
-    result = _FragmentValueAndGradResult(
-        value=fragment_value,
-        e_mp2_lis=e_mp2_lis,
-        e_ccsd=e_cc,
-        e_ccsd_t=e_t,
-        lis_occupied=int(lis_occupied),
-        lis_virtual=int(lis_virtual),
-        mf_bar=fragment_mf_bar,
-        common_bar=fragment_common_bar,
-    )
-    del fragment_pullback, fragment_term, auxiliary
-    return result
+            return value, auxiliary
+
+        fragment_value, fragment_pullback, auxiliary = jax.vjp(
+            fragment_term, mf, common, has_aux=True
+        )
+        e_mp2_lis, e_cc, e_t, lis_occupied, lis_virtual = auxiliary
+        jax.block_until_ready((fragment_value, e_mp2_lis, e_cc, e_t))
+
+        # A JAX pullback closure is process-local and cannot be serialized.
+        # The useful checkpoint immediately after the primal is deliberately
+        # tiny: component energies and fixed dimensions only.  On restart we
+        # rebuild the CC tape, but ask the custom triples primitive for its
+        # lazy ``backward replay`` primal.  The scratch directory must remain
+        # alive through this hook and the actual pullback below.
+        if save_forward is not None and not replay_forward:
+            save_forward({
+                "fragment_index": fragment_index,
+                "e_mp2_lis": float(jax.device_get(e_mp2_lis)),
+                "e_ccsd": float(jax.device_get(e_cc)),
+                "e_ccsd_t": float(jax.device_get(e_t)),
+                "lis_occupied": int(lis_occupied),
+                "lis_virtual": int(lis_virtual),
+            })
+
+        fragment_mf_bar, fragment_common_bar = fragment_pullback(
+            jnp.ones((), dtype=jnp.asarray(fragment_value).dtype)
+        )
+        if replay_forward:
+            if int(forward_record["fragment_index"]) != fragment_index:
+                raise ValueError(
+                    "fragment forward checkpoint index does not match the "
+                    f"requested fragment: {forward_record['fragment_index']} "
+                    f"!= {fragment_index}"
+                )
+            if (
+                int(forward_record["lis_occupied"]) != int(lis_occupied)
+                or int(forward_record["lis_virtual"]) != int(lis_virtual)
+            ):
+                raise ValueError(
+                    "fragment forward checkpoint LIS dimensions do not "
+                    "match the replayed fixed selections"
+                )
+            dtype = jnp.asarray(fragment_value).dtype
+            e_mp2_lis = jnp.asarray(
+                forward_record["e_mp2_lis"], dtype=dtype
+            )
+            e_cc = jnp.asarray(forward_record["e_ccsd"], dtype=dtype)
+            e_t = jnp.asarray(forward_record["e_ccsd_t"], dtype=dtype)
+            fragment_value = e_cc + e_t - e_mp2_lis
+        jax.block_until_ready(
+            (fragment_value, fragment_mf_bar, fragment_common_bar)
+        )
+        result = _FragmentValueAndGradResult(
+            value=fragment_value,
+            e_mp2_lis=e_mp2_lis,
+            e_ccsd=e_cc,
+            e_ccsd_t=e_t,
+            lis_occupied=int(lis_occupied),
+            lis_virtual=int(lis_virtual),
+            mf_bar=fragment_mf_bar,
+            common_bar=fragment_common_bar,
+        )
+        del fragment_pullback, fragment_term, auxiliary
+        return result
+
+    with tempfile.TemporaryDirectory(
+        prefix=f"pyscfad-lov-frag{fragment_index}-",
+        dir=pyscf_lib.param.TMPDIR,
+    ) as lov_scratch_dir:
+        return run_in_workspace(lov_scratch_dir)
 
 
 def kernel(
@@ -522,16 +538,22 @@ def kernel(
         metadata = _fragment_domain_metadata(
             static_selections, fragment_index
         )
-        (e_mp2_lis, e_cc, e_t), lis = _solve_fragment(
-            mf,
-            common,
-            static_selections,
-            fragment_index,
-            metadata,
-            verbose_imp=verbose_imp,
-            ccsd_t=ccsd_t,
-            dcsd=dcsd,
-        )
+        with tempfile.TemporaryDirectory(
+            prefix=f"pyscfad-lov-frag{fragment_index}-",
+            dir=pyscf_lib.param.TMPDIR,
+        ) as lov_scratch_dir:
+            (e_mp2_lis, e_cc, e_t), lis = _solve_fragment(
+                mf,
+                common,
+                static_selections,
+                fragment_index,
+                metadata,
+                verbose_imp=verbose_imp,
+                ccsd_t=ccsd_t,
+                dcsd=dcsd,
+                lov_scratch_dir=lov_scratch_dir,
+            )
+            jax.block_until_ready((e_mp2_lis, e_cc, e_t))
         e_mp2_lis_terms.append(e_mp2_lis)
         e_cc_terms.append(e_cc)
         e_t_terms.append(e_t)

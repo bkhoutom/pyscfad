@@ -6,6 +6,7 @@ separated graph with two strong self domains plus one unordered weak pair.
 """
 
 import inspect
+from pathlib import Path
 from types import SimpleNamespace
 
 import jax
@@ -35,10 +36,12 @@ from pyscfad.dlno.iao_mp2_grad import (
     rebuild_iao_mp2_common,
 )
 from pyscfad.dlno.iao_lis import (
+    IAOFragmentLISStaticSelections,
     build_fragment_lis,
     build_iao_lis_static_selections,
     strong_domain_prescreen,
 )
+from pyscf import lib as pyscf_lib
 from pyscfad.lno.ccsd import RCCSD as ImpurityRCCSD
 from pyscfad.lno.ccsd import mp2_fragment_energy
 from pyscfad.mp import dfmp2
@@ -157,6 +160,157 @@ def test_fragment_forward_restart_replays_lazy_triples_pullback(monkeypatch):
     )
     np.testing.assert_allclose(replay.mf_bar, 10.0, atol=0.0, rtol=0.0)
     np.testing.assert_allclose(replay.common_bar, 7.0, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize("fail_pullback", [False, True])
+def test_fragment_workspace_spans_forward_and_pullback_and_cleans_up(
+    tmp_path, monkeypatch, fail_pullback
+):
+    """The rank-private Lov directory outlives the complete fragment VJP."""
+
+    monkeypatch.setattr(pyscf_lib.param, "TMPDIR", str(tmp_path))
+    phases = []
+    scratch_paths = []
+
+    def fake_solve(
+        mf_value,
+        common_value,
+        _static,
+        _fragment_index,
+        _metadata,
+        *,
+        lov_scratch_dir,
+        **_kwargs,
+    ):
+        scratch_path = Path(lov_scratch_dir)
+        assert scratch_path.is_dir()
+        scratch_paths.append(scratch_path)
+
+        @jax.custom_vjp
+        def probe(value):
+            return 2.0 * value
+
+        def probe_fwd(value):
+            assert scratch_path.is_dir()
+            phases.append("forward")
+            return 2.0 * value, None
+
+        def probe_bwd(_residual, cotangent):
+            assert scratch_path.is_dir()
+            phases.append("pullback")
+            if fail_pullback:
+                raise RuntimeError("injected workspace pullback failure")
+            return (2.0 * cotangent,)
+
+        probe.defvjp(probe_fwd, probe_bwd)
+        values = (
+            probe(mf_value) + 3.0 * common_value,
+            jnp.zeros_like(mf_value),
+            jnp.zeros_like(mf_value),
+        )
+        lis = SimpleNamespace(
+            active_occupied_coeff=jnp.zeros((1, 1)),
+            active_virtual_coeff=jnp.zeros((1, 1)),
+        )
+        return values, lis
+
+    monkeypatch.setattr(iao_ccsd_module, "_solve_fragment", fake_solve)
+    static = SimpleNamespace(
+        mp2_static=SimpleNamespace(
+            fragments=(SimpleNamespace(extended_atoms=np.asarray([0])),)
+        )
+    )
+    call = lambda: _fragment_value_and_grad(
+        jnp.asarray(0.4),
+        jnp.asarray(-0.2),
+        static,
+        0,
+        verbose_imp=0,
+        ccsd_t=False,
+        dcsd=False,
+    )
+
+    if fail_pullback:
+        with pytest.raises(
+            RuntimeError, match="injected workspace pullback failure"
+        ):
+            call()
+    else:
+        result = call()
+        np.testing.assert_allclose(result.mf_bar, -2.0)
+        np.testing.assert_allclose(result.common_bar, -3.0)
+
+    assert phases == ["forward", "pullback"]
+    assert len(scratch_paths) == 1
+    assert scratch_paths[0].name.startswith("pyscfad-lov-frag0-")
+    assert not scratch_paths[0].exists()
+    assert list(tmp_path.glob("pyscfad-lov-frag*")) == []
+
+
+def test_energy_only_kernel_gives_each_fragment_a_forward_workspace(
+    tmp_path, monkeypatch
+):
+    """The energy-only loop also owns and removes per-fragment Lov files."""
+
+    monkeypatch.setattr(pyscf_lib.param, "TMPDIR", str(tmp_path))
+    mp2_fragments = tuple(
+        SimpleNamespace(extended_atoms=np.asarray([index]))
+        for index in range(2)
+    )
+    static = IAOFragmentLISStaticSelections(
+        mp2_static=SimpleNamespace(fragments=mp2_fragments),
+        thresh_occ=1e-4,
+        thresh_vir=1e-5,
+        internal_rank_threshold=1e-6,
+        fragments=tuple(
+            SimpleNamespace(fragment_index=index) for index in range(2)
+        ),
+    )
+    common = SimpleNamespace(s1e=jnp.eye(1))
+    scratch_paths = []
+
+    def fake_solve(
+        _mf,
+        _common,
+        _static,
+        fragment_index,
+        _metadata,
+        *,
+        lov_scratch_dir,
+        **_kwargs,
+    ):
+        scratch_path = Path(lov_scratch_dir)
+        assert scratch_path.is_dir()
+        (scratch_path / "local_lov.h5").touch()
+        scratch_paths.append(scratch_path)
+        value = jnp.asarray(float(fragment_index + 1))
+        lis = SimpleNamespace(
+            active_occupied_coeff=jnp.zeros((1, 1)),
+            active_virtual_coeff=jnp.zeros((1, 1)),
+        )
+        return (value, 2.0 * value, jnp.zeros_like(value)), lis
+
+    monkeypatch.setattr(
+        iao_ccsd_module, "rebuild_iao_mp2_common", lambda *_args: common
+    )
+    monkeypatch.setattr(iao_ccsd_module, "_solve_fragment", fake_solve)
+    monkeypatch.setattr(
+        iao_ccsd_module,
+        "iao_mp2_correlation_energy",
+        lambda *_args: jnp.asarray(-0.25),
+    )
+
+    result = iao_ccsd_module.kernel(
+        SimpleNamespace(e_tot=jnp.asarray(-10.0)),
+        static_selections=static,
+    )
+
+    np.testing.assert_allclose(result.e_mp2_lis, 3.0)
+    assert len(scratch_paths) == 2
+    assert len({path.name for path in scratch_paths}) == 2
+    assert all(path.name.startswith("pyscfad-lov-frag") for path in scratch_paths)
+    assert all(not path.exists() for path in scratch_paths)
+    assert list(tmp_path.glob("pyscfad-lov-frag*")) == []
 
 
 def test_serial_cc_restart_after_fragment_and_from_pre_scf_high_cost(
@@ -523,6 +677,17 @@ def _full_domain_thresholds():
     )
 
 
+def _canonical_dfmp2_energy(mf):
+    """Evaluate the small reference independent of prior JAX cache RSS."""
+
+    reference = dfmp2.MP2(mf)
+    reference.max_memory = max(
+        float(reference.max_memory),
+        float(pyscf_lib.current_memory()[0]) + 512.0,
+    )
+    return reference.kernel(with_t2=False)[0]
+
+
 def test_far_water_pt2_is_strong_energy_plus_one_weak_pair():
     """The molecular PT2 correction contains each weak pair exactly once."""
 
@@ -536,7 +701,7 @@ def test_far_water_pt2_is_strong_energy_plus_one_weak_pair():
         abs=2e-14,
     )
 
-    canonical, _ = dfmp2.MP2(mf).kernel(with_t2=False)
+    canonical = _canonical_dfmp2_energy(mf)
     # At 8 Angstrom the fourth-order weak multipole model is already within
     # sub-microhartree accuracy of canonical DF-MP2.
     assert abs(result.e_corr - canonical) < 1e-6
@@ -552,7 +717,7 @@ def test_far_water_pt2_is_strong_energy_plus_one_weak_pair():
     np.testing.assert_allclose(tight.e_corr, canonical, atol=2e-9, rtol=0.0)
 
 
-def test_far_water_lis_rejects_distant_iao_projection_tails():
+def test_far_water_lis_rejects_distant_iao_projection_tails(tmp_path):
     """Tiny cross-monomer IAO projections must not become internal orbitals."""
 
     _, mf, _, mp2_static, common = _build_local_problem(separated=True)
@@ -564,8 +729,14 @@ def test_far_water_lis_rejects_distant_iao_projection_tails():
         thresh_vir=1e-3,
     )
     for fragment_index in range(2):
+        scratch_dir = tmp_path / f"far-fragment-{fragment_index}"
+        scratch_dir.mkdir()
         lis = build_fragment_lis(
-            mf, common, lis_static, fragment_index
+            mf,
+            common,
+            lis_static,
+            fragment_index,
+            lov_scratch_dir=scratch_dir,
         )
         assert lis.n_internal_occ == 5
         assert lis.n_internal_vir == 2
@@ -573,7 +744,7 @@ def test_far_water_lis_rejects_distant_iao_projection_tails():
         assert lis.active_virtual_coeff.shape[1] == 2
 
 
-def test_full_domain_iao_pt2_exactly_cancels_lis_mp2_sum():
+def test_full_domain_iao_pt2_exactly_cancels_lis_mp2_sum(tmp_path):
     """At zero LIS thresholds both MP2 branches recover the same energy."""
 
     _, mf, _, mp2_static, common = _build_local_problem(
@@ -594,8 +765,14 @@ def test_full_domain_iao_pt2_exactly_cancels_lis_mp2_sum():
     nocc = int(np.count_nonzero(np.asarray(mf.mo_occ) > 0.0))
     nvir = int(mf.mo_occ.size - nocc)
     for fragment_index in range(len(mp2_static.fragments)):
+        scratch_dir = tmp_path / f"full-fragment-{fragment_index}"
+        scratch_dir.mkdir()
         lis = build_fragment_lis(
-            mf, common, lis_static, fragment_index
+            mf,
+            common,
+            lis_static,
+            fragment_index,
+            lov_scratch_dir=scratch_dir,
         )
         assert lis.active_occupied_coeff.shape[1] == nocc
         assert lis.active_virtual_coeff.shape[1] == nvir
@@ -632,7 +809,7 @@ def test_full_domain_iao_pt2_exactly_cancels_lis_mp2_sum():
         e_mp2_lis, e_iao_mp2, atol=2e-9, rtol=0.0
     )
 
-    canonical, _ = dfmp2.MP2(mf).kernel(with_t2=False)
+    canonical = _canonical_dfmp2_energy(mf)
     np.testing.assert_allclose(
         e_iao_mp2, canonical, atol=2e-9, rtol=0.0
     )

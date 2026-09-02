@@ -1,3 +1,6 @@
+from pathlib import Path
+from types import SimpleNamespace
+
 import h5py
 import jax
 import jax.numpy as jnp
@@ -5,6 +8,7 @@ import numpy as np
 import pytest
 
 from pyscfad import gto, scf
+from pyscf import lib as pyscf_lib
 from pyscfad.dlno import iao_lis
 from pyscfad.dlno.iao_lis import (
     _density_from_target_amplitude_block,
@@ -22,6 +26,7 @@ from pyscfad.dlno.iao_mp2 import (
 )
 from pyscfad.dlno.iao_mp2_grad import (
     FixedPAOSubspaceSelection,
+    IAOFragmentMP2ContinuousData,
     IAOFragmentMP2StaticSelections,
     IAOMP2FragmentStaticSelection,
     IAOMP2StrongDomain,
@@ -152,8 +157,8 @@ def test_target_amplitude_block_density_validates_rank_and_shapes():
         )
 
 
-def test_strong_domain_density_forwards_memory_and_profiles_lov_and_density(
-    monkeypatch,
+def test_strong_domain_density_routes_directly_to_predictable_h5_file(
+    tmp_path, monkeypatch,
 ):
     empty = np.zeros((0,), dtype=np.int32)
     empty_selection = FixedPAOSubspaceSelection(
@@ -179,14 +184,10 @@ def test_strong_domain_density_forwards_memory_and_profiles_lov_and_density(
         weak_occ_span_metric_keep=empty,
         weak_virtual=None,
     )
-    lov = np.arange(12.0).reshape(2, 2, 3)
-    itemsize = lov.dtype.itemsize
-    bytes_per_c = itemsize * 2 * 3 * (2 * 2 + 6)
-    max_memory_mb = 2.5 * bytes_per_c / 1024.0**2
     static = IAOFragmentMP2StaticSelections(
         frozen=None,
         thresholds=IAOFragmentMP2Thresholds(
-            mp2_block_memory_mb=max_memory_mb,
+            mp2_block_nvir=2,
         ),
         active_occ_indices=empty,
         active_vir_indices=empty,
@@ -211,117 +212,209 @@ def test_strong_domain_density_forwards_memory_and_profiles_lov_and_density(
         np.eye(2), 2.0 * np.eye(3)
     )
     events = []
-    call_kwargs = []
-    starts = [object(), object()]
+    profile_token = object()
+    fake_mol = SimpleNamespace(nao=4)
+    auxmol = SimpleNamespace(nao=2)
+    sentinel_mf = SimpleNamespace(
+        mol=object(),
+        max_memory=900.0,
+        with_df=SimpleNamespace(auxbasis="sentinel-aux", max_memory=713.0),
+    )
 
     def fake_start():
-        token = starts.pop(0)
-        events.append(("start", token))
-        return token
+        events.append(("start", profile_token))
+        return profile_token
 
     def fake_finish(phase, before, **details):
         events.append(("finish", phase, before, details))
 
-    def fake_local_lov(mf, coeff, nocc, atoms, *, integral_direct):
-        assert mf is sentinel_mf
-        assert coeff.shape == (4, 5)
-        assert nocc == 2
+    def fake_make_local_mol(mol, atoms):
+        assert mol is sentinel_mf.mol
         np.testing.assert_array_equal(atoms, np.asarray([0, 1]))
-        assert integral_direct
-        events.append(("lov",))
-        return lov
+        events.append(("local_mol",))
+        return fake_mol
 
-    def fake_density(*args, **kwargs):
-        events.append(("density",))
-        call_kwargs.append(kwargs)
-        np.testing.assert_array_equal(args[0], lov)
+    def fake_make_auxmol(mol, auxbasis):
+        assert mol is fake_mol
+        assert auxbasis == "sentinel-aux"
+        events.append(("auxmol",))
+        return auxmol
+
+    def fake_resolve(**kwargs):
+        events.append(("resolve", kwargs))
+        return 2, "manual_width", 225.0
+
+    def fake_h5_density(*args):
+        events.append(("h5-density", args))
         return expected_density
 
-    sentinel_mf = object()
     monkeypatch.setattr(iao_lis.resource_profile, "start", fake_start)
     monkeypatch.setattr(iao_lis.resource_profile, "finish", fake_finish)
-    monkeypatch.setattr(iao_lis.lno_base, "get_local_Lov", fake_local_lov)
+    monkeypatch.setattr(iao_lis.lno_base, "make_local_mol", fake_make_local_mol)
     monkeypatch.setattr(
-        iao_lis, "strong_domain_mp2_density_from_lov", fake_density
+        iao_lis.lno_base.df_addons, "make_auxmol", fake_make_auxmol
+    )
+    monkeypatch.setattr(
+        iao_lis, "_resolve_mp2_density_block_nvir", fake_resolve
+    )
+    monkeypatch.setattr(
+        iao_lis, "_strong_domain_mp2_density_h5", fake_h5_density
+    )
+    monkeypatch.setattr(
+        iao_lis.lno_base,
+        "get_local_Lov",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("the production route must not materialize Lov")
+        ),
     )
 
     density = iao_lis.strong_domain_mp2_density(
-        sentinel_mf, domain, static, 0
+        sentinel_mf, domain, static, 0, lov_scratch_dir=tmp_path
     )
 
     assert density is expected_density
-    assert call_kwargs == [{"block_nvir": 1}]
-    assert [event[0] for event in events] == [
-        "start", "lov", "finish", "start", "density", "finish",
-    ]
-    lov_finish, density_finish = (
-        event for event in events if event[0] == "finish"
-    )
-    assert lov_finish[1] == "iao_lis.strong_domain_local_lov"
-    assert density_finish[1] == "iao_lis.strong_domain_mp2_density"
-    assert lov_finish[2] is not density_finish[2]
-
-    lov_mib = 2 * 2 * 3 * itemsize / 1024.0**2
-    common_details = {
-        "fragment_index": 0,
-        "coeff_shape": (4, 5),
-        "lov_shape": (2, 2, 3),
+    resolve_event = next(event for event in events if event[0] == "resolve")
+    assert resolve_event[1] == {
         "naux": 2,
         "nocc": 2,
         "nvir": 3,
         "ntarget": 2,
-        "lov_mib": lov_mib,
+        "dtype": domain.occupied_coeff.dtype,
+        "mf_max_memory_mb": 900.0,
+        "configured_memory_mb": None,
+        "configured_block_nvir": 2,
     }
-    assert lov_finish[3] == {
-        **common_details,
-        "local_direct_block_mb": (
-            iao_lis.lno_base._local_direct_int3c_block_mb()
-        ),
-    }
-    assert density_finish[3] == {
-        **common_details,
-        "block_nvir": 1,
-        "nblock": 3,
-        "block_mode": "manual_budget",
-        "workspace_target_mb": max_memory_mb,
-        "full_target_amplitudes_mib": 2 * 2 * 3 * 3 * itemsize / 1024.0**2,
-        "block_target_amplitudes_mib": (
-            2 * 2 * 2 * 3 * 1 * itemsize / 1024.0**2
-        ),
-        "estimated_block_workspace_mib": (
-            itemsize * (2 * 2 * 3 + 2 * 2 + 3 * 3 + 1 * (4 * 2 * 2 * 3 + 4 * 2 * 3 + 2 * 2 * 2)) / 1024.0**2
-        ),
-        "occupied_density_shape": (2, 2),
-        "virtual_density_shape": (3, 3),
-        "density_mib": (2 * 2 + 3 * 3) * itemsize / 1024.0**2,
-    }
+    h5_event = next(event for event in events if event[0] == "h5-density")
+    h5_args = h5_event[1]
+    assert h5_args[0] is fake_mol
+    assert h5_args[1] is auxmol
+    np.testing.assert_array_equal(
+        h5_args[2],
+        np.concatenate((domain.occupied_coeff, domain.virtual_coeff), axis=1),
+    )
+    assert h5_args[6:] == (
+        2,
+        str(tmp_path / "local_lov.h5"),
+        713.0,
+        2,
+    )
+    assert [event[0] for event in events].index("resolve") < [
+        event[0] for event in events
+    ].index("h5-density")
+    finish = next(event for event in events if event[0] == "finish")
+    assert finish[1] == "iao_lis.strong_domain_mp2_density"
+    assert finish[2] is profile_token
+    assert finish[3]["lov_shape"] == (2, 2, 3)
+    assert finish[3]["block_nvir"] == 2
+    assert finish[3]["block_mode"] == "manual_width"
+    assert finish[3]["workspace_target_mb"] == 225.0
 
-    events.clear()
-    call_kwargs.clear()
 
-    def diagnostics_touched(*args, **kwargs):
-        del args, kwargs
-        raise AssertionError("disabled profiling must not evaluate diagnostics")
+@pytest.mark.parametrize("fail_selection", [False, True])
+def test_static_selection_owns_and_cleans_forward_workspace(
+    tmp_path, monkeypatch, fail_selection
+):
+    empty = np.zeros((0,), dtype=np.int32)
+    empty_selection = FixedPAOSubspaceSelection(
+        empty, empty, empty, empty, empty, empty
+    )
+    fragment = IAOMP2FragmentStaticSelection(
+        fragment_index=0,
+        iao_indices=empty,
+        fragment_atoms=np.asarray([0], dtype=np.int32),
+        strong_fragments=np.asarray([0], dtype=np.int32),
+        extended_atoms=np.asarray([0], dtype=np.int32),
+        extended_ao_indices=empty,
+        pao_center_atoms=empty,
+        strong_occ_union_keep=empty,
+        strong_occ_metric_keep=empty,
+        strong_virtual=empty_selection,
+        primary_atoms=empty,
+        primary_ao_indices=empty,
+        primary_bp_atoms=empty,
+        weak_weight_eigen_indices=empty,
+        weak_weight_degenerate_blocks=(),
+        weak_occ_norm_keep=empty,
+        weak_occ_span_metric_keep=empty,
+        weak_virtual=None,
+    )
+    static = IAOFragmentMP2StaticSelections(
+        frozen=None,
+        thresholds=IAOFragmentMP2Thresholds(),
+        active_occ_indices=empty,
+        active_vir_indices=empty,
+        pao_projected_out_indices=empty,
+        pao_parent_ao_indices=empty,
+        ao2pao_map=empty,
+        frag_lolist=(empty,),
+        frag_atmlist=(None,),
+        strong_mask=np.ones((1, 1), dtype=bool),
+        fragments=(fragment,),
+    )
+    common = IAOFragmentMP2ContinuousData(
+        s1e=jnp.eye(1),
+        fock=jnp.eye(1),
+        occupied_coeff=jnp.zeros((1, 0)),
+        virtual_coeff=jnp.zeros((1, 0)),
+        occupied_energy=jnp.zeros((0,)),
+        virtual_energy=jnp.zeros((0,)),
+        iao_coeff=jnp.zeros((1, 0)),
+        pao_coeff=jnp.zeros((1, 0)),
+        fragment_occupied_data=(),
+    )
+    domain = IAOMP2StrongDomain(
+        occupied_coeff=jnp.zeros((1, 0)),
+        virtual_coeff=jnp.zeros((1, 0)),
+        occupied_energy=jnp.zeros((0,)),
+        virtual_energy=jnp.zeros((0,)),
+        target_projection=jnp.zeros((0, 0)),
+        target_weight=jnp.zeros((0, 0)),
+        partner_weight=jnp.zeros((0, 0)),
+    )
+    sentinel_selection = object()
+    scratch_paths = []
 
-    monkeypatch.setattr(iao_lis.resource_profile, "start", lambda: None)
+    def fake_density(_mf, _domain, _static, _fragment_index, *, lov_scratch_dir):
+        scratch_path = Path(lov_scratch_dir)
+        assert scratch_path.is_dir()
+        (scratch_path / "local_lov.h5").touch()
+        scratch_paths.append(scratch_path)
+        return iao_lis.IAOMP2Density(jnp.zeros((0, 0)), jnp.zeros((0, 0)))
+
+    def fake_reference(*_args, **_kwargs):
+        assert scratch_paths[-1].is_dir()
+        assert (scratch_paths[-1] / "local_lov.h5").is_file()
+        if fail_selection:
+            raise RuntimeError("injected static rank-selection failure")
+        return sentinel_selection
+
+    monkeypatch.setattr(pyscf_lib.param, "TMPDIR", str(tmp_path))
+    monkeypatch.setattr(iao_lis, "strong_domain_mp2_density", fake_density)
     monkeypatch.setattr(
-        iao_lis.resource_profile, "finish", diagnostics_touched
+        iao_lis,
+        "_domain_density_in_active_spaces",
+        lambda *_args: (jnp.zeros((0, 0)), jnp.zeros((0, 0))),
     )
     monkeypatch.setattr(
-        iao_lis.resource_profile, "estimated_array_mib", diagnostics_touched
+        iao_lis, "_reference_fragment_selection", fake_reference
     )
-    monkeypatch.setattr(
-        iao_lis.lno_base, "_local_direct_int3c_block_mb", diagnostics_touched
-    )
-    monkeypatch.setattr(
-        iao_lis, "_mp2_density_virtual_block_size", diagnostics_touched
-    )
-    disabled_density = iao_lis.strong_domain_mp2_density(
-        sentinel_mf, domain, static, 0
-    )
-    assert disabled_density is expected_density
-    assert call_kwargs == [{"block_nvir": 1}]
-    assert [event[0] for event in events] == ["lov", "density"]
+
+    if fail_selection:
+        with pytest.raises(
+            RuntimeError, match="injected static rank-selection failure"
+        ):
+            build_iao_lis_fragment_static_selection(
+                object(), static, 0, common=common, domain=domain
+            )
+    else:
+        actual = build_iao_lis_fragment_static_selection(
+            object(), static, 0, common=common, domain=domain
+        )
+        assert actual is sentinel_selection
+    assert len(scratch_paths) == 1
+    assert scratch_paths[0].name.startswith("pyscfad-lov-frag0-")
+    assert not scratch_paths[0].exists()
+    assert list(tmp_path.glob("pyscfad-lov-frag*")) == []
 
 
 def _manual_ie_density(target_amplitudes):
@@ -1513,7 +1606,9 @@ def _full_domain_thresholds():
 
 
 @pytest.mark.parametrize("frozen", [None, 1])
-def test_zero_lno_threshold_recovers_full_active_hf_spaces(frozen):
+def test_zero_lno_threshold_recovers_full_active_hf_spaces(
+    frozen, tmp_path
+):
     mf = _water_mf(frozen)
     topology = build_iao_fragment_topology(
         mf,
@@ -1532,7 +1627,28 @@ def test_zero_lno_threshold_recovers_full_active_hf_spaces(frozen):
         thresh_occ=0.0,
         thresh_vir=0.0,
     )
-    result = build_fragment_lis(mf, common, lis_static, 0)
+    scratch_dir = tmp_path / "fragment-0"
+    scratch_dir.mkdir()
+    result = build_fragment_lis(
+        mf,
+        common,
+        lis_static,
+        0,
+        lov_scratch_dir=scratch_dir,
+    )
+
+    injected = build_fragment_lis(
+        mf,
+        common,
+        lis_static,
+        0,
+        domain=result.domain,
+        density=iao_lis.IAOMP2Density(
+            result.density_occupied_ed,
+            result.density_virtual_ed,
+        ),
+    )
+    np.testing.assert_allclose(injected.mo_coeff, result.mo_coeff)
 
     nocc_active = len(mp2_static.active_occ_indices)
     nvir_active = len(mp2_static.active_vir_indices)

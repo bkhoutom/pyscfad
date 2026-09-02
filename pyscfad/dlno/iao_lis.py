@@ -43,6 +43,7 @@ from dataclasses import dataclass
 from functools import partial
 from typing import NamedTuple
 import os
+import tempfile
 import time
 import warnings
 
@@ -51,9 +52,11 @@ import jax
 from jax.interpreters import ad as jax_ad
 import numpy as onp
 import scipy.linalg as onp_scipy_linalg
+from pyscf import lib as pyscf_lib
 
 from pyscfad import numpy as np
 from pyscfad import scipy
+from pyscfad.df import addons as df_addons
 from pyscfad.lno import lno_base
 from pyscfad.tools import resource_profile
 
@@ -1246,8 +1249,15 @@ _strong_domain_mp2_density_h5.defvjp(
 )
 
 
-def strong_domain_mp2_density(mf, domain, static, fragment_index):
-    """Evaluate one fragment's target-conditioned density in its strong ED."""
+def strong_domain_mp2_density(
+    mf,
+    domain,
+    static,
+    fragment_index,
+    *,
+    lov_scratch_dir,
+):
+    """Evaluate one fragment density through a rank-private HDF5 Lov file."""
 
     if not isinstance(static, IAOFragmentMP2StaticSelections):
         raise TypeError("static must be IAOFragmentMP2StaticSelections")
@@ -1259,61 +1269,64 @@ def strong_domain_mp2_density(mf, domain, static, fragment_index):
     coeff = np.concatenate(
         (domain.occupied_coeff, domain.virtual_coeff), axis=1
     )
-    nvir = domain.virtual_coeff.shape[1]
-    profile_lov = resource_profile.start()
-    lov = lno_base.get_local_Lov(
-        mf,
-        coeff,
-        nocc,
-        fragment.extended_atoms,
-        integral_direct=True,
-    ).reshape((-1, nocc, nvir))
-    if profile_lov is not None:
-        resource_profile.finish(
-            "iao_lis.strong_domain_local_lov",
-            profile_lov,
-            fragment_index=fragment_index,
-            coeff_shape=tuple(coeff.shape),
-            lov_shape=tuple(lov.shape),
-            naux=lov.shape[0],
-            nocc=nocc,
-            nvir=nvir,
-            ntarget=domain.target_projection.shape[0],
-            lov_mib=resource_profile.estimated_array_mib(lov),
-            local_direct_block_mb=lno_base._local_direct_int3c_block_mb(),
+    nvir = int(domain.virtual_coeff.shape[1])
+    if lov_scratch_dir is None:
+        raise ValueError(
+            "lov_scratch_dir is required when building the MP2 density"
         )
+    lov_scratch_dir = os.fspath(lov_scratch_dir)
+    if not os.path.isdir(lov_scratch_dir):
+        raise FileNotFoundError(
+            f"Lov scratch directory does not exist: {lov_scratch_dir}"
+        )
+
+    fake_mol = lno_base.make_local_mol(
+        mf.mol, fragment.extended_atoms
+    )
+    auxmol = df_addons.make_auxmol(fake_mol, mf.with_df.auxbasis)
+    naux = int(auxmol.nao)
+    ntarget = int(domain.target_projection.shape[0])
 
     block_nvir, block_mode, workspace_target_mb = (
         _resolve_mp2_density_block_nvir(
-            naux=lov.shape[0],
+            naux=naux,
             nocc=nocc,
             nvir=nvir,
-            ntarget=domain.target_projection.shape[0],
-            dtype=lov.dtype,
+            ntarget=ntarget,
+            dtype=coeff.dtype,
             mf_max_memory_mb=getattr(mf, "max_memory", 256.0),
             configured_memory_mb=static.thresholds.mp2_block_memory_mb,
             configured_block_nvir=static.thresholds.mp2_block_nvir,
         )
     )
     profile_density = resource_profile.start()
-    density = strong_domain_mp2_density_from_lov(
-        lov,
+    h5_path = os.path.join(lov_scratch_dir, "local_lov.h5")
+    local_max_memory = getattr(
+        mf.with_df,
+        "max_memory",
+        getattr(mf, "max_memory", 256.0),
+    )
+    density = _strong_domain_mp2_density_h5(
+        fake_mol,
+        auxmol,
+        coeff,
         domain.occupied_energy,
         domain.virtual_energy,
         domain.target_projection,
-        block_nvir=block_nvir,
+        nocc,
+        h5_path,
+        local_max_memory,
+        block_nvir,
     )
     if profile_density is not None:
-        ntarget = domain.target_projection.shape[0]
-        naux = lov.shape[0]
-        lov_mib = resource_profile.estimated_array_mib(lov)
-        itemsize = onp.dtype(lov.dtype).itemsize
+        itemsize = onp.dtype(coeff.dtype).itemsize
+        lov_mib = naux * nocc * nvir * itemsize / 1024.0**2
         resource_profile.finish(
             "iao_lis.strong_domain_mp2_density",
             profile_density,
             fragment_index=fragment_index,
             coeff_shape=tuple(coeff.shape),
-            lov_shape=tuple(lov.shape),
+            lov_shape=(naux, nocc, nvir),
             naux=naux,
             nocc=nocc,
             nvir=nvir,
@@ -1349,6 +1362,8 @@ def strong_domain_mp2_density(mf, domain, static, fragment_index):
             density_mib=resource_profile.estimated_array_mib(
                 density.occupied, density.virtual
             ),
+            lov_filename=os.path.basename(h5_path),
+            local_direct_block_mb=lno_base._local_direct_int3c_block_mb(),
         )
     return density
 
@@ -1599,22 +1614,32 @@ def build_iao_lis_fragment_static_selection(
     if not isinstance(domain, IAOMP2StrongDomain):
         raise TypeError("domain must be IAOMP2StrongDomain")
 
-    density = strong_domain_mp2_density(
-        mf, domain, mp2_static, fragment_index
-    )
-    dmoo_active, dmvv_active = _domain_density_in_active_spaces(
-        common, mp2_static, fragment_index, domain, density
-    )
-    return _reference_fragment_selection(
-        common,
-        mp2_static,
-        fragment_index,
-        dmoo_active,
-        dmvv_active,
-        thresh_occ=thresh_occ,
-        thresh_vir=thresh_vir,
-        internal_rank_threshold=internal_rank_threshold,
-    )
+    with tempfile.TemporaryDirectory(
+        prefix=f"pyscfad-lov-frag{fragment_index}-",
+        dir=pyscf_lib.param.TMPDIR,
+    ) as lov_scratch_dir:
+        density = strong_domain_mp2_density(
+            mf,
+            domain,
+            mp2_static,
+            fragment_index,
+            lov_scratch_dir=lov_scratch_dir,
+        )
+        dmoo_active, dmvv_active = _domain_density_in_active_spaces(
+            common, mp2_static, fragment_index, domain, density
+        )
+        selection = _reference_fragment_selection(
+            common,
+            mp2_static,
+            fragment_index,
+            dmoo_active,
+            dmvv_active,
+            thresh_occ=thresh_occ,
+            thresh_vir=thresh_vir,
+            internal_rank_threshold=internal_rank_threshold,
+        )
+        jax.block_until_ready((density, dmoo_active, dmvv_active))
+    return selection
 
 
 def build_iao_lis_static_selections(
@@ -1763,6 +1788,7 @@ def build_fragment_lis(
     *,
     domain=None,
     density=None,
+    lov_scratch_dir=None,
 ):
     """Rebuild one fixed-rank IAO-MP2 LIS on the differentiable path."""
 
@@ -1781,8 +1807,16 @@ def build_fragment_lis(
             common, mp2_static, fragment_index
         )
     if density is None:
+        if lov_scratch_dir is None:
+            raise ValueError(
+                "lov_scratch_dir is required when density is not supplied"
+            )
         density = strong_domain_mp2_density(
-            mf, domain, mp2_static, fragment_index
+            mf,
+            domain,
+            mp2_static,
+            fragment_index,
+            lov_scratch_dir=lov_scratch_dir,
         )
     dmoo_active, dmvv_active = _domain_density_in_active_spaces(
         common, mp2_static, fragment_index, domain, density

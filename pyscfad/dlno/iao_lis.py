@@ -39,6 +39,7 @@ rebuilt on the differentiable path by :func:`build_fragment_lis`.
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import partial
 from typing import NamedTuple
@@ -90,6 +91,59 @@ __all__ = [
 # locality, even though they are harmless in projector-based ED construction.
 # This is a singular-value threshold (not a Gram-eigenvalue threshold).
 IAO_LIS_INTERNAL_RANK_THRESHOLD = 1e-6
+_H5_DENSITY_IO_PROFILE = ContextVar(
+    "pyscfad_iao_lis_h5_density_io_profile", default=None
+)
+
+
+def _new_h5_io_profile():
+    return {
+        "hdf5_bytes_read": 0,
+        "hdf5_bytes_written": 0,
+        "hdf5_read_seconds": 0.0,
+        "hdf5_write_seconds": 0.0,
+    }
+
+
+def _record_h5_density_io(**details):
+    profile = _H5_DENSITY_IO_PROFILE.get()
+    if profile is None:
+        return
+    for key, value in details.items():
+        if key in (
+            "hdf5_bytes_read",
+            "hdf5_bytes_written",
+            "hdf5_read_seconds",
+            "hdf5_write_seconds",
+        ):
+            profile[key] += value
+        else:
+            profile[key] = value
+
+
+def _h5_dataset_disk_mib(dataset):
+    """Return allocated HDF5 storage without reading the dataset."""
+    return float(dataset.id.get_storage_size()) / 1024.0**2
+
+
+def _timed_h5_read(dataset, key, profile):
+    start = time.perf_counter()
+    value = dataset[key]
+    elapsed = time.perf_counter() - start
+    if profile is not None:
+        profile["hdf5_read_seconds"] += elapsed
+        profile["hdf5_bytes_read"] += int(onp.asarray(value).nbytes)
+    return value
+
+
+def _timed_h5_write(dataset, key, value, profile):
+    value = onp.asarray(value)
+    start = time.perf_counter()
+    dataset[key] = value
+    elapsed = time.perf_counter() - start
+    if profile is not None:
+        profile["hdf5_write_seconds"] += elapsed
+        profile["hdf5_bytes_written"] += int(value.nbytes)
 
 
 @dataclass(frozen=True)
@@ -350,7 +404,15 @@ def _resolve_mp2_density_block_nvir(
     configured_memory_mb: float | None,
     configured_block_nvir: int | None,
 ) -> tuple[int, str, float]:
-    """Return ``(block_nvir, mode, workspace_target_mb)`` for MP2 density."""
+    """Return ``(block_nvir, mode, workspace_target_mib)`` for MP2 density.
+
+    With no override, the workspace target and virtual width are selected
+    automatically from ``mf_max_memory_mb`` and the tensor dimensions.
+    ``configured_block_nvir`` is an advanced exact-width override (clamped
+    only to the available virtual dimension); ``configured_memory_mb`` is an
+    optional workspace-target override.  Neither value is a hard process-RSS
+    cap.
+    """
     naux = int(naux)
     nocc = int(nocc)
     nvir = int(nvir)
@@ -572,7 +634,11 @@ def _strong_domain_mp2_density_h5_primal(
     nvir: int,
     block_nvir: int,
 ) -> IAOMP2Density:
-    """Evaluate Doo/Dvv while reading only bounded pair-major Lov slices."""
+    """Evaluate Doo/Dvv while reading only bounded pair-major Lov slices.
+
+    HDF5 access is host-orchestrated and synchronous; no complete ``Lov`` or
+    target-amplitude tensor is materialized.
+    """
 
     dimensions = {"naux": naux, "nocc": nocc, "nvir": nvir}
     for name, value in dimensions.items():
@@ -616,6 +682,7 @@ def _strong_domain_mp2_density_h5_primal(
                 f"/lov must have shape {expected_shape}, got {lov_h5.shape}"
             )
         dtype = lov_h5.dtype
+        lov_disk_mib = _h5_dataset_disk_mib(lov_h5)
         itemsize = int(dtype.itemsize)
         dmoo = np.zeros((nocc, nocc), dtype=dtype)
         dmvv = np.zeros((nvir, nvir), dtype=dtype)
@@ -684,20 +751,31 @@ def _strong_domain_mp2_density_h5_primal(
     jax.block_until_ready(density)
     mp2_kernel_s += time.perf_counter() - kernel_start
     if profile is not None:
+        _record_h5_density_io(
+            lov_disk_mib=lov_disk_mib,
+            lov_bar_disk_mib=0.0,
+            z_disk_mib=0.0,
+            hdf5_bytes_read=bytes_read,
+            hdf5_read_seconds=hdf5_read_s,
+        )
         resource_profile.finish(
             "iao_lis.strong_domain_mp2_density_h5_primal",
             profile,
-            lov_file_bytes=os.path.getsize(h5_path),
+            lov_h5_path_basename=os.path.basename(h5_path),
+            lov_disk_mib=lov_disk_mib,
+            lov_bar_disk_mib=0.0,
+            z_disk_mib=0.0,
             naux=naux,
             nocc=nocc,
             nvir=nvir,
             ntarget=ntarget,
             block_nvir=block_nvir,
-            nblock=nblock,
-            bytes_read=bytes_read,
-            bytes_written=0,
-            hdf5_read_s=hdf5_read_s,
-            mp2_kernel_s=mp2_kernel_s,
+            block_count=nblock,
+            hdf5_bytes_read=bytes_read,
+            hdf5_bytes_written=0,
+            hdf5_read_seconds=hdf5_read_s,
+            hdf5_write_seconds=0.0,
+            mp2_kernel_seconds=mp2_kernel_s,
         )
     return density
 
@@ -793,7 +871,7 @@ def _h5_density_hermitized_output_bars(
 
 
 def _read_h5_lov_virtual_block(
-    lov_h5, *, naux, nocc, nvir, c0, c1
+    lov_h5, *, naux, nocc, nvir, c0, c1, io_profile=None
 ):
     """Read one contracted-virtual block into auxiliary-first layout."""
 
@@ -801,7 +879,11 @@ def _read_h5_lov_virtual_block(
     lov_c_host = onp.empty((naux, nocc, width), dtype=lov_h5.dtype)
     for r in range(nocc):
         lov_c_host[:, r, :] = onp.asarray(
-            lov_h5[r * nvir + c0:r * nvir + c1, :]
+            _timed_h5_read(
+                lov_h5,
+                (slice(r * nvir + c0, r * nvir + c1), slice(None)),
+                io_profile,
+            )
         ).T
     return lov_c_host
 
@@ -817,6 +899,7 @@ def _reconstruct_h5_target_amplitude_block(
     nvir,
     c0,
     c1,
+    io_profile=None,
 ):
     """Replay one bounded A/B block without retaining occupied pullbacks."""
 
@@ -831,7 +914,11 @@ def _reconstruct_h5_target_amplitude_block(
     eia_c = eia[:, c0:c1]
     for p in range(nocc):
         lov_p_host = onp.asarray(
-            lov_h5[p * nvir:(p + 1) * nvir, :]
+            _timed_h5_read(
+                lov_h5,
+                (slice(p * nvir, (p + 1) * nvir), slice(None)),
+                io_profile,
+            )
         )
         a_increment, b_row = (
             _target_amplitude_block_from_lov_occupied_slice(
@@ -911,6 +998,9 @@ def _strong_domain_mp2_density_h5_lov_bwd(
         onp.asarray(jax.device_get(target_projection))
     )
     npair = nocc * nvir
+    profile_start = resource_profile.start()
+    io_profile = _new_h5_io_profile()
+    lov_disk_mib = lov_bar_disk_mib = 0.0
     try:
         with h5py.File(h5_path, "r+") as h5file:
             if "lov" not in h5file:
@@ -927,9 +1017,11 @@ def _strong_domain_mp2_density_h5_lov_bwd(
                     "Fused HDF5 MP2 density reverse requires real float64 "
                     f"/lov; got {lov_h5.dtype}"
                 )
+            lov_disk_mib = _h5_dataset_disk_mib(lov_h5)
             for name in ("lov_bar", "z"):
                 if name in h5file:
                     del h5file[name]
+            write_start = time.perf_counter()
             lov_bar_h5 = h5file.create_dataset(
                 "lov_bar",
                 shape=expected_shape,
@@ -937,6 +1029,9 @@ def _strong_domain_mp2_density_h5_lov_bwd(
                 chunks=None,
                 compression=None,
                 fillvalue=0.0,
+            )
+            io_profile["hdf5_write_seconds"] += (
+                time.perf_counter() - write_start
             )
             hermitized_bar = _h5_density_hermitized_output_bars(
                 density_bar, nocc=nocc, nvir=nvir, dtype=lov_h5.dtype
@@ -955,6 +1050,7 @@ def _strong_domain_mp2_density_h5_lov_bwd(
                         nvir=nvir,
                         c0=c0,
                         c1=c1,
+                        io_profile=io_profile,
                     )
                     lov_c = np.asarray(lov_c_host)
                     del lov_c_host
@@ -969,6 +1065,7 @@ def _strong_domain_mp2_density_h5_lov_bwd(
                             nvir=nvir,
                             c0=c0,
                             c1=c1,
+                            io_profile=io_profile,
                         )
                     )
                     _, density_pullback = jax.vjp(
@@ -986,7 +1083,14 @@ def _strong_domain_mp2_density_h5_lov_bwd(
                     eia_c = eia[:, c0:c1]
                     for p in range(nocc):
                         lov_p_host = onp.asarray(
-                            lov_h5[p * nvir:(p + 1) * nvir, :]
+                            _timed_h5_read(
+                                lov_h5,
+                                (
+                                    slice(p * nvir, (p + 1) * nvir),
+                                    slice(None),
+                                ),
+                                io_profile,
+                            )
                         )
                         slice_inputs = (
                             np.asarray(lov_p_host.T),
@@ -1020,10 +1124,19 @@ def _strong_domain_mp2_density_h5_lov_bwd(
 
                         pair0, pair1 = p * nvir, (p + 1) * nvir
                         lov_bar_row = onp.asarray(
-                            lov_bar_h5[pair0:pair1, :]
+                            _timed_h5_read(
+                                lov_bar_h5,
+                                (slice(pair0, pair1), slice(None)),
+                                io_profile,
+                            )
                         )
                         lov_bar_row += lov_p_bar.T
-                        lov_bar_h5[pair0:pair1, :] = lov_bar_row
+                        _timed_h5_write(
+                            lov_bar_h5,
+                            (slice(pair0, pair1), slice(None)),
+                            lov_bar_row,
+                            io_profile,
+                        )
                         lov_c_bar_host += lov_c_bar
                         occupied_bar_host[p] += onp.sum(eia_p_bar)
                         virtual_bar_host -= eia_p_bar
@@ -1049,21 +1162,46 @@ def _strong_domain_mp2_density_h5_lov_bwd(
                         pair0 = r * nvir + c0
                         pair1 = r * nvir + c1
                         lov_bar_block = onp.asarray(
-                            lov_bar_h5[pair0:pair1, :]
+                            _timed_h5_read(
+                                lov_bar_h5,
+                                (slice(pair0, pair1), slice(None)),
+                                io_profile,
+                            )
                         )
                         lov_bar_block += lov_c_bar_host[:, r, :].T
-                        lov_bar_h5[pair0:pair1, :] = lov_bar_block
+                        _timed_h5_write(
+                            lov_bar_h5,
+                            (slice(pair0, pair1), slice(None)),
+                            lov_bar_block,
+                            io_profile,
+                        )
                     del (
                         a_bar,
                         b_bar,
                         lov_c,
                         lov_c_bar_host,
                     )
+            flush_start = time.perf_counter()
             h5file.flush()
+            io_profile["hdf5_write_seconds"] += (
+                time.perf_counter() - flush_start
+            )
+            lov_bar_disk_mib = _h5_dataset_disk_mib(lov_bar_h5)
     except BaseException:
         _remove_h5_density_derivative_datasets(h5_path)
         raise
 
+    resource_profile.finish(
+        "iao_lis.strong_domain_mp2_density_h5_lov_bwd",
+        profile_start,
+        lov_h5_path_basename=os.path.basename(h5_path),
+        lov_disk_mib=lov_disk_mib,
+        lov_bar_disk_mib=lov_bar_disk_mib,
+        z_disk_mib=0.0,
+        block_nvir=block_nvir,
+        block_count=(nvir + block_nvir - 1) // block_nvir,
+        **io_profile,
+    )
     return (
         np.asarray(occupied_bar_host),
         np.asarray(virtual_bar_host),
@@ -1113,6 +1251,13 @@ def _strong_domain_mp2_density_h5_impl(
     )
     if (info.naux, info.nocc, info.nvir) != (auxmol.nao, nocc, nvir):
         raise RuntimeError("direct HDF5 Lov metadata is inconsistent")
+    _record_h5_density_io(
+        lov_disk_mib=info.lov_disk_mib,
+        lov_bar_disk_mib=0.0,
+        z_disk_mib=0.0,
+        hdf5_bytes_written=info.hdf5_bytes_written,
+        hdf5_write_seconds=info.hdf5_write_seconds,
+    )
     return _strong_domain_mp2_density_h5_primal(
         h5_path,
         occupied_energy,
@@ -1257,7 +1402,15 @@ def strong_domain_mp2_density(
     *,
     lov_scratch_dir,
 ):
-    """Evaluate one fragment density through a rank-private HDF5 Lov file."""
+    """Evaluate one fragment density through rank-private HDF5 scratch.
+
+    The local ``Lov`` is always written to the supplied node-local workspace;
+    this IAO-LIS path has no in-memory storage mode.  MP2 virtual blocking is
+    automatic when neither threshold option is supplied.  The corresponding
+    driver option ``--mp2-block-nvir N`` is an advanced exact-width override;
+    ``--mp2-block-memory MB`` is an optional workspace-target override.  Both
+    tune temporary workspace and neither is a hard cap on process memory.
+    """
 
     if not isinstance(static, IAOFragmentMP2StaticSelections):
         raise TypeError("static must be IAOFragmentMP2StaticSelections")
@@ -1300,24 +1453,31 @@ def strong_domain_mp2_density(
         )
     )
     profile_density = resource_profile.start()
+    h5_io_profile = _new_h5_io_profile()
     h5_path = os.path.join(lov_scratch_dir, "local_lov.h5")
     local_max_memory = getattr(
         mf.with_df,
         "max_memory",
         getattr(mf, "max_memory", 256.0),
     )
-    density = _strong_domain_mp2_density_h5(
-        fake_mol,
-        auxmol,
-        coeff,
-        domain.occupied_energy,
-        domain.virtual_energy,
-        domain.target_projection,
-        nocc,
-        h5_path,
-        local_max_memory,
-        block_nvir,
+    profile_token = _H5_DENSITY_IO_PROFILE.set(
+        h5_io_profile if profile_density is not None else None
     )
+    try:
+        density = _strong_domain_mp2_density_h5(
+            fake_mol,
+            auxmol,
+            coeff,
+            domain.occupied_energy,
+            domain.virtual_energy,
+            domain.target_projection,
+            nocc,
+            h5_path,
+            local_max_memory,
+            block_nvir,
+        )
+    finally:
+        _H5_DENSITY_IO_PROFILE.reset(profile_token)
     if profile_density is not None:
         itemsize = onp.dtype(coeff.dtype).itemsize
         lov_mib = naux * nocc * nvir * itemsize / 1024.0**2
@@ -1333,9 +1493,9 @@ def strong_domain_mp2_density(
             ntarget=ntarget,
             lov_mib=lov_mib,
             block_nvir=block_nvir,
-            nblock=(nvir + block_nvir - 1) // block_nvir,
+            block_count=(nvir + block_nvir - 1) // block_nvir,
             block_mode=block_mode,
-            workspace_target_mb=workspace_target_mb,
+            workspace_target_mib=workspace_target_mb,
             full_target_amplitudes_mib=(
                 ntarget * nocc * nvir * nvir * itemsize / 1024.0**2
             ),
@@ -1362,7 +1522,14 @@ def strong_domain_mp2_density(
             density_mib=resource_profile.estimated_array_mib(
                 density.occupied, density.virtual
             ),
-            lov_filename=os.path.basename(h5_path),
+            lov_h5_path_basename=os.path.basename(h5_path),
+            lov_disk_mib=h5_io_profile.get("lov_disk_mib", lov_mib),
+            lov_bar_disk_mib=h5_io_profile.get("lov_bar_disk_mib", 0.0),
+            z_disk_mib=h5_io_profile.get("z_disk_mib", 0.0),
+            hdf5_bytes_read=h5_io_profile["hdf5_bytes_read"],
+            hdf5_bytes_written=h5_io_profile["hdf5_bytes_written"],
+            hdf5_read_seconds=h5_io_profile["hdf5_read_seconds"],
+            hdf5_write_seconds=h5_io_profile["hdf5_write_seconds"],
             local_direct_block_mb=lno_base._local_direct_int3c_block_mb(),
         )
     return density

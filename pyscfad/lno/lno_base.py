@@ -85,6 +85,9 @@ class LocalLovH5Info:
     lov_dataset: str = "lov"
     lov_bar_dataset: str = "lov_bar"
     z_dataset: str = "z"
+    lov_disk_mib: float = 0.0
+    hdf5_bytes_written: int = 0
+    hdf5_write_seconds: float = 0.0
 
 
 @contextmanager
@@ -2649,12 +2652,32 @@ def _local_direct_nr_e2_impl(mol, auxmol, mo_coeff, max_memory, orbs_slice):
     return np.asarray(numpy.asarray(ovl.T))
 
 
+class _TimedH5DatasetWriter:
+    """Transparent dataset writer that accounts only actual HDF5 writes."""
+
+    def __init__(self, dataset):
+        self.dataset = dataset
+        self.bytes_written = 0
+        self.write_seconds = 0.0
+
+    def __getattr__(self, name):
+        return getattr(self.dataset, name)
+
+    def __setitem__(self, key, value):
+        value = numpy.asarray(value)
+        start = time.perf_counter()
+        self.dataset[key] = value
+        self.write_seconds += time.perf_counter() - start
+        self.bytes_written += int(value.nbytes)
+
+
 class _LocalLovH5Output:
     """Map PySCF's out-of-core ``ovL`` request onto contiguous ``/lov``."""
 
     def __init__(self, h5file):
         self.h5file = h5file
         self.dataset = None
+        self.writer = None
 
     def create_dataset(self, name, shape, dtype=None, **unused_options):
         if name != 'ovL':
@@ -2664,7 +2687,8 @@ class _LocalLovH5Output:
         self.dataset = self.h5file.create_dataset(
             'lov', shape=shape, dtype=dtype, chunks=None, compression=None
         )
-        return self.dataset
+        self.writer = _TimedH5DatasetWriter(self.dataset)
+        return self.writer
 
 
 class _PyscfLibScratchProxy:
@@ -2740,7 +2764,11 @@ def _build_local_Lov_h5_impl(
     path,
     max_memory,
 ):
-    """Run the direct producer for an already prepared local domain."""
+    """Write fitted local ``Lov`` directly to uncompressed HDF5 scratch.
+
+    The producer streams raw three-center blocks and never returns a complete
+    in-memory ``Lov`` array.  ``path`` is owned by the fragment workspace.
+    """
     from pyscf.mp.dfmp2 import _init_mp_df_eris_direct
 
     path = os.fspath(path)
@@ -2773,6 +2801,9 @@ def _build_local_Lov_h5_impl(
         dir=destination_dir,
     )
     os.close(fd)
+    hdf5_bytes_written = 0
+    hdf5_write_seconds = 0.0
+    lov_disk_mib = 0.0
     try:
         with h5py.File(staging_path, 'w') as h5file:
             if nocc == 0 or nvir == 0:
@@ -2803,8 +2834,16 @@ def _build_local_Lov_h5_impl(
                         "PySCF did not create the fitted Lov dataset"
                     )
                 lov = output.dataset
+                hdf5_bytes_written = output.writer.bytes_written
+                hdf5_write_seconds = output.writer.write_seconds
             naux = int(lov.shape[1])
             dtype = str(lov.dtype)
+            flush_start = time.perf_counter()
+            h5file.flush()
+            hdf5_write_seconds += time.perf_counter() - flush_start
+            lov_disk_mib = (
+                float(lov.id.get_storage_size()) / 1024.0**2
+            )
         os.replace(staging_path, path)
     except BaseException:
         try:
@@ -2819,6 +2858,9 @@ def _build_local_Lov_h5_impl(
         nocc=int(nocc),
         nvir=int(nvir),
         dtype=dtype,
+        lov_disk_mib=lov_disk_mib,
+        hdf5_bytes_written=hdf5_bytes_written,
+        hdf5_write_seconds=hdf5_write_seconds,
     )
 
 
@@ -2829,7 +2871,12 @@ def build_local_Lov_h5(
     atmlst,
     path: str | os.PathLike,
 ) -> LocalLovH5Info:
-    """Write fitted local Lov directly to a contiguous HDF5 dataset."""
+    """Write local ``Lov`` directly to a contiguous HDF5 dataset.
+
+    This helper has no in-memory backend: the fitted pair-major factors are
+    written to ``/lov`` at ``path`` and represented only by metadata on
+    return.
+    """
     atmlst = numpy.asarray(atmlst, dtype=numpy.int32).ravel()
     ao_idx = dlno_util.ao_index_by_atom(mf.mol, atmlst)
     mo_coeff_local = numpy.asarray(
@@ -2890,6 +2937,31 @@ def _local_lov_h5_pair_tile_size(
 def _local_lov_h5_reverse_dtype(low_dtype, lov_dtype, lov_bar_dtype):
     """Return the widest dtype resident in each three-tile reverse step."""
     return numpy.result_type(low_dtype, lov_dtype, lov_bar_dtype)
+
+
+def _local_lov_h5_io_profile():
+    return {
+        'hdf5_bytes_read': 0,
+        'hdf5_bytes_written': 0,
+        'hdf5_read_seconds': 0.0,
+        'hdf5_write_seconds': 0.0,
+    }
+
+
+def _local_lov_h5_timed_read(dataset, key, profile):
+    start = time.perf_counter()
+    value = dataset[key]
+    profile['hdf5_read_seconds'] += time.perf_counter() - start
+    profile['hdf5_bytes_read'] += int(numpy.asarray(value).nbytes)
+    return value
+
+
+def _local_lov_h5_timed_write(dataset, key, value, profile):
+    value = numpy.asarray(value)
+    start = time.perf_counter()
+    dataset[key] = value
+    profile['hdf5_write_seconds'] += time.perf_counter() - start
+    profile['hdf5_bytes_written'] += int(value.nbytes)
 
 
 def _local_lov_h5_z_chunks(naux, npair, dtype, pair_tile_size):
@@ -3025,7 +3097,11 @@ def _local_direct_nr_e2_h5_bwd(
     orbs_slice,
     h5_path: str,
 ):
-    """Consume pair-major Lov/Lov-bar datasets without materializing z."""
+    """Reverse pair-major ``Lov``/``Lov_bar`` without materializing ``z``.
+
+    The auxiliary-major ``/z`` workspace is formed in pair tiles and consumed
+    in bounded auxiliary ranges by the coefficient and coordinate pullbacks.
+    """
     if mol.exp is not None or mol.ctr_coeff is not None or mol.r0 is not None:
         raise NotImplementedError(
             'Integral-direct local Lov currently supports coordinate and '
@@ -3052,6 +3128,9 @@ def _local_direct_nr_e2_h5_bwd(
         raise ValueError('Invalid second-orbital slice for direct local AO2MO')
     naux = int(auxmol.nao)
     npair = (k1 - k0) * (l1 - l0)
+    profile_start = resource_profile.start()
+    io_profile = _local_lov_h5_io_profile()
+    h5_path = os.fspath(h5_path)
 
     def metric_cholesky(auxmol_):
         return jsp_linalg.cholesky(
@@ -3059,7 +3138,7 @@ def _local_direct_nr_e2_h5_bwd(
             lower=True,
         )
 
-    with h5py.File(os.fspath(h5_path), 'r+') as h5file:
+    with h5py.File(h5_path, 'r+') as h5file:
         if 'lov' not in h5file or 'lov_bar' not in h5file:
             raise ValueError('HDF5 reverse requires /lov and /lov_bar datasets')
         lov = h5file['lov']
@@ -3113,10 +3192,15 @@ def _local_direct_nr_e2_h5_bwd(
         pair_tile_size = _local_lov_h5_pair_tile_size(
             naux, npair, z_dtype
         )
+        lov_disk_mib = float(lov.id.get_storage_size()) / 1024.0**2
+        lov_bar_disk_mib = (
+            float(lov_bar.id.get_storage_size()) / 1024.0**2
+        )
         z_created = False
         try:
             if 'z' in h5file:
                 del h5file['z']
+            write_start = time.perf_counter()
             z = h5file.create_dataset(
                 'z',
                 shape=(naux, npair),
@@ -3126,6 +3210,9 @@ def _local_direct_nr_e2_h5_bwd(
                 ),
                 compression=None,
             )
+            io_profile['hdf5_write_seconds'] += (
+                time.perf_counter() - write_start
+            )
             z_created = True
             low_bar = numpy.zeros(
                 (naux, naux),
@@ -3133,8 +3220,16 @@ def _local_direct_nr_e2_h5_bwd(
             )
             for pair0 in range(0, npair, pair_tile_size):
                 pair1 = min(pair0 + pair_tile_size, npair)
-                lov_tile = numpy.asarray(lov[pair0:pair1, :])
-                lov_bar_tile = numpy.asarray(lov_bar[pair0:pair1, :])
+                lov_tile = numpy.asarray(_local_lov_h5_timed_read(
+                    lov,
+                    (slice(pair0, pair1), slice(None)),
+                    io_profile,
+                ))
+                lov_bar_tile = numpy.asarray(_local_lov_h5_timed_read(
+                    lov_bar,
+                    (slice(pair0, pair1), slice(None)),
+                    io_profile,
+                ))
                 z_tile = scipy_linalg.solve_triangular(
                     low.T,
                     lov_bar_tile.T,
@@ -3142,11 +3237,24 @@ def _local_direct_nr_e2_h5_bwd(
                     check_finite=False,
                 )
                 low_bar -= z_tile @ lov_tile
-                z[:, pair0:pair1] = z_tile
+                _local_lov_h5_timed_write(
+                    z,
+                    (slice(None), slice(pair0, pair1)),
+                    z_tile,
+                    io_profile,
+                )
+            flush_start = time.perf_counter()
             h5file.flush()
+            io_profile['hdf5_write_seconds'] += (
+                time.perf_counter() - flush_start
+            )
 
             def read_z_aux_block(p0, p1):
-                return z[p0:p1, :]
+                return _local_lov_h5_timed_read(
+                    z,
+                    (slice(p0, p1), slice(None)),
+                    io_profile,
+                )
 
             mo_coeff_bar = _local_direct_mo_coeff_vjp(
                 mol,
@@ -3172,6 +3280,19 @@ def _local_direct_nr_e2_h5_bwd(
             _cderi_vjp._zero_strict_upper_inplace(low_bar)
             aux_metric_bar = metric_pullback(np.asarray(low_bar))[0]
             auxmol_bar = _tree_add(auxmol_bar, aux_metric_bar)
+            resource_profile.finish(
+                'lno.local_direct_nr_e2_h5_bwd',
+                profile_start,
+                lov_h5_path_basename=os.path.basename(h5_path),
+                lov_disk_mib=lov_disk_mib,
+                lov_bar_disk_mib=lov_bar_disk_mib,
+                z_disk_mib=(
+                    float(z.id.get_storage_size()) / 1024.0**2
+                ),
+                pair_tile_size=pair_tile_size,
+                z_aux_block_max_rows=z_aux_block_max_rows,
+                **io_profile,
+            )
             return mol_bar, auxmol_bar, mo_coeff_bar
         except BaseException:
             if z_created and 'z' in h5file:

@@ -307,7 +307,19 @@ def test_strong_domain_density_routes_directly_to_predictable_h5_file(
     assert finish[3]["lov_shape"] == (2, 2, 3)
     assert finish[3]["block_nvir"] == 2
     assert finish[3]["block_mode"] == "manual_width"
-    assert finish[3]["workspace_target_mb"] == 225.0
+    assert finish[3]["block_count"] == 2
+    assert finish[3]["workspace_target_mib"] == 225.0
+    assert finish[3]["lov_h5_path_basename"] == "local_lov.h5"
+    assert finish[3]["lov_disk_mib"] == 12 * 8 / 1024.0**2
+    assert finish[3]["lov_bar_disk_mib"] == 0.0
+    assert finish[3]["z_disk_mib"] == 0.0
+    for key in (
+        "hdf5_bytes_read",
+        "hdf5_bytes_written",
+        "hdf5_read_seconds",
+        "hdf5_write_seconds",
+    ):
+        assert key in finish[3]
 
 
 @pytest.mark.parametrize("fail_selection", [False, True])
@@ -664,20 +676,31 @@ def test_h5_primal_profiles_exact_io_and_kernel_timing(monkeypatch, tmp_path):
     assert phase == "iao_lis.strong_domain_mp2_density_h5_primal"
     assert before is token
     expected_details = {
-        "lov_file_bytes": path.stat().st_size,
+        "lov_h5_path_basename": path.name,
+        "lov_disk_mib": lov.size * lov.dtype.itemsize / 1024.0**2,
+        "lov_bar_disk_mib": 0.0,
+        "z_disk_mib": 0.0,
         "naux": naux,
         "nocc": nocc,
         "nvir": nvir,
         "ntarget": ntarget,
         "block_nvir": block_nvir,
-        "nblock": nblock,
-        "bytes_read": nocc * naux * nvir * (nblock + 1) * lov.dtype.itemsize,
-        "bytes_written": 0,
+        "block_count": nblock,
+        "hdf5_bytes_read": (
+            nocc * naux * nvir * (nblock + 1) * lov.dtype.itemsize
+        ),
+        "hdf5_bytes_written": 0,
     }
     assert {key: details[key] for key in expected_details} == expected_details
-    assert set(details) == {*expected_details, "hdf5_read_s", "mp2_kernel_s"}
-    assert details["hdf5_read_s"] >= 0.0
-    assert details["mp2_kernel_s"] >= 0.0
+    assert set(details) == {
+        *expected_details,
+        "hdf5_read_seconds",
+        "hdf5_write_seconds",
+        "mp2_kernel_seconds",
+    }
+    assert details["hdf5_read_seconds"] >= 0.0
+    assert details["hdf5_write_seconds"] == 0.0
+    assert details["mp2_kernel_seconds"] >= 0.0
 
 
 def test_h5_primal_read_timing_excludes_host_transpose_and_assignment(
@@ -738,7 +761,7 @@ def test_h5_primal_read_timing_excludes_host_transpose_and_assignment(
 
     nblock = (nvir + block_nvir - 1) // block_nvir
     nreads = 2 * nocc * nblock
-    assert finished[0]["hdf5_read_s"] == 2.0 * nreads
+    assert finished[0]["hdf5_read_seconds"] == 2.0 * nreads
 
 
 def test_h5_primal_times_hermitization_and_synchronizes_return(
@@ -1027,7 +1050,7 @@ def test_h5_custom_density_parent_coordinate_chain_and_one_output_bar(
 
 
 def test_h5_density_lov_backward_matches_dense_gradient_with_tail_block(
-    tmp_path,
+    tmp_path, monkeypatch,
 ):
     rng = np.random.default_rng(1404)
     naux, nocc, nvir, ntarget, block_nvir = 5, 3, 5, 2, 2
@@ -1043,6 +1066,18 @@ def test_h5_density_lov_backward_matches_dense_gradient_with_tail_block(
     virtual_weight = _general_weight(rng, nvir)
     path = tmp_path / "lov-backward.h5"
     _write_pair_major_lov(path, lov)
+    profile_token = object()
+    profile_events = []
+    monkeypatch.setattr(
+        iao_lis.resource_profile, "start", lambda: profile_token
+    )
+    monkeypatch.setattr(
+        iao_lis.resource_profile,
+        "finish",
+        lambda phase, before, **details: profile_events.append(
+            (phase, before, details)
+        ),
+    )
 
     def reference_objective(*args):
         return _weighted_density_objective(
@@ -1083,6 +1118,20 @@ def test_h5_density_lov_backward_matches_dense_gradient_with_tail_block(
         np.testing.assert_allclose(
             actual, expected, rtol=3e-10, atol=3e-11
         )
+    assert len(profile_events) == 1
+    phase, before, details = profile_events[0]
+    assert phase == "iao_lis.strong_domain_mp2_density_h5_lov_bwd"
+    assert before is profile_token
+    assert details["lov_h5_path_basename"] == path.name
+    assert details["lov_disk_mib"] > 0.0
+    assert details["lov_bar_disk_mib"] > 0.0
+    assert details["z_disk_mib"] == 0.0
+    assert details["block_nvir"] == block_nvir
+    assert details["block_count"] == 3
+    assert details["hdf5_bytes_read"] > 0
+    assert details["hdf5_bytes_written"] > 0
+    assert details["hdf5_read_seconds"] >= 0.0
+    assert details["hdf5_write_seconds"] >= 0.0
 
 
 def test_h5_density_lov_backward_uses_only_rows_and_virtual_blocks(

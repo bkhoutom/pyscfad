@@ -504,6 +504,12 @@ class IAOFragmentMP2Thresholds:
     ``pair_energy`` is applied to Nagy's OS-based pair-increment convention
     (the ``-8`` prefactor of their Eq. (7)), not to the conventional global
     SCS-MP2 opposite-spin component.
+
+    The IAO-LIS MP2-density path always stores local ``Lov`` in node-local
+    HDF5 scratch.  Its virtual block width is automatic by default.
+    ``mp2_block_nvir`` is an advanced exact-width override and
+    ``mp2_block_memory_mb`` is an optional workspace-target override; neither
+    setting is a hard process-memory cap.
     """
 
     bp_occ: float = 0.985

@@ -239,13 +239,12 @@ def test_build_local_lov_h5_matches_integral_direct_pair_major(tmp_path):
     reference_array = numpy.asarray(reference)
     naux = reference_array.shape[0]
     nvir = reference_array.shape[2]
-    assert info == lno_base.LocalLovH5Info(
-        path=str(path),
-        naux=naux,
-        nocc=nocc,
-        nvir=nvir,
-        dtype=str(reference_array.dtype),
+    assert (info.path, info.naux, info.nocc, info.nvir, info.dtype) == (
+        str(path), naux, nocc, nvir, str(reference_array.dtype)
     )
+    assert info.hdf5_bytes_written == reference_array.nbytes
+    assert info.hdf5_write_seconds >= 0.0
+    assert info.lov_disk_mib == reference_array.nbytes / 1024.0**2
     with h5py.File(path, "r") as h5file:
         assert set(h5file) == {"lov"}
         assert h5file["lov"].shape == (nocc * nvir, naux)
@@ -608,7 +607,9 @@ def test_local_direct_mo_coeff_vjp_oversized_shell_fallback_is_disjoint(
     )
 
 
-def test_local_direct_nr_e2_h5_bwd_matches_full_general_cotangent(tmp_path):
+def test_local_direct_nr_e2_h5_bwd_matches_full_general_cotangent(
+    tmp_path, monkeypatch
+):
     mol, fake_mol, auxmol, coeff, orbs_slice, lov = _direct_local_problem()
     lov = numpy.asarray(lov)
     rng = numpy.random.default_rng(184)
@@ -623,6 +624,18 @@ def test_local_direct_nr_e2_h5_bwd_matches_full_general_cotangent(tmp_path):
     with h5py.File(path, 'w') as h5file:
         h5file.create_dataset('lov', data=lov.T)
         h5file.create_dataset('lov_bar', data=lov_bar.T)
+    profile_token = object()
+    profile_events = []
+    monkeypatch.setattr(
+        lno_base.resource_profile, 'start', lambda: profile_token
+    )
+    monkeypatch.setattr(
+        lno_base.resource_profile,
+        'finish',
+        lambda phase, before, **details: profile_events.append(
+            (phase, before, details)
+        ),
+    )
 
     result = lno_base._local_direct_nr_e2_h5_bwd(
         fake_mol, auxmol, coeff, orbs_slice, path
@@ -648,6 +661,18 @@ def test_local_direct_nr_e2_h5_bwd_matches_full_general_cotangent(tmp_path):
         numpy.testing.assert_allclose(
             h5file['z'][:], z_reference, atol=2e-11, rtol=2e-11
         )
+    assert len(profile_events) == 1
+    phase, before, details = profile_events[0]
+    assert phase == 'lno.local_direct_nr_e2_h5_bwd'
+    assert before is profile_token
+    assert details['lov_h5_path_basename'] == path.name
+    assert details['lov_disk_mib'] > 0.0
+    assert details['lov_bar_disk_mib'] > 0.0
+    assert details['z_disk_mib'] > 0.0
+    assert details['hdf5_bytes_read'] > 0
+    assert details['hdf5_bytes_written'] > 0
+    assert details['hdf5_read_seconds'] >= 0.0
+    assert details['hdf5_write_seconds'] >= 0.0
 
 
 def test_local_direct_nr_e2_h5_bwd_uses_bounded_dataset_slices(

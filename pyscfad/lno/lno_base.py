@@ -2655,8 +2655,9 @@ def _local_direct_nr_e2_impl(mol, auxmol, mo_coeff, max_memory, orbs_slice):
 class _TimedH5DatasetWriter:
     """Transparent dataset writer that accounts only actual HDF5 writes."""
 
-    def __init__(self, dataset):
+    def __init__(self, dataset, enabled):
         self.dataset = dataset
+        self.enabled = bool(enabled)
         self.bytes_written = 0
         self.write_seconds = 0.0
 
@@ -2664,6 +2665,9 @@ class _TimedH5DatasetWriter:
         return getattr(self.dataset, name)
 
     def __setitem__(self, key, value):
+        if not self.enabled:
+            self.dataset[key] = value
+            return
         value = numpy.asarray(value)
         start = time.perf_counter()
         self.dataset[key] = value
@@ -2674,8 +2678,9 @@ class _TimedH5DatasetWriter:
 class _LocalLovH5Output:
     """Map PySCF's out-of-core ``ovL`` request onto contiguous ``/lov``."""
 
-    def __init__(self, h5file):
+    def __init__(self, h5file, profile_io):
         self.h5file = h5file
+        self.profile_io = bool(profile_io)
         self.dataset = None
         self.writer = None
 
@@ -2687,7 +2692,9 @@ class _LocalLovH5Output:
         self.dataset = self.h5file.create_dataset(
             'lov', shape=shape, dtype=dtype, chunks=None, compression=None
         )
-        self.writer = _TimedH5DatasetWriter(self.dataset)
+        self.writer = _TimedH5DatasetWriter(
+            self.dataset, self.profile_io
+        )
         return self.writer
 
 
@@ -2763,6 +2770,7 @@ def _build_local_Lov_h5_impl(
     orbs_slice,
     path,
     max_memory,
+    profile_io=None,
 ):
     """Write fitted local ``Lov`` directly to uncompressed HDF5 scratch.
 
@@ -2771,6 +2779,9 @@ def _build_local_Lov_h5_impl(
     """
     from pyscf.mp.dfmp2 import _init_mp_df_eris_direct
 
+    if profile_io is None:
+        profile_io = resource_profile.enabled()
+    profile_io = bool(profile_io)
     path = os.fspath(path)
     mo_coeff = numpy.asarray(jax.device_get(mo_coeff), order='F')
     k0, k1, l0, l1 = map(int, orbs_slice)
@@ -2815,7 +2826,7 @@ def _build_local_Lov_h5_impl(
                     compression=None,
                 )
             else:
-                output = _LocalLovH5Output(h5file)
+                output = _LocalLovH5Output(h5file, profile_io)
                 holder = SimpleNamespace(mol=fake_mol, auxmol=auxmol)
                 effective_memory = _local_direct_h5_effective_max_memory(
                     max_memory
@@ -2838,12 +2849,13 @@ def _build_local_Lov_h5_impl(
                 hdf5_write_seconds = output.writer.write_seconds
             naux = int(lov.shape[1])
             dtype = str(lov.dtype)
-            flush_start = time.perf_counter()
-            h5file.flush()
-            hdf5_write_seconds += time.perf_counter() - flush_start
-            lov_disk_mib = (
-                float(lov.id.get_storage_size()) / 1024.0**2
-            )
+            if profile_io:
+                flush_start = time.perf_counter()
+                h5file.flush()
+                hdf5_write_seconds += time.perf_counter() - flush_start
+                lov_disk_mib = (
+                    float(lov.id.get_storage_size()) / 1024.0**2
+                )
         os.replace(staging_path, path)
     except BaseException:
         try:
@@ -2949,6 +2961,8 @@ def _local_lov_h5_io_profile():
 
 
 def _local_lov_h5_timed_read(dataset, key, profile):
+    if profile is None:
+        return dataset[key]
     start = time.perf_counter()
     value = dataset[key]
     profile['hdf5_read_seconds'] += time.perf_counter() - start
@@ -2957,11 +2971,45 @@ def _local_lov_h5_timed_read(dataset, key, profile):
 
 
 def _local_lov_h5_timed_write(dataset, key, value, profile):
+    if profile is None:
+        dataset[key] = value
+        return
     value = numpy.asarray(value)
     start = time.perf_counter()
     dataset[key] = value
     profile['hdf5_write_seconds'] += time.perf_counter() - start
     profile['hdf5_bytes_written'] += int(value.nbytes)
+
+
+@contextmanager
+def _local_lov_h5_reverse_profile_scope(
+    profile_start, h5_path, io_profile
+):
+    details = None
+    if profile_start is not None:
+        details = {
+            'status': 'failed',
+            'fragment_index': -1,
+            'lov_h5_path_basename': os.path.basename(h5_path),
+            'lov_disk_mib': 0.0,
+            'lov_bar_disk_mib': 0.0,
+            'z_disk_mib': 0.0,
+        }
+    try:
+        yield details
+    except BaseException:
+        raise
+    else:
+        if details is not None:
+            details['status'] = 'ok'
+    finally:
+        if details is not None:
+            resource_profile.finish(
+                'lno.local_direct_nr_e2_h5_bwd',
+                profile_start,
+                **details,
+                **io_profile,
+            )
 
 
 def _local_lov_h5_z_chunks(naux, npair, dtype, pair_tile_size):
@@ -3129,7 +3177,9 @@ def _local_direct_nr_e2_h5_bwd(
     naux = int(auxmol.nao)
     npair = (k1 - k0) * (l1 - l0)
     profile_start = resource_profile.start()
-    io_profile = _local_lov_h5_io_profile()
+    io_profile = (
+        _local_lov_h5_io_profile() if profile_start is not None else None
+    )
     h5_path = os.fspath(h5_path)
 
     def metric_cholesky(auxmol_):
@@ -3138,7 +3188,13 @@ def _local_direct_nr_e2_h5_bwd(
             lower=True,
         )
 
-    with h5py.File(h5_path, 'r+') as h5file:
+    with _local_lov_h5_reverse_profile_scope(
+        profile_start, h5_path, io_profile
+    ) as profile_details, h5py.File(h5_path, 'r+') as h5file:
+        if profile_details is not None:
+            profile_details['fragment_index'] = int(
+                h5file.attrs.get('pyscfad_fragment_index', -1)
+            )
         if 'lov' not in h5file or 'lov_bar' not in h5file:
             raise ValueError('HDF5 reverse requires /lov and /lov_bar datasets')
         lov = h5file['lov']
@@ -3192,15 +3248,24 @@ def _local_direct_nr_e2_h5_bwd(
         pair_tile_size = _local_lov_h5_pair_tile_size(
             naux, npair, z_dtype
         )
-        lov_disk_mib = float(lov.id.get_storage_size()) / 1024.0**2
-        lov_bar_disk_mib = (
-            float(lov_bar.id.get_storage_size()) / 1024.0**2
-        )
+        if profile_details is not None:
+            profile_details.update(
+                lov_disk_mib=(
+                    float(lov.id.get_storage_size()) / 1024.0**2
+                ),
+                lov_bar_disk_mib=(
+                    float(lov_bar.id.get_storage_size()) / 1024.0**2
+                ),
+                pair_tile_size=pair_tile_size,
+                z_aux_block_max_rows=z_aux_block_max_rows,
+            )
         z_created = False
         try:
             if 'z' in h5file:
                 del h5file['z']
-            write_start = time.perf_counter()
+            write_start = (
+                time.perf_counter() if io_profile is not None else None
+            )
             z = h5file.create_dataset(
                 'z',
                 shape=(naux, npair),
@@ -3210,9 +3275,10 @@ def _local_direct_nr_e2_h5_bwd(
                 ),
                 compression=None,
             )
-            io_profile['hdf5_write_seconds'] += (
-                time.perf_counter() - write_start
-            )
+            if io_profile is not None:
+                io_profile['hdf5_write_seconds'] += (
+                    time.perf_counter() - write_start
+                )
             z_created = True
             low_bar = numpy.zeros(
                 (naux, naux),
@@ -3243,11 +3309,14 @@ def _local_direct_nr_e2_h5_bwd(
                     z_tile,
                     io_profile,
                 )
-            flush_start = time.perf_counter()
-            h5file.flush()
-            io_profile['hdf5_write_seconds'] += (
-                time.perf_counter() - flush_start
+            flush_start = (
+                time.perf_counter() if io_profile is not None else None
             )
+            h5file.flush()
+            if io_profile is not None:
+                io_profile['hdf5_write_seconds'] += (
+                    time.perf_counter() - flush_start
+                )
 
             def read_z_aux_block(p0, p1):
                 return _local_lov_h5_timed_read(
@@ -3280,19 +3349,10 @@ def _local_direct_nr_e2_h5_bwd(
             _cderi_vjp._zero_strict_upper_inplace(low_bar)
             aux_metric_bar = metric_pullback(np.asarray(low_bar))[0]
             auxmol_bar = _tree_add(auxmol_bar, aux_metric_bar)
-            resource_profile.finish(
-                'lno.local_direct_nr_e2_h5_bwd',
-                profile_start,
-                lov_h5_path_basename=os.path.basename(h5_path),
-                lov_disk_mib=lov_disk_mib,
-                lov_bar_disk_mib=lov_bar_disk_mib,
-                z_disk_mib=(
+            if profile_details is not None:
+                profile_details['z_disk_mib'] = (
                     float(z.id.get_storage_size()) / 1024.0**2
-                ),
-                pair_tile_size=pair_tile_size,
-                z_aux_block_max_rows=z_aux_block_max_rows,
-                **io_profile,
-            )
+                )
             return mol_bar, auxmol_bar, mo_coeff_bar
         except BaseException:
             if z_created and 'z' in h5file:

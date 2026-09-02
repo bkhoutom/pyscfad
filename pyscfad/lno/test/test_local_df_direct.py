@@ -222,7 +222,9 @@ def test_integral_direct_local_lov_general_cotangent_matches_coordinate_fd():
     )
 
 
-def test_build_local_lov_h5_matches_integral_direct_pair_major(tmp_path):
+def test_build_local_lov_h5_matches_integral_direct_pair_major(
+    tmp_path, monkeypatch
+):
     mol = _water_mol()
     atmlst = numpy.asarray([0, 1], dtype=numpy.int32)
     coeff = _local_coeff(mol, atmlst)
@@ -231,6 +233,7 @@ def test_build_local_lov_h5_matches_integral_direct_pair_major(tmp_path):
         _df_holder(mol), coeff, nocc, atmlst, integral_direct=True
     )
     path = tmp_path / "local-lov.h5"
+    monkeypatch.setattr(lno_base.resource_profile, "enabled", lambda: True)
 
     info = lno_base.build_local_Lov_h5(
         _df_holder(mol), coeff, nocc, atmlst, path
@@ -257,6 +260,29 @@ def test_build_local_lov_h5_matches_integral_direct_pair_major(tmp_path):
             rtol=2e-11,
             atol=2e-12,
         )
+
+
+def test_build_local_lov_h5_skips_diagnostics_when_profile_disabled(
+    tmp_path, monkeypatch
+):
+    mol = _water_mol()
+    atmlst = numpy.asarray([0, 1], dtype=numpy.int32)
+    coeff = _local_coeff(mol, atmlst)
+    monkeypatch.setattr(lno_base.resource_profile, "enabled", lambda: False)
+    class FailTime:
+        @staticmethod
+        def perf_counter():
+            raise AssertionError("disabled profiling consulted the clock")
+
+    monkeypatch.setattr(lno_base, "time", FailTime)
+
+    info = lno_base.build_local_Lov_h5(
+        _df_holder(mol), coeff, 2, atmlst, tmp_path / "disabled.h5"
+    )
+
+    assert info.hdf5_bytes_written == 0
+    assert info.hdf5_write_seconds == 0.0
+    assert info.lov_disk_mib == 0.0
 
 
 def test_build_local_lov_h5_supports_zero_occupied_orbitals(tmp_path):
@@ -624,6 +650,7 @@ def test_local_direct_nr_e2_h5_bwd_matches_full_general_cotangent(
     with h5py.File(path, 'w') as h5file:
         h5file.create_dataset('lov', data=lov.T)
         h5file.create_dataset('lov_bar', data=lov_bar.T)
+        h5file.attrs['pyscfad_fragment_index'] = 19
     profile_token = object()
     profile_events = []
     monkeypatch.setattr(
@@ -665,6 +692,8 @@ def test_local_direct_nr_e2_h5_bwd_matches_full_general_cotangent(
     phase, before, details = profile_events[0]
     assert phase == 'lno.local_direct_nr_e2_h5_bwd'
     assert before is profile_token
+    assert details['status'] == 'ok'
+    assert details['fragment_index'] == 19
     assert details['lov_h5_path_basename'] == path.name
     assert details['lov_disk_mib'] > 0.0
     assert details['lov_bar_disk_mib'] > 0.0
@@ -797,6 +826,7 @@ def test_local_direct_nr_e2_h5_bwd_recreates_z_and_cleans_failed_z(
     with h5py.File(path, 'w') as h5file:
         h5file.create_dataset('lov', data=lov.T)
         h5file.create_dataset('lov_bar', data=first_bar.T)
+        h5file.attrs['pyscfad_fragment_index'] = 29
 
     lno_base._local_direct_nr_e2_h5_bwd(
         fake_mol, auxmol, coeff, orbs_slice, path
@@ -816,12 +846,29 @@ def test_local_direct_nr_e2_h5_bwd_recreates_z_and_cleans_failed_z(
     monkeypatch.setattr(
         lno_base, '_local_direct_mo_coeff_vjp', fail_after_z
     )
+    token = object()
+    events = []
+    monkeypatch.setattr(lno_base.resource_profile, 'start', lambda: token)
+    monkeypatch.setattr(
+        lno_base.resource_profile,
+        'finish',
+        lambda phase, before, **details: events.append(
+            (phase, before, details)
+        ),
+    )
     with pytest.raises(RuntimeError, match='downstream failure'):
         lno_base._local_direct_nr_e2_h5_bwd(
             fake_mol, auxmol, coeff, orbs_slice, path
         )
     with h5py.File(path, 'r') as h5file:
         assert set(h5file) == {'lov', 'lov_bar'}
+    assert len(events) == 1
+    phase, before, details = events[0]
+    assert phase == 'lno.local_direct_nr_e2_h5_bwd'
+    assert before is token
+    assert details['status'] == 'failed'
+    assert details['fragment_index'] == 29
+    assert details['hdf5_bytes_read'] > 0
 
 
 def test_local_direct_nr_e2_h5_bwd_supports_empty_pair_dimension(tmp_path):

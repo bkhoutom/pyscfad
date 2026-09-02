@@ -246,6 +246,8 @@ def test_strong_domain_density_routes_directly_to_predictable_h5_file(
 
     def fake_h5_density(*args):
         events.append(("h5-density", args))
+        with h5py.File(args[7], "w") as h5file:
+            h5file.create_dataset("lov", shape=(6, 2), dtype=np.float64)
         return expected_density
 
     monkeypatch.setattr(iao_lis.resource_profile, "start", fake_start)
@@ -304,6 +306,7 @@ def test_strong_domain_density_routes_directly_to_predictable_h5_file(
     finish = next(event for event in events if event[0] == "finish")
     assert finish[1] == "iao_lis.strong_domain_mp2_density"
     assert finish[2] is profile_token
+    assert finish[3]["status"] == "ok"
     assert finish[3]["lov_shape"] == (2, 2, 3)
     assert finish[3]["block_nvir"] == 2
     assert finish[3]["block_mode"] == "manual_width"
@@ -320,6 +323,8 @@ def test_strong_domain_density_routes_directly_to_predictable_h5_file(
         "hdf5_write_seconds",
     ):
         assert key in finish[3]
+    with h5py.File(tmp_path / "local_lov.h5", "r") as h5file:
+        assert h5file.attrs["pyscfad_fragment_index"] == 0
 
 
 @pytest.mark.parametrize("fail_selection", [False, True])
@@ -676,6 +681,7 @@ def test_h5_primal_profiles_exact_io_and_kernel_timing(monkeypatch, tmp_path):
     assert phase == "iao_lis.strong_domain_mp2_density_h5_primal"
     assert before is token
     expected_details = {
+        "status": "ok",
         "lov_h5_path_basename": path.name,
         "lov_disk_mib": lov.size * lov.dtype.itemsize / 1024.0**2,
         "lov_bar_disk_mib": 0.0,
@@ -701,6 +707,37 @@ def test_h5_primal_profiles_exact_io_and_kernel_timing(monkeypatch, tmp_path):
     assert details["hdf5_read_seconds"] >= 0.0
     assert details["hdf5_write_seconds"] == 0.0
     assert details["mp2_kernel_seconds"] >= 0.0
+
+
+def test_h5_access_helpers_skip_clock_when_profile_disabled(
+    monkeypatch, tmp_path
+):
+    path = tmp_path / "disabled-profile-helpers.h5"
+    class FailTime:
+        @staticmethod
+        def perf_counter():
+            raise AssertionError("disabled profiling consulted the clock")
+
+    with h5py.File(path, "w") as h5file:
+        dataset = h5file.create_dataset("data", data=np.arange(6).reshape(2, 3))
+        monkeypatch.setattr(iao_lis, "time", FailTime)
+        monkeypatch.setattr(iao_lis.lno_base, "time", FailTime)
+        np.testing.assert_array_equal(
+            iao_lis._timed_h5_read(dataset, (slice(0, 1), slice(None)), None),
+            [[0, 1, 2]],
+        )
+        iao_lis._timed_h5_write(
+            dataset, (slice(0, 1), slice(None)), [[3, 4, 5]], None
+        )
+        np.testing.assert_array_equal(
+            iao_lis.lno_base._local_lov_h5_timed_read(
+                dataset, (slice(0, 1), slice(None)), None
+            ),
+            [[3, 4, 5]],
+        )
+        iao_lis.lno_base._local_lov_h5_timed_write(
+            dataset, (slice(1, 2), slice(None)), [[6, 7, 8]], None
+        )
 
 
 def test_h5_primal_read_timing_excludes_host_transpose_and_assignment(
@@ -1066,6 +1103,8 @@ def test_h5_density_lov_backward_matches_dense_gradient_with_tail_block(
     virtual_weight = _general_weight(rng, nvir)
     path = tmp_path / "lov-backward.h5"
     _write_pair_major_lov(path, lov)
+    with h5py.File(path, "r+") as h5file:
+        h5file.attrs["pyscfad_fragment_index"] = 17
     profile_token = object()
     profile_events = []
     monkeypatch.setattr(
@@ -1122,6 +1161,8 @@ def test_h5_density_lov_backward_matches_dense_gradient_with_tail_block(
     phase, before, details = profile_events[0]
     assert phase == "iao_lis.strong_domain_mp2_density_h5_lov_bwd"
     assert before is profile_token
+    assert details["status"] == "ok"
+    assert details["fragment_index"] == 17
     assert details["lov_h5_path_basename"] == path.name
     assert details["lov_disk_mib"] > 0.0
     assert details["lov_bar_disk_mib"] > 0.0
@@ -1132,6 +1173,48 @@ def test_h5_density_lov_backward_matches_dense_gradient_with_tail_block(
     assert details["hdf5_bytes_written"] > 0
     assert details["hdf5_read_seconds"] >= 0.0
     assert details["hdf5_write_seconds"] >= 0.0
+
+
+def test_h5_density_reverse_profiles_failure_after_cleanup(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "failed-profile-density-reverse.h5"
+    with h5py.File(path, "w") as h5file:
+        h5file.create_dataset("lov", shape=(2, 3), dtype=np.float64)
+        h5file.attrs["pyscfad_fragment_index"] = 23
+    token = object()
+    events = []
+    monkeypatch.setattr(iao_lis.resource_profile, "start", lambda: token)
+    monkeypatch.setattr(
+        iao_lis.resource_profile,
+        "finish",
+        lambda phase, before, **details: events.append(
+            (phase, before, details)
+        ),
+    )
+
+    with pytest.raises(ValueError, match="must have shape"):
+        iao_lis._strong_domain_mp2_density_h5_lov_bwd(
+            str(path),
+            jnp.asarray([-1.0]),
+            jnp.asarray([0.2, 0.4]),
+            jnp.ones((1, 1)),
+            iao_lis.IAOMP2Density(jnp.ones((1, 1)), jnp.eye(2)),
+            naux=4,
+            nocc=1,
+            nvir=2,
+            block_nvir=1,
+        )
+
+    assert len(events) == 1
+    phase, before, details = events[0]
+    assert phase == "iao_lis.strong_domain_mp2_density_h5_lov_bwd"
+    assert before is token
+    assert details["status"] == "failed"
+    assert details["fragment_index"] == 23
+    assert details["hdf5_bytes_read"] == 0
+    with h5py.File(path, "r") as h5file:
+        assert set(h5file) == {"lov"}
 
 
 def test_h5_density_lov_backward_uses_only_rows_and_virtual_blocks(

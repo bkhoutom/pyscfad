@@ -386,6 +386,32 @@ def _density_from_target_amplitude_block(a_block, b_block):
     return IAOMP2Density(dmoo, dmvv)
 
 
+@jax.jit
+def _density_from_target_amplitude_block_real_pullback(
+    a_block, b_block, density_bar
+):
+    """Block adjoint for real amplitudes and symmetric Doo/Dvv cotangents.
+
+    For either occupied or virtual matricization, the density is
+    A A.T + B B.T - (A B.T + B A.T)/2.  Its adjoint is H(2A-B),
+    H(2B-A), where H applies both output cotangents.  This uses four
+    contractions and never reconstructs the unused density outputs.
+    The HDF5 caller validates real inputs and hermitizes the cotangents.
+    """
+
+    def apply_density_bar(block):
+        return np.einsum(
+            "rs,Isac->Irac", density_bar.occupied, block, optimize=True
+        ) + np.einsum(
+            "ad,Irdc->Irac", density_bar.virtual, block, optimize=True
+        )
+
+    return (
+        apply_density_bar(2 * a_block - b_block),
+        apply_density_bar(2 * b_block - a_block),
+    )
+
+
 def target_conditioned_mp2_density_from_amplitudes(
     amplitudes,
     target_projection,
@@ -655,6 +681,31 @@ def _target_amplitude_block_from_lov_occupied_slice(
         "Ir,rac->Iac", target_projection.conj(), amplitudes, optimize=True
     )
     return a_increment, b_row
+
+
+@jax.jit
+def _target_amplitude_block_from_lov_occupied_slice_pullback(
+    lov_p,
+    lov_c,
+    eia_p,
+    eia_c,
+    target_column,
+    target_projection,
+    a_bar,
+    b_row_bar,
+):
+    """Compile only the slice pullback, discarding unused primal outputs.
+
+    Amplitudes are still recomputed for the energy/projection response.
+    Keeping this wrapper outside the occupied loop reuses the executable
+    without retaining the amplitude blocks or Lov slices between calls.
+    """
+
+    _, pullback = jax.vjp(
+        _target_amplitude_block_from_lov_occupied_slice,
+        lov_p, lov_c, eia_p, eia_c, target_column, target_projection,
+    )
+    return pullback((a_bar, b_row_bar))
 
 
 def _strong_domain_mp2_density_h5_primal_impl(
@@ -1165,14 +1216,13 @@ def _strong_domain_mp2_density_h5_lov_bwd(
                             io_profile=io_profile,
                         )
                     )
-                    _, density_pullback = jax.vjp(
-                        _density_from_target_amplitude_block,
-                        a_block,
-                        b_block,
+                    a_bar, b_bar = (
+                        _density_from_target_amplitude_block_real_pullback(
+                            a_block, b_block, hermitized_bar
+                        )
                     )
-                    a_bar, b_bar = density_pullback(hermitized_bar)
                     jax.block_until_ready((a_bar, b_bar))
-                    del density_pullback, a_block, b_block
+                    del a_block, b_block
 
                     lov_c_bar_host = onp.zeros(
                         (naux, nocc, width), dtype=lov_h5.dtype
@@ -1197,19 +1247,17 @@ def _strong_domain_mp2_density_h5_lov_bwd(
                             target_projection[:, p],
                             target_projection,
                         )
-                        _, slice_pullback = jax.vjp(
-                            _target_amplitude_block_from_lov_occupied_slice,
-                            *slice_inputs,
-                        )
-                        slice_bars = slice_pullback(
-                            (a_bar, b_bar[:, p, :, :])
+                        slice_bars = (
+                            _target_amplitude_block_from_lov_occupied_slice_pullback(
+                                *slice_inputs, a_bar, b_bar[:, p, :, :]
+                            )
                         )
                         slice_bars_host = tuple(
                             onp.asarray(jax.device_get(bar))
                             for bar in slice_bars
                         )
                         jax.block_until_ready(slice_bars)
-                        del slice_pullback, slice_inputs, slice_bars
+                        del slice_inputs, slice_bars
                         (
                             lov_p_bar,
                             lov_c_bar,

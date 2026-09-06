@@ -157,6 +157,53 @@ def test_target_amplitude_block_density_validates_rank_and_shapes():
         )
 
 
+@pytest.mark.parametrize("width", [1, 3])
+def test_target_amplitude_block_real_pullback_matches_autodiff(width):
+    """Catch incorrect exchange factors or occupied/virtual adjoint axes."""
+    rng = np.random.default_rng(1410)
+    a_block, b_block = (
+        jnp.asarray(rng.normal(size=(2, 3, 5, width)))
+        for _ in range(2)
+    )
+    density_bar = iao_lis.IAOMP2Density(
+        _symmetric_weight(rng, 3), _symmetric_weight(rng, 5)
+    )
+    _, reference_pullback = jax.vjp(
+        _density_from_target_amplitude_block, a_block, b_block
+    )
+    expected = reference_pullback(density_bar)
+    actual = iao_lis._density_from_target_amplitude_block_real_pullback(
+        a_block, b_block, density_bar
+    )
+    _assert_pytree_allclose(actual, expected, rtol=2e-12, atol=2e-12)
+
+
+@pytest.mark.parametrize("width", [1, 3])
+def test_occupied_slice_pullback_matches_all_six_autodiff_bars(width):
+    """Catch dropped energy/projection response when compiling the VJP."""
+    rng = np.random.default_rng(1411)
+    inputs = tuple(map(jnp.asarray, (
+        rng.normal(size=(7, 5)),
+        rng.normal(size=(7, 3, width)),
+        -np.linspace(1.2, 2.0, 5),
+        -rng.uniform(0.5, 1.5, size=(3, width)),
+        rng.normal(size=(2,)),
+        rng.normal(size=(2, 3)),
+    )))
+    output_bars = tuple(map(jnp.asarray, (
+        rng.normal(size=(2, 3, 5, width)),
+        rng.normal(size=(2, 5, width)),
+    )))
+    _, reference_pullback = jax.vjp(
+        iao_lis._target_amplitude_block_from_lov_occupied_slice, *inputs
+    )
+    expected = reference_pullback(output_bars)
+    actual = iao_lis._target_amplitude_block_from_lov_occupied_slice_pullback(
+        *inputs, *output_bars
+    )
+    _assert_pytree_allclose(actual, expected, rtol=2e-12, atol=2e-12)
+
+
 def test_strong_domain_density_routes_directly_to_predictable_h5_file(
     tmp_path, monkeypatch,
 ):

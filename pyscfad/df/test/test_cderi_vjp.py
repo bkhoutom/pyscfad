@@ -768,7 +768,7 @@ def test_int3c_mo_deriv_coords_vjp_oversized_shell_fallback_is_disjoint(
     )
 
 
-def test_local_disk_cderi_bar_cholesky_vjp_matches_pairwise_path(tmp_path):
+def test_local_disk_cderi_bar_cholesky_vjp_matches_pairwise_path(tmp_path, monkeypatch):
     from pyscfad.lno import lno_base
 
     rng = numpy.random.default_rng(151)
@@ -850,3 +850,36 @@ def test_local_disk_cderi_bar_cholesky_vjp_matches_pairwise_path(tmp_path):
         atol=1e-8,
         rtol=1e-8,
     )
+
+    coeff = np.asarray(mo_coeff)
+    cotangent = np.asarray(ybar)
+    _, coeff_pullback = jax.vjp(
+        lambda c: _ao2mo.nr_e2(np.asarray(cderi[:, pair_idx]), c,
+                               orbs_slice, aosym='s2'), coeff,
+    )
+    coeff_ref = coeff_pullback(cotangent)[0]
+
+    def reject_disk(*args, **kwargs):
+        raise AssertionError('Supported partial domains must not build an AO cotangent file')
+
+    monkeypatch.setattr(_cderi_vjp, 'nr_e2_cderi_bar_packed_disk', reject_disk)
+    y, pullback = jax.vjp(
+        lambda m, a, c: lno_base._outcore_local_nr_e2_from_global_cderi(
+            m, a, c, str(cderi_file), 1024, orbs_slice, 's2', tuple(pair_idx)),
+        mol, auxmol, coeff,
+    )
+    mol_direct, aux_direct, coeff_direct = pullback(cotangent)
+    y_ref = _ao2mo.nr_e2(np.asarray(cderi[:, pair_idx]), coeff, orbs_slice, aosym='s2')
+    for actual, expected in ((y, y_ref), (mol_direct.coords, mol_ref.coords),
+                             (aux_direct.coords, aux_ref.coords), (coeff_direct, coeff_ref)):
+        numpy.testing.assert_allclose(actual, expected, atol=1e-8, rtol=1e-8)
+
+
+    # An empty MO slice has identically zero pullbacks and needs no DF work.
+    _, empty_pullback = jax.vjp(
+        lambda m, a, c: lno_base._outcore_local_nr_e2_from_global_cderi(
+            m, a, c, str(cderi_file), 1024, (0, 0, 1, 3), 's2', tuple(pair_idx)),
+        mol, auxmol, coeff,
+    )
+    for bar in jax.tree_util.tree_leaves(empty_pullback(np.zeros((auxmol.nao, 0)))):
+        numpy.testing.assert_array_equal(bar, np.zeros_like(bar))

@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from functools import partial, reduce
+from math import isqrt
 import h5py
 import numpy
 import jax
@@ -3473,6 +3474,36 @@ def _global_pair_indices_for_local_ao(ao_idx, nao):
     return idx
 
 
+def _embed_local_mo_coeff_from_pair_idx(mo_coeff, pair_idx, nao):
+    """Embed a complete local packed-pair domain into the global AO basis."""
+    coeff = numpy.asarray(jax.device_get(mo_coeff))
+    pair_idx = numpy.asarray(pair_idx, dtype=numpy.int64)
+    if coeff.ndim != 2 or pair_idx.ndim != 1:
+        raise ValueError('Expected a coefficient matrix and a one-dimensional pair map.')
+    nlocal = coeff.shape[0]
+    if nlocal > nao or pair_idx.size != nlocal * (nlocal + 1) // 2:
+        raise ValueError('pair_idx must contain the complete local AO-pair space.')
+    if pair_idx.size and (pair_idx.min() < 0 or pair_idx.max() >= nao * (nao + 1) // 2):
+        raise ValueError('pair_idx is outside the global packed-pair space.')
+
+    rows = numpy.arange(nlocal, dtype=numpy.int64)
+    diagonal = pair_idx[rows * (rows + 3) // 2]
+    ao_idx = numpy.asarray([(isqrt(8 * int(p) + 1) - 1) // 2 for p in diagonal],
+                           dtype=numpy.int64)
+    if numpy.any(numpy.diff(ao_idx) <= 0):
+        raise ValueError('Local AO labels must be strictly increasing.')
+    # Validate all pairs, not just the diagonal. Row-wise comparison avoids
+    # allocating additional O(nlocal**2) index arrays for large AO domains.
+    for i, ao in enumerate(ao_idx):
+        p0, p1 = i * (i + 1) // 2, (i + 1) * (i + 2) // 2
+        if not numpy.array_equal(pair_idx[p0:p1], ao * (ao + 1) // 2 + ao_idx[:i + 1]):
+            raise ValueError('pair_idx is not an induced local AO-domain map.')
+
+    coeff_full = numpy.zeros((nao, coeff.shape[1]), dtype=coeff.dtype)
+    coeff_full[ao_idx] = coeff
+    return coeff_full
+
+
 def _outcore_nr_e2_block_mb():
     try:
         return max(float(os.environ.get('PYSCFAD_LNO_OUTCORE_NR_E2_BLOCK_MB', 256.0)), 1.0)
@@ -3631,6 +3662,12 @@ def _outcore_local_nr_e2_from_global_cderi_bwd(cderi_source, max_memory,
                                                res, ybar):
     mol, auxmol, mo_coeff = res
     pair_idx = numpy.asarray(pair_idx, dtype=numpy.int64)
+    full_pair_idx = _is_full_global_pair_idx(pair_idx, mol.nao)
+    coeff_full = None if full_pair_idx else _embed_local_mo_coeff_from_pair_idx(
+        mo_coeff, pair_idx, mol.nao
+    )
+    if ybar.size == 0:
+        return jax.tree_util.tree_map(np.zeros_like, (mol, auxmol, mo_coeff))
     try:
         with _vjp_progress_section('fragment DF AO2MO MO-coeff backward'):
             mo_coeff_bar = _cderi_vjp.nr_e2_mo_coeff_vjp_from_cderi_source(
@@ -3639,7 +3676,6 @@ def _outcore_local_nr_e2_from_global_cderi_bwd(cderi_source, max_memory,
             )
 
         ybar_np = numpy.asarray(jax.device_get(ybar))
-        full_pair_idx = _is_full_global_pair_idx(pair_idx, mol.nao)
         if full_pair_idx:
             try:
                 with _vjp_progress_section('fragment DF integral derivative backward'):
@@ -3676,12 +3712,34 @@ def _outcore_local_nr_e2_from_global_cderi_bwd(cderi_source, max_memory,
                     aosym='s2ij',
                 )
             return mol_bar, auxmol_bar, mo_coeff_bar
-        expected_local_pairs = mo_coeff.shape[0] * (mo_coeff.shape[0] + 1) // 2
-        if pair_idx.size != expected_local_pairs:
-            raise RuntimeError(
-                f'Local AO-pair map has {pair_idx.size} entries; expected '
-                f'{expected_local_pairs} for {mo_coeff.shape[0]} local AOs.'
+        coordinate_only = all(
+            obj.coords is not None and all(
+                getattr(obj, name, None) is None for name in ('exp', 'ctr_coeff', 'r0')
+            ) for obj in (mol, auxmol)
+        )
+        if coordinate_only and coeff_full.dtype == numpy.float64 and ybar_np.dtype == numpy.float64:
+            _cderi_vjp._profile_msg(
+                'partial-domain strategy=embedded_mo '
+                f'local_nao={mo_coeff.shape[0]} global_nao={mol.nao} '
+                f'naux={auxmol.nao} orbs_slice={orbs_slice}'
             )
+            try:
+                with _vjp_progress_section('fragment DF integral derivative backward'):
+                    mol_bar, auxmol_bar = _cderi_vjp.cholesky_eri_vjp_from_mo_coeff_ybar(
+                        mol, auxmol, cderi_source, coeff_full, ybar_np, orbs_slice,
+                        max(max_memory, 4096), int3c=mol._add_suffix('int3c2e'),
+                        int2c=mol._add_suffix('int2c2e'), aosym='s2ij',
+                    )
+            except NotImplementedError as err:
+                _cderi_vjp._profile_msg(f'partial-domain strategy=disk fallback: {err}')
+            else:
+                return mol_bar, auxmol_bar, mo_coeff_bar
+        else:
+            _cderi_vjp._profile_msg(
+                'partial-domain strategy=disk fallback: '
+                'embedded MO derivative requires real float64 coordinate-only inputs'
+            )
+        del coeff_full
         with _vjp_progress_section('fragment DF integral derivative backward'):
             # Build Bbar by auxiliary slabs with the dense two-GEMM native
             # kernel.  The tiled HDF layout is then read by AO-pair slabs,

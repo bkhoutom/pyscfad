@@ -1742,8 +1742,9 @@ def cholesky_eri_vjp_from_mo_coeff_ybar(mol, auxmol, cderi_source,
     """Back-propagate through CDERI using MO-basis int3c derivatives.
 
     This avoids materializing the large packed AO-pair cotangent
-    ``cderi_bar[naux, nao_pair]``.  It is currently limited to the full AO
-    basis; localized AO domains should keep using the block-function fallback.
+    ``cderi_bar[naux, nao_pair]``. Coefficients must have global AO rows;
+    a local domain is represented by zero rows outside its AO support while
+    retaining the global auxiliary metric.
     """
     t_total = time.perf_counter()
     _profile_msg(

@@ -197,6 +197,12 @@ def _exception_text(stage):
     return f"{stage} failed on an MPI rank:\n{traceback.format_exc()}"
 
 
+def _raise_if_root_failed(comm, error, *, root):
+    error = comm.bcast(error, root=root)
+    if error is not None:
+        raise RuntimeError(error)
+
+
 def _raise_if_any_rank_failed(comm, local_error):
     errors = comm.allgather(local_error)
     failures = [error for error in errors if error is not None]
@@ -223,10 +229,6 @@ def _to_device_leaf(leaf):
     return leaf
 
 
-def _path_key(path):
-    return jax.tree_util.keystr(path)
-
-
 def _tree_sum_to_root(comm, tree, *, root=0):
     """Sum numeric leaves of a JAX pytree onto ``root``.
 
@@ -239,7 +241,7 @@ def _tree_sum_to_root(comm, tree, *, root=0):
     leaves_with_path, treedef = jax.tree_util.tree_flatten_with_path(
         tree, is_leaf=lambda value: value is None
     )
-    paths = [_path_key(path) for path, _ in leaves_with_path]
+    paths = [jax.tree_util.keystr(path) for path, _ in leaves_with_path]
     if len(paths) != len(set(paths)):
         raise RuntimeError(
             f"MPI cotangent tree on rank {rank} contains duplicate paths"
@@ -284,7 +286,7 @@ def _array_tree_digest(tree):
         if leaf is None or not hasattr(leaf, "dtype"):
             continue
         array = numpy.ascontiguousarray(numpy.asarray(leaf))
-        digest.update(_path_key(path).encode("utf8"))
+        digest.update(jax.tree_util.keystr(path).encode("utf8"))
         digest.update(array.dtype.str.encode("ascii"))
         digest.update(repr(array.shape).encode("ascii"))
         digest.update(array.tobytes())
@@ -474,9 +476,7 @@ def correlation_value_and_grad(
             closed_error = _exception_text(
                 "root MPI correlation restart load"
             )
-    closed_error = comm.bcast(closed_error, root=root)
-    if closed_error is not None:
-        raise RuntimeError(closed_error)
+    _raise_if_root_failed(comm, closed_error, root=root)
     closed_payload = comm.bcast(closed_payload, root=root)
     if closed_payload is not None:
         corr_energy, closed_metadata = closed_payload
@@ -496,9 +496,7 @@ def correlation_value_and_grad(
                     details_error = _exception_text(
                         "root restarted MPI correlation diagnostics"
                     )
-            details_error = comm.bcast(details_error, root=root)
-            if details_error is not None:
-                raise RuntimeError(details_error)
+            _raise_if_root_failed(comm, details_error, root=root)
             details = comm.bcast(
                 details, root=root
             )
@@ -1003,9 +1001,7 @@ def correlation_value_and_grad(
             checkpoint_error = _exception_text(
                 "root MPI correlation checkpoint write"
             )
-    checkpoint_error = comm.bcast(checkpoint_error, root=root)
-    if checkpoint_error is not None:
-        raise RuntimeError(checkpoint_error)
+    _raise_if_root_failed(comm, checkpoint_error, root=root)
 
     if return_details:
         if collect_timing:
@@ -1461,9 +1457,7 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
                             "root restarted MP2 diagnostics load"
                         )
                         details = None
-                details_error = comm.bcast(details_error, root=root)
-                if details_error is not None:
-                    raise RuntimeError(details_error)
+                _raise_if_root_failed(comm, details_error, root=root)
                 details = comm.bcast(details, root=root)
                 corr_result = (corr_energy, mf_bar_root, details)
             else:
@@ -1514,9 +1508,7 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
                     checkpoint_error = _exception_text(
                         "root pre-SCF checkpoint write"
                     )
-            checkpoint_error = comm.bcast(checkpoint_error, root=root)
-            if checkpoint_error is not None:
-                raise RuntimeError(checkpoint_error)
+            _raise_if_root_failed(comm, checkpoint_error, root=root)
             energy = comm.bcast(
                 energy if rank == root else None, root=root
             )

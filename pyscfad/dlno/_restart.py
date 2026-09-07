@@ -848,22 +848,17 @@ class RestartManager:
             else Path(checkpoint_dir).expanduser().resolve()
         )
         self.enabled = self.path is not None
-        if not self.enabled:
-            if self.resume:
-                raise ValueError("resume=True requires checkpoint_dir")
-            self.base_digest = scientific_digest({
-                "abi": _ALGORITHM_ABI,
-                "method": self.method,
-                "payload": scientific_payload,
-            })
-            self._manifest = None
-            return
-
+        if not self.enabled and self.resume:
+            raise ValueError("resume=True requires checkpoint_dir")
         self.base_digest = scientific_digest({
             "abi": _ALGORITHM_ABI,
             "method": self.method,
             "payload": scientific_payload,
         })
+        if not self.enabled:
+            self._manifest = None
+            return
+
         self._base_summary = _encode_value(scientific_payload)
         self.manifest_path = self.path / "run.json"
         if initialize:

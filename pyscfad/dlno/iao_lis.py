@@ -1847,7 +1847,6 @@ def _external_density(density, internal):
 
 
 def _density_keep_numpy(density, internal, threshold, full_space):
-    nspace = int(density.shape[0])
     if full_space:
         return onp.zeros((0,), dtype=onp.int32)
     external = onp.asarray(jax.device_get(_external_density(density, internal)))

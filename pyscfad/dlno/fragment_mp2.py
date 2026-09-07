@@ -1213,7 +1213,7 @@ def fragment_pair_energy_from_lov_jax(
         )
     elif not isinstance(block_nvir, (int, np.integer)) or block_nvir <= 0:
         raise ValueError("block_nvir must be a positive integer")
-    nvir = lov.shape[2] if getattr(lov, 'ndim', None) == 3 else 0
+    nvir = lov.shape[2]
     block_nvir = min(int(block_nvir), nvir) if nvir else 1
 
     operands = (lov, e_occ, e_vir, target_factor, partner_weight)

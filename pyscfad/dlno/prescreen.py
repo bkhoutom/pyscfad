@@ -12,8 +12,7 @@ import numpy as np
 import scipy.linalg as onp_scipy_linalg
 import jax
 import jax.numpy as jnp
-from pyscf import gto, lo, scf, mp, lib
-from pyscf.data.elements import chemcore
+from pyscf import lo, mp, lib
 
 from pyscfad.ao2mo import _ao2mo
 from pyscfad.mp import dfmp2
@@ -23,6 +22,7 @@ from pyscfad.lno import lno_base
 from pyscfad.ops import stop_grad
 from pyscfad.tools import resource_profile
 from pyscfad.dlno import multipole_numpy as static_multipole
+from .util import _is_traced
 
 try:
     from pyscfad.dlno import dlno as dlno_mod
@@ -33,13 +33,6 @@ except Exception:
     from dlno import dlno as dlno_mod
     from dlno import pao as dlno_pao
     from dlno import util as dlno_util
-
-
-def _is_traced(*xs):
-    for x in xs:
-        if isinstance(x, jax.core.Tracer):
-            return True
-    return False
 
 
 def _diag_subspace_energies(vir_prescreen, fock_block):
@@ -278,6 +271,56 @@ def _canonicalize_single_lo_domain(
     return _maybe_asarray(e_occ_i).reshape(-1), lo_i_canon, _maybe_asarray(e_vir_i), pao_i_canon
 
 
+def _fragment_virtual_prescreen(
+    mol,
+    pao,
+    *,
+    frag_ext_bp,
+    frag_ext_primary,
+    ao2pao_map,
+    s1e,
+    s21,
+    s22,
+    fock,
+    ao_idx,
+    occ_prescreen,
+    domain_pao_thr,
+    pao_bp_domain_thr,
+):
+    """Build the shared virtual prescreen span inside a fixed atom domain."""
+    frag_pao = dlno_pao.pao_overlap_with_domain(
+        mol,
+        pao,
+        list(frag_ext_bp),
+        ao2pao_map=ao2pao_map,
+        s1e=s1e,
+        ovlp_thr=domain_pao_thr,
+    )
+    if frag_pao.shape[1] > 0:
+        av = dlno_mod._compute_av(mol, frag_pao, s1e=s1e, atmlst=frag_ext_primary)
+        frag_pao = frag_pao[:, av > pao_bp_domain_thr]
+    if frag_pao.shape[1] > 0:
+        frag_pao_prj = dlno_util.project_mo(frag_pao, s21, s22)
+        frag_pao_prj = dlno_util.orthogonalize(occ_prescreen, frag_pao_prj, s22)
+        frag_pao_prj = lno_base.orthonormalize_metric_colspace_smooth(
+            frag_pao_prj, s22, thresh=1e-10
+        )
+        # The downstream DLNO path only consumes the virtual prescreen span.
+        # Keeping these coefficients in a fixed-gauge orthonormal basis avoids
+        # introducing an extra semicanonical rotation whose derivative can
+        # become disproportionately large in near-degenerate local spaces.
+        vir_prescreen = frag_pao_prj
+        if vir_prescreen.shape[1] > 0:
+            fock22 = fock[np.ix_(ao_idx, ao_idx)]
+            e_vir_prescreen = _diag_subspace_energies(vir_prescreen, fock22)
+        else:
+            e_vir_prescreen = onp.zeros((0,))
+    else:
+        e_vir_prescreen = onp.zeros((0,))
+        vir_prescreen = onp.zeros((len(ao_idx), 0))
+    return e_vir_prescreen, vir_prescreen
+
+
 def _lo_pair_energy_matrix_multipole(
     mf,
     lo_coeff,
@@ -354,7 +397,6 @@ def _build_lo_indexed_prescreen_data(
         s1e = mol.intor_symmetric('int1e_ovlp')
         fock = mf.get_fock()
 
-    lmo_bp_domain = get_bp_domain = None
     # Treat domain topology as fixed metadata. The selected prescreen spaces
     # inside those domains remain the only objects consumed downstream.
     with _topology_profile_section(profile_rows, 'LMO BP domains'):
@@ -418,36 +460,21 @@ def _build_lo_indexed_prescreen_data(
                 mol, lmo_block_prj, fock, frag_ext_primary
             )
 
-            frag_pao = dlno_pao.pao_overlap_with_domain(
+            e_vir_prescreen, vir_prescreen = _fragment_virtual_prescreen(
                 mol,
                 pao,
-                list(frag_ext_bp),
+                frag_ext_bp=frag_ext_bp,
+                frag_ext_primary=frag_ext_primary,
                 ao2pao_map=ao2pao_map,
                 s1e=s1e,
-                ovlp_thr=domain_pao_thr,
+                s21=s21,
+                s22=s22,
+                fock=fock,
+                ao_idx=ao_idx,
+                occ_prescreen=occ_prescreen,
+                domain_pao_thr=domain_pao_thr,
+                pao_bp_domain_thr=pao_bp_domain_thr,
             )
-            if frag_pao.shape[1] > 0:
-                av = dlno_mod._compute_av(mol, frag_pao, s1e=s1e, atmlst=frag_ext_primary)
-                frag_pao = frag_pao[:, av > pao_bp_domain_thr]
-            if frag_pao.shape[1] > 0:
-                frag_pao_prj = dlno_util.project_mo(frag_pao, s21, s22)
-                frag_pao_prj = dlno_util.orthogonalize(occ_prescreen, frag_pao_prj, s22)
-                frag_pao_prj = lno_base.orthonormalize_metric_colspace_smooth(
-                    frag_pao_prj, s22, thresh=1e-10
-                )
-                # The downstream DLNO path only consumes the virtual prescreen span.
-                # Keeping these coefficients in a fixed-gauge orthonormal basis avoids
-                # introducing an extra semicanonical rotation whose derivative can
-                # become disproportionately large in near-degenerate local spaces.
-                vir_prescreen = frag_pao_prj
-                if vir_prescreen.shape[1] > 0:
-                    fock22 = fock[np.ix_(ao_idx, ao_idx)]
-                    e_vir_prescreen = _diag_subspace_energies(vir_prescreen, fock22)
-                else:
-                    e_vir_prescreen = onp.zeros((0,))
-            else:
-                e_vir_prescreen = onp.zeros((0,))
-                vir_prescreen = onp.zeros((len(ao_idx), 0))
 
             fragment_data.append(
                 {
@@ -589,32 +616,21 @@ def build_dlno_prescreen_data(
                 mol, lmo_block_prj, fock, frag_ext_primary
             )
 
-            frag_pao = dlno_pao.pao_overlap_with_domain(
+            e_vir_prescreen, vir_prescreen = _fragment_virtual_prescreen(
                 mol,
                 pao,
-                list(frag_ext_bp),
+                frag_ext_bp=frag_ext_bp,
+                frag_ext_primary=frag_ext_primary,
                 ao2pao_map=ao2pao_map,
                 s1e=s1e,
-                ovlp_thr=domain_pao_thr,
+                s21=s21,
+                s22=s22,
+                fock=fock,
+                ao_idx=ao_idx,
+                occ_prescreen=occ_prescreen,
+                domain_pao_thr=domain_pao_thr,
+                pao_bp_domain_thr=pao_bp_domain_thr,
             )
-            if frag_pao.shape[1] > 0:
-                av = dlno_mod._compute_av(mol, frag_pao, s1e=s1e, atmlst=frag_ext_primary)
-                frag_pao = frag_pao[:, av > pao_bp_domain_thr]
-            if frag_pao.shape[1] > 0:
-                frag_pao_prj = dlno_util.project_mo(frag_pao, s21, s22)
-                frag_pao_prj = dlno_util.orthogonalize(occ_prescreen, frag_pao_prj, s22)
-                frag_pao_prj = lno_base.orthonormalize_metric_colspace_smooth(
-                    frag_pao_prj, s22, thresh=1e-10
-                )
-                vir_prescreen = frag_pao_prj
-                if vir_prescreen.shape[1] > 0:
-                    fock22 = fock[np.ix_(ao_idx, ao_idx)]
-                    e_vir_prescreen = _diag_subspace_energies(vir_prescreen, fock22)
-                else:
-                    e_vir_prescreen = onp.zeros((0,))
-            else:
-                e_vir_prescreen = onp.zeros((0,))
-                vir_prescreen = onp.zeros((len(ao_idx), 0))
 
             fragment_data.append(
                 {
@@ -707,32 +723,21 @@ def rebuild_dlno_prescreen_data(mf, lo_coeff, topology_data, *, frozen=None):
             mol, lmo_block_prj, fock, frag_ext_primary
         )
 
-        frag_pao = dlno_pao.pao_overlap_with_domain(
+        e_vir_prescreen, vir_prescreen = _fragment_virtual_prescreen(
             mol,
             pao,
-            list(frag_ext_bp),
+            frag_ext_bp=frag_ext_bp,
+            frag_ext_primary=frag_ext_primary,
             ao2pao_map=ao2pao_map,
             s1e=s1e,
-            ovlp_thr=domain_pao_thr,
+            s21=s21,
+            s22=s22,
+            fock=fock,
+            ao_idx=ao_idx,
+            occ_prescreen=occ_prescreen,
+            domain_pao_thr=domain_pao_thr,
+            pao_bp_domain_thr=pao_bp_domain_thr,
         )
-        if frag_pao.shape[1] > 0:
-            av = dlno_mod._compute_av(mol, frag_pao, s1e=s1e, atmlst=frag_ext_primary)
-            frag_pao = frag_pao[:, av > pao_bp_domain_thr]
-        if frag_pao.shape[1] > 0:
-            frag_pao_prj = dlno_util.project_mo(frag_pao, s21, s22)
-            frag_pao_prj = dlno_util.orthogonalize(occ_prescreen, frag_pao_prj, s22)
-            frag_pao_prj = lno_base.orthonormalize_metric_colspace_smooth(
-                frag_pao_prj, s22, thresh=1e-10
-            )
-            vir_prescreen = frag_pao_prj
-            if vir_prescreen.shape[1] > 0:
-                fock22 = fock[np.ix_(ao_idx, ao_idx)]
-                e_vir_prescreen = _diag_subspace_energies(vir_prescreen, fock22)
-            else:
-                e_vir_prescreen = onp.zeros((0,))
-        else:
-            e_vir_prescreen = onp.zeros((0,))
-            vir_prescreen = onp.zeros((len(ao_idx), 0))
 
         fragment_data.append(
             {

@@ -19,7 +19,7 @@ energies are partitioned with the positive-semidefinite weight
 must not be substituted for these weights.
 """
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import reduce
 import numbers
 import time
@@ -298,6 +298,7 @@ class IAOFragmentMP2:
         from ._restart import RestartManager
         from .iao_mp2_grad import (
             IAOFragmentMP2StaticSelections,
+            _add_cotangent,
             build_iao_mp2_static_selections,
         )
 
@@ -395,13 +396,8 @@ class IAOFragmentMP2:
             fixed_topology = stop_trace(
                 lambda mf_: build_iao_mp2_static_selections(mf_, topology)
             )(mf)
-        elif isinstance(topology, IAOFragmentMP2StaticSelections):
-            fixed_topology = topology
         else:
-            raise TypeError(
-                "topology must be IAOFragmentTopology or "
-                "IAOFragmentMP2StaticSelections"
-            )
+            fixed_topology = topology
 
         if restart.enabled and saved_topology is None:
             restart.save_static(fixed_topology)
@@ -450,25 +446,8 @@ class IAOFragmentMP2:
         )
         e_corr, mf_bar = corr_result[:2]
         if include_hf:
-            def add_cotangent(left, right):
-                if left is None:
-                    return right
-                if right is None:
-                    return left
-                if (
-                    hasattr(left, "dtype")
-                    and left.dtype == jax.dtypes.float0
-                ):
-                    return right
-                if (
-                    hasattr(right, "dtype")
-                    and right.dtype == jax.dtypes.float0
-                ):
-                    return left
-                return left + right
-
             mf_bar = jax.tree_util.tree_map(
-                add_cotangent, mf_bar, hf_bar
+                _add_cotangent, mf_bar, hf_bar
             )
             energy = e_hf + e_corr
         else:

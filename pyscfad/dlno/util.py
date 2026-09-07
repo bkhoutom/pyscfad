@@ -3,7 +3,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from pyscf import lib, gto
+from pyscf import gto
 
 
 def _is_traced(*xs):

@@ -1,16 +1,9 @@
 import numpy as np
 import scipy.linalg as _sla_numpy
-import jax
 import jax.numpy as jnp
 from pyscfad import scipy
 from . import util
-
-
-def _is_traced(*xs):
-    for x in xs:
-        if isinstance(x, jax.core.Tracer):
-            return True
-    return False
+from .util import _is_traced
 
 
 def _canonical_orth(s, thr=1e-6):

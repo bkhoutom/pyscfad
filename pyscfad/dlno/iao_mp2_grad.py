@@ -34,7 +34,6 @@ from pyscfad import scipy
 from pyscfad.lno import lno_base
 from pyscfad.mp import dfmp2
 
-from . import pao as dlno_pao
 from . import util
 from . import mp2 as dlno_mp2
 from .fragment_mp2 import fragment_pair_energy_from_lov_jax

@@ -1,8 +1,6 @@
 from functools import reduce
 import numpy as np
-import jax.numpy as jnp
 
-from pyscfad import lib
 from pyscfad.lib import logger
 from pyscfad import scf, df
 from pyscfad.lo import orth
@@ -138,7 +136,6 @@ def kernel(mydlno, auxbasis=None,
 
         _df = None
         fake_mol = None
-        fake_auxmol = None
         fake_mf = None
         s21 = s22 = None
         fock22 = None

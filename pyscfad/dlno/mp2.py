@@ -1,4 +1,3 @@
-from functools import partial
 import jax.numpy as jnp
 import numpy as np
 from pyscf import lib

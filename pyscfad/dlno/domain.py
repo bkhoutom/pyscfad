@@ -2,7 +2,6 @@ from functools import reduce
 import numpy as np
 import jax
 import jax.numpy as jnp
-from pyscf.gto.mole import inter_distance
 from . import util
 
 def get_bp_domain(mol, mos, s1e=None, bp_thr=0.999,

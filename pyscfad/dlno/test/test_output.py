@@ -40,6 +40,10 @@ def _static_selections():
             extended_ao_indices=np.arange(24),
             strong_occ_metric_keep=np.arange(6),
             strong_virtual=SimpleNamespace(metric_keep=np.arange(18)),
+            primary_atoms=np.arange(4),
+            primary_ao_indices=np.arange(19),
+            weak_occ_norm_keep=np.arange(3),
+            weak_virtual=SimpleNamespace(metric_keep=np.arange(12)),
         ),
         SimpleNamespace(
             iao_indices=np.arange(4),
@@ -49,6 +53,10 @@ def _static_selections():
             extended_ao_indices=np.arange(15),
             strong_occ_metric_keep=np.arange(4),
             strong_virtual=SimpleNamespace(metric_keep=np.arange(11)),
+            primary_atoms=np.arange(2),
+            primary_ao_indices=np.arange(9),
+            weak_occ_norm_keep=np.arange(2),
+            weak_virtual=None,
         ),
     )
     mp2_static = SimpleNamespace(
@@ -90,8 +98,19 @@ def test_domain_and_lis_tables_report_fixed_dimensions():
     domain = "\n".join(mp2_prescreened_domain_lines(static))
     assert "IAO-MP2 PRESCREENED DOMAINS" in domain
     assert "target IAO/atoms" in domain
+    assert "PD atoms" in domain
+    assert "PD AOs" in domain
+    assert "PD occ" in domain
+    assert "PD vir" in domain
     assert "     1        3/2" in domain
     assert "     2        4/-" in domain
+    rows = domain.splitlines()
+    assert rows[3].split() == [
+        "1", "3/2", "4", "19", "3", "12", "2", "5", "24", "6", "18"
+    ]
+    assert rows[4].split() == [
+        "2", "4/-", "2", "9", "-", "-", "1", "3", "15", "4", "11"
+    ]
 
     occupied, virtual = lis_dimensions_from_static(static)
     assert occupied == (5, 8)

@@ -1,11 +1,13 @@
 """Factor-direct regression tests for the projected LNO (T) correction."""
 
 from types import SimpleNamespace
+import os
 import sys
 
 import jax
 import jax.numpy as jnp
 import numpy
+import pytest
 
 from pyscfad import config_update, df, gto, scf
 from pyscfad.cc import dfccsd
@@ -13,6 +15,128 @@ from pyscfad.dlno.ccsd import DLNOCCSD
 from pyscfad.dlno.iao_mp2 import IAOFragmentMP2Thresholds
 from pyscfad.lno import ccsd as lno_ccsd
 from pyscfad.lno import ccsd_t
+
+
+@pytest.fixture
+def factor_block_environment(monkeypatch):
+    # Emulate allocations independently of the machine/test launcher.
+    for key in tuple(os.environ):
+        if key.startswith(('SLURM_', 'OMPI_', 'PMI_', 'PYSCFAD_LNO_CCSD_T_')):
+            monkeypatch.delenv(key)
+    monkeypatch.setattr(ccsd_t, 'num_threads', lambda: 16)
+    monkeypatch.setattr(ccsd_t, 'current_memory', lambda: (8589.934592, 0))
+
+
+def test_factor_block_auto_scales_with_local_ranks(
+        monkeypatch, factor_block_environment):
+    monkeypatch.setenv('SLURM_MEM_PER_NODE', '131072')  # 128 GiB
+    monkeypatch.setenv('SLURM_NTASKS_PER_NODE', '8')
+    monkeypatch.setenv('OMPI_COMM_WORLD_LOCAL_SIZE', '4')
+    four_ranks = ccsd_t._ccsd_t_factor_block_nvir(16, 116, 100000, True)
+    monkeypatch.setenv('OMPI_COMM_WORLD_LOCAL_SIZE', '2')
+    two_ranks = ccsd_t._ccsd_t_factor_block_nvir(16, 116, 100000, True)
+    assert 1 < four_ranks < two_ranks
+    assert two_ranks == 116
+
+
+@pytest.mark.parametrize('setting', [None, 'auto'])
+def test_factor_block_auto_respects_remaining_process_memory(
+        monkeypatch, factor_block_environment, setting):
+    if setting is not None:
+        monkeypatch.setenv('PYSCFAD_LNO_CCSD_T_FACTOR_BLOCK_MB', setting)
+    monkeypatch.setenv('SLURM_MEM_PER_NODE', '262144')
+    monkeypatch.setenv('OMPI_COMM_WORLD_LOCAL_SIZE', '2')
+    monkeypatch.setattr(ccsd_t, 'num_threads', lambda: 32)
+    monkeypatch.setattr(ccsd_t, 'current_memory', lambda: (9228.403, 0))
+    # Recorded water16 headroom in decimal MB: more node memory must not
+    # override this configured process limit.
+    assert ccsd_t._ccsd_t_factor_block_nvir(18, 92, 16771.597, True) == 43
+    assert ccsd_t._ccsd_t_factor_block_nvir(18, 92, 0, True) == 1
+
+
+def test_factor_block_slurm_per_cpu_and_heterogeneous_nodes(
+        monkeypatch, factor_block_environment):
+    monkeypatch.setenv('SLURM_MEM_PER_CPU', '2048')
+    monkeypatch.setenv('SLURM_CPUS_ON_NODE', '64')  # 128 GiB allocated
+    monkeypatch.setenv('SLURM_CPUS_PER_TASK', '32')
+    monkeypatch.setenv('SLURM_TASKS_PER_NODE', '4(x2),2')
+    monkeypatch.setenv('SLURM_NODEID', '2')
+    assert ccsd_t._ccsd_t_factor_block_nvir(16, 116, 100000, True) == 116
+    monkeypatch.setenv('SLURM_NODEID', '1')
+    four_ranks = ccsd_t._ccsd_t_factor_block_nvir(16, 116, 100000, True)
+    assert 1 < four_ranks < 116
+    # Without a node ID use the largest listed rank count conservatively.
+    monkeypatch.delenv('SLURM_NODEID')
+    assert ccsd_t._ccsd_t_factor_block_nvir(16, 116, 100000, True) == four_ranks
+
+
+def test_factor_block_per_cpu_does_not_count_unusable_smt_threads(
+        monkeypatch, factor_block_environment):
+    monkeypatch.setenv('SLURM_MEM_PER_CPU', '2048')
+    monkeypatch.setenv('SLURM_CPUS_ON_NODE', '64')
+    monkeypatch.setenv('SLURM_CPUS_PER_TASK', '8')
+    monkeypatch.setenv('SLURM_THREADS_PER_CORE', '1')
+    monkeypatch.setenv('OMPI_COMM_WORLD_LOCAL_SIZE', '4')
+    # Only 32 of the 64 allocated hardware threads count toward memory.
+    # Each rank has 16 GiB, not 32 GiB, before reserves and its 8 GiB RSS.
+    assert ccsd_t._ccsd_t_factor_block_nvir(16, 116, 100000, True) == 19
+
+
+def test_factor_block_full_node_memory_request(
+        monkeypatch, factor_block_environment):
+    monkeypatch.setenv('SLURM_MEM_PER_NODE', '0')
+    monkeypatch.setenv('SLURM_NTASKS_PER_NODE', '2')
+    monkeypatch.setattr(ccsd_t.os, 'sysconf', lambda key: {
+        'SC_PHYS_PAGES': 33554432, 'SC_PAGE_SIZE': 4096}[key])
+    assert ccsd_t._ccsd_t_factor_block_nvir(16, 116, 100000, True) == 116
+
+
+def test_factor_block_missing_allocation_uses_process_budget(
+        monkeypatch, factor_block_environment):
+    monkeypatch.setattr(ccsd_t, 'num_threads', lambda: 32)
+    assert ccsd_t._ccsd_t_factor_block_nvir(18, 92, 16771.597, True) == 43
+    monkeypatch.setenv('SLURM_MEM_PER_NODE', 'unknown')
+    monkeypatch.setenv('SLURM_TASKS_PER_NODE', 'unknown')
+    assert ccsd_t._ccsd_t_factor_block_nvir(18, 92, 16771.597, True) == 43
+
+
+def test_factor_block_numeric_override_still_obeys_allocation(
+        monkeypatch, factor_block_environment):
+    monkeypatch.setattr(ccsd_t, 'num_threads', lambda: 32)
+    monkeypatch.setenv('PYSCFAD_LNO_CCSD_T_FACTOR_BLOCK_MB', '128')
+    assert ccsd_t._ccsd_t_factor_block_nvir(18, 92, 100000, True) == 1
+    monkeypatch.setenv('PYSCFAD_LNO_CCSD_T_FACTOR_BLOCK_MB', '8192')
+    assert ccsd_t._ccsd_t_factor_block_nvir(18, 92, 100000, True) == 44
+    monkeypatch.setenv('SLURM_MEM_PER_NODE', '32768')
+    monkeypatch.setenv('OMPI_COMM_WORLD_LOCAL_SIZE', '4')
+    # The rank already exceeds its share; don't allocate another 8 GiB.
+    assert ccsd_t._ccsd_t_factor_block_nvir(18, 92, 100000, True) == 1
+
+
+@pytest.mark.parametrize('setting', ['typo', 'nan', 'inf', '-1'])
+def test_factor_block_rejects_invalid_budget(
+        monkeypatch, factor_block_environment, setting):
+    monkeypatch.setenv('PYSCFAD_LNO_CCSD_T_FACTOR_BLOCK_MB', setting)
+    with pytest.raises(ValueError, match='PYSCFAD_LNO_CCSD_T_FACTOR_BLOCK_MB'):
+        ccsd_t._ccsd_t_factor_block_nvir(16, 116, 100000, True)
+
+
+def test_factor_block_auto_and_numeric_preserve_energy_and_all_cotangents(
+        monkeypatch, factor_block_environment):
+    problem = _random_problem(nocc=5, nvir=16, naux=10)
+    args = _factor_args(problem)
+    values, bars, widths = [], [], []
+    for setting in ('1', 'auto'):
+        monkeypatch.setenv('PYSCFAD_LNO_CCSD_T_FACTOR_BLOCK_MB', setting)
+        widths.append(ccsd_t._ccsd_t_factor_block_nvir(5, 16, 10000, True))
+        values.append(ccsd_t._ccsd_t_energy_df(*args, 20000, False))
+        bars.append(ccsd_t._ccsd_t_energy_df_bwd(
+            20000, False, args, numpy.asarray(1.0)))
+    assert widths[0] < widths[1] == 16
+    numpy.testing.assert_allclose(values[0], values[1], atol=2e-13, rtol=0)
+    assert len(bars[0]) == len(bars[1]) == 9
+    for blocked, automatic in zip(*bars):
+        numpy.testing.assert_allclose(blocked, automatic, atol=3e-12, rtol=0)
 
 
 def _random_problem(seed=12, nocc=3, nvir=5, naux=7):

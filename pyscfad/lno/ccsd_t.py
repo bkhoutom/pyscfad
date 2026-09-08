@@ -17,6 +17,7 @@
 
 import ctypes
 import os
+import re
 import time
 from functools import partial
 from types import SimpleNamespace
@@ -104,34 +105,131 @@ def _accumulate_factor_cache_pair_bar(
             ovov_bar, Lov_bar, Lvv_bar)
 
 
-def _ccsd_t_factor_block_nvir(nocc, nvir, max_memory, backward=False):
-    """Choose a bounded virtual width for factor-direct LNO triples.
+def _node_env_value(name, *, minimum=False):
+    """Read an integer or Slurm's per-node ``4(x2),2`` notation.
 
-    One rectangular cache of width ``w`` contains
-    ``w*nvir*nocc*(nocc+nvir)`` doubles.  The reverse C kernel additionally
-    creates cache-bar copies for its OpenMP workers, so its estimate includes
-    those thread-private buffers.  This controls the large virtual cache;
-    amplitude/bar workspaces inside the triples kernel are separate.
+    If the node index is unavailable, use the largest rank count (or smallest
+    CPU allocation when requested) rather than assuming an even distribution.
     """
+    groups = []
+    for token in os.environ.get(name, '').split(','):
+        match = re.fullmatch(r'(\d+)(?:\(x(\d+)\))?', token.strip())
+        if match is None:
+            return None
+        count, repeat = int(match[1]), int(match[2] or 1)
+        if repeat < 1:
+            return None
+        groups.append((count, repeat))
     try:
-        block_mb = float(os.environ.get(
-            'PYSCFAD_LNO_CCSD_T_FACTOR_BLOCK_MB', 128.0))
+        node_id = int(os.environ.get('SLURM_NODEID', '-1'))
     except ValueError:
-        block_mb = 128.0
+        node_id = -1
+    for count, repeat in groups:
+        if 0 <= node_id < repeat:
+            return count
+        node_id -= repeat
+    return (min if minimum else max)(count for count, _ in groups)
 
-    nmo = nocc + nvir
-    one_width_bytes = max(
-        nvir * nocc * nmo * numpy.dtype(numpy.float64).itemsize, 1)
-    if max_memory <= 0:
-        return 1
-    # At a disjoint pair of blocks the forward owns four input caches.  The
-    # reverse owns those inputs plus four cache bars, with the bars replicated
-    # by the C kernel for additional OpenMP workers.
-    cache_multiplicity = 4 * (num_threads() + 1) if backward else 4
-    target_bytes = max(block_mb, 1.0) * 1024.0**2
-    target_bytes = min(target_bytes, max_memory * 1e6 * 0.5)
-    width = int(target_bytes // (cache_multiplicity * one_width_bytes))
-    return max(1, min(nvir, width))
+
+def _factor_rank_allocation():
+    """Return local ranks, allocated bytes/rank if known, and its source.
+
+    No MPI collectives: fragment solves reach the selector asynchronously.
+    Slurm memory values are MiB. In contrast, PySCF max_memory is decimal MB.
+    """
+    local_ranks = 1
+    for name in ('OMPI_COMM_WORLD_LOCAL_SIZE', 'SLURM_TASKS_PER_NODE',
+                 'SLURM_NTASKS_PER_NODE', 'OMPI_COMM_WORLD_SIZE',
+                 'PMI_SIZE', 'SLURM_NTASKS'):
+        count = _node_env_value(name)
+        if count is not None and count > 0:
+            local_ranks = count
+            break
+
+    node_mb = _node_env_value('SLURM_MEM_PER_NODE', minimum=True)
+    source = 'SLURM_MEM_PER_NODE'
+    if node_mb == 0:  # Slurm --mem=0 requests all memory on the node.
+        try:
+            pages = os.sysconf('SC_PHYS_PAGES')
+            page_size = os.sysconf('SC_PAGE_SIZE')
+            if pages > 0 and page_size > 0:
+                return (local_ranks, pages * page_size / local_ranks,
+                        'SLURM_MEM_PER_NODE=0')
+        except (AttributeError, OSError, ValueError):
+            pass
+        node_mb = None
+    elif node_mb is None:
+        per_cpu_mb = _node_env_value('SLURM_MEM_PER_CPU', minimum=True)
+        cpus = (_node_env_value('SLURM_CPUS_ON_NODE', minimum=True)
+                or _node_env_value('SLURM_JOB_CPUS_PER_NODE', minimum=True))
+        # Allocated CPUs can include unusable SMT siblings which Slurm does
+        # not include in --mem-per-cpu. Use the requested task CPUs as a
+        # conservative bound, including when SMT hints are not exported.
+        task_cpus = _node_env_value('SLURM_CPUS_PER_TASK', minimum=True) or 1
+        usable_cpus = local_ranks * task_cpus
+        if cpus:
+            usable_cpus = min(usable_cpus, cpus)
+        if per_cpu_mb:
+            node_mb = per_cpu_mb * usable_cpus
+            source = 'SLURM_MEM_PER_CPU'
+    if node_mb is None:
+        return local_ranks, None, 'max_memory'
+    return local_ranks, node_mb * 1024.0**2 / local_ranks, source
+
+
+def _ccsd_t_factor_block_nvir(nocc, nvir, max_memory, backward=False):
+    """Choose a factor-cache width within process and node memory budgets.
+
+    ``max_memory`` is the caller's remaining process budget in decimal MB.
+    Unset/``auto`` uses half the available headroom, capped by a full-width
+    cache. Numeric settings override the cache target in MiB. Both modes
+    respect max_memory and, when known, 80% of this rank's node allocation.
+    The remaining headroom covers workspaces outside the factor caches.
+    """
+    name = 'PYSCFAD_LNO_CCSD_T_FACTOR_BLOCK_MB'
+    setting = os.environ.get(name, 'auto').strip().lower()
+    block_mb = None
+    if setting != 'auto':
+        try:
+            block_mb = float(setting)
+        except ValueError:
+            raise ValueError(
+                f'{name} must be auto or a positive finite MiB value') from None
+        if not numpy.isfinite(block_mb) or block_mb <= 0:
+            raise ValueError(
+                f'{name} must be auto or a positive finite MiB value')
+
+    local_ranks, rank_bytes, source = _factor_rank_allocation()
+    available_bytes = max(max_memory, 0.0) * 1e6
+    if rank_bytes is not None:
+        rank_headroom = 0.8 * rank_bytes - current_memory()[0] * 1e6
+        available_bytes = min(available_bytes, max(rank_headroom, 0.0))
+
+    threads = num_threads()
+    # Rectangular forward caches have up to four copies. Backward also
+    # includes the native workers' private cache bars, as in the old selector.
+    copies = 4 * (threads + 1) if backward else 4
+    width_bytes = copies * max(nvir * nocc * (nocc + nvir) * 8, 1)
+    target_bytes = min(0.5 * available_bytes, width_bytes * nvir)
+    if block_mb is not None:
+        target_bytes = min(target_bytes, max(block_mb, 1.0) * 1024.0**2)
+    width = max(1, min(nvir, int(target_bytes // width_bytes)))
+
+    details = dict(
+        mode='auto' if block_mb is None else 'manual',
+        backward=backward, nocc=nocc, nvir=nvir, threads=threads,
+        ranks_per_node=local_ranks, memory_source=source,
+        allocated_rank_mib=(
+            None if rank_bytes is None else rank_bytes / 1024.0**2),
+        remaining_memory_mib=available_bytes / 1024.0**2,
+        cache_budget_mib=target_bytes / 1024.0**2, virtual_block=width,
+    )
+    resource_profile.checkpoint('triples.factor_block', **details)
+    if _profile_enabled() and not resource_profile.enabled():
+        print('    factor-cache selection: ' + ' '.join(
+            f'{key}={value}' for key, value in details.items()
+            if value is not None), flush=True)
+    return width
 
 
 def kernel(mycc, eris, ulo, t1=None, t2=None, verbose=logger.NOTE):

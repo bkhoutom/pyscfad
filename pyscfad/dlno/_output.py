@@ -128,25 +128,37 @@ def local_correlation_settings_lines(
 
 
 def mp2_prescreened_domain_lines(static_selections):
-    """Format fixed MP2 strong-extended-domain dimensions per fragment."""
+    """Format fixed MP2 primary- and extended-domain dimensions."""
 
     mp2_static = getattr(static_selections, "mp2_static", static_selections)
     lines = [
         _section("IAO-MP2 PRESCREENED DOMAINS"),
         (
             "All fragment labels are 1-based. Strong F includes the target; "
-            "ED is the MP2 strong extended domain."
+            "PD is the multipole-screen primary domain and ED is the MP2 "
+            "strong extended domain. A missing PD occ/vir screen is shown "
+            "as '-'."
         ),
         (
-            "  Frag   target IAO/atoms   strong F   ED atoms   ED AOs"
-            "   ED occ   ED vir"
+            "  Frag   target IAO/atoms   PD atoms   PD AOs   PD occ   PD vir"
+            "   strong F   ED atoms   ED AOs   ED occ   ED vir"
         ),
     ]
     for number, fragment in enumerate(mp2_static.fragments, start=1):
+        weak_virtual = fragment.weak_virtual
+        if weak_virtual is None:
+            primary_occ = primary_vir = "-"
+        else:
+            primary_occ = _count(fragment.weak_occ_norm_keep)
+            primary_vir = _count(weak_virtual.metric_keep)
         lines.append(
             f"  {number:4d}"
             f"   {_count(fragment.iao_indices):>6s}/"
             f"{_count(fragment.fragment_atoms):<5s}"
+            f"   {_size(fragment.primary_atoms):8d}"
+            f"   {_size(fragment.primary_ao_indices):6d}"
+            f"   {primary_occ:>6s}"
+            f"   {primary_vir:>6s}"
             f"   {_size(fragment.strong_fragments):8d}"
             f"   {_size(fragment.extended_atoms):8d}"
             f"   {_size(fragment.extended_ao_indices):6d}"

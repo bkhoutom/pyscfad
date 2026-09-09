@@ -229,11 +229,95 @@ def _to_device_leaf(leaf):
     return leaf
 
 
+_TREE_REDUCE_CHUNK_BYTES = 64 * 1024**2
+_TREE_REDUCE_MAX_COUNT = int(numpy.iinfo(numpy.int32).max)
+
+
+def _tree_reduce_leaf_metadata(leaf):
+    """Describe one cotangent leaf without serializing its data."""
+    if leaf is None:
+        return ("none",)
+    if hasattr(leaf, "dtype") and leaf.dtype == jax.dtypes.float0:
+        return ("float0", tuple(int(value) for value in leaf.shape))
+    try:
+        if hasattr(leaf, "dtype") and hasattr(leaf, "shape"):
+            dtype = numpy.dtype(leaf.dtype)
+            shape = tuple(int(value) for value in leaf.shape)
+        else:
+            array = numpy.asarray(leaf)
+            dtype = array.dtype
+            shape = tuple(int(value) for value in array.shape)
+    except (TypeError, ValueError):
+        return ("unsupported", type(leaf).__name__)
+    if dtype.hasobject or dtype.kind not in "iufc":
+        return ("unsupported", dtype.str)
+    return ("numeric", shape, dtype.str)
+
+
+def _tree_reduce_plans(paths, metadata_by_rank):
+    """Validate collective leaf metadata and return reduction plans."""
+    plans = {}
+    for path in paths:
+        descriptors = [metadata[path] for metadata in metadata_by_rank]
+        unsupported = [
+            (rank, descriptor)
+            for rank, descriptor in enumerate(descriptors)
+            if descriptor[0] == "unsupported"
+        ]
+        if unsupported:
+            rank, descriptor = unsupported[0]
+            raise TypeError(
+                f"MPI cotangent leaf {path} on rank {rank} has unsupported "
+                f"type {descriptor[1]}"
+            )
+
+        numeric = [
+            descriptor for descriptor in descriptors
+            if descriptor[0] == "numeric"
+        ]
+        if numeric:
+            reference = numeric[0]
+            if any(descriptor != reference for descriptor in numeric[1:]):
+                raise RuntimeError(
+                    f"MPI cotangent leaf {path} has inconsistent numeric "
+                    f"shape or dtype across ranks: {descriptors}"
+                )
+            shape = reference[1]
+            if any(
+                descriptor[0] == "float0" and descriptor[1] != shape
+                for descriptor in descriptors
+            ):
+                raise RuntimeError(
+                    f"MPI cotangent leaf {path} has inconsistent zero and "
+                    f"numeric shapes across ranks: {descriptors}"
+                )
+            plans[path] = reference
+            continue
+
+        float0 = [
+            descriptor for descriptor in descriptors
+            if descriptor[0] == "float0"
+        ]
+        if float0:
+            reference = float0[0]
+            if any(descriptor != reference for descriptor in float0[1:]):
+                raise RuntimeError(
+                    f"MPI cotangent leaf {path} has inconsistent float0 "
+                    f"shapes across ranks: {descriptors}"
+                )
+            plans[path] = reference
+        else:
+            plans[path] = ("none",)
+    return plans
+
+
 def _tree_sum_to_root(comm, tree, *, root=0):
     """Sum numeric leaves of a JAX pytree onto ``root``.
 
     Paths, rather than registered object identities, align leaves across the
-    independently constructed rank-0 and worker ``mf`` objects.
+    independently constructed rank-0 and worker ``mf`` objects. Numeric
+    leaves use bounded buffer reductions so the root never gathers every
+    rank's serialized tree at once.
     """
     if comm.Get_size() == 1:
         return tree
@@ -259,18 +343,80 @@ def _tree_sum_to_root(comm, tree, *, root=0):
             f"{mismatch}; root-only={sorted(root_path_set - other_paths)[:5]}, "
             f"rank-only={sorted(other_paths - root_path_set)[:5]}"
         )
-    local = {
-        path: _to_host_leaf(leaf)
+
+    leaves_by_path = {
+        path: leaf
         for path, (_, leaf) in zip(paths, leaves_with_path)
     }
-    gathered = comm.gather(local, root=root)
+    local_metadata = {
+        path: _tree_reduce_leaf_metadata(leaf)
+        for path, leaf in leaves_by_path.items()
+    }
+    metadata_by_rank = comm.allgather(local_metadata)
+    ordered_paths = all_paths[root]
+    plans = _tree_reduce_plans(ordered_paths, metadata_by_rank)
+
+    summed = {} if rank == root else None
+    for path in ordered_paths:
+        plan = plans[path]
+        if plan[0] == "none":
+            if rank == root:
+                summed[path] = None
+            continue
+        if plan[0] == "float0":
+            if rank == root:
+                summed[path] = numpy.zeros(
+                    plan[1], dtype=jax.dtypes.float0
+                )
+            continue
+
+        shape, dtype = plan[1], numpy.dtype(plan[2])
+        local_leaf = leaves_by_path[path]
+        local_kind = local_metadata[path][0]
+        if local_kind == "numeric":
+            host_leaf = numpy.array(
+                numpy.asarray(local_leaf), copy=True, order="C"
+            )
+            flat_leaf = host_leaf.reshape(-1)
+        else:
+            host_leaf = None
+            flat_leaf = None
+
+        if rank == root:
+            if host_leaf is None:
+                result = numpy.zeros(shape, dtype=dtype)
+            else:
+                result = host_leaf
+            flat_result = result.reshape(-1)
+        else:
+            result = None
+            flat_result = None
+
+        size = int(numpy.prod(shape, dtype=numpy.int64))
+        chunk_count = min(
+            _TREE_REDUCE_MAX_COUNT,
+            max(1, int(_TREE_REDUCE_CHUNK_BYTES) // dtype.itemsize),
+        )
+        for start in range(0, size, chunk_count):
+            stop = min(size, start + chunk_count)
+            if rank == root:
+                comm.Reduce(
+                    MPI.IN_PLACE,
+                    flat_result[start:stop],
+                    op=MPI.SUM,
+                    root=root,
+                )
+            else:
+                if flat_leaf is None:
+                    send = numpy.zeros(stop - start, dtype=dtype)
+                else:
+                    send = flat_leaf[start:stop]
+                comm.Reduce(send, None, op=MPI.SUM, root=root)
+        if rank == root:
+            summed[path] = result
+
     if rank != root:
         return None
-
-    summed = dict(gathered[0])
-    for other in gathered[1:]:
-        for path, value in other.items():
-            summed[path] = _add_cotangent(summed[path], value)
     return jax.tree_util.tree_unflatten(
         treedef, [summed[path] for path in paths]
     )

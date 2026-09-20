@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import reduce
+
+import jax
+import jax.numpy as jnp
 import numpy as np
+from pyscf import gto
 from pyscf.lib import logger
 
 def autofrag(mol, H2heavy=True):
@@ -100,3 +105,43 @@ def map_lo_to_frag(mol, orbloc, frag_atmlist, verbose=None):
     frag_lolist = [np.where(lo_frag_map==i)[0] for i in range(nfrag)]
 
     return frag_lolist
+
+
+def _is_traced(*xs):
+    for x in xs:
+        if isinstance(x, jax.core.Tracer):
+            return True
+    return False
+
+
+def project_mo(mo1, s21, s22):
+    """Project columns between AO bases by solving ``s22 @ mo2 = s21 @ mo1``.
+
+    Traced inputs use JAX. Concrete inputs use NumPy to keep reference-domain
+    preprocessing on the host without accumulating JAX dispatch caches.
+    """
+    if _is_traced(mo1, s21, s22):
+        rhs = jnp.asarray(s21) @ jnp.asarray(mo1)
+        return jnp.linalg.solve(jnp.asarray(s22), rhs)
+    rhs = np.asarray(s21) @ np.asarray(mo1)
+    return np.linalg.solve(np.asarray(s22), rhs)
+
+
+def ao_index_by_atom(mol, atmlst):
+    aoslices = mol.aoslice_by_atom()[:, 2:]
+    ao_idx_lst = map(lambda x: np.arange(*x), aoslices[atmlst].reshape(-1, 2))
+    ao_idx = reduce(np.union1d, ao_idx_lst)
+    return ao_idx
+
+
+def fake_mol_by_atom(mol, atmlst=None):
+    if atmlst is not None:
+        fake_mol = mol.copy(deep=False)
+        fake_mol._atom = [mol._atom[a] for a in atmlst]
+        fake_mol._atm, fake_mol._bas, fake_mol._env = \
+            fake_mol.make_env(fake_mol._atom, fake_mol._basis,
+                              mol._env[:gto.PTR_ENV_START])
+        fake_mol._built = True
+    else:
+        fake_mol = mol
+    return fake_mol

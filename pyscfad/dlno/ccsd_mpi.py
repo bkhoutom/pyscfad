@@ -1,93 +1,57 @@
-"""MPI fragment parallelism for IAO-DLNO-CCSD(T) gradients.
-
-Each MPI task owns complete fragment calculations.  In particular, a worker
-constructs one fragment LIS, evaluates its CCSD(T) and matching MP2
-subtraction, and closes that entire scalar calculation back into the shared
-``(mf, common)`` coordinates before communicating any cotangent.  Raw LIS
-coefficients and LIS-frame cotangents never cross MPI, so independently
-constructed fragment gauges do not need to be aligned between ranks.
-
-The molecule-wide IAO-DLNO-MP2 correction is evaluated by the existing
-gauge-safe MPI implementation.  Root then combines the fragment, MP2, and HF
-mean-field cotangents and applies exactly one implicit SCF pullback.
-
-For fixed LIS selection, the root rank alone fixes the fragment/ED topology
-and constructs ED orbital frames.  It streams at most one frame per MPI rank
-in each batch; the ranks independently form the target-conditioned MP2
-density and select the fixed LIS labels.  Only those small label records are
-gathered, so neither ED frames nor MP2-density intermediates accumulate over
-all fragments.
-"""
+"""MPI DLNO-CCSD(T) with rank-local fragment solves and shared SCF response."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import gc
 import os
 import time
 import traceback
-from dataclasses import dataclass
 
 import jax
-import jax.numpy as jnp
-import numpy
+import jax.numpy as np
 from mpi4py import MPI
+import numpy
 
 from pyscfad import config_update
 from pyscfad.df.mpi_df_jk import MPIDFJKExecutor, ServiceExit
 from pyscfad.ops import stop_trace
 
 from ._output import (
-    emit_lines,
-    energy_summary_lines,
-    fragment_energy_lines,
-    lis_active_space_lines,
-    lis_dimensions_from_static,
-    local_correlation_settings_lines,
-    mp2_prescreened_domain_lines,
+    emit_lines, energy_summary_lines, fragment_energy_lines,
+    lis_active_space_lines, lis_dimensions_from_static,
+    local_correlation_settings_lines, mp2_prescreened_domain_lines,
     nuclear_force_lines,
 )
-from .ccsd import DLNOCCSD as _SerialDLNOCCSD
-from .iao_ccsd import (
-    _add_cotangent,
-    _fragment_value_and_grad,
-    _restart_scientific_payload,
-    _validate_solver_options,
-    build_iao_dlno_ccsd_domain_selections,
-)
-from .iao_lis import (
-    IAO_LIS_INTERNAL_RANK_THRESHOLD,
-    IAOLISFragmentStaticSelection,
-    IAOFragmentLISStaticSelections,
-    build_iao_lis_fragment_static_selection,
-)
-from .iao_mp2 import IAOFragmentMP2Thresholds, _fix_restart_mo_phases
-from .iao_mp2_grad import build_strong_ed_domain, rebuild_iao_mp2_common
-from .iao_mp2_mpi import (
-    _exception_text,
-    _progress_enabled,
-    _progress_reporter,
-    _raise_if_any_rank_failed,
-    _raise_if_root_failed,
-    _to_device_leaf,
-    _to_host_leaf,
-    _tree_sum_to_root,
-    _verify_shared_reference,
-    _verify_shared_gauge,
-    _zero_term_cotangents,
-    correlation_value_and_grad as _mp2_correlation_value_and_grad,
-)
 from ._restart import RestartManager
+from .ccsd import (
+    DLNOCCSD as _SerialDLNOCCSD, _add_cotangent, _fragment_value_and_grad,
+    _restart_jsonable, _restart_scientific_payload, _validate_solver_options,
+    _validate_static_target_options, build_domain_selections_for_ccsd,
+)
+from .lis import FragmentLISSelection, LISSelections, LIS_INTERNAL_RANK_THRESHOLD, build_fragment_lis_selection
+from .dlno_base import build_strong_ed_domain, rebuild_domain_data
+from .dlno_base_mpi import (
+    _exception_text, _progress_enabled, _progress_reporter,
+    _raise_if_any_rank_failed, _raise_if_root_failed, _to_device_leaf,
+    _to_host_leaf, _tree_sum_to_root, _verify_shared_gauge,
+    _verify_shared_reference, _zero_term_cotangents,
+)
+from .domain import DLNOThresholds
+from .mp2 import _fix_restart_mo_phases
+from .mp2_mpi import correlation_value_and_grad as _mp2_correlation_value_and_grad
+from .targets import resolve_target_options
 
 
 __all__ = [
     "DLNOCCSD",
-    "IAODLNOCCSDMPIFragmentResult",
-    "IAODLNOCCSDMPIResult",
+    "CCSDMPIFragmentResult",
+    "CCSDMPIResult",
 ]
 
 
 @dataclass(frozen=True)
-class IAODLNOCCSDMPIFragmentResult:
+class CCSDMPIFragmentResult:
     """Scalar record for one complete fragment job."""
 
     fragment_index: int
@@ -101,7 +65,7 @@ class IAODLNOCCSDMPIFragmentResult:
 
 
 @dataclass(frozen=True)
-class IAODLNOCCSDMPIResult:
+class CCSDMPIResult:
     """MPI energy decomposition, fragment ownership, and scalar timings."""
 
     e_hf: float
@@ -111,7 +75,7 @@ class IAODLNOCCSDMPIResult:
     e_ccsd_t: float
     e_corr: float
     e_total: float
-    fragments: tuple[IAODLNOCCSDMPIFragmentResult, ...]
+    fragments: tuple[CCSDMPIFragmentResult, ...]
     nproc: int
     total_seconds: float
 
@@ -130,7 +94,7 @@ def _fragment_record_metadata(record):
 
 
 def _fragment_record_from_metadata(row):
-    return IAODLNOCCSDMPIFragmentResult(
+    return CCSDMPIFragmentResult(
         fragment_index=int(row["fragment_index"]),
         worker_rank=int(row["worker_rank"]),
         e_mp2_lis=float(row["e_mp2_lis"]),
@@ -168,6 +132,8 @@ def _mpi_restart_scientific_payload(
     internal_rank_threshold,
     ccsd_t,
     dcsd,
+    lo_type="iao",
+    lo_kwargs=None,
     nproc,
     root,
 ):
@@ -187,6 +153,8 @@ def _mpi_restart_scientific_payload(
         internal_rank_threshold=internal_rank_threshold,
         ccsd_t=ccsd_t,
         dcsd=dcsd,
+        lo_type=lo_type,
+        lo_kwargs=lo_kwargs,
     )
     payload["driver_schema"] = "mpi-iao-dlno-gradient-v1"
     # Rank-local cumulative CC states use the current round-robin ownership.
@@ -226,11 +194,13 @@ def _build_mp2_static_selections(
     thresholds,
     pair_energy_model,
     force_full_domains,
+    lo_type,
+    lo_kwargs,
     static_selections,
 ):
     if static_selections is None:
         return stop_trace(
-            lambda mf_: build_iao_dlno_ccsd_domain_selections(
+            lambda mf_: build_domain_selections_for_ccsd(
                 mf_,
                 frag_lolist=frag_lolist,
                 frag_atmlist=frag_atmlist,
@@ -238,12 +208,22 @@ def _build_mp2_static_selections(
                 thresholds=thresholds,
                 pair_energy_model=pair_energy_model,
                 force_full_domains=force_full_domains,
+                lo_type=lo_type,
+                lo_kwargs=lo_kwargs,
             )
         )(mf)
-    if not isinstance(static_selections, IAOFragmentLISStaticSelections):
+    if not isinstance(static_selections, LISSelections):
         raise TypeError(
-            "static_selections must be IAOFragmentLISStaticSelections"
+            "static_selections must be LISSelections"
         )
+    _validate_static_target_options(
+        static_selections,
+        lo_type=lo_type,
+        lo_kwargs=lo_kwargs,
+        frag_lolist=frag_lolist,
+        frag_atmlist=frag_atmlist,
+        frozen=frozen,
+    )
     return static_selections.mp2_static
 
 
@@ -307,7 +287,7 @@ def _assemble_lis_static_selections(
     fragments = []
     for fragment_index, selection in records:
         fragment_index = int(fragment_index)
-        if not isinstance(selection, IAOLISFragmentStaticSelection):
+        if not isinstance(selection, FragmentLISSelection):
             raise TypeError(
                 "MPI LIS worker returned a non-LIS selection for fragment "
                 f"{fragment_index}"
@@ -319,7 +299,7 @@ def _assemble_lis_static_selections(
                 f"{selection.fragment_index}"
             )
         fragments.append(selection)
-    return IAOFragmentLISStaticSelections(
+    return LISSelections(
         mp2_static=mp2_static,
         thresh_occ=float(thresh_occ),
         thresh_vir=float(thresh_vir),
@@ -439,7 +419,7 @@ def _finish_value_and_grad(
         )
     if return_details:
         if rank == root:
-            details = IAODLNOCCSDMPIResult(
+            details = CCSDMPIResult(
                 e_hf=float(canonical["e_tot"]),
                 e_iao_mp2=float(e_iao_mp2),
                 e_mp2_lis=float(components["e_mp2_lis"]),
@@ -576,9 +556,11 @@ def _value_and_grad(
     thresholds=None,
     pair_energy_model="multipole",
     force_full_domains=False,
+    lo_type="iao",
+    lo_kwargs=None,
     thresh_occ=1e-4,
     thresh_vir=1e-5,
-    internal_rank_threshold=IAO_LIS_INTERNAL_RANK_THRESHOLD,
+    internal_rank_threshold=LIS_INTERNAL_RANK_THRESHOLD,
     ccsd_t=False,
     dcsd=False,
     verbose_imp=0,
@@ -598,6 +580,7 @@ def _value_and_grad(
     if root < 0 or root >= nproc:
         raise ValueError(f"root={root} is invalid for {nproc} MPI ranks")
     _validate_solver_options(ccsd_t=ccsd_t, dcsd=dcsd)
+    lo_type, lo_kwargs = resolve_target_options(lo_type, lo_kwargs)
     if resume and checkpoint_dir is None:
         raise ValueError("resume=True requires checkpoint_dir")
     progress_enabled = _progress_enabled(progress)
@@ -608,6 +591,8 @@ def _value_and_grad(
         bool(parallel_scf_jk),
         bool(ccsd_t),
         bool(dcsd),
+        lo_type,
+        repr(_restart_jsonable(lo_kwargs)),
         None if checkpoint_dir is None else str(
             os.path.abspath(os.path.expanduser(os.fspath(checkpoint_dir)))
         ),
@@ -616,7 +601,8 @@ def _value_and_grad(
     if len(set(schedules)) != 1:
         raise ValueError(
             "root, return_details, progress, parallel_scf_jk, "
-            "ccsd_t, dcsd, checkpoint_dir, and resume must be consistent "
+            "ccsd_t, dcsd, lo_type, lo_kwargs, checkpoint_dir, and resume "
+            "must be consistent "
             "on all ranks"
         )
     parallel_scf_jk = bool(parallel_scf_jk) and nproc > 1
@@ -633,7 +619,7 @@ def _value_and_grad(
             "trace_ctr_coeff=False"
         )
     if thresholds is None:
-        thresholds = IAOFragmentMP2Thresholds()
+        thresholds = DLNOThresholds()
 
     scf_builder = build_mf
     if checkpoint_dir is not None:
@@ -728,6 +714,8 @@ def _value_and_grad(
                 internal_rank_threshold=internal_rank_threshold,
                 ccsd_t=ccsd_t,
                 dcsd=dcsd,
+                lo_type=lo_type,
+                lo_kwargs=lo_kwargs,
                 nproc=nproc,
                 root=root,
             )
@@ -785,17 +773,17 @@ def _value_and_grad(
         try:
             e_hf, hf_pullback = jax.vjp(lambda mf_: mf_.e_tot, mf)
             hf_bar, = hf_pullback(
-                jnp.ones((), dtype=jnp.asarray(e_hf).dtype)
+                np.ones((), dtype=np.asarray(e_hf).dtype)
             )
             if resume and restart.enabled:
                 if static_selections is not None:
                     if not isinstance(
                         static_selections,
-                        IAOFragmentLISStaticSelections,
+                        LISSelections,
                     ):
                         raise TypeError(
                             "static_selections must be "
-                            "IAOFragmentLISStaticSelections"
+                            "LISSelections"
                         )
                     restart.bind_static(static_selections)
                 pre_scf = restart.load_record(
@@ -912,7 +900,7 @@ def _value_and_grad(
             saved_static = None
             if resume and restart.enabled:
                 saved_static = restart.load_static(
-                    expected_type=IAOFragmentLISStaticSelections
+                    expected_type=LISSelections
                 )
             if prebuilt_static is None and saved_static is not None:
                 prebuilt_static = saved_static
@@ -937,10 +925,12 @@ def _value_and_grad(
                 thresholds=thresholds,
                 pair_energy_model=pair_energy_model,
                 force_full_domains=force_full_domains,
+                lo_type=lo_type,
+                lo_kwargs=lo_kwargs,
                 static_selections=prebuilt_static,
             )
             common_original, common_pullback = jax.vjp(
-                lambda mf_: rebuild_iao_mp2_common(mf_, mp2_static), mf
+                lambda mf_: rebuild_domain_data(mf_, mp2_static), mf
             )
             common_host = jax.tree_util.tree_map(
                 _to_host_leaf, common_original
@@ -961,6 +951,11 @@ def _value_and_grad(
                     float(thresh_vir),
                     float(internal_rank_threshold),
                 ),
+            )
+            _report_progress(
+                reporter,
+                f"target localization: mode={lo_type}; options="
+                f"{_restart_jsonable(lo_kwargs)!r}",
             )
             _report_progress(
                 reporter,
@@ -1079,7 +1074,7 @@ def _value_and_grad(
                     )
                     selection = stop_trace(
                         lambda mf_, common_, domain_: (
-                            build_iao_lis_fragment_static_selection(
+                            build_fragment_lis_selection(
                                 mf_,
                                 mp2_static,
                                 fragment_index,
@@ -1411,7 +1406,7 @@ def _value_and_grad(
                     _add_cotangent, local_common_bar, fragment.common_bar
                 )
                 jax.block_until_ready((local_mf_bar, local_common_bar))
-                local_records.append(IAODLNOCCSDMPIFragmentResult(
+                local_records.append(CCSDMPIFragmentResult(
                     fragment_index=int(fragment_index),
                     worker_rank=int(rank),
                     e_mp2_lis=float(jax.device_get(fragment.e_mp2_lis)),
@@ -1559,7 +1554,12 @@ def _value_and_grad(
 
 
 class DLNOCCSD(_SerialDLNOCCSD):
-    """IAO-DLNO-CCSD(T) with MPI distribution over complete fragments."""
+    """Targeted DLNO-CCSD(T) distributed over complete MPI fragments.
+
+    ``lo_type="boys"`` selects Boys-localized targets and forwards optional
+    ``lo_kwargs`` to the localizer.  Boys targets require singleton
+    ``frag_lolist`` entries and reject ``frag_atmlist``.
+    """
 
     @classmethod
     def value_and_grad(
@@ -1573,9 +1573,11 @@ class DLNOCCSD(_SerialDLNOCCSD):
         thresholds=None,
         pair_energy_model="multipole",
         force_full_domains=False,
+        lo_type="iao",
+        lo_kwargs=None,
         thresh_occ=1e-4,
         thresh_vir=1e-5,
-        internal_rank_threshold=IAO_LIS_INTERNAL_RANK_THRESHOLD,
+        internal_rank_threshold=LIS_INTERNAL_RANK_THRESHOLD,
         ccsd_t=False,
         dcsd=False,
         verbose_imp=0,
@@ -1590,6 +1592,11 @@ class DLNOCCSD(_SerialDLNOCCSD):
     ):
         """Return total energy on all ranks and the nuclear gradient on root.
 
+        ``lo_type="boys"`` selects Boys-localized singleton targets;
+        ``lo_kwargs`` is forwarded to the Boys localizer.  In this mode,
+        ``frag_lolist`` must be a complete singleton partition and
+        ``frag_atmlist`` is unsupported.
+
         Root calls ``build_mf(mol)`` and owns the converged SCF VJP.  Every
         non-root rank calls ``build_mf`` with ``mo_coeff_init``,
         ``mo_energy_init``, ``mo_occ_init``, and ``e_tot_init``.  That worker
@@ -1602,7 +1609,7 @@ class DLNOCCSD(_SerialDLNOCCSD):
         or LIS-frame cotangent is communicated.  With ``return_details=True``
         a third, immutable decomposition object is broadcast to every rank.
         ``progress`` follows the same root-only bool/callable convention as
-        :mod:`pyscfad.dlno.iao_mp2_mpi` and must be consistent on all ranks.
+        :mod:`pyscfad.dlno.mp2_mpi` and must be consistent on all ranks.
         With ``parallel_scf_jk=True``, workers additionally serve the forward
         DF-SCF J/K builds, implicit density response, and distributed
         three-centre coordinate VJP before fragment work and during the final
@@ -1627,6 +1634,8 @@ class DLNOCCSD(_SerialDLNOCCSD):
                 thresholds=thresholds,
                 pair_energy_model=pair_energy_model,
                 force_full_domains=force_full_domains,
+                lo_type=lo_type,
+                lo_kwargs=lo_kwargs,
                 thresh_occ=thresh_occ,
                 thresh_vir=thresh_vir,
                 internal_rank_threshold=internal_rank_threshold,

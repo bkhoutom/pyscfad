@@ -1,3 +1,5 @@
+from pyscfad.dlno import mp2_mpi
+
 import warnings
 
 from mpi4py import MPI
@@ -6,12 +8,10 @@ import pytest
 
 from pyscfad import config_update, gto, scf
 from pyscfad.dlno import _restart as restart_module
-from pyscfad.dlno import iao_mp2_mpi as iao_mp2_mpi_module
-from pyscfad.dlno.iao_mp2 import (
-    IAOFragmentMP2 as SerialIAOFragmentMP2,
-    IAOFragmentMP2Thresholds,
-)
-from pyscfad.dlno.iao_mp2_mpi import IAOFragmentMP2 as MPIIAOFragmentMP2
+
+from pyscfad.dlno.mp2 import DLNOMP2 as SerialIAOFragmentMP2
+from pyscfad.dlno.domain import DLNOThresholds
+from pyscfad.dlno.mp2_mpi import DLNOMP2 as MPIDLNOMP2
 
 
 warnings.filterwarnings(
@@ -61,7 +61,7 @@ def _build_mf(
 
 
 def _full_domain_thresholds():
-    return IAOFragmentMP2Thresholds(
+    return DLNOThresholds(
         pao_norm=1e-10,
         domain_pao=0.0,
         ed_pao=0.0,
@@ -89,7 +89,7 @@ def test_comm_self_matches_serial_energy_and_gradient_to_roundoff():
             )
         )
         mpi_energy, mpi_bar, mpi_details = (
-            MPIIAOFragmentMP2.value_and_grad(
+            MPIDLNOMP2.value_and_grad(
                 mol,
                 comm=MPI.COMM_SELF,
                 return_details=True,
@@ -164,7 +164,7 @@ def test_comm_self_restart_after_correlation_and_from_pre_scf(
         config_update("pyscfad_scf_first_order_custom", False),
     ):
         reference_energy, reference_bar, reference_details = (
-            MPIIAOFragmentMP2.value_and_grad(mol, **kwargs)
+            MPIDLNOMP2.value_and_grad(mol, **kwargs)
         )
 
         class InjectedStop(RuntimeError):
@@ -182,14 +182,14 @@ def test_comm_self_restart_after_correlation_and_from_pre_scf(
             stop_after_correlation,
         )
         with pytest.raises(RuntimeError, match="durable MPI correlation"):
-            MPIIAOFragmentMP2.value_and_grad(
+            MPIDLNOMP2.value_and_grad(
                 mol, checkpoint_dir=checkpoint_dir, **kwargs
             )
 
         messages = []
         monkeypatch.setattr(restart_module, "_CHECKPOINT_EVENT_HOOK", None)
         resumed_energy, resumed_bar, resumed_details = (
-            MPIIAOFragmentMP2.value_and_grad(
+            MPIDLNOMP2.value_and_grad(
                 mol,
                 checkpoint_dir=checkpoint_dir,
                 resume=True,
@@ -221,13 +221,13 @@ def test_comm_self_restart_after_correlation_and_from_pre_scf(
             raise AssertionError("pre-SCF restart repeated MPI correlation")
 
         monkeypatch.setattr(
-            iao_mp2_mpi_module,
-            "correlation_value_and_grad",
+            mp2_mpi,
+            'correlation_value_and_grad',
             forbidden_correlation,
         )
         messages.clear()
         final_energy, final_bar, final_details = (
-            MPIIAOFragmentMP2.value_and_grad(
+            MPIDLNOMP2.value_and_grad(
                 mol,
                 checkpoint_dir=checkpoint_dir,
                 resume=True,

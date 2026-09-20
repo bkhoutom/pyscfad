@@ -1,3 +1,5 @@
+from pyscfad.dlno import dlno_base, mp2
+
 import warnings
 
 import jax
@@ -5,20 +7,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-import pyscfad.dlno.iao_mp2_grad as iao_mp2_grad_module
+
 from pyscfad import config, config_update, gto, scf
-from pyscfad.dlno.iao_mp2 import (
-    IAOFragmentMP2,
-    IAOFragmentMP2Thresholds,
-    build_iao_fragment_topology,
-    evaluate_iao_fragment_mp2,
-)
-from pyscfad.dlno.iao_mp2_grad import (
-    build_iao_mp2_static_selections,
-    correlation_energy,
-    correlation_value_and_grad,
-    correlation_value_and_grad_with_iao,
-)
+from pyscfad.dlno.mp2 import DLNOMP2, evaluate_domain_mp2
+from pyscfad.dlno.domain import DLNOThresholds, build_domain_topology
+from pyscfad.dlno._selection import build_domain_selections
+from pyscfad.dlno.mp2 import correlation_energy, correlation_value_and_grad, correlation_value_and_grad_with_targets
 from pyscfad.lno import lno_base
 from pyscfad.mp import dfmp2
 from pyscfad.ops import stop_trace
@@ -76,7 +70,7 @@ def _build_mf(mol):
 
 
 def _full_domain_thresholds():
-    return IAOFragmentMP2Thresholds(
+    return DLNOThresholds(
         pao_norm=1e-10,
         domain_pao=0.0,
         ed_pao=0.0,
@@ -108,7 +102,7 @@ def test_fixed_metric_orthonormalization_projector_jvp_matches_fd(keep):
     probe = 0.5 * (probe + probe.T)
 
     def projected_scalar(coeff_):
-        orth = iao_mp2_grad_module._fixed_metric_orthonormalize(
+        orth = dlno_base._fixed_metric_orthonormalize(
             coeff_, overlap, keep
         )
         projector = orth @ orth.T
@@ -144,7 +138,7 @@ def test_full_domain_value_and_grad_matches_canonical_dfmp2(
         reference_energy, reference_bar = jax.value_and_grad(
             canonical_total
         )(mol)
-    local_energy, local_bar = IAOFragmentMP2.value_and_grad(
+    local_energy, local_bar = DLNOMP2.value_and_grad(
         mol,
         build_mf=_build_mf,
         frozen=frozen,
@@ -175,7 +169,7 @@ def test_value_and_grad_forces_standard_implicit_scf_response():
 
     assert config.scf_first_order_custom
     with config_update("pyscfad_scf_implicit_diff", False):
-        energy, mol_bar = IAOFragmentMP2.value_and_grad(
+        energy, mol_bar = DLNOMP2.value_and_grad(
             _water(),
             build_mf=build_mf,
             thresholds=_full_domain_thresholds(),
@@ -216,21 +210,21 @@ def _water_dimer(distance_angstrom):
 def test_fixed_topology_mixed_strong_weak_gradient_matches_fd():
     distance = 8.0
     mol = _water_dimer(distance)
-    thresholds = IAOFragmentMP2Thresholds(
+    thresholds = DLNOThresholds(
         pair_energy=1e-4,
     )
     with config_update("pyscfad_scf_first_order_custom", False):
         reference_mf = _build_mf(mol)
-    reference_topology = build_iao_fragment_topology(
+    reference_topology = build_domain_topology(
         reference_mf,
         thresholds=thresholds,
         pair_energy_model="multipole",
     )
-    static = build_iao_mp2_static_selections(
+    static = build_domain_selections(
         reference_mf, reference_topology
     )
     assert np.count_nonzero(~static.strong_mask) == 2
-    eager_energy = evaluate_iao_fragment_mp2(
+    eager_energy = evaluate_domain_mp2(
         reference_mf, reference_topology
     ).e_corr
     rebuilt_energy = float(correlation_energy(reference_mf, static))
@@ -238,7 +232,7 @@ def test_fixed_topology_mixed_strong_weak_gradient_matches_fd():
         rebuilt_energy, eager_energy, atol=2e-10, rtol=2e-10
     )
 
-    energy, mol_bar = IAOFragmentMP2.value_and_grad(
+    energy, mol_bar = DLNOMP2.value_and_grad(
         mol,
         build_mf=_build_mf,
         topology=static,
@@ -274,19 +268,19 @@ def test_total_and_progressive_paths_evaluate_unordered_weak_pair_once(
     monkeypatch,
 ):
     mol = _water_dimer(8.0)
-    thresholds = IAOFragmentMP2Thresholds(
+    thresholds = DLNOThresholds(
         pair_energy=1e-4,
     )
     mf = _build_mf(mol)
-    topology = build_iao_fragment_topology(
+    topology = build_domain_topology(
         mf,
         thresholds=thresholds,
         pair_energy_model="multipole",
     )
-    static = build_iao_mp2_static_selections(mf, topology)
+    static = build_domain_selections(mf, topology)
     assert np.count_nonzero(~static.strong_mask) == 2
 
-    real_cross = iao_mp2_grad_module.dlno_mp2.pair_energy_multipole_cross
+    real_cross = mp2.multipole.pair_energy_multipole_cross
     calls = []
 
     def counted_cross(*args, **kwargs):
@@ -294,7 +288,7 @@ def test_total_and_progressive_paths_evaluate_unordered_weak_pair_once(
         return real_cross(*args, **kwargs)
 
     monkeypatch.setattr(
-        iao_mp2_grad_module.dlno_mp2,
+        mp2.multipole,
         "pair_energy_multipole_cross",
         counted_cross,
     )
@@ -313,12 +307,12 @@ def test_total_and_progressive_paths_evaluate_unordered_weak_pair_once(
 def test_progressive_details_preserve_energy_and_cotangent_to_roundoff():
     mol = _water_dimer(8.0)
     mf = _build_mf(mol)
-    topology = build_iao_fragment_topology(
+    topology = build_domain_topology(
         mf,
-        thresholds=IAOFragmentMP2Thresholds(pair_energy=1e-4),
+        thresholds=DLNOThresholds(pair_energy=1e-4),
         pair_energy_model="multipole",
     )
-    static = build_iao_mp2_static_selections(mf, topology)
+    static = build_domain_selections(mf, topology)
 
     plain_energy, plain_bar = correlation_value_and_grad(mf, static)
     profiled_energy, profiled_bar, details = correlation_value_and_grad(
@@ -369,16 +363,16 @@ def test_progressive_details_preserve_energy_and_cotangent_to_roundoff():
 
 def test_scalar_correlation_energy_rejects_outer_ad_trace():
     mol = _water_dimer(8.0)
-    thresholds = IAOFragmentMP2Thresholds(
+    thresholds = DLNOThresholds(
         pair_energy=1e-4,
     )
     mf = _build_mf(mol)
-    topology = build_iao_fragment_topology(
+    topology = build_domain_topology(
         mf,
         thresholds=thresholds,
         pair_energy_model="multipole",
     )
-    static = build_iao_mp2_static_selections(mf, topology)
+    static = build_domain_selections(mf, topology)
 
     with pytest.raises(TypeError, match="correlation_value_and_grad"):
         jax.vjp(lambda mf_: correlation_energy(mf_, static), mf)
@@ -388,7 +382,7 @@ def test_external_iao_pullback_matches_internal_rebuild():
     mol = _water()
     mf, internal_scf_pullback = jax.vjp(_build_mf, mol)
     static = stop_trace(
-        lambda mf_: IAOFragmentMP2.build_static_topology(
+        lambda mf_: DLNOMP2.build_static_topology(
             mf_,
             thresholds=_full_domain_thresholds(),
             pair_energy_model="all",
@@ -412,7 +406,7 @@ def test_external_iao_pullback_matches_internal_rebuild():
         mf,
     )
     external_energy, external_mf_bar, iao_bar = (
-        correlation_value_and_grad_with_iao(mf, iao_coeff, static)
+        correlation_value_and_grad_with_targets(mf, iao_coeff, static)
     )
     iao_mf_bar, = iao_pullback(iao_bar)
 
@@ -454,7 +448,7 @@ def test_serial_restart_from_pre_scf_avoids_local_mp2(tmp_path, monkeypatch):
         force_full_domains=True,
         checkpoint_dir=checkpoint_dir,
     )
-    reference_energy, reference_bar = IAOFragmentMP2.value_and_grad(
+    reference_energy, reference_bar = DLNOMP2.value_and_grad(
         _water(), **kwargs
     )
 
@@ -462,9 +456,9 @@ def test_serial_restart_from_pre_scf_avoids_local_mp2(tmp_path, monkeypatch):
         raise AssertionError("a pre-SCF restart reevaluated local MP2")
 
     monkeypatch.setattr(
-        iao_mp2_grad_module, "_correlation_term_energy", forbidden_term
+        mp2, '_correlation_term_energy', forbidden_term
     )
-    resumed_energy, resumed_bar = IAOFragmentMP2.value_and_grad(
+    resumed_energy, resumed_bar = DLNOMP2.value_and_grad(
         _water(), resume=True, **kwargs
     )
     np.testing.assert_allclose(resumed_energy, reference_energy, atol=0, rtol=0)
@@ -508,7 +502,7 @@ def test_serial_restart_accepts_fresh_scf_vjp_from_chk_and_cderi(
         force_full_domains=True,
         checkpoint_dir=checkpoint_dir,
     )
-    reference_energy, reference_bar = IAOFragmentMP2.value_and_grad(
+    reference_energy, reference_bar = DLNOMP2.value_and_grad(
         mol, build_mf=first_build_mf, **kwargs
     )
 
@@ -533,9 +527,9 @@ def test_serial_restart_accepts_fresh_scf_vjp_from_chk_and_cderi(
         raise AssertionError("SCF/CDERI restart reevaluated local MP2")
 
     monkeypatch.setattr(
-        iao_mp2_grad_module, "_correlation_term_energy", forbidden_term
+        mp2, '_correlation_term_energy', forbidden_term
     )
-    resumed_energy, resumed_bar = IAOFragmentMP2.value_and_grad(
+    resumed_energy, resumed_bar = DLNOMP2.value_and_grad(
         mol, build_mf=restart_build_mf, resume=True, **kwargs
     )
     np.testing.assert_allclose(
@@ -566,7 +560,7 @@ def test_serial_restart_resumes_after_one_completed_term(tmp_path, monkeypatch):
     )
     reference_kwargs = dict(kwargs)
     reference_kwargs.pop("checkpoint_dir")
-    reference_energy, reference_bar = IAOFragmentMP2.value_and_grad(
+    reference_energy, reference_bar = DLNOMP2.value_and_grad(
         _hydrogen_molecule(), **reference_kwargs
     )
 
@@ -582,20 +576,20 @@ def test_serial_restart_resumes_after_one_completed_term(tmp_path, monkeypatch):
         _restart, "_CHECKPOINT_EVENT_HOOK", stop_after_first_term
     )
     with pytest.raises(ExpectedStop):
-        IAOFragmentMP2.value_and_grad(_hydrogen_molecule(), **kwargs)
+        DLNOMP2.value_and_grad(_hydrogen_molecule(), **kwargs)
 
     monkeypatch.setattr(_restart, "_CHECKPOINT_EVENT_HOOK", None)
     completed_specs = []
-    real_term = iao_mp2_grad_module._correlation_term_energy
+    real_term = mp2._correlation_term_energy
 
     def counted_term(mf, common, static, spec):
         completed_specs.append(tuple(spec))
         return real_term(mf, common, static, spec)
 
     monkeypatch.setattr(
-        iao_mp2_grad_module, "_correlation_term_energy", counted_term
+        mp2, '_correlation_term_energy', counted_term
     )
-    resumed_energy, resumed_bar = IAOFragmentMP2.value_and_grad(
+    resumed_energy, resumed_bar = DLNOMP2.value_and_grad(
         _hydrogen_molecule(), resume=True, **kwargs
     )
 

@@ -2,7 +2,7 @@
 
 Run explicitly with::
 
-    pytest -q pyscfad/dlno/test/test_iao_ccsd_mpi_restart.py \
+    pytest -q pyscfad/dlno/test/test_ccsd_mpi_restart.py \
         -k true_mpiexec_restart_high_cost
 
 The normal test selection excludes ``*_high_cost`` tests.
@@ -142,6 +142,7 @@ def test_true_mpiexec_restart_high_cost(tmp_path):
     # Both ranks durably finished the first round before the injected rank-0
     # failure was reported.  Rank 0 must continue with fragment 2, while rank
     # 1 correctly skips its already committed fragment.
+    assert reference["fragment_calls"] == [2, 1]
     assert resumed["fragment_calls"] == [1, 0]
     np.testing.assert_allclose(
         pre_scf["energy"], resumed["energy"], atol=0.0, rtol=0.0

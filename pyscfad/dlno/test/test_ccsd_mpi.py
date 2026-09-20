@@ -6,7 +6,7 @@ ranks, so the two-fragment water dimer actually crosses the MPI boundary.
 
 Run the true multi-rank check explicitly with, for example::
 
-    pytest -q pyscfad/dlno/test/test_iao_ccsd_mpi.py \
+    pytest -q pyscfad/dlno/test/test_ccsd_mpi.py \
         -k mpiexec_np1_np2_high_cost
 
 The repository-wide pytest configuration excludes ``*_high_cost`` tests by
@@ -14,6 +14,10 @@ default.
 """
 
 from __future__ import annotations
+
+from pyscfad.dlno import ccsd_mpi, dlno_base
+from pyscfad.dlno import lis
+
 
 import argparse
 from contextlib import contextmanager
@@ -45,9 +49,9 @@ from pyscfad.df.mpi_df_jk import MPIDFJKExecutor
 from pyscfad.df.mpi_outcore import build_cderi
 from pyscfad.dlno import _restart as restart_module
 from pyscfad.dlno.ccsd import DLNOCCSD as SerialDLNOCCSD
-from pyscfad.dlno import ccsd_mpi as ccsd_mpi_module
+
 from pyscfad.dlno.ccsd_mpi import DLNOCCSD as MPIDLNOCCSD
-from pyscfad.dlno.iao_mp2 import IAOFragmentMP2Thresholds
+from pyscfad.dlno.domain import DLNOThresholds
 
 
 warnings.filterwarnings(
@@ -119,7 +123,7 @@ def _build_mf(
 
 
 def _full_domain_thresholds():
-    return IAOFragmentMP2Thresholds(
+    return DLNOThresholds(
         pao_norm=1e-10,
         domain_pao=0.0,
         ed_pao=0.0,
@@ -149,12 +153,12 @@ def test_lis_fragment_owners_are_deterministic_and_cost_weighted():
     uneven = SimpleNamespace(
         fragments=tuple(fragment(nvir) for nvir in (10, 9, 6, 5))
     )
-    assert ccsd_mpi_module._lis_fragment_owners(
+    assert ccsd_mpi._lis_fragment_owners(
         uneven, 2, root=0
     ) == (0, 1, 1, 0)
 
     two_equal = SimpleNamespace(fragments=(fragment(4), fragment(4)))
-    assert ccsd_mpi_module._lis_fragment_owners(
+    assert ccsd_mpi._lis_fragment_owners(
         two_equal, 4, root=2
     ) == (2, 3)
 
@@ -317,7 +321,7 @@ def test_comm_self_ccsdt_restart_at_fragment_boundaries_and_pre_scf(
             raise AssertionError("pre-SCF restart rebuilt common orbitals")
 
         monkeypatch.setattr(
-            ccsd_mpi_module, "rebuild_iao_mp2_common", forbidden_common
+            ccsd_mpi, 'rebuild_domain_data', forbidden_common
         )
         messages.clear()
         final_energy, final_bar, _ = MPIDLNOCCSD.value_and_grad(
@@ -378,7 +382,7 @@ def _run_world_driver(output: Path):
 
     kwargs = dict(
         build_mf=build_outcore_mf,
-        thresholds=IAOFragmentMP2Thresholds(pair_energy=1e-4),
+        thresholds=DLNOThresholds(pair_energy=1e-4),
         pair_energy_model="multipole",
         thresh_occ=1e-3,
         thresh_vir=1e-3,
@@ -395,9 +399,9 @@ def _run_world_driver(output: Path):
     original_density_vjp = MPIDFJKExecutor._execute_density_vjp
     original_coordinate_vjp = MPIDFJKExecutor._execute_coordinate_vjp_block
     original_lis_static_fragment = (
-        ccsd_mpi_module.build_iao_lis_fragment_static_selection
+        lis.build_fragment_lis_selection
     )
-    original_lis_domain = ccsd_mpi_module.build_strong_ed_domain
+    original_lis_domain = dlno_base.build_strong_ed_domain
 
     def counted_forward(self, dfobj, payload):
         operation_counts["forward"] += 1
@@ -426,10 +430,10 @@ def _run_world_driver(output: Path):
     MPIDFJKExecutor._execute_forward = counted_forward
     MPIDFJKExecutor._execute_density_vjp = counted_density_vjp
     MPIDFJKExecutor._execute_coordinate_vjp_block = counted_coordinate_vjp
-    ccsd_mpi_module.build_iao_lis_fragment_static_selection = (
+    lis.build_fragment_lis_selection = (
         counted_lis_static_fragment
     )
-    ccsd_mpi_module.build_strong_ed_domain = counted_lis_domain
+    dlno_base.build_strong_ed_domain = counted_lis_domain
     try:
         with _gradient_options():
             energy, mol_bar, details = MPIDLNOCCSD.value_and_grad(
@@ -445,10 +449,10 @@ def _run_world_driver(output: Path):
         MPIDFJKExecutor._execute_forward = original_forward
         MPIDFJKExecutor._execute_density_vjp = original_density_vjp
         MPIDFJKExecutor._execute_coordinate_vjp_block = original_coordinate_vjp
-        ccsd_mpi_module.build_iao_lis_fragment_static_selection = (
+        lis.build_fragment_lis_selection = (
             original_lis_static_fragment
         )
-        ccsd_mpi_module.build_strong_ed_domain = original_lis_domain
+        dlno_base.build_strong_ed_domain = original_lis_domain
     jax.block_until_ready(energy)
 
     energies = comm.allgather(float(energy))

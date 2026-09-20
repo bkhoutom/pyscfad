@@ -15,6 +15,7 @@
 '''Impurity solver for LNO CCSD/CCSD(T).
 '''
 
+from pyscfad.lno import df as lno_df
 import os
 import time
 import numpy
@@ -308,7 +309,7 @@ def _make_df_eris_incore(cc, mo_coeff=None, fockao=None):
     mo = np.asarray(eris.mo_coeff)
     ijslice = (0, nmo, 0, nmo)
     atmlst = getattr(cc, '_domain_atmlst', None)
-    Lpq = lno_base.transform_df_to_mo(
+    Lpq = lno_df.transform_df_to_mo(
         cc._scf, mo, ijslice, aosym='s2', mosym='s1', atmlst=atmlst
     ).reshape(-1, nmo, nmo)
 

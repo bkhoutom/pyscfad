@@ -1,96 +1,35 @@
-r"""IAO-fragment MP2 construction of local interacting spaces.
+"""Target-conditioned MP2 selection densities and their blocked reverse pass.
 
-This module connects the fixed-topology IAO--DLNO--MP2 construction in
-``iao_mp2_grad`` to the orbital layout expected by the LNO CCSD(T) impurity
-solver.  It deliberately keeps the two uses of MP2 separate:
-
-* the additive MP2 energy uses both the target fragment weight and the
-  strong-partner weight; and
-* the LNO selection density is conditioned on the target IAO block while the
-  second occupied line spans the already selected strong extended domain.
-
-The latter is the direct IAO generalization of the usual ``ie`` LNO density.
-If ``p,r`` are semicanonical occupied orbitals of the strong ED, ``a,b`` are
-its virtual orbitals, and ``X[I,p]`` is the projection of target-fragment IAO
-``I`` into that occupied space, the amplitudes used for LIS construction are
-
-.. math::
-
-   U_{Ir}^{ab} = \sum_p X_{Ip}^*\,
-       \frac{(pa|rb)}{\epsilon_p+\epsilon_r-\epsilon_a-\epsilon_b}.
-
-The complete spin-adapted unrelaxed ``oo`` and ``vv`` density blocks are
-formed from ``U``.  The strong-partner weight is *not* applied a second time:
-its retained range has already selected the ED occupied environment.  This
-choice reduces exactly to the conventional one-internal/one-environment LNO
-density for orthogonal localized occupied orbitals and remains invariant to
-unitary rotations inside an IAO fragment.
-
-The ED orbitals are projected back into the global active HF occupied and
-virtual spaces before diagonalizing the density.  Consequently the final LIS
-does not mix the HF occupied and virtual manifolds even though the numerical
-ED orbitals live in a truncated AO domain.
-
-All discrete ranks and retained natural-orbital labels are selected once by
-:func:`build_iao_lis_static_selections`.  The overlap, Fock matrix, IAOs, ED
-orbitals, MP2 amplitudes, densities, projectors, and retained LIS orbitals are
-rebuilt on the differentiable path by :func:`build_fragment_lis`.
-"""
+The target conditions the first occupied line; the selected extended domain
+supplies the occupied environment. These are unrelaxed oo/vv selection
+densities, not the occupied-virtual response density in lno.mp2_rdm."""
 
 from __future__ import annotations
 
+from pyscfad.lno import _df_h5 as lno_df_h5
 from contextvars import ContextVar
-from dataclasses import dataclass
 from functools import partial
-from typing import NamedTuple
 import os
-import tempfile
 import time
+from typing import NamedTuple
 import warnings
 
 import h5py
 import jax
 from jax.interpreters import ad as jax_ad
-import numpy as onp
-import scipy.linalg as onp_scipy_linalg
-from pyscf import lib as pyscf_lib
+import numpy
 
 from pyscfad import numpy as np
-from pyscfad import scipy
-from pyscfad.df import addons as df_addons
-from pyscfad.lno import lno_base
 from pyscfad.tools import resource_profile
-
-from .iao_mp2_grad import (
-    IAOFragmentMP2ContinuousData,
-    IAOFragmentMP2StaticSelections,
-    IAOMP2StrongDomain,
-    build_strong_ed_domain,
-    rebuild_iao_mp2_common,
-)
 
 
 __all__ = [
-    "IAO_LIS_INTERNAL_RANK_THRESHOLD",
-    "IAOLISFragmentStaticSelection",
-    "IAOFragmentLISStaticSelections",
-    "IAOMP2Density",
-    "IAOFragmentLIS",
+    "MP2Density",
     "target_conditioned_mp2_density_from_amplitudes",
     "strong_domain_mp2_density_from_lov",
-    "strong_domain_mp2_density",
-    "strong_domain_prescreen",
-    "build_iao_lis_fragment_static_selection",
-    "build_iao_lis_static_selections",
-    "build_fragment_lis",
 ]
 
 
-# Raw IAOs have algebraically tiny projections onto distant occupied and
-# virtual manifolds.  Normalizing those tails as internal LIS orbitals defeats
-# locality, even though they are harmless in projector-based ED construction.
-# This is a singular-value threshold (not a Gram-eigenvalue threshold).
-IAO_LIS_INTERNAL_RANK_THRESHOLD = 1e-6
 _H5_DENSITY_IO_PROFILE = ContextVar(
     "pyscfad_iao_lis_h5_density_io_profile", default=None
 )
@@ -134,7 +73,7 @@ def _timed_h5_read(dataset, key, profile):
     elapsed = time.perf_counter() - start
     if profile is not None:
         profile["hdf5_read_seconds"] += elapsed
-        profile["hdf5_bytes_read"] += int(onp.asarray(value).nbytes)
+        profile["hdf5_bytes_read"] += int(numpy.asarray(value).nbytes)
     return value
 
 
@@ -142,7 +81,7 @@ def _timed_h5_write(dataset, key, value, profile):
     if profile is None:
         dataset[key] = value
         return
-    value = onp.asarray(value)
+    value = numpy.asarray(value)
     start = time.perf_counter()
     dataset[key] = value
     elapsed = time.perf_counter() - start
@@ -180,94 +119,11 @@ def _finish_h5_density_reverse_profile(
     )
 
 
-@dataclass(frozen=True)
-class IAOLISFragmentStaticSelection:
-    """Fixed rank/label choices for one fragment LIS.
-
-    All index arrays refer to ascending Hermitian-eigenvalue order at the
-    corresponding reference eigenproblem.  ``internal_*_keep`` index the
-    small IAO-row Gram matrix.  ``*_lno_keep`` index the density projected
-    into the complete global active occupied or virtual manifold.
-    """
-
-    fragment_index: int
-    internal_occ_keep: onp.ndarray
-    internal_vir_keep: onp.ndarray
-    occupied_lno_keep: onp.ndarray
-    virtual_lno_keep: onp.ndarray
-    full_occupied_space: bool
-    full_virtual_space: bool
-
-
-@dataclass(frozen=True)
-class IAOFragmentLISStaticSelections:
-    """Static IAO-MP2 ED topology plus fixed LIS rank selections."""
-
-    mp2_static: IAOFragmentMP2StaticSelections
-    thresh_occ: float
-    thresh_vir: float
-    internal_rank_threshold: float
-    fragments: tuple[IAOLISFragmentStaticSelection, ...]
-
-
-class IAOMP2Density(NamedTuple):
+class MP2Density(NamedTuple):
     """Target-conditioned strong-ED MP2 density blocks."""
 
     occupied: object
     virtual: object
-
-
-@dataclass(frozen=True)
-class IAOFragmentLIS:
-    """One rebuilt fragment LIS and the data needed by an impurity solver.
-
-    ``mo_coeff`` contains a complete MO layout ordered as frozen occupied,
-    active LIS occupied, active LIS virtual, and frozen virtual blocks in the
-    convention expected by :mod:`pyscfad.lno.ccsd`.  ``frozen`` contains the
-    corresponding frozen column indices.
-
-    ``fragment_occupied_anchor`` is the occupied projection of the target IAO
-    block.  Its overlap with any HF-occupied LIS is identical to that of the
-    raw fragment IAOs, while making explicit that the CC energy partition is
-    an occupied-space weight.  ``fragment_iao_coeff`` is retained for callers
-    that also need the raw IAO block.
-    """
-
-    mo_coeff: object
-    frozen: onp.ndarray
-    fragment_occupied_anchor: object
-    fragment_iao_coeff: object
-    active_occupied_coeff: object
-    active_virtual_coeff: object
-    occupied_projector: object
-    virtual_projector: object
-    density_occupied_ed: object
-    density_virtual_ed: object
-    density_occupied_active: object
-    density_virtual_active: object
-    domain: IAOMP2StrongDomain
-    n_internal_occ: int
-    n_internal_vir: int
-    n_lno_occ: int
-    n_lno_vir: int
-
-    @property
-    def orbfrag(self):
-        """Compatibility alias for the complete impurity MO layout."""
-
-        return self.mo_coeff
-
-    @property
-    def frzfrag(self):
-        """Compatibility alias for the impurity frozen indices."""
-
-        return self.frozen
-
-    @property
-    def orbfragloc(self):
-        """Raw IAO block used by the historical fragment interface."""
-
-        return self.fragment_iao_coeff
 
 
 def _hermitize(array):
@@ -335,11 +191,11 @@ def _density_from_target_amplitudes(target_amplitudes):
         return (dmoo + term_oo, dmvv + term_vv), None
 
     if ntarget == 0:
-        return IAOMP2Density(dmoo0, dmvv0)
+        return MP2Density(dmoo0, dmvv0)
     (dmoo, dmvv), _ = jax.lax.scan(
         scan_body, (dmoo0, dmvv0), target_amplitudes
     )
-    return IAOMP2Density(_hermitize(dmoo), _hermitize(dmvv))
+    return MP2Density(_hermitize(dmoo), _hermitize(dmvv))
 
 
 def _density_from_target_amplitude_block(a_block, b_block):
@@ -383,7 +239,7 @@ def _density_from_target_amplitude_block(a_block, b_block):
     dmoo = dmoo - 0.5 * np.einsum(
         "icpx,ixqc->pq", b_first, a.conj()
     )
-    return IAOMP2Density(dmoo, dmvv)
+    return MP2Density(dmoo, dmvv)
 
 
 @jax.jit
@@ -429,7 +285,7 @@ def target_conditioned_mp2_density_from_amplitudes(
 
     Returns
     -------
-    :class:`IAOMP2Density`
+    :class:`MP2Density`
         Occupied and virtual unrelaxed selection-density blocks in the ED
         semicanonical bases.
     """
@@ -480,7 +336,7 @@ def _resolve_mp2_density_block_nvir(
     if configured_memory_mb is not None and configured_memory_mb <= 0.0:
         raise ValueError("mp2_block_memory_mb must be positive")
     if configured_block_nvir is not None and (
-        not isinstance(configured_block_nvir, (int, onp.integer))
+        not isinstance(configured_block_nvir, (int, numpy.integer))
         or isinstance(configured_block_nvir, bool)
         or configured_block_nvir <= 0
     ):
@@ -497,7 +353,7 @@ def _resolve_mp2_density_block_nvir(
         workspace_target_mb = automatic_target_mb
         mode = "auto"
 
-    itemsize = onp.dtype(dtype).itemsize
+    itemsize = numpy.dtype(dtype).itemsize
     fixed_elements = (
         2 * naux * nvir
         + nocc * nocc
@@ -536,7 +392,7 @@ def _resolve_mp2_density_block_nvir(
 
 
 def _mp2_density_virtual_block_size(lov, ntarget, max_memory_mb):
-    itemsize = onp.dtype(lov.dtype).itemsize
+    itemsize = numpy.dtype(lov.dtype).itemsize
     nocc = lov.shape[1]
     nvir = lov.shape[2]
     bytes_per_c = itemsize * nocc * nvir * max(2 * ntarget + 6, 1)
@@ -584,7 +440,7 @@ def strong_domain_mp2_density_from_lov(
             lov, ntarget, max_memory_mb
         )
     elif (
-        not isinstance(block_nvir, (int, onp.integer))
+        not isinstance(block_nvir, (int, numpy.integer))
         or isinstance(block_nvir, bool)
         or block_nvir <= 0
     ):
@@ -594,13 +450,13 @@ def strong_domain_mp2_density_from_lov(
     dmoo0 = np.zeros((nocc, nocc), dtype=lov.dtype)
     dmvv0 = np.zeros((nvir, nvir), dtype=lov.dtype)
     if ntarget == 0 or nocc == 0 or nvir == 0:
-        return IAOMP2Density(dmoo0, dmvv0)
+        return MP2Density(dmoo0, dmvv0)
 
     eia = occupied_energy[:, None] - virtual_energy[None, :]
     nblock = (nvir + block_nvir - 1) // block_nvir
-    block_ids = np.arange(nblock, dtype=onp.int32)
-    block_offsets = np.arange(block_nvir, dtype=onp.int32)
-    occupied_ids = np.arange(nocc, dtype=onp.int32)
+    block_ids = np.arange(nblock, dtype=numpy.int32)
+    block_offsets = np.arange(block_nvir, dtype=numpy.int32)
+    occupied_ids = np.arange(nocc, dtype=numpy.int32)
 
     @jax.checkpoint
     def virtual_block_body(carry, block_id):
@@ -658,7 +514,7 @@ def strong_domain_mp2_density_from_lov(
     (dmoo, dmvv), _ = jax.lax.scan(
         jax.checkpoint(virtual_block_body), (dmoo0, dmvv0), block_ids
     )
-    return IAOMP2Density(_hermitize(dmoo), _hermitize(dmvv))
+    return MP2Density(_hermitize(dmoo), _hermitize(dmvv))
 
 
 def _target_amplitude_block_from_lov_occupied_slice(
@@ -719,7 +575,7 @@ def _strong_domain_mp2_density_h5_primal_impl(
     nvir: int,
     block_nvir: int,
     profile,
-) -> IAOMP2Density:
+) -> MP2Density:
     """Evaluate Doo/Dvv while reading only bounded pair-major Lov slices.
 
     HDF5 access is host-orchestrated and synchronous; no complete ``Lov`` or
@@ -729,13 +585,13 @@ def _strong_domain_mp2_density_h5_primal_impl(
     dimensions = {"naux": naux, "nocc": nocc, "nvir": nvir}
     for name, value in dimensions.items():
         if (
-            not isinstance(value, (int, onp.integer))
+            not isinstance(value, (int, numpy.integer))
             or isinstance(value, bool)
             or value < 0
         ):
             raise ValueError(f"{name} must be a nonnegative integer")
     if (
-        not isinstance(block_nvir, (int, onp.integer))
+        not isinstance(block_nvir, (int, numpy.integer))
         or isinstance(block_nvir, bool)
         or block_nvir <= 0
     ):
@@ -778,7 +634,7 @@ def _strong_domain_mp2_density_h5_primal_impl(
             for c0 in range(0, nvir, block_nvir):
                 c1 = min(c0 + block_nvir, nvir)
                 width = c1 - c0
-                lov_c_host = onp.empty((naux, nocc, width), dtype=dtype)
+                lov_c_host = numpy.empty((naux, nocc, width), dtype=dtype)
                 for r in range(nocc):
                     read_start = time.perf_counter() if profiling else None
                     pair_rows = lov_h5[
@@ -786,7 +642,7 @@ def _strong_domain_mp2_density_h5_primal_impl(
                     ]
                     if profiling:
                         hdf5_read_s += time.perf_counter() - read_start
-                    lov_c_host[:, r, :] = onp.asarray(pair_rows).T
+                    lov_c_host[:, r, :] = numpy.asarray(pair_rows).T
                     del pair_rows
                 if profiling:
                     bytes_read += nocc * naux * width * itemsize
@@ -805,7 +661,7 @@ def _strong_domain_mp2_density_h5_primal_impl(
                     ]
                     if profiling:
                         hdf5_read_s += time.perf_counter() - read_start
-                    lov_p_host = onp.asarray(lov_p_host)
+                    lov_p_host = numpy.asarray(lov_p_host)
                     if profiling:
                         bytes_read += naux * nvir * itemsize
 
@@ -841,7 +697,7 @@ def _strong_domain_mp2_density_h5_primal_impl(
                     mp2_kernel_s += time.perf_counter() - kernel_start
 
     kernel_start = time.perf_counter() if profiling else None
-    density = IAOMP2Density(_hermitize(dmoo), _hermitize(dmvv))
+    density = MP2Density(_hermitize(dmoo), _hermitize(dmvv))
     jax.block_until_ready(density)
     if profiling:
         mp2_kernel_s += time.perf_counter() - kernel_start
@@ -886,7 +742,7 @@ def _strong_domain_mp2_density_h5_primal(
     nocc: int,
     nvir: int,
     block_nvir: int,
-) -> IAOMP2Density:
+) -> MP2Density:
     """Profile-safe wrapper for the bounded HDF5 density primal."""
     profile = resource_profile.start()
     try:
@@ -927,13 +783,13 @@ def _validate_strong_domain_mp2_density_h5_inputs(
     """Validate the real-float64 contract of the fused disk reverse."""
 
     if (
-        not isinstance(nocc, (int, onp.integer))
+        not isinstance(nocc, (int, numpy.integer))
         or isinstance(nocc, bool)
         or nocc < 0
     ):
         raise ValueError("nocc must be a nonnegative integer")
     if (
-        not isinstance(block_nvir, (int, onp.integer))
+        not isinstance(block_nvir, (int, numpy.integer))
         or isinstance(block_nvir, bool)
         or block_nvir <= 0
     ):
@@ -957,9 +813,9 @@ def _validate_strong_domain_mp2_density_h5_inputs(
         "target_projection": target_projection,
     }
     incompatible = {
-        name: onp.dtype(value.dtype)
+        name: numpy.dtype(value.dtype)
         for name, value in arrays.items()
-        if onp.dtype(value.dtype) != onp.dtype(onp.float64)
+        if numpy.dtype(value.dtype) != numpy.dtype(numpy.float64)
     }
     if incompatible:
         details = ", ".join(
@@ -1001,7 +857,7 @@ def _h5_density_hermitized_output_bars(
     virtual_bar = _materialize_density_output_bar(
         virtual_bar, (nvir, nvir), dtype
     )
-    return IAOMP2Density(
+    return MP2Density(
         _hermitize(occupied_bar), _hermitize(virtual_bar)
     )
 
@@ -1012,9 +868,9 @@ def _read_h5_lov_virtual_block(
     """Read one contracted-virtual block into auxiliary-first layout."""
 
     width = c1 - c0
-    lov_c_host = onp.empty((naux, nocc, width), dtype=lov_h5.dtype)
+    lov_c_host = numpy.empty((naux, nocc, width), dtype=lov_h5.dtype)
     for r in range(nocc):
-        lov_c_host[:, r, :] = onp.asarray(
+        lov_c_host[:, r, :] = numpy.asarray(
             _timed_h5_read(
                 lov_h5,
                 (slice(r * nvir + c0, r * nvir + c1), slice(None)),
@@ -1044,12 +900,12 @@ def _reconstruct_h5_target_amplitude_block(
     a_block = np.zeros(
         (ntarget, nocc, nvir, width), dtype=lov_h5.dtype
     )
-    b_block_host = onp.empty(
+    b_block_host = numpy.empty(
         (ntarget, nocc, nvir, width), dtype=lov_h5.dtype
     )
     eia_c = eia[:, c0:c1]
     for p in range(nocc):
-        lov_p_host = onp.asarray(
+        lov_p_host = numpy.asarray(
             _timed_h5_read(
                 lov_h5,
                 (slice(p * nvir, (p + 1) * nvir), slice(None)),
@@ -1068,7 +924,7 @@ def _reconstruct_h5_target_amplitude_block(
         )
         a_block = a_block + a_increment
         jax.block_until_ready((a_block, b_row))
-        b_block_host[:, p, :, :] = onp.asarray(jax.device_get(b_row))
+        b_block_host[:, p, :, :] = numpy.asarray(jax.device_get(b_row))
         del lov_p_host, a_increment, b_row
     return a_block, np.asarray(b_block_host)
 
@@ -1108,7 +964,7 @@ def _strong_domain_mp2_density_h5_lov_bwd(
     if min(naux, nocc, nvir) < 0:
         raise ValueError("HDF5 Lov dimensions must be nonnegative")
     if (
-        not isinstance(block_nvir, (int, onp.integer))
+        not isinstance(block_nvir, (int, numpy.integer))
         or isinstance(block_nvir, bool)
         or block_nvir <= 0
     ):
@@ -1124,14 +980,14 @@ def _strong_domain_mp2_density_h5_lov_bwd(
     if target_projection.ndim != 2 or target_projection.shape[1] != nocc:
         raise ValueError("target_projection must have shape (ntarget,nocc)")
 
-    occupied_bar_host = onp.zeros_like(
-        onp.asarray(jax.device_get(occupied_energy))
+    occupied_bar_host = numpy.zeros_like(
+        numpy.asarray(jax.device_get(occupied_energy))
     )
-    virtual_bar_host = onp.zeros_like(
-        onp.asarray(jax.device_get(virtual_energy))
+    virtual_bar_host = numpy.zeros_like(
+        numpy.asarray(jax.device_get(virtual_energy))
     )
-    target_bar_host = onp.zeros_like(
-        onp.asarray(jax.device_get(target_projection))
+    target_bar_host = numpy.zeros_like(
+        numpy.asarray(jax.device_get(target_projection))
     )
     npair = nocc * nvir
     profile_start = resource_profile.start()
@@ -1156,7 +1012,7 @@ def _strong_domain_mp2_density_h5_lov_bwd(
                     f"/lov must have shape {expected_shape}, got "
                     f"{lov_h5.shape}"
                 )
-            if onp.dtype(lov_h5.dtype) != onp.dtype(onp.float64):
+            if numpy.dtype(lov_h5.dtype) != numpy.dtype(numpy.float64):
                 raise ValueError(
                     "Fused HDF5 MP2 density reverse requires real float64 "
                     f"/lov; got {lov_h5.dtype}"
@@ -1224,12 +1080,12 @@ def _strong_domain_mp2_density_h5_lov_bwd(
                     jax.block_until_ready((a_bar, b_bar))
                     del a_block, b_block
 
-                    lov_c_bar_host = onp.zeros(
+                    lov_c_bar_host = numpy.zeros(
                         (naux, nocc, width), dtype=lov_h5.dtype
                     )
                     eia_c = eia[:, c0:c1]
                     for p in range(nocc):
-                        lov_p_host = onp.asarray(
+                        lov_p_host = numpy.asarray(
                             _timed_h5_read(
                                 lov_h5,
                                 (
@@ -1253,7 +1109,7 @@ def _strong_domain_mp2_density_h5_lov_bwd(
                             )
                         )
                         slice_bars_host = tuple(
-                            onp.asarray(jax.device_get(bar))
+                            numpy.asarray(jax.device_get(bar))
                             for bar in slice_bars
                         )
                         jax.block_until_ready(slice_bars)
@@ -1268,7 +1124,7 @@ def _strong_domain_mp2_density_h5_lov_bwd(
                         ) = slice_bars_host
 
                         pair0, pair1 = p * nvir, (p + 1) * nvir
-                        lov_bar_row = onp.asarray(
+                        lov_bar_row = numpy.asarray(
                             _timed_h5_read(
                                 lov_bar_h5,
                                 (slice(pair0, pair1), slice(None)),
@@ -1283,10 +1139,10 @@ def _strong_domain_mp2_density_h5_lov_bwd(
                             io_profile,
                         )
                         lov_c_bar_host += lov_c_bar
-                        occupied_bar_host[p] += onp.sum(eia_p_bar)
+                        occupied_bar_host[p] += numpy.sum(eia_p_bar)
                         virtual_bar_host -= eia_p_bar
-                        occupied_bar_host += onp.sum(eia_c_bar, axis=1)
-                        virtual_bar_host[c0:c1] -= onp.sum(
+                        occupied_bar_host += numpy.sum(eia_c_bar, axis=1)
+                        virtual_bar_host[c0:c1] -= numpy.sum(
                             eia_c_bar, axis=0
                         )
                         target_bar_host[:, p] += target_column_bar
@@ -1306,7 +1162,7 @@ def _strong_domain_mp2_density_h5_lov_bwd(
                     for r in range(nocc):
                         pair0 = r * nvir + c0
                         pair1 = r * nvir + c1
-                        lov_bar_block = onp.asarray(
+                        lov_bar_block = numpy.asarray(
                             _timed_h5_read(
                                 lov_bar_h5,
                                 (slice(pair0, pair1), slice(None)),
@@ -1402,7 +1258,7 @@ def _strong_domain_mp2_density_h5_impl(
     block_nvir = int(block_nvir)
     if local_coeff.shape[0] != fake_mol.nao:
         raise ValueError("local_coeff rows must match the local AO basis")
-    info = lno_base._build_local_Lov_h5_impl(
+    info = lno_df_h5._build_local_Lov_h5_impl(
         fake_mol,
         auxmol,
         local_coeff,
@@ -1531,7 +1387,7 @@ def _strong_domain_mp2_density_h5_bwd(
             )
         )
         fake_mol_bar, auxmol_bar, local_coeff_bar = (
-            lno_base._local_direct_nr_e2_h5_bwd(
+            lno_df_h5._local_direct_nr_e2_h5_bwd(
                 fake_mol,
                 auxmol,
                 local_coeff,
@@ -1554,694 +1410,3 @@ _strong_domain_mp2_density_h5.defvjp(
     _strong_domain_mp2_density_h5_fwd,
     _strong_domain_mp2_density_h5_bwd,
 )
-
-
-def strong_domain_mp2_density(
-    mf,
-    domain,
-    static,
-    fragment_index,
-    *,
-    lov_scratch_dir,
-):
-    """Evaluate one fragment density through rank-private HDF5 scratch.
-
-    The local ``Lov`` is always written to the supplied rank-private workspace;
-    this IAO-LIS path has no in-memory storage mode.  MP2 virtual blocking is
-    automatic when neither threshold option is supplied.  The corresponding
-    driver option ``--mp2-block-nvir N`` is an advanced exact-width override;
-    ``--mp2-block-memory MB`` is an optional workspace-target override.  Both
-    tune temporary workspace and neither is a hard cap on process memory.
-    """
-
-    if not isinstance(static, IAOFragmentMP2StaticSelections):
-        raise TypeError("static must be IAOFragmentMP2StaticSelections")
-    if not isinstance(domain, IAOMP2StrongDomain):
-        raise TypeError("domain must be IAOMP2StrongDomain")
-    fragment_index = int(fragment_index)
-    fragment = static.fragments[fragment_index]
-    nocc = int(domain.occupied_coeff.shape[1])
-    coeff = np.concatenate(
-        (domain.occupied_coeff, domain.virtual_coeff), axis=1
-    )
-    nvir = int(domain.virtual_coeff.shape[1])
-    if lov_scratch_dir is None:
-        raise ValueError(
-            "lov_scratch_dir is required when building the MP2 density"
-        )
-    lov_scratch_dir = os.fspath(lov_scratch_dir)
-    if not os.path.isdir(lov_scratch_dir):
-        raise FileNotFoundError(
-            f"Lov scratch directory does not exist: {lov_scratch_dir}"
-        )
-
-    fake_mol = lno_base.make_local_mol(
-        mf.mol, fragment.extended_atoms
-    )
-    auxmol = df_addons.make_auxmol(fake_mol, mf.with_df.auxbasis)
-    naux = int(auxmol.nao)
-    ntarget = int(domain.target_projection.shape[0])
-
-    block_nvir, block_mode, workspace_target_mb = (
-        _resolve_mp2_density_block_nvir(
-            naux=naux,
-            nocc=nocc,
-            nvir=nvir,
-            ntarget=ntarget,
-            dtype=coeff.dtype,
-            mf_max_memory_mb=getattr(mf, "max_memory", 256.0),
-            configured_memory_mb=static.thresholds.mp2_block_memory_mb,
-            configured_block_nvir=static.thresholds.mp2_block_nvir,
-        )
-    )
-    profile_density = resource_profile.start()
-    h5_io_profile = (
-        _new_h5_io_profile() if profile_density is not None else None
-    )
-    h5_path = os.path.join(lov_scratch_dir, "local_lov.h5")
-    local_max_memory = getattr(
-        mf.with_df,
-        "max_memory",
-        getattr(mf, "max_memory", 256.0),
-    )
-    profile_token = _H5_DENSITY_IO_PROFILE.set(
-        h5_io_profile
-    )
-    try:
-        try:
-            density = _strong_domain_mp2_density_h5(
-                fake_mol,
-                auxmol,
-                coeff,
-                domain.occupied_energy,
-                domain.virtual_energy,
-                domain.target_projection,
-                nocc,
-                h5_path,
-                local_max_memory,
-                block_nvir,
-            )
-        finally:
-            _H5_DENSITY_IO_PROFILE.reset(profile_token)
-    except BaseException:
-        if profile_density is not None:
-            resource_profile.finish(
-                "iao_lis.strong_domain_mp2_density",
-                profile_density,
-                status="failed",
-                fragment_index=fragment_index,
-                lov_h5_path_basename=os.path.basename(h5_path),
-                **h5_io_profile,
-            )
-        raise
-    if profile_density is not None:
-        try:
-            if os.path.isfile(h5_path):
-                with h5py.File(h5_path, "r+") as h5file:
-                    h5file.attrs["pyscfad_fragment_index"] = fragment_index
-        except BaseException:
-            resource_profile.finish(
-                "iao_lis.strong_domain_mp2_density",
-                profile_density,
-                status="failed",
-                fragment_index=fragment_index,
-                lov_h5_path_basename=os.path.basename(h5_path),
-                **h5_io_profile,
-            )
-            raise
-        itemsize = onp.dtype(coeff.dtype).itemsize
-        lov_mib = naux * nocc * nvir * itemsize / 1024.0**2
-        resource_profile.finish(
-            "iao_lis.strong_domain_mp2_density",
-            profile_density,
-            status="ok",
-            fragment_index=fragment_index,
-            coeff_shape=tuple(coeff.shape),
-            lov_shape=(naux, nocc, nvir),
-            naux=naux,
-            nocc=nocc,
-            nvir=nvir,
-            ntarget=ntarget,
-            lov_mib=lov_mib,
-            block_nvir=block_nvir,
-            block_count=(nvir + block_nvir - 1) // block_nvir,
-            block_mode=block_mode,
-            workspace_target_mib=workspace_target_mb,
-            full_target_amplitudes_mib=(
-                ntarget * nocc * nvir * nvir * itemsize / 1024.0**2
-            ),
-            block_target_amplitudes_mib=(
-                2 * ntarget * nocc * nvir * block_nvir * itemsize / 1024.0**2
-            ),
-            estimated_block_workspace_mib=(
-                itemsize
-                * (
-                    2 * naux * nvir
-                    + nocc * nocc
-                    + nvir * nvir
-                    + block_nvir
-                    * (
-                        4 * ntarget * nocc * nvir
-                        + 4 * nocc * nvir
-                        + 2 * naux * nocc
-                    )
-                )
-                / 1024.0**2
-            ),
-            occupied_density_shape=tuple(density.occupied.shape),
-            virtual_density_shape=tuple(density.virtual.shape),
-            density_mib=resource_profile.estimated_array_mib(
-                density.occupied, density.virtual
-            ),
-            lov_h5_path_basename=os.path.basename(h5_path),
-            lov_disk_mib=h5_io_profile.get("lov_disk_mib", lov_mib),
-            lov_bar_disk_mib=h5_io_profile.get("lov_bar_disk_mib", 0.0),
-            z_disk_mib=h5_io_profile.get("z_disk_mib", 0.0),
-            hdf5_bytes_read=h5_io_profile["hdf5_bytes_read"],
-            hdf5_bytes_written=h5_io_profile["hdf5_bytes_written"],
-            hdf5_read_seconds=h5_io_profile["hdf5_read_seconds"],
-            hdf5_write_seconds=h5_io_profile["hdf5_write_seconds"],
-            local_direct_block_mb=lno_base._local_direct_int3c_block_mb(),
-        )
-    return density
-
-
-def _union_partner_iao_indices(static, fragment_index):
-    fragment = static.fragments[int(fragment_index)]
-    arrays = [
-        onp.asarray(static.frag_lolist[int(partner)], dtype=onp.int32)
-        for partner in fragment.strong_fragments
-    ]
-    if not arrays:
-        return onp.zeros((0,), dtype=onp.int32)
-    return onp.unique(onp.concatenate(arrays)).astype(onp.int32, copy=False)
-
-
-def strong_domain_prescreen(common, static, fragment_index, *, domain=None):
-    """Return a lightweight legacy-style view of one IAO strong ED.
-
-    This adapter is useful for reporting and transition tests.  The occupied
-    and virtual coefficient arrays are expressed in the local AO basis of
-    ``extended_primary_domain``.  ``strong_lmo_indices`` are the union of IAO
-    column indices belonging to the strong partner *fragments*, not the
-    fragment-number array itself.
-    """
-
-    if domain is None:
-        domain = build_strong_ed_domain(common, static, fragment_index)
-    fragment_index = int(fragment_index)
-    fragment = static.fragments[fragment_index]
-    return {
-        "fragment_index": fragment_index,
-        "lo_indices": onp.asarray(
-            static.frag_lolist[fragment_index], dtype=onp.int32
-        ),
-        "strong_lmo_indices": _union_partner_iao_indices(
-            static, fragment_index
-        ),
-        "extended_bp_domain": onp.asarray(
-            fragment.pao_center_atoms, dtype=onp.int32
-        ),
-        "extended_primary_domain": onp.asarray(
-            fragment.extended_atoms, dtype=onp.int32
-        ),
-        "occ_prescreen_energies": domain.occupied_energy,
-        "occ_prescreen_coeff": domain.occupied_coeff,
-        "vir_prescreen_energies": domain.virtual_energy,
-        "vir_prescreen_coeff": domain.virtual_coeff,
-        "orbfragloc": common.iao_coeff[:, fragment.iao_indices],
-    }
-
-
-def _row_gram_keep_numpy(matrix, threshold):
-    matrix = onp.asarray(jax.device_get(matrix))
-    if matrix.ndim != 2:
-        raise ValueError("fragment projection must be rank two")
-    if matrix.shape[0] == 0:
-        return onp.zeros((0,), dtype=onp.int32)
-    # Determine numerical rank from singular values, rather than comparing
-    # eigenvalues of M M^H with threshold**2.  Exact null eigenvalues of the
-    # Gram matrix acquire O(eps) roundoff, which is much larger than a typical
-    # squared singular-value cutoff (e.g. 1e-20 for THRESH_INTERNAL=1e-10).
-    # The differentiable rebuild below still uses the equivalent Hermitian
-    # eigenproblem; its ascending retained labels are simply the final `rank`
-    # columns.
-    singular = onp_scipy_linalg.svdvals(matrix, check_finite=False)
-    rank = int(onp.count_nonzero(singular > float(threshold)))
-    return onp.arange(
-        matrix.shape[0] - rank, matrix.shape[0], dtype=onp.int32
-    )
-
-
-def _fixed_row_space(matrix, keep):
-    """Differentiably rebuild a fixed-rank row space in column coordinates."""
-
-    matrix = np.asarray(matrix)
-    keep = onp.asarray(keep, dtype=onp.int32)
-    if matrix.shape[0] == 0 or keep.size == 0:
-        return np.zeros((matrix.shape[1], 0), dtype=matrix.dtype)
-    gram = _hermitize(matrix @ matrix.T.conj())
-    _, vectors = scipy.linalg.eigh(
-        gram, deg_thresh=lno_base.COMPRESS_DEG_THRESH
-    )
-    candidate = matrix.T.conj() @ vectors[:, keep]
-    # The fixed reference rank guarantees a nonsingular retained Gram matrix.
-    metric = _hermitize(candidate.T.conj() @ candidate)
-    chol = np.linalg.cholesky(metric)
-    return np.linalg.solve(chol, candidate.T.conj()).T.conj()
-
-
-def _domain_density_in_active_spaces(common, static, fragment_index,
-                                     domain, density):
-    fragment = static.fragments[int(fragment_index)]
-    ao_indices = fragment.extended_ao_indices
-    overlap_to_domain = common.s1e[:, ao_indices]
-    occupied_map = (
-        common.occupied_coeff.T.conj()
-        @ overlap_to_domain
-        @ domain.occupied_coeff
-    )
-    virtual_map = (
-        common.virtual_coeff.T.conj()
-        @ overlap_to_domain
-        @ domain.virtual_coeff
-    )
-    dmoo = occupied_map @ density.occupied @ occupied_map.T.conj()
-    dmvv = virtual_map @ density.virtual @ virtual_map.T.conj()
-    return _hermitize(dmoo), _hermitize(dmvv)
-
-
-def _internal_projection_matrices(common, fragment_index):
-    data = common.fragment_occupied_data[int(fragment_index)]
-    occ_projection = data.iao_occ_overlap
-    vir_projection = (
-        data.iao_coeff.T.conj() @ common.s1e @ common.virtual_coeff
-    )
-    return occ_projection, vir_projection
-
-
-def _external_density(density, internal):
-    identity = np.eye(density.shape[0], dtype=density.dtype)
-    projector = identity - internal @ internal.T.conj()
-    return _hermitize(projector @ density @ projector)
-
-
-def _density_keep_numpy(density, internal, threshold, full_space):
-    if full_space:
-        return onp.zeros((0,), dtype=onp.int32)
-    external = onp.asarray(jax.device_get(_external_density(density, internal)))
-    values = onp_scipy_linalg.eigh(
-        0.5 * (external + external.T.conj()),
-        eigvals_only=True,
-        check_finite=False,
-    )
-    return onp.where(onp.abs(onp.real(values)) > float(threshold))[0].astype(
-        onp.int32
-    )
-
-
-def _fixed_density_space(density, internal, keep, full_space):
-    nspace = int(density.shape[0])
-    if full_space:
-        return np.eye(nspace, dtype=density.dtype)
-    keep = onp.asarray(keep, dtype=onp.int32)
-    if keep.size == 0:
-        return internal
-    external = _external_density(density, internal)
-    _, vectors = scipy.linalg.eigh(
-        external, deg_thresh=lno_base.COMPRESS_DEG_THRESH
-    )
-    lno = vectors[:, keep]
-    if internal.shape[1]:
-        lno = lno - internal @ (internal.T.conj() @ lno)
-    # Numerical projection against the internal space changes only roundoff,
-    # but Cholesky normalization makes the rebuilt span explicitly orthonormal.
-    metric = _hermitize(lno.T.conj() @ lno)
-    chol = np.linalg.cholesky(metric)
-    lno = np.linalg.solve(chol, lno.T.conj()).T.conj()
-    return np.concatenate((internal, lno), axis=1)
-
-
-def _reference_fragment_selection(
-    common,
-    mp2_static,
-    fragment_index,
-    density_occupied_active,
-    density_virtual_active,
-    *,
-    thresh_occ,
-    thresh_vir,
-    internal_rank_threshold,
-):
-    occ_projection, vir_projection = _internal_projection_matrices(
-        common, fragment_index
-    )
-    occ_internal_keep = _row_gram_keep_numpy(
-        occ_projection, internal_rank_threshold
-    )
-    vir_internal_keep = _row_gram_keep_numpy(
-        vir_projection, internal_rank_threshold
-    )
-    occ_internal = _fixed_row_space(occ_projection, occ_internal_keep)
-    vir_internal = _fixed_row_space(vir_projection, vir_internal_keep)
-
-    full_occ = float(thresh_occ) <= 0.0
-    full_vir = float(thresh_vir) <= 0.0
-    occ_lno_keep = _density_keep_numpy(
-        density_occupied_active, occ_internal, thresh_occ, full_occ
-    )
-    vir_lno_keep = _density_keep_numpy(
-        density_virtual_active, vir_internal, thresh_vir, full_vir
-    )
-    return IAOLISFragmentStaticSelection(
-        fragment_index=int(fragment_index),
-        internal_occ_keep=occ_internal_keep,
-        internal_vir_keep=vir_internal_keep,
-        occupied_lno_keep=occ_lno_keep,
-        virtual_lno_keep=vir_lno_keep,
-        full_occupied_space=full_occ,
-        full_virtual_space=full_vir,
-    )
-
-
-def build_iao_lis_fragment_static_selection(
-    mf,
-    mp2_static,
-    fragment_index,
-    *,
-    common=None,
-    domain=None,
-    thresh_occ=1e-4,
-    thresh_vir=1e-5,
-    internal_rank_threshold=IAO_LIS_INTERNAL_RANK_THRESHOLD,
-):
-    """Select the fixed LIS ranks for one fragment.
-
-    ``domain`` may be supplied by a caller that constructs ED orbital frames
-    separately from the target-conditioned MP2-density calculation.  This is
-    the boundary used by the MPI driver: its root rank owns all discrete domain
-    construction, while independent ranks evaluate this fragment-local
-    operation.  Supplying a domain does not change the serial equations or
-    any retained-rank decision.
-    """
-
-    if not isinstance(mp2_static, IAOFragmentMP2StaticSelections):
-        raise TypeError("mp2_static must be IAOFragmentMP2StaticSelections")
-    fragment_index = int(fragment_index)
-    if fragment_index < 0 or fragment_index >= len(mp2_static.fragments):
-        raise IndexError(
-            f"fragment_index={fragment_index} is outside "
-            f"[0, {len(mp2_static.fragments)})"
-        )
-    for name, value in (
-        ("thresh_occ", thresh_occ),
-        ("thresh_vir", thresh_vir),
-        ("internal_rank_threshold", internal_rank_threshold),
-    ):
-        if float(value) < 0.0:
-            raise ValueError(f"{name} must be non-negative")
-    if common is None:
-        common = rebuild_iao_mp2_common(mf, mp2_static)
-    if not isinstance(common, IAOFragmentMP2ContinuousData):
-        raise TypeError("common must be IAOFragmentMP2ContinuousData")
-    if domain is None:
-        domain = build_strong_ed_domain(
-            common, mp2_static, fragment_index
-        )
-    if not isinstance(domain, IAOMP2StrongDomain):
-        raise TypeError("domain must be IAOMP2StrongDomain")
-
-    with tempfile.TemporaryDirectory(
-        prefix=f"pyscfad-lov-frag{fragment_index}-",
-        dir=pyscf_lib.param.TMPDIR,
-    ) as lov_scratch_dir:
-        density = strong_domain_mp2_density(
-            mf,
-            domain,
-            mp2_static,
-            fragment_index,
-            lov_scratch_dir=lov_scratch_dir,
-        )
-        dmoo_active, dmvv_active = _domain_density_in_active_spaces(
-            common, mp2_static, fragment_index, domain, density
-        )
-        selection = _reference_fragment_selection(
-            common,
-            mp2_static,
-            fragment_index,
-            dmoo_active,
-            dmvv_active,
-            thresh_occ=thresh_occ,
-            thresh_vir=thresh_vir,
-            internal_rank_threshold=internal_rank_threshold,
-        )
-        jax.block_until_ready((density, dmoo_active, dmvv_active))
-    return selection
-
-
-def build_iao_lis_static_selections(
-    mf,
-    mp2_static,
-    *,
-    common=None,
-    thresh_occ=1e-4,
-    thresh_vir=1e-5,
-    internal_rank_threshold=IAO_LIS_INTERNAL_RANK_THRESHOLD,
-):
-    """Select fixed internal/LNO ranks from a concrete reference geometry."""
-
-    if not isinstance(mp2_static, IAOFragmentMP2StaticSelections):
-        raise TypeError("mp2_static must be IAOFragmentMP2StaticSelections")
-    for name, value in (
-        ("thresh_occ", thresh_occ),
-        ("thresh_vir", thresh_vir),
-        ("internal_rank_threshold", internal_rank_threshold),
-    ):
-        if float(value) < 0.0:
-            raise ValueError(f"{name} must be non-negative")
-    if common is None:
-        common = rebuild_iao_mp2_common(mf, mp2_static)
-    if not isinstance(common, IAOFragmentMP2ContinuousData):
-        raise TypeError("common must be IAOFragmentMP2ContinuousData")
-
-    fragments = tuple(
-        build_iao_lis_fragment_static_selection(
-            mf,
-            mp2_static,
-            fragment_index,
-            common=common,
-            thresh_occ=thresh_occ,
-            thresh_vir=thresh_vir,
-            internal_rank_threshold=internal_rank_threshold,
-        )
-        for fragment_index in range(len(mp2_static.fragments))
-    )
-
-    return IAOFragmentLISStaticSelections(
-        mp2_static=mp2_static,
-        thresh_occ=float(thresh_occ),
-        thresh_vir=float(thresh_vir),
-        internal_rank_threshold=float(internal_rank_threshold),
-        fragments=fragments,
-    )
-
-
-def _active_complement(selected, threshold):
-    """Frozen-gauge complement used only to complete the impurity MO layout."""
-
-    nspace = int(selected.shape[0])
-    if selected.shape[1] == nspace:
-        return np.zeros((nspace, 0), dtype=selected.dtype)
-    identity = np.eye(nspace, dtype=selected.dtype)
-    return lno_base._dlno_outside_space(
-        identity,
-        selected,
-        max(float(threshold), 1e-8),
-    )
-
-
-def _semicanonical_space(coeff, fock):
-    if coeff.shape[1] == 0:
-        return coeff
-    return lno_base.semicanonicalize(fock, coeff)[1]
-
-
-def _assemble_full_mo_layout(
-    mf,
-    static,
-    occupied_coeff,
-    virtual_coeff,
-    fock,
-    occupied_selected,
-    virtual_selected,
-    rank_threshold,
-):
-    mo_coeff = np.asarray(mf.mo_coeff)
-    mo_occ_host = onp.asarray(jax.device_get(mf.mo_occ))
-    nmo = int(mo_occ_host.size)
-    all_indices = onp.arange(nmo, dtype=onp.int32)
-    occupied_indices = all_indices[mo_occ_host > lno_base.THRESH_OCC]
-    virtual_indices = all_indices[mo_occ_host <= lno_base.THRESH_OCC]
-    active_occ_indices = onp.asarray(
-        static.active_occ_indices, dtype=onp.int32
-    )
-    active_vir_indices = onp.asarray(
-        static.active_vir_indices, dtype=onp.int32
-    )
-    frozen_occ_indices = onp.setdiff1d(
-        occupied_indices, active_occ_indices, assume_unique=False
-    )
-    frozen_vir_indices = onp.setdiff1d(
-        virtual_indices, active_vir_indices, assume_unique=False
-    )
-
-    occ_complement = _active_complement(
-        occupied_selected, rank_threshold
-    )
-    vir_complement = _active_complement(
-        virtual_selected, rank_threshold
-    )
-    occupied_active = _semicanonical_space(
-        occupied_coeff @ occupied_selected,
-        fock,
-    )
-    virtual_active = _semicanonical_space(
-        virtual_coeff @ virtual_selected,
-        fock,
-    )
-    occupied_discarded = (
-        occupied_coeff @ occ_complement
-    )
-    virtual_discarded = (
-        virtual_coeff @ vir_complement
-    )
-
-    blocks = (
-        mo_coeff[:, frozen_occ_indices],
-        occupied_discarded,
-        occupied_active,
-        virtual_active,
-        virtual_discarded,
-        mo_coeff[:, frozen_vir_indices],
-    )
-    full_coeff = np.concatenate(blocks, axis=1)
-    nocc_total = int(occupied_indices.size)
-    n_frozen_occ = int(frozen_occ_indices.size + occ_complement.shape[1])
-    n_active_vir = int(virtual_active.shape[1])
-    frozen = onp.concatenate((
-        onp.arange(n_frozen_occ, dtype=onp.int32),
-        onp.arange(
-            nocc_total + n_active_vir, nmo, dtype=onp.int32
-        ),
-    ))
-    return full_coeff, frozen, occupied_active, virtual_active
-
-
-def build_fragment_lis(
-    mf,
-    common,
-    static,
-    fragment_index,
-    *,
-    domain=None,
-    density=None,
-    lov_scratch_dir=None,
-):
-    """Rebuild one fixed-rank IAO-MP2 LIS on the differentiable path."""
-
-    if not isinstance(static, IAOFragmentLISStaticSelections):
-        raise TypeError("static must be IAOFragmentLISStaticSelections")
-    mp2_static = static.mp2_static
-    if not isinstance(common, IAOFragmentMP2ContinuousData):
-        raise TypeError("common must be IAOFragmentMP2ContinuousData")
-    fragment_index = int(fragment_index)
-    selection = static.fragments[fragment_index]
-    if selection.fragment_index != fragment_index:
-        raise ValueError("fragment selection order is inconsistent")
-
-    if domain is None:
-        domain = build_strong_ed_domain(
-            common, mp2_static, fragment_index
-        )
-    if density is None:
-        if lov_scratch_dir is None:
-            raise ValueError(
-                "lov_scratch_dir is required when density is not supplied"
-            )
-        density = strong_domain_mp2_density(
-            mf,
-            domain,
-            mp2_static,
-            fragment_index,
-            lov_scratch_dir=lov_scratch_dir,
-        )
-    dmoo_active, dmvv_active = _domain_density_in_active_spaces(
-        common, mp2_static, fragment_index, domain, density
-    )
-
-    occ_projection, vir_projection = _internal_projection_matrices(
-        common, fragment_index
-    )
-    occ_internal = _fixed_row_space(
-        occ_projection, selection.internal_occ_keep
-    )
-    vir_internal = _fixed_row_space(
-        vir_projection, selection.internal_vir_keep
-    )
-    occ_selected = _fixed_density_space(
-        dmoo_active,
-        occ_internal,
-        selection.occupied_lno_keep,
-        selection.full_occupied_space,
-    )
-    vir_selected = _fixed_density_space(
-        dmvv_active,
-        vir_internal,
-        selection.virtual_lno_keep,
-        selection.full_virtual_space,
-    )
-
-    full_coeff, frozen, occupied_active, virtual_active = (
-        _assemble_full_mo_layout(
-            mf,
-            mp2_static,
-            common.occupied_coeff,
-            common.virtual_coeff,
-            common.fock,
-            occ_selected,
-            vir_selected,
-            static.internal_rank_threshold,
-        )
-    )
-    fragment_data = common.fragment_occupied_data[fragment_index]
-    occupied_projector = occ_selected @ occ_selected.T.conj()
-    virtual_projector = vir_selected @ vir_selected.T.conj()
-    return IAOFragmentLIS(
-        mo_coeff=full_coeff,
-        frozen=frozen,
-        fragment_occupied_anchor=fragment_data.occupied_projection,
-        fragment_iao_coeff=fragment_data.iao_coeff,
-        active_occupied_coeff=occupied_active,
-        active_virtual_coeff=virtual_active,
-        occupied_projector=_hermitize(occupied_projector),
-        virtual_projector=_hermitize(virtual_projector),
-        density_occupied_ed=density.occupied,
-        density_virtual_ed=density.virtual,
-        density_occupied_active=dmoo_active,
-        density_virtual_active=dmvv_active,
-        domain=domain,
-        n_internal_occ=int(selection.internal_occ_keep.size),
-        n_internal_vir=int(selection.internal_vir_keep.size),
-        n_lno_occ=(
-            int(common.occupied_coeff.shape[1]
-                - selection.internal_occ_keep.size)
-            if selection.full_occupied_space
-            else int(selection.occupied_lno_keep.size)
-        ),
-        n_lno_vir=(
-            int(common.virtual_coeff.shape[1]
-                - selection.internal_vir_keep.size)
-            if selection.full_virtual_space
-            else int(selection.virtual_lno_keep.size)
-        ),
-    )

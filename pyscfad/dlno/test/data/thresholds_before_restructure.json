@@ -1,0 +1,121 @@
+{
+  "encoded": {
+    "kind": "dataclass",
+    "class": "pyscfad.dlno.iao_mp2:IAOFragmentMP2Thresholds",
+    "fields": [
+      [
+        "bp_occ",
+        {
+          "kind": "float",
+          "hex": "0x1.f851eb851eb85p-1",
+          "dtype": null
+        }
+      ],
+      [
+        "bp_primary",
+        {
+          "kind": "float",
+          "hex": "0x1.ff7ced916872bp-1",
+          "dtype": null
+        }
+      ],
+      [
+        "bp_ed",
+        {
+          "kind": "float",
+          "hex": "0x1.ffe5c91d14e3cp-1",
+          "dtype": null
+        }
+      ],
+      [
+        "bp_pao",
+        {
+          "kind": "float",
+          "hex": "0x1.f5c28f5c28f5cp-1",
+          "dtype": null
+        }
+      ],
+      [
+        "pao_norm",
+        {
+          "kind": "float",
+          "hex": "0x1.a36e2eb1c432dp-14",
+          "dtype": null
+        }
+      ],
+      [
+        "domain_pao",
+        {
+          "kind": "float",
+          "hex": "0x1.a36e2eb1c432dp-14",
+          "dtype": null
+        }
+      ],
+      [
+        "ed_pao",
+        {
+          "kind": "float",
+          "hex": "0x1.fd70a3d70a3d7p-1",
+          "dtype": null
+        }
+      ],
+      [
+        "occupied_weight",
+        {
+          "kind": "float",
+          "hex": "0x1.a36e2eb1c432dp-14",
+          "dtype": null
+        }
+      ],
+      [
+        "metric_rank",
+        {
+          "kind": "float",
+          "hex": "0x1.b7cdfd9d7bdbbp-34",
+          "dtype": null
+        }
+      ],
+      [
+        "pair_energy",
+        {
+          "kind": "float",
+          "hex": "0x1.5cf751db94e6bp-22",
+          "dtype": null
+        }
+      ],
+      [
+        "near_pair_distance",
+        {
+          "kind": "float",
+          "hex": "0x1.c000000000000p+1",
+          "dtype": null
+        }
+      ],
+      [
+        "multipole_order",
+        {
+          "kind": "int",
+          "value": "3",
+          "dtype": null
+        }
+      ],
+      [
+        "mp2_block_memory_mb",
+        {
+          "kind": "float",
+          "hex": "0x1.3800000000000p+4",
+          "dtype": null
+        }
+      ],
+      [
+        "mp2_block_nvir",
+        {
+          "kind": "int",
+          "value": "17",
+          "dtype": null
+        }
+      ]
+    ]
+  },
+  "digest": "c4de855c48f15353b780fd06c6f8ffec47d98d5dbcb9c77c7900be24bd016e04"
+}

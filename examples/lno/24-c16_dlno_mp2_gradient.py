@@ -12,7 +12,8 @@ from pathlib import Path
 import numpy
 
 from pyscfad import config, gto, scf
-from pyscfad.dlno.iao_mp2 import IAOFragmentMP2, IAOFragmentMP2Thresholds
+from pyscfad.dlno.mp2 import DLNOMP2
+from pyscfad.dlno.domain import DLNOThresholds
 
 
 HERE = Path(__file__).resolve().parent
@@ -62,11 +63,11 @@ def build_mf(mol_):
 
 print(f"SCF checkpoint will be written to: {SCF_CHK}", flush=True)
 print("Running DF-RHF and IAO-DLNO-MP2 gradient", flush=True)
-energy, mol_bar, details = IAOFragmentMP2.value_and_grad(
+energy, mol_bar, details = DLNOMP2.value_and_grad(
     mol,
     build_mf=build_mf,
     frozen=FROZEN,
-    thresholds=IAOFragmentMP2Thresholds(pair_energy=1e-4),
+    thresholds=DLNOThresholds(pair_energy=1e-4),
     pair_energy_model="multipole",
     include_hf=True,
     return_details=True,

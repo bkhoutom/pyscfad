@@ -18,6 +18,7 @@ import re
 import uuid
 import warnings
 
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - non-POSIX fallback
@@ -48,7 +49,7 @@ _FORMAT_VERSION = 1
 # Increment this whenever MP2/CC/(T) equations, cotangent conventions, or
 # saved pytree semantics change without an accompanying payload/static-shape
 # change.  It deliberately invalidates every older progressive cotangent.
-_ALGORITHM_ABI = 1
+_ALGORITHM_ABI = 2
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 # Tests may monkeypatch this callable.  It is invoked after a temporary HDF5
@@ -131,33 +132,47 @@ def _array_digest(array):
 def _static_registry():
     # Imports are deliberately lazy: the restart helper is imported by the
     # drivers whose dataclasses are registered here.
-    from .iao_lis import (
-        IAOLISFragmentStaticSelection,
-        IAOFragmentLISStaticSelections,
-    )
-    from .iao_mp2 import IAOFragmentMP2Thresholds
-    from .iao_mp2_grad import (
-        FixedPAOSubspaceSelection,
-        IAOMP2FragmentStaticSelection,
-        IAOFragmentMP2StaticSelections,
-    )
+    from .lis import FragmentLISSelection, LISSelections
+    from .domain import DLNOThresholds
+    from ._selection import FixedPAOSubspaceSelection, FragmentDomainSelection, DomainSelections
 
     classes = (
-        IAOFragmentMP2Thresholds,
+        DLNOThresholds,
         FixedPAOSubspaceSelection,
-        IAOMP2FragmentStaticSelection,
-        IAOFragmentMP2StaticSelections,
-        IAOLISFragmentStaticSelection,
-        IAOFragmentLISStaticSelections,
+        FragmentDomainSelection,
+        DomainSelections,
+        FragmentLISSelection,
+        LISSelections,
     )
-    return {
-        f"{cls.__module__}:{cls.__qualname__}": cls
-        for cls in classes
-    }
+    registry = {}
+    for cls in classes:
+        registry[_class_tag(cls)] = cls
+        registry[f"{cls.__module__}:{cls.__qualname__}"] = cls
+    return registry
+
+
+# Persist the original wire names independently of Python module organization.
+# Existing checkpoint digests include these tags, so both reading and writing
+# must use the same identities after a source-only restructuring.
+_STATIC_CLASS_TAGS = {
+    "pyscfad.dlno.domain:DLNOThresholds":
+        "pyscfad.dlno.iao_mp2:IAOFragmentMP2Thresholds",
+    "pyscfad.dlno._selection:FixedPAOSubspaceSelection":
+        "pyscfad.dlno.iao_mp2_grad:FixedPAOSubspaceSelection",
+    "pyscfad.dlno._selection:FragmentDomainSelection":
+        "pyscfad.dlno.iao_mp2_grad:IAOMP2FragmentStaticSelection",
+    "pyscfad.dlno._selection:DomainSelections":
+        "pyscfad.dlno.iao_mp2_grad:IAOFragmentMP2StaticSelections",
+    "pyscfad.dlno.lis:FragmentLISSelection":
+        "pyscfad.dlno.iao_lis:IAOLISFragmentStaticSelection",
+    "pyscfad.dlno.lis:LISSelections":
+        "pyscfad.dlno.iao_lis:IAOFragmentLISStaticSelections",
+}
 
 
 def _class_tag(cls):
-    return f"{cls.__module__}:{cls.__qualname__}"
+    tag = f"{cls.__module__}:{cls.__qualname__}"
+    return _STATIC_CLASS_TAGS.get(tag, tag)
 
 
 def _host_array(value):
@@ -984,12 +999,6 @@ class RestartManager:
             )
         self._manifest = manifest
 
-    def refresh_manifest(self):
-        """Reload and validate ``run.json`` after an MPI-root update."""
-        if self.enabled:
-            self._open_existing_manifest()
-        return self
-
     def _write_manifest(self):
         _atomic_bytes(
             self.manifest_path,
@@ -1098,10 +1107,6 @@ class RestartManager:
             self._component(key, "key") + ".h5"
         )
         return self.path / "records" / stage / filename
-
-    def has_record(self, stage, key=None):
-        path = self.record_path(stage, key)
-        return path is not None and path.is_file()
 
     def save_record(
         self,

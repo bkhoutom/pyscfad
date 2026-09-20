@@ -1,6 +1,6 @@
 """Static NumPy implementation of the DLNO multipole pair model.
 
-The routines in :mod:`pyscfad.dlno.mp2` intentionally use JAX because their
+The routines in :mod:`pyscfad.dlno.multipole` intentionally use JAX because their
 results may participate in a differentiated energy expression.  Domain
 topology construction, on the other hand, is a discrete preprocessing step.
 Sending every trial pair through JAX there grows the device allocation and
@@ -10,7 +10,7 @@ the same dipole--octupole formulas using only NumPy and PySCF integral calls.
 
 import numpy as np
 
-from .util import fake_mol_by_atom
+from .tools import fake_mol_by_atom
 
 
 __all__ = [

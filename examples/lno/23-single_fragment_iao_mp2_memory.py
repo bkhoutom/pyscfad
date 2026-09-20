@@ -43,17 +43,11 @@ from pyscf.df import addons as df_addons
 from pyscf.scf import chkfile as pyscf_scf_chkfile
 
 from pyscfad import config, gto, scf
-from pyscfad.dlno.iao_mp2 import (
-    IAOFragmentMP2Thresholds,
-    build_iao_fragment_topology,
-)
-from pyscfad.dlno.iao_mp2_grad import (
-    build_iao_mp2_static_selections,
-    build_strong_ed_domain,
-    rebuild_iao_mp2_common,
-    strong_domain_energy,
-)
-from pyscfad.lno import lno_base
+from pyscfad.dlno.domain import DLNOThresholds, build_domain_topology
+from pyscfad.dlno._selection import build_domain_selections
+from pyscfad.dlno.dlno_base import build_strong_ed_domain, rebuild_domain_data
+from pyscfad.dlno.mp2 import strong_domain_energy
+from pyscfad.lno import df as lno_df
 from pyscfad.ops import stop_trace
 from pyscfad.tools import resource_profile
 
@@ -178,25 +172,25 @@ def main():
             jax.block_until_ready(mf.e_tot)
         e_hf = float(jax.device_get(mf.e_tot))
 
-        thresholds = IAOFragmentMP2Thresholds(
+        thresholds = DLNOThresholds(
             pair_energy=PAIR_THRESHOLD,
             mp2_block_memory_mb=128.0,
         )
 
         def build_static(mf_):
-            topology = build_iao_fragment_topology(
+            topology = build_domain_topology(
                 mf_,
                 frozen=FROZEN,
                 thresholds=thresholds,
                 pair_energy_model="multipole",
             )
-            return build_iao_mp2_static_selections(mf_, topology)
+            return build_domain_selections(mf_, topology)
 
         with resource_profile.section("single_fragment_fixed_topology"):
             static = stop_trace(build_static)(mf)
 
         def local_naux(fragment_):
-            local_mol_ = lno_base.make_local_mol(
+            local_mol_ = lno_df.make_local_mol(
                 mol, fragment_.extended_atoms
             )
             local_auxmol_ = df_addons.make_auxmol(local_mol_, AUXBASIS)
@@ -239,7 +233,7 @@ def main():
         mp2_forward_profile = resource_profile.start()
         with resource_profile.section("single_fragment_common_forward"):
             common, common_pullback = jax.vjp(
-                lambda mf_: rebuild_iao_mp2_common(mf_, static), mf
+                lambda mf_: rebuild_domain_data(mf_, static), mf
             )
             jax.block_until_ready(common)
 

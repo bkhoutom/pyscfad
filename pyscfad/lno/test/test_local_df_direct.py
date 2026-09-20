@@ -1,3 +1,8 @@
+from pyscfad.lno import _df_direct as lno_df_direct
+from pyscfad.lno import _df_h5 as lno_df_h5
+from pyscfad.lno import _profile as lno_profile
+from pyscfad.lno import df as lno_df
+from pyscfad.lno import tools as lno_tools
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,7 +16,6 @@ from pyscf.mp import dfmp2
 
 from pyscfad import df, gto
 from pyscfad import numpy as np
-from pyscfad.lno import lno_base
 
 
 def _water_mol():
@@ -32,13 +36,13 @@ def _df_holder(mol):
 
 
 def _local_coeff(mol, atmlst):
-    ao_idx = lno_base.dlno_util.ao_index_by_atom(mol, atmlst)
+    ao_idx = lno_tools.ao_index_by_atom(mol, atmlst)
     rng = numpy.random.default_rng(14)
     return np.asarray(rng.normal(size=(ao_idx.size, 5)))
 
 
 def _lov_norm(mol, coeff, atmlst, integral_direct):
-    lov = lno_base.get_local_Lov(
+    lov = lno_df.get_local_Lov(
         _df_holder(mol),
         coeff,
         2,
@@ -52,12 +56,12 @@ def _direct_local_problem(nocc=2):
     mol = _water_mol()
     atmlst = numpy.asarray([0, 1], dtype=numpy.int32)
     coeff = _local_coeff(mol, atmlst)
-    fake_mol = lno_base.make_local_mol(mol, atmlst)
-    auxmol = lno_base.df_addons.make_auxmol(
+    fake_mol = lno_df.make_local_mol(mol, atmlst)
+    auxmol = lno_df.df_addons.make_auxmol(
         fake_mol, _df_holder(mol).with_df.auxbasis
     )
     orbs_slice = (0, nocc, nocc, coeff.shape[1])
-    lov = lno_base._local_direct_nr_e2_impl(
+    lov = lno_df_direct._local_direct_nr_e2_impl(
         fake_mol, auxmol, coeff, mol.max_memory, orbs_slice
     )
     return mol, fake_mol, auxmol, coeff, orbs_slice, lov
@@ -87,15 +91,15 @@ def test_integral_direct_local_lov_matches_cderi_without_building_local_df(
     mol = _water_mol()
     atmlst = numpy.asarray([0, 1], dtype=numpy.int32)
     coeff = _local_coeff(mol, atmlst)
-    reference = lno_base.get_local_Lov(
+    reference = lno_df.get_local_Lov(
         _df_holder(mol), coeff, 2, atmlst
     )
 
     def forbidden_local_df(*args, **kwargs):
         raise AssertionError("integral-direct Lov must not build an AO-pair CDERI")
 
-    monkeypatch.setattr(lno_base, "get_local_df", forbidden_local_df)
-    direct = lno_base.get_local_Lov(
+    monkeypatch.setattr(lno_df, "get_local_df", forbidden_local_df)
+    direct = lno_df.get_local_Lov(
         _df_holder(mol), coeff, 2, atmlst, integral_direct=True
     )
 
@@ -157,7 +161,7 @@ def test_integral_direct_coordinate_vjp_uses_forward_block_budget(
             str(configured_mb),
         )
 
-    real_vjp = lno_base._cderi_vjp._int3c_mo_deriv_coords_vjp
+    real_vjp = lno_df_direct._cderi_vjp._int3c_mo_deriv_coords_vjp
     seen = []
 
     def checked_vjp(*args, **kwargs):
@@ -165,7 +169,7 @@ def test_integral_direct_coordinate_vjp_uses_forward_block_budget(
         return real_vjp(*args, **kwargs)
 
     monkeypatch.setattr(
-        lno_base._cderi_vjp,
+        lno_df_direct._cderi_vjp,
         "_int3c_mo_deriv_coords_vjp",
         checked_vjp,
     )
@@ -180,14 +184,14 @@ def test_integral_direct_local_lov_general_cotangent_matches_coordinate_fd():
     mol = _water_mol()
     atmlst = numpy.asarray([0, 1], dtype=numpy.int32)
     coeff = _local_coeff(mol, atmlst)
-    reference = lno_base.get_local_Lov(
+    reference = lno_df.get_local_Lov(
         _df_holder(mol), coeff, 2, atmlst, integral_direct=True
     )
     rng = numpy.random.default_rng(91)
     cotangent = np.asarray(rng.normal(size=reference.shape))
 
     def objective(mol_):
-        lov = lno_base.get_local_Lov(
+        lov = lno_df.get_local_Lov(
             _df_holder(mol_), coeff, 2, atmlst, integral_direct=True
         )
         return np.einsum("Lia,Lia->", cotangent, lov)
@@ -229,13 +233,13 @@ def test_build_local_lov_h5_matches_integral_direct_pair_major(
     atmlst = numpy.asarray([0, 1], dtype=numpy.int32)
     coeff = _local_coeff(mol, atmlst)
     nocc = 2
-    reference = lno_base.get_local_Lov(
+    reference = lno_df.get_local_Lov(
         _df_holder(mol), coeff, nocc, atmlst, integral_direct=True
     )
     path = tmp_path / "local-lov.h5"
-    monkeypatch.setattr(lno_base.resource_profile, "enabled", lambda: True)
+    monkeypatch.setattr(lno_profile.resource_profile, "enabled", lambda: True)
 
-    info = lno_base.build_local_Lov_h5(
+    info = lno_df.build_local_Lov_h5(
         _df_holder(mol), coeff, nocc, atmlst, path
     )
 
@@ -268,15 +272,15 @@ def test_build_local_lov_h5_skips_diagnostics_when_profile_disabled(
     mol = _water_mol()
     atmlst = numpy.asarray([0, 1], dtype=numpy.int32)
     coeff = _local_coeff(mol, atmlst)
-    monkeypatch.setattr(lno_base.resource_profile, "enabled", lambda: False)
+    monkeypatch.setattr(lno_profile.resource_profile, "enabled", lambda: False)
     class FailTime:
         @staticmethod
         def perf_counter():
             raise AssertionError("disabled profiling consulted the clock")
 
-    monkeypatch.setattr(lno_base, "time", FailTime)
+    monkeypatch.setattr(lno_df_h5, "time", FailTime)
 
-    info = lno_base.build_local_Lov_h5(
+    info = lno_df.build_local_Lov_h5(
         _df_holder(mol), coeff, 2, atmlst, tmp_path / "disabled.h5"
     )
 
@@ -289,12 +293,12 @@ def test_build_local_lov_h5_supports_zero_occupied_orbitals(tmp_path):
     mol = _water_mol()
     atmlst = numpy.asarray([0, 1], dtype=numpy.int32)
     coeff = _local_coeff(mol, atmlst)
-    reference = lno_base.get_local_Lov(
+    reference = lno_df.get_local_Lov(
         _df_holder(mol), coeff, 0, atmlst, integral_direct=True
     )
     path = tmp_path / "zero-occ.h5"
 
-    info = lno_base.build_local_Lov_h5(
+    info = lno_df.build_local_Lov_h5(
         _df_holder(mol), coeff, 0, atmlst, path
     )
 
@@ -315,12 +319,12 @@ def test_build_local_lov_h5_supports_zero_virtual_orbitals(tmp_path):
     atmlst = numpy.asarray([0, 1], dtype=numpy.int32)
     coeff = _local_coeff(mol, atmlst)
     nocc = coeff.shape[1]
-    reference = lno_base.get_local_Lov(
+    reference = lno_df.get_local_Lov(
         _df_holder(mol), coeff, nocc, atmlst, integral_direct=True
     )
     path = tmp_path / "zero-vir.h5"
 
-    info = lno_base.build_local_Lov_h5(
+    info = lno_df.build_local_Lov_h5(
         _df_holder(mol), coeff, nocc, atmlst, path
     )
 
@@ -344,20 +348,20 @@ def test_build_local_lov_h5_rejects_insufficient_scratch_space(
     coeff = _local_coeff(mol, atmlst)
     nocc = 2
     nvir = coeff.shape[1] - nocc
-    fake_mol = lno_base.make_local_mol(mol, atmlst)
-    auxmol = lno_base.df_addons.make_auxmol(
+    fake_mol = lno_df.make_local_mol(mol, atmlst)
+    auxmol = lno_df.df_addons.make_auxmol(
         fake_mol, _df_holder(mol).with_df.auxbasis
     )
     required = int(3.25 * auxmol.nao * nocc * nvir * 8) + 1024**3
     path = tmp_path / "too-large.h5"
     monkeypatch.setattr(
-        lno_base.shutil,
+        lno_df_h5.shutil,
         "disk_usage",
         lambda unused: SimpleNamespace(free=required - 1),
     )
 
     with pytest.raises(OSError) as excinfo:
-        lno_base.build_local_Lov_h5(
+        lno_df.build_local_Lov_h5(
             _df_holder(mol), coeff, nocc, atmlst, path
         )
 
@@ -387,7 +391,7 @@ def test_build_local_lov_h5_uses_configured_tmpdir_and_removes_raw_store(
     monkeypatch.setattr(pyscf_lib.param, "TMPDIR", str(scratch))
     monkeypatch.setattr(pyscf_lib, "H5TmpFile", tracked_h5tmp)
 
-    lno_base.build_local_Lov_h5(
+    lno_df.build_local_Lov_h5(
         _df_holder(mol), coeff, 2, atmlst, tmp_path / "local-lov.h5"
     )
 
@@ -418,7 +422,7 @@ def test_build_local_lov_h5_removes_partial_target_after_failure(
     monkeypatch.setattr(dfmp2, "_init_mp_df_eris_direct", failing_producer)
 
     with pytest.raises(RuntimeError, match="producer failed"):
-        lno_base.build_local_Lov_h5(
+        lno_df.build_local_Lov_h5(
             _df_holder(mol), coeff, 2, atmlst, path
         )
 
@@ -460,7 +464,7 @@ def test_build_local_lov_h5_never_converts_complete_lov_dataset(
     monkeypatch.setattr(h5py.Dataset, "__getitem__", tracked_getitem)
     monkeypatch.setattr(h5py.Dataset, "__setitem__", tracked_setitem)
 
-    info = lno_base.build_local_Lov_h5(
+    info = lno_df.build_local_Lov_h5(
         _df_holder(mol), coeff, 2, atmlst, path
     )
 
@@ -476,10 +480,10 @@ def test_local_lov_h5_pair_tile_size_accounts_for_all_reverse_tiles():
     target_bytes = target_mb * 1024.0**2
     expected = int(target_bytes // (3 * naux * numpy.dtype('float64').itemsize))
 
-    assert lno_base._local_lov_h5_pair_tile_size(
+    assert lno_df_h5._local_lov_h5_pair_tile_size(
         naux, npair, numpy.float64, target_mb=target_mb
     ) == max(1, min(npair, expected))
-    assert lno_base._local_lov_h5_pair_tile_size(
+    assert lno_df_h5._local_lov_h5_pair_tile_size(
         naux, 0, numpy.float64, target_mb=target_mb
     ) == 1
 
@@ -490,13 +494,13 @@ def test_local_lov_h5_pair_tile_size_accounts_for_all_reverse_tiles():
         (naux, npair, numpy.dtype('O'), target_mb),
     ):
         with pytest.raises(ValueError):
-            lno_base._local_lov_h5_pair_tile_size(
+            lno_df_h5._local_lov_h5_pair_tile_size(
                 args[0], args[1], args[2], target_mb=args[3]
             )
 
 
 def test_local_lov_h5_z_chunks_are_two_dimensional_and_near_eight_mib():
-    chunks = lno_base._local_lov_h5_z_chunks(
+    chunks = lno_df_h5._local_lov_h5_z_chunks(
         naux=10_000,
         npair=100_000,
         dtype=numpy.float64,
@@ -511,10 +515,10 @@ def test_local_lov_h5_z_chunks_are_two_dimensional_and_near_eight_mib():
 
 
 def test_local_lov_h5_z_aux_reads_are_memory_bounded_and_strictly_partial():
-    small_rows = lno_base._local_lov_h5_z_aux_read_rows(
+    small_rows = lno_df_h5._local_lov_h5_z_aux_read_rows(
         naux=71, npair=6, dtype=numpy.float64
     )
-    large_rows = lno_base._local_lov_h5_z_aux_read_rows(
+    large_rows = lno_df_h5._local_lov_h5_z_aux_read_rows(
         naux=1_000, npair=100_000, dtype=numpy.float64
     )
 
@@ -524,10 +528,10 @@ def test_local_lov_h5_z_aux_reads_are_memory_bounded_and_strictly_partial():
 
 
 def test_local_lov_h5_reverse_dtype_includes_every_tile_participant():
-    assert lno_base._local_lov_h5_reverse_dtype(
+    assert lno_df_h5._local_lov_h5_reverse_dtype(
         numpy.float64, numpy.complex128, numpy.float32
     ) == numpy.dtype(numpy.complex128)
-    assert lno_base._local_lov_h5_reverse_dtype(
+    assert lno_df_h5._local_lov_h5_reverse_dtype(
         numpy.float64, numpy.float32, numpy.float32
     ) == numpy.dtype(numpy.float64)
 
@@ -535,7 +539,7 @@ def test_local_lov_h5_reverse_dtype_includes_every_tile_participant():
 def test_local_direct_mo_coeff_vjp_accepts_one_read_per_raw_block(monkeypatch):
     _, fake_mol, auxmol, coeff, orbs_slice, lov = _direct_local_problem()
     z = numpy.random.default_rng(183).normal(size=numpy.asarray(lov).shape)
-    real_blocks = lno_base._local_direct_raw_int3c_blocks
+    real_blocks = lno_df_direct._local_direct_raw_int3c_blocks
     block_ranges = []
 
     def tracked_blocks(*args, **kwargs):
@@ -544,9 +548,9 @@ def test_local_direct_mo_coeff_vjp_accepts_one_read_per_raw_block(monkeypatch):
             yield p0, p1, raw_ints
 
     monkeypatch.setattr(
-        lno_base, '_local_direct_raw_int3c_blocks', tracked_blocks
+        lno_df_direct, '_local_direct_raw_int3c_blocks', tracked_blocks
     )
-    reference = lno_base._local_direct_mo_coeff_vjp(
+    reference = lno_df_direct._local_direct_mo_coeff_vjp(
         fake_mol, auxmol, coeff, z, orbs_slice
     )
     block_ranges.clear()
@@ -556,7 +560,7 @@ def test_local_direct_mo_coeff_vjp_accepts_one_read_per_raw_block(monkeypatch):
         calls.append((p0, p1))
         return z[p0:p1, :]
 
-    result = lno_base._local_direct_mo_coeff_vjp(
+    result = lno_df_direct._local_direct_mo_coeff_vjp(
         fake_mol, auxmol, coeff, read_z_aux_block, orbs_slice
     )
 
@@ -575,7 +579,7 @@ def test_local_direct_mo_coeff_vjp_rejects_transposed_reader_block():
         return z[p0:p1, :].T
 
     with pytest.raises(ValueError, match='z auxiliary block.*shape'):
-        lno_base._local_direct_mo_coeff_vjp(
+        lno_df_direct._local_direct_mo_coeff_vjp(
             fake_mol, auxmol, coeff, transposed_z_aux_block, orbs_slice
         )
 
@@ -585,11 +589,11 @@ def test_local_direct_mo_coeff_vjp_oversized_shell_fallback_is_disjoint(
 ):
     _, fake_mol, auxmol, coeff, orbs_slice, lov = _direct_local_problem()
     z = numpy.random.default_rng(181).normal(size=numpy.asarray(lov).shape)
-    reference = lno_base._local_direct_mo_coeff_vjp(
+    reference = lno_df_direct._local_direct_mo_coeff_vjp(
         fake_mol, auxmol, coeff, z, orbs_slice
     )
-    real_blocks = lno_base._local_direct_raw_int3c_blocks
-    real_int3c_cross = lno_base._int3c_cross_opt.int3c_cross
+    real_blocks = lno_df_direct._local_direct_raw_int3c_blocks
+    real_int3c_cross = lno_df_direct._int3c_cross_opt.int3c_cross
     logical_ranges = []
     integral_calls = []
 
@@ -603,10 +607,10 @@ def test_local_direct_mo_coeff_vjp_oversized_shell_fallback_is_disjoint(
         return real_int3c_cross(*args, **kwargs)
 
     monkeypatch.setattr(
-        lno_base, '_local_direct_raw_int3c_blocks', tracked_blocks
+        lno_df_direct, '_local_direct_raw_int3c_blocks', tracked_blocks
     )
     monkeypatch.setattr(
-        lno_base._int3c_cross_opt, 'int3c_cross', tracked_int3c_cross
+        lno_df_direct._int3c_cross_opt, 'int3c_cross', tracked_int3c_cross
     )
     read_ranges = []
 
@@ -614,7 +618,7 @@ def test_local_direct_mo_coeff_vjp_oversized_shell_fallback_is_disjoint(
         read_ranges.append((p0, p1))
         return z[p0:p1, :]
 
-    result = lno_base._local_direct_mo_coeff_vjp(
+    result = lno_df_direct._local_direct_mo_coeff_vjp(
         fake_mol,
         auxmol,
         coeff,
@@ -640,7 +644,7 @@ def test_local_direct_nr_e2_h5_bwd_matches_full_general_cotangent(
     lov = numpy.asarray(lov)
     rng = numpy.random.default_rng(184)
     lov_bar = rng.normal(size=lov.shape)
-    reference = lno_base._local_direct_nr_e2_bwd(
+    reference = lno_df_direct._local_direct_nr_e2_bwd(
         mol.max_memory,
         orbs_slice,
         (fake_mol, auxmol, coeff, np.asarray(lov)),
@@ -654,17 +658,17 @@ def test_local_direct_nr_e2_h5_bwd_matches_full_general_cotangent(
     profile_token = object()
     profile_events = []
     monkeypatch.setattr(
-        lno_base.resource_profile, 'start', lambda: profile_token
+        lno_profile.resource_profile, 'start', lambda: profile_token
     )
     monkeypatch.setattr(
-        lno_base.resource_profile,
+        lno_profile.resource_profile,
         'finish',
         lambda phase, before, **details: profile_events.append(
             (phase, before, details)
         ),
     )
 
-    result = lno_base._local_direct_nr_e2_h5_bwd(
+    result = lno_df_h5._local_direct_nr_e2_h5_bwd(
         fake_mol, auxmol, coeff, orbs_slice, path
     )
 
@@ -716,11 +720,11 @@ def test_local_direct_nr_e2_h5_bwd_uses_bounded_dataset_slices(
         h5file.create_dataset('lov_bar', data=lov_bar.T)
 
     monkeypatch.setattr(
-        lno_base, '_local_lov_h5_pair_tile_size', lambda *args, **kwargs: 2
+        lno_df_h5, '_local_lov_h5_pair_tile_size', lambda *args, **kwargs: 2
     )
     original_array = h5py.Dataset.__array__
     original_getitem = h5py.Dataset.__getitem__
-    original_int3c_cross = lno_base._int3c_cross_opt.int3c_cross
+    original_int3c_cross = lno_df_direct._int3c_cross_opt.int3c_cross
     reads = {'/lov': [], '/lov_bar': [], '/z': []}
     integral_ranges = []
 
@@ -750,10 +754,10 @@ def test_local_direct_nr_e2_h5_bwd_uses_bounded_dataset_slices(
     monkeypatch.setattr(h5py.Dataset, '__array__', forbidden_array)
     monkeypatch.setattr(h5py.Dataset, '__getitem__', tracked_getitem)
     monkeypatch.setattr(
-        lno_base._int3c_cross_opt, 'int3c_cross', tracked_int3c_cross
+        lno_df_direct._int3c_cross_opt, 'int3c_cross', tracked_int3c_cross
     )
 
-    lno_base._local_direct_nr_e2_h5_bwd(
+    lno_df_h5._local_direct_nr_e2_h5_bwd(
         fake_mol, auxmol, coeff, orbs_slice, path
     )
 
@@ -806,7 +810,7 @@ def test_local_direct_nr_e2_h5_bwd_rejects_non_float64_contract(
         )
 
     with pytest.raises(ValueError, match='real float64'):
-        lno_base._local_direct_nr_e2_h5_bwd(
+        lno_df_h5._local_direct_nr_e2_h5_bwd(
             fake_mol,
             auxmol,
             np.asarray(numpy.asarray(coeff).astype(coeff_dtype)),
@@ -828,13 +832,13 @@ def test_local_direct_nr_e2_h5_bwd_recreates_z_and_cleans_failed_z(
         h5file.create_dataset('lov_bar', data=first_bar.T)
         h5file.attrs['pyscfad_fragment_index'] = 29
 
-    lno_base._local_direct_nr_e2_h5_bwd(
+    lno_df_h5._local_direct_nr_e2_h5_bwd(
         fake_mol, auxmol, coeff, orbs_slice, path
     )
     with h5py.File(path, 'r+') as h5file:
         first_z = h5file['z'][:]
         h5file['lov_bar'][:] = second_bar.T
-    lno_base._local_direct_nr_e2_h5_bwd(
+    lno_df_h5._local_direct_nr_e2_h5_bwd(
         fake_mol, auxmol, coeff, orbs_slice, path
     )
     with h5py.File(path, 'r') as h5file:
@@ -844,20 +848,20 @@ def test_local_direct_nr_e2_h5_bwd_recreates_z_and_cleans_failed_z(
         raise RuntimeError('downstream failure')
 
     monkeypatch.setattr(
-        lno_base, '_local_direct_mo_coeff_vjp', fail_after_z
+        lno_df_h5, '_local_direct_mo_coeff_vjp', fail_after_z
     )
     token = object()
     events = []
-    monkeypatch.setattr(lno_base.resource_profile, 'start', lambda: token)
+    monkeypatch.setattr(lno_profile.resource_profile, 'start', lambda: token)
     monkeypatch.setattr(
-        lno_base.resource_profile,
+        lno_profile.resource_profile,
         'finish',
         lambda phase, before, **details: events.append(
             (phase, before, details)
         ),
     )
     with pytest.raises(RuntimeError, match='downstream failure'):
-        lno_base._local_direct_nr_e2_h5_bwd(
+        lno_df_h5._local_direct_nr_e2_h5_bwd(
             fake_mol, auxmol, coeff, orbs_slice, path
         )
     with h5py.File(path, 'r') as h5file:
@@ -881,7 +885,7 @@ def test_local_direct_nr_e2_h5_bwd_supports_empty_pair_dimension(tmp_path):
             'lov_bar', shape=(0, auxmol.nao), dtype=numpy.float64
         )
 
-    mol_bar, auxmol_bar, coeff_bar = lno_base._local_direct_nr_e2_h5_bwd(
+    mol_bar, auxmol_bar, coeff_bar = lno_df_h5._local_direct_nr_e2_h5_bwd(
         fake_mol, auxmol, coeff, orbs_slice, path
     )
 

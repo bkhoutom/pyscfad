@@ -32,6 +32,7 @@ import argparse
 import csv
 from datetime import datetime, timezone
 import json
+import runpy
 import os
 from pathlib import Path
 import platform
@@ -45,17 +46,18 @@ import numpy as np
 import pyscf
 
 from pyscfad import config, df, gto, scf
-from pyscfad.dlno.alkane import make_n_alkane
-from pyscfad.dlno.iao_mp2 import (
-    IAOFragmentMP2Thresholds,
-    build_iao_fragment_topology,
-)
-from pyscfad.dlno.iao_mp2_grad import (
-    build_iao_mp2_static_selections,
-    correlation_value_and_grad,
-)
+from pyscfad.dlno.domain import DLNOThresholds, build_domain_topology
+from pyscfad.dlno._selection import build_domain_selections
+from pyscfad.dlno.mp2 import correlation_value_and_grad
 from pyscfad.mp import dfmp2
 from pyscfad.ops import stop_trace
+
+
+# This benchmark is also loaded by path in tests, without its directory
+# on sys.path. Resolve the example-only geometry helper explicitly.
+make_n_alkane = runpy.run_path(
+    str(Path(__file__).with_name("_molecules.py"))
+)["make_n_alkane"]
 
 
 def build_molecule(atoms, *, basis, verbose, max_memory):
@@ -659,7 +661,7 @@ def main(argv=None):
 
     for label, pair_cutoff, force_full in jobs:
         if force_full:
-            thresholds = IAOFragmentMP2Thresholds(
+            thresholds = DLNOThresholds(
                 pair_energy=0.0,
                 pao_norm=1e-10,
                 domain_pao=0.0,
@@ -669,7 +671,7 @@ def main(argv=None):
             )
             pair_model = "all"
         else:
-            thresholds = IAOFragmentMP2Thresholds(
+            thresholds = DLNOThresholds(
                 bp_occ=args.bp_occ,
                 bp_primary=args.bp_primary,
                 bp_ed=args.bp_ed,
@@ -692,7 +694,7 @@ def main(argv=None):
 
         def build_fixed_topology(mf_):
             start = time.perf_counter()
-            topology = build_iao_fragment_topology(
+            topology = build_domain_topology(
                 mf_,
                 frozen=args.frozen_core,
                 thresholds=thresholds,
@@ -701,7 +703,7 @@ def main(argv=None):
             )
             selection_timing["topology"] = time.perf_counter() - start
             start = time.perf_counter()
-            static_ = build_iao_mp2_static_selections(mf_, topology)
+            static_ = build_domain_selections(mf_, topology)
             selection_timing["static"] = time.perf_counter() - start
             return static_
 

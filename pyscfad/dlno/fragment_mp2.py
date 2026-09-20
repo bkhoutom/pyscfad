@@ -1,17 +1,12 @@
-"""Algebraic primitives for IAO-fragment MP2 energy partitions.
+"""Weighted-target MP2 energies and their blocked derivatives.
 
-This module deliberately contains no domain-selection logic.  It separates
-two objects that play different roles in an IAO-based local correlation
-calculation:
+The NumPy routines provide reference fragment algebra. The JAX routines and
+custom pullbacks evaluate the same energy with bounded memory, including
+HDF5-backed density-fitting factors.
 
-* the occupied *span* associated with an IAO fragment, which is useful for
-  constructing spatial domains; and
-* the positive-semidefinite occupied weight of that fragment, which is
-  required for an additive correlation-energy partition.
-
-The routines are NumPy implementations intended first for validating the
-fragment algebra on small systems.  A JAX implementation can use the same
-identities once the domain construction has been settled.
+An occupied span selects a domain; a raw target weight partitions correlation
+energy. These are different objects when IAO fragment spans overlap. Domain
+selection itself lives in the domain and fixed-selection rebuild modules.
 """
 
 from dataclasses import dataclass
@@ -19,8 +14,8 @@ from functools import partial
 import os
 
 import jax
-import jax.numpy as jnp
-import numpy as np
+import jax.numpy as np
+import numpy
 
 
 __all__ = [
@@ -69,14 +64,14 @@ class FragmentOccupiedData:
     occupied spans overlap.
     """
 
-    iao_indices: np.ndarray
-    iao_coeff: np.ndarray
-    iao_occ_overlap: np.ndarray
-    occupied_projection: np.ndarray
-    occupied_weight: np.ndarray
-    singular_values: np.ndarray
-    right_singular_vectors: np.ndarray
-    occupied_subspace_coeff: np.ndarray
+    iao_indices: numpy.ndarray
+    iao_coeff: numpy.ndarray
+    iao_occ_overlap: numpy.ndarray
+    occupied_projection: numpy.ndarray
+    occupied_weight: numpy.ndarray
+    singular_values: numpy.ndarray
+    right_singular_vectors: numpy.ndarray
+    occupied_subspace_coeff: numpy.ndarray
 
     @property
     def rank(self):
@@ -95,17 +90,17 @@ class FragmentPairEnergies:
     a single matrix; singleton fragment axes are then removed.
     """
 
-    total: np.ndarray
-    opposite_spin: np.ndarray
-    same_spin: np.ndarray
+    total: numpy.ndarray
+    opposite_spin: numpy.ndarray
+    same_spin: numpy.ndarray
 
     def summed(self):
         """Return the three components summed over all fragment pairs."""
 
         return FragmentPairEnergies(
-            total=np.sum(self.total),
-            opposite_spin=np.sum(self.opposite_spin),
-            same_spin=np.sum(self.same_spin),
+            total=numpy.sum(self.total),
+            opposite_spin=numpy.sum(self.opposite_spin),
+            same_spin=numpy.sum(self.same_spin),
         )
 
 
@@ -118,9 +113,9 @@ class FragmentPairPartition:
 
 
 def _validate_coefficients(occ_coeff, iao_coeff, s1e):
-    occ_coeff = np.asarray(occ_coeff)
-    iao_coeff = np.asarray(iao_coeff)
-    s1e = np.asarray(s1e)
+    occ_coeff = numpy.asarray(occ_coeff)
+    iao_coeff = numpy.asarray(iao_coeff)
+    s1e = numpy.asarray(s1e)
 
     if occ_coeff.ndim != 2:
         raise ValueError("occ_coeff must be a rank-2 array")
@@ -137,17 +132,17 @@ def _validate_coefficients(occ_coeff, iao_coeff, s1e):
 def _validate_fragment_partition(frag_lolist, niao):
     fragments = []
     for ifrag, indices in enumerate(frag_lolist):
-        raw = np.asarray(indices)
+        raw = numpy.asarray(indices)
         if raw.ndim > 1:
             raise ValueError(
                 f"fragment {ifrag} IAO indices must be a one-dimensional array"
             )
-        if raw.size and not np.issubdtype(raw.dtype, np.integer):
+        if raw.size and not numpy.issubdtype(raw.dtype, numpy.integer):
             raise ValueError(f"fragment {ifrag} IAO indices must be integers")
-        idx = raw.astype(np.int64, copy=False).reshape(-1)
-        if np.any(idx < 0) or np.any(idx >= niao):
+        idx = raw.astype(numpy.int64, copy=False).reshape(-1)
+        if numpy.any(idx < 0) or numpy.any(idx >= niao):
             raise ValueError(f"fragment {ifrag} contains an out-of-range IAO index")
-        if np.unique(idx).size != idx.size:
+        if numpy.unique(idx).size != idx.size:
             raise ValueError(f"fragment {ifrag} contains duplicate IAO indices")
         fragments.append(idx)
 
@@ -156,11 +151,11 @@ def _validate_fragment_partition(frag_lolist, niao):
             raise ValueError("frag_lolist does not contain the IAO columns")
         return tuple()
 
-    all_indices = np.concatenate(fragments)
-    if np.unique(all_indices).size != all_indices.size:
+    all_indices = numpy.concatenate(fragments)
+    if numpy.unique(all_indices).size != all_indices.size:
         raise ValueError("an IAO is assigned to more than one fragment")
-    if all_indices.size != niao or not np.array_equal(
-        np.sort(all_indices), np.arange(niao)
+    if all_indices.size != niao or not numpy.array_equal(
+        numpy.sort(all_indices), numpy.arange(niao)
     ):
         raise ValueError("frag_lolist must assign every IAO exactly once")
     return tuple(fragments)
@@ -222,10 +217,10 @@ def build_fragment_occupied_data(
         wf = mf.conj().T @ mf
 
         if min(mf.shape) == 0:
-            sigma = np.zeros((0,), dtype=np.real(mf).dtype)
-            right = np.zeros((nocc, 0), dtype=mf.dtype)
+            sigma = numpy.zeros((0,), dtype=numpy.real(mf).dtype)
+            right = numpy.zeros((nocc, 0), dtype=mf.dtype)
         else:
-            _, sigma, vh = np.linalg.svd(mf, full_matrices=False)
+            _, sigma, vh = numpy.linalg.svd(mf, full_matrices=False)
             keep = sigma > svd_thr
             right = vh.conj().T[:, keep]
         occupied_subspace = occ_coeff @ right
@@ -246,7 +241,7 @@ def build_fragment_occupied_data(
 
 
 def _as_weight_stack(weights, nocc, name):
-    array = np.asarray(weights)
+    array = numpy.asarray(weights)
     was_single = array.ndim == 2
     if was_single:
         array = array[None, :, :]
@@ -254,7 +249,7 @@ def _as_weight_stack(weights, nocc, name):
         raise ValueError(
             f"{name} must have shape (nocc, nocc) or (nfrag, nocc, nocc)"
         )
-    if not np.allclose(array, array.swapaxes(-1, -2).conj(), atol=1e-10):
+    if not numpy.allclose(array, array.swapaxes(-1, -2).conj(), atol=1e-10):
         raise ValueError(f"{name} must contain Hermitian matrices")
     return array, was_single
 
@@ -311,9 +306,9 @@ def fragment_pair_energy_from_ovov(
     production path.
     """
 
-    ovov = np.asarray(ovov)
-    e_occ = np.asarray(e_occ)
-    e_vir = np.asarray(e_vir)
+    ovov = numpy.asarray(ovov)
+    e_occ = numpy.asarray(e_occ)
+    e_vir = numpy.asarray(e_vir)
     if ovov.ndim != 4:
         raise ValueError("ovov must be a rank-4 array")
     nocc, nvir, nocc1, nvir1 = ovov.shape
@@ -334,12 +329,12 @@ def fragment_pair_energy_from_ovov(
 
     eia = e_occ[:, None] - e_vir[None, :]
     denominator = eia[:, None, :, None] + eia[None, :, None, :]
-    if np.any(np.abs(denominator) < 1e-14):
+    if numpy.any(numpy.abs(denominator) < 1e-14):
         raise ValueError("an MP2 energy denominator is zero")
     integrals = ovov.transpose(0, 2, 1, 3)
     amplitudes = integrals / denominator
 
-    direct = np.einsum(
+    direct = numpy.einsum(
         "fpq,grs,prab,qasb->fg",
         left,
         right,
@@ -347,7 +342,7 @@ def fragment_pair_energy_from_ovov(
         ovov,
         optimize=True,
     )
-    exchange = np.einsum(
+    exchange = numpy.einsum(
         "fpq,grs,prab,qbsa->fg",
         left,
         right,
@@ -375,13 +370,13 @@ def _virtual_block_size(lov, nleft, nright, max_memory_mb):
     if max_memory_mb <= 0:
         raise ValueError("max_memory_mb must be positive")
     nocc = lov.shape[1]
-    itemsize = np.dtype(lov.dtype).itemsize
+    itemsize = numpy.dtype(lov.dtype).itemsize
     # Per (a,b) block we hold the ERIs, amplitudes, a denominator, and the
     # occupied-weight transforms, plus comparatively small fragment
     # contractions.  A factor of five leaves room for einsum workspaces.
     bytes_per_virtual_pair = max(5 * nocc * nocc * itemsize, 1)
     budget = max_memory_mb * 1024.0**2
-    block = int(np.sqrt(budget / bytes_per_virtual_pair))
+    block = int(numpy.sqrt(budget / bytes_per_virtual_pair))
     return max(1, min(lov.shape[2], block))
 
 
@@ -420,9 +415,9 @@ def fragment_pair_energy_from_lov(
     but contracts the small target dimension before the occupied partner
     weight.  Stacked weights continue to use the general dense path.
     """
-    lov = np.asarray(lov)
-    e_occ = np.asarray(e_occ)
-    e_vir = np.asarray(e_vir)
+    lov = numpy.asarray(lov)
+    e_occ = numpy.asarray(e_occ)
+    e_vir = numpy.asarray(e_vir)
     if lov.ndim != 3:
         raise ValueError("lov must have shape (naux, nocc, nvir)")
     _, nocc, nvir = lov.shape
@@ -440,7 +435,7 @@ def fragment_pair_energy_from_lov(
         )
 
     if target_factor is not None:
-        target_factor = np.asarray(target_factor)
+        target_factor = numpy.asarray(target_factor)
         if target_factor.ndim != 2 or target_factor.shape[1] != nocc:
             raise ValueError(
                 "target_factor must have shape (ntarget, nocc)"
@@ -451,7 +446,7 @@ def fragment_pair_energy_from_lov(
                 "weights"
             )
         factor_weight = target_factor.conj().T @ target_factor
-        if not np.allclose(factor_weight, left[0], atol=1e-10, rtol=1e-10):
+        if not numpy.allclose(factor_weight, left[0], atol=1e-10, rtol=1e-10):
             raise ValueError(
                 "target_factor must satisfy weights = "
                 "target_factor^H target_factor"
@@ -461,16 +456,16 @@ def fragment_pair_energy_from_lov(
         block_nvir = _virtual_block_size(
             lov, left.shape[0], right.shape[0], max_memory_mb
         )
-    elif not isinstance(block_nvir, (int, np.integer)) or block_nvir <= 0:
+    elif not isinstance(block_nvir, (int, numpy.integer)) or block_nvir <= 0:
         raise ValueError("block_nvir must be a positive integer")
     block_nvir = min(int(block_nvir), nvir) if nvir else 1
 
     dtype_operands = (lov, e_occ, e_vir, left, right)
     if target_factor is not None:
         dtype_operands += (target_factor,)
-    result_dtype = np.result_type(*dtype_operands)
-    direct = np.zeros((left.shape[0], right.shape[0]), dtype=result_dtype)
-    exchange = np.zeros_like(direct)
+    result_dtype = numpy.result_type(*dtype_operands)
+    direct = numpy.zeros((left.shape[0], right.shape[0]), dtype=result_dtype)
+    exchange = numpy.zeros_like(direct)
     eia = e_occ[:, None] - e_vir[None, :]
     single_weight_path = left_single and right_single
 
@@ -493,20 +488,20 @@ def fragment_pair_energy_from_lov(
             # B[q,s,a,b] = sum_{p,r} Wl[p,q] A[p,r,a,b] Wr[r,s].
             # The two contractions are deliberately explicit: this keeps
             # einsum from considering an outer product of the weight matrices.
-            weighted_amplitudes = np.einsum(
+            weighted_amplitudes = numpy.einsum(
                 "pq,prab->qrab", left[0], amplitudes, optimize=True
             )
-            weighted_amplitudes = np.einsum(
+            weighted_amplitudes = numpy.einsum(
                 "qrab,rs->qsab",
                 weighted_amplitudes,
                 right[0],
                 optimize=True,
             )
-            direct[0, 0] += np.einsum(
+            direct[0, 0] += numpy.einsum(
                 "qsab,qsab->", weighted_amplitudes, eri_prab,
                 optimize=True,
             )
-            exchange[0, 0] += np.einsum(
+            exchange[0, 0] += numpy.einsum(
                 "qsab,sqab->", weighted_amplitudes, eri_prab,
                 optimize=True,
             )
@@ -520,70 +515,70 @@ def fragment_pair_energy_from_lov(
             # intermediate.
             if left.shape[0] <= right.shape[0]:
                 for fragment in range(left.shape[0]):
-                    weighted = np.einsum(
+                    weighted = numpy.einsum(
                         "pq,prab->qrab",
                         left[fragment],
                         amplitudes,
                         optimize=True,
                     )
-                    direct_kernel = np.einsum(
+                    direct_kernel = numpy.einsum(
                         "qrab,qsab->rs",
                         weighted,
                         eri_prab,
                         optimize=True,
                     )
-                    exchange_kernel = np.einsum(
+                    exchange_kernel = numpy.einsum(
                         "qrab,sqab->rs",
                         weighted,
                         eri_prab,
                         optimize=True,
                     )
-                    direct[fragment] += np.einsum(
+                    direct[fragment] += numpy.einsum(
                         "grs,rs->g", right, direct_kernel,
                         optimize=True,
                     )
-                    exchange[fragment] += np.einsum(
+                    exchange[fragment] += numpy.einsum(
                         "grs,rs->g", right, exchange_kernel,
                         optimize=True,
                     )
             else:
                 for fragment in range(right.shape[0]):
-                    weighted = np.einsum(
+                    weighted = numpy.einsum(
                         "prab,rs->psab",
                         amplitudes,
                         right[fragment],
                         optimize=True,
                     )
-                    direct_kernel = np.einsum(
+                    direct_kernel = numpy.einsum(
                         "psab,qsab->pq",
                         weighted,
                         eri_prab,
                         optimize=True,
                     )
-                    exchange_kernel = np.einsum(
+                    exchange_kernel = numpy.einsum(
                         "psab,sqab->pq",
                         weighted,
                         eri_prab,
                         optimize=True,
                     )
-                    direct[:, fragment] += np.einsum(
+                    direct[:, fragment] += numpy.einsum(
                         "fpq,pq->f", left, direct_kernel,
                         optimize=True,
                     )
-                    exchange[:, fragment] += np.einsum(
+                    exchange[:, fragment] += numpy.einsum(
                         "fpq,pq->f", left, exchange_kernel,
                         optimize=True,
                     )
 
     def target_weighted_amplitudes(amplitudes):
         r"""Apply :math:`X^*` and the dense partner weight to amplitudes."""
-        weighted = np.einsum(
+        weighted = numpy.einsum(
             "xp,prab->xrab",
             target_factor.conj(),
             amplitudes,
             optimize=True,
         )
-        return np.einsum(
+        return numpy.einsum(
             "xrab,rs->xsab", weighted, right[0], optimize=True
         )
 
@@ -599,19 +594,19 @@ def fragment_pair_energy_from_lov(
         nonlocal direct, exchange
         eri_ab = integrals_ab.transpose(0, 2, 1, 3)
         eri_ba = eri_ab.transpose(1, 0, 3, 2)
-        direct_integrals_ab = np.einsum(
+        direct_integrals_ab = numpy.einsum(
             "xq,qsab->xsab", target_factor, eri_ab, optimize=True
         )
-        direct_integrals_ba = np.einsum(
+        direct_integrals_ba = numpy.einsum(
             "xq,qsab->xsab", target_factor, eri_ba, optimize=True
         )
 
         weighted_ab = target_weighted_amplitudes(amplitudes_ab)
-        direct[0, 0] += np.einsum(
+        direct[0, 0] += numpy.einsum(
             "xsab,xsab->", weighted_ab, direct_integrals_ab,
             optimize=True,
         )
-        exchange[0, 0] += np.einsum(
+        exchange[0, 0] += numpy.einsum(
             "xsab,xsba->", weighted_ab, direct_integrals_ba,
             optimize=True,
         )
@@ -620,11 +615,11 @@ def fragment_pair_energy_from_lov(
         if offdiag:
             amplitudes_ba = amplitudes_ab.transpose(1, 0, 3, 2)
             weighted_ba = target_weighted_amplitudes(amplitudes_ba)
-            direct[0, 0] += np.einsum(
+            direct[0, 0] += numpy.einsum(
                 "xsab,xsab->", weighted_ba, direct_integrals_ba,
                 optimize=True,
             )
-            exchange[0, 0] += np.einsum(
+            exchange[0, 0] += numpy.einsum(
                 "xsab,xsba->", weighted_ba, direct_integrals_ab,
                 optimize=True,
             )
@@ -641,14 +636,14 @@ def fragment_pair_energy_from_lov(
             lov_b = lov[:, :, b0:b1]
             eia_b = eia[:, b0:b1]
 
-            integrals_ab = np.einsum(
+            integrals_ab = numpy.einsum(
                 "Lia,Ljb->iajb", lov_a, lov_b, optimize=True
             )
             denominator = (
                 eia_a[:, None, :, None]
                 + eia_b[None, :, None, :]
             )
-            if np.any(np.abs(denominator) < 1e-14):
+            if numpy.any(numpy.abs(denominator) < 1e-14):
                 raise ValueError("an MP2 energy denominator is zero")
             amplitudes = integrals_ab.transpose(0, 2, 1, 3) / denominator
             del denominator
@@ -708,11 +703,11 @@ def _fragment_pair_energy_from_lov_jax_ad(
     inputs are retained; neither a full :math:`ovov` tensor nor one physical
     ``Lov`` slice per block pair is stored.
     """
-    lov = jnp.asarray(lov)
-    e_occ = jnp.asarray(e_occ)
-    e_vir = jnp.asarray(e_vir)
-    target_factor = jnp.asarray(target_factor)
-    partner_weight = jnp.asarray(partner_weight)
+    lov = np.asarray(lov)
+    e_occ = np.asarray(e_occ)
+    e_vir = np.asarray(e_vir)
+    target_factor = np.asarray(target_factor)
+    partner_weight = np.asarray(partner_weight)
 
     if lov.ndim != 3:
         raise ValueError("lov must have shape (naux, nocc, nvir)")
@@ -732,27 +727,27 @@ def _fragment_pair_energy_from_lov_jax_ad(
         block_nvir = _virtual_block_size(
             lov, 1, 1, max_memory_mb
         )
-    elif not isinstance(block_nvir, (int, np.integer)) or block_nvir <= 0:
+    elif not isinstance(block_nvir, (int, numpy.integer)) or block_nvir <= 0:
         raise ValueError("block_nvir must be a positive integer")
     block_nvir = min(int(block_nvir), nvir) if nvir else 1
 
     eia = e_occ[:, None] - e_vir[None, :]
-    direct = jnp.zeros((), dtype=lov.dtype)
-    exchange = jnp.zeros((), dtype=lov.dtype)
+    direct = np.zeros((), dtype=lov.dtype)
+    exchange = np.zeros((), dtype=lov.dtype)
 
     def _block_energy(lov_a, lov_b, eia_a, eia_b, x_target, w_partner,
                       include_transpose, valid_a, valid_b):
-        integrals_ab = jnp.einsum(
+        integrals_ab = np.einsum(
             "Lia,Ljb->iajb", lov_a, lov_b, optimize=True
         )
         denominator = (
             eia_a[:, None, :, None] + eia_b[None, :, None, :]
         )
-        denominator = jnp.where(
+        denominator = np.where(
             valid_a[None, None, :, None]
             & valid_b[None, None, None, :],
             denominator,
-            jnp.ones((), dtype=denominator.dtype),
+            np.ones((), dtype=denominator.dtype),
         )
         amplitudes_ab = (
             integrals_ab.transpose(0, 2, 1, 3) / denominator
@@ -760,44 +755,44 @@ def _fragment_pair_energy_from_lov_jax_ad(
 
         eri_ab = integrals_ab.transpose(0, 2, 1, 3)
         eri_ba = eri_ab.transpose(1, 0, 3, 2)
-        direct_integrals_ab = jnp.einsum(
+        direct_integrals_ab = np.einsum(
             "xq,qsab->xsab", x_target, eri_ab, optimize=True
         )
-        direct_integrals_ba = jnp.einsum(
+        direct_integrals_ba = np.einsum(
             "xq,qsab->xsab", x_target, eri_ba, optimize=True
         )
 
-        weighted_ab = jnp.einsum(
+        weighted_ab = np.einsum(
             "xp,prab->xrab", x_target.conj(), amplitudes_ab,
             optimize=True,
         )
-        weighted_ab = jnp.einsum(
+        weighted_ab = np.einsum(
             "xrab,rs->xsab", weighted_ab, w_partner, optimize=True
         )
-        block_direct = jnp.einsum(
+        block_direct = np.einsum(
             "xsab,xsab->", weighted_ab, direct_integrals_ab,
             optimize=True,
         )
-        block_exchange = jnp.einsum(
+        block_exchange = np.einsum(
             "xsab,xsba->", weighted_ab, direct_integrals_ba,
             optimize=True,
         )
 
         def _transpose_energy(_):
             amplitudes_ba = amplitudes_ab.transpose(1, 0, 3, 2)
-            weighted_ba = jnp.einsum(
+            weighted_ba = np.einsum(
                 "xp,prab->xrab", x_target.conj(), amplitudes_ba,
                 optimize=True,
             )
-            weighted_ba = jnp.einsum(
+            weighted_ba = np.einsum(
                 "xrab,rs->xsab", weighted_ba, w_partner,
                 optimize=True,
             )
-            transpose_direct = jnp.einsum(
+            transpose_direct = np.einsum(
                 "xsab,xsab->", weighted_ba, direct_integrals_ba,
                 optimize=True,
             )
-            transpose_exchange = jnp.einsum(
+            transpose_exchange = np.einsum(
                 "xsab,xsba->", weighted_ba, direct_integrals_ab,
                 optimize=True,
             )
@@ -807,8 +802,8 @@ def _fragment_pair_energy_from_lov_jax_ad(
             include_transpose,
             _transpose_energy,
             lambda _: (
-                jnp.zeros((), dtype=block_direct.dtype),
-                jnp.zeros((), dtype=block_exchange.dtype),
+                np.zeros((), dtype=block_direct.dtype),
+                np.zeros((), dtype=block_exchange.dtype),
             ),
             operand=None,
         )
@@ -818,25 +813,25 @@ def _fragment_pair_energy_from_lov_jax_ad(
 
     if nvir:
         nblock = (nvir + block_nvir - 1) // block_nvir
-        block_pairs = jnp.asarray(
+        block_pairs = np.asarray(
             [
                 (left_block, right_block)
                 for left_block in range(nblock)
                 for right_block in range(left_block, nblock)
             ],
-            dtype=jnp.int32,
+            dtype=np.int32,
         )
-        block_offsets = jnp.arange(block_nvir, dtype=jnp.int32)
+        block_offsets = np.arange(block_nvir, dtype=np.int32)
 
         def _gather_virtual_block(array, block, axis):
             """Gather one padded fixed-size block without padding ``array``."""
             indices = block * block_nvir + block_offsets
             valid = indices < nvir
-            safe_indices = jnp.minimum(indices, nvir - 1)
-            gathered = jnp.take(array, safe_indices, axis=axis)
+            safe_indices = np.minimum(indices, nvir - 1)
+            gathered = np.take(array, safe_indices, axis=axis)
             mask_shape = [1] * gathered.ndim
             mask_shape[axis] = block_nvir
-            return jnp.where(valid.reshape(mask_shape), gathered, 0), valid
+            return np.where(valid.reshape(mask_shape), gathered, 0), valid
 
         def _scan_block(carry, pair):
             left_block, right_block = pair
@@ -894,17 +889,17 @@ def _fragment_mp2_orientation_vjp(amplitudes, integrals, target_factor,
     the einsum graph.
     """
     exchanged_integrals = integrals.transpose(1, 0, 3, 2)
-    direct_projected = jnp.einsum(
+    direct_projected = np.einsum(
         "xq,qsab->xsab", target_factor, integrals, optimize=True
     )
-    exchange_projected = jnp.einsum(
+    exchange_projected = np.einsum(
         "xq,qsba->xsba", target_factor, exchanged_integrals,
         optimize=True,
     )
-    target_amplitudes = jnp.einsum(
+    target_amplitudes = np.einsum(
         "xp,prab->xrab", target_factor, amplitudes, optimize=True
     )
-    weighted_amplitudes = jnp.einsum(
+    weighted_amplitudes = np.einsum(
         "xrab,rs->xsab", target_amplitudes, partner_weight,
         optimize=True,
     )
@@ -918,35 +913,35 @@ def _fragment_mp2_orientation_vjp(amplitudes, integrals, target_factor,
         exchange_bar * weighted_amplitudes.transpose(0, 1, 3, 2)
     )
 
-    target_amplitudes_bar = jnp.einsum(
+    target_amplitudes_bar = np.einsum(
         "xsab,rs->xrab", weighted_bar, partner_weight, optimize=True
     )
-    partner_weight_bar = jnp.einsum(
+    partner_weight_bar = np.einsum(
         "xrab,xsab->rs", target_amplitudes, weighted_bar, optimize=True
     )
-    amplitudes_bar = jnp.einsum(
+    amplitudes_bar = np.einsum(
         "xp,xrab->prab", target_factor, target_amplitudes_bar,
         optimize=True,
     )
 
-    target_factor_bar = jnp.einsum(
+    target_factor_bar = np.einsum(
         "xrab,prab->xp", target_amplitudes_bar, amplitudes,
         optimize=True,
     )
-    target_factor_bar += jnp.einsum(
+    target_factor_bar += np.einsum(
         "xsab,qsab->xq", direct_projected_bar, integrals,
         optimize=True,
     )
-    target_factor_bar += jnp.einsum(
+    target_factor_bar += np.einsum(
         "xsba,qsba->xq", exchange_projected_bar,
         exchanged_integrals, optimize=True,
     )
 
-    integrals_bar = jnp.einsum(
+    integrals_bar = np.einsum(
         "xq,xsab->qsab", target_factor, direct_projected_bar,
         optimize=True,
     )
-    exchanged_bar = jnp.einsum(
+    exchanged_bar = np.einsum(
         "xq,xsba->qsba", target_factor, exchange_projected_bar,
         optimize=True,
     )
@@ -964,17 +959,17 @@ def _fragment_mp2_block_vjp(lov_a, lov_b, eia_a, eia_b,
                             include_transpose, valid_a, valid_b,
                             direct_bar, exchange_bar):
     """Recompute one DF-MP2 block and return all of its input cotangents."""
-    integrals = jnp.einsum(
+    integrals = np.einsum(
         "Lia,Ljb->ijab", lov_a, lov_b, optimize=True
     )
     denominator = (
         eia_a[:, None, :, None] + eia_b[None, :, None, :]
     )
-    denominator = jnp.where(
+    denominator = np.where(
         valid_a[None, None, :, None]
         & valid_b[None, None, None, :],
         denominator,
-        jnp.ones((), dtype=denominator.dtype),
+        np.ones((), dtype=denominator.dtype),
     )
     amplitudes = integrals / denominator
 
@@ -1008,10 +1003,10 @@ def _fragment_mp2_block_vjp(lov_a, lov_b, eia_a, eia_b,
         include_transpose,
         _transpose_bars,
         lambda _: (
-            jnp.zeros_like(amplitudes_bar),
-            jnp.zeros_like(integrals_bar),
-            jnp.zeros_like(target_bar),
-            jnp.zeros_like(partner_bar),
+            np.zeros_like(amplitudes_bar),
+            np.zeros_like(integrals_bar),
+            np.zeros_like(target_bar),
+            np.zeros_like(partner_bar),
         ),
         operand=None,
     )
@@ -1022,12 +1017,12 @@ def _fragment_mp2_block_vjp(lov_a, lov_b, eia_a, eia_b,
 
     denominator_bar = -amplitudes_bar * integrals / denominator**2
     integrals_bar += amplitudes_bar / denominator
-    eia_a_bar = jnp.sum(denominator_bar, axis=(1, 3))
-    eia_b_bar = jnp.sum(denominator_bar, axis=(0, 2))
-    lov_a_bar = jnp.einsum(
+    eia_a_bar = np.sum(denominator_bar, axis=(1, 3))
+    eia_b_bar = np.sum(denominator_bar, axis=(0, 2))
+    lov_a_bar = np.einsum(
         "ijab,Ljb->Lia", integrals_bar, lov_b, optimize=True
     )
-    lov_b_bar = jnp.einsum(
+    lov_b_bar = np.einsum(
         "ijab,Lia->Ljb", integrals_bar, lov_a, optimize=True
     )
     return (
@@ -1046,37 +1041,37 @@ def _fragment_pair_energy_components_analytic_bwd(
     """Blockwise handwritten VJP of the real two-sided DF-MP2 energy."""
     _, nocc, nvir = lov.shape
     if nvir == 0 or nocc == 0:
-        return tuple(jnp.zeros_like(x) for x in (
+        return tuple(np.zeros_like(x) for x in (
             lov, e_occ, e_vir, target_factor, partner_weight
         ))
 
     eia = e_occ[:, None] - e_vir[None, :]
     nblock = (nvir + block_nvir - 1) // block_nvir
-    block_pairs = jnp.asarray(
+    block_pairs = np.asarray(
         [
             (left_block, right_block)
             for left_block in range(nblock)
             for right_block in range(left_block, nblock)
         ],
-        dtype=jnp.int32,
+        dtype=np.int32,
     )
-    block_offsets = jnp.arange(block_nvir, dtype=jnp.int32)
+    block_offsets = np.arange(block_nvir, dtype=np.int32)
 
     def _gather(array, block, axis):
         indices = block * block_nvir + block_offsets
         valid = indices < nvir
-        safe_indices = jnp.minimum(indices, nvir - 1)
-        gathered = jnp.take(array, safe_indices, axis=axis)
+        safe_indices = np.minimum(indices, nvir - 1)
+        gathered = np.take(array, safe_indices, axis=axis)
         mask_shape = [1] * gathered.ndim
         mask_shape[axis] = block_nvir
         mask = valid.reshape(mask_shape)
-        return jnp.where(mask, gathered, 0), valid, safe_indices, mask
+        return np.where(mask, gathered, 0), valid, safe_indices, mask
 
     initial = (
-        jnp.zeros_like(lov),
-        jnp.zeros_like(eia),
-        jnp.zeros_like(target_factor),
-        jnp.zeros_like(partner_weight),
+        np.zeros_like(lov),
+        np.zeros_like(eia),
+        np.zeros_like(target_factor),
+        np.zeros_like(partner_weight),
     )
 
     def _scan_block(carry, pair):
@@ -1105,18 +1100,18 @@ def _fragment_pair_energy_components_analytic_bwd(
             direct_bar,
             exchange_bar,
         )
-        lov_a_bar = jnp.where(mask_a, block_bars[0], 0)
-        lov_b_bar = jnp.where(mask_b, block_bars[1], 0)
-        eia_a_bar = jnp.where(eia_mask_a, block_bars[2], 0)
-        eia_b_bar = jnp.where(eia_mask_b, block_bars[3], 0)
+        lov_a_bar = np.where(mask_a, block_bars[0], 0)
+        lov_b_bar = np.where(mask_b, block_bars[1], 0)
+        eia_a_bar = np.where(eia_mask_a, block_bars[2], 0)
+        eia_b_bar = np.where(eia_mask_b, block_bars[3], 0)
 
         lov_bar, eia_bar, target_bar, partner_bar = carry
-        block_indices = jnp.concatenate((indices_a, indices_b))
+        block_indices = np.concatenate((indices_a, indices_b))
         lov_bar = lov_bar.at[:, :, block_indices].add(
-            jnp.concatenate((lov_a_bar, lov_b_bar), axis=2)
+            np.concatenate((lov_a_bar, lov_b_bar), axis=2)
         )
         eia_bar = eia_bar.at[:, block_indices].add(
-            jnp.concatenate((eia_a_bar, eia_b_bar), axis=1)
+            np.concatenate((eia_a_bar, eia_b_bar), axis=1)
         )
         return (
             lov_bar,
@@ -1130,8 +1125,8 @@ def _fragment_pair_energy_components_analytic_bwd(
     )
     return (
         lov_bar,
-        jnp.sum(eia_bar, axis=1),
-        -jnp.sum(eia_bar, axis=0),
+        np.sum(eia_bar, axis=1),
+        -np.sum(eia_bar, axis=0),
         target_bar,
         partner_bar,
     )
@@ -1211,7 +1206,7 @@ def fragment_pair_energy_from_lov_jax(
         block_nvir = _virtual_block_size(
             lov, 1, 1, max_memory_mb
         )
-    elif not isinstance(block_nvir, (int, np.integer)) or block_nvir <= 0:
+    elif not isinstance(block_nvir, (int, numpy.integer)) or block_nvir <= 0:
         raise ValueError("block_nvir must be a positive integer")
     nvir = lov.shape[2]
     block_nvir = min(int(block_nvir), nvir) if nvir else 1
@@ -1219,7 +1214,7 @@ def fragment_pair_energy_from_lov_jax(
     operands = (lov, e_occ, e_vir, target_factor, partner_weight)
     use_analytic = (
         _fragment_mp2_analytic_vjp_enabled()
-        and not any(jnp.issubdtype(jnp.asarray(x).dtype, jnp.complexfloating)
+        and not any(np.issubdtype(np.asarray(x).dtype, np.complexfloating)
                     for x in operands)
     )
     if not use_analytic:
@@ -1241,16 +1236,16 @@ def fragment_pair_energy_from_lov_jax(
 
 def _masked_pair_energies(energies, mask):
     return FragmentPairEnergies(
-        total=np.where(mask, energies.total, np.zeros_like(energies.total)),
-        opposite_spin=np.where(
+        total=numpy.where(mask, energies.total, numpy.zeros_like(energies.total)),
+        opposite_spin=numpy.where(
             mask,
             energies.opposite_spin,
-            np.zeros_like(energies.opposite_spin),
+            numpy.zeros_like(energies.opposite_spin),
         ),
-        same_spin=np.where(
+        same_spin=numpy.where(
             mask,
             energies.same_spin,
-            np.zeros_like(energies.same_spin),
+            numpy.zeros_like(energies.same_spin),
         ),
     )
 
@@ -1268,8 +1263,8 @@ def partition_fragment_pair_energies(energies, strong_mask):
 
     if not isinstance(energies, FragmentPairEnergies):
         raise TypeError("energies must be a FragmentPairEnergies instance")
-    mask = np.asarray(strong_mask, dtype=bool)
-    if mask.shape != np.shape(energies.total):
+    mask = numpy.asarray(strong_mask, dtype=bool)
+    if mask.shape != numpy.shape(energies.total):
         raise ValueError("strong_mask must have the same shape as the energies")
     strong = _masked_pair_energies(energies, mask)
     weak = _masked_pair_energies(energies, ~mask)

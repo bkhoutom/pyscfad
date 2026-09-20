@@ -3,8 +3,8 @@ import jax.numpy as jnp
 import numpy as np
 
 from pyscfad import gto
-from pyscfad.dlno import mp2 as dlno_mp2
-from pyscfad.dlno.mp2 import pair_energy_multipole_cross
+from pyscfad.dlno import multipole
+from pyscfad.dlno.multipole import pair_energy_multipole_cross
 
 
 def _carbon_pair(coords):
@@ -223,19 +223,19 @@ def test_multimode_order_four_endpoint_vjps_match_directional_fd():
             (right_e_vir,) * nright,
             (right_vir,) * nright,
         )
-        left_data = dlno_mp2._multipole_endpoint_data(
+        left_data = multipole._multipole_endpoint_data(
             mol,
             *left_values,
             ([0],) * nleft,
             4,
         )
-        right_data = dlno_mp2._multipole_endpoint_data(
+        right_data = multipole._multipole_endpoint_data(
             mol,
             *right_values,
             ([1],) * nright,
             4,
         )
-        pair = dlno_mp2._multipole_cross_from_data(
+        pair = multipole._multipole_cross_from_data(
             left_data, right_data, 4
         )
         return jnp.sum(pair_weight * pair)
@@ -281,14 +281,14 @@ def test_shared_endpoint_builds_one_raw_moment_set_per_side(monkeypatch):
     ]))
     left, right = _two_mode_cross_arguments(mol)
     calls = []
-    original = dlno_mp2.multipole_ops._origin_zero_moments
+    original = multipole._origin_zero_moments
 
     def counted(fake_mol, order):
         calls.append((fake_mol.nao, order))
         return original(fake_mol, order)
 
     monkeypatch.setattr(
-        dlno_mp2.multipole_ops, '_origin_zero_moments', counted
+        multipole, '_origin_zero_moments', counted
     )
     energy = pair_energy_multipole_cross(
         mol,
@@ -310,7 +310,7 @@ def test_differing_atom_lists_use_singleton_batches(monkeypatch):
     left, _ = _two_mode_cross_arguments(mol)
 
     calls = []
-    original = dlno_mp2._multipole_orbital_data_batch
+    original = multipole._multipole_orbital_data_batch
 
     def counted_batch(mol_, e_occ, mo_occ, e_vir, mo_vir, atmlst, order):
         calls.append((atmlst, len(e_occ)))
@@ -319,9 +319,9 @@ def test_differing_atom_lists_use_singleton_batches(monkeypatch):
         )
 
     monkeypatch.setattr(
-        dlno_mp2, '_multipole_orbital_data_batch', counted_batch
+        multipole, '_multipole_orbital_data_batch', counted_batch
     )
-    data = dlno_mp2._multipole_endpoint_data(
+    data = multipole._multipole_endpoint_data(
         mol,
         left[0], left[1], left[2], left[3],
         ([0], [1]),

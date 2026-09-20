@@ -1,3 +1,9 @@
+from pyscfad.lno import _df_direct as lno_df_direct
+from pyscfad.lno import _df_h5 as lno_df_h5
+from pyscfad.lno import df as lno_df
+from pyscfad.dlno import dlno_base, mp2_rdm
+from pyscfad.dlno import lis
+
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,43 +15,24 @@ import pytest
 
 from pyscfad import gto, scf
 from pyscf import lib as pyscf_lib
-from pyscfad.dlno import iao_lis
-from pyscfad.dlno.iao_lis import (
-    _density_from_target_amplitude_block,
-    _density_from_target_amplitudes,
-    build_fragment_lis,
-    build_iao_lis_fragment_static_selection,
-    build_iao_lis_static_selections,
-    strong_domain_mp2_density_from_lov,
-    strong_domain_prescreen,
-    target_conditioned_mp2_density_from_amplitudes,
-)
-from pyscfad.dlno.iao_mp2 import (
-    IAOFragmentMP2Thresholds,
-    build_iao_fragment_topology,
-)
-from pyscfad.dlno.iao_mp2_grad import (
-    FixedPAOSubspaceSelection,
-    IAOFragmentMP2ContinuousData,
-    IAOFragmentMP2StaticSelections,
-    IAOMP2FragmentStaticSelection,
-    IAOMP2StrongDomain,
-    build_iao_mp2_static_selections,
-    build_strong_ed_domain,
-    rebuild_iao_mp2_common,
-)
+
+from pyscfad.dlno.mp2_rdm import _density_from_target_amplitude_block, _density_from_target_amplitudes, strong_domain_mp2_density_from_lov, target_conditioned_mp2_density_from_amplitudes
+from pyscfad.dlno.lis import build_fragment_lis, build_fragment_lis_selection, build_lis_selections
+from pyscfad.dlno.domain import DLNOThresholds, build_domain_topology
+from pyscfad.dlno._selection import FixedPAOSubspaceSelection, DomainSelections, FragmentDomainSelection, build_domain_selections
+from pyscfad.dlno.dlno_base import DomainData, StrongDomain, build_strong_ed_domain, rebuild_domain_data
 
 
 def test_mp2_density_block_threshold_defaults_overrides_and_validation():
     """Configuration accepts only positive optional density block settings."""
-    defaults = IAOFragmentMP2Thresholds()
+    defaults = DLNOThresholds()
     assert defaults.mp2_block_memory_mb is None
     assert defaults.mp2_block_nvir is None
 
-    exact = IAOFragmentMP2Thresholds(mp2_block_nvir=192)
+    exact = DLNOThresholds(mp2_block_nvir=192)
     assert exact.mp2_block_nvir == 192
 
-    budget = IAOFragmentMP2Thresholds(mp2_block_memory_mb=4096.0)
+    budget = DLNOThresholds(mp2_block_memory_mb=4096.0)
     assert budget.mp2_block_memory_mb == 4096.0
 
     for kwargs, field in (
@@ -54,12 +41,12 @@ def test_mp2_density_block_threshold_defaults_overrides_and_validation():
         ({"mp2_block_nvir": -1}, "mp2_block_nvir"),
     ):
         with pytest.raises(ValueError, match=field):
-            IAOFragmentMP2Thresholds(**kwargs)
+            DLNOThresholds(**kwargs)
 
 
 def test_resolve_mp2_density_block_nvir_precedence_and_dimension_scaling():
     """The resolver makes a positive, dimension-aware block choice."""
-    resolve = iao_lis._resolve_mp2_density_block_nvir
+    resolve = mp2_rdm._resolve_mp2_density_block_nvir
     common = dict(
         naux=100,
         nocc=4,
@@ -165,14 +152,14 @@ def test_target_amplitude_block_real_pullback_matches_autodiff(width):
         jnp.asarray(rng.normal(size=(2, 3, 5, width)))
         for _ in range(2)
     )
-    density_bar = iao_lis.IAOMP2Density(
+    density_bar = mp2_rdm.MP2Density(
         _symmetric_weight(rng, 3), _symmetric_weight(rng, 5)
     )
     _, reference_pullback = jax.vjp(
         _density_from_target_amplitude_block, a_block, b_block
     )
     expected = reference_pullback(density_bar)
-    actual = iao_lis._density_from_target_amplitude_block_real_pullback(
+    actual = mp2_rdm._density_from_target_amplitude_block_real_pullback(
         a_block, b_block, density_bar
     )
     _assert_pytree_allclose(actual, expected, rtol=2e-12, atol=2e-12)
@@ -195,10 +182,10 @@ def test_occupied_slice_pullback_matches_all_six_autodiff_bars(width):
         rng.normal(size=(2, 5, width)),
     )))
     _, reference_pullback = jax.vjp(
-        iao_lis._target_amplitude_block_from_lov_occupied_slice, *inputs
+        mp2_rdm._target_amplitude_block_from_lov_occupied_slice, *inputs
     )
     expected = reference_pullback(output_bars)
-    actual = iao_lis._target_amplitude_block_from_lov_occupied_slice_pullback(
+    actual = mp2_rdm._target_amplitude_block_from_lov_occupied_slice_pullback(
         *inputs, *output_bars
     )
     _assert_pytree_allclose(actual, expected, rtol=2e-12, atol=2e-12)
@@ -211,7 +198,7 @@ def test_strong_domain_density_routes_directly_to_predictable_h5_file(
     empty_selection = FixedPAOSubspaceSelection(
         empty, empty, empty, empty, empty, empty
     )
-    fragment = IAOMP2FragmentStaticSelection(
+    fragment = FragmentDomainSelection(
         fragment_index=0,
         iao_indices=empty,
         fragment_atoms=np.asarray([0], dtype=np.int32),
@@ -231,9 +218,9 @@ def test_strong_domain_density_routes_directly_to_predictable_h5_file(
         weak_occ_span_metric_keep=empty,
         weak_virtual=None,
     )
-    static = IAOFragmentMP2StaticSelections(
+    static = DomainSelections(
         frozen=None,
-        thresholds=IAOFragmentMP2Thresholds(
+        thresholds=DLNOThresholds(
             mp2_block_nvir=2,
         ),
         active_occ_indices=empty,
@@ -246,7 +233,7 @@ def test_strong_domain_density_routes_directly_to_predictable_h5_file(
         strong_mask=np.zeros((1, 1), dtype=bool),
         fragments=(fragment,),
     )
-    domain = IAOMP2StrongDomain(
+    domain = StrongDomain(
         occupied_coeff=np.arange(8.0).reshape(4, 2),
         virtual_coeff=np.arange(12.0).reshape(4, 3),
         occupied_energy=np.asarray([-1.2, -0.8]),
@@ -255,7 +242,7 @@ def test_strong_domain_density_routes_directly_to_predictable_h5_file(
         target_weight=np.eye(2),
         partner_weight=np.eye(2),
     )
-    expected_density = iao_lis.IAOMP2Density(
+    expected_density = mp2_rdm.MP2Density(
         np.eye(2), 2.0 * np.eye(3)
     )
     events = []
@@ -297,27 +284,27 @@ def test_strong_domain_density_routes_directly_to_predictable_h5_file(
             h5file.create_dataset("lov", shape=(6, 2), dtype=np.float64)
         return expected_density
 
-    monkeypatch.setattr(iao_lis.resource_profile, "start", fake_start)
-    monkeypatch.setattr(iao_lis.resource_profile, "finish", fake_finish)
-    monkeypatch.setattr(iao_lis.lno_base, "make_local_mol", fake_make_local_mol)
+    monkeypatch.setattr(mp2_rdm.resource_profile, "start", fake_start)
+    monkeypatch.setattr(mp2_rdm.resource_profile, "finish", fake_finish)
+    monkeypatch.setattr(lno_df, "make_local_mol", fake_make_local_mol)
     monkeypatch.setattr(
-        iao_lis.lno_base.df_addons, "make_auxmol", fake_make_auxmol
+        lno_df.df_addons, "make_auxmol", fake_make_auxmol
     )
     monkeypatch.setattr(
-        iao_lis, "_resolve_mp2_density_block_nvir", fake_resolve
+        lis, '_resolve_mp2_density_block_nvir', fake_resolve
     )
     monkeypatch.setattr(
-        iao_lis, "_strong_domain_mp2_density_h5", fake_h5_density
+        lis, '_strong_domain_mp2_density_h5', fake_h5_density
     )
     monkeypatch.setattr(
-        iao_lis.lno_base,
+        lno_df,
         "get_local_Lov",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("the production route must not materialize Lov")
         ),
     )
 
-    density = iao_lis.strong_domain_mp2_density(
+    density = lis.strong_domain_mp2_density(
         sentinel_mf, domain, static, 0, lov_scratch_dir=tmp_path
     )
 
@@ -382,7 +369,7 @@ def test_static_selection_owns_and_cleans_forward_workspace(
     empty_selection = FixedPAOSubspaceSelection(
         empty, empty, empty, empty, empty, empty
     )
-    fragment = IAOMP2FragmentStaticSelection(
+    fragment = FragmentDomainSelection(
         fragment_index=0,
         iao_indices=empty,
         fragment_atoms=np.asarray([0], dtype=np.int32),
@@ -402,9 +389,9 @@ def test_static_selection_owns_and_cleans_forward_workspace(
         weak_occ_span_metric_keep=empty,
         weak_virtual=None,
     )
-    static = IAOFragmentMP2StaticSelections(
+    static = DomainSelections(
         frozen=None,
-        thresholds=IAOFragmentMP2Thresholds(),
+        thresholds=DLNOThresholds(),
         active_occ_indices=empty,
         active_vir_indices=empty,
         pao_projected_out_indices=empty,
@@ -415,7 +402,7 @@ def test_static_selection_owns_and_cleans_forward_workspace(
         strong_mask=np.ones((1, 1), dtype=bool),
         fragments=(fragment,),
     )
-    common = IAOFragmentMP2ContinuousData(
+    common = DomainData(
         s1e=jnp.eye(1),
         fock=jnp.eye(1),
         occupied_coeff=jnp.zeros((1, 0)),
@@ -426,7 +413,7 @@ def test_static_selection_owns_and_cleans_forward_workspace(
         pao_coeff=jnp.zeros((1, 0)),
         fragment_occupied_data=(),
     )
-    domain = IAOMP2StrongDomain(
+    domain = StrongDomain(
         occupied_coeff=jnp.zeros((1, 0)),
         virtual_coeff=jnp.zeros((1, 0)),
         occupied_energy=jnp.zeros((0,)),
@@ -443,7 +430,7 @@ def test_static_selection_owns_and_cleans_forward_workspace(
         assert scratch_path.is_dir()
         (scratch_path / "local_lov.h5").touch()
         scratch_paths.append(scratch_path)
-        return iao_lis.IAOMP2Density(jnp.zeros((0, 0)), jnp.zeros((0, 0)))
+        return mp2_rdm.MP2Density(jnp.zeros((0, 0)), jnp.zeros((0, 0)))
 
     def fake_reference(*_args, **_kwargs):
         assert scratch_paths[-1].is_dir()
@@ -453,25 +440,25 @@ def test_static_selection_owns_and_cleans_forward_workspace(
         return sentinel_selection
 
     monkeypatch.setattr(pyscf_lib.param, "TMPDIR", str(tmp_path))
-    monkeypatch.setattr(iao_lis, "strong_domain_mp2_density", fake_density)
+    monkeypatch.setattr(lis, 'strong_domain_mp2_density', fake_density)
     monkeypatch.setattr(
-        iao_lis,
-        "_domain_density_in_active_spaces",
+        lis,
+        '_domain_density_in_active_spaces',
         lambda *_args: (jnp.zeros((0, 0)), jnp.zeros((0, 0))),
     )
     monkeypatch.setattr(
-        iao_lis, "_reference_fragment_selection", fake_reference
+        lis, '_reference_fragment_selection', fake_reference
     )
 
     if fail_selection:
         with pytest.raises(
             RuntimeError, match="injected static rank-selection failure"
         ):
-            build_iao_lis_fragment_static_selection(
+            build_fragment_lis_selection(
                 object(), static, 0, common=common, domain=domain
             )
     else:
-        actual = build_iao_lis_fragment_static_selection(
+        actual = build_fragment_lis_selection(
             object(), static, 0, common=common, domain=domain
         )
         assert actual is sentinel_selection
@@ -580,12 +567,12 @@ def test_h5_primal_lov_density_matches_in_memory_blocks(tmp_path, block_nvir):
     reference = strong_domain_mp2_density_from_lov(
         lov, e_occ, e_vir, target, block_nvir=block_nvir
     )
-    actual = iao_lis._strong_domain_mp2_density_h5_primal(
+    actual = mp2_rdm._strong_domain_mp2_density_h5_primal(
         str(path), e_occ, e_vir, target,
         naux=naux, nocc=nocc, nvir=nvir, block_nvir=block_nvir,
     )
 
-    assert isinstance(actual, iao_lis.IAOMP2Density)
+    assert isinstance(actual, mp2_rdm.MP2Density)
     np.testing.assert_allclose(actual.occupied, reference.occupied, atol=3e-12)
     np.testing.assert_allclose(actual.virtual, reference.virtual, atol=3e-12)
 
@@ -609,7 +596,7 @@ def test_h5_primal_lov_density_preserves_complex_algebra(tmp_path):
     reference = strong_domain_mp2_density_from_lov(
         lov, e_occ, e_vir, target, block_nvir=2
     )
-    actual = iao_lis._strong_domain_mp2_density_h5_primal(
+    actual = mp2_rdm._strong_domain_mp2_density_h5_primal(
         str(path), e_occ, e_vir, target,
         naux=naux, nocc=nocc, nvir=nvir, block_nvir=2,
     )
@@ -634,7 +621,7 @@ def test_h5_primal_lov_density_handles_empty_dimensions(
     path = tmp_path / f"empty-{naux}-{nocc}-{nvir}-{ntarget}.h5"
     _write_pair_major_lov(path, lov)
 
-    density = iao_lis._strong_domain_mp2_density_h5_primal(
+    density = mp2_rdm._strong_domain_mp2_density_h5_primal(
         str(path),
         -np.arange(nocc, dtype=float) - 1.0,
         np.arange(nvir, dtype=float) + 0.2,
@@ -673,7 +660,7 @@ def test_h5_primal_reads_only_contiguous_pair_major_slabs(
     monkeypatch.setattr(h5py.Dataset, "__array__", forbidden_array)
     monkeypatch.setattr(h5py.Dataset, "__getitem__", tracked_getitem)
 
-    iao_lis._strong_domain_mp2_density_h5_primal(
+    mp2_rdm._strong_domain_mp2_density_h5_primal(
         str(path),
         -np.linspace(1.3, 0.7, nocc),
         np.linspace(0.2, 1.2, nvir),
@@ -706,15 +693,15 @@ def test_h5_primal_profiles_exact_io_and_kernel_timing(monkeypatch, tmp_path):
     _write_pair_major_lov(path, lov)
     token = object()
     finished = []
-    monkeypatch.setattr(iao_lis.resource_profile, "start", lambda: token)
+    monkeypatch.setattr(mp2_rdm.resource_profile, "start", lambda: token)
     monkeypatch.setattr(
-        iao_lis.resource_profile, "finish",
+        mp2_rdm.resource_profile, "finish",
         lambda phase, before, **details: finished.append(
             (phase, before, details)
         ),
     )
 
-    iao_lis._strong_domain_mp2_density_h5_primal(
+    mp2_rdm._strong_domain_mp2_density_h5_primal(
         str(path),
         -np.linspace(1.4, 0.8, nocc),
         np.linspace(0.2, 1.2, nvir),
@@ -767,22 +754,22 @@ def test_h5_access_helpers_skip_clock_when_profile_disabled(
 
     with h5py.File(path, "w") as h5file:
         dataset = h5file.create_dataset("data", data=np.arange(6).reshape(2, 3))
-        monkeypatch.setattr(iao_lis, "time", FailTime)
-        monkeypatch.setattr(iao_lis.lno_base, "time", FailTime)
+        monkeypatch.setattr(mp2_rdm, 'time', FailTime)
+        monkeypatch.setattr(lno_df_h5, "time", FailTime)
         np.testing.assert_array_equal(
-            iao_lis._timed_h5_read(dataset, (slice(0, 1), slice(None)), None),
+            mp2_rdm._timed_h5_read(dataset, (slice(0, 1), slice(None)), None),
             [[0, 1, 2]],
         )
-        iao_lis._timed_h5_write(
+        mp2_rdm._timed_h5_write(
             dataset, (slice(0, 1), slice(None)), [[3, 4, 5]], None
         )
         np.testing.assert_array_equal(
-            iao_lis.lno_base._local_lov_h5_timed_read(
+            lno_df_h5._local_lov_h5_timed_read(
                 dataset, (slice(0, 1), slice(None)), None
             ),
             [[3, 4, 5]],
         )
-        iao_lis.lno_base._local_lov_h5_timed_write(
+        lno_df_h5._local_lov_h5_timed_write(
             dataset, (slice(1, 2), slice(None)), [[6, 7, 8]], None
         )
 
@@ -796,7 +783,7 @@ def test_h5_primal_read_timing_excludes_host_transpose_and_assignment(
     path = tmp_path / "timed-lov.h5"
     _write_pair_major_lov(path, lov)
     original_getitem = h5py.Dataset.__getitem__
-    original_empty = iao_lis.onp.empty
+    original_empty = mp2_rdm.numpy.empty
     clock = [0.0]
     finished = []
 
@@ -827,15 +814,15 @@ def test_h5_primal_read_timing_excludes_host_transpose_and_assignment(
         asarray = staticmethod(np.asarray)
 
     monkeypatch.setattr(h5py.Dataset, "__getitem__", tracked_getitem)
-    monkeypatch.setattr(iao_lis, "onp", TrackedNumpy)
-    monkeypatch.setattr(iao_lis, "time", FakeTime)
-    monkeypatch.setattr(iao_lis.resource_profile, "start", lambda: object())
+    monkeypatch.setattr(mp2_rdm, 'numpy', TrackedNumpy)
+    monkeypatch.setattr(mp2_rdm, 'time', FakeTime)
+    monkeypatch.setattr(mp2_rdm.resource_profile, "start", lambda: object())
     monkeypatch.setattr(
-        iao_lis.resource_profile, "finish",
+        mp2_rdm.resource_profile, "finish",
         lambda phase, before, **details: finished.append(details),
     )
 
-    iao_lis._strong_domain_mp2_density_h5_primal(
+    mp2_rdm._strong_domain_mp2_density_h5_primal(
         str(path),
         -np.linspace(1.3, 0.7, nocc),
         np.linspace(0.2, 1.0, nvir),
@@ -856,9 +843,9 @@ def test_h5_primal_times_hermitization_and_synchronizes_return(
     lov = rng.normal(size=(naux, nocc, nvir))
     path = tmp_path / "synchronized-lov.h5"
     _write_pair_major_lov(path, lov)
-    original_hermitize = iao_lis._hermitize
+    original_hermitize = mp2_rdm._hermitize
     original_block_until_ready = jax.block_until_ready
-    original_perf_counter = iao_lis.time.perf_counter
+    original_perf_counter = mp2_rdm.time.perf_counter
     events = []
     synchronized = []
 
@@ -875,16 +862,16 @@ def test_h5_primal_times_hermitization_and_synchronizes_return(
         events.append("perf_counter")
         return original_perf_counter()
 
-    monkeypatch.setattr(iao_lis, "_hermitize", tracked_hermitize)
+    monkeypatch.setattr(mp2_rdm, '_hermitize', tracked_hermitize)
     monkeypatch.setattr(jax, "block_until_ready", tracked_block_until_ready)
-    monkeypatch.setattr(iao_lis.time, "perf_counter", tracked_perf_counter)
-    monkeypatch.setattr(iao_lis.resource_profile, "start", lambda: object())
+    monkeypatch.setattr(mp2_rdm.time, "perf_counter", tracked_perf_counter)
+    monkeypatch.setattr(mp2_rdm.resource_profile, "start", lambda: object())
     monkeypatch.setattr(
-        iao_lis.resource_profile, "finish",
+        mp2_rdm.resource_profile, "finish",
         lambda phase, before, **details: events.append("profile_finish"),
     )
 
-    density = iao_lis._strong_domain_mp2_density_h5_primal(
+    density = mp2_rdm._strong_domain_mp2_density_h5_primal(
         str(path),
         -np.linspace(1.2, 0.8, nocc),
         np.linspace(0.2, 1.0, nvir),
@@ -945,8 +932,8 @@ def _actual_h5_custom_density_problem(path):
     )
     mol.build(trace_exp=False, trace_ctr_coeff=False)
     atmlst = np.asarray([0, 1], dtype=np.int32)
-    fake_mol = iao_lis.lno_base.make_local_mol(mol, atmlst)
-    auxmol = iao_lis.lno_base.df_addons.make_auxmol(
+    fake_mol = lno_df.make_local_mol(mol, atmlst)
+    auxmol = lno_df.df_addons.make_auxmol(
         fake_mol, "weigend"
     )
     rng = np.random.default_rng(1401)
@@ -973,7 +960,7 @@ def _actual_h5_custom_density_problem(path):
 
 
 def _h5_custom_density(differentiable, static):
-    return iao_lis._strong_domain_mp2_density_h5(
+    return mp2_rdm._strong_domain_mp2_density_h5(
         *differentiable, *static
     )
 
@@ -989,7 +976,7 @@ def _in_memory_direct_density(differentiable, static):
     ) = differentiable
     nocc, _, max_memory, block_nvir = static
     nvir = local_coeff.shape[1] - nocc
-    lov = iao_lis.lno_base._local_direct_nr_e2(
+    lov = lno_df_direct._local_direct_nr_e2(
         fake_mol,
         auxmol,
         local_coeff,
@@ -1102,8 +1089,8 @@ def test_h5_custom_density_parent_coordinate_chain_and_one_output_bar(
     occupied_weight = _general_weight(np.random.default_rng(1408), 2)
 
     def local_arguments(mol):
-        fake_mol = iao_lis.lno_base.make_local_mol(mol, atmlst)
-        auxmol = iao_lis.lno_base.df_addons.make_auxmol(
+        fake_mol = lno_df.make_local_mol(mol, atmlst)
+        auxmol = lno_df.df_addons.make_auxmol(
             fake_mol, "weigend"
         )
         return (
@@ -1155,10 +1142,10 @@ def test_h5_density_lov_backward_matches_dense_gradient_with_tail_block(
     profile_token = object()
     profile_events = []
     monkeypatch.setattr(
-        iao_lis.resource_profile, "start", lambda: profile_token
+        mp2_rdm.resource_profile, "start", lambda: profile_token
     )
     monkeypatch.setattr(
-        iao_lis.resource_profile,
+        mp2_rdm.resource_profile,
         "finish",
         lambda phase, before, **details: profile_events.append(
             (phase, before, details)
@@ -1178,12 +1165,12 @@ def test_h5_density_lov_backward_matches_dense_gradient_with_tail_block(
         reference_objective, argnums=(0, 1, 2, 3)
     )(lov, occupied_energy, virtual_energy, target_projection)
     actual_energy_projection_bars = (
-        iao_lis._strong_domain_mp2_density_h5_lov_bwd(
+        mp2_rdm._strong_domain_mp2_density_h5_lov_bwd(
             str(path),
             occupied_energy,
             virtual_energy,
             target_projection,
-            iao_lis.IAOMP2Density(occupied_weight, virtual_weight),
+            mp2_rdm.MP2Density(occupied_weight, virtual_weight),
             naux=naux,
             nocc=nocc,
             nvir=nvir,
@@ -1231,9 +1218,9 @@ def test_h5_density_reverse_profiles_failure_after_cleanup(
         h5file.attrs["pyscfad_fragment_index"] = 23
     token = object()
     events = []
-    monkeypatch.setattr(iao_lis.resource_profile, "start", lambda: token)
+    monkeypatch.setattr(mp2_rdm.resource_profile, "start", lambda: token)
     monkeypatch.setattr(
-        iao_lis.resource_profile,
+        mp2_rdm.resource_profile,
         "finish",
         lambda phase, before, **details: events.append(
             (phase, before, details)
@@ -1241,12 +1228,12 @@ def test_h5_density_reverse_profiles_failure_after_cleanup(
     )
 
     with pytest.raises(ValueError, match="must have shape"):
-        iao_lis._strong_domain_mp2_density_h5_lov_bwd(
+        mp2_rdm._strong_domain_mp2_density_h5_lov_bwd(
             str(path),
             jnp.asarray([-1.0]),
             jnp.asarray([0.2, 0.4]),
             jnp.ones((1, 1)),
-            iao_lis.IAOMP2Density(jnp.ones((1, 1)), jnp.eye(2)),
+            mp2_rdm.MP2Density(jnp.ones((1, 1)), jnp.eye(2)),
             naux=4,
             nocc=1,
             nvir=2,
@@ -1297,12 +1284,12 @@ def test_h5_density_lov_backward_uses_only_rows_and_virtual_blocks(
     monkeypatch.setattr(h5py.Dataset, "__getitem__", tracked_getitem)
     monkeypatch.setattr(h5py.Dataset, "__setitem__", tracked_setitem)
 
-    iao_lis._strong_domain_mp2_density_h5_lov_bwd(
+    mp2_rdm._strong_domain_mp2_density_h5_lov_bwd(
         str(path),
         -jnp.linspace(1.4, 0.8, nocc),
         jnp.linspace(0.2, 1.1, nvir),
         jnp.asarray(rng.normal(size=(ntarget, nocc))),
-        iao_lis.IAOMP2Density(
+        mp2_rdm.MP2Density(
             _symmetric_weight(rng, nocc),
             _symmetric_weight(rng, nvir),
         ),
@@ -1346,12 +1333,12 @@ def test_h5_density_lov_backward_flushes_only_after_all_virtual_blocks(
         return original_flush(h5file)
 
     monkeypatch.setattr(h5py.File, "flush", tracked_flush)
-    iao_lis._strong_domain_mp2_density_h5_lov_bwd(
+    mp2_rdm._strong_domain_mp2_density_h5_lov_bwd(
         str(path),
         -jnp.linspace(1.4, 0.8, nocc),
         jnp.linspace(0.2, 1.1, nvir),
         jnp.asarray(rng.normal(size=(2, nocc))),
-        iao_lis.IAOMP2Density(
+        mp2_rdm.MP2Density(
             _general_weight(rng, nocc), _general_weight(rng, nvir)
         ),
         naux=naux,
@@ -1370,12 +1357,12 @@ def test_h5_density_lov_backward_zero_target_writes_zero_bar(tmp_path):
     _write_pair_major_lov(
         path, rng.normal(size=(naux, nocc, nvir))
     )
-    bars = iao_lis._strong_domain_mp2_density_h5_lov_bwd(
+    bars = mp2_rdm._strong_domain_mp2_density_h5_lov_bwd(
         str(path),
         -jnp.linspace(1.2, 0.8, nocc),
         jnp.linspace(0.2, 1.0, nvir),
         jnp.zeros((0, nocc)),
-        iao_lis.IAOMP2Density(jnp.ones((nocc, nocc)),
+        mp2_rdm.MP2Density(jnp.ones((nocc, nocc)),
                               jnp.ones((nvir, nvir))),
         naux=naux,
         nocc=nocc,
@@ -1422,7 +1409,7 @@ def test_h5_custom_density_residual_is_bounded_and_pullback_is_repeatable(
     )
 
     rng = np.random.default_rng(1407)
-    density_bar = iao_lis.IAOMP2Density(
+    density_bar = mp2_rdm.MP2Density(
         _symmetric_weight(rng, density.occupied.shape[0]),
         _symmetric_weight(rng, density.virtual.shape[0]),
     )
@@ -1431,7 +1418,7 @@ def test_h5_custom_density_residual_is_bounded_and_pullback_is_repeatable(
         first_lov_bar = h5file["lov_bar"][:]
         assert set(h5file) == {"lov", "lov_bar", "z"}
     second_bars = pullback(
-        iao_lis.IAOMP2Density(
+        mp2_rdm.MP2Density(
             2 * density_bar.occupied, 2 * density_bar.virtual
         )
     )
@@ -1466,13 +1453,13 @@ def test_h5_custom_density_failed_pullback_removes_derivative_datasets(
         raise RuntimeError("injected local reverse failure")
 
     monkeypatch.setattr(
-        iao_lis.lno_base,
+        lno_df_h5,
         "_local_direct_nr_e2_h5_bwd",
         fail_local_reverse,
     )
     with pytest.raises(RuntimeError, match="injected local reverse failure"):
         pullback(
-            iao_lis.IAOMP2Density(
+            mp2_rdm.MP2Density(
                 jnp.ones_like(density.occupied),
                 jnp.ones_like(density.virtual),
             )
@@ -1776,7 +1763,7 @@ def _water_dimer_mf():
 
 
 def _full_domain_thresholds():
-    return IAOFragmentMP2Thresholds(
+    return DLNOThresholds(
         pao_norm=1e-10,
         domain_pao=0.0,
         ed_pao=0.0,
@@ -1789,7 +1776,7 @@ def test_zero_lno_threshold_recovers_full_active_hf_spaces(
     frozen, tmp_path
 ):
     mf = _water_mf(frozen)
-    topology = build_iao_fragment_topology(
+    topology = build_domain_topology(
         mf,
         frozen=frozen,
         thresholds=_full_domain_thresholds(),
@@ -1797,9 +1784,9 @@ def test_zero_lno_threshold_recovers_full_active_hf_spaces(
         force_full_domains=True,
     )
     assert len(topology.frag_lolist) == 1
-    mp2_static = build_iao_mp2_static_selections(mf, topology)
-    common = rebuild_iao_mp2_common(mf, mp2_static)
-    lis_static = build_iao_lis_static_selections(
+    mp2_static = build_domain_selections(mf, topology)
+    common = rebuild_domain_data(mf, mp2_static)
+    lis_static = build_lis_selections(
         mf,
         mp2_static,
         common=common,
@@ -1822,7 +1809,7 @@ def test_zero_lno_threshold_recovers_full_active_hf_spaces(
         lis_static,
         0,
         domain=result.domain,
-        density=iao_lis.IAOMP2Density(
+        density=mp2_rdm.MP2Density(
             result.density_occupied_ed,
             result.density_virtual_ed,
         ),
@@ -1867,35 +1854,36 @@ def test_zero_lno_threshold_recovers_full_active_hf_spaces(
     assert np.all(np.isfinite(np.asarray(result.density_occupied_ed)))
     assert np.all(np.isfinite(np.asarray(result.density_virtual_ed)))
 
-    prescreen = strong_domain_prescreen(
-        common, mp2_static, 0, domain=result.domain
-    )
     np.testing.assert_array_equal(
-        prescreen["strong_lmo_indices"],
-        np.arange(common.iao_coeff.shape[1]),
+        mp2_static.fragments[0].strong_fragments,
+        np.arange(len(mp2_static.fragments)),
     )
-    assert prescreen["orbfragloc"] is not None
-    assert prescreen["occ_prescreen_coeff"].shape[1] == nocc_active
-    assert prescreen["vir_prescreen_coeff"].shape[1] == nvir_active
+    np.testing.assert_allclose(
+        result.domain.target_weight,
+        result.domain.target_projection.T @ result.domain.target_projection,
+        atol=2e-12,
+    )
+    assert result.domain.occupied_coeff.shape[1] == nocc_active
+    assert result.domain.virtual_coeff.shape[1] == nvir_active
 
 
 def test_fragment_static_selection_matches_serial_builder(monkeypatch):
     mf = _water_dimer_mf()
-    topology = build_iao_fragment_topology(
+    topology = build_domain_topology(
         mf,
         thresholds=_full_domain_thresholds(),
         pair_energy_model="all",
         force_full_domains=True,
     )
     assert len(topology.frag_lolist) == 2
-    mp2_static = build_iao_mp2_static_selections(mf, topology)
-    common = rebuild_iao_mp2_common(mf, mp2_static)
+    mp2_static = build_domain_selections(mf, topology)
+    common = rebuild_domain_data(mf, mp2_static)
     thresholds = {
         "thresh_occ": 2e-4,
         "thresh_vir": 3e-5,
         "internal_rank_threshold": 3e-7,
     }
-    serial = build_iao_lis_static_selections(
+    serial = build_lis_selections(
         mf,
         mp2_static,
         common=common,
@@ -1911,11 +1899,11 @@ def test_fragment_static_selection_matches_serial_builder(monkeypatch):
         raise AssertionError("the supplied ED domain must be reused")
 
     monkeypatch.setattr(
-        "pyscfad.dlno.iao_lis.build_strong_ed_domain",
+        "pyscfad.dlno.dlno_base.build_strong_ed_domain",
         fail_if_domain_is_rebuilt,
     )
     independent = tuple(
-        build_iao_lis_fragment_static_selection(
+        build_fragment_lis_selection(
             mf,
             mp2_static,
             fragment_index,

@@ -57,11 +57,8 @@ from pyscf import df as pyscf_df
 import psutil
 
 from pyscfad import config, gto, scf
-from pyscfad.dlno.iao_mp2 import (
-    IAOFragmentMP2Thresholds,
-    build_iao_fragment_topology,
-)
-from pyscfad.dlno.iao_mp2_mpi import IAOFragmentMP2
+from pyscfad.dlno.domain import DLNOThresholds, build_domain_topology
+from pyscfad.dlno.mp2_mpi import DLNOMP2
 from pyscfad.mp import dfmp2
 
 
@@ -246,7 +243,7 @@ def _canonical_value_and_grad(mol, build_mf, frozen):
 
 def _topology_statistics(mf, *, frozen, thresholds):
     start = time.perf_counter()
-    topology = build_iao_fragment_topology(
+    topology = build_domain_topology(
         mf,
         frozen=frozen,
         thresholds=thresholds,
@@ -526,7 +523,7 @@ def main():
                     _topology_statistics(
                         reference_mf,
                         frozen=args.frozen,
-                        thresholds=IAOFragmentMP2Thresholds(
+                        thresholds=DLNOThresholds(
                             pair_energy=pair_threshold,
                             mp2_block_memory_mb=args.mp2_block_memory,
                         ),
@@ -542,7 +539,7 @@ def main():
         comm.Barrier()
 
         for pair_threshold in args.pair_thresholds:
-            thresholds = IAOFragmentMP2Thresholds(
+            thresholds = DLNOThresholds(
                 pair_energy=pair_threshold,
                 mp2_block_memory_mb=args.mp2_block_memory,
             )
@@ -565,7 +562,7 @@ def main():
                 comm, args.max_combined_rss_gib
             )
             start = time.perf_counter()
-            energy, mol_bar = IAOFragmentMP2.value_and_grad(
+            energy, mol_bar = DLNOMP2.value_and_grad(
                 mol,
                 build_mf=build_mf,
                 frozen=args.frozen,

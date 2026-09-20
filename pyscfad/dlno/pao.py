@@ -1,9 +1,11 @@
+import jax.numpy as jnp
 import numpy as np
 import scipy.linalg as _sla_numpy
-import jax.numpy as jnp
+
 from pyscfad import scipy
-from . import util
-from .util import _is_traced
+
+from . import tools
+from .tools import _is_traced
 
 
 def _canonical_orth(s, thr=1e-6):
@@ -55,7 +57,7 @@ def pao(mol, mos, s1e=None, norm_thr=1e-4):
         nao, nmo = mos.shape
         s1e = jnp.asarray(s1e)
         paos = jnp.eye(nao) - mos @ (mos.T.conj() @ s1e)
-        norm = jnp.sqrt(util.einsum('ui,uv,vi->i', paos.conj(), s1e, paos))
+        norm = jnp.sqrt(tools.einsum('ui,uv,vi->i', paos.conj(), s1e, paos))
         pao_idx = jnp.where(norm > norm_thr)[0]
         inv_idx = np.full(nao, -1, dtype=np.int32)
         inv_idx[np.asarray(pao_idx)] = np.arange(len(pao_idx))
@@ -106,7 +108,7 @@ def pao_overlap_with_domain(
         s1e = mol.intor_symmetric('int1e_ovlp')
 
     pao_pd = pao_by_atom(mol, paos, p_domain, ao2pao_map)
-    ao_idx_bp = util.ao_index_by_atom(mol, bp_domain)
+    ao_idx_bp = tools.ao_index_by_atom(mol, bp_domain)
 
     if _is_traced(paos, s1e, pao_pd):
         x = _canonical_orth(pao_pd.T.conj() @ s1e @ pao_pd, thr=orth_thr)

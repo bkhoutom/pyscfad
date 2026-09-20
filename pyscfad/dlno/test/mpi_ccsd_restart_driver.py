@@ -1,7 +1,7 @@
 """Two-rank IAO-DLNO-CCSD(T) restart integration-test driver.
 
 This file is intentionally not collected as a pytest module.  The companion
-``test_iao_ccsd_mpi_restart.py`` launches it under ``mpiexec -n 2`` several
+``test_ccsd_mpi_restart.py`` launches it under ``mpiexec -n 2`` several
 times so a checkpoint produced by a failed MPI job is consumed by a fresh MPI
 job, rather than by another call in the same Python process.
 """
@@ -26,10 +26,11 @@ from mpi4py import MPI
 import numpy as np
 
 from pyscfad import config_update, gto, scf
+from pyscfad.dlno import ccsd_mpi
 from pyscfad.dlno import _restart as restart_module
-from pyscfad.dlno import ccsd_mpi as ccsd_mpi_module
+
 from pyscfad.dlno.ccsd_mpi import DLNOCCSD
-from pyscfad.dlno.iao_mp2 import IAOFragmentMP2Thresholds
+from pyscfad.dlno.domain import DLNOThresholds
 
 
 def _water_trimer():
@@ -82,7 +83,7 @@ def _build_mf(
 
 
 def _thresholds():
-    return IAOFragmentMP2Thresholds(
+    return DLNOThresholds(
         pao_norm=1e-10,
         domain_pao=0.0,
         ed_pao=0.0,
@@ -110,9 +111,9 @@ def _install_forbidden_pre_scf_work():
             "pre-SCF restart unexpectedly entered common/fragment/MP2 work"
         )
 
-    ccsd_mpi_module.rebuild_iao_mp2_common = forbidden
-    ccsd_mpi_module._fragment_value_and_grad = forbidden
-    ccsd_mpi_module._mp2_correlation_value_and_grad = forbidden
+    ccsd_mpi.rebuild_domain_data = forbidden
+    ccsd_mpi._fragment_value_and_grad = forbidden
+    ccsd_mpi._mp2_correlation_value_and_grad = forbidden
 
 
 def _run(mode: str, checkpoint_dir: Path, output: Path):
@@ -123,14 +124,14 @@ def _run(mode: str, checkpoint_dir: Path, output: Path):
         raise RuntimeError(f"restart integration driver requires 2 ranks, got {size}")
 
     fragment_calls = 0
-    original_fragment = ccsd_mpi_module._fragment_value_and_grad
+    original_fragment = ccsd_mpi._fragment_value_and_grad
 
     def counted_fragment(*args, **kwargs):
         nonlocal fragment_calls
         fragment_calls += 1
         return original_fragment(*args, **kwargs)
 
-    ccsd_mpi_module._fragment_value_and_grad = counted_fragment
+    ccsd_mpi._fragment_value_and_grad = counted_fragment
 
     if mode == "interrupt-progress":
         fired = False

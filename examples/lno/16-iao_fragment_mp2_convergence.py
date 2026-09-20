@@ -31,11 +31,8 @@ import time
 import numpy as np
 
 from pyscfad import config, gto, scf
-from pyscfad.dlno.iao_mp2 import (
-    IAOFragmentMP2Thresholds,
-    build_iao_fragment_topology,
-    evaluate_iao_fragment_mp2,
-)
+from pyscfad.dlno.domain import DLNOThresholds, build_domain_topology
+from pyscfad.dlno.mp2 import evaluate_domain_mp2
 from pyscfad.mp import dfmp2
 
 
@@ -510,7 +507,7 @@ def main(argv=None):
 
     rows = []
     for pair_threshold in args.pair_thresholds:
-        thresholds = IAOFragmentMP2Thresholds(
+        thresholds = DLNOThresholds(
             bp_occ=args.bp_occ,
             bp_primary=args.bp_primary,
             bp_ed=args.bp_ed,
@@ -523,7 +520,7 @@ def main(argv=None):
             mp2_block_memory_mb=args.mp2_block_memory,
         )
         start = time.perf_counter()
-        topology = build_iao_fragment_topology(
+        topology = build_domain_topology(
             mf,
             frozen=args.frozen_core,
             thresholds=thresholds,
@@ -531,7 +528,7 @@ def main(argv=None):
         )
         topology_elapsed = time.perf_counter() - start
         start = time.perf_counter()
-        result = evaluate_iao_fragment_mp2(mf, topology)
+        result = evaluate_domain_mp2(mf, topology)
         rows.append(summarize_result(
             pair_threshold,
             result,
@@ -541,7 +538,7 @@ def main(argv=None):
         ))
 
     if args.full_domain_check:
-        thresholds = IAOFragmentMP2Thresholds(
+        thresholds = DLNOThresholds(
             pair_energy=0.0,
             pao_norm=1e-10,
             domain_pao=0.0,
@@ -549,7 +546,7 @@ def main(argv=None):
             occupied_weight=1e-12,
         )
         start = time.perf_counter()
-        topology = build_iao_fragment_topology(
+        topology = build_domain_topology(
             mf,
             frozen=args.frozen_core,
             thresholds=thresholds,
@@ -558,7 +555,7 @@ def main(argv=None):
         )
         topology_elapsed = time.perf_counter() - start
         start = time.perf_counter()
-        result = evaluate_iao_fragment_mp2(mf, topology)
+        result = evaluate_domain_mp2(mf, topology)
         row = summarize_result(
             0.0,
             result,

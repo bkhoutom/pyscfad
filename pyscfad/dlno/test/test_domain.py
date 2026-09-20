@@ -1,12 +1,7 @@
 import numpy as np
 from pyscf import gto
 
-from pyscfad.dlno.domain import (
-    _compute_av_numpy,
-    _fragment_trace_completeness_numpy,
-    get_bp_domain,
-    get_fragment_bp_domain,
-)
+from pyscfad.dlno.domain import _compute_av_numpy, _fragment_trace_completeness_numpy, get_bp_domain, get_fragment_bp_domain
 
 
 def _h4_chain():

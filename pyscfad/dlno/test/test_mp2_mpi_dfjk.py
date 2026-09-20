@@ -3,7 +3,7 @@
 The ordinary pytest suite excludes the true multi-rank check by its
 ``*_high_cost`` name.  Run it explicitly with, for example::
 
-    pytest -q pyscfad/dlno/test/test_iao_mp2_mpi_dfjk.py \
+    pytest -q pyscfad/dlno/test/test_mp2_mpi_dfjk.py \
         -k mpiexec_np1_np2_high_cost
 
 The MPI driver collectively builds a shared out-of-core CDERI file, compares
@@ -43,11 +43,9 @@ import pytest
 from pyscfad import config_update, gto, scf
 from pyscfad.df.mpi_df_jk import MPIDFJKExecutor
 from pyscfad.df.mpi_outcore import build_cderi
-from pyscfad.dlno.iao_mp2 import (
-    IAOFragmentMP2 as SerialIAOFragmentMP2,
-    IAOFragmentMP2Thresholds,
-)
-from pyscfad.dlno.iao_mp2_mpi import IAOFragmentMP2 as MPIIAOFragmentMP2
+from pyscfad.dlno.mp2 import DLNOMP2 as SerialIAOFragmentMP2
+from pyscfad.dlno.domain import DLNOThresholds
+from pyscfad.dlno.mp2_mpi import DLNOMP2 as MPIDLNOMP2
 from pyscfad.mp import dfmp2
 
 
@@ -104,7 +102,7 @@ def _build_mf(
 
 
 def _full_domain_thresholds():
-    return IAOFragmentMP2Thresholds(
+    return DLNOThresholds(
         pao_norm=1e-10,
         domain_pao=0.0,
         ed_pao=0.0,
@@ -217,7 +215,7 @@ def _run_world_driver(output: Path):
     )
     try:
         with _gradient_options():
-            energy, mol_bar, details = MPIIAOFragmentMP2.value_and_grad(
+            energy, mol_bar, details = MPIDLNOMP2.value_and_grad(
                 mol,
                 build_mf=_build_mf,
                 thresholds=_full_domain_thresholds(),

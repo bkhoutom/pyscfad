@@ -28,8 +28,8 @@ from mpi4py import MPI
 
 from pyscfad import config, gto, scf
 from pyscfad.df.mpi_outcore import build_cderi
-from pyscfad.dlno.iao_mp2 import IAOFragmentMP2Thresholds
-from pyscfad.dlno.iao_mp2_mpi import IAOFragmentMP2
+from pyscfad.dlno.domain import DLNOThresholds
+from pyscfad.dlno.mp2_mpi import DLNOMP2
 
 
 comm = MPI.COMM_WORLD
@@ -121,11 +121,11 @@ def build_mf(mol_, *, mo_coeff_init=None, mo_energy_init=None,
     return mf
 
 
-thresholds = IAOFragmentMP2Thresholds(
+thresholds = DLNOThresholds(
     pair_energy=PAIR_THRESHOLD,
     mp2_block_memory_mb=128.0,
 )
-energy, mol_bar, details = IAOFragmentMP2.value_and_grad(
+energy, mol_bar, details = DLNOMP2.value_and_grad(
     mol, build_mf=build_mf, frozen=FROZEN, thresholds=thresholds,
     pair_energy_model="multipole", include_hf=True, comm=comm,
     parallel_scf_jk=True, return_details=True, progress=True,

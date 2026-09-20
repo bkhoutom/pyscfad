@@ -12,133 +12,48 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Gauge-consistent MPI IAO-fragment MP2 energies and gradients.
-
-The shared SCF orbitals, IAOs, PAOs, fragment weights, and fixed topology are
-constructed exactly once on ``root``.  Their numerical values are broadcast
-to the workers, which differentiate independent strong-ED energies and
-unordered weak multipole pairs with respect to the *same* ``(mf, common)``
-coordinate system.  The resulting cotangents are reduced before rank 0
-replays each gauge-defining orbital build, applies the one shared common-
-orbital pullback, and finally applies the one implicit SCF pullback.
-
-This separation is important for local-correlation gradients.  Rebuilding
-canonical/local orbitals independently on every MPI rank permits otherwise
-equivalent eigenspaces to acquire different signs or internal rotations; the
-resulting cotangents then do not share a well-defined gauge.  Rank 0 therefore
-builds and distributes the exact strong-ED and weak-pair endpoint frames in
-bounded batches.  Workers differentiate only the scalar correlated
-calculation in those frames.  After each batch, rank 0 deterministically
-replays one ED/screen build at a time, verifies that its primal digest is
-unchanged, and closes its cotangent into the common representation.  This
-bounds stored orbital frames linearly in the MPI rank count and the root
-orbital-build tape to one frame instead of retaining every fragment tape
-simultaneously.
-
-The correlation result is the complete IAO-DLNO-MP2 correction: exact strong
-ED contributions plus every retained unordered weak multipole pair.  It is
-the same local-MP2 correction used by serial IAO-DLNO-CCSD(T).  "Complete"
-here means every term of the IAO-DLNO-MP2 model: the strong EDs use full-spin
-MP2, while the distant term is Nagy's OS-based multipole approximation to the
-omitted total pair correlation rather than a literal OS+SS integral
-evaluation.
-"""
+"""MPI DLNO-MP2 with one shared orbital gauge and progressive pullbacks."""
 
 from __future__ import annotations
 
 import gc
-import hashlib
-from functools import wraps
 from pathlib import Path
 import time
-import traceback
 
 import jax
-import jax.numpy as jnp
-import numpy
+import jax.numpy as np
 from mpi4py import MPI
+import numpy
 
 from pyscfad import config_update
 from pyscfad.df.mpi_df_jk import MPIDFJKExecutor, ServiceExit
 from pyscfad.ops import stop_trace
 
-from .iao_mp2 import (
-    IAOFragmentMP2 as _SerialIAOFragmentMP2,
-    IAOFragmentMP2Thresholds,
-    IAOFragmentTopology,
-    _fix_restart_mo_phases,
-    _serial_restart_scientific_payload,
+from ._restart import RestartManager
+from ._selection import DomainSelections
+from .dlno_base import build_strong_ed_domain, build_weak_multipole_screen, rebuild_domain_data
+from .dlno_base_mpi import (
+    _abort_collective_on_error, _array_tree_digest, _exception_text,
+    _progress_enabled, _progress_reporter, _raise_if_any_rank_failed,
+    _raise_if_root_failed, _to_device_leaf, _to_host_leaf, _tree_sum_to_root,
+    _validate_target_options, _verify_shared_gauge, _verify_shared_reference,
+    _zero_mf_cotangent, _zero_term_cotangents,
 )
-from .iao_mp2_grad import (
-    IAOFragmentMP2StaticSelections,
-    IAOMP2GradientTiming,
-    IAOMP2TermResult,
-    _add_cotangent,
-    _correlation_term_specs,
-    _details_from_restart_metadata,
-    _details_restart_metadata,
-    _make_decomposition,
-    build_strong_ed_domain,
-    build_weak_multipole_screen,
-    rebuild_iao_mp2_common,
-    strong_domain_energy,
+from .domain import DLNOThresholds, DomainTopology
+from .mp2 import (
+    DLNOMP2 as _SerialDLNOMP2, MP2GradientTiming, MP2TermResult, _add_cotangent,
+    _correlation_term_specs, _details_from_restart_metadata,
+    _details_restart_metadata, _fix_restart_mo_phases, _make_decomposition,
+    _serial_restart_scientific_payload, strong_domain_energy,
     weak_screen_pair_energy,
 )
-from ._restart import (
-    RestartManager,
-    df_source_fingerprint,
-    scientific_digest,
-)
+from .targets import resolve_target_options, semantic_tuple as _semantic_tuple
 
 
 __all__ = [
-    "IAOFragmentMP2",
+    "DLNOMP2",
     "correlation_value_and_grad",
 ]
-
-
-def _abort_collective_on_error(function):
-    """Prevent a rank-local Python error from stranding MPI peers."""
-
-    @wraps(function)
-    def wrapped(*args, **kwargs):
-        comm = kwargs.get("comm", MPI.COMM_WORLD)
-        if comm is None:
-            comm = MPI.COMM_WORLD
-        root = int(kwargs.get("root", 0))
-        try:
-            return function(*args, **kwargs)
-        except Exception:
-            if comm.Get_size() > 1:  # pragma: no cover - MPI failure path
-                if comm.Get_rank() == root:
-                    traceback.print_exc()
-                comm.Abort(1)
-            raise
-
-    return wrapped
-
-
-def _progress_enabled(progress):
-    """Validate and normalize the public progress-reporting switch."""
-    if progress is None or progress is False:
-        return False
-    if progress is True or callable(progress):
-        return True
-    raise TypeError("progress must be a bool, callable, or None")
-
-
-def _progress_reporter(progress, *, rank, root):
-    """Return a rank-root-only, line-buffered progress reporter."""
-    enabled = _progress_enabled(progress)
-    if not enabled or rank != root:
-        return None
-    if callable(progress):
-        return progress
-
-    def report(message):
-        print(message, flush=True)
-
-    return report
 
 
 def _report_progress(reporter, message):
@@ -157,6 +72,8 @@ def _mpi_restart_scientific_payload(
     pair_energy_model,
     force_full_domains,
     include_hf,
+    lo_type="iao",
+    lo_kwargs=None,
     nproc,
     root,
 ):
@@ -172,6 +89,8 @@ def _mpi_restart_scientific_payload(
         pair_energy_model=pair_energy_model,
         force_full_domains=force_full_domains,
         include_hf=include_hf,
+        lo_type=lo_type,
+        lo_kwargs=lo_kwargs,
     )
     payload["driver"] = "mpi-iao-dlno-mp2-gradient"
     # Progressive MPI batch records contain rank-local cumulative bars, so a
@@ -180,369 +99,6 @@ def _mpi_restart_scientific_payload(
     # keeping one strict manifest avoids accidentally mixing both contracts.
     payload["mpi"] = {"size": int(nproc), "root": int(root)}
     return payload
-
-
-def _zero_mf_cotangent(mf):
-    """Construct a live MF-shaped zero tree for checkpoint deserialization."""
-
-    dtype = jnp.asarray(mf.mo_coeff).dtype
-    _, pullback = jax.vjp(
-        lambda mf_: jnp.zeros((), dtype=dtype), mf
-    )
-    mf_bar, = pullback(jnp.ones((), dtype=dtype))
-    return mf_bar
-
-
-def _exception_text(stage):
-    return f"{stage} failed on an MPI rank:\n{traceback.format_exc()}"
-
-
-def _raise_if_root_failed(comm, error, *, root):
-    error = comm.bcast(error, root=root)
-    if error is not None:
-        raise RuntimeError(error)
-
-
-def _raise_if_any_rank_failed(comm, local_error):
-    errors = comm.allgather(local_error)
-    failures = [error for error in errors if error is not None]
-    if failures:
-        raise RuntimeError("\n".join(failures))
-
-
-def _to_host_leaf(leaf):
-    if leaf is None:
-        return None
-    if hasattr(leaf, "dtype") and leaf.dtype == jax.dtypes.float0:
-        return leaf
-    try:
-        return numpy.array(numpy.asarray(leaf), copy=True, order="C")
-    except (TypeError, ValueError):
-        return leaf
-
-
-def _to_device_leaf(leaf):
-    if leaf is None:
-        return None
-    if isinstance(leaf, numpy.ndarray):
-        return jnp.asarray(leaf)
-    return leaf
-
-
-_TREE_REDUCE_CHUNK_BYTES = 64 * 1024**2
-_TREE_REDUCE_MAX_COUNT = int(numpy.iinfo(numpy.int32).max)
-
-
-def _tree_reduce_leaf_metadata(leaf):
-    """Describe one cotangent leaf without serializing its data."""
-    if leaf is None:
-        return ("none",)
-    if hasattr(leaf, "dtype") and leaf.dtype == jax.dtypes.float0:
-        return ("float0", tuple(int(value) for value in leaf.shape))
-    try:
-        if hasattr(leaf, "dtype") and hasattr(leaf, "shape"):
-            dtype = numpy.dtype(leaf.dtype)
-            shape = tuple(int(value) for value in leaf.shape)
-        else:
-            array = numpy.asarray(leaf)
-            dtype = array.dtype
-            shape = tuple(int(value) for value in array.shape)
-    except (TypeError, ValueError):
-        return ("unsupported", type(leaf).__name__)
-    if dtype.hasobject or dtype.kind not in "iufc":
-        return ("unsupported", dtype.str)
-    return ("numeric", shape, dtype.str)
-
-
-def _tree_reduce_plans(paths, metadata_by_rank):
-    """Validate collective leaf metadata and return reduction plans."""
-    plans = {}
-    for path in paths:
-        descriptors = [metadata[path] for metadata in metadata_by_rank]
-        unsupported = [
-            (rank, descriptor)
-            for rank, descriptor in enumerate(descriptors)
-            if descriptor[0] == "unsupported"
-        ]
-        if unsupported:
-            rank, descriptor = unsupported[0]
-            raise TypeError(
-                f"MPI cotangent leaf {path} on rank {rank} has unsupported "
-                f"type {descriptor[1]}"
-            )
-
-        numeric = [
-            descriptor for descriptor in descriptors
-            if descriptor[0] == "numeric"
-        ]
-        if numeric:
-            reference = numeric[0]
-            if any(descriptor != reference for descriptor in numeric[1:]):
-                raise RuntimeError(
-                    f"MPI cotangent leaf {path} has inconsistent numeric "
-                    f"shape or dtype across ranks: {descriptors}"
-                )
-            shape = reference[1]
-            if any(
-                descriptor[0] == "float0" and descriptor[1] != shape
-                for descriptor in descriptors
-            ):
-                raise RuntimeError(
-                    f"MPI cotangent leaf {path} has inconsistent zero and "
-                    f"numeric shapes across ranks: {descriptors}"
-                )
-            plans[path] = reference
-            continue
-
-        float0 = [
-            descriptor for descriptor in descriptors
-            if descriptor[0] == "float0"
-        ]
-        if float0:
-            reference = float0[0]
-            if any(descriptor != reference for descriptor in float0[1:]):
-                raise RuntimeError(
-                    f"MPI cotangent leaf {path} has inconsistent float0 "
-                    f"shapes across ranks: {descriptors}"
-                )
-            plans[path] = reference
-        else:
-            plans[path] = ("none",)
-    return plans
-
-
-def _tree_sum_to_root(comm, tree, *, root=0):
-    """Sum numeric leaves of a JAX pytree onto ``root``.
-
-    Paths, rather than registered object identities, align leaves across the
-    independently constructed rank-0 and worker ``mf`` objects. Numeric
-    leaves use bounded buffer reductions so the root never gathers every
-    rank's serialized tree at once.
-    """
-    if comm.Get_size() == 1:
-        return tree
-    rank = comm.Get_rank()
-    leaves_with_path, treedef = jax.tree_util.tree_flatten_with_path(
-        tree, is_leaf=lambda value: value is None
-    )
-    paths = [jax.tree_util.keystr(path) for path, _ in leaves_with_path]
-    if len(paths) != len(set(paths)):
-        raise RuntimeError(
-            f"MPI cotangent tree on rank {rank} contains duplicate paths"
-        )
-    all_paths = comm.allgather(tuple(paths))
-    root_path_set = set(all_paths[root])
-    if any(set(other) != root_path_set for other in all_paths):
-        mismatch = next(
-            index for index, other in enumerate(all_paths)
-            if set(other) != root_path_set
-        )
-        other_paths = set(all_paths[mismatch])
-        raise RuntimeError(
-            "MPI cotangent pytrees differ between root and rank "
-            f"{mismatch}; root-only={sorted(root_path_set - other_paths)[:5]}, "
-            f"rank-only={sorted(other_paths - root_path_set)[:5]}"
-        )
-
-    leaves_by_path = {
-        path: leaf
-        for path, (_, leaf) in zip(paths, leaves_with_path)
-    }
-    local_metadata = {
-        path: _tree_reduce_leaf_metadata(leaf)
-        for path, leaf in leaves_by_path.items()
-    }
-    metadata_by_rank = comm.allgather(local_metadata)
-    ordered_paths = all_paths[root]
-    plans = _tree_reduce_plans(ordered_paths, metadata_by_rank)
-
-    summed = {} if rank == root else None
-    for path in ordered_paths:
-        plan = plans[path]
-        if plan[0] == "none":
-            if rank == root:
-                summed[path] = None
-            continue
-        if plan[0] == "float0":
-            if rank == root:
-                summed[path] = numpy.zeros(
-                    plan[1], dtype=jax.dtypes.float0
-                )
-            continue
-
-        shape, dtype = plan[1], numpy.dtype(plan[2])
-        local_leaf = leaves_by_path[path]
-        local_kind = local_metadata[path][0]
-        if local_kind == "numeric":
-            host_leaf = numpy.array(
-                numpy.asarray(local_leaf), copy=True, order="C"
-            )
-            flat_leaf = host_leaf.reshape(-1)
-        else:
-            host_leaf = None
-            flat_leaf = None
-
-        if rank == root:
-            if host_leaf is None:
-                result = numpy.zeros(shape, dtype=dtype)
-            else:
-                result = host_leaf
-            flat_result = result.reshape(-1)
-        else:
-            result = None
-            flat_result = None
-
-        size = int(numpy.prod(shape, dtype=numpy.int64))
-        chunk_count = min(
-            _TREE_REDUCE_MAX_COUNT,
-            max(1, int(_TREE_REDUCE_CHUNK_BYTES) // dtype.itemsize),
-        )
-        for start in range(0, size, chunk_count):
-            stop = min(size, start + chunk_count)
-            if rank == root:
-                comm.Reduce(
-                    MPI.IN_PLACE,
-                    flat_result[start:stop],
-                    op=MPI.SUM,
-                    root=root,
-                )
-            else:
-                if flat_leaf is None:
-                    send = numpy.zeros(stop - start, dtype=dtype)
-                else:
-                    send = flat_leaf[start:stop]
-                comm.Reduce(send, None, op=MPI.SUM, root=root)
-        if rank == root:
-            summed[path] = result
-
-    if rank != root:
-        return None
-    return jax.tree_util.tree_unflatten(
-        treedef, [summed[path] for path in paths]
-    )
-
-
-def _array_tree_digest(tree):
-    """Return a reproducible digest of all numeric leaves in ``tree``."""
-    digest = hashlib.sha256()
-    leaves_with_path, _ = jax.tree_util.tree_flatten_with_path(
-        tree, is_leaf=lambda value: value is None
-    )
-    for path, leaf in leaves_with_path:
-        if leaf is None or not hasattr(leaf, "dtype"):
-            continue
-        array = numpy.ascontiguousarray(numpy.asarray(leaf))
-        digest.update(jax.tree_util.keystr(path).encode("utf8"))
-        digest.update(array.dtype.str.encode("ascii"))
-        digest.update(repr(array.shape).encode("ascii"))
-        digest.update(array.tobytes())
-    return digest.hexdigest()
-
-
-def _semantic_tuple(value):
-    """Convert nested PySCF basis metadata to a comparable value tuple."""
-    if isinstance(value, dict):
-        return tuple(
-            (key, _semantic_tuple(item))
-            for key, item in sorted(value.items(), key=lambda pair: pair[0])
-        )
-    if isinstance(value, (list, tuple)):
-        return tuple(_semantic_tuple(item) for item in value)
-    if isinstance(value, numpy.ndarray):
-        return _semantic_tuple(value.tolist())
-    if isinstance(value, numpy.generic):
-        return value.item()
-    return value
-
-
-def _verify_shared_reference(
-    comm, canonical, mf, *, verify_df_source=False
-):
-    """Require identical canonical, molecular, and DF metadata on all ranks."""
-
-    mol = mf.mol
-    auxmol = getattr(getattr(mf, "with_df", None), "auxmol", None)
-    local = _array_tree_digest(canonical)
-    digests = comm.allgather(local)
-    if len(set(digests)) != 1:
-        details = ", ".join(
-            f"rank {rank}: {value[:12]}"
-            for rank, value in enumerate(digests)
-        )
-        raise RuntimeError(
-            "broadcast canonical orbital gauges differ across MPI ranks ("
-            + details + ")"
-        )
-    system_signature = (
-        int(mol.natm),
-        int(mol.nao),
-        int(mol.charge),
-        int(mol.spin),
-        bool(getattr(mol, "cart", False)),
-        tuple(mol.atom_symbol(index) for index in range(mol.natm)),
-        _semantic_tuple(numpy.asarray(mol.atom_charges()).tolist()),
-        _semantic_tuple(numpy.asarray(mol.atom_coords()).tolist()),
-        _semantic_tuple(getattr(mol, "_basis", None)),
-        _semantic_tuple(getattr(mol, "_ecp", None)),
-        _semantic_tuple(getattr(mol, "_pseudo", None)),
-        None if auxmol is None else int(auxmol.nao),
-        _semantic_tuple(
-            getattr(getattr(mf, "with_df", None), "auxbasis", None)
-        ),
-        _semantic_tuple(getattr(auxmol, "_basis", None)),
-    )
-    system_signatures = comm.allgather(system_signature)
-    if len(set(system_signatures)) != 1:
-        raise RuntimeError(
-            "molecular geometry or orbital/auxiliary bases differ across "
-            "MPI ranks"
-        )
-    if verify_df_source:
-        # Shape-compatible but scientifically different CDERI files are a
-        # particularly dangerous MPI failure mode: fragment energies remain
-        # finite while belonging to different Hamiltonians.  Hash logical
-        # HDF5 contents (or the in-memory factors) once before distributed
-        # correlation/response work and require exact agreement with root.
-        df_digest = scientific_digest(df_source_fingerprint(mf))
-        df_digests = comm.allgather(df_digest)
-        if len(set(df_digests)) != 1:
-            details = ", ".join(
-                f"rank {rank}: {value[:12]}"
-                for rank, value in enumerate(df_digests)
-            )
-            raise RuntimeError(
-                "density-fitting integral contents differ across MPI ranks "
-                f"({details})"
-            )
-
-
-def _verify_shared_gauge(comm, canonical, common, mf):
-    """Require a shared reference and byte-identical common orbital frame."""
-
-    _verify_shared_reference(
-        comm, canonical, mf, verify_df_source=True
-    )
-    local = _array_tree_digest(common)
-    digests = comm.allgather(local)
-    if len(set(digests)) != 1:
-        details = ", ".join(
-            f"rank {rank}: {value[:12]}"
-            for rank, value in enumerate(digests)
-        )
-        raise RuntimeError(
-            "broadcast IAO-MP2 common orbital gauges differ across MPI "
-            f"ranks ({details})"
-        )
-
-
-def _zero_term_cotangents(mf, common):
-    """Construct exact zero cotangents with the local pytree structures."""
-    _, pullback = jax.vjp(
-        lambda mf_, common_: jnp.zeros((), dtype=common_.s1e.dtype),
-        mf,
-        common,
-    )
-    return pullback(jnp.ones((), dtype=common.s1e.dtype))
 
 
 @_abort_collective_on_error
@@ -654,9 +210,9 @@ def correlation_value_and_grad(
         )
 
     if rank == root:
-        if not isinstance(static, IAOFragmentMP2StaticSelections):
+        if not isinstance(static, DomainSelections):
             raise TypeError(
-                "root must supply IAOFragmentMP2StaticSelections"
+                "root must supply DomainSelections"
             )
         _report_progress(
             reporter,
@@ -664,7 +220,7 @@ def correlation_value_and_grad(
         )
         common_start = time.perf_counter() if collect_timing else None
         common, common_pullback = jax.vjp(
-            lambda mf_: rebuild_iao_mp2_common(mf_, static), mf
+            lambda mf_: rebuild_domain_data(mf_, static), mf
         )
         if collect_timing:
             jax.block_until_ready(common)
@@ -699,7 +255,7 @@ def correlation_value_and_grad(
     work = _correlation_term_specs(static)
     nstrong_terms = sum(spec[0] == "strong" for spec in work)
     nweak_terms = len(work) - nstrong_terms
-    local_energy = jnp.zeros((), dtype=common.s1e.dtype)
+    local_energy = np.zeros((), dtype=common.s1e.dtype)
     mf_bar, _ = _zero_term_cotangents(mf, common)
     if rank == root:
         _, common_bar_root = _zero_term_cotangents(mf, common)
@@ -847,14 +403,14 @@ def correlation_value_and_grad(
                 reverse_start = time.perf_counter()
             if kind == "strong":
                 term_mf_bar, frame_bar = pullback(
-                    jnp.ones((), dtype=term_energy.dtype)
+                    np.ones((), dtype=term_energy.dtype)
                 )
             else:
                 (
                     term_mf_bar,
                     left_frame_bar,
                     right_frame_bar,
-                ) = pullback(jnp.ones((), dtype=term_energy.dtype))
+                ) = pullback(np.ones((), dtype=term_energy.dtype))
                 frame_bar = (left_frame_bar, right_frame_bar)
                 del left_frame_bar, right_frame_bar
 
@@ -983,7 +539,7 @@ def correlation_value_and_grad(
                     frame_replay_seconds = (
                         time.perf_counter() - replay_start
                     )
-                    term_result = IAOMP2TermResult(
+                    term_result = MP2TermResult(
                         kind=str(kind),
                         left_fragment=int(left),
                         right_fragment=(
@@ -1091,7 +647,7 @@ def correlation_value_and_grad(
                 term for term in term_results_root
                 if term.kind == "weak"
             )
-            timing = IAOMP2GradientTiming(
+            timing = MP2GradientTiming(
                 common_forward_seconds=float(common_forward_seconds),
                 strong_forward_seconds=sum(
                     term.forward_seconds for term in strong_terms
@@ -1157,7 +713,7 @@ def correlation_value_and_grad(
     return corr_energy, mf_bar_root
 
 
-class IAOFragmentMP2(_SerialIAOFragmentMP2):
+class DLNOMP2(_SerialDLNOMP2):
     """MPI-parallel fixed-topology IAO-fragment MP2 driver."""
 
     @classmethod
@@ -1173,6 +729,8 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
         thresholds=None,
         pair_energy_model="multipole",
         force_full_domains=False,
+        lo_type="iao",
+        lo_kwargs=None,
         topology=None,
         include_hf=True,
         parallel_scf_jk=False,
@@ -1233,6 +791,7 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
         """
         rank = comm.Get_rank()
         nproc = comm.Get_size()
+        lo_type, lo_kwargs = resolve_target_options(lo_type, lo_kwargs)
         progress_enabled = _progress_enabled(progress)
         local_schedule = (
             int(root),
@@ -1240,6 +799,8 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
             bool(include_hf),
             bool(return_details),
             progress_enabled,
+            lo_type,
+            _semantic_tuple(lo_kwargs),
             None if checkpoint_dir is None else str(
                 Path(checkpoint_dir).expanduser().resolve()
             ),
@@ -1249,7 +810,8 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
         if len(set(schedules)) != 1:
             raise ValueError(
                 "root, parallel_scf_jk, include_hf, return_details, progress, "
-                "checkpoint_dir, and resume must be consistent on all MPI "
+                "lo_type, lo_kwargs, checkpoint_dir, and resume must be consistent "
+                "on all MPI "
                 "ranks"
             )
         if root < 0 or root >= nproc:
@@ -1264,12 +826,12 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
             or getattr(mol, "ctr_coeff", None) is not None
         ):
             raise NotImplementedError(
-                "MPI IAOFragmentMP2 currently differentiates nuclear "
+                "MPI DLNOMP2 currently differentiates nuclear "
                 "coordinates only; build mol with trace_exp=False and "
                 "trace_ctr_coeff=False"
             )
         if thresholds is None:
-            thresholds = IAOFragmentMP2Thresholds()
+            thresholds = DLNOThresholds()
 
         scf_builder = build_mf
         if checkpoint_dir is not None:
@@ -1370,6 +932,8 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
                     pair_energy_model=pair_energy_model,
                     force_full_domains=force_full_domains,
                     include_hf=include_hf,
+                    lo_type=lo_type,
+                    lo_kwargs=lo_kwargs,
                     nproc=nproc,
                     root=root,
                 )
@@ -1382,11 +946,20 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
                 )
                 if topology is not None and not isinstance(
                     topology,
-                    (IAOFragmentTopology, IAOFragmentMP2StaticSelections),
+                    (DomainTopology, DomainSelections),
                 ):
                     raise TypeError(
-                        "topology must be IAOFragmentTopology or "
-                        "IAOFragmentMP2StaticSelections"
+                        "topology must be DomainTopology or "
+                        "DomainSelections"
+                    )
+                if topology is not None:
+                    _validate_target_options(
+                        topology,
+                        lo_type=lo_type,
+                        lo_kwargs=lo_kwargs,
+                        frag_lolist=frag_lolist,
+                        frag_atmlist=frag_atmlist,
+                        frozen=frozen,
                     )
                 topology_start = time.perf_counter()
                 _report_progress(
@@ -1395,20 +968,18 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
                 saved_topology = None
                 if resume and restart.enabled:
                     saved_topology = restart.load_static(
-                        expected_type=IAOFragmentMP2StaticSelections
+                        expected_type=DomainSelections
                     )
                 if saved_topology is not None:
                     if isinstance(
-                        topology, IAOFragmentMP2StaticSelections
+                        topology, DomainSelections
                     ):
                         restart.bind_static(topology)
-                    elif isinstance(topology, IAOFragmentTopology):
-                        from .iao_mp2_grad import (
-                            build_iao_mp2_static_selections,
-                        )
+                    elif isinstance(topology, DomainTopology):
+                        from ._selection import build_domain_selections
 
                         supplied_static = stop_trace(
-                            lambda mf_: build_iao_mp2_static_selections(
+                            lambda mf_: build_domain_selections(
                                 mf_, topology
                             )
                         )(mf)
@@ -1428,25 +999,40 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
                             thresholds=thresholds,
                             pair_energy_model=pair_energy_model,
                             force_full_domains=force_full_domains,
+                            lo_type=lo_type,
+                            lo_kwargs=lo_kwargs,
                         )
                     )(mf)
-                elif isinstance(topology, IAOFragmentTopology):
-                    from .iao_mp2_grad import build_iao_mp2_static_selections
+                elif isinstance(topology, DomainTopology):
+                    from ._selection import build_domain_selections
 
                     fixed_topology = stop_trace(
-                        lambda mf_: build_iao_mp2_static_selections(
+                        lambda mf_: build_domain_selections(
                             mf_, topology
                         )
                     )(mf)
-                elif isinstance(topology, IAOFragmentMP2StaticSelections):
+                elif isinstance(topology, DomainSelections):
                     fixed_topology = topology
                 else:
                     raise TypeError(
-                        "topology must be IAOFragmentTopology or "
-                        "IAOFragmentMP2StaticSelections"
+                        "topology must be DomainTopology or "
+                        "DomainSelections"
                     )
+                _validate_target_options(
+                    fixed_topology,
+                    lo_type=lo_type,
+                    lo_kwargs=lo_kwargs,
+                    frag_lolist=frag_lolist,
+                    frag_atmlist=frag_atmlist,
+                    frozen=frozen,
+                )
                 if restart.enabled and saved_topology is None:
                     restart.save_static(fixed_topology)
+                _report_progress(
+                    reporter,
+                    f"target localization: mode={lo_type}; options="
+                    f"{_semantic_tuple(lo_kwargs)!r}",
+                )
 
                 term_specs = _correlation_term_specs(fixed_topology)
                 nstrong_terms = sum(
@@ -1502,7 +1088,7 @@ class IAOFragmentMP2(_SerialIAOFragmentMP2):
             try:
                 e_hf, hf_pullback = jax.vjp(lambda mf_: mf_.e_tot, mf)
                 hf_bar, = hf_pullback(
-                    jnp.ones((), dtype=jnp.asarray(e_hf).dtype)
+                    np.ones((), dtype=np.asarray(e_hf).dtype)
                 )
                 if resume and restart.enabled:
                     pre_scf = restart.load_record(

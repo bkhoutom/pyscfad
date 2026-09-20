@@ -13,7 +13,7 @@ from mpi4py import MPI
 from pyscfad import config, gto, scf
 from pyscfad.df.mpi_outcore import build_cderi
 from pyscfad.dlno.ccsd_mpi import DLNOCCSD
-from pyscfad.dlno.iao_mp2 import IAOFragmentMP2Thresholds
+from pyscfad.dlno.domain import DLNOThresholds
 
 
 comm = MPI.COMM_WORLD
@@ -63,7 +63,7 @@ energy, gradient = DLNOCCSD.value_and_grad(
     mol,
     build_mf=build_mf,
     frozen=4,
-    thresholds=IAOFragmentMP2Thresholds(pair_energy=1e-4),
+    thresholds=DLNOThresholds(pair_energy=1e-4),
     thresh_occ=1e-3,
     thresh_vir=1e-4,
     ccsd_t=True,

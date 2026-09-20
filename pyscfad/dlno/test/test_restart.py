@@ -1,3 +1,5 @@
+from pyscfad.dlno import _restart
+
 import json
 from types import SimpleNamespace
 
@@ -7,17 +9,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-import pyscfad.dlno._restart as restart_module
-from pyscfad.dlno._restart import (
-    RestartCorruptionError,
-    RestartManager,
-    RestartManifestError,
-    RestartMismatchError,
-    df_source_fingerprint,
-)
-from pyscfad.dlno.iao_ccsd import _restart_scientific_payload
-from pyscfad.dlno.iao_mp2 import _serial_restart_scientific_payload
-from pyscfad.dlno.iao_mp2 import IAOFragmentMP2Thresholds
+
+from pyscfad.dlno._restart import RestartCorruptionError, RestartManager, RestartManifestError, RestartMismatchError, df_source_fingerprint
+from pyscfad.dlno.ccsd import _restart_scientific_payload
+from pyscfad.dlno.mp2 import _serial_restart_scientific_payload
+from pyscfad.dlno.domain import DLNOThresholds
 
 
 @jax.tree_util.register_pytree_with_keys_class
@@ -93,7 +89,7 @@ def _mp2_restart_payload(mol, mf):
         frag_lolist=None,
         frag_atmlist=None,
         frozen=None,
-        thresholds=IAOFragmentMP2Thresholds(),
+        thresholds=DLNOThresholds(),
         pair_energy_model="multipole",
         force_full_domains=False,
         include_hf=True,
@@ -107,7 +103,7 @@ def _cc_restart_payload(mol, mf):
         frag_lolist=None,
         frag_atmlist=None,
         frozen=None,
-        thresholds=IAOFragmentMP2Thresholds(),
+        thresholds=DLNOThresholds(),
         pair_energy_model="multipole",
         force_full_domains=False,
         thresh_occ=1e-4,
@@ -242,11 +238,11 @@ def test_disabled_manager_and_invalid_resume():
 @pytest.mark.parametrize(
     "static",
     [
-        IAOFragmentMP2Thresholds(
+        DLNOThresholds(
             pair_energy=3.25e-7,
             multipole_order=3,
         ),
-        IAOFragmentMP2Thresholds(
+        DLNOThresholds(
             pair_energy=3.25e-7,
             multipole_order=3,
             mp2_block_memory_mb=19.5,
@@ -259,7 +255,7 @@ def test_static_dataclass_round_trip_and_unbound_manifest_recovery(
 ):
     manager = _manager(tmp_path)
     digest = manager.save_static(static)
-    assert manager.load_static(expected_type=IAOFragmentMP2Thresholds) == static
+    assert manager.load_static(expected_type=DLNOThresholds) == static
 
     # Emulate interruption after static.h5 was committed but before run.json
     # received its static digest.  load_static must recover and bind it.
@@ -275,7 +271,7 @@ def test_static_dataclass_round_trip_and_unbound_manifest_recovery(
 
 def test_pytree_round_trip_uses_paths_not_flatten_order(tmp_path):
     manager = _manager(tmp_path)
-    manager.bind_static(IAOFragmentMP2Thresholds())
+    manager.bind_static(DLNOThresholds())
     saved = _OrderedTree(
         {
             "dense": jnp.asarray([1.5, -2.0]),
@@ -359,10 +355,10 @@ def test_pre_replace_failure_preserves_old_generation(tmp_path, monkeypatch):
     def interrupt(_temporary, _final):
         raise RuntimeError("simulated interruption")
 
-    monkeypatch.setattr(restart_module, "_POST_SAVE_TEST_HOOK", interrupt)
+    monkeypatch.setattr(_restart, '_POST_SAVE_TEST_HOOK', interrupt)
     with pytest.raises(RuntimeError, match="simulated interruption"):
         manager.save_record("progress", scalars={"generation": 2})
-    monkeypatch.setattr(restart_module, "_POST_SAVE_TEST_HOOK", None)
+    monkeypatch.setattr(_restart, '_POST_SAVE_TEST_HOOK', None)
     record = manager.load_record("progress")
     assert record.scalars["generation"] == 1
 
@@ -375,8 +371,8 @@ def test_durable_event_hook_runs_after_stage_commit(tmp_path, monkeypatch):
         assert path.is_file()
         events.append((stage, key, path))
 
-    monkeypatch.setattr(restart_module, "_CHECKPOINT_EVENT_HOOK", event)
-    manager.save_static(IAOFragmentMP2Thresholds())
+    monkeypatch.setattr(_restart, '_CHECKPOINT_EVENT_HOOK', event)
+    manager.save_static(DLNOThresholds())
     manager.save_record("fragment_forward", key=3, scalars={"e": -0.1})
     assert [(stage, key) for stage, key, _ in events] == [
         ("static", None),
@@ -401,3 +397,17 @@ def test_df_source_fingerprint_tracks_logical_hdf5_contents(tmp_path):
     with h5py.File(second, "r+") as handle:
         handle["j3c"][2, 3] += 0.25
     assert fingerprint(second)["sha256"] != reference["sha256"]
+
+
+def test_pre_restructure_checkpoint_identity():
+    """An actual old payload still decodes and has exactly the same digest."""
+    from pathlib import Path
+
+    path = Path(__file__).with_name("data") / "thresholds_before_restructure.json"
+    fixture = json.loads(path.read_text())
+    value = _restart._decode_value(fixture["encoded"], None)
+    assert isinstance(value, DLNOThresholds)
+    assert value.pair_energy == 3.25e-7
+    assert value.mp2_block_nvir == 17
+    assert _restart._encode_value(value) == fixture["encoded"]
+    assert _restart.scientific_digest(value) == fixture["digest"]

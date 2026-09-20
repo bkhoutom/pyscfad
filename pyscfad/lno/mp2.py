@@ -15,6 +15,7 @@
 '''Impurity MP2 solver.
 '''
 
+from pyscfad.lno import df as lno_df
 from functools import reduce
 import numpy
 import time
@@ -45,7 +46,7 @@ def _make_df_eris_incore(cc, mo_coeff=None, fockao=None):
     mo = np.asarray(eris.mo_coeff)
     ijslice = (0, nocc, nocc, nmo)
     atmlst = getattr(cc, '_domain_atmlst', None)
-    Lov = lno_base.transform_df_to_mo(
+    Lov = lno_df.transform_df_to_mo(
         cc._scf, mo, ijslice, aosym='s2', mosym='s1', atmlst=atmlst
     )
 

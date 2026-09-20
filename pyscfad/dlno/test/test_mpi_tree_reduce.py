@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from pyscfad.dlno import dlno_base_mpi
+
+
 import argparse
 import os
 from pathlib import Path
@@ -20,7 +23,7 @@ from mpi4py import MPI
 import numpy as np
 import pytest
 
-from pyscfad.dlno import iao_mp2_mpi
+
 
 
 class _TypedCollectiveOnly:
@@ -48,7 +51,7 @@ def _run_world_driver():
     assert size == 2
 
     # Force the dense and complex leaves through multiple small chunks.
-    iao_mp2_mpi._TREE_REDUCE_CHUNK_BYTES = 16
+    dlno_base_mpi._TREE_REDUCE_CHUNK_BYTES = 16
     tree = {
         "dense": np.arange(12, dtype=np.float64).reshape(3, 4) + rank,
         "scalar": np.asarray(rank + 0.25, dtype=np.float64),
@@ -58,7 +61,7 @@ def _run_world_driver():
         "float0": np.zeros((3,), dtype=jax.dtypes.float0),
     }
 
-    result = iao_mp2_mpi._tree_sum_to_root(comm, tree, root=0)
+    result = dlno_base_mpi._tree_sum_to_root(comm, tree, root=0)
     assert comm.reduce_calls > 3
     if rank != 0:
         assert result is None

@@ -1,3 +1,7 @@
+from pyscfad.lno import _df_direct as lno_df_direct
+from pyscfad.lno import _df_outcore as lno_df_outcore
+from pyscfad.lno import df as lno_df
+from pyscfad.lno import tools as lno_tools
 import gc
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,7 +12,6 @@ import pytest
 
 from pyscfad import df, gto
 from pyscfad import numpy as np
-from pyscfad.lno import lno_base
 
 
 def _water_mol():
@@ -29,7 +32,7 @@ def _df_holder(mol, incore):
 
 
 def _local_coeff(mol, atmlst):
-    ao_idx = lno_base.dlno_util.ao_index_by_atom(mol, atmlst)
+    ao_idx = lno_tools.ao_index_by_atom(mol, atmlst)
     rng = numpy.random.default_rng(14)
     return np.asarray(rng.normal(size=(ao_idx.size, 5)))
 
@@ -41,12 +44,12 @@ def test_local_lov_outcore_is_blocked_and_matches_incore(monkeypatch):
     nocc = 2
 
     mf_incore = _df_holder(mol, incore=True)
-    lov_incore = lno_base.get_local_Lov(
+    lov_incore = lno_df.get_local_Lov(
         mf_incore, coeff, nocc, atmlst
     )
 
     mf_outcore = _df_holder(mol, incore=False)
-    entry = lno_base.get_local_df(mf_outcore, atmlst)
+    entry = lno_df.get_local_df(mf_outcore, atmlst)
     fake_mol, local_df, _ = entry
     assert local_df._has_outcore_cderi_placeholder()
     source = local_df._get_cderi_source()
@@ -54,16 +57,16 @@ def test_local_lov_outcore_is_blocked_and_matches_incore(monkeypatch):
     assert source_path.exists()
 
     # Force one auxiliary function per slab and record the actual transforms.
-    monkeypatch.setattr(lno_base, "_outcore_nr_e2_block_mb", lambda: 1e-6)
-    nr_e2 = lno_base._ao2mo.nr_e2
+    monkeypatch.setattr(lno_df_outcore, "_outcore_nr_e2_block_mb", lambda: 1e-6)
+    nr_e2 = lno_df._ao2mo.nr_e2
     slab_sizes = []
 
     def record_nr_e2(cderi, *args, **kwargs):
         slab_sizes.append(cderi.shape[0])
         return nr_e2(cderi, *args, **kwargs)
 
-    monkeypatch.setattr(lno_base._ao2mo, "nr_e2", record_nr_e2)
-    lov_outcore = lno_base.get_local_Lov(
+    monkeypatch.setattr(lno_df._ao2mo, "nr_e2", record_nr_e2)
+    lov_outcore = lno_df.get_local_Lov(
         mf_outcore, coeff, nocc, atmlst
     )
 
@@ -91,7 +94,7 @@ def test_local_lov_outcore_preserves_mo_coefficient_vjp():
     mf_outcore = _df_holder(mol, incore=False)
 
     def objective(mf, coeff_):
-        lov = lno_base.get_local_Lov(mf, coeff_, nocc, atmlst)
+        lov = lno_df.get_local_Lov(mf, coeff_, nocc, atmlst)
         return np.einsum("Lia,Lia->", lov, lov)
 
     value_incore, grad_incore = jax.value_and_grad(
@@ -115,17 +118,17 @@ def test_local_lov_outcore_preserves_mo_coefficient_vjp():
 def test_embed_local_coefficients_preserves_rows_and_rejects_invalid_pair_maps():
     coeff = numpy.arange(6., dtype=numpy.float64).reshape(3, 2)
     pairs = [0, 3, 5, 15, 17, 20]  # AO labels [0, 2, 5].
-    embedded = lno_base._embed_local_mo_coeff_from_pair_idx(coeff, pairs, 6)
+    embedded = lno_df_outcore._embed_local_mo_coeff_from_pair_idx(coeff, pairs, 6)
     numpy.testing.assert_array_equal(embedded[[0, 2, 5]], coeff)
     numpy.testing.assert_array_equal(embedded[[1, 3, 4]], 0.)
     numpy.testing.assert_array_equal(
-        lno_base._embed_local_mo_coeff_from_pair_idx(coeff, range(6), 3), coeff)
-    assert lno_base._embed_local_mo_coeff_from_pair_idx(
+        lno_df_outcore._embed_local_mo_coeff_from_pair_idx(coeff, range(6), 3), coeff)
+    assert lno_df_outcore._embed_local_mo_coeff_from_pair_idx(
         numpy.zeros((0, 2)), [], 6).shape == (6, 2)
     for bad in (pairs[:-1], [0, 4, 5, 15, 17, 20], [-1, 3, 5, 15, 17, 20],
                 [0, 3, 5, 15, 17, 21], [5, 3, 0, 17, 15, 20]):
         with pytest.raises(ValueError):
-            lno_base._embed_local_mo_coeff_from_pair_idx(coeff, bad, 6)
+            lno_df_outcore._embed_local_mo_coeff_from_pair_idx(coeff, bad, 6)
 
 
 def test_partial_global_df_preserves_overlap_projection_response(tmp_path, monkeypatch):
@@ -136,7 +139,7 @@ def test_partial_global_df_preserves_overlap_projection_response(tmp_path, monke
     mol = _water_mol()
     auxmol = addons.make_auxmol(mol, 'weigend')
     ao_idx = numpy.asarray([0, 1, 2, 3, 4, 6])  # O and the second H.
-    pairs = tuple(lno_base._global_pair_indices_for_local_ao(ao_idx, mol.nao))
+    pairs = tuple(lno_df_outcore._global_pair_indices_for_local_ao(ao_idx, mol.nao))
     rows, cols = numpy.tril_indices(mol.nao)
 
     def packed_cderi(m, a):
@@ -156,7 +159,7 @@ def test_partial_global_df_preserves_overlap_projection_response(tmp_path, monke
         holder = SimpleNamespace(mol=m, auxmol=a, max_memory=200,
             _get_cderi_source=lambda: source, _has_outcore_cderi_placeholder=lambda: True)
         mf = SimpleNamespace(mol=m, with_df=holder, get_ovlp=lambda: m.intor('int1e_ovlp'))
-        y = lno_base.transform_df_to_mo(mf, c, orbs_slice, atmlst=[0, 2])
+        y = lno_df.transform_df_to_mo(mf, c, orbs_slice, atmlst=[0, 2])
         return np.sum(y * cotangent)
 
     def reference(m, a, c):
@@ -172,7 +175,7 @@ def test_partial_global_df_preserves_overlap_projection_response(tmp_path, monke
     def reject_disk(*args, **kwargs):
         raise AssertionError('Projected partial domain should use the direct VJP')
 
-    monkeypatch.setattr(lno_base._cderi_vjp, 'nr_e2_cderi_bar_packed_disk', reject_disk)
+    monkeypatch.setattr(lno_df_direct._cderi_vjp, 'nr_e2_cderi_bar_packed_disk', reject_disk)
     value, grad = jax.value_and_grad(actual, argnums=(0, 1, 2))(mol, auxmol, coeff)
     numpy.testing.assert_allclose(value, expected, atol=1e-8, rtol=1e-8)
     for result, ref in zip(jax.tree_util.tree_leaves(grad), jax.tree_util.tree_leaves(expected_grad)):

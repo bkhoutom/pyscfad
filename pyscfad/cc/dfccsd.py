@@ -201,7 +201,7 @@ def _make_df_eris_incore(cc, mo_coeff=None):
         # JAX trace.  The custom_vjp's backward analytically propagates
         # mo_coeff_bar via streamed nr_e2 VJP and mol/auxmol_bar via the
         # chunked cholesky_eri VJP.
-        from pyscfad.lno.lno_base import _outcore_nr_e2
+        from pyscfad.lno._df_outcore import _outcore_nr_e2
         cderi_source = with_df._get_cderi_source()
         Lpq = _outcore_nr_e2(
             with_df.mol, with_df.auxmol, mo, cderi_source,

@@ -15,7 +15,7 @@ import numpy
 
 from pyscfad import config, gto, scf
 from pyscfad.dlno.ccsd import DLNOCCSD
-from pyscfad.dlno.iao_mp2 import IAOFragmentMP2Thresholds
+from pyscfad.dlno.domain import DLNOThresholds
 
 
 config.update("pyscfad_moleintor_opt", True)
@@ -39,7 +39,7 @@ def build_mf(mol_):
     return mf
 
 
-thresholds = IAOFragmentMP2Thresholds(pair_energy=1e-4)
+thresholds = DLNOThresholds(pair_energy=1e-4)
 energy, gradient = DLNOCCSD.value_and_grad(
     mol,
     build_mf=build_mf,

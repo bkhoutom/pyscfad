@@ -5,33 +5,11 @@ import jax.numpy as jnp
 import numpy
 
 from pyscfad.lno import ccsd as lnoccsd
-from pyscfad.lno import lno_base
 
 
 class _FakeEris:
     def __init__(self, ovov):
         self.ovov = ovov
-
-
-def test_active_space_screening_report(capsys):
-    fragment = {
-        "extended_primary_domain": numpy.asarray([0, 1]),
-        "occ_prescreen_coeff": numpy.zeros((5, 3)),
-    }
-    lno_base._print_active_space_screening(
-        "Fragment 1/2",
-        fragment,
-        2,
-        prescreen_nocc=8,
-        prescreen_nvir=20,
-        screened_nocc=6,
-        screened_nvir=14,
-    )
-    output = capsys.readouterr().out
-    assert "Fragment 1/2 active-space screening" in output
-    assert "Domain       : 2 atoms / 5 AOs; fragment LOs = 2" in output
-    assert "Prescreened  : 8 occ / 20 vir (28 MOs)" in output
-    assert "PNO-screened : 6 occ / 14 vir (20 MOs)" in output
 
 
 def test_projected_mp2_fragment_energy_matches_full_spin_term_and_fd():

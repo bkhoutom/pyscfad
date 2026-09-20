@@ -1,3 +1,4 @@
+from pyscfad.lno import _df_outcore as lno_df_outcore
 import os
 
 import h5py
@@ -483,7 +484,6 @@ def test_nr_e2_mo_coeff_vjp_from_local_cderi_source(tmp_path):
 
 
 def test_local_cderi_bar_disk_scatter_matches_pair_projection(tmp_path):
-    from pyscfad.lno import lno_base
 
     rng = numpy.random.default_rng(141)
     naux, global_nao, local_nao = 5, 6, 3
@@ -504,11 +504,11 @@ def test_local_cderi_bar_disk_scatter_matches_pair_projection(tmp_path):
         global_pair_count = global_nao * (global_nao + 1) // 2
         for p0 in range(0, global_pair_count, 4):
             p1 = min(p0 + 4, global_pair_count)
-            reference = lno_base._nr_e2_local_cderi_bar_block(
+            reference = lno_df_outcore._nr_e2_local_cderi_bar_block(
                 np.asarray(mo_coeff), np.asarray(ybar), orbs_slice,
                 pair_idx, p0, p1,
             )
-            result = lno_base._nr_e2_local_cderi_bar_disk_block(
+            result = lno_df_outcore._nr_e2_local_cderi_bar_disk_block(
                 dataset, pair_idx, p0, p1
             )
             assert numpy.allclose(result, reference, atol=1e-10, rtol=1e-10)
@@ -769,7 +769,6 @@ def test_int3c_mo_deriv_coords_vjp_oversized_shell_fallback_is_disjoint(
 
 
 def test_local_disk_cderi_bar_cholesky_vjp_matches_pairwise_path(tmp_path, monkeypatch):
-    from pyscfad.lno import lno_base
 
     rng = numpy.random.default_rng(151)
     mol = gto.Mole(
@@ -810,7 +809,7 @@ def test_local_disk_cderi_bar_cholesky_vjp_matches_pairwise_path(tmp_path, monke
     ybar = rng.normal(size=(auxmol.nao, nocc * nvir))
 
     def pairwise_block(p0, p1):
-        return lno_base._nr_e2_local_cderi_bar_block(
+        return lno_df_outcore._nr_e2_local_cderi_bar_block(
             np.asarray(mo_coeff), np.asarray(ybar), orbs_slice,
             pair_idx, p0, p1,
         )
@@ -829,7 +828,7 @@ def test_local_disk_cderi_bar_cholesky_vjp_matches_pairwise_path(tmp_path, monke
             mol,
             auxmol,
             str(cderi_file),
-            lambda p0, p1: lno_base._nr_e2_local_cderi_bar_disk_block(
+            lambda p0, p1: lno_df_outcore._nr_e2_local_cderi_bar_disk_block(
                 dataset, pair_idx, p0, p1
             ),
             1024,
@@ -864,7 +863,7 @@ def test_local_disk_cderi_bar_cholesky_vjp_matches_pairwise_path(tmp_path, monke
 
     monkeypatch.setattr(_cderi_vjp, 'nr_e2_cderi_bar_packed_disk', reject_disk)
     y, pullback = jax.vjp(
-        lambda m, a, c: lno_base._outcore_local_nr_e2_from_global_cderi(
+        lambda m, a, c: lno_df_outcore._outcore_local_nr_e2_from_global_cderi(
             m, a, c, str(cderi_file), 1024, orbs_slice, 's2', tuple(pair_idx)),
         mol, auxmol, coeff,
     )
@@ -877,7 +876,7 @@ def test_local_disk_cderi_bar_cholesky_vjp_matches_pairwise_path(tmp_path, monke
 
     # An empty MO slice has identically zero pullbacks and needs no DF work.
     _, empty_pullback = jax.vjp(
-        lambda m, a, c: lno_base._outcore_local_nr_e2_from_global_cderi(
+        lambda m, a, c: lno_df_outcore._outcore_local_nr_e2_from_global_cderi(
             m, a, c, str(cderi_file), 1024, (0, 0, 1, 3), 's2', tuple(pair_idx)),
         mol, auxmol, coeff,
     )

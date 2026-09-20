@@ -1,16 +1,12 @@
+from pyscfad.dlno import fragment_mp2
+
 import numpy as np
 import pytest
 import jax
 import jax.numpy as jnp
 
-import pyscfad.dlno.fragment_mp2 as fragment_mp2_module
-from pyscfad.dlno.fragment_mp2 import (
-    build_fragment_occupied_data,
-    fragment_pair_energy_from_lov,
-    fragment_pair_energy_from_lov_jax,
-    fragment_pair_energy_from_ovov,
-    partition_fragment_pair_energies,
-)
+
+from pyscfad.dlno.fragment_mp2 import build_fragment_occupied_data, fragment_pair_energy_from_lov, fragment_pair_energy_from_lov_jax, fragment_pair_energy_from_ovov, partition_fragment_pair_energies
 
 
 def test_jax_blocked_lov_energy_and_directional_derivative():
@@ -565,7 +561,7 @@ def test_blocked_lov_kernel_builds_only_upper_triangle_df_blocks(monkeypatch):
     e_occ = -np.linspace(1.5, 0.5, nocc)
     e_vir = np.linspace(0.1, 1.0, nvir)
 
-    real_einsum = fragment_mp2_module.np.einsum
+    real_einsum = fragment_mp2.numpy.einsum
     auxiliary_contractions = []
 
     def counted_einsum(subscripts, *operands, **kwargs):
@@ -573,7 +569,7 @@ def test_blocked_lov_kernel_builds_only_upper_triangle_df_blocks(monkeypatch):
             auxiliary_contractions.append(subscripts)
         return real_einsum(subscripts, *operands, **kwargs)
 
-    monkeypatch.setattr(fragment_mp2_module.np, "einsum", counted_einsum)
+    monkeypatch.setattr(fragment_mp2.numpy, "einsum", counted_einsum)
     fragment_pair_energy_from_lov(
         lov, e_occ, e_vir, left, right, block_nvir=3
     )
@@ -595,7 +591,7 @@ def test_stacked_weights_avoid_all_at_once_scaling_eight_contractions(
     e_occ = -np.linspace(1.5, 0.5, nocc)
     e_vir = np.linspace(0.1, 1.0, nvir)
 
-    real_einsum = fragment_mp2_module.np.einsum
+    real_einsum = fragment_mp2.numpy.einsum
     ovov = real_einsum("Lia,Ljb->iajb", lov, lov)
     dense = fragment_pair_energy_from_ovov(
         ovov, e_occ, e_vir, left, right
@@ -609,7 +605,7 @@ def test_stacked_weights_avoid_all_at_once_scaling_eight_contractions(
         contractions.append(subscripts)
         return real_einsum(subscripts, *operands, **kwargs)
 
-    monkeypatch.setattr(fragment_mp2_module.np, "einsum", recorded_einsum)
+    monkeypatch.setattr(fragment_mp2.numpy, "einsum", recorded_einsum)
     blocked = fragment_pair_energy_from_lov(
         lov, e_occ, e_vir, left, right, block_nvir=2
     )

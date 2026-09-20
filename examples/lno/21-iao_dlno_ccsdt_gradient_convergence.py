@@ -77,16 +77,11 @@ import pyscf
 from pyscfad import config, df, gto, scf
 from pyscfad.cc import dfccsd
 from pyscfad.dlno.ccsd import DLNOCCSD
-from pyscfad.dlno.iao_lis import build_iao_lis_static_selections
-from pyscfad.dlno.iao_mp2 import (
-    IAOFragmentMP2,
-    IAOFragmentMP2Thresholds,
-    build_iao_fragment_topology,
-)
-from pyscfad.dlno.iao_mp2_grad import (
-    build_iao_mp2_static_selections,
-    rebuild_iao_mp2_common,
-)
+from pyscfad.dlno.lis import build_lis_selections
+from pyscfad.dlno.mp2 import DLNOMP2
+from pyscfad.dlno.domain import DLNOThresholds, build_domain_topology
+from pyscfad.dlno._selection import build_domain_selections
+from pyscfad.dlno.dlno_base import rebuild_domain_data
 from pyscfad.mp import dfmp2
 from pyscfad.ops import stop_trace
 
@@ -293,7 +288,7 @@ def select_pair_cutoff(rows, target_mha):
 
 
 def _thresholds(args, pair_cutoff):
-    return IAOFragmentMP2Thresholds(
+    return DLNOThresholds(
         bp_occ=args.bp_occ,
         bp_primary=args.bp_primary,
         bp_ed=args.bp_ed,
@@ -756,7 +751,7 @@ def _load_mpi_pair_results(prefix, args, signature):
     # Example 20 uses the production dataclass defaults for every domain
     # threshold except pair_energy and block memory.  Reject a silent mixture
     # if this CC run has customized any of those topology controls.
-    source_defaults = asdict(IAOFragmentMP2Thresholds())
+    source_defaults = asdict(DLNOThresholds())
     requested = asdict(_thresholds(args, 0.0))
     ignored = {"pair_energy", "mp2_block_memory_mb"}
     for key in source_defaults.keys() - ignored:
@@ -1213,20 +1208,20 @@ def main(argv=None):
 
             def build_static(mf_):
                 start = time.perf_counter()
-                topology = build_iao_fragment_topology(
+                topology = build_domain_topology(
                     mf_, frozen=args.frozen, thresholds=thresholds,
                     pair_energy_model=args.pair_model,
                 )
                 selection_timing["topology"] = time.perf_counter() - start
                 start = time.perf_counter()
-                static_ = build_iao_mp2_static_selections(mf_, topology)
+                static_ = build_domain_selections(mf_, topology)
                 selection_timing["static"] = time.perf_counter() - start
                 return static_
 
             static = stop_trace(build_static)(eager_mf)
             statistics = _domain_statistics(static)
             start = time.perf_counter()
-            energy, mol_bar = IAOFragmentMP2.value_and_grad(
+            energy, mol_bar = DLNOMP2.value_and_grad(
                 mol,
                 build_mf=build_mf,
                 frozen=args.frozen,
@@ -1306,15 +1301,15 @@ def main(argv=None):
 
             def build_cc_static(mf_):
                 start = time.perf_counter()
-                topology = build_iao_fragment_topology(
+                topology = build_domain_topology(
                     mf_, frozen=args.frozen, thresholds=thresholds,
                     pair_energy_model=args.pair_model,
                 )
                 selection_timing["topology"] = time.perf_counter() - start
                 start = time.perf_counter()
-                mp2_static = build_iao_mp2_static_selections(mf_, topology)
-                common = rebuild_iao_mp2_common(mf_, mp2_static)
-                static_ = build_iao_lis_static_selections(
+                mp2_static = build_domain_selections(mf_, topology)
+                common = rebuild_domain_data(mf_, mp2_static)
+                static_ = build_lis_selections(
                     mf_, mp2_static, common=common,
                     thresh_occ=occ_threshold,
                     thresh_vir=vir_threshold,

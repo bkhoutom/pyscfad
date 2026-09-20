@@ -12,7 +12,7 @@ import pytest
 from pyscfad import config_update, df, gto, scf
 from pyscfad.cc import dfccsd
 from pyscfad.dlno.ccsd import DLNOCCSD
-from pyscfad.dlno.iao_mp2 import IAOFragmentMP2Thresholds
+from pyscfad.dlno.domain import DLNOThresholds
 from pyscfad.lno import ccsd as lno_ccsd
 from pyscfad.lno import ccsd_t
 
@@ -416,7 +416,7 @@ def test_factor_direct_outcore_water_dlno_gradient_high_cost(
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError('LNO triples constructed global vvop')),
     )
-    thresholds = IAOFragmentMP2Thresholds(
+    thresholds = DLNOThresholds(
         pao_norm=1e-10,
         domain_pao=0.0,
         ed_pao=0.0,

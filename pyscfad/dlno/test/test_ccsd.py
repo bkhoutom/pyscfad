@@ -5,6 +5,9 @@ two important limits for the CC driver: a compact all-strong graph and a
 separated graph with two strong self domains plus one unordered weak pair.
 """
 
+from pyscfad.dlno import ccsd
+
+
 import inspect
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,30 +20,15 @@ import pytest
 from pyscfad import config_update, gto, scf
 from pyscfad.cc import dfccsd
 from pyscfad.dlno.ccsd import DLNOCCSD
-from pyscfad.dlno import iao_ccsd as iao_ccsd_module
+
 from pyscfad.dlno import _restart as restart_module
-from pyscfad.dlno.iao_ccsd import (
-    _assemble_iao_dlno_correlation,
-    _fragment_value_and_grad,
-    build_iao_dlno_ccsd_static_selections,
-)
-from pyscfad.dlno.iao_mp2 import (
-    IAOFragmentMP2Thresholds,
-    build_iao_fragment_topology,
-    evaluate_iao_fragment_mp2,
-)
-from pyscfad.dlno.iao_mp2_grad import (
-    build_iao_mp2_static_selections,
-    build_strong_ed_domain,
-    correlation_energy,
-    rebuild_iao_mp2_common,
-)
-from pyscfad.dlno.iao_lis import (
-    IAOFragmentLISStaticSelections,
-    build_fragment_lis,
-    build_iao_lis_static_selections,
-    strong_domain_prescreen,
-)
+from pyscfad.dlno.ccsd import _assemble_correlation_energy, _fragment_value_and_grad, build_static_selections
+from pyscfad.dlno.domain import DLNOThresholds, build_domain_topology
+from pyscfad.dlno.mp2 import evaluate_domain_mp2
+from pyscfad.dlno._selection import build_domain_selections
+from pyscfad.dlno.dlno_base import build_strong_ed_domain, rebuild_domain_data
+from pyscfad.dlno.mp2 import correlation_energy
+from pyscfad.dlno.lis import LISSelections, build_fragment_lis, build_lis_selections
 from pyscf import lib as pyscf_lib
 from pyscfad.lno.ccsd import RCCSD as ImpurityRCCSD
 from pyscfad.lno.ccsd import mp2_fragment_energy
@@ -55,7 +43,7 @@ def test_correction_bookkeeping_and_cotangent_seeds_are_unique():
     e_mp2_lis = jnp.asarray([-0.22, -0.18, -0.14])
     e_iao_mp2 = jnp.asarray(-0.61)
 
-    value = _assemble_iao_dlno_correlation(
+    value = _assemble_correlation_energy(
         e_cc, e_t, e_mp2_lis, e_iao_mp2
     )
     expected = (
@@ -67,7 +55,7 @@ def test_correction_bookkeeping_and_cotangent_seeds_are_unique():
     np.testing.assert_allclose(value, expected, atol=0.0, rtol=0.0)
 
     gradients = jax.grad(
-        _assemble_iao_dlno_correlation,
+        _assemble_correlation_energy,
         argnums=(0, 1, 2, 3),
     )(e_cc, e_t, e_mp2_lis, e_iao_mp2)
     np.testing.assert_array_equal(gradients[0], np.ones(3))
@@ -117,7 +105,7 @@ def test_fragment_forward_restart_replays_lazy_triples_pullback(monkeypatch):
         )
         return (e_mp2, e_ccsd, e_t), lis
 
-    monkeypatch.setattr(iao_ccsd_module, "_solve_fragment", fake_solve)
+    monkeypatch.setattr(ccsd, '_solve_fragment', fake_solve)
     static = SimpleNamespace(
         mp2_static=SimpleNamespace(
             fragments=(SimpleNamespace(extended_atoms=np.asarray([0])),)
@@ -214,7 +202,7 @@ def test_fragment_workspace_spans_forward_and_pullback_and_cleans_up(
         )
         return values, lis
 
-    monkeypatch.setattr(iao_ccsd_module, "_solve_fragment", fake_solve)
+    monkeypatch.setattr(ccsd, '_solve_fragment', fake_solve)
     static = SimpleNamespace(
         mp2_static=SimpleNamespace(
             fragments=(SimpleNamespace(extended_atoms=np.asarray([0])),)
@@ -257,7 +245,7 @@ def test_energy_only_kernel_gives_each_fragment_a_forward_workspace(
         SimpleNamespace(extended_atoms=np.asarray([index]))
         for index in range(2)
     )
-    static = IAOFragmentLISStaticSelections(
+    static = LISSelections(
         mp2_static=SimpleNamespace(fragments=mp2_fragments),
         thresh_occ=1e-4,
         thresh_vir=1e-5,
@@ -291,16 +279,16 @@ def test_energy_only_kernel_gives_each_fragment_a_forward_workspace(
         return (value, 2.0 * value, jnp.zeros_like(value)), lis
 
     monkeypatch.setattr(
-        iao_ccsd_module, "rebuild_iao_mp2_common", lambda *_args: common
+        ccsd, 'rebuild_domain_data', lambda *_args: common
     )
-    monkeypatch.setattr(iao_ccsd_module, "_solve_fragment", fake_solve)
+    monkeypatch.setattr(ccsd, '_solve_fragment', fake_solve)
     monkeypatch.setattr(
-        iao_ccsd_module,
-        "iao_mp2_correlation_energy",
+        ccsd,
+        'mp2_correlation_energy',
         lambda *_args: jnp.asarray(-0.25),
     )
 
-    result = iao_ccsd_module.kernel(
+    result = ccsd.kernel(
         SimpleNamespace(e_tot=jnp.asarray(-10.0)),
         static_selections=static,
     )
@@ -423,7 +411,7 @@ def test_serial_cc_restart_after_fragment_and_from_pre_scf_high_cost(
         raise AssertionError("pre-SCF restart rebuilt the common orbitals")
 
     monkeypatch.setattr(
-        iao_ccsd_module, "rebuild_iao_mp2_common", forbidden_common
+        ccsd, 'rebuild_domain_data', forbidden_common
     )
     messages.clear()
     final_energy, final_bar = DLNOCCSD.value_and_grad(
@@ -582,15 +570,15 @@ def _build_local_problem(*, separated, thresholds=None,
     mol = _water_dimer(separated=separated)
     mf = _build_mf(mol)
     if thresholds is None:
-        thresholds = IAOFragmentMP2Thresholds(pair_energy=1e-4)
-    topology = build_iao_fragment_topology(
+        thresholds = DLNOThresholds(pair_energy=1e-4)
+    topology = build_domain_topology(
         mf,
         thresholds=thresholds,
         pair_energy_model=pair_energy_model,
         force_full_domains=force_full_domains,
     )
-    static = build_iao_mp2_static_selections(mf, topology)
-    common = rebuild_iao_mp2_common(mf, static)
+    static = build_domain_selections(mf, topology)
+    common = rebuild_domain_data(mf, static)
     return mol, mf, topology, static, common
 
 
@@ -639,36 +627,28 @@ def test_compact_and_far_water_define_expected_iao_strong_domains(
         assert domain.virtual_coeff.shape == (nao_domain, nvir_domain)
         assert domain.target_projection.shape[1] == nocc_domain
 
-        prescreen = strong_domain_prescreen(
-            common, static, fragment_index, domain=domain
+        target = common.fragment_occupied_data[fragment_index].iao_coeff
+        expected_projection = (
+            target.T @ common.s1e[:, fragment.extended_ao_indices]
+            @ domain.occupied_coeff
         )
-        np.testing.assert_array_equal(
-            prescreen["extended_primary_domain"], atoms
-        )
-        np.testing.assert_allclose(
-            prescreen["occ_prescreen_coeff"], domain.occupied_coeff,
-            atol=0.0, rtol=0.0,
-        )
-        np.testing.assert_allclose(
-            prescreen["vir_prescreen_coeff"], domain.virtual_coeff,
-            atol=0.0, rtol=0.0,
-        )
-        np.testing.assert_allclose(
-            prescreen["orbfragloc"],
-            common.iao_coeff[:, static.frag_lolist[fragment_index]],
-            atol=0.0, rtol=0.0,
-        )
-        expected_strong_iao = np.unique(np.concatenate([
-            static.frag_lolist[int(partner)]
+        np.testing.assert_allclose(domain.target_projection, expected_projection,
+                                   atol=2e-12, rtol=0.0)
+        partner_targets = np.concatenate([
+            np.asarray(common.fragment_occupied_data[int(partner)].iao_coeff)
             for partner in fragment.strong_fragments
-        ]))
-        np.testing.assert_array_equal(
-            prescreen["strong_lmo_indices"], expected_strong_iao
+        ], axis=1)
+        partner_projection = (
+            partner_targets.T @ np.asarray(common.s1e)[:, fragment.extended_ao_indices]
+            @ np.asarray(domain.occupied_coeff)
         )
+        np.testing.assert_allclose(domain.partner_weight,
+                                   partner_projection.T @ partner_projection,
+                                   atol=2e-12, rtol=0.0)
 
 
 def _full_domain_thresholds():
-    return IAOFragmentMP2Thresholds(
+    return DLNOThresholds(
         pao_norm=1e-10,
         domain_pao=0.0,
         ed_pao=0.0,
@@ -694,7 +674,7 @@ def test_far_water_pt2_is_strong_energy_plus_one_weak_pair():
     _, mf, topology, static, _ = _build_local_problem(separated=True)
     assert np.count_nonzero(np.triu(~static.strong_mask, k=1)) == 1
 
-    result = evaluate_iao_fragment_mp2(mf, topology)
+    result = evaluate_domain_mp2(mf, topology)
     assert result.e_weak_multipole_os != 0.0
     assert result.e_corr == pytest.approx(
         result.e_strong + result.e_weak_multipole_os,
@@ -706,13 +686,13 @@ def test_far_water_pt2_is_strong_energy_plus_one_weak_pair():
     # sub-microhartree accuracy of canonical DF-MP2.
     assert abs(result.e_corr - canonical) < 1e-6
 
-    tight_topology = build_iao_fragment_topology(
+    tight_topology = build_domain_topology(
         mf,
         thresholds=_full_domain_thresholds(),
         pair_energy_model="all",
         force_full_domains=True,
     )
-    tight = evaluate_iao_fragment_mp2(mf, tight_topology)
+    tight = evaluate_domain_mp2(mf, tight_topology)
     assert tight.e_weak_multipole_os == 0.0
     np.testing.assert_allclose(tight.e_corr, canonical, atol=2e-9, rtol=0.0)
 
@@ -721,7 +701,7 @@ def test_far_water_lis_rejects_distant_iao_projection_tails(tmp_path):
     """Tiny cross-monomer IAO projections must not become internal orbitals."""
 
     _, mf, _, mp2_static, common = _build_local_problem(separated=True)
-    lis_static = build_iao_lis_static_selections(
+    lis_static = build_lis_selections(
         mf,
         mp2_static,
         common=common,
@@ -753,7 +733,7 @@ def test_full_domain_iao_pt2_exactly_cancels_lis_mp2_sum(tmp_path):
         pair_energy_model="all",
         force_full_domains=True,
     )
-    lis_static = build_iao_lis_static_selections(
+    lis_static = build_lis_selections(
         mf,
         mp2_static,
         common=common,
@@ -950,8 +930,8 @@ def test_far_water_mixed_strong_weak_gradient_smoke_high_cost():
 
     mol = _water_dimer(separated=True)
     mf = _build_mf(mol)
-    thresholds = IAOFragmentMP2Thresholds(pair_energy=1e-4)
-    static = build_iao_dlno_ccsd_static_selections(
+    thresholds = DLNOThresholds(pair_energy=1e-4)
+    static = build_static_selections(
         mf,
         thresholds=thresholds,
         pair_energy_model="multipole",

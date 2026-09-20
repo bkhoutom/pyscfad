@@ -45,8 +45,8 @@ import numpy
 from mpi4py import MPI
 
 from pyscfad import config, gto, scf
-from pyscfad.dlno.iao_mp2 import IAOFragmentMP2Thresholds
-from pyscfad.dlno.iao_mp2_mpi import IAOFragmentMP2
+from pyscfad.dlno.domain import DLNOThresholds
+from pyscfad.dlno.mp2_mpi import DLNOMP2
 
 
 def _parser():
@@ -139,10 +139,10 @@ def main(argv=None):
                 mf.converged = True
             return mf
 
-        thresholds = IAOFragmentMP2Thresholds(
+        thresholds = DLNOThresholds(
             pair_energy=args.pair_threshold
         )
-        energy, mol_bar = IAOFragmentMP2.value_and_grad(
+        energy, mol_bar = DLNOMP2.value_and_grad(
             mol,
             build_mf=build_mf,
             frozen=args.frozen,

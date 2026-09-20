@@ -6,7 +6,7 @@ Run:
 import numpy
 from pyscfad import config, gto, scf
 from pyscfad.dlno.ccsd import DLNOCCSD
-from pyscfad.dlno.iao_mp2 import IAOFragmentMP2Thresholds
+from pyscfad.dlno.domain import DLNOThresholds
 
 config.update('pyscfad_moleintor_opt', True)
 config.update('pyscfad_scf_implicit_diff', True)
@@ -40,7 +40,7 @@ e_dlno, jac_dlno = DLNOCCSD.value_and_grad(
     mol,
     build_mf=build_mf,
     ccsd_t=True,
-    thresholds=IAOFragmentMP2Thresholds(
+    thresholds=DLNOThresholds(
         domain_pao=thr,
         pair_energy=thr,
     ),

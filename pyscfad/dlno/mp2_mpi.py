@@ -28,6 +28,7 @@ import numpy
 from pyscfad import config_update
 from pyscfad.df.mpi_df_jk import MPIDFJKExecutor, ServiceExit
 from pyscfad.ops import stop_trace
+from pyscfad.tools import resource_profile
 
 from ._restart import RestartManager
 from ._selection import DomainSelections
@@ -209,6 +210,7 @@ def correlation_value_and_grad(
             closed.trees["mf_bar"] if rank == root else None
         )
 
+    profile_total = resource_profile.start()
     if rank == root:
         if not isinstance(static, DomainSelections):
             raise TypeError(
@@ -219,11 +221,18 @@ def correlation_value_and_grad(
             "common IAO/PAO orbital build: starting",
         )
         common_start = time.perf_counter() if collect_timing else None
+        profile_common_forward = resource_profile.start()
         common, common_pullback = jax.vjp(
             lambda mf_: rebuild_domain_data(mf_, static), mf
         )
-        if collect_timing:
+        if collect_timing or profile_common_forward is not None:
             jax.block_until_ready(common)
+        resource_profile.finish(
+            "dlno.mp2_mpi.correlation.common_forward",
+            profile_common_forward,
+            n_fragments=len(static.fragments),
+        )
+        if collect_timing:
             common_forward_seconds = time.perf_counter() - common_start
             _report_progress(
                 reporter,
@@ -292,6 +301,7 @@ def correlation_value_and_grad(
                     continue
                 spec = work[work_index]
                 kind, left, right = spec
+                profile_frame_build = resource_profile.start()
                 frame_start = (
                     time.perf_counter() if collect_timing else None
                 )
@@ -323,6 +333,17 @@ def correlation_value_and_grad(
                 del pullback
                 frame_host = jax.tree_util.tree_map(_to_host_leaf, frame)
                 frame_digest = _array_tree_digest(frame)
+                resource_profile.finish(
+                    "dlno.mp2_mpi.correlation.frame_build",
+                    profile_frame_build,
+                    batch_index=batch_index,
+                    term_index=work_index,
+                    kind=kind,
+                    left_fragment=left,
+                    right_fragment=(
+                        None if int(right) == -1 else right
+                    ),
+                )
                 if collect_timing:
                     frame_build_seconds = (
                         time.perf_counter() - frame_start
@@ -369,6 +390,8 @@ def correlation_value_and_grad(
                 )
             del frame_host, frame_digest
             kind, left, right = spec
+            work_index = batch_index * nproc + rank
+            profile_term_forward = resource_profile.start()
             forward_start = (
                 time.perf_counter() if collect_timing else None
             )
@@ -397,10 +420,21 @@ def correlation_value_and_grad(
                     term, mf, frame[0], frame[1]
                 )
 
-            if collect_timing:
+            if collect_timing or profile_term_forward is not None:
                 jax.block_until_ready(term_energy)
+            resource_profile.finish(
+                "dlno.mp2_mpi.correlation.term_forward",
+                profile_term_forward,
+                batch_index=batch_index,
+                term_index=work_index,
+                kind=kind,
+                left_fragment=left,
+                right_fragment=None if int(right) == -1 else right,
+            )
+            if collect_timing:
                 forward_seconds = time.perf_counter() - forward_start
                 reverse_start = time.perf_counter()
+            profile_term_reverse = resource_profile.start()
             if kind == "strong":
                 term_mf_bar, frame_bar = pullback(
                     np.ones((), dtype=term_energy.dtype)
@@ -421,6 +455,15 @@ def correlation_value_and_grad(
             jax.block_until_ready((local_energy, mf_bar, frame_bar))
             frame_bar_host = jax.tree_util.tree_map(
                 _to_host_leaf, frame_bar
+            )
+            resource_profile.finish(
+                "dlno.mp2_mpi.correlation.term_reverse",
+                profile_term_reverse,
+                batch_index=batch_index,
+                term_index=work_index,
+                kind=kind,
+                left_fragment=left,
+                right_fragment=None if int(right) == -1 else right,
             )
             if collect_timing:
                 reverse_seconds = time.perf_counter() - reverse_start
@@ -472,6 +515,7 @@ def correlation_value_and_grad(
                     _to_device_leaf, result[1]
                 )
                 kind, left, right = spec
+                profile_frame_replay = resource_profile.start()
                 replay_start = (
                     time.perf_counter() if collect_timing else None
                 )
@@ -534,8 +578,20 @@ def correlation_value_and_grad(
                     common_bar_root,
                     term_common_bar,
                 )
-                if collect_timing:
+                if collect_timing or profile_frame_replay is not None:
                     jax.block_until_ready(common_bar_root)
+                resource_profile.finish(
+                    "dlno.mp2_mpi.correlation.frame_replay",
+                    profile_frame_replay,
+                    batch_index=batch_index,
+                    term_index=batch_index * nproc + slot,
+                    kind=kind,
+                    left_fragment=left,
+                    right_fragment=(
+                        None if int(right) == -1 else right
+                    ),
+                )
+                if collect_timing:
                     frame_replay_seconds = (
                         time.perf_counter() - replay_start
                     )
@@ -616,6 +672,7 @@ def correlation_value_and_grad(
     common_reverse_seconds = 0.0
     if rank == root:
         _report_progress(reporter, "common-orbital pullback: starting")
+        profile_common_reverse = resource_profile.start()
         common_reverse_start = (
             time.perf_counter() if collect_timing else None
         )
@@ -624,6 +681,11 @@ def correlation_value_and_grad(
             _add_cotangent, mf_bar_root, common_mf_bar
         )
         jax.block_until_ready(mf_bar_root)
+        resource_profile.finish(
+            "dlno.mp2_mpi.correlation.common_reverse",
+            profile_common_reverse,
+            n_fragments=len(static.fragments),
+        )
         if collect_timing:
             common_reverse_seconds = (
                 time.perf_counter() - common_reverse_start
@@ -704,6 +766,14 @@ def correlation_value_and_grad(
                 "root MPI correlation checkpoint write"
             )
     _raise_if_root_failed(comm, checkpoint_error, root=root)
+
+    resource_profile.finish(
+        "dlno.mp2_mpi.correlation.total",
+        profile_total,
+        n_strong_terms=nstrong_terms,
+        n_weak_terms=nweak_terms,
+        n_batches=nbatch,
+    )
 
     if return_details:
         if collect_timing:
@@ -893,6 +963,7 @@ class DLNOMP2(_SerialDLNOMP2):
                     reporter, f"{scf_label} SCF and VJP setup: starting"
                 )
                 scf_start = time.perf_counter()
+                profile_scf_forward = resource_profile.start()
                 with (
                     config_update("pyscfad_scf_implicit_diff", True),
                     config_update("pyscfad_scf_first_order_custom", False),
@@ -904,6 +975,11 @@ class DLNOMP2(_SerialDLNOMP2):
                     else:
                         mf, scf_pullback = jax.vjp(scf_builder, mol)
                         jax.block_until_ready(mf.e_tot)
+                resource_profile.finish(
+                    "dlno.mp2_mpi.scf_forward",
+                    profile_scf_forward,
+                    parallel_scf_jk=parallel_scf_jk,
+                )
             except Exception:
                 if scf_executor is not None:
                     scf_executor.stop_workers()
@@ -962,6 +1038,7 @@ class DLNOMP2(_SerialDLNOMP2):
                         frozen=frozen,
                     )
                 topology_start = time.perf_counter()
+                profile_topology = resource_profile.start()
                 _report_progress(
                     reporter, "fixed IAO fragment topology: starting"
                 )
@@ -1052,6 +1129,14 @@ class DLNOMP2(_SerialDLNOMP2):
                     f"fragments={len(fixed_topology.fragments)}, "
                     f"strong/weak pairs={nstrong_pairs}/{nweak_terms}, "
                     f"correlation terms={len(term_specs)}",
+                )
+                resource_profile.finish(
+                    "dlno.mp2_mpi.topology",
+                    profile_topology,
+                    lo_type=lo_type,
+                    n_fragments=len(fixed_topology.fragments),
+                    n_strong_pairs=nstrong_pairs,
+                    n_weak_terms=nweak_terms,
                 )
             except Exception:  # pragma: no cover - multi-rank failure path
                 topology_error = _exception_text(
@@ -1275,6 +1360,7 @@ class DLNOMP2(_SerialDLNOMP2):
             raise RuntimeError(response_setup_error)
 
         response_error = None
+        profile_scf_response = resource_profile.start()
         if rank == root:
             try:
                 if parallel_scf_jk:
@@ -1312,6 +1398,12 @@ class DLNOMP2(_SerialDLNOMP2):
                     f"implicit SCF response worker rank {rank}"
                 )
         _raise_if_any_rank_failed(comm, response_error)
+        resource_profile.finish(
+            "dlno.mp2_mpi.scf_response",
+            profile_scf_response,
+            role="root" if rank == root else "worker",
+            parallel_scf_jk=parallel_scf_jk,
+        )
         if return_details:
             return energy, mol_bar, corr_result[2]
         return energy, mol_bar

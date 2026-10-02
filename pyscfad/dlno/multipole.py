@@ -511,13 +511,13 @@ def _multipole_pair_energy(left, right, order):
         RR = jnp.outer(R_bar, R_bar)
         tmp1_ai = RR.ravel() @ theta_ai.reshape(9, -1)
         tmp1_bj = RR.ravel() @ theta_bj.reshape(9, -1)
-        aibj_3 = jnp.outer(tmp1_ai, tmp_bj * 5)
-        aibj_3 -= jnp.outer(tmp_ai, tmp1_bj * 5)
+        aibj_3 = jnp.outer(tmp_ai, tmp1_bj * 5)
+        aibj_3 -= jnp.outer(tmp1_ai, tmp_bj * 5)
 
         mu_R_ai = einsum('xa,y->xya', mu_ai, R_bar).reshape(9, -1)
         mu_R_bj = einsum('xb,y->xyb', mu_bj, R_bar).reshape(9, -1)
-        aibj_3 += (2 * mu_R_ai.T) @ theta_bj.reshape(9, -1)
-        aibj_3 -= theta_ai.reshape(9, -1).T @ (mu_R_bj * 2)
+        aibj_3 -= (2 * mu_R_ai.T) @ theta_bj.reshape(9, -1)
+        aibj_3 += theta_ai.reshape(9, -1).T @ (mu_R_bj * 2)
         aibj_3 /= R**4
         aibj += aibj_3
 
@@ -544,7 +544,7 @@ def _multipole_pair_energy(left, right, order):
         aibj += aibj_4
 
     aibj2 = aibj * aibj / (e_ai[:, None] + e_bj[None, :])
-    return -8 * jnp.sum(aibj2)
+    return -4 * jnp.sum(aibj2)
 
 
 def pair_energy_multipole(
@@ -556,7 +556,7 @@ def pair_energy_multipole(
         atmlst=None,
         order=4,
     ):
-    """Multipole approximation to the OS-MP2 pair energy.
+    """Multipole approximation to the MP2 pair energy.
     """
     nocc = len(e_occ)
     if atmlst is None:
@@ -589,7 +589,7 @@ def pair_energy_multipole_cross(
         atmlst_right=None,
         order=4,
     ):
-    """Multipole OS-MP2 energies for every left-right orbital pair.
+    """Multipole MP2 energies for every left-right orbital pair.
 
     Unlike :func:`pair_energy_multipole`, this routine never forms pairs
     within either input set.  Callers can therefore pass two distinct

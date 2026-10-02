@@ -126,7 +126,7 @@ def multipole_orbital_data(
 
 
 def multipole_pair_energy(left, right, order=4):
-    """Contract records using Nagy's ``-8`` OS pair-increment convention."""
+    """Contract precomputed multipoles for one orbital pair."""
     if order not in (2, 3, 4):
         raise ValueError("multipole order must be 2, 3, or 4")
 
@@ -159,8 +159,8 @@ def multipole_pair_energy(left, right, order=4):
 
         tmp1_ai = RR.ravel() @ theta_ai_flat
         tmp1_bj = RR.ravel() @ theta_bj_flat
-        aibj_3 = np.outer(tmp1_ai, tmp_bj * 5.0)
-        aibj_3 -= np.outer(tmp_ai, tmp1_bj * 5.0)
+        aibj_3 = np.outer(tmp_ai, tmp1_bj * 5.0)
+        aibj_3 -= np.outer(tmp1_ai, tmp_bj * 5.0)
 
         mu_R_ai = (
             mu_ai[:, None, :] * direction[None, :, None]
@@ -168,8 +168,8 @@ def multipole_pair_energy(left, right, order=4):
         mu_R_bj = (
             mu_bj[:, None, :] * direction[None, :, None]
         ).reshape(9, -1)
-        aibj_3 += (2.0 * mu_R_ai.T) @ theta_bj_flat
-        aibj_3 -= theta_ai_flat.T @ (mu_R_bj * 2.0)
+        aibj_3 -= (2.0 * mu_R_ai.T) @ theta_bj_flat
+        aibj_3 += theta_ai_flat.T @ (mu_R_bj * 2.0)
         aibj_3 /= distance**4
         aibj = aibj + aibj_3
 
@@ -209,7 +209,7 @@ def multipole_pair_energy(left, right, order=4):
         aibj = aibj + aibj_4
 
     denominator = e_ai[:, None] + e_bj[None, :]
-    return float(np.real(-8.0 * np.sum(aibj * aibj / denominator)))
+    return float(np.real(-4.0 * np.sum(aibj * aibj / denominator)))
 
 
 def multipole_pair_energy_cross(left_data, right_data, order=4):

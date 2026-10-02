@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from pyscf import gto
 
 from pyscfad.dlno.multipole import (
@@ -138,3 +139,43 @@ def test_pair_energy_multipole_groups_heterogeneous_virtual_shapes():
     assert np.all(np.isfinite(np.asarray(result)))
     np.testing.assert_allclose(result, reference, rtol=1e-12, atol=1e-12)
 
+
+@pytest.mark.parametrize("order", [2, 3, 4])
+@pytest.mark.parametrize("implementation", ["numpy", "jax"])
+def test_multipole_matches_native_for_asymmetric_orbitals(order, implementation):
+    native_mp2 = pytest.importorskip("dlno.mp2")
+    mol, e_occ, occupied, e_vir, virtual = _four_distinct_orbitals()
+    atmlst = [[index] for index in range(len(e_occ))]
+
+    # Mix even and odd local AOs so the dipole-quadrupole contribution and
+    # its interference with the dipole term are nonzero.
+    for index, (p0, p1) in enumerate(mol.aoslice_by_atom()[:, 2:]):
+        angle = 0.37 + 0.16 * index
+        occupied[index][p0 + 1] = np.cos(angle)
+        occupied[index][p0 + 2] = np.sin(angle)
+        virtual[index][p0 + 1, 0] = -np.sin(angle)
+        virtual[index][p0 + 2, 0] = np.cos(angle)
+        occupied[index] = occupied[index][p0:p1]
+        virtual[index] = virtual[index][p0:p1]
+    e_occ = np.asarray(e_occ)
+    e_vir = [np.asarray(energy) for energy in e_vir]
+
+    reference = native_mp2.pair_energy_multipole(
+        mol, e_occ, occupied, e_vir, virtual, atmlst=atmlst, order=order
+    )
+    if implementation == "jax":
+        actual = np.asarray(pair_energy_multipole(
+            mol, e_occ, occupied, e_vir, virtual, atmlst=atmlst, order=order
+        ))
+    else:
+        orbital_data = [
+            multipole_orbital_data(
+                mol, e_occ[index], occupied[index], e_vir[index],
+                virtual[index], atmlst=atoms, order=order,
+            )
+            for index, atoms in enumerate(atmlst)
+        ]
+        actual = multipole_pair_energy_matrix(orbital_data, order=order)
+
+    assert reference.dtype == actual.dtype == np.dtype("float64")
+    np.testing.assert_allclose(actual, reference, rtol=1e-12, atol=1e-14)

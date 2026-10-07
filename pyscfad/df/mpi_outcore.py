@@ -54,6 +54,7 @@ from pyscf.df import outcore
 import scipy.linalg
 
 from pyscfad.gto._mole_helper import setup_ctr_coeff, setup_exp
+from pyscfad.lib._threading import dense_blas_threads
 
 
 __all__ = [
@@ -348,9 +349,10 @@ def _metric_cholesky(auxmol, int2c):
         raise NotImplementedError("complex auxiliary metrics are unsupported")
     j2c = numpy.asarray(j2c, dtype=numpy.float64)
     try:
-        low = scipy.linalg.cholesky(
-            j2c, lower=True, overwrite_a=False, check_finite=False
-        )
+        with dense_blas_threads():
+            low = scipy.linalg.cholesky(
+                j2c, lower=True, overwrite_a=False, check_finite=False
+            )
     except scipy.linalg.LinAlgError as error:
         raise RuntimeError(
             "the auxiliary metric is not full-rank positive definite.  "
@@ -378,13 +380,14 @@ def _transform_int3c(raw, low, naux_raw):
         raw = lib.transpose(raw.T, axes=(0, 2, 1)).reshape(naux_raw, -1)
     else:
         raw = raw.reshape((-1, naux_raw)).T
-    transformed = scipy.linalg.solve_triangular(
-        low,
-        raw,
-        lower=True,
-        overwrite_b=True,
-        check_finite=False,
-    )
+    with dense_blas_threads():
+        transformed = scipy.linalg.solve_triangular(
+            low,
+            raw,
+            lower=True,
+            overwrite_b=True,
+            check_finite=False,
+        )
     return numpy.ascontiguousarray(transformed, dtype=numpy.float64)
 
 

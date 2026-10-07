@@ -15,6 +15,13 @@ from .domain import (
 )
 
 
+def _symmetric_fock_block(fock, coeff):
+    """Preserve the real symmetric Fock contract after projection roundoff."""
+    block = coeff.T @ fock @ coeff
+    # Keep this projection in the AD graph so both transpose paths respond.
+    return 0.5 * (block + block.T)
+
+
 def _project_inputs(mf, fock, occupied_coeff, virtual_coeff, atoms):
     """Use one occupied/virtual frame for both Fock blocks and DF factors."""
     co, cv = occupied_coeff, virtual_coeff
@@ -24,8 +31,8 @@ def _project_inputs(mf, fock, occupied_coeff, virtual_coeff, atoms):
         mf, coeff, nocc, atoms, integral_direct=True,
     )
     return {
-        "foo": co.T @ fock @ co,
-        "fvv": cv.T @ fock @ cv,
+        "foo": _symmetric_fock_block(fock, co),
+        "fvv": _symmetric_fock_block(fock, cv),
         "B": B.reshape((-1, nocc, nvir)),
     }
 
@@ -138,7 +145,7 @@ def prepare_system_inputs(mf, active_occ_indices, active_vir_indices):
     )
     fock = mf.get_fock()
     return {
-        "foo": co.T @ fock @ co,
-        "fvv": cv.T @ fock @ cv,
+        "foo": _symmetric_fock_block(fock, co),
+        "fvv": _symmetric_fock_block(fock, cv),
         "B": B.reshape((-1, nocc, nvir)),
     }

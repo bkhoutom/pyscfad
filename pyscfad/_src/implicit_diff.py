@@ -36,6 +36,27 @@ _Sub = partial(tree_map, operator.sub)
 _IMPLICIT_DIFF_SOLVE_MATVEC = ContextVar(
     'pyscfad_implicit_diff_solve_matvec', default=False
 )
+_IMPLICIT_DIFF_EXTERNAL_VJP = ContextVar(
+    'pyscfad_implicit_diff_external_vjp', default=False
+)
+
+
+def is_implicit_diff_external_vjp():
+    """Whether the root is fixed while differentiating external arguments.
+
+    This is a phase marker, not permission to discard arbitrary nested
+    derivatives. The SCF callback uses it only for its explicit fixed root.
+    """
+    return bool(_IMPLICIT_DIFF_EXTERNAL_VJP.get())
+
+
+@contextmanager
+def _implicit_diff_external_vjp(active=True):
+    token = _IMPLICIT_DIFF_EXTERNAL_VJP.set(active)
+    try:
+        yield
+    finally:
+        _IMPLICIT_DIFF_EXTERNAL_VJP.reset(token)
 
 
 def is_implicit_diff_solve_matvec():
@@ -44,8 +65,8 @@ def is_implicit_diff_solve_matvec():
 
 
 @contextmanager
-def _implicit_diff_solve_matvec():
-    token = _IMPLICIT_DIFF_SOLVE_MATVEC.set(True)
+def _implicit_diff_solve_matvec(active=True):
+    token = _IMPLICIT_DIFF_SOLVE_MATVEC.set(active)
     try:
         yield
     finally:
@@ -71,24 +92,28 @@ def root_vjp(optimality_fun, sol, args, cotangent,
     def fun_sol(sol):
         return optimality_fun(sol, *args)
 
-    # FIXME M may not work for solvers other than scipy
-    M = None
-    if optfn_has_aux:
-        if custom_vjp_from_optcond:
-            _, (vjp_fun_sol, optfn_aux) = fun_sol(sol)
+    # A nested root can be entered from another root's external pullback.
+    # Its own Jacobian and linear solve still need the full root response.
+    # Restore the parent's phase on both success and failure.
+    with _implicit_diff_external_vjp(False):
+        # FIXME M may not work for solvers other than scipy
+        M = None
+        if optfn_has_aux:
+            if custom_vjp_from_optcond:
+                _, (vjp_fun_sol, optfn_aux) = fun_sol(sol)
+            else:
+                _, vjp_fun_sol, optfn_aux = jax.vjp(fun_sol, sol, has_aux=True)
+            if gen_precond is not None:
+                M = gen_precond(optfn_aux)
         else:
-            _, vjp_fun_sol, optfn_aux = jax.vjp(fun_sol, sol, has_aux=True)
-        if gen_precond is not None:
-            M = gen_precond(optfn_aux)
-    else:
-        _, vjp_fun_sol = jax.vjp(fun_sol, sol)
+            _, vjp_fun_sol = jax.vjp(fun_sol, sol)
 
-    def matvec(u):
-        with _implicit_diff_solve_matvec():
-            return vjp_fun_sol(u)[0]
+        def matvec(u):
+            with _implicit_diff_solve_matvec():
+                return vjp_fun_sol(u)[0]
 
-    v = _Scalar_mul(-1, cotangent)
-    u = solve(matvec, v, M=M, **solver_kwargs)[0]
+        v = _Scalar_mul(-1, cotangent)
+        u = solve(matvec, v, M=M, **solver_kwargs)[0]
 
     diff_args_dict = {i: arg for i, arg in enumerate(args) if i+1 not in nondiff_argnums}
     keys = diff_args_dict.keys()
@@ -97,8 +122,10 @@ def root_vjp(optimality_fun, sol, args, cotangent,
         new_args = _map_back(diff_args, args, keys)
         return optimality_fun(sol, *new_args)
 
-    _, vjp_fun_args = jax.vjp(fun_args, *diff_args, has_aux=optfn_has_aux)[:2]
-    diff_vjps = vjp_fun_args(u)
+    # A nested root's external bars are needed even inside a parent matvec.
+    with _implicit_diff_solve_matvec(False), _implicit_diff_external_vjp():
+        _, vjp_fun_args = jax.vjp(fun_args, *diff_args, has_aux=optfn_has_aux)[:2]
+        diff_vjps = vjp_fun_args(u)
 
     vjps = [None,] * len(args)
     vjps = _map_back(diff_vjps, vjps, keys)

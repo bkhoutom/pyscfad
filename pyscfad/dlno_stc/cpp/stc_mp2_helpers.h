@@ -21,7 +21,8 @@ inline void parallel_for(std::size_t count, const Function& function) {
         return;
     }
     std::exception_ptr error;
-    #pragma omp parallel for schedule(static)
+    const int threads=static_cast<int>(std::min(count,static_cast<std::size_t>(worker_limit())));
+    #pragma omp parallel for schedule(static) num_threads(threads)
     for (std::int64_t i=0;i<static_cast<std::int64_t>(count);++i) {
         try { function(static_cast<std::size_t>(i)); }
         catch (...) {
@@ -154,13 +155,14 @@ struct Update {
     double scale;
 };
 // Logical batches and their streams are independent of the OpenMP team size.
-// At most eight batches (32768 four-role updates) reside at once. Each scatter
+// At most 32 batches (131072 four-role updates) reside at once. Each scatter
 // worker exclusively owns target columns; no full tensor bars or sample
-// histories are duplicated. Scanning this bounded wave preserves update order.
+// histories are duplicated. A stable partition preserves per-column update order.
 template<class Sampler>
 inline Moments draw_batched(std::size_t count,std::uint64_t seed,bool with_grad,
                             const std::vector<arma::uword>& offsets,const Sampler& sample) {
-    constexpr std::size_t batch_size=1024, wave_size=8;
+    constexpr std::size_t batch_size=1024;
+    const auto wave_size=static_cast<std::size_t>(std::min(32,worker_limit()));
     const auto batches=count/batch_size+(count%batch_size!=0);
     Moments total;
     for (std::size_t first=0;first<batches;first+=wave_size) {
@@ -178,10 +180,24 @@ inline Moments draw_batched(std::size_t count,std::uint64_t seed,bool with_grad,
         });
         for (const auto& moment:moments) total.merge(moment);
         if (with_grad) {
-            const auto owners=std::min(8,worker_limit());
-            parallel_for(owners,[&](std::size_t owner) {
-                for (const auto& records:updates) for (const auto& u:records) {
-                    if (u.target_col%owners!=owner) continue;
+            const auto owners=wave_size;
+            // Count first so the flat stable partition has exact capacity:
+            // one pointer per record, independent of production sample count.
+            std::vector<std::size_t> starts(owners+1,0);
+            for (const auto& records:updates) for (const auto& u:records)
+                ++starts[u.target_col%owners+1];
+            std::partial_sum(starts.begin(),starts.end(),starts.begin());
+            std::vector<const Update*> partition(starts.back());
+            auto next=starts;
+            for (const auto& records:updates) for (const auto& u:records)
+                partition[next[u.target_col%owners]++]=&u;
+            std::vector<std::size_t> active;
+            for (std::size_t owner=0;owner<owners;++owner)
+                if (starts[owner]!=starts[owner+1]) active.push_back(owner);
+            parallel_for(active.size(),[&](std::size_t worker) {
+                const auto owner=active[worker];
+                for (auto j=starts[owner];j<starts[owner+1];++j) {
+                    const auto& u=*partition[j];
                     double* target=u.target->colptr(u.target_col);
                     const double* source=u.source->colptr(u.source_col);
                     for (auto p=offsets[u.group];p<offsets[u.group+1];++p)

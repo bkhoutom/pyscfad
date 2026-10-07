@@ -14,6 +14,8 @@
 
 from contextvars import ContextVar
 from functools import wraps
+import os
+import numpy
 from jax.interpreters import ad as jax_ad
 from jax.tree_util import tree_flatten
 from pyscf.df import df_jk as pyscf_df_jk
@@ -82,6 +84,33 @@ def get_jk(dfobj, dm, hermi=1, with_j=True, with_k=True, direct_scf_tol=1e-13):
                           with_j=with_j, with_k=with_k,
                           direct_scf_tol=direct_scf_tol)
 
+
+def get_jk_from_occ(dfobj, factors, hermi=1, with_j=True, with_k=True,
+                    *, _factor_response=True):
+    """J/K for the actual density ``factors @ factors.conj().T``.
+
+    Thin first-order coordinate/orbital pullbacks apply only to real
+    out-of-core coordinate-only factors. Other inputs retain the existing
+    density primitive, including its active CDERI and tracer derivatives.
+    """
+    mol_leaves = tree_flatten(dfobj.mol)[0]
+    aux_leaves = tree_flatten(dfobj.auxmol)[0]
+    enabled = os.environ.get('PYSCFAD_DF_OCCUPIED_VJP', '1').lower() not in (
+        '0', 'false', 'no', 'off')
+    if (enabled and hermi == 1 and factors.ndim == 2 and factors.shape[1] > 0
+            and not numpy.iscomplexobj(factors)
+            and len(mol_leaves) == len(aux_leaves) == 1
+            and getattr(dfobj.mol, 'coords', None) is not None
+            and getattr(dfobj.auxmol, 'coords', None) is not None
+            and _has_outcore_cderi(dfobj)
+            and not _has_jvp_tracer(dfobj, factors)
+            and _MPI_GET_JK_HOOK.get() is None):
+        from . import _df_jk_factorized
+        return _df_jk_factorized.get_jk_from_occ(
+            dfobj, factors, with_j, with_k, _factor_response)
+    return get_jk(dfobj, factors @ factors.conj().T, hermi=hermi,
+                  with_j=with_j, with_k=with_k)
+
 def get_jk_gen(dfobj, dm, hermi=1, with_j=True, with_k=True, direct_scf_tol=1e-13):
     nao = dfobj.mol.nao
     dms = dm.reshape(-1, nao, nao)
@@ -135,6 +164,31 @@ class _DFHF(pytree.PytreeNode, pyscf_df_jk._DFHF):
     # reads) and the equality checks JAX uses for treedef matching
     # (``data_for_hash`` equality comparing tracer leaves).
     _dynamic_attr = {'mol', 'with_df', 'mo_coeff', 'mo_energy', 'e_tot'}
+
+    def _get_veff_from_occ(self, mo_coeff=None, mo_occ=None, *, factors=None,
+                          factor_response=True):
+        """Use actual RHF density factors; return None for unsupported modes."""
+        from pyscfad.scf.hf import RHF
+        if (not isinstance(self, RHF) or hasattr(self, 'xc')
+                or self.only_dfj or self.direct_scf or self.with_df is None
+                or os.environ.get('PYSCFAD_DF_OCCUPIED_VJP', '1').lower()
+                in ('0', 'false', 'no', 'off')):
+            return None
+        if factors is None:
+            if mo_coeff is None:
+                mo_coeff, mo_occ = self.mo_coeff, self.mo_occ
+            if (mo_coeff is None or mo_occ is None or mo_coeff.ndim != 2
+                    or mo_occ.ndim != 1 or numpy.iscomplexobj(mo_coeff)
+                    or numpy.any(numpy.asarray(mo_occ) < 0)):
+                return None
+            occupied = mo_occ > 0
+            factors = mo_coeff[:, occupied] * np.sqrt(mo_occ[occupied])
+        if factors.ndim != 2 or numpy.iscomplexobj(factors):
+            return None
+        if self.with_df._cderi is None:
+            self.with_df.build()
+        J, K = get_jk_from_occ(self.with_df, factors, _factor_response=factor_response)
+        return J - .5 * K
 
     def get_jk(self, mol=None, dm=None, hermi=1, with_j=True, with_k=True,
                omega=None):

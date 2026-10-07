@@ -14,6 +14,7 @@ import jax
 import numpy
 from pyscf import df as pyscf_df, lib
 from pyscfad import config_update, numpy as np
+from pyscfad.tools import resource_profile
 from pyscfad.dlno._selection import DomainSelections, _extract_active_indices
 from pyscfad.dlno.domain import _check_domain_inputs
 from pyscfad.dlno.dlno_base import rebuild_domain_data
@@ -375,19 +376,22 @@ def _prepare_system(state, controls, with_grad):
 
 def _run_system(initializer, controls, comm, *, with_grad, include_hf=False):
     rank = 0 if comm is None else comm.Get_rank()
-    state = _root_call(comm, rank, initializer, "initial system preparation")
+    with resource_profile.section('stc.system.scf'):
+        state = _root_call(comm, rank, initializer, "initial system preparation")
     has_work = bool(len(state["occupied"]) and len(state["virtual"])) if rank == 0 else None
     if comm is not None:
         has_work = comm.bcast(has_work, root=0)
     if has_work:
-        prepared = _root_call(comm, rank, lambda: _prepare_system(state, controls, with_grad),
-                              "system preparation")
-        result = run_backend(
-            prepared[1] if rank == 0 else None, {} if rank == 0 else None,
-            controls if rank == 0 else None,
-            partial(backend.solve, with_grad=with_grad, scope="system"),
-            comm=comm, array_names=ARRAY_NAMES,
-        )
+        with resource_profile.section('stc.system.prepare'):
+            prepared = _root_call(comm, rank, lambda: _prepare_system(state, controls, with_grad),
+                                  "system preparation")
+        with resource_profile.section('stc.system.native'):
+            result = run_backend(
+                prepared[1] if rank == 0 else None, {} if rank == 0 else None,
+                controls if rank == 0 else None,
+                partial(backend.solve, with_grad=with_grad, scope="system"),
+                comm=comm, array_names=ARRAY_NAMES,
+            )
 
         def apply_system():
             if with_grad:
@@ -396,11 +400,13 @@ def _run_system(initializer, controls, comm, *, with_grad, include_hf=False):
             state["variance"] = float(result["energy_standard_error"]) ** 2
             jax.block_until_ready((state["energy"], state["mf_bar"]))
 
-        _root_call(comm, rank, apply_system, "system pullback")
+        with resource_profile.section('stc.system.input_pullback'):
+            _root_call(comm, rank, apply_system, "system pullback")
         del prepared, result, apply_system
         gc.collect()
-    return _root_call(comm, rank, lambda: _finish(state, with_grad=with_grad,
-                                                include_hf=include_hf), "final response")
+    with resource_profile.section('stc.system.response'):
+        return _root_call(comm, rank, lambda: _finish(state, with_grad=with_grad,
+                                                    include_hf=include_hf), "final response")
 
 
 def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None):

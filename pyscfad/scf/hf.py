@@ -40,6 +40,7 @@ from pyscfad.scf import chkfile
 from pyscfad.scf.diis import SCF_DIIS
 from pyscfad.scipy.linalg import eigh
 from pyscfad.tools.linear_solver import gen_gmres
+from pyscfad._src.implicit_diff import is_implicit_diff_external_vjp
 
 
 def _profile_enabled():
@@ -98,8 +99,22 @@ def _stash_dfjk_mo_data(mf, mo_coeff, mo_occ, s1e):
     )
 
 
-def _scf_fixed_point(dm, mf, s1e, h1e):
-    vhf = mf.get_veff(mf.mol, dm, s1e=s1e)
+def _get_veff_from_orbitals(mf, mol, dm, mo_coeff, mo_occ, **kwargs):
+    get_factor_vhf = getattr(mf, '_get_veff_from_occ', None)
+    vhf = get_factor_vhf(mo_coeff, mo_occ) if get_factor_vhf else None
+    return mf.get_veff(mol, dm, **kwargs) if vhf is None else vhf
+
+
+def _scf_fixed_point(dm, mf, s1e, h1e, root_factors=None):
+    # Only this density is closed over in the external-root VJP. In Krylov
+    # matvecs dm remains an independent variable and requires its full bar.
+    vhf = None
+    if root_factors is not None and is_implicit_diff_external_vjp():
+        factor_vhf = getattr(mf, '_get_veff_from_occ', None)
+        if factor_vhf:
+            vhf = factor_vhf(factors=root_factors, factor_response=False)
+    if vhf is None:
+        vhf = mf.get_veff(mf.mol, dm, s1e=s1e)
     fock = mf.get_fock(h1e, s1e, vhf, dm)
     mo_energy, mo_coeff = mf.eig(fock, s1e)
     mo_occ = mf.get_occ(mo_energy, mo_coeff)
@@ -107,6 +122,19 @@ def _scf_fixed_point(dm, mf, s1e, h1e):
     dm = mf.make_rdm1(mo_coeff, mo_occ)
     del mo_energy, mo_occ
     return dm
+
+
+def _scf_with_factors(dm, mf, s1e, h1e, root_factors=None, **kwargs):
+    """Carry the exact factors that generated the root as nondiff residuals."""
+    del root_factors
+    result = _scf(dm, mf, s1e, h1e, **kwargs)
+    coeff, occupation = result[4:6]
+    factors = None
+    if (coeff.ndim == 2 and occupation.ndim == 1
+            and not numpy.iscomplexobj(coeff)):
+        occupied = occupation > 0
+        factors = coeff[:, occupied] * np.sqrt(occupation[occupied])
+    return (*result, factors)
 
 
 def _scf(dm, mf, s1e, h1e, *,
@@ -536,11 +564,13 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
     cput1 = log.timer('initialize scf', *cput0)
     # wrapped function for SCF iteration that is implicitly differentiable
     _scf_wrapped = make_implicit_diff(
-        _scf,
+        _scf_with_factors,
         config.scf_implicit_diff,
         optimality_cond=_scf_fixed_point,
         solver=gen_gmres(),
         has_aux=True,
+        nondiff_argnums=(4,),
+        use_converged_args={4: 6},
     )
     if config.scf_implicit_diff:
         e_tot = ops.stop_grad(e_tot)
@@ -548,8 +578,8 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         if mf_diis is not None:
             mf_diis.Corth = ops.stop_grad(mf_diis.Corth)
     # NOTE if use implicit differentiation, only dm will have gradient.
-    dm, scf_conv, e_tot, mo_energy, mo_coeff, mo_occ = _scf_wrapped(
-        dm, mf, s1e, h1e,
+    dm, scf_conv, e_tot, mo_energy, mo_coeff, mo_occ, _ = _scf_wrapped(
+        dm, mf, s1e, h1e, None,
         conv_tol=conv_tol, conv_tol_grad=conv_tol_grad,
         diis=mf_diis, dump_chk=dump_chk, callback=callback,
         log=log, e_tot=e_tot, vhf=vhf, cput1=cput1,
@@ -571,7 +601,9 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
         _stash_dfjk_mo_data(mf, mo_coeff, mo_occ, s1e)
         dm, dm_last = mf.make_rdm1(mo_coeff, mo_occ), dm
-        vhf = mf.get_veff(mol, dm, dm_last, vhf, s1e=s1e)
+        vhf = _get_veff_from_orbitals(
+            mf, mol, dm, mo_coeff, mo_occ,
+            dm_last=dm_last, vhf_last=vhf, s1e=s1e)
         e_tot, last_hf_e = mf.energy_tot(dm, h1e, vhf), e_tot
 
         fock = mf.get_fock(h1e, s1e, vhf, dm)
@@ -962,6 +994,10 @@ class RHF(SCF, pyscf_hf.RHF):
         if mol is None:
             mol = self.mol
         if dm is None:
+            factor_vhf = getattr(self, '_get_veff_from_occ', None)
+            vhf = factor_vhf() if factor_vhf and hermi == 1 else None
+            if vhf is not None:
+                return vhf
             dm = self.make_rdm1()
         if self._eri is not None or not self.direct_scf:
             vj, vk = self.get_jk(mol, dm, hermi)

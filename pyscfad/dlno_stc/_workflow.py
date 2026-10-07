@@ -27,8 +27,9 @@ def _native_workspace_mb(naux, nocc, nvir, *, with_grad, system):
         reverse = 8 * min(threads, naux) * (
             2 * (nocc * nocc + nvir * nvir) + 3 * nocc * nvir)
         transform = max(transform, reverse, 32 * 1024**2)
-    # Eight fixed sample batches hold at most 32768 four-role update records.
-    scatter = 2 * 1024**2 if with_grad else 0
+    # At most 32 batches retain 131072 four-role records plus a pointer
+    # partition (7 MiB together); reserve 8 MiB including small wave metadata.
+    scatter = 8 * 1024**2 if with_grad else 0
     return (max(exact, transform) + scatter) / 1e6
 
 

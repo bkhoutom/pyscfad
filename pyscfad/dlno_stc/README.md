@@ -49,6 +49,35 @@ auxiliary metric, which must be positive definite. System
 calls with no active occupied or virtual orbitals return zero correlation
 energy and derivative, and still support `include_hf=True`.
 
+The supported real, coordinate-only out-of-core DF J/K reverse uses the exact
+occupied density factors, including frozen-core occupations. Coordinate and
+orbital pullbacks contract thin occupied panels instead of storing a full packed
+AO-integral cotangent; large panels spill to temporary HDF5 scratch. The external
+SCF coordinate reverse omits density bars when they are unused. SCF response
+matvecs still use the generic density derivative. Unsupported inputs and
+forward-mode tracers retain generic fallbacks; SCF and response tolerances are unchanged. This
+reduces reverse storage but does not remove the resident STC tensors, dense
+auxiliary metric, proposal tables, or scratch-disk requirements.
+
+Serial dense molecular reverse operations use scoped BLAS limits through
+`PYSCFAD_DENSE_BLAS_THREADS`, a positive integer defaulting to `1`. Each scope
+restores the previous BLAS limits on exit, including exceptions, and leaves
+OpenMP limits unchanged. Set this variable to the allocated physical-core count
+when testing parallel dense work, while keeping `OPENBLAS_NUM_THREADS=1` and
+`MKL_NUM_THREADS=1` for BLAS calls inside OpenMP kernels. One MPI rank with
+single-thread dense BLAS is a useful starting configuration; measure memory,
+scratch use, and timings before adding ranks or dense threads.
+
+On Linux, `_stc_mp2.parallel_runtime_info()` reports the actual capped native
+OpenMP team, each worker's current CPU, and its allowed affinity mask. Passing
+an already loaded GNU OpenMP library filepath probes that runtime's own team;
+it never loads a new runtime or resets affinity. The probe uses at most 32
+workers, matching the sampling ceiling; other native parallel kernels can use
+larger allocated teams. Compare worker mask coverage with the inherited
+physical-core allocation before expensive work. Instantaneous CPU IDs need not
+be distinct, because the scheduler can temporarily place workers on the same
+CPU. The clean water16 driver performs this check before allocating DF data.
+
 In stochastic system mode, `system_workload_cutoff` defaults to the original
 absolute threshold `6.5e-3`: keep virtual column `a` for occupied `i` when
 `abs(weight)**0.25 * norm(T[:,i,a])` exceeds this threshold. This is distinct
@@ -138,11 +167,15 @@ outer OpenMP loops, use one BLAS thread per worker to avoid nested pools.
 Kept-set matrix products use up to 64 MiB of workspace per occupied worker;
 larger pairs fall back to tiles bounded by `virtual_block_size`. There are no
 complete integral-gradient replicas per worker. Sampled updates use fixed
-1024-draw batches, with at most eight batches resident, independent of the
-production sample count. Batch streams are independent of the OpenMP team
-size; restoring this batching changes stochastic realizations relative to
-the earlier serial stream. Floating-point reduction order can still change
-slightly with the number of workers. Memory guards include worker scratch.
+1024-draw batches, with at most `min(OMP_NUM_THREADS, OMP_THREAD_LIMIT, 32)`
+batches resident, independent of the production sample count. Dispatch uses
+only useful tasks, and scatter workers exclusively own columns through a
+stable update partition. At 32 workers, four-role records and partition pointers
+occupy 7 MiB plus small metadata, below the 8 MiB scatter allowance. Logical
+batch seeds and per-column update order are independent of team size; sampled
+moments and bars pass bitwise equality tests across teams. Other kernel
+reductions can still differ slightly in floating-point order. Memory guards
+include worker scratch.
 
 ### Calling the driver
 
@@ -210,7 +243,8 @@ to 1,000,000 total draws before allocation. Domain sampling retains equal
 Laplace-point budgets and a single pilot. Explicit `pilot_samples` and
 `min_production_samples` override their defaults; explicit `production_samples`
 retains fixed-count behavior. Sampling and cotangent updates remain bounded
-in eight batches of 1,024 draws, independent of the total production count.
+in at most 32 batches of 1,024 draws, limited by the allocated OpenMP team and
+thread limit, independent of the total production count.
 Native diagnostics include weighted point budgets, actual production counts,
 the explicit limit, and pilot refinement seeds when used. Timing uses the
 current batched sampler, and proposals and random streams remain those of this

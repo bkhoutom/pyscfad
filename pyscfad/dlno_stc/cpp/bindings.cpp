@@ -5,10 +5,94 @@
 #include <cmath>
 #include <string>
 #include <limits>
+#include <algorithm>
+#include <array>
+#include <omp.h>
+#ifdef __linux__
+#include <dlfcn.h>
+#include <sched.h>
+#include <cerrno>
+#endif
 
 namespace py = pybind11;
 namespace stc = pyscfad::dlno_stc;
 namespace {
+#ifdef __linux__
+struct WorkerPlacement {
+    int thread=-1, cpu=-1, error=0;
+    cpu_set_t affinity;
+};
+struct RuntimeProbe {
+    std::array<WorkerPlacement,32> workers;
+    int (*thread_number)();
+};
+// This callback is C++ only and cannot throw across the GNU OpenMP boundary.
+void collect_placement(void* data) noexcept {
+    auto& probe=*static_cast<RuntimeProbe*>(data);
+    const auto thread=probe.thread_number();
+    if (thread<0 || thread>=32) return;
+    auto& worker=probe.workers[thread];
+    worker.thread=thread;
+    CPU_ZERO(&worker.affinity);
+    if (sched_getaffinity(0,sizeof(worker.affinity),&worker.affinity)!=0)
+        worker.error=errno;
+    worker.cpu=sched_getcpu();
+    if (worker.cpu<0 && !worker.error) worker.error=errno;
+}
+#endif
+py::dict parallel_runtime_info(py::object runtime_path) {
+#ifndef __linux__
+    throw std::runtime_error("OpenMP worker affinity diagnostics require Linux");
+#else
+    using Parallel=void (*)(void (*)(void*),void*,unsigned,unsigned);
+    using Integer=int (*)();
+    void* handle=nullptr;
+    Parallel external=nullptr;
+    Integer maximum=&omp_get_max_threads, limit=&omp_get_thread_limit;
+    RuntimeProbe probe;
+    probe.thread_number=&omp_get_thread_num;
+    if (!runtime_path.is_none()) {
+        const auto path=py::cast<std::string>(runtime_path);
+        handle=dlopen(path.c_str(),RTLD_NOW|RTLD_LOCAL|RTLD_NOLOAD);
+        if (!handle)
+            throw std::runtime_error("OpenMP runtime must be an already loaded library: "+path);
+        external=reinterpret_cast<Parallel>(dlsym(handle,"GOMP_parallel"));
+        maximum=reinterpret_cast<Integer>(dlsym(handle,"omp_get_max_threads"));
+        limit=reinterpret_cast<Integer>(dlsym(handle,"omp_get_thread_limit"));
+        probe.thread_number=reinterpret_cast<Integer>(dlsym(handle,"omp_get_thread_num"));
+        if (!external || !maximum || !limit || !probe.thread_number) {
+            dlclose(handle);
+            throw std::runtime_error("Unsupported OpenMP runtime: GNU GOMP_parallel and omp worker queries are required");
+        }
+    }
+    const auto threads=std::max(1,std::min(32,std::min(maximum(),limit())));
+    {
+        py::gil_scoped_release release;
+        if (external) external(&collect_placement,&probe,static_cast<unsigned>(threads),0);
+        else {
+            #pragma omp parallel num_threads(threads)
+            collect_placement(&probe);
+        }
+    }
+    if (handle) dlclose(handle);
+    py::list workers;
+    for (const auto& worker:probe.workers) {
+        if (worker.thread<0) continue;
+        if (worker.error)
+            throw std::runtime_error("Cannot read OpenMP worker CPU affinity (errno "+std::to_string(worker.error)+")");
+        py::dict row;
+        row["thread"]=worker.thread; row["cpu"]=worker.cpu;
+        std::vector<int> affinity;
+        for (int cpu=0;cpu<CPU_SETSIZE;++cpu)
+            if (CPU_ISSET(cpu,&worker.affinity)) affinity.push_back(cpu);
+        row["affinity"]=affinity;
+        workers.append(row);
+    }
+    py::dict result;
+    result["threads"]=py::len(workers); result["workers"]=workers;
+    return result;
+#endif
+}
 py::array checked_array(py::handle value, const char* name, int ndim) {
     if (!py::isinstance<py::array>(value))
         throw py::type_error(std::string(name)+" must be a NumPy array");
@@ -195,6 +279,7 @@ py::dict solve_full(py::handle foo, py::handle fvv, py::handle B,
 }
 }  // namespace
 PYBIND11_MODULE(_stc_mp2,m) {
+    m.def("parallel_runtime_info",&parallel_runtime_info,py::arg("runtime_path")=py::none());
     m.doc()="In-memory domain and whole-system Laplace MP2 with manual reverse";
     m.def("solve",&solve,py::arg("foo"),py::arg("fvv"),py::arg("B"),
           py::arg("target_projection"),py::arg("partner_weight"),py::arg("controls"),

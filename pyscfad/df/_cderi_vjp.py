@@ -40,6 +40,7 @@ from pyscfad.ao2mo import _ao2mo
 from pyscfad.df import _int3c_cross_opt
 from pyscfad.df import addons as df_addons
 from pyscfad.tools import resource_profile
+from pyscfad.lib._threading import dense_blas_threads
 try:
     from pyscfadlib import libao2mo_vjp
 except (ImportError, OSError):
@@ -1155,15 +1156,13 @@ def _int3c_coordinate_vjp_block(mol, auxmol, ints_bar, *, int3c,
             f'{ints_bar.shape}, expected ({naoaux}, packed_pair_block)'
         )
 
-    def int3c_block(mol_, auxmol_):
-        ints = _int3c_cross_opt.int3c_cross(
-            mol_, auxmol_, intor=int3c, comp=1,
-            aosym='s2ij', shls_slice=tuple(shls_slice)
-        )
-        return ints.reshape((-1, naoaux)).T
-
-    _, int3c_pullback = jax.vjp(int3c_block, mol, auxmol)
-    return int3c_pullback(np.asarray(ints_bar))
+    # Its custom residual is exactly (mol, auxmol). Rebuilding ordinary
+    # three-centre values to obtain that residual wastes an integral pass.
+    # The existing backward rule still evaluates both required derivatives.
+    return _int3c_cross_opt.int3c_cross_bwd(
+        int3c, 1, 's2ij', tuple(shls_slice), None,
+        (mol, auxmol), ints_bar.T,
+    )
 
 
 def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
@@ -1326,9 +1325,10 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
 
                 if detail is not None:
                     stage_timing_start = _detailed_timing_start()
-                ints_bar = scipy.linalg.solve_triangular(
-                    low.T, cderi_bar_blk, lower=False, check_finite=False
-                )
+                with dense_blas_threads():
+                    ints_bar = scipy.linalg.solve_triangular(
+                        low.T, cderi_bar_blk, lower=False, check_finite=False
+                    )
                 if detail is not None:
                     elapsed = _detailed_timing_elapsed(stage_timing_start)
                     child_elapsed['triangular_solve'] = elapsed
@@ -1339,7 +1339,8 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
 
                 if detail is not None:
                     stage_timing_start = _detailed_timing_start()
-                low_bar -= ints_bar @ cderi_blk.T
+                with dense_blas_threads():
+                    low_bar -= ints_bar @ cderi_blk.T
                 if detail is not None:
                     elapsed = _detailed_timing_elapsed(stage_timing_start)
                     child_elapsed['low_bar_gemm'] = elapsed
@@ -1350,16 +1351,6 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
 
                 if detail is not None:
                     stage_timing_start = _detailed_timing_start()
-                int3c_pullback = None
-                if int3c_block_vjp is None:
-                    def int3c_block(mol_, auxmol_):
-                        ints = _int3c_cross_opt.int3c_cross(
-                            mol_, auxmol_, intor=int3c, comp=1,
-                            aosym='s2ij', shls_slice=shls_slice
-                        )
-                        return ints.reshape((-1, naoaux)).T
-
-                    _, int3c_pullback = jax.vjp(int3c_block, mol, auxmol)
                 if detail is not None:
                     elapsed = _detailed_timing_elapsed(stage_timing_start)
                     child_elapsed['int3c_primal_vjp_setup'] = elapsed
@@ -1371,8 +1362,9 @@ def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
                 if detail is not None:
                     stage_timing_start = _detailed_timing_start()
                 if int3c_block_vjp is None:
-                    mol_blk_bar, auxmol_blk_bar = int3c_pullback(
-                        np.asarray(ints_bar)
+                    mol_blk_bar, auxmol_blk_bar = _int3c_coordinate_vjp_block(
+                        mol, auxmol, ints_bar, int3c=int3c,
+                        shls_slice=shls_slice, naoaux=naoaux,
                     )
                 else:
                     mol_blk_bar, auxmol_blk_bar = int3c_block_vjp(
@@ -1589,11 +1581,11 @@ def _iter_auxiliary_subranges(p0, p1, max_rows):
 def _int3c_mo_deriv_coords_vjp_from_z_reader(
         mol, auxmol, mo_coeff, read_z_aux_block, orbs_slice,
         int3c='int3c2e', aosym='s2ij', block_memory_mb=None,
-        z_dtype=None, z_aux_block_max_rows=None):
+        z_dtype=None, z_aux_block_max_rows=None, read_density_aux_block=None):
     """Coordinate pullback with bounded z reads per auxiliary-shell block."""
     if aosym not in ('s2', 's2ij'):
         raise NotImplementedError(f'Only packed s2 CDERI is supported, got {aosym}.')
-    if mo_coeff.shape[0] != mol.nao:
+    if read_density_aux_block is None and mo_coeff.shape[0] != mol.nao:
         raise NotImplementedError(
             'Direct int3c-MO VJP currently requires the full AO basis.'
         )
@@ -1604,8 +1596,10 @@ def _int3c_mo_deriv_coords_vjp_from_z_reader(
     k0, k1, l0, l1 = orbs_slice
     kc = k1 - k0
     lc = l1 - l0
-    mo_k = numpy.asarray(mo_coeff[:, k0:k1], order='F')
-    mo_l = numpy.asarray(mo_coeff[:, l0:l1], order='F')
+    mo_k = mo_l = None
+    if read_density_aux_block is None:
+        mo_k = numpy.asarray(mo_coeff[:, k0:k1], order='F')
+        mo_l = numpy.asarray(mo_coeff[:, l0:l1], order='F')
     if kc == 0 or lc == 0:
         if z_dtype is None:
             z_dtype = numpy.asarray(mo_coeff).dtype
@@ -1649,21 +1643,30 @@ def _int3c_mo_deriv_coords_vjp_from_z_reader(
 
     def contract_aux_range(read0, read1, ints):
         nonlocal mol_ao_bar, aux_ao_bar
-        z_blk = numpy.asarray(read_z_aux_block(read0, read1))
-        expected_shape = (read1 - read0, kc * lc)
-        if z_blk.shape != expected_shape:
-            raise ValueError(
-                'z auxiliary block has incompatible shape: '
-                f'got {z_blk.shape}, expected {expected_shape}'
-            )
-        z_blk = z_blk.reshape(read1 - read0, kc, lc)
+        if read_density_aux_block is None:
+            z_blk = numpy.asarray(read_z_aux_block(read0, read1))
+            expected_shape = (read1 - read0, kc * lc)
+            if z_blk.shape != expected_shape:
+                raise ValueError(
+                    'z auxiliary block has incompatible shape: '
+                    f'got {z_blk.shape}, expected {expected_shape}'
+                )
+            z_blk = z_blk.reshape(read1 - read0, kc, lc)
+            mol_contraction, aux_contraction = \
+                _int3c_ip1_mo_density_contractions(ints, mo_k, mo_l, z_blk)
+            dtype = z_blk.dtype
+        else:
+            density = numpy.asarray(read_density_aux_block(read0, read1))
+            expected_shape = (read1 - read0, nao, nao)
+            if density.shape != expected_shape:
+                raise ValueError(f'density block {density.shape}, expected {expected_shape}')
+            per_aux_ao = numpy.einsum('puv,xuvp->pux', density, ints)
+            mol_contraction = per_aux_ao.sum(axis=0)
+            aux_contraction = per_aux_ao.sum(axis=1)
+            dtype = density.dtype
         if mol_ao_bar is None:
-            mol_ao_bar = numpy.zeros((nao, 3), dtype=z_blk.dtype)
-            aux_ao_bar = numpy.zeros((naux, 3), dtype=z_blk.dtype)
-        mol_contraction, aux_contraction = \
-            _int3c_ip1_mo_density_contractions(
-                ints, mo_k, mo_l, z_blk
-            )
+            mol_ao_bar = numpy.zeros((nao, 3), dtype=dtype)
+            aux_ao_bar = numpy.zeros((naux, 3), dtype=dtype)
         mol_ao_bar -= mol_contraction
         # The libcint ``ip1`` convention carries the same leading minus sign
         # as the former explicit ``ip2`` path.  Translational invariance
@@ -1791,9 +1794,10 @@ def cholesky_eri_vjp_from_mo_coeff_ybar(mol, auxmol, cderi_source,
             'Linear-dependent auxiliary metric fallback is not implemented.'
         )
 
-    z = scipy.linalg.solve_triangular(
-        low.T, ybar, lower=False, check_finite=False
-    )
+    with dense_blas_threads():
+        z = scipy.linalg.solve_triangular(
+            low.T, ybar, lower=False, check_finite=False
+        )
     del j2c, j2c_np, low, ybar
     _profile_msg(
         'cholesky_eri_vjp_from_mo_coeff_ybar metric/z setup done '
@@ -1804,7 +1808,8 @@ def cholesky_eri_vjp_from_mo_coeff_ybar(mol, auxmol, cderi_source,
     y = _stream_nr_e2_from_cderi_source(
         cderi_source, mo_coeff, orbs_slice, max_memory, aosym='s2'
     )
-    low_bar = -numpy.dot(z, y.T)
+    with dense_blas_threads():
+        low_bar = -numpy.dot(z, y.T)
     del y
     _profile_msg(
         'cholesky_eri_vjp_from_mo_coeff_ybar stream y/low_bar done '

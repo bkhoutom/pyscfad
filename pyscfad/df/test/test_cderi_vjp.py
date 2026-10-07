@@ -12,6 +12,44 @@ from pyscfad.ao2mo import _ao2mo
 from pyscfad.df import _cderi_vjp, addons, incore
 
 
+def test_coordinate_pullback_avoids_unused_primal_integrals(monkeypatch):
+    """The geometry-only custom residual needs no ordinary int3c values."""
+    from pyscfad.df import _int3c_cross_opt
+
+    mol = gto.Mole(atom='O 0 0 0; H 0 0 1; H 0 1 0',
+                   basis='sto-3g', verbose=0)
+    mol.build(trace_exp=False, trace_ctr_coeff=False)
+    auxmol = addons.make_auxmol(mol, 'weigend')
+    slices = (0, mol.nbas, 0, mol.nbas,
+              mol.nbas, mol.nbas + auxmol.nbas)
+    naux = auxmol.nao
+    cotangent = numpy.random.default_rng(8201).normal(
+        size=(naux, mol.nao * (mol.nao + 1) // 2))
+
+    def primal(mol_, auxmol_):
+        return _int3c_cross_opt.int3c_cross(
+            mol_, auxmol_, shls_slice=slices).reshape(-1, naux).T
+
+    _, pullback = jax.vjp(primal, mol, auxmol)
+    expected = pullback(np.asarray(cotangent))
+    ordinary_calls = []
+    actual_cross = _int3c_cross_opt.int3c_cross
+
+    def counted_cross(*args, **kwargs):
+        if kwargs.get('comp', 1) == 1:
+            ordinary_calls.append(kwargs.get('intor', 'int3c2e'))
+        return actual_cross(*args, **kwargs)
+
+    monkeypatch.setattr(_int3c_cross_opt, 'int3c_cross', counted_cross)
+    actual = _cderi_vjp._int3c_coordinate_vjp_block(
+        mol, auxmol, cotangent, int3c=mol._add_suffix('int3c2e'),
+        shls_slice=slices, naoaux=naux)
+    for result, reference in zip(actual, expected):
+        numpy.testing.assert_allclose(result.coords, reference.coords,
+                                      atol=2e-11, rtol=2e-11)
+    assert ordinary_calls == []
+
+
 def test_zero_strict_upper_inplace_preserves_lower_triangle():
     matrix = numpy.arange(25.0).reshape(5, 5)
     lower = numpy.tril(matrix)

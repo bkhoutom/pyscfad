@@ -6,13 +6,19 @@ import numpy as np
 _KEYS = ("foo", "fvv", "B")
 
 
-def _preflight(inputs, metadata, controls, backend):
+def _preflight(inputs, metadata, controls, backend, array_names=_KEYS):
     if inputs is None:
         raise ValueError("root input is missing")
     if not callable(backend):
         raise ValueError("backend must be callable")
     if not isinstance(metadata, dict) or not isinstance(controls, dict):
         raise ValueError("metadata and controls must be dictionaries")
+    if tuple(array_names) != _KEYS:
+        from .protocol import WEIGHTED_ARRAY_NAMES, validate_weighted_inputs
+        if tuple(array_names) != WEIGHTED_ARRAY_NAMES:
+            raise ValueError("unsupported input array names")
+        validate_weighted_inputs(inputs)
+        return
     if set(inputs) != set(_KEYS):
         raise ValueError("inputs must contain foo, fvv, B")
     foo, fvv, B = (np.asarray(inputs[key]) for key in _KEYS)
@@ -33,7 +39,8 @@ def _preflight(inputs, metadata, controls, backend):
             raise ValueError("sample_blocks must be a positive integer")
 
 
-def run_backend(inputs, metadata, controls, backend, *, comm=None):
+def run_backend(inputs, metadata, controls, backend, *, comm=None,
+                array_names=_KEYS):
     """Broadcast one domain packet, call backend collectively, return on root.
 
     The backend owns reductions and normalization. Its collective failures
@@ -41,7 +48,7 @@ def run_backend(inputs, metadata, controls, backend, *, comm=None):
     before any numeric broadcast. MPI is imported only for a supplied comm.
     """
     if comm is None:
-        _preflight(inputs, metadata, controls, backend)
+        _preflight(inputs, metadata, controls, backend, array_names)
         return backend(inputs, metadata, controls, comm=None)
 
     from mpi4py import MPI
@@ -54,8 +61,8 @@ def run_backend(inputs, metadata, controls, backend, *, comm=None):
         raise ValueError(f"collective preflight failed: backend is not callable on ranks {bad_ranks}")
     if rank == 0:
         try:
-            _preflight(inputs, metadata, controls, backend)
-            header = (None, {key: np.asarray(inputs[key]).shape for key in _KEYS},
+            _preflight(inputs, metadata, controls, backend, array_names)
+            header = (None, {key: np.asarray(inputs[key]).shape for key in array_names},
                       metadata, controls)
         except Exception as exc:
             header = (f"{type(exc).__name__}: {exc}", None, None, None)
@@ -65,13 +72,22 @@ def run_backend(inputs, metadata, controls, backend, *, comm=None):
     if error is not None:
         raise ValueError(f"collective preflight failed: {error}")
 
+    # The root header fixes the numeric sequence, even if a worker's local
+    # optional array_names argument differs. Prepare buffers collectively
+    # before entering any numeric broadcast so allocation errors cannot strand
+    # another rank in Bcast.
     shared_inputs = {}
-    for key in _KEYS:
-        if rank == 0:
-            array = np.ascontiguousarray(inputs[key], dtype=np.float64)
-        else:
-            array = np.empty(shapes[key], dtype=np.float64)
+    try:
+        for key, shape in shapes.items():
+            shared_inputs[key] = (np.ascontiguousarray(inputs[key], dtype=np.float64)
+                                  if rank == 0 else np.empty(shape, dtype=np.float64))
+        allocation_error = None
+    except Exception as exc:
+        allocation_error = f"rank {rank}: {type(exc).__name__}: {exc}"
+    allocation_errors = [error for error in comm.allgather(allocation_error) if error is not None]
+    if allocation_errors:
+        raise RuntimeError("collective input allocation failed: " + "; ".join(allocation_errors))
+    for array in shared_inputs.values():
         comm.Bcast(array, root=0)
-        shared_inputs[key] = array
     result = backend(shared_inputs, shared_metadata, shared_controls, comm=comm)
     return result if rank == 0 else None

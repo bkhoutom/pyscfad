@@ -1,4 +1,279 @@
-# DLNO to external MP2 tensor exchange: implementation guide
+# Domain and whole-system STC-MP2
+
+## In-memory whole-system MP2
+
+`scope="system"` runs unweighted MP2 over all active occupied and virtual
+orbitals, with full molecular AO and auxiliary support. It bypasses Boys
+localization, domain construction, PAOs, rank selection, pair screening, and
+weak-pair corrections. Existing calls default to `scope="domain"` and retain
+their five-input weighted calculation.
+
+```python
+from pyscfad import dlno_stc
+
+e_domain = dlno_stc.kernel(mf, static, controls=controls)
+e_system = dlno_stc.kernel(mf, scope="system", frozen=0, controls=controls)
+energy, mol_bar = dlno_stc.value_and_grad(
+    mol, build_mf, scope="system", frozen=0,
+    controls=controls, include_hf=True,
+)
+gradient = mol_bar.coords  # Eh/bohr
+```
+
+`scope` chooses the physical calculation; `controls["mode"]` chooses
+deterministic or stochastic evaluation. System calls require `static=None`.
+System `frozen=None` means zero; an integer freezes that many leading occupied
+MOs, and a list freezes the specified occupied or virtual MO indices. Domain
+calls require `static` and take the frozen setting from `static.frozen`;
+their separate `frozen` keyword must remain `None`.
+
+System preparation passes exactly `foo`, `fvv`, and fitted `B` in memory to
+`_stc_mp2.solve_full`. The original unweighted algorithm uses half-exponent
+Laplace dressing. The domain solver retains full-exponent dressing and its
+two projection inputs. The shared matrix-exponential VJP returns full symmetric
+Fock cotangents, including off-diagonal response at a diagonal canonical
+primal. The three system bars are applied immediately to a saved preparation
+VJP, then one implicit SCF response closes the molecular derivative. Optional
+HF energy and response are added once. No tensor exchange or replay files are
+used by either production scope.
+
+Both scopes support converged real restricted closed-shell DF references and
+coordinate-only nuclear derivatives. System preparation reuses the reference's
+global fitted AO factors and auxiliary molecule. An attached out-of-core CDERI
+cache is streamed in bounded blocks during preparation and the orbital-coefficient
+pullback; the full AO factor and its cotangent are not loaded into memory on the
+supported real, coordinate-only Cholesky path. Nuclear integral derivatives are
+still evaluated. Without cached factors, preparation retains the integral-direct
+fallback. Cached factors must match the reference geometry, basis and Cholesky
+auxiliary metric, which must be positive definite. System
+calls with no active occupied or virtual orbitals return zero correlation
+energy and derivative, and still support `include_hf=True`.
+
+In stochastic system mode, `system_workload_cutoff` defaults to the original
+absolute threshold `6.5e-3`: keep virtual column `a` for occupied `i` when
+`abs(weight)**0.25 * norm(T[:,i,a])` exceeds this threshold. This is distinct
+from the domain's relative `workload_cutoff`. `virtual_keep_fraction` overrides
+the norm rule. Retained sets partition exact and sampled work; they do not
+truncate the physical MP2 target or construct orbital domains. Pilot and
+production streams are independent. Energy and reverse use the same production
+draws with frozen proposals, including zero-energy draws with nonzero bars.
+Energy standard error does not bound gradient uncertainty.
+
+System scope removes domain approximations but retains separate Laplace
+quadrature and stochastic errors. Its reference is full-space DF-MP2 with
+matching frozen space and auxiliary basis. Hold quadrature fixed for a gradient
+and check both inverse-denominator and derivative errors over the relevant
+denominator interval.
+
+The full fitted occupied-virtual tensor, numerical bars, root AD residuals, dense auxiliary
+metric, and proposal tables reside in memory. The working-set guard includes
+pair-conditioned virtual tables scaling as `no**2 * nv` and auxiliary-group
+tables scaling as `ngroups * no * nv`; it is a conservative estimate rather
+than a measured peak guarantee. MPI ranks each hold a complete independent
+replica and duplicate exact work. Energy and all three bars are averaged;
+the combined standard error is `sqrt(sum(sigma_r**2))/nranks`. Only root owns
+molecular preparation/AD and returns the public result; workers return `None`.
+All ranks must call the same public entry point; root selects the scope.
+
+`examples/dlno_stc/water_tetramer_full.py` is a standalone driver accepting
+`@input.par`. It runs total STC-MP2 energy and gradient, writes JSON/NPZ results,
+and accepts `--reference` to additionally compute a native full-space DF-MP2
+energy and gradient. `--mode stochastic` selects sampling. Its timings separate
+DF setup, initial SCF, and the complete STC energy/gradient call; optional native
+reference time is reported separately.
+
+## In-memory weighted finite-domain MP2
+
+`driver.kernel` computes finite Boys-DLNO correlation energy from weighted
+Laplace strong-domain terms and the existing weak-pair correction.
+`driver.value_and_grad` additionally propagates all five numerical cotangents
+through domain preparation, Boys localization, and one implicit SCF response.
+Set `include_hf=True` to add the HF energy and its molecular derivative once.
+Each function processes one domain at a time; the numerical solver receives
+arrays in memory and writes no tensor exchange files.
+
+The five inputs are `foo (no,no)`, `fvv (nv,nv)`, `B (naux,no,nv)`,
+`target_projection (1,no)`, and `partner_weight (no,no)`. They use the same
+orthonormal local frame before Fock diagonalization. Both Fock blocks remain
+full matrices. The target is the raw projection of the original Boys orbital;
+the partner weight is formed from the raw projections of its strong partners
+into that host frame. The fitted `B` must not be fitted again by the solver.
+
+### Optional extension build
+
+Use one activated Python environment supplying PySCFAD and pybind11, with
+Armadillo (including its BLAS/LAPACK dependencies), CMake, and an OpenMP C++
+compiler available through the environment or cluster modules. From the
+repository root:
+
+```bash
+cmake -S pyscfad/dlno_stc/cpp -B build/dlno_stc \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DPython_EXECUTABLE="$(command -v python)" \
+  -Dpybind11_DIR="$(python -m pybind11 --cmakedir)" \
+  -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="$PWD/pyscfad/dlno_stc"
+cmake --build build/dlno_stc -j 4
+python -c 'from pyscfad.dlno_stc import _stc_mp2; print(_stc_mp2.__file__); assert hasattr(_stc_mp2, "solve_full")'
+```
+
+This builds an optional module for an editable checkout. Ordinary package
+imports work without it; requesting the native backend without a usable module
+raises a build instruction. No compilation or downloads occur during import.
+The target uses Armadillo's normal linkage and needs no Q-Chem or MPI libraries.
+Ensure the dynamic loader can find Armadillo's shared dependencies when using
+a nonstandard library prefix (`LD_LIBRARY_PATH` on Linux). Build products are
+ignored by git; this recipe does not add wheel packaging.
+
+For nested threading, start with `OMP_NUM_THREADS=2`,
+`OMP_MAX_ACTIVE_LEVELS=1`, `OPENBLAS_NUM_THREADS=1`, and `MKL_NUM_THREADS=1`.
+Increase threads only after checking the workload and allocated CPU resources.
+
+The native kernels parallelize exact contractions and sampling with exclusive
+output-column ownership. Full-system pair derivatives use occupied-pair
+symmetry; projected-domain contractions reduce private one-target adjoints.
+Integral dressing uses the packed occupied matrix and contiguous virtual
+blocks, and its reverse reuses the point's integral-adjoint buffer. With these
+outer OpenMP loops, use one BLAS thread per worker to avoid nested pools.
+
+Kept-set matrix products use up to 64 MiB of workspace per occupied worker;
+larger pairs fall back to tiles bounded by `virtual_block_size`. There are no
+complete integral-gradient replicas per worker. Sampled updates use fixed
+1024-draw batches, with at most eight batches resident, independent of the
+production sample count. Batch streams are independent of the OpenMP team
+size; restoring this batching changes stochastic realizations relative to
+the earlier serial stream. Floating-point reduction order can still change
+slightly with the number of workers. Memory guards include worker scratch.
+
+### Calling the driver
+
+The caller supplies a converged real restricted closed-shell DF reference and
+fixed `DomainSelections` from the existing `pyscfad.dlno` construction:
+
+```python
+from pyscfad.dlno_stc.driver import kernel, value_and_grad
+from pyscfad.dlno_stc.controls import default_laplace_grid, DEFAULT_ENERGY_TOLERANCE
+
+roots, weights = default_laplace_grid()
+controls = {
+    "mode": "stochastic",
+    "energy_tolerance": DEFAULT_ENERGY_TOLERANCE,  # Eh; 0.3 mHa total
+    "laplace_roots": roots,       # explicit nonnegative float64 quadrature
+    "laplace_weights": weights,   # same length, finite
+    "virtual_block_size": 64,
+    "auxiliary_group_size": 32,
+    "global_seed": 713,
+}
+e_corr = kernel(mf, static, controls=controls)
+energy, mol_bar = value_and_grad(
+    mol, build_mf, static, controls=controls, include_hf=True,
+)
+gradient = mol_bar.coords  # Eh/bohr
+```
+
+`static` must contain a complete singleton Boys partition, an explicit frozen
+setting, and compatible fixed atom, partner, and rank selections. Select PAO
+anchors from concrete common data before tracing each preparation. The driver
+does this automatically; the selected indices are fixed while their continuous
+orbital coefficients remain differentiated.
+
+Nuclear gradients require `mol.build(trace_exp=False, trace_ctr_coeff=False)`
+and no traced `r0` leaf. The local integral-direct reverse currently requires
+a positive-definite auxiliary Coulomb metric. The driver requires the supported
+direct transformation helper and rejects the compatibility fallback that would
+cache local AO-pair CDERI. An empty retained virtual space contributes zero
+energy and bars.
+
+The clean energy/gradient drivers use the original six-point fixed Laplace
+roots and weights returned by `default_laplace_grid()`, scaled by 2.6. The
+high-level API also supplies this grid when both grid fields are omitted;
+explicit custom grids remain supported for validation and low-level calls.
+
+For sampling, set `mode="stochastic"`. High-level `kernel` and `value_and_grad`
+default to adaptive sampling with `energy_tolerance=3e-4` Eh (0.3 mHa) when
+neither a tolerance nor `production_samples` is supplied. An explicit
+`production_samples` retains fixed-count sampling. The whole-system solve
+receives the total tolerance unchanged. For domain scope, each strong domain
+solve receives `energy_tolerance / n_d`, where `n_d` counts strong domain
+specifications only; native weak terms do not consume this budget. The driver
+logs the total and per-domain budgets and preserves the caller's controls.
+
+The adaptive tolerance must be positive and finite. It is a statistical energy
+standard-error target estimated from pilot samples, not an accuracy guarantee.
+Production sampling has no default cap: the pilot's allocation is rounded up,
+with at least 10,000 draws per active adaptive residual. Unrepresentable
+allocations raise an overflow error instead of silently truncating the budget.
+`max_production_samples` is an optional explicit limit (`0`, or omitting it,
+means uncapped); an explicit limit can leave uncertainty above the target.
+Pilots default to 100,000 draws. Whole-system adaptive sampling follows the
+collaborator's trace-based Laplace variance budgets and refines difficult pilots
+to 1,000,000 total draws before allocation. Domain sampling retains equal
+Laplace-point budgets and a single pilot. Explicit `pilot_samples` and
+`min_production_samples` override their defaults; explicit `production_samples`
+retains fixed-count behavior. Sampling and cotangent updates remain bounded
+in eight batches of 1,024 draws, independent of the total production count.
+Native diagnostics include weighted point budgets, actual production counts,
+the explicit limit, and pilot refinement seeds when used. Timing uses the
+current batched sampler, and proposals and random streams remain those of this
+implementation, so allocation policies agree without identical realizations.
+Quadrature bias and gradient uncertainty are separate. `virtual_keep_fraction`
+chooses the fraction of virtual columns evaluated exactly; alternatively use
+the norm-based `workload_cutoff`. Residuals exhaust the remaining index space,
+so this choice changes computational work rather than the physical energy.
+`auxiliary_group_size` partitions the actual fitted `B` rows into contiguous
+computational groups. Both direct and exchange sampling variances contribute
+to the logged energy standard error. Production counts are positive in both
+energy-only and gradient calls, including zero-energy cases with nonzero bars.
+Forward and reverse use the same production realization and frozen proposals.
+
+With a supplied communicator, every rank estimates a complete independent
+replica of each domain. Energy and all five bars are averaged; standard errors
+combine as `sqrt(sum(sigma_r**2))/nranks`. Root owns molecular preparation and
+pullbacks and returns the public result; workers return `None`. All ranks must
+call the same driver entry point. Per-domain and per-replica energy errors
+combine into a logged total stochastic energy error, which does not bound
+gradient uncertainty. Laplace quadrature error is a separate systematic error
+and must be checked for the actual denominator range.
+
+### Water-tetramer validation
+
+`examples/dlno_stc/water_tetramer.py` reuses the supplied water-4 geometry,
+cc-pVTZ settings, SCF checkpoint, and DF data. It checks all 16 finite-domain
+dimensions and selections, includes all 24 weak pairs, and compares correlation
+energy, total energy, and all 36 gradient components with the native reference.
+The runner generates that reference with the current native DLNO code. The
+supplied September 30 saved run predates the October 2 weak-multipole sign and
+prefactor correction, so its weak energy and gradient are historical values.
+The original fixture and selections are read without modifying them.
+Its explicit 40-point Gauss-Laguerre grid uses a fixed scale of 5.5; the runner
+reports inverse-denominator and derivative quadrature errors over the actual
+local spectral range. This grid is specific to the validation fixture.
+
+```bash
+OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  python -u examples/dlno_stc/water_tetramer.py \
+  --reference-dir /path/to/dlno_stc_test/water_tetramer \
+  --selections-dir /path/to/dlno_stc_test/forward/run_water4_boys \
+  --output-dir output/dlno_stc_water_tetramer
+```
+
+Omit `--selections-dir` to rebuild the fixed selections using the saved
+reference parameters. Add `--energy-only` for a forward check. The same command
+can run under `mpiexec -n 2`; root performs molecular AD. Outputs include
+`validation.json`, `results.npz`, and `native_reference.npz` with a companion
+provenance JSON. Reuse the freshly generated native baseline with
+`--native-reference output/dlno_stc_water_tetramer/native_reference.npz`;
+the runner checks fixed selections, geometry, native Python source fingerprints,
+and the current HF energy before accepting it. `--mode stochastic` reports deviations and
+the driver's sampling diagnostics without applying deterministic tolerances.
+
+With the supplied finite cc-pVTZ fixture (`frozen=4`), deterministic validation
+against current native code gives correlation energy `-1.0663636080910655` Eh
+and total energy `-305.28029303807926` Eh. The total-energy difference is
+`1.14e-13` Eh and the largest gradient difference is `9.46e-12` Eh/bohr.
+
+The previous three-tensor packet APIs below remain available for their live
+diagnostic/export callers. Their finite packet scalar omits the two projection
+inputs and therefore has a different derivative contract.
 
 `dlno_stc` exchanges one local `foo`, `fvv`, `B` problem at a time,
 accepts an external scalar energy and three unit-seed tensor cotangents, and

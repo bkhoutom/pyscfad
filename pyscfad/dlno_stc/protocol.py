@@ -15,6 +15,9 @@ ENERGY_KINDS = frozenset((
     "finite_three_tensor_v1",
 ))
 ARRAY_NAMES = ("foo", "fvv", "B")
+WEIGHTED_ARRAY_NAMES = (
+    "foo", "fvv", "B", "target_projection", "partner_weight",
+)
 _IDENTITY_FIELDS = (
     "schema_version", "method", "energy_kind", "fragment_id", "target_index",
     "basis_frame", "B_axes",
@@ -287,3 +290,75 @@ def check_replay(replayed, saved, *, rtol=1e-9, atol=1e-11):
             a, b = np.asarray(current[slices]), np.asarray(reference[slices])
             if not np.isfinite(a).all() or not np.isfinite(b).all() or not np.allclose(a, b, rtol=rtol, atol=atol):
                 raise ValueError(f"replay mismatch: {name} changed in its local frame")
+
+
+def _validate_memory_inputs(inputs, names):
+    """Check real tensors without any legacy packet metadata."""
+    _check_mapping(inputs, "inputs")
+    if set(inputs) != set(names):
+        raise ValueError("inputs must contain exactly " + ", ".join(names))
+    for name, value in inputs.items():
+        if not hasattr(value, "shape") or not hasattr(value, "dtype"):
+            raise ValueError(f"{name} must be a float64 array")
+    foo, fvv, B = (inputs[name] for name in ARRAY_NAMES)
+    if len(foo.shape) != 2 or len(fvv.shape) != 2 or len(B.shape) != 3:
+        raise ValueError("input shape ranks must be foo(oo), fvv(vv), B(Pia)")
+    nocc, nvir = foo.shape[0], fvv.shape[0]
+    if nocc == 0:
+        if names == WEIGHTED_ARRAY_NAMES:
+            raise ValueError("weighted inputs require a nonempty occupied space")
+        raise ValueError("empty occupied space is a host-side no-work case")
+    _check_array(foo, "foo", (nocc, nocc), symmetric=True)
+    _check_array(fvv, "fvv", (nvir, nvir), symmetric=True)
+    _check_array(B, "B", (B.shape[0], nocc, nvir))
+    return nocc
+
+
+def validate_full_inputs(inputs):
+    """Validate the three-array real float64 whole-system boundary."""
+    _validate_memory_inputs(inputs, ARRAY_NAMES)
+
+
+def validate_weighted_inputs(inputs):
+    """Validate five in-memory arrays; empty virtual spaces are valid."""
+    nocc = _validate_memory_inputs(inputs, WEIGHTED_ARRAY_NAMES)
+    _check_array(inputs["target_projection"], "target_projection", (1, nocc))
+    _check_array(inputs["partner_weight"], "partner_weight",
+                 (nocc, nocc), symmetric=True)
+
+
+def _validate_memory_result(result, inputs, names, *, with_grad):
+    _check_mapping(result, "result")
+    for name in ("energy", "energy_standard_error", "diagnostics"):
+        if name not in result:
+            raise ValueError(f"result missing {name}")
+    for name in ("energy", "energy_standard_error"):
+        value = np.asarray(result[name])
+        if (value.shape != () or value.dtype != np.dtype("float64")
+                or not np.isfinite(value)):
+            raise ValueError(f"{name} must be a finite float64 scalar")
+        if name == "energy_standard_error" and value < 0:
+            raise ValueError("energy_standard_error must be nonnegative")
+    _check_mapping(result["diagnostics"], "diagnostics")
+    cotangents = result.get("cotangents")
+    if not with_grad and (cotangents is None or
+                          isinstance(cotangents, dict) and not cotangents):
+        return
+    _check_mapping(cotangents, "cotangents")
+    if set(cotangents) != set(names):
+        raise ValueError("cotangents must contain exactly " + ", ".join(names))
+    for name in names:
+        _check_array(cotangents[name], name + " cotangent", inputs[name].shape,
+                     symmetric=name in ("foo", "fvv", "partner_weight"))
+
+
+def validate_full_result(result, inputs, *, with_grad=True):
+    """Check whole-system energy and its three unit-seed numerical bars."""
+    validate_full_inputs(inputs)
+    _validate_memory_result(result, inputs, ARRAY_NAMES, with_grad=with_grad)
+
+
+def validate_weighted_result(result, inputs, *, with_grad=True):
+    """Check weighted energy and its five unit-seed numerical bars."""
+    validate_weighted_inputs(inputs)
+    _validate_memory_result(result, inputs, WEIGHTED_ARRAY_NAMES, with_grad=with_grad)

@@ -5,7 +5,7 @@ import math
 import jax
 from pyscfad import numpy as np
 
-from .protocol import check_replay
+from .protocol import check_replay, validate_full_result, validate_weighted_result
 
 
 def pullback_inputs(prepare_fn, primals, saved_inputs, result, *,
@@ -33,3 +33,36 @@ def pullback_inputs(prepare_fn, primals, saved_inputs, result, *,
         for name in replayed
     }
     return vjp(cotangents)
+
+
+def _apply_preparation_pullback(pullback, inputs, result, validate, energy_bar):
+    """Apply unit-seed bars to an already-created preparation VJP.
+
+    ``inputs`` is the differentiable output returned alongside ``pullback`` by
+    ``jax.vjp``. Cast host bars to those output dtypes before applying the
+    scalar seed; the existing pullback preserves its primal tree and dtypes.
+    This immediate path neither rebuilds preparation nor replays a packet.
+    """
+    seed = np.asarray(energy_bar)
+    if seed.shape != ():
+        raise ValueError("energy_bar must be a scalar")
+    if not math.isfinite(float(seed)):
+        raise ValueError("energy_bar must be finite")
+    validate(result, inputs)
+    cotangents = {
+        name: np.asarray(result["cotangents"][name], dtype=value.dtype) * seed
+        for name, value in inputs.items()
+    }
+    return pullback(cotangents)
+
+
+def apply_weighted_pullback(pullback, inputs, result, *, energy_bar=1.0):
+    """Apply all five bars to one saved weighted preparation VJP."""
+    return _apply_preparation_pullback(pullback, inputs, result,
+                                       validate_weighted_result, energy_bar)
+
+
+def apply_full_pullback(pullback, inputs, result, *, energy_bar=1.0):
+    """Apply three bars to one saved whole-system preparation VJP."""
+    return _apply_preparation_pullback(pullback, inputs, result,
+                                       validate_full_result, energy_bar)

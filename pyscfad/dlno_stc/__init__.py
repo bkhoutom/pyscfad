@@ -14,17 +14,18 @@ __all__ = [
 ]
 
 
-def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None):
+def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
+           lo_kwargs=None):
     """Run in-memory domain or whole-system STC correlation energy."""
     from .driver import kernel as weighted_kernel
     return weighted_kernel(mf, static, scope=scope, frozen=frozen,
-                           controls=controls, comm=comm)
+                           controls=controls, comm=comm, lo_kwargs=lo_kwargs)
 
 
 def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
-                   controls, comm=None, include_hf=False):
+                   controls, comm=None, include_hf=False, lo_kwargs=None):
     """Run domain or whole-system coordinate energy and gradient."""
     from .driver import value_and_grad as weighted_value_and_grad
     return weighted_value_and_grad(mol, build_mf, static, scope=scope, frozen=frozen,
                                    controls=controls,
-                                   comm=comm, include_hf=include_hf)
+                                   comm=comm, include_hf=include_hf, lo_kwargs=lo_kwargs)

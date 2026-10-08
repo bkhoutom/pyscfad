@@ -29,7 +29,10 @@ from . import backend
 from ._workflow import check_system_memory, check_weighted_memory
 from .adjoint import apply_full_pullback, apply_weighted_pullback
 from .controls import DEFAULT_ENERGY_TOLERANCE, default_laplace_grid
-from .domain import select_virtual_anchor_columns
+from .domain import (
+    select_system_boys_reference, select_system_virtual_anchor_columns,
+    select_virtual_anchor_columns,
+)
 from .parallel import run_backend
 from .prepare import prepare_system_inputs, prepare_weighted_inputs
 from .protocol import ARRAY_NAMES, WEIGHTED_ARRAY_NAMES
@@ -75,7 +78,7 @@ def _validate_static(static):
             raise ValueError("strong partner selections disagree with strong_mask")
 
 
-def _driver_controls(controls):
+def _driver_controls(controls, *, scope=None):
     """Copy root-owned options and apply high-level defaults before preparation."""
     if not isinstance(controls, dict):
         raise TypeError("controls must be a dictionary")
@@ -85,12 +88,19 @@ def _driver_controls(controls):
     if controls.get("mode", "deterministic") == "stochastic" and "production_samples" not in controls:
         controls.setdefault("energy_tolerance", DEFAULT_ENERGY_TOLERANCE)
     _validate_controls(controls)
+    if controls.get("canonical_fock", False):
+        raise ValueError(
+            "high-level STC uses full local Fock blocks; canonical_fock=True "
+            "is reserved for low-level canonical reference calculations"
+        )
     return controls
 
 
 def _validate_controls(controls):
     if not isinstance(controls, dict):
         raise TypeError("controls must be a dictionary")
+    if "canonical_fock" in controls and not isinstance(controls["canonical_fock"], bool):
+        raise TypeError("canonical_fock must be a bool")
     for name in ("laplace_roots", "laplace_weights"):
         if name not in controls:
             raise ValueError(f"controls must supply {name}")
@@ -197,9 +207,8 @@ def _finish(state, *, with_grad, include_hf):
 def _finish_response(state, energy, mf_bar, *, include_hf):
     """Add HF once, then apply the single implicit SCF response."""
     if include_hf:
-        hf_energy, hf_pullback = jax.vjp(lambda mf_: mf_.e_tot, state["mf"])
-        hf_bar, = hf_pullback(np.ones((), dtype=hf_energy.dtype))
-        mf_bar = jax.tree_util.tree_map(_add_cotangent, mf_bar, hf_bar)
+        hf_energy = state["mf"].e_tot
+        mf_bar.e_tot = _add_cotangent(mf_bar.e_tot, np.ones_like(hf_energy))
         energy = energy + hf_energy
     mol_bar, = state["scf_pullback"](mf_bar)
     jax.block_until_ready((energy, mol_bar))
@@ -263,20 +272,22 @@ def _run_domain(initializer, static, controls, comm, *, with_grad, include_hf=Fa
                                                 include_hf=include_hf), "final response")
 
 
-def _select_scope(static, scope, frozen):
+def _select_scope(static, scope, frozen, lo_kwargs=None):
     """Validate root-owned call options before any scientific scope branch."""
     if scope not in ("domain", "system"):
         raise ValueError("scope must be domain or system")
     if scope == "domain" and frozen is not None:
         raise ValueError("domain frozen setting must come from static; frozen must be None")
+    if scope == "domain" and lo_kwargs is not None:
+        raise ValueError("domain localization options must come from static.lo_kwargs")
     if scope == "system" and static is not None:
         raise ValueError("system scope requires static=None")
     return scope
 
 
-def _shared_scope(static, scope, frozen, comm):
+def _shared_scope(static, scope, frozen, comm, lo_kwargs=None):
     rank = 0 if comm is None else comm.Get_rank()
-    selected = _root_call(comm, rank, lambda: _select_scope(static, scope, frozen),
+    selected = _root_call(comm, rank, lambda: _select_scope(static, scope, frozen, lo_kwargs),
                           "scope selection")
     return selected if comm is None else comm.bcast(selected, root=0)
 
@@ -316,25 +327,52 @@ def _system_active_indices(mf, frozen):
     return occupied, virtual
 
 
-def _initialize_scf(mol, build_mf):
+def _initialize_scf(mol, build_mf, *, fix_phases=True):
     """Build one implicit SCF VJP shared by both correlation scopes."""
     _coordinate_only(mol)
     if not callable(build_mf):
         raise TypeError("build_mf must be callable")
     with (config_update("pyscfad_scf_implicit_diff", True),
           config_update("pyscfad_scf_first_order_custom", False)):
-        return jax.vjp(lambda mol_: _fix_restart_mo_phases(build_mf(mol_)), mol)
+        build = (lambda mol_: _fix_restart_mo_phases(build_mf(mol_))) if fix_phases else build_mf
+        return jax.vjp(build, mol)
 
 
-def _initialize_system(mf, frozen, controls, *, with_grad, scf_pullback=None):
+def _initialize_system(mf, frozen, controls, *, with_grad, scf_pullback=None, lo_kwargs=None):
     _validate_controls(controls)
     occupied, virtual = _system_active_indices(mf, frozen)
     dtype = mf.mo_coeff.dtype
     return {"mf": mf, "occupied": occupied, "virtual": virtual,
+            "lo_kwargs": lo_kwargs,
             "scf_pullback": scf_pullback, "energy": np.zeros((), dtype=dtype),
             "variance": 0.0,
             "mf_bar": (_zero_mf_cotangent(mf, dtype)
                        if with_grad and not (len(occupied) and len(virtual)) else None)}
+
+
+def _validate_canonical_system(mf):
+    """Validate the converged canonical eigenproblem outside the AD tape."""
+    coeff = numpy.asarray(mf.mo_coeff)
+    energies = numpy.asarray(mf.mo_energy)
+    if energies.shape != (coeff.shape[1],) or not numpy.isfinite(energies).all():
+        raise ValueError("canonical_fock requires finite canonical orbital energies")
+    fock = numpy.asarray(mf.get_fock())
+    residual = float(numpy.max(numpy.abs(coeff.T @ fock @ coeff - numpy.diag(energies))))
+    grad_tolerance = mf.conv_tol_grad
+    if grad_tolerance is None:
+        energy_tolerance = float(mf.conv_tol)
+        if not math.isfinite(energy_tolerance) or energy_tolerance <= 0:
+            raise ValueError("canonical_fock requires a finite positive SCF energy tolerance")
+        grad_tolerance = math.sqrt(energy_tolerance)
+    grad_tolerance = float(grad_tolerance)
+    if not math.isfinite(grad_tolerance) or grad_tolerance <= 0:
+        raise ValueError("canonical_fock requires a finite positive SCF gradient tolerance")
+    residual_limit = max(1e-7, grad_tolerance)
+    if not numpy.isfinite(residual) or residual > residual_limit:
+        raise ValueError(
+            "canonical_fock requires canonical SCF orbitals and matching energies; "
+            f"max |C.T F C - diag(eps)| = {residual:.3g} Eh "
+            f"exceeds {residual_limit:.3g} Eh")
 
 
 def _validate_system_metric(mf):
@@ -363,7 +401,19 @@ def _prepare_system(state, controls, with_grad):
                         virtual_block_size=controls.get("virtual_block_size", 16),
                         auxiliary_group_size=controls.get("auxiliary_group_size", 32))
     _validate_system_metric(state["mf"])
-    prepare = lambda mf_: prepare_system_inputs(mf_, state["occupied"], state["virtual"])
+    # Save discrete labels before building the VJP; rebuild all continuous
+    # coefficients inside it. System scope needs no domain selections.
+    state["boys_reference"] = select_system_boys_reference(
+        state["mf"], state["occupied"], lo_kwargs=state["lo_kwargs"],
+    )
+    state["virtual_anchor_columns"] = select_system_virtual_anchor_columns(
+        state["mf"], state["virtual"],
+    )
+    prepare = lambda mf_: prepare_system_inputs(
+        mf_, state["occupied"], state["virtual"],
+        boys_reference=state["boys_reference"],
+        virtual_anchor_columns=state["virtual_anchor_columns"],
+    )
     with warnings.catch_warnings():
         warnings.filterwarnings("error", message="integral-direct local Lov is unavailable.*",
                                 category=RuntimeWarning)
@@ -395,7 +445,9 @@ def _run_system(initializer, controls, comm, *, with_grad, include_hf=False):
 
         def apply_system():
             if with_grad:
-                state["mf_bar"], = apply_full_pullback(prepared[2], prepared[0], result)
+                # Validate the existing host mirror without compiling many
+                # bounded JAX slices solely for repeated finite-value checks.
+                state["mf_bar"], = apply_full_pullback(prepared[2], prepared[1], result)
             state["energy"] = state["energy"] + result["energy"]
             state["variance"] = float(result["energy_standard_error"]) ** 2
             jax.block_until_ready((state["energy"], state["mf_bar"]))
@@ -409,17 +461,20 @@ def _run_system(initializer, controls, comm, *, with_grad, include_hf=False):
                                                     include_hf=include_hf), "final response")
 
 
-def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None):
+def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
+           lo_kwargs=None):
     """Return domain or whole-system correlation energy on root."""
-    scope = _shared_scope(static, scope, frozen, comm)
+    scope = _shared_scope(static, scope, frozen, comm, lo_kwargs)
     rank = 0 if comm is None else comm.Get_rank()
-    controls = _root_call(comm, rank, lambda: _driver_controls(controls), "control validation")
+    controls = _root_call(comm, rank, lambda: _driver_controls(controls, scope=scope),
+                          "control validation")
 
     def initialize():
         if _contains_tracer(mf):
             raise TypeError("STC kernel is forward-only; use value_and_grad")
         if scope == "system":
-            return _initialize_system(mf, frozen, controls, with_grad=False)
+            return _initialize_system(mf, frozen, controls, with_grad=False,
+                                      lo_kwargs=lo_kwargs)
         return _initialize(mf, static, controls, with_grad=False)
 
     if scope == "system":
@@ -428,16 +483,21 @@ def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None)
 
 
 def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
-                   controls, comm=None, include_hf=False):
+                   controls, comm=None, include_hf=False, lo_kwargs=None):
     """Return ``(energy, mol_bar)`` on root; worker ranks return ``None``.
 
-    Numerical selections and the Laplace grid are fixed. Coordinate response
-    includes the full Fock matrices, orbitals, direct DF factors and SCF.
+    Discrete selections and the Laplace grid are fixed. System scope fixes
+    Boys reference labels and complete PAO virtual anchors, while coordinate
+    response includes localization, projections, Cholesky orthonormalization,
+    full Fock blocks, fitted factors and SCF.
+    System ``lo_kwargs`` are passed to the shared Boys localization; domain
+    calls take their saved localization options from ``static``.
     Stochastic energy uncertainty does not bound gradient uncertainty.
     """
-    scope = _shared_scope(static, scope, frozen, comm)
+    scope = _shared_scope(static, scope, frozen, comm, lo_kwargs)
     rank = 0 if comm is None else comm.Get_rank()
-    controls = _root_call(comm, rank, lambda: _driver_controls(controls), "control validation")
+    controls = _root_call(comm, rank, lambda: _driver_controls(controls, scope=scope),
+                          "control validation")
 
     def initialize():
         _coordinate_only(mol)
@@ -447,7 +507,7 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
         mf, scf_pullback = _initialize_scf(mol, build_mf)
         if scope == "system":
             return _initialize_system(mf, frozen, controls, with_grad=True,
-                                      scf_pullback=scf_pullback)
+                                      scf_pullback=scf_pullback, lo_kwargs=lo_kwargs)
         return _initialize(mf, static, controls, with_grad=True,
                            scf_pullback=scf_pullback)
 

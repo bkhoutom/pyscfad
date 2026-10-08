@@ -170,6 +170,15 @@ def _boys(x, mol, mo_coeff, *,
     if max_cycle is not None:
         loc.max_cycle = max_cycle
 
+    # CIAH tests squared trial-vector norms and augmented-Hessian changes
+    # against absolute cutoffs. Tight outer tolerances require smaller inner
+    # cutoffs, or near-converged replay can discard every remaining step.
+    grad_tol = (loc.conv_tol_grad if loc.conv_tol_grad is not None
+                else numpy.sqrt(loc.conv_tol * .1))
+    inner_tol = .01 * grad_tol ** 2
+    loc.ah_conv_tol = min(loc.ah_conv_tol, inner_tol)
+    loc.ah_lindep = min(loc.ah_lindep, inner_tol)
+
     if init_guess is None:
         u, sorted_idx = loc.kernel(mo_coeff=mo_coeff, return_u=True)
     else:

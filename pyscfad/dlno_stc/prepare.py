@@ -2,6 +2,7 @@
 
 import jax
 import numpy
+from functools import partial
 
 from pyscfad import numpy as np
 from pyscfad.lno import df as lno_df
@@ -10,6 +11,7 @@ from .domain import (
     _build_local_strong_ed_domain_and_anchors,
     _validate_virtual_anchor_columns,
     build_local_strong_ed_domain,
+    build_system_local_frame,
     build_stc_domain,
     select_virtual_anchor_columns,
 )
@@ -122,16 +124,23 @@ def prepare_weighted_inputs(
     return inputs
 
 
-def prepare_system_inputs(mf, active_occ_indices, active_vir_indices):
-    """Project full Fock blocks and reuse global fitted factors in active MOs.
+def prepare_system_inputs(
+    mf, active_occ_indices, active_vir_indices, *, boys_reference=None,
+    virtual_anchor_columns=None,
+):
+    """Project full Fock blocks and fitted factors into one complete local frame.
 
-    Concrete active indices are selected before tracing. Attached out-of-core
-    factors and their orbital-coefficient response are streamed without
-    reconstructing the AO-pair tensor. References without fitted factors
-    retain the integral-direct path, which does not build a new DF leaf.
+    Active occupied Boys orbitals and complete PAO-derived active virtuals use
+    fixed reference labels and AO anchors selected before tracing. Their
+    current continuous coefficients remain in the preparation graph. Attached
+    out-of-core factors and their response are streamed without reconstructing
+    the AO-pair tensor; the integral-direct fallback does not build a DF leaf.
     """
-    co = mf.mo_coeff[:, active_occ_indices]
-    cv = mf.mo_coeff[:, active_vir_indices]
+    frame = build_system_local_frame(
+        mf, active_occ_indices, active_vir_indices, boys_reference=boys_reference,
+        virtual_anchor_columns=virtual_anchor_columns,
+    )
+    co, cv = frame.occupied_coeff, frame.virtual_coeff
     get_cderi = getattr(mf.with_df, "_get_cderi_source", None)
     cderi = get_cderi() if get_cderi is not None else mf.with_df._cderi
     if cderi is None:
@@ -149,3 +158,38 @@ def prepare_system_inputs(mf, active_occ_indices, active_vir_indices):
         "fvv": _symmetric_fock_block(fock, cv),
         "B": B.reshape((-1, nocc, nvir)),
     }
+
+
+@partial(jax.jit, static_argnums=(2, 3))
+def _canonical_system_space(coeff, energies, occupied, virtual):
+    """Fuse active-column selection and diagonal canonical Fock blocks."""
+    active = numpy.asarray(occupied + virtual, dtype=numpy.int32)
+    return (coeff[:, active], np.diag(energies[numpy.asarray(occupied)]),
+            np.diag(energies[numpy.asarray(virtual)]))
+
+
+def prepare_canonical_system_inputs(mf, active_occ_indices, active_vir_indices):
+    """Prepare a validated canonical SCF frame using orbital-energy response.
+
+    This is a reference path for deterministic frame-invariance checks, not
+    production system preparation. Along the canonical SCF solution curve
+    C.T F C = diag(eps); off-diagonal projected
+    Fock derivatives vanish after the complete orbital/SCF chain rule. General
+    orbital frames and independent Fock/coefficient variations must use
+    prepare_system_inputs instead.
+    """
+    occupied = tuple(int(i) for i in active_occ_indices)
+    virtual = tuple(int(i) for i in active_vir_indices)
+    nocc, nvir = len(occupied), len(virtual)
+    coeff, foo, fvv = _canonical_system_space(
+        mf.mo_coeff, mf.mo_energy, occupied, virtual)
+    get_cderi = getattr(mf.with_df, "_get_cderi_source", None)
+    cderi = get_cderi() if get_cderi is not None else mf.with_df._cderi
+    if cderi is None:
+        B = lno_df.get_local_Lov(
+            mf, coeff, nocc, numpy.arange(mf.mol.natm, dtype=numpy.int32),
+            integral_direct=True)
+    else:
+        B = lno_df.transform_df_to_mo(
+            mf, coeff, (0, nocc, nocc, nocc + nvir), atmlst=None)
+    return {"foo": foo, "fvv": fvv, "B": B.reshape((-1, nocc, nvir))}

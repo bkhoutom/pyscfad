@@ -11,7 +11,7 @@ from pyscf import df as pyscf_df
 from pyscfad import config_update, df, gto, scf
 from pyscfad import numpy as adnp
 from pyscfad.df import _cderi_vjp, incore
-from pyscfad.dlno_stc import prepare
+from pyscfad.dlno_stc import domain, prepare
 from pyscfad.lno import _df_direct, _df_outcore
 from pyscfad.lno import df as lno_df
 
@@ -25,6 +25,10 @@ def reference():
     mol = gto.Mole(atom="O 0 0 0; H 0.1 -0.75 0.57; H 0 0.8 0.61",
                    basis="sto-3g", verbose=0, max_memory=3000)
     mol.build(trace_exp=False, trace_ctr_coeff=False)
+    # DFMP2's in-core guard counts unrelated JAX caches accumulated by the
+    # full test suite. This seven-AO reference always fits in memory; keep
+    # its tiny oracle independent of the process-wide cache footprint.
+    mol.incore_anyway = True
     mf = scf.RHF(mol).density_fit(auxbasis="weigend")
     mf.conv_tol = 1e-12
     mf.conv_tol_grad = 1e-9
@@ -40,10 +44,28 @@ def _holder(mol, coeff, with_df):
                            get_fock=lambda: adnp.eye(mol.nao))
 
 
-def _direct_B(mol, coeff):
+def _frame_selections(mf):
+    # Select the discrete Boys branch and PAO anchors before either VJP.
+    return {
+        "boys_reference": domain.select_system_boys_reference(mf, OCCUPIED),
+        "virtual_anchor_columns": domain.select_system_virtual_anchor_columns(
+            mf, VIRTUAL,
+        ),
+    }
+
+
+def _direct_B(mol, coeff, *, boys_reference, virtual_anchor_columns):
     with_df = df.DF(mol, auxbasis="weigend")
     holder = _holder(mol, coeff, with_df)
-    active_coeff = adnp.concatenate((coeff[:, OCCUPIED], coeff[:, VIRTUAL]), axis=1)
+    # This oracle tests fitted-factor reuse in the tracked local frame; the
+    # independent local-frame tests cover the localization itself.
+    frame = domain.build_system_local_frame(
+        holder, OCCUPIED, VIRTUAL, boys_reference=boys_reference,
+        virtual_anchor_columns=virtual_anchor_columns,
+    )
+    active_coeff = adnp.concatenate(
+        (frame.occupied_coeff, frame.virtual_coeff), axis=1,
+    )
     return lno_df.get_local_Lov(
         holder, active_coeff, len(OCCUPIED), np.arange(mol.natm),
         integral_direct=True,
@@ -58,7 +80,10 @@ def _cotangent(B):
 def test_system_outcore_cache_preserves_factors_coordinate_and_coefficient_vjps(
         reference, tmp_path, monkeypatch):
     mol, coeff = reference.mol, reference.mo_coeff
-    expected, direct_pullback = jax.vjp(_direct_B, mol, coeff)
+    frame_selections = _frame_selections(reference)
+    expected, direct_pullback = jax.vjp(
+        lambda m, c: _direct_B(m, c, **frame_selections), mol, coeff,
+    )
     B_bar = _cotangent(expected)
     expected_mol_bar, expected_coeff_bar = direct_pullback(B_bar)
 
@@ -71,6 +96,7 @@ def test_system_outcore_cache_preserves_factors_coordinate_and_coefficient_vjps(
         with_df.attach_outcore_cderi(source)
         return prepare.prepare_system_inputs(
             _holder(mol_, coeff_, with_df), OCCUPIED, VIRTUAL,
+            **frame_selections,
         )["B"]
 
     def forbidden_regeneration(*args, **kwargs):
@@ -147,7 +173,10 @@ def test_system_outcore_cache_preserves_factors_coordinate_and_coefficient_vjps(
 
 def test_system_incore_cache_preserves_factors_and_coefficient_vjp(reference, monkeypatch):
     mol, coeff = reference.mol, reference.mo_coeff
-    expected, direct_pullback = jax.vjp(lambda c: _direct_B(mol, c), coeff)
+    frame_selections = _frame_selections(reference)
+    expected, direct_pullback = jax.vjp(
+        lambda c: _direct_B(mol, c, **frame_selections), coeff,
+    )
     B_bar = _cotangent(expected)
     expected_coeff_bar, = direct_pullback(B_bar)
     source = reference.with_df._cderi
@@ -160,6 +189,7 @@ def test_system_incore_cache_preserves_factors_and_coefficient_vjp(reference, mo
     def cached_B(coeff_):
         return prepare.prepare_system_inputs(
             _holder(mol, coeff_, reference.with_df), OCCUPIED, VIRTUAL,
+            **frame_selections,
         )["B"]
 
     actual, pullback = jax.vjp(cached_B, coeff)
@@ -172,7 +202,10 @@ def test_system_incore_cache_preserves_factors_and_coefficient_vjp(reference, mo
 
 def test_system_without_global_cache_preserves_direct_factor_response(reference):
     mol, coeff = reference.mol, reference.mo_coeff
-    expected, direct_pullback = jax.vjp(_direct_B, mol, coeff)
+    frame_selections = _frame_selections(reference)
+    expected, direct_pullback = jax.vjp(
+        lambda m, c: _direct_B(m, c, **frame_selections), mol, coeff,
+    )
     B_bar = _cotangent(expected)
     expected_mol_bar, expected_coeff_bar = direct_pullback(B_bar)
 
@@ -180,6 +213,7 @@ def test_system_without_global_cache_preserves_direct_factor_response(reference)
         with_df = df.DF(mol_, auxbasis="weigend")
         result = prepare.prepare_system_inputs(
             _holder(mol_, coeff_, with_df), OCCUPIED, VIRTUAL,
+            **frame_selections,
         )["B"]
         # A trace-safe no-cache fallback must not build a new AO-factor leaf.
         assert with_df._get_cderi_source() is None

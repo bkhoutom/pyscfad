@@ -46,6 +46,12 @@ def test_public_options_are_explicit_before_reference_use():
             dlno_stc.kernel(None, controls=_controls(), **options)
 
 
+def test_system_canonical_shortcut_cannot_bypass_local_sampling_frame():
+    controls = dict(_controls(), canonical_fock=True)
+    with pytest.raises(ValueError, match="local Fock"):
+        dlno_stc.kernel(None, scope="system", frozen=0, controls=controls)
+
+
 def test_full_boundary_retains_three_arrays_and_validates_bars():
     inputs = {"foo": np.array([[-1.0]]), "fvv": np.array([[1.0]]),
               "B": np.ones((2, 1, 1))}
@@ -66,15 +72,20 @@ def test_system_rejects_invalid_frozen_before_preparation(molecule, frozen):
         dlno_stc.kernel(_mf(molecule), scope="system", frozen=frozen, controls=_controls())
 
 
-def test_system_preparation_uses_all_active_mos_without_mutating_mf(molecule):
+def test_system_preparation_preserves_active_spaces_without_mutating_mf(molecule):
     mf = _mf(molecule)
     before = jax.tree_util.tree_structure(mf)
+    original_coeff = np.asarray(mf.mo_coeff).copy()
     arrays = prepare.prepare_system_inputs(mf, np.array([1, 2, 3, 4]), np.array([5, 6]))
     assert set(arrays) == {"foo", "fvv", "B"}
     assert arrays["B"].shape[1:] == (4, 2)
-    np.testing.assert_allclose(arrays["foo"], np.diag(np.asarray(mf.mo_energy)[1:5]), atol=2e-10)
-    np.testing.assert_allclose(arrays["fvv"], np.diag(np.asarray(mf.mo_energy)[5:]), atol=2e-10)
+    for key, selected in (("foo", slice(1, 5)), ("fvv", slice(5, 7))):
+        block = np.asarray(arrays[key])
+        assert np.linalg.norm(block-np.diag(np.diag(block))) > 1e-3
+        np.testing.assert_allclose(np.linalg.eigvalsh(block),
+                                   np.asarray(mf.mo_energy)[selected], atol=2e-10)
     assert jax.tree_util.tree_structure(mf) == before
+    np.testing.assert_array_equal(mf.mo_coeff, original_coeff)
 
 
 def test_empty_active_spaces_add_hf_once_without_fitting_or_backend(molecule, monkeypatch):

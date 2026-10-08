@@ -120,6 +120,12 @@ void symmetric(const arma::mat& m, const char* name) {
     if (!arma::approx_equal(m,m.t(),"both",1e-12,1e-12))
         throw py::value_error(std::string(name)+" must be symmetric");
 }
+void strictly_diagonal(const arma::mat& m, const char* name) {
+    for (arma::uword i=0; i<m.n_rows; ++i)
+        for (arma::uword j=0; j<m.n_cols; ++j)
+            if (i!=j && m(i,j)!=0.0)
+                throw py::value_error(std::string("canonical_fock requires exactly diagonal ")+name);
+}
 py::array_t<double> array(const arma::mat& m) {
     py::array_t<double> a({static_cast<py::ssize_t>(m.n_rows),static_cast<py::ssize_t>(m.n_cols)});
     auto* p = a.mutable_data();
@@ -150,6 +156,14 @@ double real_control(const py::dict& controls,const char* key,double fallback,
 py::dict solve_binding(bool full, py::handle foo, py::handle fvv, py::handle B,
                py::handle target_projection, py::handle partner_weight,
                py::dict controls, py::object aux_offsets, bool with_grad) {
+    bool canonical_fock=false;
+    if (controls.contains("canonical_fock")) {
+        if (!py::isinstance<py::bool_>(controls["canonical_fock"]))
+            throw py::type_error("canonical_fock must be a bool");
+        canonical_fock=py::cast<bool>(controls["canonical_fock"]);
+    }
+    if (canonical_fock && !full)
+        throw py::value_error("canonical_fock is supported only by solve_full");
     const auto fo = checked_array(foo,"foo",2), fv = checked_array(fvv,"fvv",2);
     const auto bp = checked_array(B,"B",3);
     const py::ssize_t no = fo.shape(0), nv = fv.shape(0), np = bp.shape(0);
@@ -159,6 +173,9 @@ py::dict solve_binding(bool full, py::handle foo, py::handle fvv, py::handle B,
     stc::Inputs x;
     x.foo=matrix(fo); x.fvv=matrix(fv);
     symmetric(x.foo,"foo"); symmetric(x.fvv,"fvv");
+    if (canonical_fock) {
+        strictly_diagonal(x.foo,"foo"); strictly_diagonal(x.fvv,"fvv");
+    }
     if (!full) {
         const auto m=checked_array(target_projection,"target_projection",2);
         const auto w=checked_array(partner_weight,"partner_weight",2);
@@ -168,6 +185,7 @@ py::dict solve_binding(bool full, py::handle foo, py::handle fvv, py::handle B,
         symmetric(x.partner_weight,"partner_weight");
     }
     stc::Controls settings;
+    settings.canonical_fock=canonical_fock;
     const std::string mode=controls.contains("mode") ? py::cast<std::string>(controls["mode"]):"deterministic";
     if (mode!="deterministic" && mode!="stochastic")
         throw py::value_error("mode must be deterministic or stochastic");
@@ -233,6 +251,9 @@ py::dict solve_binding(bool full, py::handle foo, py::handle fvv, py::handle B,
     py::dict result, diagnostics;
     result["energy"]=out.energy; result["energy_standard_error"]=out.energy_standard_error;
     diagnostics["mode"]=mode; diagnostics["global_seed"]=settings.global_seed;
+    diagnostics["canonical_fock"]=settings.canonical_fock;
+    if (settings.canonical_fock)
+        diagnostics["fock_derivative_kind"]="canonical_diagonal_energies";
     diagnostics["max_production_samples"]=settings.max_production_samples;
     diagnostics["point_variance_targets"]=out.point_variance_targets;
     py::int_ sample_count(0);
@@ -280,7 +301,7 @@ py::dict solve_full(py::handle foo, py::handle fvv, py::handle B,
 }  // namespace
 PYBIND11_MODULE(_stc_mp2,m) {
     m.def("parallel_runtime_info",&parallel_runtime_info,py::arg("runtime_path")=py::none());
-    m.doc()="In-memory domain and whole-system Laplace MP2 with manual reverse";
+    m.doc()="STC-MP2 with bounded pair contractions and an explicit canonical-system specialization";
     m.def("solve",&solve,py::arg("foo"),py::arg("fvv"),py::arg("B"),
           py::arg("target_projection"),py::arg("partner_weight"),py::arg("controls"),
           py::arg("aux_offsets")=py::none(),py::arg("with_grad")=false);

@@ -3,10 +3,14 @@
 ## In-memory whole-system MP2
 
 `scope="system"` runs unweighted MP2 over all active occupied and virtual
-orbitals, with full molecular AO and auxiliary support. It bypasses Boys
-localization, domain construction, PAOs, rank selection, pair screening, and
-weak-pair corrections. Existing calls default to `scope="domain"` and retain
-their five-input weighted calculation.
+orbitals, with full molecular AO and auxiliary support. After frozen-space
+selection, it Boys-localizes only the active occupied orbitals. The active
+virtual space is represented by a complete PAO-derived frame: pivoted QR
+selects exactly one independent projected AO column per active virtual, then
+metric Cholesky orthonormalization retains the entire selected space. No
+domains, support restrictions, virtual-space truncation, pair screening or
+weak-pair corrections are constructed. Existing calls default to
+`scope="domain"` and retain their five-input weighted calculation.
 
 ```python
 from pyscfad import dlno_stc
@@ -28,7 +32,38 @@ calls require `static` and take the frozen setting from `static.frozen`;
 their separate `frozen` keyword must remain `None`.
 
 System preparation passes exactly `foo`, `fvv`, and fitted `B` in memory to
-`_stc_mp2.solve_full`. The original unweighted algorithm uses half-exponent
+`_stc_mp2.solve_full`. All three use the same active occupied Boys coefficients
+and complete local virtual coefficients. With selected AO labels `J`, the
+virtual construction is `A = Cv @ (Cv.T @ S[:, J])`, followed by
+`Cloc = A @ inv(L.T)` for `A.T @ S @ A = L @ L.T`. The full projected
+`foo = Co.T @ F @ Co` and `fvv = Cloc.T @ F @ Cloc` are generally
+non-diagonal and passed directly to the solver. Preparation does not rotate
+them into Fock eigenvectors: that would change the sampling frame.
+
+The Boys reference orbitals/coordinates and virtual AO labels are fixed
+metadata selected before constructing the preparation VJP. Current Boys
+orbitals, virtual projections, metric Cholesky, Fock blocks and fitted factors
+remain differentiated. System localization uses the shared Boys-domain
+setup: `init_guess="atomic"`, `conv_tol=1e-10`, and localization-response
+GMRES settings `restart=120`, `maxiter=100`. The Boys wrapper derives its
+gradient tolerance from `conv_tol` (about `3.16e-6` for this default).
+Pass `lo_kwargs` to system `kernel` or `value_and_grad` to change these
+options, including an explicit `conv_tol_grad` if needed. Domain scope uses
+the options already saved in `static.lo_kwargs`. Low-level traced
+calls to `prepare_system_inputs` must supply `boys_reference` and
+`virtual_anchor_columns`, selected from concrete data using the helpers in
+`domain.py`. Only these choices are fixed, not the coefficient arrays.
+
+Boys replay starts from the reference-aligned occupied coefficients and solves
+for the remaining small rotation. This avoids poorly conditioned response
+coordinates for large canonical-to-local rotations while retaining orbital
+and coordinate derivatives. CIAH inner cutoffs tighten with the requested
+localization gradient tolerance so near-converged replay can reach it.
+As in the Boys-domain workflow, preparation performs one reference
+localization followed by one short differentiable replay. It adds no separate
+Hessian stability search or localization restart loop.
+
+The original unweighted algorithm uses half-exponent
 Laplace dressing. The domain solver retains full-exponent dressing and its
 two projection inputs. The shared matrix-exponential VJP returns full symmetric
 Fock cotangents, including off-diagonal response at a diagonal canonical
@@ -36,6 +71,21 @@ primal. The three system bars are applied immediately to a saved preparation
 VJP, then one implicit SCF response closes the molecular derivative. Optional
 HF energy and response are added once. No tensor exchange or replay files are
 used by either production scope.
+
+`prepare_canonical_system_inputs` is retained as a low-level deterministic
+reference for checking energies and coordinate gradients with the same active
+spaces and Laplace grid. High-level `kernel` and `value_and_grad` always use
+the local frame and reject `controls["canonical_fock"] = True`; remove that
+setting from earlier system inputs. Canonical sampling results use a different
+frame and must be assessed separately from local sampling variance and timing.
+
+The low-level native `canonical_fock` option requires exactly diagonal `foo` and `fvv`.
+Its Fock cotangents represent derivatives of the diagonal energies; their
+off-diagonal entries are zero. Independent full-matrix derivatives require
+the default native path, including at a diagonal primal. Both paths reuse one
+kept-pair Gram matrix for direct and exchange contributions, and combine the
+owner's cotangent updates in one matrix multiplication when the bounded
+workspace fits.
 
 Both scopes support converged real restricted closed-shell DF references and
 coordinate-only nuclear derivatives. System preparation reuses the reference's
@@ -93,6 +143,21 @@ quadrature and stochastic errors. Its reference is full-space DF-MP2 with
 matching frozen space and auxiliary basis. Hold quadrature fixed for a gradient
 and check both inverse-denominator and derivative errors over the relevant
 denominator interval.
+
+The system-frame regressions can be run from the repository root:
+
+```bash
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 JAX_ENABLE_X64=True \
+    python -m pytest -q pyscfad/dlno_stc/test/test_system_local_frame.py \
+    pyscfad/dlno_stc/test/test_system.py pyscfad/dlno_stc/test/test_system_cache.py
+```
+
+They compare deterministic local and canonical energies and coordinate
+gradients using identical active spaces and Laplace nodes/weights, verify
+frozen virtual exclusion and the complete PAO gauge, and check a general
+three-tensor cotangent against coordinate finite differences. The last check
+detects accidentally fixed continuous orbitals even when invariant MP2
+energies still agree. Sampling variance and timing are separate comparisons.
 
 The full fitted occupied-virtual tensor, numerical bars, root AD residuals, dense auxiliary
 metric, and proposal tables reside in memory. The working-set guard includes
@@ -585,8 +650,8 @@ The immediate Python files under `pyscfad/dlno_stc/` have these roles:
 | [`exchange.py`](exchange.py) | Implements `write_input`, `read_input`, `write_result`, and `read_result` for complete, fingerprinted HDF5 request/result pairs. Writes publish atomically and refuse overwrite by default. |
 | [`parallel.py`](parallel.py) | `run_backend` checks the root packet and calls a backend serially or on a supplied MPI communicator. MPI is imported lazily; all ranks call the backend and only root receives its combined result. |
 | [`_workflow.py`](_workflow.py) | Shared host helpers for restart identity (`run_payload`), Git revision status, per-fragment dimension reporting, and a conservative DF packet memory guard. |
-| [`domain.py`](domain.py) | `build_stc_domain` enforces the full Boys frame; `build_local_strong_ed_domain` constructs the finite frame and internal target/partner weights. `select_virtual_anchor_columns` and the internal builder fix the finite PAO gauge for replay. |
-| [`prepare.py`](prepare.py) | Projects Fock and local DF factors into one frame. `prepare_inputs` makes full Boys packets; `prepare_finite_export_inputs` returns a finite packet plus anchors; `prepare_finite_inputs` rebuilds it using saved anchors. |
+| [`domain.py`](domain.py) | `build_system_local_frame` rebuilds complete active Boys/PAO spaces with fixed reference and AO-anchor choices. `build_stc_domain` enforces the full Boys target frame; `build_local_strong_ed_domain` constructs finite frames and target/partner weights. |
+| [`prepare.py`](prepare.py) | Projects Fock and local DF factors into one frame. `prepare_system_inputs` streams fitted factors into the complete local system frame; `prepare_inputs`, `prepare_finite_export_inputs` and `prepare_finite_inputs` prepare domain packets. |
 | [`adjoint.py`](adjoint.py) | `pullback_inputs` verifies the reconstructed packet and applies imported unit-seed tensor bars through JAX's VJP. |
 | [`mp2.py`](mp2.py) | Full-support Boys workflow: `export_run`, `solve_request`, `load_static_from_run`, `load_disk_packet`, and `imported_value_and_grad`. It sums validated target energies and closes the molecular response, with HF included by default. |
 | [`finite.py`](finite.py) | Finite three-tensor workflow: `export_finite_run`, `load_finite_static_from_run`, `load_finite_disk_packet`, and `imported_finite_value_and_grad`. It validates finite selections and anchor metadata, with HF omitted by default. |
@@ -605,6 +670,7 @@ regressions; it does not contain a production STC backend:
 | [`test/test_reference.py`](test/test_reference.py) | Checks the deterministic oracles against hand contractions, an independent amplitude solve and finite differences; also covers empty spaces and serial sampling. |
 | [`test/test_adjoint.py`](test/test_adjoint.py) | Compares imported tensor VJPs with direct JAX differentiation and tests frame mismatch rejection and the explicit finite replay tolerance. |
 | [`test/test_prepare.py`](test/test_prepare.py) | Full-support water tests for the Boys frame, Fock/DF rotation, support restrictions, molecular finite differences, and deterministic target energy/gradient equivalence. |
+| [`test/test_system_local_frame.py`](test/test_system_local_frame.py) | Complete system Boys/PAO frames, frozen virtual exclusion, local/canonical tensor and energy/gradient equivalence, fixed-metadata validation, and arbitrary-cotangent coordinate finite differences. |
 | [`test/test_finite_prepare.py`](test/test_finite_prepare.py) | Finite water-dimer tests for orthonormal local frames, non-diagonal Fock blocks, fixed PAO anchors and orbital gauge, traced replay, and Fock/DF cotangent response. |
 | [`test/test_finite_workflow.py`](test/test_finite_workflow.py) | Truncated water-dimer export/import test for finite metadata and anchor validation, packet replay, and a molecular gradient against displacement. |
 | [`test/test_workflow.py`](test/test_workflow.py) | Tests dimension reporting, stable checkpoint fingerprints, disk solving and full Boys import, and the fresh-process example including partial-import labeling. |

@@ -91,10 +91,15 @@ def _rebuild_boys_targets(mf, occupied, static):
     if singular.min() < 0.5:
         raise ValueError("Boys reference no longer spans the current occupied space; rebuild selections")
     options = dict(static.lo_kwargs or {})
-    # Polar alignment is an initial guess only; converged LMOs are never
-    # mixed by a post-localization Procrustes rotation.
-    options["init_guess"] = left @ right
-    localized = build_targets(mf.mol, occupied, lo_type="boys", lo_kwargs=options)
+    # Rebase the optimizer at the reference-aligned occupied frame. Solving
+    # for the small remaining rotation avoids nearly singular exponential
+    # coordinates for a large canonical-to-local rotation. The concrete
+    # alignment is a coordinate choice; current occupied coefficients and
+    # their localization response remain differentiated.
+    options["init_guess"] = numpy.eye(occupied.shape[1])
+    localized = build_targets(
+        mf.mol, occupied @ (left @ right), lo_type="boys", lo_kwargs=options,
+    )
     current_localized = _host_array(jax.lax.stop_gradient(localized))
     overlaps = reference.T @ cross_overlap.T @ current_localized
     magnitude = numpy.abs(overlaps)

@@ -10,6 +10,9 @@ struct Controls {
     arma::uword virtual_block_size = 16;
     std::uint64_t global_seed = 0;
     bool stochastic = false, adaptive = false;
+    // Explicit system specialization: diagonal canonical energies are the only
+    // differentiable Fock inputs. Offdiagonal Fock cotangents stay zero.
+    bool canonical_fock = false;
     double workload_cutoff = 0.1, virtual_keep_fraction = -1.0;
     double system_workload_cutoff = 6.5e-3;
     double uniform_mixture = 0.05, energy_tolerance = 0.0;

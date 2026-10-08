@@ -91,6 +91,48 @@ double exact_owned(const arma::mat& T,arma::mat& gamma,arma::uword i,arma::uword
         }
     return energy;
 }
+// The exchange Gram matrix is the intersection submatrix of the direct Gram
+// matrix, even when the two sorted keep sets differ. Reuse G and combine both
+// owner updates into one GEMM. Do not allocate a separate intersection matrix:
+// G and Z are the two pair-sized workspaces counted by pair_fits.
+double exact_pair_owned(const arma::mat& T,arma::mat& gamma,
+                        arma::uword i,arma::uword k,arma::uword nv,
+                        const std::vector<arma::uword>& first,
+                        const std::vector<arma::uword>& second,double weight,
+                        bool with_grad,const arma::mat* cached=nullptr) {
+    if (first.empty() || second.empty()) return 0;
+    const auto ia=occupied_columns(first,i,nv),kb=occupied_columns(second,k,nv);
+    arma::mat gathered;
+    if (!cached) gathered=T.cols(ia);
+    const arma::mat& X=cached ? *cached:gathered;
+    const arma::mat Y=T.cols(kb),G=X.t()*Y;
+    if (first==second) {
+        if (with_grad) gamma.cols(ia)+=weight*(Y*(4*G-8*G.t()));
+        return -2*weight*arma::accu(G%G)+weight*arma::accu(G%G.t());
+    }
+    std::vector<arma::uword> first_positions,second_positions;
+    for (std::size_t a=0,b=0;a<first.size() && b<second.size();) {
+        if (first[a]<second[b]) ++a;
+        else if (second[b]<first[a]) ++b;
+        else {
+            first_positions.push_back(a++);
+            second_positions.push_back(b++);
+        }
+    }
+    double exchange=0;
+    arma::mat Z;
+    if (with_grad) Z=-8*weight*G.t();
+    for (std::size_t b=0;b<first_positions.size();++b)
+        for (std::size_t a=0;a<first_positions.size();++a) {
+            const double value=G(first_positions[a],second_positions[b]);
+            exchange+=value*G(first_positions[b],second_positions[a]);
+            // Z has second-set rows and first-set columns. This embeds the
+            // untransposed intersection Gram matrix, reproducing Y_D * G_D.
+            if (with_grad) Z(second_positions[a],first_positions[b])+=4*weight*value;
+        }
+    if (with_grad) gamma.cols(ia)+=Y*Z;
+    return -2*weight*arma::accu(G%G)+weight*exchange;
+}
 struct FullResidual {
     std::size_t term=0, number=0;
     Proposal pairs;
@@ -231,6 +273,11 @@ void contract_full(const Inputs& x,const Controls& controls,std::size_t point,
         const auto begin=with_grad ? 0:i;
         for (arma::uword k=begin;k<no;++k) {
             const double factor=(!with_grad && i!=k) ? 2.0:1.0;
+            if (pair_fits(T.n_rows,keep[i].size(),keep[k].size())) {
+                energy[i]+=factor*exact_pair_owned(T,gamma,i,k,nv,keep[i],keep[k],
+                    weight,with_grad,cache ? &cached:nullptr);
+                continue;
+            }
             energy[i]+=factor*exact_owned(T,gamma,i,k,nv,keep[i],keep[k],false,
                                          weight,block,with_grad,cache ? &cached:nullptr);
             const auto D=intersection(keep[i],keep[k]);

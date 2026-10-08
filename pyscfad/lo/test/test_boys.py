@@ -14,12 +14,49 @@
 
 import pytest
 import jax
+import numpy
 from pyscf.data.nist import BOHR
 from pyscfad import numpy as np
 from pyscfad import gto, scf
 from pyscfad.lo import boys
 from pyscfad.lo.boys import dipole_integral
 from pyscfad import config_update
+
+
+@pytest.mark.parametrize("gradient_tolerance", [1e-7, 1e-9])
+def test_boys_replay_reaches_requested_tight_stationarity(gradient_tolerance):
+    from scipy.linalg import expm
+
+    mol = gto.Mole(
+        atom="O 0 0 0; H 0.1 -0.75 0.57; H 0 0.8 0.61",
+        basis="sto-3g", verbose=0,
+    )
+    mol.build(trace_exp=False, trace_ctr_coeff=False)
+    mf = scf.RHF(mol)
+    mf.conv_tol = 1e-13
+    mf.conv_tol_grad = 1e-10
+    mf.kernel()
+
+    # Build a stationary reference, then mimic reference-frame replay with a
+    # tiny displacement. The original CIAH cutoffs discard the small steps
+    # needed to satisfy the explicitly requested outer gradient tolerance.
+    reference = boys.Boys(mol, numpy.asarray(mf.mo_coeff[:, 1:5]))
+    reference.conv_tol = 1e-14
+    reference.conv_tol_grad = 1e-11
+    reference.ah_conv_tol = 1e-16
+    reference.ah_lindep = 1e-24
+    coeff = reference.kernel()
+    perturbation = numpy.random.default_rng(713).normal(size=(4, 4))
+    perturbation -= perturbation.T.copy()
+    displaced = coeff @ expm(1e-8 * perturbation)
+
+    localized = boys.boys(
+        mol, displaced, init_guess=numpy.eye(4), conv_tol=1e-12,
+        conv_tol_grad=gradient_tolerance,
+    )
+    check = boys.Boys(mol, numpy.asarray(localized))
+    actual_gradient = numpy.linalg.norm(check.get_grad(numpy.eye(4)))
+    assert actual_gradient < gradient_tolerance
 
 def cost_function(mol):
     mf = scf.RHF(mol)

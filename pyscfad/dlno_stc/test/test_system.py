@@ -88,6 +88,19 @@ def test_system_preparation_preserves_active_spaces_without_mutating_mf(molecule
     np.testing.assert_array_equal(mf.mo_coeff, original_coeff)
 
 
+@pytest.mark.parametrize("energies", [np.zeros(6), np.full(7, np.nan),
+                                     np.ones(7, dtype=complex)])
+def test_scf_fock_projection_requires_real_finite_matching_energies(molecule, energies):
+    def invalid_reference(mol):
+        mf = _mf(mol)
+        mf.mo_energy = jax.numpy.asarray(energies)
+        return mf
+
+    with pytest.raises(ValueError, match="orbital energies"):
+        dlno_stc.value_and_grad(molecule, invalid_reference, scope="system", frozen=1,
+                                controls=_controls())
+
+
 def test_empty_active_spaces_add_hf_once_without_fitting_or_backend(molecule, monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError("zero-work system must skip fitting and backend")

@@ -24,6 +24,14 @@ def _symmetric_fock_block(fock, coeff):
     return 0.5 * (block + block.T)
 
 
+def _scf_fock_block(mf, overlap, indices, local_coeff):
+    """Project canonical energies while retaining the complete SCF chain rule."""
+    canonical = mf.mo_coeff[:, indices]
+    rotation = canonical.T @ overlap @ local_coeff
+    block = rotation.T @ (mf.mo_energy[indices, None] * rotation)
+    return 0.5 * (block + block.T)
+
+
 def _project_inputs(mf, fock, occupied_coeff, virtual_coeff, atoms):
     """Use one occupied/virtual frame for both Fock blocks and DF factors."""
     co, cv = occupied_coeff, virtual_coeff
@@ -126,7 +134,7 @@ def prepare_weighted_inputs(
 
 def prepare_system_inputs(
     mf, active_occ_indices, active_vir_indices, *, boys_reference=None,
-    virtual_anchor_columns=None,
+    virtual_anchor_columns=None, fock_from_scf=False,
 ):
     """Project full Fock blocks and fitted factors into one complete local frame.
 
@@ -135,6 +143,14 @@ def prepare_system_inputs(
     current continuous coefficients remain in the preparation graph. Attached
     out-of-core factors and their response are streamed without reconstructing
     the AO-pair tensor; the integral-direct fallback does not build a DF leaf.
+
+    ``fock_from_scf=True`` projects canonical SCF energies into the same local
+    frame without rebuilding the AO Fock. It requires converged canonical
+    ``mo_coeff`` and matching ``mo_energy``; its VJP must be composed with SCF
+    response. Within each active occupied/virtual space, energy gaps must
+    exceed the SCF eigensolver's 1e-9 degeneracy cutoff. The high-level driver
+    selects the general path otherwise. Leave this false for independent
+    Fock/coefficient variations.
     """
     frame = build_system_local_frame(
         mf, active_occ_indices, active_vir_indices, boys_reference=boys_reference,
@@ -143,19 +159,31 @@ def prepare_system_inputs(
     co, cv = frame.occupied_coeff, frame.virtual_coeff
     get_cderi = getattr(mf.with_df, "_get_cderi_source", None)
     cderi = get_cderi() if get_cderi is not None else mf.with_df._cderi
-    if cderi is None:
-        return _project_inputs(mf, mf.get_fock(), co, cv,
-                               numpy.arange(mf.mol.natm, dtype=numpy.int32))
-
     nocc, nvir = co.shape[1], cv.shape[1]
     coeff = np.concatenate((co, cv), axis=1)
-    B = lno_df.transform_df_to_mo(
-        mf, coeff, (0, nocc, nocc, nocc + nvir), atmlst=None,
-    )
-    fock = mf.get_fock()
+    if cderi is None:
+        B = lno_df.get_local_Lov(
+            mf, coeff, nocc, numpy.arange(mf.mol.natm, dtype=numpy.int32),
+            integral_direct=True,
+        )
+    else:
+        B = lno_df.transform_df_to_mo(
+            mf, coeff, (0, nocc, nocc, nocc + nvir), atmlst=None,
+        )
+    if fock_from_scf:
+        # FC = SC eps holds along the converged SCF solution. Keep eps, C,
+        # S, and the Boys/PAO frame in the graph; independent partial VJPs
+        # differ from the AO-Fock path until the SCF pullback is applied.
+        overlap = mf.get_ovlp()
+        foo = _scf_fock_block(mf, overlap, active_occ_indices, co)
+        fvv = _scf_fock_block(mf, overlap, active_vir_indices, cv)
+    else:
+        fock = mf.get_fock()
+        foo = _symmetric_fock_block(fock, co)
+        fvv = _symmetric_fock_block(fock, cv)
     return {
-        "foo": _symmetric_fock_block(fock, co),
-        "fvv": _symmetric_fock_block(fock, cv),
+        "foo": foo,
+        "fvv": fvv,
         "B": B.reshape((-1, nocc, nvir)),
     }
 

@@ -72,6 +72,29 @@ VJP, then one implicit SCF response closes the molecular derivative. Optional
 HF energy and response are added once. No tensor exchange or replay files are
 used by either production scope.
 
+Whole-system `value_and_grad` forms each local Fock block from the converged
+canonical SCF energies: `U = C_active.T @ S @ C_local` and
+`F_local = sym(U.T @ (eps_active[:, None] * U))`. Its `build_mf` must return
+converged canonical orbitals with their matching orbital energies; do not
+rotate or otherwise replace these outputs after SCF. The local Boys/PAO
+frames, full off-diagonal Fock blocks, and fitted factors are retained.
+Energies, canonical coefficients, overlap, and local-frame rotations all
+remain differentiated, and the saved SCF pullback completes their response.
+This avoids an additional AO Fock/J/K construction and its reverse during
+input preparation. The Fock response inside SCF itself is still required.
+If two active occupied energies or two active virtual energies differ by
+`1e-9` Hartree or less, the driver automatically retains AO-Fock preparation.
+SCF's eigensolver suppresses rotations within such degenerate blocks, so
+reconstructing the Fock from its outputs would lose off-diagonal response.
+
+Standalone `kernel(mf)` and low-level `prepare_system_inputs` retain the
+general AO-Fock projection. The latter accepts `fock_from_scf=True` to opt
+into the same canonical-SCF specialization. Its partial mean-field VJP is
+different from independent Fock/coefficient differentiation; equivalence
+holds after composing with canonical SCF response for nondegenerate active
+blocks. Low-level callers must check this prerequisite themselves. At finite SCF tolerance,
+the two local Fock representations can differ by the SCF residual.
+
 `prepare_canonical_system_inputs` is retained as a low-level deterministic
 reference for checking energies and coordinate gradients with the same active
 spaces and Laplace grid. High-level `kernel` and `value_and_grad` always use

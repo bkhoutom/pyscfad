@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import partial
 import numpy
 import jax
@@ -28,6 +30,7 @@ from pyscfad.df import incore as df_incore
 from pyscfad.df import addons as df_addons
 from pyscfad.df import _cderi_vjp
 from pyscfad.mp import mp2
+from pyscfad.tools import resource_profile
 
 WITH_T2 = getattr(__config__, 'mp_dfmp2_with_t2', True)
 
@@ -117,7 +120,109 @@ def _contract_opt_bwd(nocc, nvir, with_t2,
 
 _contract_opt.defvjp(_contract_opt_fwd, _contract_opt_bwd)
 
+_PROFILE_REVERSE_MODE = ContextVar('dfmp2_profile_reverse_mode', default=False)
+
+
+@contextmanager
+def profile_reverse_mode():
+    """Opt in to separate contraction forward/reverse execution profiling.
+
+    Use around eager reverse-mode ``jax.grad``, ``jax.value_and_grad``, or
+    ``jax.vjp`` evaluation.  The resource-profile environment flag must also
+    be enabled.  This explicit scope is needed because JAX's ``linearize``
+    shares the eager reverse-mode tracer, but cannot use a custom-VJP boundary.
+    General resource profiling retains the original scan's full AD behavior.
+    """
+    token = _PROFILE_REVERSE_MODE.set(True)
+    try:
+        yield
+    finally:
+        _PROFILE_REVERSE_MODE.reset(token)
+
+
+def _profile_eager_arrays(tree):
+    """Get completed primal arrays, or reject staged/nested traces.
+
+    Eager JAX linearization uses LinearizeTracer with concrete primals.
+    Other tracer kinds (including older JAX AD tracers) conservatively keep the
+    original calculation path: a host tracing interval is not execution time.
+    Only one reverse-AD layer is accepted, so nested AD remains untouched.
+    """
+    arrays = []
+    for value in jax.tree_util.tree_leaves(tree):
+        if isinstance(value, jax.core.Tracer):
+            if type(value).__name__ == 'LinearizeTracer':
+                value = value.primal
+            if isinstance(value, jax.core.Tracer):
+                return None
+        if hasattr(value, 'block_until_ready'):
+            arrays.append(value)
+    return arrays
+
+
+def _profile_call(phase, fn, *args):
+    if not resource_profile.enabled():
+        return fn(*args)
+    arrays = _profile_eager_arrays(args)
+    if arrays is None:
+        return fn(*args)
+    # Exclude pending input work; include completion of every result leaf.
+    jax.block_until_ready(arrays)
+    before = resource_profile.start()
+    try:
+        result = fn(*args)
+        output_arrays = _profile_eager_arrays(result)
+        if output_arrays is not None:
+            jax.block_until_ready(output_arrays)
+        else:
+            # A closure can contain a staged value even when args are concrete.
+            # Discard this tracing interval and release its optional sampler.
+            if before is not None and before.sampler is not None:
+                before.sampler.stop(resource_profile.snapshot().rss_mib)
+            before = None
+        return result
+    finally:
+        resource_profile.finish(phase, before)
+
+
 def _contract_scan(Lov, mo_energy, nocc, nvir, with_t2=True):
+    if not resource_profile.enabled():
+        return _contract_scan_impl(Lov, mo_energy, nocc, nvir, with_t2)
+    if (_PROFILE_REVERSE_MODE.get()
+            and _profile_eager_arrays((Lov, mo_energy)) is not None):
+        return _contract_scan_profiled(Lov, mo_energy, nocc, nvir, with_t2)
+    return _profile_call(
+        'dfmp2.energy_forward', _contract_scan_impl,
+        Lov, mo_energy, nocc, nvir, with_t2,
+    )
+
+
+@partial(custom_vjp, nondiff_argnums=(2, 3, 4))
+def _contract_scan_profiled(Lov, mo_energy, nocc, nvir, with_t2):
+    return _profile_call(
+        'dfmp2.energy_forward', _contract_scan_impl,
+        Lov, mo_energy, nocc, nvir, with_t2,
+    )
+
+
+def _contract_scan_profiled_fwd(Lov, mo_energy, nocc, nvir, with_t2):
+    # Differentiate the identical checkpointed scan.  Keeping its pullback as
+    # the residual avoids an extra contraction and retains its rematerialization
+    # strategy; the boundary only separates completed forward and reverse work.
+    fn = partial(_contract_scan_impl, nocc=nocc, nvir=nvir, with_t2=with_t2)
+    return _profile_call('dfmp2.energy_forward', jax.vjp, fn, Lov, mo_energy)
+
+
+def _contract_scan_profiled_bwd(nocc, nvir, with_t2, pullback, ybar):
+    return _profile_call('dfmp2.energy_cotangents', pullback, ybar)
+
+
+_contract_scan_profiled.defvjp(
+    _contract_scan_profiled_fwd, _contract_scan_profiled_bwd,
+)
+
+
+def _contract_scan_impl(Lov, mo_energy, nocc, nvir, with_t2=True):
     if with_t2:
         t2 = numpy.empty((nocc,nocc,nvir,nvir))
     else:
@@ -173,6 +278,13 @@ def _outcore_nr_e2_fwd(mol, auxmol, mo_coeff, cderi_source, max_memory,
 
 
 def _outcore_nr_e2_bwd(cderi_source, max_memory, ijslice, aosym, res, ybar):
+    return _profile_call(
+        'dfmp2.input_pullback', _outcore_nr_e2_bwd_impl,
+        cderi_source, max_memory, ijslice, aosym, res, ybar,
+    )
+
+
+def _outcore_nr_e2_bwd_impl(cderi_source, max_memory, ijslice, aosym, res, ybar):
     mol, auxmol, mo_coeff = res
     effective_memory = max(max_memory, 4096)
     use_direct_vjp = (
@@ -287,7 +399,9 @@ def kernel(mp, mo_energy=None, mo_coeff=None, eris=None, with_t2=WITH_T2,
     nvir = mp.nmo - nocc
     #naux = mp.with_df.get_naoaux()
 
-    Lov = mp.loop_ao2mo(mo_coeff, nocc, with_t2)
+    Lov = _profile_call(
+        'dfmp2.ao2mo', mp.loop_ao2mo, mo_coeff, nocc, with_t2,
+    )
 
     if config.moleintor_opt:
         #emp2, t2 = _contract_opt(Lov, mo_energy, nocc, nvir, with_t2)

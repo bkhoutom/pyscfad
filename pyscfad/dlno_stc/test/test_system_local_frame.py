@@ -111,6 +111,45 @@ def test_local_preparation_rotates_every_tensor_in_the_same_frame(reference, vir
         np.testing.assert_allclose(actual[name], expected[name], atol=5e-10, rtol=2e-10)
 
 
+@pytest.mark.parametrize("virtual", [VIRTUAL, VIRTUAL[1:]],
+                         ids=["all-virtuals", "frozen-virtual"])
+@pytest.mark.parametrize("source", ["saved", "direct"])
+def test_scf_energy_local_focks_match_generic_without_building_fock(
+        reference, virtual, source, tmp_path, monkeypatch):
+    from copy import copy
+    import h5py
+
+    frame = domain.build_system_local_frame(reference, OCCUPIED, virtual)
+    expected = _local_prepare(reference, frame, virtual)
+    current = copy(reference)
+    current.with_df = copy(reference.with_df)
+    if source == "saved":
+        path = str(tmp_path / "scf-energy-cderi.h5")
+        with h5py.File(path, "w") as handle:
+            handle.create_dataset("j3c", data=np.asarray(reference.with_df._cderi))
+        current.with_df.attach_outcore_cderi(path)
+    else:
+        current.with_df._cderi = None
+        current.with_df._prefer_cderi_to_save = False
+
+    def forbidden_fock(*args, **kwargs):
+        raise AssertionError("SCF-energy preparation must not build an AO Fock")
+
+    monkeypatch.setattr(type(current), "get_fock", forbidden_fock)
+    actual, pullback = jax.vjp(lambda mf: prepare.prepare_system_inputs(
+        mf, OCCUPIED, virtual, boys_reference=frame.boys_reference,
+        virtual_anchor_columns=frame.virtual_anchor_columns, fock_from_scf=True,
+    ), current)
+    for name in expected:
+        np.testing.assert_allclose(actual[name], expected[name], atol=5e-10, rtol=2e-10)
+    # An arbitrary seed checks the saved reverse path, including direct DF;
+    # keeping local Fock blocks diagonal would also fail the primal comparison.
+    rng = np.random.default_rng(932)
+    seeds = {name: jax.numpy.asarray(rng.normal(size=value.shape))
+             for name, value in actual.items()}
+    jax.block_until_ready(pullback(seeds))
+
+
 def test_virtual_frame_is_the_cholesky_orthonormalized_ao_projection(reference):
     # A further arbitrary virtual rotation preserves the active projector but
     # changes this prescribed PAO anchor gauge and its coordinate response.
@@ -317,7 +356,7 @@ def coordinate_response(reference):
         mf_bar, = apply_full_pullback(pullback, host, result)
         mol_bar, = scf_pullback(mf_bar)
         values[name] = (result["energy"], mol_bar)
-    return {"mol": reference.mol, "frame": frame, "inputs": local,
+    return {"mol": reference.mol, "mf": mf, "frame": frame, "inputs": local,
             "local_pullback": local_pullback, "scf_pullback": scf_pullback,
             **values}
 
@@ -359,11 +398,114 @@ def test_local_preparation_coordinate_vjp_rebuilds_continuous_frame(coordinate_r
     np.testing.assert_allclose(actual, finite, atol=2e-5, rtol=2e-4)
 
 
+def test_scf_energy_local_fock_coordinate_vjp_matches_generic_and_differences(
+        coordinate_response, monkeypatch):
+    state = coordinate_response
+    frame = state["frame"]
+    rng = np.random.default_rng(217)
+    seeds = {name: jax.numpy.asarray(rng.normal(size=value.shape))
+             for name, value in state["inputs"].items()}
+    generic_mf_bar, = state["local_pullback"](seeds)
+    generic_bar, = state["scf_pullback"](generic_mf_bar)
+
+    def forbidden_fock(*args, **kwargs):
+        raise AssertionError("SCF-energy preparation must not build an AO Fock")
+
+    # Limit the guard to preparation: the implicit SCF response must still
+    # build its own Fock map when composing the final coordinate derivative.
+    with monkeypatch.context() as guard:
+        guard.setattr(type(state["mf"]), "get_fock", forbidden_fock)
+        _, pullback = jax.vjp(lambda mf: prepare.prepare_system_inputs(
+            mf, OCCUPIED, VIRTUAL, boys_reference=frame.boys_reference,
+            virtual_anchor_columns=frame.virtual_anchor_columns,
+            fock_from_scf=True,
+        ), state["mf"])
+        fast_mf_bar, = pullback(seeds)
+        jax.block_until_ready(fast_mf_bar)
+    fast_bar, = state["scf_pullback"](fast_mf_bar)
+    np.testing.assert_allclose(fast_bar.coords, generic_bar.coords,
+                               atol=2e-7, rtol=2e-5)
+
+    coords = np.asarray(state["mol"].atom_coords())
+    direction = np.zeros_like(coords)
+    direction[1, 0], direction[1, 2], direction[2, 1] = 0.3, 1, -0.2
+    step = 1e-4
+
+    def displaced(sign):
+        moved = state["mol"].set_geom_(coords + sign * step * direction,
+                                       unit="Bohr", inplace=False)
+        # Use the generic AO-Fock path as an independent molecular oracle.
+        inputs = _local_prepare(_fix_restart_mo_phases(_mf(moved)), frame)
+        return sum(np.sum(np.asarray(inputs[name]) * np.asarray(seed))
+                   for name, seed in seeds.items())
+
+    finite = (displaced(1) - displaced(-1)) / (2 * step)
+    actual = np.sum(np.asarray(fast_bar.coords) * direction)
+    assert abs(finite) > 1e-4
+    np.testing.assert_allclose(actual, finite, atol=2e-5, rtol=2e-4)
+
+
+def test_degenerate_scf_uses_full_local_fock_response_for_arbitrary_seed():
+    from pyscfad.dlno_stc import driver
+
+    # Tetrahedral methane has degenerate occupied and virtual canonical
+    # eigenvalues. The eigensolver masks rotations inside those blocks, so
+    # reconstructing F solely from eigenpairs loses their off-diagonal bars.
+    bond_component = 1.09 / np.sqrt(3)
+    atoms = [("C", (0, 0, 0))]
+    atoms.extend(("H", tuple(bond_component * np.asarray(signs))) for signs in
+                 [(1, 1, 1), (1, -1, -1), (-1, 1, -1), (-1, -1, 1)])
+    mol = gto.Mole(atom=atoms, basis="sto-3g", verbose=0, max_memory=3000)
+    mol.build(trace_exp=False, trace_ctr_coeff=False)
+    mol.incore_anyway = True
+    with (config_update("pyscfad_scf_implicit_diff", True),
+          config_update("pyscfad_scf_first_order_custom", False)):
+        mf, scf_pullback = jax.vjp(
+            lambda mol_: _fix_restart_mo_phases(_mf(mol_)), mol,
+        )
+    state = driver._initialize_system(
+        mf, 1, _controls(), with_grad=True, scf_pullback=scf_pullback,
+        fock_from_scf=True,
+    )
+    energies = np.asarray(mf.mo_energy)
+    assert any(np.min(np.diff(np.sort(energies[indices]))) <= 1e-9
+               for indices in (state["occupied"], state["virtual"]))
+    inputs, _, selected_pullback = driver._prepare_system(state, _controls(), True)
+    generic, generic_pullback = jax.vjp(lambda current: prepare.prepare_system_inputs(
+        current, state["occupied"], state["virtual"],
+        boys_reference=state["boys_reference"],
+        virtual_anchor_columns=state["virtual_anchor_columns"],
+    ), mf)
+    for name in inputs:
+        np.testing.assert_allclose(inputs[name], generic[name], atol=5e-10, rtol=2e-10)
+    rng = np.random.default_rng(142)
+    seeds = {name: jax.numpy.asarray(rng.normal(size=value.shape))
+             for name, value in inputs.items()}
+    selected_mf_bar, = selected_pullback(seeds)
+    generic_mf_bar, = generic_pullback(seeds)
+    selected_bar, = scf_pullback(selected_mf_bar)
+    generic_bar, = scf_pullback(generic_mf_bar)
+    assert np.linalg.norm(np.asarray(generic_bar.coords)) > 1e-4
+    np.testing.assert_allclose(selected_bar.coords, generic_bar.coords,
+                               atol=2e-7, rtol=2e-5)
+
+
 def test_system_driver_passes_local_focks_and_matches_canonical_response(
         coordinate_response, monkeypatch):
+    from pyscfad.dlno_stc import driver
+
     # Check the real backend boundary as well as the invariant final result:
     # returning to a canonical shortcut would otherwise pass energy tests.
     real_solve = backend.solve
+    real_prepare = driver.prepare_system_inputs
+
+    def prepare_without_fock(mf, *args, **kwargs):
+        def forbidden_fock(*args, **kwargs):
+            raise AssertionError("system SCF preparation must use orbital energies")
+
+        with monkeypatch.context() as guard:
+            guard.setattr(type(mf), "get_fock", forbidden_fock)
+            return real_prepare(mf, *args, **kwargs)
 
     def local_solve(inputs, metadata, controls, **kwargs):
         assert _off_diagonal_norm(inputs["foo"]) > 1e-3
@@ -371,6 +513,7 @@ def test_system_driver_passes_local_focks_and_matches_canonical_response(
         return real_solve(inputs, metadata, controls, **kwargs)
 
     monkeypatch.setattr(backend, "solve", local_solve)
+    monkeypatch.setattr(driver, "prepare_system_inputs", prepare_without_fock)
     energy, bar = dlno_stc.value_and_grad(
         coordinate_response["mol"], _mf, scope="system", frozen=1,
         controls=_controls(),

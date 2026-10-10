@@ -244,9 +244,13 @@ def test_outcore_nr_e2_preserves_generic_float32_backend(
     )
 
 
+@pytest.mark.parametrize("profiling", [False, True])
 def test_dfmp2_energy_gradient_uses_streamed_outcore_transform(
-        tmp_path, monkeypatch):
+        tmp_path, monkeypatch, capsys, profiling):
+    monkeypatch.delenv("PYSCFAD_DLNO_RESOURCE_PROFILE", raising=False)
     mol = _water()
+    # Compiled AD cases earlier in a combined test run can exceed 1 GB RSS.
+    mol.max_memory = 4000
     auxbasis = "weigend"
     cderi_path = tmp_path / "cderi.h5"
     builder = df.DF(mol, auxbasis=auxbasis, incore=False)
@@ -270,6 +274,9 @@ def test_dfmp2_energy_gradient_uses_streamed_outcore_transform(
         dense_energy, dense_gradient = jax.value_and_grad(
             lambda mol_: energy(mol_, outcore=False)
         )(mol)
+        assert "[DLNO-RESOURCE]" not in capsys.readouterr().out
+        if profiling:
+            monkeypatch.setenv("PYSCFAD_DLNO_RESOURCE_PROFILE", "1")
 
         def forbidden_full_cderi(*args, **kwargs):
             raise AssertionError("canonical DF-MP2 used the full CDERI/bar VJP")
@@ -281,10 +288,18 @@ def test_dfmp2_energy_gradient_uses_streamed_outcore_transform(
             _cderi_vjp, "cholesky_eri_vjp_from_cderi_source",
             forbidden_full_cderi,
         )
-        streamed_energy, streamed_gradient = jax.value_and_grad(
-            lambda mol_: energy(mol_, outcore=True)
-        )(mol)
+        with dfmp2.profile_reverse_mode():
+            streamed_energy, streamed_gradient = jax.value_and_grad(
+                lambda mol_: energy(mol_, outcore=True)
+            )(mol)
 
+    phases = [line.split("phase=")[1].split()[0]
+              for line in capsys.readouterr().out.splitlines()
+              if "phase=dfmp2." in line]
+    assert phases == ([
+        "dfmp2.ao2mo", "dfmp2.energy_forward",
+        "dfmp2.energy_cotangents", "dfmp2.input_pullback",
+    ] if profiling else [])
     assert float(streamed_energy) == pytest.approx(
         float(dense_energy), abs=2e-10, rel=2e-10
     )

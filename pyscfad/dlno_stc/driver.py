@@ -338,12 +338,26 @@ def _initialize_scf(mol, build_mf, *, fix_phases=True):
         return jax.vjp(build, mol)
 
 
-def _initialize_system(mf, frozen, controls, *, with_grad, scf_pullback=None, lo_kwargs=None):
+def _initialize_system(mf, frozen, controls, *, with_grad, scf_pullback=None,
+                       lo_kwargs=None, fock_from_scf=False):
     _validate_controls(controls)
     occupied, virtual = _system_active_indices(mf, frozen)
+    if fock_from_scf and len(occupied) and len(virtual):
+        energies = numpy.asarray(mf.mo_energy)
+        if (energies.shape != (mf.mo_coeff.shape[1],) or numpy.iscomplexobj(energies)
+                or not numpy.isfinite(energies).all()):
+            raise ValueError("SCF Fock projection requires real finite orbital energies "
+                             "matching the canonical coefficient columns")
+        # SCF's generalized-eigh response masks rotations at gaps <= 1e-9.
+        # Reconstructing F from those outputs would lose off-diagonal Fock
+        # response inside a degenerate active block. Select the general path
+        # outside the AD tape, using the same cutoff as the SCF eigensolver.
+        if any(numpy.any(numpy.diff(numpy.sort(energies[indices])) <= 1e-9)
+               for indices in (occupied, virtual)):
+            fock_from_scf = False
     dtype = mf.mo_coeff.dtype
     return {"mf": mf, "occupied": occupied, "virtual": virtual,
-            "lo_kwargs": lo_kwargs,
+            "lo_kwargs": lo_kwargs, "fock_from_scf": fock_from_scf,
             "scf_pullback": scf_pullback, "energy": np.zeros((), dtype=dtype),
             "variance": 0.0,
             "mf_bar": (_zero_mf_cotangent(mf, dtype)
@@ -413,6 +427,7 @@ def _prepare_system(state, controls, with_grad):
         mf_, state["occupied"], state["virtual"],
         boys_reference=state["boys_reference"],
         virtual_anchor_columns=state["virtual_anchor_columns"],
+        fock_from_scf=state["fock_from_scf"],
     )
     with warnings.catch_warnings():
         warnings.filterwarnings("error", message="integral-direct local Lov is unavailable.*",
@@ -490,6 +505,12 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
     Boys reference labels and complete PAO virtual anchors, while coordinate
     response includes localization, projections, Cholesky orthonormalization,
     full Fock blocks, fitted factors and SCF.
+    For system scope, ``build_mf`` must return converged canonical orbitals
+    and matching orbital energies without subsequent orbital rotations.
+    Local Fock blocks use these differentiable energies and rotations to
+    avoid a separate AO Fock construction and its preparation pullback.
+    Degenerate active occupied or virtual spectra use AO Fock preparation
+    because the SCF eigensolver masks their internal rotation response.
     System ``lo_kwargs`` are passed to the shared Boys localization; domain
     calls take their saved localization options from ``static``.
     Stochastic energy uncertainty does not bound gradient uncertainty.
@@ -507,7 +528,8 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
         mf, scf_pullback = _initialize_scf(mol, build_mf)
         if scope == "system":
             return _initialize_system(mf, frozen, controls, with_grad=True,
-                                      scf_pullback=scf_pullback, lo_kwargs=lo_kwargs)
+                                      scf_pullback=scf_pullback, lo_kwargs=lo_kwargs,
+                                      fock_from_scf=True)
         return _initialize(mf, static, controls, with_grad=True,
                            scf_pullback=scf_pullback)
 

@@ -14,11 +14,7 @@ def _preflight(inputs, metadata, controls, backend, array_names=_KEYS):
     if not isinstance(metadata, dict) or not isinstance(controls, dict):
         raise ValueError("metadata and controls must be dictionaries")
     if tuple(array_names) != _KEYS:
-        from .protocol import WEIGHTED_ARRAY_NAMES, validate_weighted_inputs
-        if tuple(array_names) != WEIGHTED_ARRAY_NAMES:
-            raise ValueError("unsupported input array names")
-        validate_weighted_inputs(inputs)
-        return
+        raise ValueError("unsupported input array names")
     if set(inputs) != set(_KEYS):
         raise ValueError("inputs must contain foo, fvv, B")
     foo, fvv, B = (np.asarray(inputs[key]) for key in _KEYS)

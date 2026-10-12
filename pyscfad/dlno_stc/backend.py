@@ -6,15 +6,12 @@ import math
 import numpy as np
 
 from .protocol import (
-    ARRAY_NAMES, WEIGHTED_ARRAY_NAMES, validate_full_inputs, validate_full_result,
-    validate_weighted_inputs, validate_weighted_result,
+    ARRAY_NAMES, validate_full_inputs, validate_full_result,
 )
 
 
 def _scope_boundary(scope):
-    if scope == "domain":
-        return WEIGHTED_ARRAY_NAMES, validate_weighted_inputs, validate_weighted_result
-    if scope == "system":
+    if scope in ("domain", "system"):
         return ARRAY_NAMES, validate_full_inputs, validate_full_result
     raise ValueError("scope must be domain or system")
 
@@ -47,9 +44,10 @@ def _solve_local(inputs, metadata, controls, *, with_grad, aux_offsets, scope="d
             "with CMake as described in pyscfad/dlno_stc/README.md"
         ) from exc
     names, _, _ = _scope_boundary(scope)
-    solver = extension.solve if scope == "domain" else extension.solve_full
+    solver = extension.solve_selected if scope == "domain" else extension.solve_full
+    arguments = (tuple(metadata["target_indices"]), controls) if scope == "domain" else (controls,)
     return solver(
-        *(inputs[key] for key in names), controls,
+        *(inputs[key] for key in names), *arguments,
         aux_offsets=aux_offsets, with_grad=with_grad,
     )
 
@@ -122,15 +120,34 @@ def solve(inputs, metadata, controls, *, comm=None, with_grad=True, aux_offsets=
         "energy": np.float64(local_energy / size),
         "energy_standard_error": np.float64(math.sqrt(float(local_variance)) / size),
         "metadata": {
-            "energy_kind": ("weighted_laplace_mp2_v1" if scope == "domain"
+            "energy_kind": ("boys_target_laplace_mp2_v1" if scope == "domain"
                             else "full_laplace_mp2_v1"), "cotangent_seed": 1.0,
+            "target_indices": metadata.get("target_indices"),
             "fragment_id": int(metadata.get("fragment_id", 0)),
             "replica_count": size, "global_seed": int(requested_seed),
             "derivative_convention": "fixed_sample",
         },
-        "diagnostics": {"replica_seeds": replica_seeds,
+        "diagnostics": {"target_indices": metadata.get("target_indices"),
+                        "energy_tolerance": controls.get("energy_tolerance"),
+                        "sampling_mode": ("fixed_count" if "production_samples" in controls
+                                          else controls.get("mode", "deterministic")),
+                        "replica_seeds": replica_seeds,
                         "replicas": replica_diagnostics},
     }
+    if "request_fingerprint" in metadata:
+        result["metadata"] = dict(metadata, **{
+            "cotangent_seed": 1.0, "backend": "stc_selected", "backend_version": "1",
+            "actual_sample_count": sum(int(d.get("actual_sample_count", 0))
+                                       for d in replica_diagnostics),
+            "derivative_convention": "fixed_sample",
+            "seed_replay": {"global_seed": int(requested_seed),
+                            "replica_seeds": replica_seeds},
+            "replica_count": size,
+        })
+    for name in ("frame_convention", "global_target_orbitals", "candidate_order",
+                 "virtual_anchor_parent_columns", "grouping_fingerprint", "budget"):
+        if name in metadata:
+            result["metadata"][name] = metadata[name]
     if with_grad:
         for value in bars.values():
             value /= size

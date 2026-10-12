@@ -1,4 +1,4 @@
-"""Export, reference-solve, and import a small exact-Boys DLNO-MP2 run.
+"""Export, reference-solve, and import a small selected-target STC-MP2 run.
 
 This example fixes a water/STO-3G/full-domain problem with one frozen core.
 The reference solver is a tiny deterministic oracle, not an STC sampler. An
@@ -11,8 +11,8 @@ from pathlib import Path
 import numpy as np
 
 from pyscfad import gto, scf
-from pyscfad.dlno import _selection, domain as dlno_domain
-from pyscfad.dlno.mp2 import _fix_restart_mo_phases
+from pyscfad.dlno_stc import build_domain_selections, build_domain_groups
+from pyscfad.dlno_stc.adjoint import fix_restart_mo_phases as _fix_restart_mo_phases
 from pyscfad.dlno_stc.mp2 import (
     export_run, imported_value_and_grad, load_disk_packet,
     load_static_from_run, solve_request,
@@ -43,13 +43,7 @@ def _build_mf(mol):
 def _export(workdir):
     mol = _molecule()
     mf = _build_mf(mol)
-    topology = dlno_domain.build_domain_topology(
-        mf, frozen=FROZEN, lo_type="boys", force_full_domains=True,
-        thresholds=dlno_domain.DLNOThresholds(
-            domain_pao=0.0, ed_pao=0.0, pao_norm=1e-10,
-        ),
-    )
-    static = _selection.build_domain_selections(mf, topology)
+    static = build_domain_selections(mf, frozen=FROZEN, force_full_domains=True)
     rows = export_run(mf, static, workdir, controls={}, reporter=print)
     print(f"Exported {len(rows)} target requests to {workdir}")
 
@@ -105,11 +99,11 @@ def _import(workdir, fragment=None):
     mf = _build_mf(mol)
     static = load_static_from_run(mf, workdir, frozen=FROZEN)
     selected = (
-        tuple(range(len(static.fragments))) if fragment is None
+        tuple(range(len(build_domain_groups(static)))) if fragment is None
         else (fragment,)
     )
     for fragment_id in selected:
-        if not 0 <= fragment_id < len(static.fragments):
+        if not 0 <= fragment_id < len(build_domain_groups(static)):
             raise ValueError(f"fragment {fragment_id} is outside this run")
         result_path = workdir / f"fragment_{fragment_id:04d}" / "result.h5"
         if not result_path.is_file():
@@ -117,7 +111,7 @@ def _import(workdir, fragment=None):
     energy, gradient = imported_value_and_grad(
         mol, _build_mf, static,
         lambda fragment_id: load_disk_packet(workdir, fragment_id),
-        fragment_ids=selected, include_hf=(fragment is None),
+        fragment_ids=selected, include_hf=(fragment is None), include_weak=(fragment is None),
     )
     if fragment is None:
         print(f"E_total (Eh): {float(energy):.12f}")

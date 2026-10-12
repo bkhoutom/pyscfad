@@ -20,7 +20,7 @@ def packet():
 def metadata():
     return {"schema_version": 1, "method": "mp2",
             "energy_kind": "quadratic_test_v1", "fragment_id": 0,
-            "target_index": 0, "basis_frame": "orthonormal_local",
+            "target_indices": [0], "basis_frame": "orthonormal_local",
             "B_axes": "Pia", "request_fingerprint": "b" * 64,
             "units": {"energy": "Eh", "length": "bohr"}, "frozen": [0],
             "orbital_order": {"occupied": [0, 1], "virtual": [0, 1]},

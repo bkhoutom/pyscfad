@@ -1,4 +1,4 @@
-"""Native parallel ownership preserves fixed-sample energies and every adjoint."""
+"""Native parallel ownership and fixed-thread sampling remain reproducible."""
 import os
 from pathlib import Path
 import subprocess
@@ -19,8 +19,6 @@ fvv = np.diag(np.linspace(.4, 1.4, 7))
 fvv[1, 2] = fvv[2, 1] = .05
 B = rng.normal(size=(5, 3, 7)) * .08
 B *= np.array([.3, 1., 2.])[None, :, None]
-M = np.array([[.2, -.6, .7]])
-W = np.array([[.9, .1, -.2], [.1, .7, .05], [-.2, .05, .8]])
 offsets = np.array([0, 1, 3, 5], dtype=np.int64)
 saved = {}
 for scope in ('full', 'domain'):
@@ -28,27 +26,42 @@ for scope in ('full', 'domain'):
         controls = dict(mode=mode, laplace_roots=[0., .3, 1.1],
                         laplace_weights=[.07, .4, .6], virtual_block_size=3,
                         global_seed=713, production_samples=10007,
-                        min_production_samples=2, virtual_keep_fraction=.34)
+                        min_production_samples=2)
+        if scope == 'full':
+            controls['virtual_keep_fraction'] = .34
+        else:
+            controls['system_workload_cutoff'] = 2.
         before = B.copy()
         if scope == 'full':
             out = native.solve_full(foo, fvv, B, controls, offsets, True)
         else:
-            out = native.solve(foo, fvv, B, M, W, controls, offsets, True)
+            out = native.solve_selected(foo, fvv, B, (0, 2), controls,
+                                        aux_offsets=offsets, with_grad=True)
         np.testing.assert_array_equal(B, before)
+        if mode == 'stochastic':
+            assert out['diagnostics']['actual_sample_count'] > 0
         again = (native.solve_full(foo, fvv, B, controls, offsets, True)
                  if scope == 'full' else
-                 native.solve(foo, fvv, B, M, W, controls, offsets, True))
+                 native.solve_selected(foo, fvv, B, (0, 2), controls,
+                                        aux_offsets=offsets, with_grad=True))
+        np.testing.assert_allclose(out['energy'], again['energy'], rtol=3e-12, atol=3e-12)
+        np.testing.assert_allclose(out['energy_standard_error'],
+                                   again['energy_standard_error'], rtol=3e-12, atol=3e-12)
+        assert out['diagnostics']['actual_sample_count'] == again['diagnostics']['actual_sample_count']
         prefix = scope + '_' + mode + '_'
         saved[prefix + 'energy'] = out['energy']
         saved[prefix + 'error'] = out['energy_standard_error']
         for key, value in out['cotangents'].items():
-            np.testing.assert_array_equal(value, again['cotangents'][key])
+            # OpenMP reductions may reorder roundoff even at a fixed thread count.
+            assert np.isfinite(value).all()
+            np.testing.assert_allclose(value, again['cotangents'][key],
+                                       rtol=3e-12, atol=3e-12)
             saved[prefix + key] = value
 np.savez(sys.argv[1], **saved)
 """
 
 
-def test_native_fixed_draws_and_all_bars_across_thread_counts(tmp_path):
+def test_native_fixed_thread_draws_and_parallel_deterministic_bars(tmp_path):
     pytest.importorskip('pyscfad.dlno_stc._stc_mp2')
     outputs = []
     for threads in (1, 2, 4):
@@ -62,6 +75,10 @@ def test_native_fixed_draws_and_all_bars_across_thread_counts(tmp_path):
         outputs.append(dict(np.load(output)))
     for result in outputs[1:]:
         for key, expected in outputs[0].items():
+            # The source selected sampler assigns an RNG stream per OpenMP
+            # thread. Changing thread count changes its realized draws.
+            if key.startswith('domain_stochastic_'):
+                continue
             np.testing.assert_allclose(result[key], expected,
                                        rtol=3e-12, atol=3e-12, err_msg=key)
 
@@ -73,8 +90,6 @@ def test_zero_auxiliary_padding_preserves_tiled_energy_and_gradients():
     B = rng.normal(size=(3, 2, 31)) * .04
     padded = np.zeros((100000, 2, 31))
     padded[:3] = B
-    M = np.array([[.3, -.8]])
-    W = np.array([[.9, .1], [.1, .6]])
     controls = dict(mode='deterministic', laplace_roots=[0.],
                     laplace_weights=[1.], virtual_block_size=13)
     # Zero auxiliary rows cannot change the physical contraction. Their size
@@ -83,7 +98,8 @@ def test_zero_auxiliary_padding_preserves_tiled_energy_and_gradients():
         def solve(tensor):
             if scope == 'full':
                 return native.solve_full(foo, fvv, tensor, controls, None, True)
-            return native.solve(foo, fvv, tensor, M, W, controls, None, True)
+            return native.solve_selected(foo, fvv, tensor, (1,), controls,
+                                         aux_offsets=None, with_grad=True)
         reference, result = solve(B), solve(padded)
         np.testing.assert_allclose(result['energy'], reference['energy'],
                                    rtol=2e-12, atol=2e-12)

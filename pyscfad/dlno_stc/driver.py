@@ -6,6 +6,7 @@
 """
 
 from functools import partial
+from contextlib import nullcontext
 import gc
 import math
 import warnings
@@ -15,27 +16,28 @@ import numpy
 from pyscf import df as pyscf_df, lib
 from pyscfad import config_update, numpy as np
 from pyscfad.tools import resource_profile
-from pyscfad.dlno._selection import DomainSelections, _extract_active_indices
-from pyscfad.dlno.domain import _check_domain_inputs
-from pyscfad.dlno.dlno_base import rebuild_domain_data
-from pyscfad.dlno.targets import validate_boys_target_groups
-from pyscfad.dlno.mp2 import (
-    _add_cotangent, _contains_tracer, _correlation_term_energy,
-    _correlation_term_specs, _fix_restart_mo_phases, _zero_term_cotangents,
-    _zero_mf_cotangent,
+from ._selection import DomainSelections, _extract_active_indices, build_domain_groups
+from .domain import rebuild_domain_data
+from ._selection import _validate_boys_target_groups as validate_boys_target_groups
+from .adjoint import (
+    add_cotangent as _add_cotangent,
+    fix_restart_mo_phases as _fix_restart_mo_phases,
+    zero_term_cotangents as _zero_term_cotangents,
+    zero_mf_cotangent as _zero_mf_cotangent,
 )
+from ._pairs import weak_pair_energy, weak_pair_indices
+
 
 from . import backend
-from ._workflow import check_system_memory, check_weighted_memory
-from .adjoint import apply_full_pullback, apply_weighted_pullback
+from ._workflow import check_system_memory, check_domain_memory, allocate_domain_controls
+from .adjoint import apply_full_pullback, apply_selected_pullback
 from .controls import DEFAULT_ENERGY_TOLERANCE, default_laplace_grid
 from .domain import (
     select_system_boys_reference, select_system_virtual_anchor_columns,
-    select_virtual_anchor_columns,
 )
 from .parallel import run_backend
-from .prepare import prepare_system_inputs, prepare_weighted_inputs
-from .protocol import ARRAY_NAMES, WEIGHTED_ARRAY_NAMES
+from .prepare import prepare_system_inputs, prepare_boys_group_inputs
+from .protocol import ARRAY_NAMES
 
 
 def _root_call(comm, rank, function, phase):
@@ -74,7 +76,9 @@ def _validate_static(static):
     for index, fragment in enumerate(static.fragments):
         if not numpy.array_equal(fragment.iao_indices, groups[index]):
             raise ValueError("fragment target does not match the singleton partition")
-        if not numpy.array_equal(fragment.strong_fragments, numpy.flatnonzero(mask[index])):
+        partners = numpy.asarray(fragment.strong_fragments)
+        if (partners.ndim != 1 or partners.dtype.kind not in "iu"
+                or not numpy.array_equal(numpy.sort(partners), numpy.flatnonzero(mask[index]))):
             raise ValueError("strong partner selections disagree with strong_mask")
 
 
@@ -127,7 +131,7 @@ def _validate_controls(controls):
 
 
 def _validate_reference(mf, static):
-    _check_domain_inputs(mf, static.thresholds)
+    _system_active_indices(mf, static.frozen)
     for name, expected in zip(
         ("active_occ_indices", "active_vir_indices", "pao_projected_out_indices"),
         _extract_active_indices(mf, static.frozen),
@@ -155,25 +159,25 @@ def _initialize(mf, static, controls, *, with_grad, scf_pullback=None):
     _validate_static(static)
     _validate_controls(controls)
     _validate_reference(mf, static)
-    if with_grad:
-        common, common_pullback = jax.vjp(lambda mf_: rebuild_domain_data(mf_, static), mf)
-        mf_bar, common_bar = _zero_term_cotangents(mf, common)
-    else:
-        common = rebuild_domain_data(mf, static)
-        common_pullback = mf_bar = common_bar = None
+    with resource_profile.section('stc.domain.common_prepare'):
+        if with_grad:
+            common, common_pullback = jax.vjp(lambda mf_: rebuild_domain_data(mf_, static), mf)
+            mf_bar, common_bar = _zero_term_cotangents(mf, common)
+        else:
+            common = rebuild_domain_data(mf, static)
+            common_pullback = mf_bar = common_bar = None
+        jax.block_until_ready(common)
     return {"mf": mf, "common": common, "common_pullback": common_pullback,
             "scf_pullback": scf_pullback, "mf_bar": mf_bar, "common_bar": common_bar,
             "energy": np.zeros((), dtype=common.s1e.dtype), "variance": 0.0,
-            "specs": _correlation_term_specs(static)}
+            "weak_pairs": tuple(weak_pair_indices(static))}
 
 
-def _prepare(state, static, fragment_id, controls, with_grad):
-    check_weighted_memory(state["mf"], static, fragment_id, with_grad=with_grad,
-                          virtual_block_size=controls.get("virtual_block_size", 16))
-    anchors = select_virtual_anchor_columns(state["common"], static, fragment_id)
-    prepare = lambda mf_, common_: prepare_weighted_inputs(
-        mf_, common_, static, fragment_id, virtual_anchor_columns=anchors,
-    )
+def _prepare(state, static, group, controls, with_grad):
+    check_domain_memory(state["mf"], static, group.representative_index,
+                        with_grad=with_grad,
+                        virtual_block_size=controls.get("virtual_block_size", 16))
+    prepare = lambda mf_, common_: prepare_boys_group_inputs(mf_, common_, static, group)
     with warnings.catch_warnings():
         warnings.filterwarnings("error", message="integral-direct local Lov is unavailable.*",
                                 category=RuntimeWarning)
@@ -181,6 +185,7 @@ def _prepare(state, static, fragment_id, controls, with_grad):
             inputs, pullback = jax.vjp(prepare, state["mf"], state["common"])
         else:
             inputs, pullback = prepare(state["mf"], state["common"]), None
+    jax.block_until_ready(inputs)
     return inputs, backend.host_inputs(inputs), pullback
 
 
@@ -199,8 +204,10 @@ def _finish(state, *, with_grad, include_hf):
         return energy
     mf_bar = state["mf_bar"]
     if state.get("common_pullback") is not None:
-        common_mf_bar, = state["common_pullback"](state["common_bar"])
-        mf_bar = jax.tree_util.tree_map(_add_cotangent, mf_bar, common_mf_bar)
+        with resource_profile.section('stc.domain.common_pullback'):
+            common_mf_bar, = state["common_pullback"](state["common_bar"])
+            mf_bar = jax.tree_util.tree_map(_add_cotangent, mf_bar, common_mf_bar)
+            jax.block_until_ready(mf_bar)
     return _finish_response(state, energy, mf_bar, include_hf=include_hf)
 
 
@@ -215,61 +222,64 @@ def _finish_response(state, energy, mf_bar, *, include_hf):
     return energy, mol_bar
 
 
-def _run_domain(initializer, static, controls, comm, *, with_grad, include_hf=False):
+def _run_domain(initializer, static, controls, comm, *, with_grad, include_hf=False,
+                merge_identical=True):
     rank = 0 if comm is None else comm.Get_rank()
-    state = _root_call(comm, rank, initializer, "initial preparation")
-    specs = state["specs"] if rank == 0 else None
+    with resource_profile.section('stc.domain.initialize'):
+        state = _root_call(comm, rank, initializer, "initial preparation")
+    groups = _root_call(comm, rank,
+                        lambda: build_domain_groups(static, merge_identical=merge_identical),
+                        "group selection")
+    pairs = state["weak_pairs"] if rank == 0 else None
     if comm is not None:
-        specs = comm.bcast(specs, root=0)
-    domain_controls = controls.copy() if rank == 0 else None
-    ndomains = sum(spec[0] == "strong" for spec in specs)
-    if rank == 0 and ndomains and "energy_tolerance" in domain_controls:
-        total_tolerance = float(domain_controls["energy_tolerance"])
-        domain_controls["energy_tolerance"] = total_tolerance / ndomains
-        lib.logger.info(state["mf"],
-                        "STC requested energy tolerance %.6g Eh; %d domains; per-domain %.6g Eh",
-                        total_tolerance, ndomains, domain_controls["energy_tolerance"])
-    for spec in specs:
-        kind, fragment_id, _ = spec
-        if kind == "strong":
-            prepared = _root_call(
-                comm, rank, lambda: _prepare(state, static, fragment_id, controls, with_grad),
-                f"domain {fragment_id} preparation",
-            )
-            inputs = prepared[1] if rank == 0 else None
-            result = run_backend(
-                inputs, {"fragment_id": fragment_id} if rank == 0 else None,
-                domain_controls if rank == 0 else None, partial(backend.solve, with_grad=with_grad),
-                comm=comm, array_names=WEIGHTED_ARRAY_NAMES,
-            )
+        groups, pairs = comm.bcast((groups, pairs), root=0)
+    settings = allocate_domain_controls(controls, len(groups)) if rank == 0 else None
+    for group in groups:
+        fragment_id = group.representative_index
+        with resource_profile.section('stc.domain.prepare'):
+            prepared = _root_call(comm, rank,
+                lambda: _prepare(state, static, group, controls, with_grad),
+                f"group {fragment_id} preparation")
+        metadata = ({"fragment_id": fragment_id, "target_indices": group.target_indices,
+                     "fragment_indices": group.fragment_indices,
+                     "global_target_orbitals": tuple(int(static.frag_lolist[i][0])
+                                                     for i in group.fragment_indices),
+                     "budget": {"total_tolerance": controls.get("energy_tolerance"),
+                                "effective_tolerance": settings.get("energy_tolerance"),
+                                "original_target_count": len(static.fragments),
+                                "group_count": len(groups)}} if rank == 0 else None)
+        with resource_profile.section('stc.domain.native'):
+            result = run_backend(prepared[1] if rank == 0 else None, metadata, settings,
+                                 partial(backend.solve, with_grad=with_grad), comm=comm)
 
-            def apply_domain():
-                if with_grad:
-                    bars = apply_weighted_pullback(prepared[2], prepared[0], result)
-                    _add_bars(state, *bars)
-                state["energy"] = state["energy"] + result["energy"]
-                state["variance"] += float(result["energy_standard_error"]) ** 2
-                jax.block_until_ready((state["energy"], state["mf_bar"], state["common_bar"]))
+        def apply_group():
+            if with_grad:
+                _add_bars(state, *apply_selected_pullback(prepared[2], prepared[0], result))
+            state["energy"] = state["energy"] + result["energy"]
+            state["variance"] += float(result["energy_standard_error"]) ** 2
+            jax.block_until_ready((state["energy"], state["mf_bar"], state["common_bar"]))
 
-            _root_call(comm, rank, apply_domain, f"domain {fragment_id} pullback")
-            del prepared, inputs, result, apply_domain
-        else:
-            def apply_weak():
-                term = lambda mf_, common_: _correlation_term_energy(mf_, common_, static, spec)
-                if with_grad:
-                    energy, pullback = jax.vjp(term, state["mf"], state["common"])
-                    _add_bars(state, *pullback(np.ones((), dtype=energy.dtype)))
-                    del pullback
-                else:
-                    energy = term(state["mf"], state["common"])
-                state["energy"] = state["energy"] + energy
-                jax.block_until_ready((state["energy"], state["mf_bar"], state["common_bar"]))
-
-            _root_call(comm, rank, apply_weak, f"weak pair {spec[1:]} pullback")
-            del apply_weak
+        with resource_profile.section('stc.domain.input_pullback'):
+            _root_call(comm, rank, apply_group, f"group {fragment_id} pullback")
+        del prepared, result, apply_group
         gc.collect()
-    return _root_call(comm, rank, lambda: _finish(state, with_grad=with_grad,
-                                                include_hf=include_hf), "final response")
+    for left, right in pairs:
+        def apply_weak():
+            term = lambda mf_, common_: weak_pair_energy(mf_, common_, static, left, right)
+            if with_grad:
+                energy, pullback = jax.vjp(term, state["mf"], state["common"])
+                _add_bars(state, *pullback(np.ones((), dtype=energy.dtype)))
+            else:
+                energy = term(state["mf"], state["common"])
+            state["energy"] = state["energy"] + energy
+            jax.block_until_ready((state["energy"], state["mf_bar"], state["common_bar"]))
+        with resource_profile.section('stc.domain.weak'):
+            _root_call(comm, rank, apply_weak, f"weak pair {(left, right)} pullback")
+        del apply_weak
+        gc.collect()
+    with resource_profile.section('stc.domain.response'):
+        return _root_call(comm, rank, lambda: _finish(state, with_grad=with_grad,
+                         include_hf=include_hf), "final response")
 
 
 def _select_scope(static, scope, frozen, lo_kwargs=None):
@@ -477,15 +487,19 @@ def _run_system(initializer, controls, comm, *, with_grad, include_hf=False):
 
 
 def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
-           lo_kwargs=None):
-    """Return domain or whole-system correlation energy on root."""
+           lo_kwargs=None, merge_identical=True):
+    """Return correlation energy on root.
+
+    Domain jobs share identical saved frames by default. ``merge_identical=False``
+    runs each singleton separately for diagnostic comparisons.
+    """
     scope = _shared_scope(static, scope, frozen, comm, lo_kwargs)
     rank = 0 if comm is None else comm.Get_rank()
     controls = _root_call(comm, rank, lambda: _driver_controls(controls, scope=scope),
                           "control validation")
 
     def initialize():
-        if _contains_tracer(mf):
+        if any(isinstance(x, jax.core.Tracer) for x in jax.tree_util.tree_leaves(mf)):
             raise TypeError("STC kernel is forward-only; use value_and_grad")
         if scope == "system":
             return _initialize_system(mf, frozen, controls, with_grad=False,
@@ -494,11 +508,12 @@ def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
 
     if scope == "system":
         return _run_system(initialize, controls, comm, with_grad=False)
-    return _run_domain(initialize, static, controls, comm, with_grad=False)
+    return _run_domain(initialize, static, controls, comm, with_grad=False,
+                       merge_identical=merge_identical)
 
 
 def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
-                   controls, comm=None, include_hf=False, lo_kwargs=None):
+                   controls, comm=None, include_hf=False, lo_kwargs=None, merge_identical=True):
     """Return ``(energy, mol_bar)`` on root; worker ranks return ``None``.
 
     Discrete selections and the Laplace grid are fixed. System scope fixes
@@ -513,6 +528,8 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
     because the SCF eigensolver masks their internal rotation response.
     System ``lo_kwargs`` are passed to the shared Boys localization; domain
     calls take their saved localization options from ``static``.
+    Identical domain frames share one selected solve/VJP unless the diagnostic
+    option ``merge_identical=False`` is supplied. Public targets stay singleton.
     Stochastic energy uncertainty does not bound gradient uncertainty.
     """
     scope = _shared_scope(static, scope, frozen, comm, lo_kwargs)
@@ -525,7 +542,8 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
         if scope == "domain":
             _validate_static(static)
         _validate_controls(controls)
-        mf, scf_pullback = _initialize_scf(mol, build_mf)
+        with (resource_profile.section('stc.domain.scf') if scope == 'domain' else nullcontext()):
+            mf, scf_pullback = _initialize_scf(mol, build_mf)
         if scope == "system":
             return _initialize_system(mf, frozen, controls, with_grad=True,
                                       scf_pullback=scf_pullback, lo_kwargs=lo_kwargs,
@@ -535,4 +553,5 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
 
     if scope == "system":
         return _run_system(initialize, controls, comm, with_grad=True, include_hf=include_hf)
-    return _run_domain(initialize, static, controls, comm, with_grad=True, include_hf=include_hf)
+    return _run_domain(initialize, static, controls, comm, with_grad=True, include_hf=include_hf,
+                       merge_identical=merge_identical)

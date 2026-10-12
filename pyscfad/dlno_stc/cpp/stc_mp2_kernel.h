@@ -23,7 +23,7 @@ struct Controls {
     std::vector<double> point_variance_targets;
 };
 struct Inputs {
-    arma::mat foo, fvv, B, target_projection, partner_weight;
+    arma::mat foo, fvv, B;
     std::vector<arma::uword> aux_offsets;
 };
 struct ResidualDiagnostic {
@@ -36,17 +36,10 @@ struct Result {
     double energy = 0.0, energy_standard_error = 0.0;
     std::vector<ResidualDiagnostic> residuals;
     std::vector<double> point_variance_targets;
-    arma::mat foo, fvv, B, target_projection, partner_weight;
+    arma::mat foo, fvv, B;
 };
 struct Spectrum { arma::vec values; arma::mat vectors; };
 using KeepSets = std::vector<std::vector<arma::uword>>;
-KeepSets select_keep(const arma::mat&, const arma::mat&, const arma::mat&,
-                     const arma::mat&, arma::uword, const Controls&);
-void sample_residuals(const Inputs&, const Controls&, std::size_t,
-                      const KeepSets&, const arma::mat&, const arma::mat&,
-                      const arma::mat&, const arma::mat&, arma::mat&, arma::mat&,
-                      arma::mat&, arma::mat&, bool, Result&);
-Result solve(const Inputs&, const Controls&, bool with_grad);
 Result solve_full(const Inputs&, const Controls&, bool with_grad);
 void contract_full(const Inputs&, const Controls&, std::size_t point,
                    const arma::mat& dressed, arma::mat& gamma, bool with_grad, Result&);

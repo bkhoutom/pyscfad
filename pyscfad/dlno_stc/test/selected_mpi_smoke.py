@@ -1,4 +1,4 @@
-"""Domain/system replica smoke: mpiexec -n 2 python -m ...weighted_mpi_smoke."""
+"""Domain/system replica smoke: mpiexec -n 2 python -m ...selected_mpi_smoke."""
 
 from functools import partial
 
@@ -7,7 +7,7 @@ from mpi4py import MPI
 
 from pyscfad.dlno_stc import backend
 from pyscfad.dlno_stc.parallel import run_backend
-from pyscfad.dlno_stc.protocol import ARRAY_NAMES, WEIGHTED_ARRAY_NAMES
+from pyscfad.dlno_stc.protocol import ARRAY_NAMES
 
 
 def packet():
@@ -15,23 +15,21 @@ def packet():
         "foo": np.array([[-0.8, 0.07], [0.07, -0.5]]),
         "fvv": np.array([[0.3, -0.02], [-0.02, 0.7]]),
         "B": np.arange(16, dtype=np.float64).reshape(4, 2, 2) / 30,
-        "target_projection": np.array([[0.8, 0.3]]),
-        "partner_weight": np.array([[0.9, 0.1], [0.1, 0.7]]),
     }
 
 
 def check_team(comm, scope="domain"):
     rank, size = comm.Get_rank(), comm.Get_size()
-    names = WEIGHTED_ARRAY_NAMES if scope == "domain" else ARRAY_NAMES
+    names = ARRAY_NAMES
     inputs = {key: packet()[key] for key in names} if rank == 0 else None
     solve = backend.solve if scope == "domain" else partial(backend.solve, scope="system")
-    metadata = {"fragment_id": 3} if rank == 0 else None
+    metadata = {"fragment_id": 3, "target_indices": (0, 1)} if rank == 0 else None
     controls = {"mode": "deterministic", "global_seed": 17,
                 "laplace_roots": [0.1, 0.8], "laplace_weights": [0.2, 0.7]}
     result = run_backend(inputs, metadata, controls if rank == 0 else None,
                          solve, comm=comm, array_names=names)
     if rank == 0:
-        serial = solve(inputs, {"fragment_id": 3}, controls)
+        serial = solve(inputs, {"fragment_id": 3, "target_indices": (0, 1)}, controls)
         np.testing.assert_allclose(result["energy"], serial["energy"], atol=1e-14)
         for key in names:
             np.testing.assert_allclose(result["cotangents"][key],
@@ -52,17 +50,23 @@ def check_team(comm, scope="domain"):
         local = original(*args, **kwargs)
         captured = {"energy": float(local["energy"]),
                     "sigma": float(local["energy_standard_error"]),
+                    "sample_count": int(local["diagnostics"]["actual_sample_count"]),
                     "bars": {key: value.copy() for key, value in local["cotangents"].items()}}
         return local
 
-    sampled = dict(controls, mode="stochastic", virtual_keep_fraction=0.5,
-                   production_samples=97, auxiliary_group_size=2)
+    sampled = dict(controls, mode="stochastic", production_samples=97,
+                   auxiliary_group_size=2)
+    if scope == "domain":
+        sampled["system_workload_cutoff"] = 2.0  # Exercise selected residual draws.
+    else:
+        sampled["virtual_keep_fraction"] = 0.5
     backend._solve_local = capture_replica
     try:
         result = run_backend(inputs, metadata, sampled if rank == 0 else None,
                              solve, comm=comm, array_names=names)
         replicas = comm.gather(captured, root=0)
         if rank == 0:
+            assert all(local["sample_count"] > 0 for local in replicas)
             np.testing.assert_allclose(result["energy"],
                                        np.mean([local["energy"] for local in replicas]),
                                        atol=1e-14, rtol=1e-14)

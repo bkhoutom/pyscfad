@@ -19,7 +19,7 @@ def packet():
 
 def metadata(kind="quadratic_test_v1"):
     return {"schema_version": 1, "method": "mp2", "energy_kind": kind,
-            "fragment_id": 3, "target_index": 0,
+            "fragment_id": 3, "target_indices": [0],
             "basis_frame": "orthonormal_local", "B_axes": "Pia",
             "request_fingerprint": "a" * 64}
 
@@ -52,7 +52,7 @@ def test_diagonal_target_mp2_matches_hand_contraction_and_whole_sum():
 
 def test_target_gradient_matches_directional_differences():
     x = packet()
-    result = reference_backend(x, metadata("boys_target_mp2_v1"), {})
+    result = reference_backend(x, metadata("boys_target_laplace_mp2_v1"), {})
     directions = {"foo": np.array([[0.2, -0.3], [-0.3, 0.1]]),
                   "fvv": np.array([[0.1, 0.2, -0.1], [0.2, -0.3, 0.4], [-0.1, 0.4, 0.2]]),
                   "B": np.sin(np.arange(24)).reshape(4, 2, 3) / 10}
@@ -71,13 +71,13 @@ def test_target_gradient_matches_directional_differences():
 
 def test_empty_virtual_and_empty_occupied_cases():
     x = {"foo": np.eye(1), "fvv": np.empty((0, 0)), "B": np.empty((2, 1, 0))}
-    result = reference_backend(x, metadata("boys_target_mp2_v1"), {})
+    result = reference_backend(x, metadata("boys_target_laplace_mp2_v1"), {})
     assert result["energy"] == 0
     assert all(np.all(v == 0) for v in result["cotangents"].values())
     y = {"foo": np.empty((0, 0)), "fvv": np.eye(1), "B": np.empty((2, 0, 1))}
     assert reference_backend(y, metadata(), {})["energy"] == 0.5
     with pytest.raises(ValueError, match="active occupied"):
-        reference_backend(y, metadata("boys_target_mp2_v1"), {})
+        reference_backend(y, metadata("boys_target_laplace_mp2_v1"), {})
 
 
 def test_serial_sampled_backend_adds_deterministic_term_once():

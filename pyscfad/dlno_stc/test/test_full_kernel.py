@@ -63,11 +63,11 @@ def test_full_formula_three_bars_and_symmetric_directions(repeated):
     assert 'cotangents' not in solve(x)
 
 
-def test_full_equals_sum_of_weighted_identity_rows():
+def test_full_equals_sum_of_selected_rows():
     x, controls = full_fixture(), grid()
     full = solve(x, controls, with_grad=True)
-    rows = [native().solve(x['foo'], x['fvv'], x['B'], np.eye(2)[i:i+1].copy(),
-                           np.eye(2), controls, with_grad=True) for i in range(2)]
+    rows = [native().solve_selected(x['foo'], x['fvv'], x['B'], (i,),
+                           controls, with_grad=True) for i in range(2)]
     np.testing.assert_allclose(full['energy'], sum(r['energy'] for r in rows), atol=2e-13)
     for key in KEYS:
         np.testing.assert_allclose(full['cotangents'][key],

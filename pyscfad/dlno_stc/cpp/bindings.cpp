@@ -1,4 +1,5 @@
 #include "stc_mp2_kernel.h"
+#include "stc_mp2_selected.h"
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -153,8 +154,7 @@ double real_control(const py::dict& controls,const char* key,double fallback,
         throw py::value_error(std::string(key)+" is out of range");
     return number;
 }
-py::dict solve_binding(bool full, py::handle foo, py::handle fvv, py::handle B,
-               py::handle target_projection, py::handle partner_weight,
+py::dict solve_binding(py::handle foo, py::handle fvv, py::handle B,
                py::dict controls, py::object aux_offsets, bool with_grad) {
     bool canonical_fock=false;
     if (controls.contains("canonical_fock")) {
@@ -162,8 +162,6 @@ py::dict solve_binding(bool full, py::handle foo, py::handle fvv, py::handle B,
             throw py::type_error("canonical_fock must be a bool");
         canonical_fock=py::cast<bool>(controls["canonical_fock"]);
     }
-    if (canonical_fock && !full)
-        throw py::value_error("canonical_fock is supported only by solve_full");
     const auto fo = checked_array(foo,"foo",2), fv = checked_array(fvv,"fvv",2);
     const auto bp = checked_array(B,"B",3);
     const py::ssize_t no = fo.shape(0), nv = fv.shape(0), np = bp.shape(0);
@@ -175,14 +173,6 @@ py::dict solve_binding(bool full, py::handle foo, py::handle fvv, py::handle B,
     symmetric(x.foo,"foo"); symmetric(x.fvv,"fvv");
     if (canonical_fock) {
         strictly_diagonal(x.foo,"foo"); strictly_diagonal(x.fvv,"fvv");
-    }
-    if (!full) {
-        const auto m=checked_array(target_projection,"target_projection",2);
-        const auto w=checked_array(partner_weight,"partner_weight",2);
-        if (m.shape(0)!=1 || m.shape(1)!=no || w.shape(0)!=no || w.shape(1)!=no)
-            throw py::value_error("inconsistent five-input shapes");
-        x.target_projection=matrix(m); x.partner_weight=matrix(w);
-        symmetric(x.partner_weight,"partner_weight");
     }
     stc::Controls settings;
     settings.canonical_fock=canonical_fock;
@@ -242,11 +232,10 @@ py::dict solve_binding(bool full, py::handle foo, py::handle fvv, py::handle B,
         }
     }
     stc::Result out;
-    { py::gil_scoped_release release; out=full ? stc::solve_full(x,settings,with_grad):stc::solve(x,settings,with_grad); }
+    { py::gil_scoped_release release; out=stc::solve_full(x,settings,with_grad); }
     if (!std::isfinite(out.energy) || !std::isfinite(out.energy_standard_error))
         throw std::runtime_error("nonfinite STC-MP2 energy or uncertainty");
-    if (with_grad && (!out.foo.is_finite() || !out.fvv.is_finite() || !out.B.is_finite() ||
-                      !out.target_projection.is_finite() || !out.partner_weight.is_finite()))
+    if (with_grad && (!out.foo.is_finite() || !out.fvv.is_finite() || !out.B.is_finite()))
         throw std::runtime_error("nonfinite STC-MP2 cotangents");
     py::dict result, diagnostics;
     result["energy"]=out.energy; result["energy_standard_error"]=out.energy_standard_error;
@@ -264,7 +253,7 @@ py::dict solve_binding(bool full, py::handle foo, py::handle fvv, py::handle B,
         entry["residual"]=row.residual; entry["pilot_samples"]=row.pilot_samples;
         entry["production_samples"]=row.production_samples;
         entry["pilot_seed"]=row.pilot_seed; entry["production_seed"]=row.production_seed;
-        if (full && row.pilot_samples>settings.pilot_samples)
+        if (row.pilot_samples>settings.pilot_samples)
             entry["pilot_refinement_seed"]=row.pilot_refinement_seed;
         entry["variance_of_mean"]=row.variance_of_mean;
         sample_count=py::reinterpret_borrow<py::int_>(sample_count.attr("__add__")(py::int_(row.production_samples)));
@@ -276,10 +265,6 @@ py::dict solve_binding(bool full, py::handle foo, py::handle fvv, py::handle B,
     if (with_grad) {
         py::dict bars;
         bars["foo"]=array(out.foo); bars["fvv"]=array(out.fvv);
-        if (!full) {
-            bars["target_projection"]=array(out.target_projection);
-            bars["partner_weight"]=array(out.partner_weight);
-        }
         py::array_t<double> bar_B({np,no,nv});
         auto* target=bar_B.mutable_data();
         for (py::ssize_t P=0; P<np; ++P)
@@ -289,22 +274,155 @@ py::dict solve_binding(bool full, py::handle foo, py::handle fvv, py::handle B,
     }
     return result;
 }
-py::dict solve(py::handle foo, py::handle fvv, py::handle B,
-               py::handle target_projection, py::handle partner_weight,
+py::dict solve_selected(py::handle foo, py::handle fvv, py::handle B,
+                        py::handle target_indices,
                py::dict controls, py::object aux_offsets, bool with_grad) {
-    return solve_binding(false,foo,fvv,B,target_projection,partner_weight,controls,aux_offsets,with_grad);
+    if (controls.contains("canonical_fock") && py::cast<bool>(controls["canonical_fock"]))
+        throw py::value_error("canonical_fock is supported only by solve_full");
+    const auto fo = checked_array(foo,"foo",2), fv = checked_array(fvv,"fvv",2);
+    const auto bp = checked_array(B,"B",3);
+    const py::ssize_t no = fo.shape(0), nv = fv.shape(0), np = bp.shape(0);
+    if (no == 0) throw py::value_error("STC-MP2 requires at least one active occupied orbital");
+    if (fo.shape(1)!=no || fv.shape(1)!=nv || bp.shape(1)!=no || bp.shape(2)!=nv)
+        throw py::value_error("inconsistent Fock/B shapes");
+    stc::Inputs x;
+    x.foo=matrix(fo); x.fvv=matrix(fv);
+    symmetric(x.foo,"foo"); symmetric(x.fvv,"fvv");
+    if (!py::isinstance<py::tuple>(target_indices))
+        throw py::type_error("target_indices must be a nonempty tuple of integers");
+    std::vector<arma::uword> targets;
+    std::vector<bool> seen(static_cast<std::size_t>(no),false);
+    for (py::handle label:py::reinterpret_borrow<py::tuple>(target_indices)) {
+        if (py::isinstance<py::bool_>(label) ||
+            py::isinstance(label,py::module_::import("numpy").attr("bool_")) || !PyIndex_Check(label.ptr()))
+            throw py::type_error("target_indices must contain integers excluding booleans");
+        auto index=py::reinterpret_steal<py::object>(PyNumber_Index(label.ptr()));
+        if (!index) throw py::error_already_set();
+        int overflow=0;
+        const auto value=PyLong_AsLongLongAndOverflow(index.ptr(),&overflow);
+        if (PyErr_Occurred()) throw py::error_already_set();
+        if (overflow || value<0 || value>=no) throw py::value_error("target index out of range");
+        if (seen[value]) throw py::value_error("duplicate target index");
+        seen[value]=true; targets.push_back(static_cast<arma::uword>(value));
+    }
+    if (targets.empty()) throw py::value_error("target_indices must be nonempty");
+    stc::SelectedControls selected_controls;
+    auto& settings=selected_controls.numerical;
+    const std::string mode=controls.contains("mode") ? py::cast<std::string>(controls["mode"]):"deterministic";
+    if (mode!="deterministic" && mode!="stochastic")
+        throw py::value_error("mode must be deterministic or stochastic");
+    settings.stochastic=mode=="stochastic";
+    if (!controls.contains("laplace_roots") || !controls.contains("laplace_weights"))
+        throw py::value_error("explicit laplace_roots and laplace_weights are required");
+    settings.roots = py::cast<std::vector<double>>(controls["laplace_roots"]);
+    settings.weights = py::cast<std::vector<double>>(controls["laplace_weights"]);
+    if (settings.roots.empty() || settings.roots.size()!=settings.weights.size())
+        throw py::value_error("Laplace roots and weights must have equal nonzero lengths");
+    for (double v : settings.roots)
+        if (!std::isfinite(v) || v<0) throw py::value_error("laplace_roots must be finite and nonnegative");
+    for (double v : settings.weights)
+        if (!std::isfinite(v)) throw py::value_error("laplace_weights must be finite");
+    settings.adaptive=controls.contains("energy_tolerance") && !controls.contains("production_samples");
+    settings.virtual_block_size=integer_control(controls,"virtual_block_size",16);
+    settings.production_samples=integer_control(controls,"production_samples",4096,2);
+    settings.min_production_samples=integer_control(controls,"min_production_samples",10000,2);
+    settings.pilot_samples=integer_control(controls,"pilot_samples",100000,2);
+    settings.max_production_samples=integer_control(controls,"max_production_samples",0,0);
+    if (settings.max_production_samples && settings.max_production_samples<settings.min_production_samples)
+        throw py::value_error("max_production_samples is below min_production_samples");
+    settings.system_workload_cutoff=real_control(controls,"system_workload_cutoff",6.5e-3,
+                                                  0.,std::numeric_limits<double>::max(),true);
+    if (controls.contains("virtual_keep_fraction") || controls.contains("uniform_mixture"))
+        throw py::value_error("Selected sampling uses the source cutoff and support floors; keep fractions and mixtures are unsupported");
+    settings.energy_tolerance=real_control(controls,"energy_tolerance",0.,0.,std::numeric_limits<double>::max(),true);
+    if (settings.stochastic && !controls.contains("production_samples") && !controls.contains("energy_tolerance"))
+        throw py::value_error("Selected stochastic mode requires energy_tolerance or explicit production_samples");
+    if (settings.adaptive)
+        for(double weight:settings.weights)
+            if (!(weight>0)) throw py::value_error("Selected adaptive allocation requires positive laplace_weights");
+    selected_controls.has_global_seed=controls.contains("global_seed");
+    if (selected_controls.has_global_seed) {
+        const auto value=controls["global_seed"];
+        if (py::isinstance<py::bool_>(value)) throw py::value_error("global_seed must be an integer");
+        auto index=py::reinterpret_steal<py::object>(PyNumber_Index(value.ptr()));
+        if (!index) throw py::error_already_set();
+        settings.global_seed=py::cast<std::uint64_t>(index);
+    }
+    x.B.set_size(np,no*nv);
+    const auto* source = static_cast<const double*>(bp.data());
+    for (py::ssize_t P=0; P<np; ++P)
+        for (py::ssize_t i=0; i<no; ++i)
+            for (py::ssize_t a=0; a<nv; ++a) x.B(P,i*nv+a)=source[(P*no+i)*nv+a];
+    if (aux_offsets.is_none()) x.aux_offsets={0,static_cast<arma::uword>(np)};
+    else {
+        auto offsets = py::array::ensure(aux_offsets);
+        if (!offsets || offsets.ndim()!=1 ||
+            (offsets.dtype().kind()!='i' && offsets.dtype().kind()!='u'))
+            throw py::value_error("aux_offsets must be a one-dimensional integer array");
+        const auto values=py::cast<std::vector<std::int64_t>>(offsets);
+        if (values.size()<2 || values.front()!=0 || values.back()!=np)
+            throw py::value_error("aux_offsets must span [0,naux]");
+        for (std::size_t j=0; j<values.size(); ++j) {
+            if (values[j]<0 || (j>0 && values[j]<=values[j-1] && !(np==0 && values.size()==2)))
+                throw py::value_error("aux_offsets must be strictly increasing");
+            x.aux_offsets.push_back(static_cast<arma::uword>(values[j]));
+        }
+    }
+    stc::Result out;
+    { py::gil_scoped_release release; out=stc::solve_selected(x,targets,selected_controls,with_grad); }
+    if (!std::isfinite(out.energy) || !std::isfinite(out.energy_standard_error))
+        throw std::runtime_error("nonfinite STC-MP2 energy or uncertainty");
+    if (with_grad && (!out.foo.is_finite() || !out.fvv.is_finite() || !out.B.is_finite()))
+        throw std::runtime_error("nonfinite STC-MP2 cotangents");
+    py::dict result, diagnostics;
+    result["energy"]=out.energy; result["energy_standard_error"]=out.energy_standard_error;
+    diagnostics["mode"]=mode; diagnostics["global_seed"]=settings.global_seed;
+    diagnostics["energy_identity"]="boys_target_laplace_mp2_v1";
+    diagnostics["target_indices"]=targets;
+    diagnostics["seed_explicit"]=selected_controls.has_global_seed;
+    diagnostics["sampling_proposal"]="source_separate_bare_dressed_support_floors";
+    diagnostics["max_production_samples"]=settings.max_production_samples;
+    diagnostics["point_variance_targets"]=out.point_variance_targets;
+    py::int_ sample_count(0);
+    py::list residuals;
+    for (const auto& row:out.residuals) {
+        py::dict entry;
+        entry["point"]=row.point; entry["term"]=row.term==0 ? "direct":"exchange";
+        entry["residual"]=row.residual; entry["pilot_samples"]=row.pilot_samples;
+        entry["production_samples"]=row.production_samples;
+        entry["pilot_seed"]=row.pilot_seed; entry["production_seed"]=row.production_seed;
+        if (row.pilot_samples>settings.pilot_samples)
+            entry["pilot_refinement_seed"]=row.pilot_refinement_seed;
+        entry["variance_of_mean"]=row.variance_of_mean;
+        sample_count=py::reinterpret_borrow<py::int_>(sample_count.attr("__add__")(py::int_(row.production_samples)));
+        residuals.append(entry);
+    }
+    diagnostics["actual_sample_count"]=sample_count; diagnostics["residuals"]=residuals;
+    diagnostics["laplace_point_count"]=settings.roots.size();
+    result["diagnostics"]=diagnostics;
+    if (with_grad) {
+        py::dict bars;
+        bars["foo"]=array(out.foo); bars["fvv"]=array(out.fvv);
+        py::array_t<double> bar_B({np,no,nv});
+        auto* target=bar_B.mutable_data();
+        for (py::ssize_t P=0; P<np; ++P)
+            for (py::ssize_t i=0; i<no; ++i)
+                for (py::ssize_t a=0; a<nv; ++a) target[(P*no+i)*nv+a]=out.B(P,i*nv+a);
+        bars["B"]=bar_B; result["cotangents"]=bars;
+    }
+    return result;
 }
 py::dict solve_full(py::handle foo, py::handle fvv, py::handle B,
                     py::dict controls, py::object aux_offsets, bool with_grad) {
-    return solve_binding(true,foo,fvv,B,py::none(),py::none(),controls,aux_offsets,with_grad);
+    return solve_binding(foo,fvv,B,controls,aux_offsets,with_grad);
 }
 }  // namespace
 PYBIND11_MODULE(_stc_mp2,m) {
     m.def("parallel_runtime_info",&parallel_runtime_info,py::arg("runtime_path")=py::none());
     m.doc()="STC-MP2 with bounded pair contractions and an explicit canonical-system specialization";
-    m.def("solve",&solve,py::arg("foo"),py::arg("fvv"),py::arg("B"),
-          py::arg("target_projection"),py::arg("partner_weight"),py::arg("controls"),
-          py::arg("aux_offsets")=py::none(),py::arg("with_grad")=false);
+    m.def("solve_selected",&solve_selected,py::arg("foo"),py::arg("fvv"),py::arg("B"),
+          py::arg("target_indices"),py::arg("controls"),py::kw_only(),
+          py::arg("aux_offsets")=py::none(),py::arg("with_grad")=true);
     m.def("solve_full",&solve_full,py::arg("foo"),py::arg("fvv"),py::arg("B"),
           py::arg("controls"),py::arg("aux_offsets")=py::none(),py::arg("with_grad")=false);
 }

@@ -1,125 +1,93 @@
-"""Weighted finite-domain molecular integration, including weak and HF terms."""
-
+"""Selected finite-domain molecular integration, including weak and HF terms."""
+from dataclasses import replace
 import jax
 import numpy as np
 import pytest
-from types import SimpleNamespace
-
-from pyscfad import config_update, gto, scf
-from pyscfad.dlno._selection import DomainSelections, build_domain_selections
-from pyscfad.dlno.domain import DLNOThresholds, build_domain_topology
-from pyscfad.dlno.mp2 import (
-    _correlation_term_specs, _fix_restart_mo_phases,
-    correlation_value_and_grad,
-)
-
-
-def _mf(mol):
-    mf = scf.RHF(mol).density_fit()
-    mf.conv_tol = 1e-12
-    mf.conv_tol_grad = 1e-9
-    mf.kernel()
-    return mf
-
-
-def _controls():
-    nodes, weights = np.polynomial.legendre.leggauss(48)
-    return {"laplace_roots": 20 * (nodes + 1),
-            "laplace_weights": 20 * weights, "mode": "deterministic"}
+from pyscfad import gto
+from pyscfad.dlno_stc.test import _boys_acceptance as accept
 
 
 def test_coordinate_only_driver_rejects_basis_leaves_before_scf():
     from pyscfad import dlno_stc
-
-    driver = getattr(dlno_stc, "value_and_grad", None)
-    assert callable(driver), "the weighted molecular driver is missing"
-    mol = gto.Mole(atom="H 0 0 0; H 0 0 1", basis="sto-3g", verbose=0)
+    mol = gto.Mole(atom='H 0 0 0; H 0 0 1', basis='sto-3g', verbose=0)
     mol.build()
-
     def forbidden_scf(mol):
-        raise AssertionError("SCF must not run for unsupported basis derivatives")
+        raise AssertionError('SCF must not run for unsupported basis derivatives')
+    with pytest.raises(NotImplementedError, match='coordinate|nuclear'):
+        dlno_stc.value_and_grad(mol, forbidden_scf, controls=accept.controls())
 
-    with pytest.raises(NotImplementedError, match="coordinate|nuclear"):
-        driver(mol, forbidden_scf, None, controls=_controls())
 
-
-def test_fractional_boys_labels_are_rejected_before_reference_use():
-    from pyscfad.dlno_stc import kernel
-
-    labels = np.array([0.9])
+def test_unsupported_public_targets_are_rejected_before_scf():
+    from pyscfad import dlno_stc
+    from pyscfad.dlno_stc._selection import DomainSelections
+    from types import SimpleNamespace
     static = DomainSelections(
         frozen=0, thresholds=None, active_occ_indices=np.array([0]),
         active_vir_indices=np.array([], dtype=int),
         pao_projected_out_indices=np.array([0]),
         pao_parent_ao_indices=np.array([], dtype=int), ao2pao_map=np.array([], dtype=int),
-        frag_lolist=(labels,), frag_atmlist=(None,), strong_mask=np.ones((1, 1), dtype=bool),
-        fragments=(SimpleNamespace(iao_indices=labels, strong_fragments=np.array([0])),),
-        lo_type="boys",
+        frag_lolist=(np.array([0]),), frag_atmlist=(None,),
+        strong_mask=np.ones((1, 1), dtype=bool),
+        fragments=(SimpleNamespace(iao_indices=np.array([0]), strong_fragments=np.array([0])),),
+        lo_type='boys',
     )
-    with pytest.raises(ValueError, match="singleton"):
-        kernel(None, static, controls=_controls())
+    def forbidden_scf(mol):
+        raise AssertionError('unsupported targets reached SCF')
+    mol = accept.molecule()
+    for invalid in (replace(static, lo_type='iao'),
+                    replace(static, frag_lolist=(np.array([0, 1]),)),
+                    replace(static, frag_lolist=(np.array([.9]),))):
+        with pytest.raises(ValueError, match='singleton'):
+            dlno_stc.value_and_grad(mol, forbidden_scf, invalid, controls=accept.controls())
 
 
-def test_finite_weighted_energy_and_molecular_gradient_include_weak_and_hf():
-    from pyscfad.dlno_stc import kernel, value_and_grad
-
-    mol = gto.Mole(
-        atom="O 0 0 0; H 0.1 -0.75 0.57; H 0 0.8 0.61; "
-             "O 0 0 8; H 0.13 -0.74 8.57; H 0.02 0.81 8.61",
-        basis="sto-3g", verbose=0, max_memory=3000,
-    )
-    mol.build(trace_exp=False, trace_ctr_coeff=False)
-    mf = _mf(mol)
-    topology = build_domain_topology(
-        mf, frozen=2, lo_type="boys",
-        lo_kwargs={"conv_tol": 1e-12, "conv_tol_grad": 1e-9},
-        force_full_domains=False,
-        thresholds=DLNOThresholds(pair_energy=1e-4),
-    )
-    static = build_domain_selections(mf, topology)
-    assert any(len(fragment.extended_ao_indices) < mol.nao
-               for fragment in static.fragments)
-    assert any(spec[0] == "weak" for spec in _correlation_term_specs(static))
-
-    controls = _controls()
-    energy, bar = value_and_grad(mol, _mf, static, controls=controls)
-    np.testing.assert_allclose(kernel(mf, static, controls=controls), energy,
+def test_finite_grouped_energy_gradient_weak_and_hf():
+    from pyscfad import dlno_stc
+    from pyscfad.dlno_stc._pairs import weak_pair_indices
+    mol = accept.molecule()
+    mf = accept.build_mf(mol)
+    static = accept.selection(mf)
+    assert any(len(f.extended_ao_indices) < mol.nao for f in static.fragments)
+    assert tuple(weak_pair_indices(static))
+    controls = accept.controls()
+    energy, bar = dlno_stc.value_and_grad(mol, accept.build_mf, static, controls=controls)
+    singleton, singleton_bar = dlno_stc.value_and_grad(
+        mol, accept.build_mf, static, controls=controls, merge_identical=False)
+    np.testing.assert_allclose(energy, singleton, atol=2e-10, rtol=0)
+    np.testing.assert_allclose(bar.coords, singleton_bar.coords, atol=2e-8, rtol=0)
+    np.testing.assert_allclose(dlno_stc.kernel(mf, static, controls=controls), energy,
                                atol=2e-10, rtol=0)
-    with (config_update("pyscfad_scf_implicit_diff", True),
-          config_update("pyscfad_scf_first_order_custom", False)):
-        native_mf, scf_pullback = jax.vjp(
-            lambda mol_: _fix_restart_mo_phases(_mf(mol_)), mol,
-        )
-    native_energy, native_mf_bar = correlation_value_and_grad(native_mf, static)
-    native_bar, = scf_pullback(native_mf_bar)
-    np.testing.assert_allclose(energy, native_energy, atol=2e-9, rtol=0)
-    np.testing.assert_allclose(bar.coords, native_bar.coords, atol=2e-7, rtol=2e-5)
-
-    total_energy, total_bar = value_and_grad(
-        mol, _mf, static, controls=controls, include_hf=True,
-    )
-    hf_energy, hf_pullback = jax.vjp(lambda mf_: mf_.e_tot, native_mf)
-    hf_mf_bar, = hf_pullback(jax.numpy.ones_like(hf_energy))
-    hf_bar, = scf_pullback(hf_mf_bar)
-    np.testing.assert_allclose(total_energy - energy, hf_energy, atol=2e-10, rtol=0)
-    np.testing.assert_allclose(total_bar.coords - bar.coords, hf_bar.coords,
-                               atol=2e-7, rtol=2e-5)
-
+    # Independent Phase2 per-singleton assembly closes the same three-input functional.
+    np.testing.assert_allclose(energy, accept.correlation_energy(mf, static), atol=2e-10, rtol=0)
+    total, total_bar = dlno_stc.value_and_grad(
+        mol, accept.build_mf, static, controls=controls, include_hf=True)
+    from pyscfad.dlno_stc.driver import _initialize_scf
+    current, pullback = _initialize_scf(mol, accept.build_mf)
+    hf, hf_pullback = jax.vjp(lambda x: x.e_tot, current)
+    hf_mf_bar, = hf_pullback(jax.numpy.ones_like(hf))
+    hf_bar, = pullback(hf_mf_bar)
+    np.testing.assert_allclose(total-energy, hf, atol=2e-10, rtol=0)
+    np.testing.assert_allclose(total_bar.coords-bar.coords, hf_bar.coords, atol=2e-7, rtol=2e-5)
     coords = np.asarray(mol.atom_coords())
-    direction = np.zeros_like(coords)
-    direction[1, 2] = 1
+    direction = np.zeros_like(coords); direction[1, 2] = 1
     step = 1e-4
-
     def displaced(sign):
-        moved = mol.set_geom_(coords + sign * step * direction,
-                              unit="Bohr", inplace=False)
-        return kernel(_mf(moved), static, controls=controls)
-
-    difference = (displaced(1) - displaced(-1)) / (2 * step)
-    np.testing.assert_allclose(np.sum(np.asarray(bar.coords) * direction), difference,
-                               atol=2e-6, rtol=3e-4)
-
-    mf.mo_occ = np.asarray(mf.mo_occ).copy()
-    mf.mo_occ[0] = 1
-    with pytest.raises(NotImplementedError, match="closed.shell"):
-        kernel(mf, static, controls=controls)
+        moved = mol.set_geom_(coords+sign*step*direction, unit='Bohr', inplace=False)
+        return dlno_stc.kernel(accept.build_mf(moved), static, controls=controls)
+    finite = (displaced(1)-displaced(-1))/(2*step)
+    np.testing.assert_allclose(np.sum(bar.coords*direction), finite, atol=2e-6, rtol=0)
+    accept.record_result('phase3_finite_driver', {
+        'correlation_energy_Eh': float(energy), 'total_energy_Eh': float(total),
+        'grouped_minus_singleton_energy_Eh': float(energy-singleton),
+        'gradient_max_abs_Eh_per_bohr': float(np.max(np.abs(bar.coords-singleton_bar.coords))),
+        'total_gradient_Eh_per_bohr': np.asarray(total_bar.coords).tolist(),
+        'fd_step_bohr': step, 'fd_slope_Eh_per_bohr': float(finite),
+        'analytic_slope_Eh_per_bohr': float(np.sum(bar.coords*direction)),
+        'fd_absolute_error_Eh_per_bohr': float(abs(np.sum(bar.coords*direction)-finite)),
+        'weak_pair_count': len(tuple(weak_pair_indices(static))),
+        'ao_count': mol.nao,
+        'finite_ao_support_counts': [len(f.extended_ao_indices) for f in static.fragments],
+    })
+    mf.mo_occ = np.asarray(mf.mo_occ).copy(); mf.mo_occ[0] = 1
+    with pytest.raises(NotImplementedError, match='closed.shell'):
+        dlno_stc.kernel(mf, static, controls=controls)

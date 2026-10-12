@@ -54,13 +54,7 @@ inline Spectrum spectrum(const arma::mat& matrix) {
         throw std::runtime_error("STC-MP2 Fock eigendecomposition failed");
     return result;
 }
-inline arma::mat project_target(const arma::mat& B, const arma::mat& M,
-                                arma::uword nv) {
-    arma::mat result(B.n_rows, nv, arma::fill::zeros);
-    for (arma::uword i = 0; i < M.n_cols; ++i)
-        result += M(0,i) * B.cols(i*nv, (i+1)*nv-1);
-    return result;
-}
+
 // Migrated alias-table construction from the student's numerical helpers.
 class AliasDistribution {
     std::vector<double> threshold;

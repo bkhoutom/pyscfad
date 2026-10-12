@@ -8,7 +8,7 @@ import numpy
 from pyscf import df as pyscf_df
 from pyscf import lib as pyscf_lib
 
-from pyscfad.dlno._restart import df_source_fingerprint
+from ._restart import df_source_fingerprint
 
 
 def _native_workspace_mb(naux, nocc, nvir, *, with_grad, system):
@@ -42,7 +42,7 @@ def format_domain_dimensions(rows):
         for row in rows
     ]
     widths = [
-        max(len(columns[index]), *(len(row[index]) for row in values))
+        max([len(columns[index])] + [len(row[index]) for row in values])
         for index in range(4)
     ]
 
@@ -112,7 +112,7 @@ def check_memory(mf, nocc, nvir):
     return estimate_mb
 
 
-def check_weighted_memory(mf, static, fragment_index, *, with_grad,
+def check_domain_memory(mf, static, fragment_index, *, with_grad,
                           virtual_block_size=16):
     """Guard one finite domain using its local auxiliary basis and buffers.
 
@@ -206,3 +206,11 @@ def check_system_memory(mf, nocc, nvir, *, with_grad, virtual_block_size=16,
             f"exceeds configured {limit_mb:.1f} MB"
         )
     return estimate_mb
+
+
+def allocate_domain_controls(controls, job_count):
+    """Copy controls and divide the total budget over actual strong jobs."""
+    settings = controls.copy()
+    if job_count and "energy_tolerance" in settings:
+        settings["energy_tolerance"] = float(settings["energy_tolerance"]) / job_count
+    return settings

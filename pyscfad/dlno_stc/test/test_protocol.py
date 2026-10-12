@@ -23,9 +23,9 @@ def metadata():
     return {
         "schema_version": 1,
         "method": "mp2",
-        "energy_kind": "boys_target_mp2_v1",
+        "energy_kind": "boys_target_laplace_mp2_v1",
         "fragment_id": 0,
-        "target_index": 1,
+        "target_indices": [1],
         "basis_frame": "orthonormal_local",
         "B_axes": "Pia",
         "units": {"energy": "Eh", "length": "bohr", "fock": "Eh", "B": "Eh**0.5"},
@@ -44,9 +44,7 @@ def result(inputs, md, controls):
         "energy": np.float64(-0.125),
         "cotangents": {key: np.ones_like(value) for key, value in inputs.items()},
         "metadata": {
-            **{key: md[key] for key in (
-                "schema_version", "method", "energy_kind", "fragment_id",
-                "target_index", "basis_frame", "B_axes")},
+            **md,
             "request_fingerprint": request_fingerprint(inputs, md, controls),
             "cotangent_seed": 1.0,
             "backend": "tiny_reference",
@@ -70,27 +68,39 @@ def test_valid_full_fock_packet_and_unit_seed_result():
                            controls=controls) is None
 
 
-def test_finite_packet_accepts_nondiagonal_local_fock_blocks():
-    inputs, md, controls = packet(), metadata(), {}
-    md.update(energy_kind="finite_three_tensor_v1", target_index=None)
-    assert inputs["foo"][0, 1] != 0.0
-    assert inputs["fvv"][0, 1] != 0.0
-    assert validate_inputs(inputs, md) is None
-    assert validate_result(result(inputs, md, controls), inputs, md,
-                           controls=controls) is None
+def finite_metadata():
+    md = metadata()
+    md.update(energy_kind="finite_boys_target_mp2_v1",
+              global_target_orbitals=[5], candidate_order=[2, 5],
+              frame_convention="local_before_fock_v1",
+              virtual_anchor_parent_columns=[0, 1, 2],
+              grouping_fingerprint="a" * 64,
+              budget={"total_tolerance": .0003, "original_target_count": 2,
+                      "group_count": 1, "effective_tolerance": .0003})
+    return md
 
 
-@pytest.mark.parametrize("change, match", [
-    (lambda md: md.__setitem__("basis_frame", "semicanonical_local"),
-     "orthonormal_local"),
-    (lambda md: md.__setitem__("target_index", 0), "target_index"),
-])
-def test_finite_packet_rejects_wrong_frame_or_local_target(change, match):
-    inputs, md = packet(), metadata()
-    md.update(energy_kind="finite_three_tensor_v1", target_index=None)
-    change(md)
-    with pytest.raises(ValueError, match=match):
-        validate_inputs(inputs, md)
+def test_finite_packet_declares_selected_mp2_and_rejects_old_identity():
+    inputs, md = packet(), finite_metadata()
+    validate_inputs(inputs, md)
+    for kind in ("finite_three_tensor_v1", "boys_target_mp2_v1"):
+        with pytest.raises(ValueError, match="energy_kind"):
+            validate_inputs(inputs, {**md, "energy_kind": kind})
+
+
+@pytest.mark.parametrize("targets", [None, [], [0, 0], [-1], [2], [True], [0.5]])
+def test_invalid_selected_targets(targets):
+    with pytest.raises(ValueError, match="target_indices"):
+        validate_inputs(packet(), {**metadata(), "target_indices": targets})
+
+
+@pytest.mark.parametrize("field", ["global_target_orbitals", "candidate_order",
+    "frame_convention", "virtual_anchor_parent_columns", "grouping_fingerprint", "budget"])
+def test_finite_packet_requires_complete_frame_identity(field):
+    md = finite_metadata()
+    md.pop(field)
+    with pytest.raises(ValueError, match=field):
+        validate_inputs(packet(), md)
 
 
 @pytest.mark.parametrize("change, match", [
@@ -100,7 +110,7 @@ def test_finite_packet_rejects_wrong_frame_or_local_target(change, match):
     (lambda x, m: x["B"].__setitem__((0, 0, 0), np.nan), "finite"),
     (lambda x, m: m.__setitem__("B_axes", "Paj"), "B_axes"),
     (lambda x, m: m.__setitem__("method", "ccsd"), "method"),
-    (lambda x, m: m.__setitem__("target_index", 2), "target_index"),
+    (lambda x, m: m.__setitem__("target_indices", 2), "target_indices"),
     (lambda x, m: m.__setitem__("energy_kind", "unknown"), "energy_kind"),
 ])
 def test_invalid_input_is_rejected(change, match):
@@ -149,7 +159,7 @@ def test_fingerprint_covers_controls_and_values_but_not_timestamp():
 @pytest.mark.parametrize("change, match", [
     (lambda r: r["metadata"].__setitem__("request_fingerprint", "0" * 64), "fingerprint"),
     (lambda r: r["metadata"].__setitem__("energy_kind", "quadratic_test_v1"), "energy_kind"),
-    (lambda r: r["metadata"].__setitem__("target_index", 0), "target_index"),
+    (lambda r: r["metadata"].__setitem__("target_indices", 0), "target_indices"),
     (lambda r: r["metadata"].__setitem__("cotangent_seed", -2.0), "cotangent_seed"),
     (lambda r: r["cotangents"].pop("B"), "B"),
     (lambda r: r["cotangents"].__setitem__("foo", r["cotangents"]["foo"][:, :1]), "shape"),
@@ -233,3 +243,15 @@ def test_unsupported_request_units_are_rejected(unit_name, wrong_value):
     md["units"][unit_name] = wrong_value
     with pytest.raises(ValueError, match="units"):
         validate_inputs(inputs, md)
+
+
+def test_finite_response_frame_and_budget_are_checked():
+    x, md = packet(), finite_metadata()
+    controls = {"energy_tolerance": .0003}
+    answer = result(x, md, controls)
+    validate_result(answer, x, md, controls=controls)
+    answer["metadata"]["frame_convention"] = "semicanonical"
+    with pytest.raises(ValueError, match="frame_convention"):
+        validate_result(answer, x, md, controls=controls)
+    with pytest.raises(ValueError, match="budget"):
+        request_fingerprint(x, md, {"energy_tolerance": .00015})

@@ -6,7 +6,7 @@ import pytest
 
 from pyscfad import config_update, gto, scf
 from pyscfad import dlno_stc
-from pyscfad.dlno.mp2 import _fix_restart_mo_phases
+from pyscfad.dlno_stc.adjoint import fix_restart_mo_phases as _fix_restart_mo_phases
 from pyscfad.dlno_stc import backend, domain, prepare
 from pyscfad.dlno_stc.adjoint import apply_full_pullback
 
@@ -251,16 +251,15 @@ def test_system_boys_uses_domain_setup_without_extra_searches(guess, monkeypatch
     # should follow the shared domain scheme: one reference search, then one
     # differentiated replay, without a separate stability-restart algorithm.
     from scipy.linalg import expm
-    from pyscfad.dlno import targets
 
     calls = []
-    real_build = targets.build_targets
+    real_build = domain._build_boys_targets
 
     def record_localization(*args, **kwargs):
-        calls.append(kwargs["lo_kwargs"])
+        calls.append(args[2])
         return real_build(*args, **kwargs)
 
-    monkeypatch.setattr(targets, "build_targets", record_localization)
+    monkeypatch.setattr(domain, "_build_boys_targets", record_localization)
 
     atoms = [("C", (-0.77, 0, 0)), ("C", (0.77, 0, 0))]
     for side in (-1, 1):

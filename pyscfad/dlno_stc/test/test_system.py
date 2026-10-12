@@ -123,15 +123,15 @@ def test_empty_active_spaces_add_hf_once_without_fitting_or_backend(molecule, mo
 
 
 def test_system_matches_native_dfmp2_with_frozen_and_coordinate_response(molecule, monkeypatch):
-    from pyscfad.dlno.mp2 import _fix_restart_mo_phases
+    from pyscfad.dlno_stc.adjoint import fix_restart_mo_phases as _fix_restart_mo_phases
     from pyscfad.dlno_stc import exchange
     from pyscfad.mp import dfmp2
 
     def forbidden(*args, **kwargs):
         raise AssertionError("system scope reached domain construction or STC disk exchange")
     monkeypatch.setattr(driver, "rebuild_domain_data", forbidden)
-    monkeypatch.setattr(driver, "select_virtual_anchor_columns", forbidden)
-    monkeypatch.setattr(driver, "_correlation_term_specs", forbidden)
+    monkeypatch.setattr(driver, "prepare_boys_group_inputs", forbidden)
+    monkeypatch.setattr(driver, "weak_pair_indices", forbidden)
     for name in ("read_input", "read_result", "write_input", "write_result"):
         monkeypatch.setattr(exchange, name, forbidden)
 

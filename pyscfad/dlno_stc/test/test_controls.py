@@ -31,21 +31,25 @@ def test_high_level_budget_reaches_solver_without_mutating_caller(monkeypatch, s
     if production is not None:
         controls['production_samples'] = production
     before = controls.copy()
-    state = dict(specs=[('strong', 0, None), ('weak', 0, 1), ('strong', 1, None)],
+    state = dict(weak_pairs=[(0, 1)],
                  occupied=[0], virtual=[1], energy=np.float64(0), variance=0.,
                  mf_bar=None, common_bar=None, mf=SimpleNamespace(verbose=0), common=None)
     monkeypatch.setattr(driver, '_initialize', lambda *a, **k: state)
     monkeypatch.setattr(driver, '_initialize_system', lambda *a, **k: state)
     monkeypatch.setattr(driver, '_prepare', lambda *a, **k: (None, {}, None))
     monkeypatch.setattr(driver, '_prepare_system', lambda *a, **k: (None, {}, None))
-    monkeypatch.setattr(driver, '_correlation_term_energy', lambda *a: np.float64(-.25))
+    monkeypatch.setattr(driver, 'weak_pair_energy', lambda *a: np.float64(-.25))
+    from pyscfad.dlno_stc import DomainGroup
+    monkeypatch.setattr(driver, 'build_domain_groups', lambda *a, **k:
+        (DomainGroup((0,), 0, (0,)), DomainGroup((1,), 1, (0,))))
     monkeypatch.setattr(driver, '_finish', lambda s, **k: s['energy'])
     received = []
     def solver(inputs, metadata, solve_controls, backend, **kwargs):
         received.append(solve_controls.copy())
         return {'energy': np.float64(-1), 'energy_standard_error': 0.}
     monkeypatch.setattr(driver, 'run_backend', solver)
-    value = driver.kernel(None, None, scope=scope, controls=controls)
+    static = SimpleNamespace(fragments=(None, None), frag_lolist=((0,), (1,)))
+    value = driver.kernel(None, static if scope == 'domain' else None, scope=scope, controls=controls)
     assert value == (-2.25 if scope == 'domain' else -1.)
     assert len(received) == (2 if scope == 'domain' else 1)
     for passed in received:

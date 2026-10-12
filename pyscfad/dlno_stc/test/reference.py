@@ -7,7 +7,7 @@ import numpy as np
 
 _KEYS = ("foo", "fvv", "B")
 _IDENTITY = ("schema_version", "method", "energy_kind", "fragment_id",
-             "target_index", "basis_frame", "B_axes", "request_fingerprint")
+             "target_indices", "basis_frame", "B_axes", "request_fingerprint")
 
 
 def _symmetric(a):
@@ -50,7 +50,7 @@ def target_mp2_energy(inputs, target_index):
 
 def _result(energy, cotangents, metadata, *, backend, sample_count=0,
             diagnostics=None, seed_replay=None):
-    result_metadata = {key: metadata[key] for key in _IDENTITY if key in metadata}
+    result_metadata = dict(metadata)
     result_metadata.update(cotangent_seed=1.0, backend=backend,
                            backend_version="1", actual_sample_count=int(sample_count),
                            derivative_convention="fixed_sample",
@@ -75,8 +75,8 @@ def reference_backend(inputs, metadata, controls, *, comm=None):
     kind = metadata["energy_kind"]
     if kind == "quadratic_test_v1":
         energy_fn = quadratic_energy
-    elif kind == "boys_target_mp2_v1":
-        energy_fn = lambda x: target_mp2_energy(x, metadata["target_index"])
+    elif kind in ("boys_target_laplace_mp2_v1", "finite_boys_target_mp2_v1"):
+        energy_fn = lambda x: sum(target_mp2_energy(x, i) for i in metadata["target_indices"])
     elif kind == "whole_domain_mp2_test_v1":
         energy_fn = lambda x: sum(target_mp2_energy(x, f)
                                   for f in range(inputs["foo"].shape[0]))

@@ -7,14 +7,7 @@ from functools import partial
 from pyscfad import numpy as np
 from pyscfad.lno import df as lno_df
 
-from .domain import (
-    _build_local_strong_ed_domain_and_anchors,
-    _validate_virtual_anchor_columns,
-    build_local_strong_ed_domain,
-    build_system_local_frame,
-    build_stc_domain,
-    select_virtual_anchor_columns,
-)
+from .domain import build_boys_ed_frame, build_system_local_frame
 
 
 def _symmetric_fock_block(fock, coeff):
@@ -48,88 +41,29 @@ def _project_inputs(mf, fock, occupied_coeff, virtual_coeff, atoms):
 
 
 def prepare_inputs(mf, common, static, fragment_index):
-    """Project Fock and fitted OV factors into one full-support Boys frame.
+    """Prepare exactly three tensors in one fixed, labelled finite Boys frame.
 
-    ``common`` must be rebuilt from the current differentiable ``mf`` using
-    ``dlno_base.rebuild_domain_data``. Fixed discrete selections live in
-    ``static`` and never replace the continuous orbitals.
+    ``common`` is rebuilt by the independent Boys ``rebuild_domain_data``.
+    The saved selection owns the target's local slot and concrete virtual
+    anchors; callers obtain that discrete metadata from ``build_boys_ed_frame``
+    rather than placing it in this differentiable tensor packet. Local AO and
+    auxiliary supports remain finite through ``get_local_Lov``.
     """
-    domain = build_stc_domain(mf, common, static, fragment_index)
+    frame = build_boys_ed_frame(common, static, fragment_index)
+    ao = numpy.asarray(frame.extended_ao_indices)
     return _project_inputs(
-        mf, common.fock, domain.occupied_coeff, domain.virtual_coeff,
-        domain.extended_atoms,
+        mf, common.fock[numpy.ix_(ao, ao)], frame.occupied_coeff,
+        frame.virtual_coeff, frame.extended_atoms,
     )
 
 
-def _project_finite_domain(mf, common, static, fragment_index, domain):
-    fragment = static.fragments[int(fragment_index)]
-    ao = numpy.asarray(fragment.extended_ao_indices)
-    fock22 = common.fock[numpy.ix_(ao, ao)]
-    return _project_inputs(
-        mf, fock22, domain.occupied_coeff, domain.virtual_coeff,
-        fragment.extended_atoms,
-    )
+def prepare_boys_group_inputs(mf, common, static, group):
+    """Prepare three tensors once in the group's saved representative frame.
 
-
-def prepare_finite_export_inputs(mf, common, static, fragment_index):
-    """Prepare a finite packet and its PAO anchors with one domain build."""
-    domain, anchors = _build_local_strong_ed_domain_and_anchors(
-        common, static, fragment_index
-    )
-    return _project_finite_domain(
-        mf, common, static, fragment_index, domain,
-    ), anchors
-
-
-def prepare_finite_inputs(
-    mf, common, static, fragment_index, *, virtual_anchor_columns=None,
-):
-    """Return full local ``foo``, ``fvv``, and ``B`` for one finite ED.
-
-    All three arrays use the same pre-semicanonical, orthonormal occupied and
-    virtual frame. The fixed AO/atom/rank selections come from ``static``;
-    their continuous coefficients are rebuilt from differentiable ``common``.
-    The external solver must use the full Fock matrices when forming its
-    amplitudes.
+    The full occupied partner space is retained. Group membership and target
+    slots stay outside the differentiable tensor dictionary.
     """
-    domain = build_local_strong_ed_domain(
-        common, static, fragment_index,
-        virtual_anchor_columns=virtual_anchor_columns,
-    )
-    return _project_finite_domain(
-        mf, common, static, fragment_index, domain,
-    )
-
-
-def prepare_weighted_inputs(
-    mf, common, static, fragment_index, *, virtual_anchor_columns=None,
-):
-    """Return five differentiable arrays in one finite local frame.
-
-    The target row and partner weight are the raw projections of the original
-    localized orbitals. Select PAO anchors from concrete ``common`` with
-    ``select_virtual_anchor_columns`` before constructing a preparation VJP,
-    and pass those columns on every traced call. Orbital coefficients and
-    projection weights remain differentiable with these selections fixed.
-    """
-    if virtual_anchor_columns is None and any(
-        isinstance(leaf, jax.core.Tracer)
-        for leaf in jax.tree_util.tree_leaves(common)
-    ):
-        raise ValueError(
-            "select virtual anchor columns from concrete common data before "
-            "tracing weighted preparation"
-        )
-    domain = build_local_strong_ed_domain(
-        common, static, fragment_index,
-        virtual_anchor_columns=virtual_anchor_columns,
-    )
-    inputs = _project_finite_domain(
-        mf, common, static, fragment_index, domain,
-    )
-    inputs["target_projection"] = domain.target_projection
-    inputs["partner_weight"] = domain.partner_weight
-    return inputs
+    return prepare_inputs(mf, common, static, group.representative_index)
 
 
 def prepare_system_inputs(
@@ -156,6 +90,15 @@ def prepare_system_inputs(
         mf, active_occ_indices, active_vir_indices, boys_reference=boys_reference,
         virtual_anchor_columns=virtual_anchor_columns,
     )
+    return _project_system_frame(
+        mf, frame, active_occ_indices, active_vir_indices,
+        fock_from_scf=fock_from_scf,
+    )
+
+
+def _project_system_frame(mf, frame, active_occ_indices, active_vir_indices, *,
+                          fock_from_scf=False):
+    """Project either system frame without changing its DF storage strategy."""
     co, cv = frame.occupied_coeff, frame.virtual_coeff
     get_cderi = getattr(mf.with_df, "_get_cderi_source", None)
     cderi = get_cderi() if get_cderi is not None else mf.with_df._cderi

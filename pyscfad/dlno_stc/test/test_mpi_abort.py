@@ -28,7 +28,7 @@ def test_reference_solve_aborts_after_root_backend_failure(tmp_path):
     metadata = {
         "schema_version": 1, "method": "mp2",
         "energy_kind": "quadratic_test_v1", "fragment_id": 0,
-        "target_index": 0, "basis_frame": "orthonormal_local",
+        "target_indices": [0], "basis_frame": "orthonormal_local",
         "B_axes": "Pia", "units": {"energy": "Eh", "length": "bohr"},
         "frozen": [0],
         "orbital_order": {"occupied": [0], "virtual": [0]},

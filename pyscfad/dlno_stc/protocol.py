@@ -11,15 +11,12 @@ import numpy as np
 
 SCHEMA_VERSION = 1
 ENERGY_KINDS = frozenset((
-    "boys_target_mp2_v1", "quadratic_test_v1", "whole_domain_mp2_test_v1",
-    "finite_three_tensor_v1",
+    "boys_target_laplace_mp2_v1", "quadratic_test_v1", "whole_domain_mp2_test_v1",
+    "finite_boys_target_mp2_v1",
 ))
 ARRAY_NAMES = ("foo", "fvv", "B")
-WEIGHTED_ARRAY_NAMES = (
-    "foo", "fvv", "B", "target_projection", "partner_weight",
-)
 _IDENTITY_FIELDS = (
-    "schema_version", "method", "energy_kind", "fragment_id", "target_index",
+    "schema_version", "method", "energy_kind", "fragment_id", "target_indices",
     "basis_frame", "B_axes",
 )
 _DESCRIPTIVE_FIELDS = (
@@ -81,21 +78,48 @@ def _check_metadata(metadata, nocc=None):
     if (not isinstance(fragment_id, (int, np.integer))
             or isinstance(fragment_id, (bool, np.bool_)) or fragment_id < 0):
         raise ValueError("fragment_id must be a nonnegative integer")
-    finite = metadata["energy_kind"] == "finite_three_tensor_v1"
-    target_index = metadata["target_index"]
-    if finite:
-        if target_index is not None:
-            raise ValueError("finite three-tensor packets have no local target_index")
-        if metadata["basis_frame"] != "orthonormal_local":
-            raise ValueError("finite three-tensor packets require an orthonormal_local frame")
-    else:
-        if (not isinstance(target_index, (int, np.integer))
-                or isinstance(target_index, (bool, np.bool_)) or target_index < 0):
-            raise ValueError("target_index must be a nonnegative integer")
-        if nocc is not None and target_index >= nocc:
-            raise ValueError("target_index is outside the occupied space")
-        if metadata["basis_frame"] != "orthonormal_local":
-            raise ValueError("basis_frame must be orthonormal_local")
+    targets = metadata["target_indices"]
+    if not isinstance(targets, (list, tuple)) or not targets:
+        raise ValueError("target_indices must be a nonempty ordered list")
+    if any(not isinstance(i, (int, np.integer)) or isinstance(i, (bool, np.bool_))
+           or i < 0 or (nocc is not None and i >= nocc) for i in targets):
+        raise ValueError("target_indices contains an out-of-range or invalid label")
+    if len(set(targets)) != len(targets):
+        raise ValueError("target_indices contains duplicate labels")
+    if metadata["basis_frame"] != "orthonormal_local":
+        raise ValueError("basis_frame must be orthonormal_local")
+    if metadata["energy_kind"] == "finite_boys_target_mp2_v1":
+        for field in ("global_target_orbitals", "candidate_order", "frame_convention",
+                      "virtual_anchor_parent_columns", "grouping_fingerprint", "budget"):
+            if field not in metadata:
+                raise ValueError(f"metadata missing {field}")
+        if metadata["frame_convention"] != "local_before_fock_v1":
+            raise ValueError("unsupported frame_convention")
+        budget = metadata["budget"]
+        required = {"total_tolerance", "original_target_count", "group_count", "effective_tolerance"}
+        if not isinstance(budget, dict) or set(budget) != required:
+            raise ValueError("budget must identify total/effective tolerance and target/group counts")
+        original, count = budget["original_target_count"], budget["group_count"]
+        if (type(original) is not int or type(count) is not int
+                or not 0 < count <= original or len(targets) > original):
+            raise ValueError("budget target/group counts are invalid")
+        total, effective = budget["total_tolerance"], budget["effective_tolerance"]
+        if total is None:
+            if effective is not None:
+                raise ValueError("budget effective tolerance requires a total")
+        elif (type(total) not in (int, float) or not math.isfinite(total) or total <= 0
+              or type(effective) not in (int, float) or effective != total / count):
+            raise ValueError("budget effective tolerance does not match total/group count")
+        labels = metadata["global_target_orbitals"]
+        candidates = metadata["candidate_order"]
+        if (not isinstance(labels, (list, tuple)) or len(labels) != len(targets)
+                or len(set(labels)) != len(labels)
+                or not isinstance(candidates, (list, tuple))
+                or len(set(candidates)) != len(candidates)
+                or any(type(i) is not int or i < 0 for i in (*labels, *candidates))
+                or (nocc is not None and len(candidates) != nocc)
+                or [candidates[i] for i in targets] != list(labels)):
+            raise ValueError("target labels do not match candidate_order")
     if metadata["B_axes"] != "Pia":
         raise ValueError("B_axes must be Pia")
     units = metadata["units"]
@@ -169,6 +193,9 @@ def request_fingerprint(inputs, metadata, controls):
     """Hash the problem and requested controls, streaming numeric blocks."""
     validate_inputs(inputs, metadata)
     _check_mapping(controls, "controls")
+    if (metadata["energy_kind"] == "finite_boys_target_mp2_v1"
+            and controls.get("energy_tolerance") != metadata["budget"]["effective_tolerance"]):
+        raise ValueError("controls do not match saved budget effective tolerance")
     problem = {key: value for key, value in metadata.items()
                if key not in _NON_FINGERPRINT_FIELDS}
     requested = {key: value for key, value in controls.items()
@@ -253,8 +280,13 @@ def validate_result(result, inputs, metadata, *, controls=None,
     _check_digest(expected_fingerprint)
     result_md = result["metadata"]
     for field in _IDENTITY_FIELDS:
-        if result_md[field] != metadata[field]:
+        if canonical_json(result_md[field]) != canonical_json(metadata[field]):
             raise ValueError(f"result {field} does not match request")
+    if metadata["energy_kind"] == "finite_boys_target_mp2_v1":
+        for field in ("frame_convention", "global_target_orbitals", "candidate_order",
+                      "virtual_anchor_parent_columns", "grouping_fingerprint", "budget"):
+            if field not in result_md or canonical_json(result_md[field]) != canonical_json(metadata[field]):
+                raise ValueError(f"result {field} does not match request")
     if result_md["request_fingerprint"] != expected_fingerprint:
         raise ValueError("result request fingerprint does not match request")
     if controls is not None:
@@ -305,8 +337,6 @@ def _validate_memory_inputs(inputs, names):
         raise ValueError("input shape ranks must be foo(oo), fvv(vv), B(Pia)")
     nocc, nvir = foo.shape[0], fvv.shape[0]
     if nocc == 0:
-        if names == WEIGHTED_ARRAY_NAMES:
-            raise ValueError("weighted inputs require a nonempty occupied space")
         raise ValueError("empty occupied space is a host-side no-work case")
     _check_array(foo, "foo", (nocc, nocc), symmetric=True)
     _check_array(fvv, "fvv", (nvir, nvir), symmetric=True)
@@ -317,14 +347,6 @@ def _validate_memory_inputs(inputs, names):
 def validate_full_inputs(inputs):
     """Validate the three-array real float64 whole-system boundary."""
     _validate_memory_inputs(inputs, ARRAY_NAMES)
-
-
-def validate_weighted_inputs(inputs):
-    """Validate five in-memory arrays; empty virtual spaces are valid."""
-    nocc = _validate_memory_inputs(inputs, WEIGHTED_ARRAY_NAMES)
-    _check_array(inputs["target_projection"], "target_projection", (1, nocc))
-    _check_array(inputs["partner_weight"], "partner_weight",
-                 (nocc, nocc), symmetric=True)
 
 
 def _validate_memory_result(result, inputs, names, *, with_grad):
@@ -349,16 +371,10 @@ def _validate_memory_result(result, inputs, names, *, with_grad):
         raise ValueError("cotangents must contain exactly " + ", ".join(names))
     for name in names:
         _check_array(cotangents[name], name + " cotangent", inputs[name].shape,
-                     symmetric=name in ("foo", "fvv", "partner_weight"))
+                     symmetric=name in ("foo", "fvv"))
 
 
 def validate_full_result(result, inputs, *, with_grad=True):
     """Check whole-system energy and its three unit-seed numerical bars."""
     validate_full_inputs(inputs)
     _validate_memory_result(result, inputs, ARRAY_NAMES, with_grad=with_grad)
-
-
-def validate_weighted_result(result, inputs, *, with_grad=True):
-    """Check weighted energy and its five unit-seed numerical bars."""
-    validate_weighted_inputs(inputs)
-    _validate_memory_result(result, inputs, WEIGHTED_ARRAY_NAMES, with_grad=with_grad)

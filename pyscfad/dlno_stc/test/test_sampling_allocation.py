@@ -76,10 +76,17 @@ def test_unrepresentable_adaptive_budget_raises_instead_of_truncating(scope):
     foo, fvv = -np.eye(2), np.eye(2)
     B = rng.normal(size=(2, 2, 2))
     controls = adaptive(pilot_samples=64, global_seed=7, uniform_mixture=1.)
-    controls['energy_tolerance'] = 1e-300
-    with pytest.raises(OverflowError, match='sampling budget'):
+    # The selected source reports runtime_error and needs a representable
+    # variance target; squaring 1e-300 underflows before its overflow guard.
+    controls['energy_tolerance'] = 1e-300 if scope == 'full' else 1e-100
+    error = OverflowError if scope == 'full' else RuntimeError
+    with pytest.raises(error, match='sampling budget'):
         if scope == 'full':
             native().solve_full(foo, fvv, B, controls, np.array([0, 1, 2]))
         else:
-            native().solve(foo, fvv, B, np.ones((1, 2)), np.eye(2), controls,
-                           np.array([0, 1, 2]))
+            # Selected sampling retains the source cutoff and support policy.
+            controls.pop('virtual_keep_fraction')
+            controls.pop('uniform_mixture')
+            controls['system_workload_cutoff'] = 2.
+            native().solve_selected(foo, fvv, B, (0, 1), controls,
+                                    aux_offsets=np.array([0, 1, 2]))

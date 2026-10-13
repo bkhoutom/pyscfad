@@ -18,7 +18,8 @@ def test_original_grid_returns_independent_arrays():
 
 @pytest.mark.parametrize('supplied_grid', [True, False])
 @pytest.mark.parametrize('scope,tolerance,production,expected', [
-    ('domain', 6e-4, None, 3e-4), ('domain', None, None, 1.5e-4),
+    ('domain', 6e-4, None, 6e-4 / np.sqrt(2)),
+    ('domain', None, None, 3e-4 / np.sqrt(2)),
     ('system', 6e-4, None, 6e-4), ('system', None, None, 3e-4),
     ('domain', None, 7, None), ('system', None, 7, None),
 ])
@@ -38,7 +39,7 @@ def test_high_level_budget_reaches_solver_without_mutating_caller(monkeypatch, s
     monkeypatch.setattr(driver, '_initialize_system', lambda *a, **k: state)
     monkeypatch.setattr(driver, '_prepare', lambda *a, **k: (None, {}, None))
     monkeypatch.setattr(driver, '_prepare_system', lambda *a, **k: (None, {}, None))
-    monkeypatch.setattr(driver, 'weak_pair_energy', lambda *a: np.float64(-.25))
+    monkeypatch.setattr(driver, 'weak_pair_energy_sum', lambda *a, **k: np.float64(-.25))
     from pyscfad.dlno_stc import DomainGroup
     monkeypatch.setattr(driver, 'build_domain_groups', lambda *a, **k:
         (DomainGroup((0,), 0, (0,)), DomainGroup((1,), 1, (0,))))

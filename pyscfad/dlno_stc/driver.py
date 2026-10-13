@@ -15,6 +15,7 @@ import jax
 import numpy
 from pyscf import df as pyscf_df, lib
 from pyscfad import config_update, numpy as np
+from pyscfad.lib._compilation_cache import configure_compilation_cache
 from pyscfad.tools import resource_profile
 from ._selection import DomainSelections, _extract_active_indices, build_domain_groups
 from .domain import rebuild_domain_data
@@ -25,7 +26,7 @@ from .adjoint import (
     zero_term_cotangents as _zero_term_cotangents,
     zero_mf_cotangent as _zero_mf_cotangent,
 )
-from ._pairs import weak_pair_energy, weak_pair_indices
+from ._pairs import weak_pair_energy_and_grad, weak_pair_energy_sum, weak_pair_indices
 
 
 from . import backend
@@ -159,6 +160,7 @@ def _initialize(mf, static, controls, *, with_grad, scf_pullback=None):
     _validate_static(static)
     _validate_controls(controls)
     _validate_reference(mf, static)
+    configure_compilation_cache()
     with resource_profile.section('stc.domain.common_prepare'):
         if with_grad:
             common, common_pullback = jax.vjp(lambda mf_: rebuild_domain_data(mf_, static), mf)
@@ -263,20 +265,23 @@ def _run_domain(initializer, static, controls, comm, *, with_grad, include_hf=Fa
             _root_call(comm, rank, apply_group, f"group {fragment_id} pullback")
         del prepared, result, apply_group
         gc.collect()
-    for left, right in pairs:
+    if pairs:
         def apply_weak():
-            term = lambda mf_, common_: weak_pair_energy(mf_, common_, static, left, right)
             if with_grad:
-                energy, pullback = jax.vjp(term, state["mf"], state["common"])
-                _add_bars(state, *pullback(np.ones((), dtype=energy.dtype)))
+                energy, bars = weak_pair_energy_and_grad(
+                    state["mf"], state["common"], static, pairs=pairs)
+                _add_bars(state, *bars)
             else:
-                energy = term(state["mf"], state["common"])
+                energy = weak_pair_energy_sum(
+                    state["mf"], state["common"], static, pairs=pairs)
             state["energy"] = state["energy"] + energy
             jax.block_until_ready((state["energy"], state["mf_bar"], state["common_bar"]))
         with resource_profile.section('stc.domain.weak'):
-            _root_call(comm, rank, apply_weak, f"weak pair {(left, right)} pullback")
+            _root_call(comm, rank, apply_weak, "weak endpoint response")
         del apply_weak
-        gc.collect()
+        if not with_grad:
+            # The gradient helper already collects after releasing its tapes.
+            gc.collect()
     with resource_profile.section('stc.domain.response'):
         return _root_call(comm, rank, lambda: _finish(state, with_grad=with_grad,
                          include_hf=include_hf), "final response")

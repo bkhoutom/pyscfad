@@ -280,17 +280,23 @@ def test_total_and_progressive_paths_evaluate_unordered_weak_pair_once(
     static = build_domain_selections(mf, topology)
     assert np.count_nonzero(~static.strong_mask) == 2
 
-    real_cross = mp2.multipole.pair_energy_multipole_cross
+    real_pair = mp2.weak_endpoint_pair_energy
+    real_response = mp2._weak_endpoint_pair_value_and_grad
     calls = []
 
-    def counted_cross(*args, **kwargs):
+    def counted_pair(*args, **kwargs):
         calls.append(None)
-        return real_cross(*args, **kwargs)
+        return real_pair(*args, **kwargs)
+
+    def counted_response(*args, **kwargs):
+        calls.append(None)
+        return real_response(*args, **kwargs)
 
     monkeypatch.setattr(
-        mp2.multipole,
-        "pair_energy_multipole_cross",
-        counted_cross,
+        mp2, "weak_endpoint_pair_energy", counted_pair,
+    )
+    monkeypatch.setattr(
+        mp2, "_weak_endpoint_pair_value_and_grad", counted_response,
     )
 
     scalar_energy = correlation_energy(mf, static)

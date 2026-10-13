@@ -16,6 +16,7 @@ import scipy.linalg as scipy_linalg
 from pyscf.mp.mp2 import _mo_splitter
 from pyscf.dft.rks import KohnShamDFT
 from pyscfad.mp import dfmp2
+from pyscfad.lib._compilation_cache import configure_compilation_cache
 from pyscfad.lno import tools
 from pyscfad.lo.boys import boys
 from pyscfad.scf.hf import RHF
@@ -582,6 +583,7 @@ def build_domain_selections(
     model = str(pair_energy_model).lower().replace("_", "-")
     if model not in {"all", "all-strong", "exact", "multipole", "multipole-os", "os-multipole"}:
         raise ValueError(f"unknown pair_energy_model: {pair_energy_model}")
+    configure_compilation_cache()
     mol = mf.mol
     overlap, fock = map(_host_array, (mol.intor_symmetric("int1e_ovlp"), mf.get_fock()))
     if numpy.iscomplexobj(overlap) or numpy.iscomplexobj(fock):

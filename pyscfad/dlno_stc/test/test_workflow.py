@@ -38,7 +38,7 @@ def test_sixteen_targets_four_jobs_allocate_export_once(tmp_path, monkeypatch):
     monkeypatch.setattr(mp2, 'prepare_boys_group_inputs', lambda *args: {
         'foo': -np.eye(4), 'fvv': np.eye(2), 'B': np.ones((3, 4, 2))})
     controls = dict(grid(), energy_tolerance=.0003, production_samples=32)
-    for merge, count, tolerance in [(True, 4, 7.5e-5), (False, 16, 1.875e-5)]:
+    for merge, count, tolerance in [(True, 4, 1.5e-4), (False, 16, 7.5e-5)]:
         folder = tmp_path / str(merge)
         rows = mp2.export_run(mf, static, folder, controls=controls, merge_identical=merge)
         assert len(rows) == count
@@ -62,9 +62,9 @@ def test_stochastic_disk_uses_representative_seed_identity(tmp_path):
     from pyscfad.dlno_stc.test.test_full_kernel import grid
     inputs, metadata = packet(), finite_metadata()
     metadata.update(fragment_id=4, representative_index=4, group_id=1,
-                    budget=dict(total_tolerance=.0003, effective_tolerance=7.5e-5,
+                    budget=dict(total_tolerance=.0003, effective_tolerance=1.5e-4,
                                 original_target_count=16, group_count=4))
-    controls = dict(grid(), mode='stochastic', energy_tolerance=7.5e-5,
+    controls = dict(grid(), mode='stochastic', energy_tolerance=1.5e-4,
                     production_samples=64, pilot_samples=32,
                     min_production_samples=2, global_seed=17,
                     system_workload_cutoff=2.)

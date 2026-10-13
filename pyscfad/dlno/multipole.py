@@ -11,7 +11,12 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 import numpy as np
-from .tools import fake_mol_by_atom, einsum
+from pyscfad.lib._multipole import (
+    coordinate_moment_jvp,
+    pair_energy as _multipole_pair_energy,
+    transition_moments,
+)
+from .tools import fake_mol_by_atom
 
 __all__ = [
     'dipole_op', 'quadrupole_op', 'octupole_op',
@@ -67,16 +72,12 @@ def _raw_cartesian_moment_coordinate_jvp(fake_mol, coords_t, rank):
     bra = bra.reshape(3, ncart, nao, nao)
     ket = ket.reshape(ncart, 3, nao, nao).transpose(1, 0, 2, 3)
 
-    tangent = jnp.zeros((ncart, nao, nao), dtype=bra.dtype)
-    for atom, (_, _, p0, p1) in enumerate(fake_mol.aoslice_by_atom()):
-        bra_atom = jnp.einsum(
-            'x,xpuv->puv', coords_t[atom], bra[:, :, p0:p1, :]
-        )
-        ket_atom = jnp.einsum(
-            'x,xpuv->puv', coords_t[atom], ket[:, :, :, p0:p1]
-        )
-        tangent = tangent.at[:, p0:p1, :].add(bra_atom)
-        tangent = tangent.at[:, :, p0:p1].add(ket_atom)
+    aoslices = fake_mol.aoslice_by_atom()
+    ao_owner = np.repeat(
+        np.arange(fake_mol.natm, dtype=np.int32),
+        aoslices[:, 3] - aoslices[:, 2],
+    )
+    tangent = coordinate_moment_jvp(bra, ket, coords_t, ao_owner)
     return tangent.reshape((3,) * rank + (nao, nao))
 
 
@@ -287,16 +288,8 @@ def _multipole_orbital_data_batch(
     )
     if shared_virtual:
         virtual = jnp.asarray(mo_vir[0])
-        overlap_transition_expr = 'ua,uv,vi->ia'
-        dipole_transition_expr = 'ua,xuv,vi->ixa'
-        quadrupole_transition_expr = 'ua,xyuv,vi->ixya'
-        octupole_transition_expr = 'ua,xyzuv,vi->ixyza'
     else:
         virtual = jnp.stack([jnp.asarray(space) for space in mo_vir])
-        overlap_transition_expr = 'iua,uv,vi->ia'
-        dipole_transition_expr = 'iua,xuv,vi->ixa'
-        quadrupole_transition_expr = 'iua,xyuv,vi->ixya'
-        octupole_transition_expr = 'iua,xyzuv,vi->ixyza'
 
     shared_virtual_energy = all(
         energy is e_vir[0] for energy in e_vir[1:]
@@ -315,89 +308,11 @@ def _multipole_orbital_data_batch(
     overlap, dipole, second, third = _origin_zero_moments(
         fake_mol, order=max(1, order - 1)
     )
-    center = jnp.einsum(
-        'ui,xuv,vi->ix', occupied.conj(), dipole, occupied
+    center, transition_dipole, transition_quadrupole, transition_octupole = (
+        transition_moments(
+            occupied, virtual, overlap, dipole, second, third, order
+        )
     )
-    transition_overlap = jnp.einsum(
-        overlap_transition_expr, virtual.conj(), overlap, occupied
-    )
-    transition_dipole = jnp.einsum(
-        dipole_transition_expr, virtual.conj(), dipole, occupied
-    )
-
-    transition_quadrupole = None
-    transition_octupole = None
-    translated_second = None
-    if order > 2:
-        raw_second = jnp.einsum(
-            quadrupole_transition_expr,
-            virtual.conj(),
-            second,
-            occupied,
-        )
-        translated_second = raw_second
-        translated_second = translated_second - jnp.einsum(
-            'ix,iya->ixya', center, transition_dipole
-        )
-        translated_second = translated_second - jnp.einsum(
-            'iy,ixa->ixya', center, transition_dipole
-        )
-        translated_second = translated_second + jnp.einsum(
-            'ix,iy,ia->ixya', center, center, transition_overlap
-        )
-        second_trace = jnp.trace(
-            translated_second, axis1=1, axis2=2
-        )
-        identity = jnp.eye(3, dtype=translated_second.dtype)
-        transition_quadrupole = 0.5 * (
-            3.0 * translated_second
-            - jnp.einsum('xy,ia->ixya', identity, second_trace)
-        )
-
-    if order > 3:
-        raw_third = jnp.einsum(
-            octupole_transition_expr,
-            virtual.conj(),
-            third,
-            occupied,
-        )
-        translated_third = raw_third
-        translated_third = translated_third - jnp.einsum(
-            'ix,iyza->ixyza', center, raw_second
-        )
-        translated_third = translated_third - jnp.einsum(
-            'iy,ixza->ixyza', center, raw_second
-        )
-        translated_third = translated_third - jnp.einsum(
-            'iz,ixya->ixyza', center, raw_second
-        )
-        translated_third = translated_third + jnp.einsum(
-            'ix,iy,iza->ixyza', center, center, transition_dipole
-        )
-        translated_third = translated_third + jnp.einsum(
-            'ix,iz,iya->ixyza', center, center, transition_dipole
-        )
-        translated_third = translated_third + jnp.einsum(
-            'iy,iz,ixa->ixyza', center, center, transition_dipole
-        )
-        translated_third = translated_third - jnp.einsum(
-            'ix,iy,iz,ia->ixyza',
-            center,
-            center,
-            center,
-            transition_overlap,
-        )
-
-        trace_yz = jnp.trace(translated_third, axis1=2, axis2=3)
-        trace_xz = jnp.trace(translated_third, axis1=1, axis2=3)
-        trace_xy = jnp.trace(translated_third, axis1=1, axis2=2)
-        identity = jnp.eye(3, dtype=translated_third.dtype)
-        transition_octupole = 0.5 * (
-            5.0 * translated_third
-            - jnp.einsum('yz,ixa->ixyza', identity, trace_yz)
-            - jnp.einsum('xz,iya->ixyza', identity, trace_xz)
-            - jnp.einsum('xy,iza->ixyza', identity, trace_xy)
-        )
 
     return [
         (
@@ -490,61 +405,6 @@ def _multipole_cross_from_data(left_data, right_data, order):
                 _multipole_pair_energy(left, right, order)
             )
     return pair_energy
-
-
-def _multipole_pair_energy(left, right, order):
-    """Contract precomputed multipoles for one ordered orbital pair."""
-    Ri, mu_ai, e_ai, theta_ai, omega_ai = left
-    Rj, mu_bj, e_bj, theta_bj, omega_bj = right
-
-    R = jnp.linalg.norm(Rj - Ri)
-    R_bar = (Rj - Ri) / R
-
-    aibj_2 = mu_ai.T @ mu_bj
-    tmp_ai = R_bar @ mu_ai
-    tmp_bj = R_bar @ mu_bj
-    aibj_2 -= jnp.outer(tmp_ai, tmp_bj * 3)
-    aibj_2 /= R**3
-
-    aibj = aibj_2
-    if order > 2:
-        RR = jnp.outer(R_bar, R_bar)
-        tmp1_ai = RR.ravel() @ theta_ai.reshape(9, -1)
-        tmp1_bj = RR.ravel() @ theta_bj.reshape(9, -1)
-        aibj_3 = jnp.outer(tmp_ai, tmp1_bj * 5)
-        aibj_3 -= jnp.outer(tmp1_ai, tmp_bj * 5)
-
-        mu_R_ai = einsum('xa,y->xya', mu_ai, R_bar).reshape(9, -1)
-        mu_R_bj = einsum('xb,y->xyb', mu_bj, R_bar).reshape(9, -1)
-        aibj_3 -= (2 * mu_R_ai.T) @ theta_bj.reshape(9, -1)
-        aibj_3 += theta_ai.reshape(9, -1).T @ (mu_R_bj * 2)
-        aibj_3 /= R**4
-        aibj += aibj_3
-
-    if order > 3:
-        RR = jnp.outer(R_bar, R_bar)
-        RRR = einsum('x,y,z->xyz', R_bar, R_bar, R_bar)
-
-        aibj_4 = einsum('xa,xyzb,yz->ab', mu_ai, omega_bj, RR * 9)
-        aibj_4 += einsum('xy,xyza,zb->ab', RR * 9, omega_ai, mu_bj)
-
-        omega_R3_ai = RRR.ravel() @ omega_ai.reshape(27, -1)
-        omega_R3_bj = RRR.ravel() @ omega_bj.reshape(27, -1)
-        aibj_4 -= jnp.outer(tmp_ai, omega_R3_bj * 21)
-        aibj_4 -= jnp.outer(omega_R3_ai, tmp_bj * 21)
-        aibj_4 += jnp.outer(tmp1_ai, tmp1_bj * 35)
-
-        tmp2_ai = einsum('xya,y->xa', theta_ai, R_bar)
-        tmp2_bj = einsum('xyb,y->xb', theta_bj, R_bar)
-        aibj_4 -= tmp2_ai.T @ (tmp2_bj * 20)
-        aibj_4 += theta_ai.reshape(9, -1).T @ (
-            theta_bj.reshape(9, -1) * 2
-        )
-        aibj_4 /= (3 * R**5)
-        aibj += aibj_4
-
-    aibj2 = aibj * aibj / (e_ai[:, None] + e_bj[None, :])
-    return -4 * jnp.sum(aibj2)
 
 
 def pair_energy_multipole(

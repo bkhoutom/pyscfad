@@ -209,8 +209,8 @@ def check_system_memory(mf, nocc, nvir, *, with_grad, virtual_block_size=16,
 
 
 def allocate_domain_controls(controls, job_count):
-    """Copy controls and divide the total budget over actual strong jobs."""
+    """Copy controls and split total variance equally over strong jobs."""
     settings = controls.copy()
     if job_count and "energy_tolerance" in settings:
-        settings["energy_tolerance"] = float(settings["energy_tolerance"]) / job_count
+        settings["energy_tolerance"] = float(settings["energy_tolerance"]) / math.sqrt(job_count)
     return settings

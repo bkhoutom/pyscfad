@@ -88,6 +88,31 @@ def test_finite_packet_declares_selected_mp2_and_rejects_old_identity():
             validate_inputs(inputs, {**md, "energy_kind": kind})
 
 
+@pytest.mark.parametrize("count", [2, 4, 9])
+def test_finite_packet_budget_uses_equal_group_variances(count):
+    from types import SimpleNamespace
+    from pyscfad.dlno_stc.mp2 import _validate_budget
+
+    inputs, md = packet(), finite_metadata()
+    total = .0003
+    effective = float(total / np.sqrt(count))
+    md['budget'] = dict(total_tolerance=total, original_target_count=16,
+                        group_count=count, effective_tolerance=effective)
+    controls = dict(energy_tolerance=effective)
+    static, groups = SimpleNamespace(fragments=(None,) * 16), (None,) * count
+    validate_inputs(inputs, md)
+    request_fingerprint(inputs, md, controls)
+    _validate_budget(md['budget'], controls, static, groups)
+
+    # Consistent metadata and controls using the discarded rule must be rejected.
+    md['budget']['effective_tolerance'] = total / count
+    controls['energy_tolerance'] = total / count
+    with pytest.raises(ValueError, match='budget'):
+        validate_inputs(inputs, md)
+    with pytest.raises(ValueError, match='budget'):
+        _validate_budget(md['budget'], controls, static, groups)
+
+
 @pytest.mark.parametrize("targets", [None, [], [0, 0], [-1], [2], [True], [0.5]])
 def test_invalid_selected_targets(targets):
     with pytest.raises(ValueError, match="target_indices"):

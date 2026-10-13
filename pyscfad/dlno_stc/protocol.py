@@ -108,8 +108,8 @@ def _check_metadata(metadata, nocc=None):
             if effective is not None:
                 raise ValueError("budget effective tolerance requires a total")
         elif (type(total) not in (int, float) or not math.isfinite(total) or total <= 0
-              or type(effective) not in (int, float) or effective != total / count):
-            raise ValueError("budget effective tolerance does not match total/group count")
+              or type(effective) not in (int, float) or effective != total / math.sqrt(count)):
+            raise ValueError("budget effective tolerance does not match total/sqrt(group count)")
         labels = metadata["global_target_orbitals"]
         candidates = metadata["candidate_order"]
         if (not isinstance(labels, (list, tuple)) or len(labels) != len(targets)

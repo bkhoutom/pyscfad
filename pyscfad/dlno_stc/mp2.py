@@ -1,6 +1,7 @@
 """Grouped selected-target MP2 exchange and molecular replay."""
 from pathlib import Path
 import gc
+import math
 import jax
 import numpy
 from pyscfad import config_update, numpy as np
@@ -79,7 +80,7 @@ def _validate_budget(budget, controls, static, groups):
                 "original_target_count": len(static.fragments),
                 "group_count": len(groups),
                 "effective_tolerance": (total if not groups or total is None
-                                        else total / len(groups))}
+                                        else total / math.sqrt(len(groups)))}
     if budget != expected or controls.get("energy_tolerance") != expected["effective_tolerance"]:
         raise ValueError("packet sampling budget does not match grouped controls")
 

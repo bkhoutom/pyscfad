@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import gc
+from dataclasses import replace
 from pathlib import Path
 import time
 
@@ -26,13 +27,14 @@ from mpi4py import MPI
 import numpy
 
 from pyscfad import config_update
+from pyscfad.lib._compilation_cache import configure_compilation_cache
 from pyscfad.df.mpi_df_jk import MPIDFJKExecutor, ServiceExit
 from pyscfad.ops import stop_trace
 from pyscfad.tools import resource_profile
 
 from ._restart import RestartManager
 from ._selection import DomainSelections
-from .dlno_base import build_strong_ed_domain, build_weak_multipole_screen, rebuild_domain_data
+from .dlno_base import build_strong_ed_domain, rebuild_domain_data
 from .dlno_base_mpi import (
     _abort_collective_on_error, _array_tree_digest, _exception_text,
     _progress_enabled, _progress_reporter, _raise_if_any_rank_failed,
@@ -46,7 +48,9 @@ from .mp2 import (
     _correlation_term_specs, _details_from_restart_metadata,
     _details_restart_metadata, _fix_restart_mo_phases, _make_decomposition,
     _serial_restart_scientific_payload, strong_domain_energy,
-    weak_screen_pair_energy,
+    build_weak_endpoint, _check_weak_endpoint_gauge,
+    _align_weak_endpoint_signs,
+    _weak_endpoint_pair_value_and_grad,
 )
 from .targets import resolve_target_options, semantic_tuple as _semantic_tuple
 
@@ -94,12 +98,176 @@ def _mpi_restart_scientific_payload(
         lo_kwargs=lo_kwargs,
     )
     payload["driver"] = "mpi-iao-dlno-mp2-gradient"
-    # Progressive MPI batch records contain rank-local cumulative bars, so a
-    # partial correlation restart currently requires the same collective
-    # layout.  The final pre-SCF state remains independent of scheduling, but
-    # keeping one strict manifest avoids accidentally mixing both contracts.
+    # Keep the collective service/scheduling layout identical on resume.
+    # Correlation checkpoints themselves contain the fully closed canonical
+    # cotangent and never advertise a partially completed reordered phase.
     payload["mpi"] = {"size": int(nproc), "root": int(root)}
     return payload
+
+
+def _weak_endpoint_correlation_pullback(
+    mf, common, static, weak_work, *, comm, root, collect_timing=False,
+    reporter=None,
+):
+    """Distribute compact weak pairs and close each endpoint on its owner.
+
+    Endpoint values are small enough to share on every rank.  The much
+    larger AO moment VJP is constructed only on the endpoint's owning rank,
+    used once with the reduced incident-pair cotangent, and released.
+    """
+    configure_compilation_cache()
+    rank, nproc = comm.Get_rank(), comm.Get_size()
+    indices = sorted({i for _, left, right in weak_work for i in (left, right)})
+    owners = {index: slot % nproc for slot, index in enumerate(indices)}
+    mf_bar, common_bar = _zero_term_cotangents(mf, common)
+    local_energy = np.zeros((), dtype=common.s1e.dtype)
+    if not indices:
+        return local_energy, mf_bar, common_bar, ()
+
+    _report_progress(reporter, f"weak endpoints: preparing {len(indices)} fragments")
+    prepared = []
+    profile_prepare = resource_profile.start()
+    for index in indices:
+        if owners[index] != rank:
+            continue
+        start = time.perf_counter() if collect_timing else None
+        endpoint = build_weak_endpoint(mf, common, static, index)
+        if collect_timing or profile_prepare is not None:
+            jax.block_until_ready(endpoint)
+        prepared.append((
+            index, jax.tree_util.tree_map(_to_host_leaf, endpoint),
+            _array_tree_digest(endpoint),
+            time.perf_counter() - start if collect_timing else 0.0,
+        ))
+        del endpoint
+    resource_profile.finish(
+        "dlno.mp2_mpi.weak_endpoints.prepare", profile_prepare,
+        n_endpoints=len(prepared),
+    )
+    endpoints, build_seconds = {}, {}
+    for rank_prepared in comm.allgather(prepared):
+        for index, endpoint_host, digest, seconds in rank_prepared:
+            endpoint = jax.tree_util.tree_map(_to_device_leaf, endpoint_host)
+            if _array_tree_digest(endpoint) != digest:
+                raise RuntimeError(f"MPI corrupted weak endpoint {index}")
+            endpoints[index] = endpoint
+            build_seconds[index] = seconds
+            del endpoint, endpoint_host
+    del prepared, rank_prepared
+    endpoint_bars = {
+        index: jax.tree_util.tree_map(np.zeros_like, endpoint)
+        for index, endpoint in endpoints.items()
+    }
+
+    _report_progress(reporter, f"weak pairs: contracting {len(weak_work)} compact pairs")
+    local_results = []
+    profile_pairs = resource_profile.start()
+    for spec in weak_work[rank::nproc]:
+        _, left, right = spec
+        start = time.perf_counter() if collect_timing else None
+        term_energy, (left_bar, right_bar) = _weak_endpoint_pair_value_and_grad(
+            endpoints[left], endpoints[right], static.thresholds.multipole_order
+        )
+        if collect_timing:
+            jax.block_until_ready((term_energy, left_bar, right_bar))
+            forward_seconds = time.perf_counter() - start
+            start = time.perf_counter()
+        endpoint_bars[left] = jax.tree_util.tree_map(
+            _add_cotangent, endpoint_bars[left], left_bar
+        )
+        endpoint_bars[right] = jax.tree_util.tree_map(
+            _add_cotangent, endpoint_bars[right], right_bar
+        )
+        local_energy = local_energy + term_energy
+        if collect_timing:
+            jax.block_until_ready((local_energy, endpoint_bars))
+            local_results.append(MP2TermResult(
+                kind="weak", left_fragment=int(left), right_fragment=int(right),
+                energy=float(jax.device_get(term_energy)),
+                forward_seconds=float(forward_seconds),
+                reverse_seconds=float(time.perf_counter() - start),
+                worker_rank=int(rank),
+            ))
+        del left_bar, right_bar
+    jax.block_until_ready((local_energy, endpoint_bars))
+    resource_profile.finish(
+        "dlno.mp2_mpi.weak_endpoints.pairs", profile_pairs,
+        n_pairs=len(weak_work[rank::nproc]),
+    )
+
+    # Reduce each compact bar directly to the rank that built its endpoint.
+    # Collective waits stay outside the local computation profile sections.
+    owned_bars = {}
+    for index in indices:
+        reduced = _tree_sum_to_root(comm, endpoint_bars[index], root=owners[index])
+        if owners[index] == rank:
+            owned_bars[index] = reduced
+    del endpoint_bars, reduced
+    endpoints = {index: endpoints[index] for index in owned_bars}
+
+    _report_progress(reporter, "weak endpoints: replaying distributed response")
+    response_seconds = {}
+    profile_response = resource_profile.start()
+    owned_indices = tuple(owned_bars)
+    for index in owned_indices:
+        endpoint_bar = owned_bars.pop(index)
+        start = time.perf_counter() if collect_timing else None
+        reference = endpoints.pop(index)
+        # Owner-local alignment is part of the differentiated map; pair bars
+        # remain in their shared forward frame and need no manual correction.
+        rebuilt, pullback = jax.vjp(
+            lambda mf_, common_: _align_weak_endpoint_signs(
+                build_weak_endpoint(mf_, common_, static, index), reference
+            ), mf, common,
+        )
+        _check_weak_endpoint_gauge(
+            rebuilt, reference, index, "MPI response replay"
+        )
+        endpoint_mf_bar, endpoint_common_bar = pullback(endpoint_bar)
+        mf_bar = jax.tree_util.tree_map(_add_cotangent, mf_bar, endpoint_mf_bar)
+        common_bar = jax.tree_util.tree_map(
+            _add_cotangent, common_bar, endpoint_common_bar
+        )
+        jax.block_until_ready((mf_bar, common_bar))
+        if collect_timing:
+            response_seconds[index] = time.perf_counter() - start
+        del reference, rebuilt, pullback
+        del endpoint_mf_bar, endpoint_common_bar, endpoint_bar
+    if owned_indices:
+        # Keep only one live endpoint tape and collect after the entire
+        # owned response, rather than scanning the heap for every endpoint.
+        gc.collect()
+    resource_profile.finish(
+        "dlno.mp2_mpi.weak_endpoints.response", profile_response,
+        n_endpoints=len(owned_indices),
+    )
+    results = None
+    if collect_timing:
+        gathered_results = comm.gather(local_results, root=root)
+        gathered_response = comm.gather(response_seconds, root=root)
+        if rank == root:
+            by_spec = {
+                ("weak", row.left_fragment, row.right_fragment): row
+                for rows in gathered_results for row in rows
+            }
+            all_response = {
+                index: seconds for rows in gathered_response
+                for index, seconds in rows.items()
+            }
+            results = []
+            for spec in weak_work:
+                _, left, right = spec
+                row = by_spec[spec]
+                results.append(replace(
+                    row,
+                    frame_build_seconds=sum(
+                        build_seconds.pop(index, 0.0) for index in (left, right)
+                    ),
+                    frame_replay_seconds=sum(
+                        all_response.pop(index, 0.0) for index in (left, right)
+                    ),
+                ))
+    return local_energy, mf_bar, common_bar, results
 
 
 @_abort_collective_on_error
@@ -135,6 +303,7 @@ def correlation_value_and_grad(
     nproc = comm.Get_size()
     if root < 0 or root >= nproc:
         raise ValueError(f"root={root} is invalid for {nproc} MPI ranks")
+    configure_compilation_cache()
     progress_enabled = _progress_enabled(progress)
     progress_flags = comm.allgather(progress_enabled)
     if len(set(progress_flags)) != 1:
@@ -261,9 +430,10 @@ def correlation_value_and_grad(
     _verify_shared_gauge(comm, canonical, common, mf)
     _report_progress(reporter, "shared orbital gauge verified on all ranks")
 
-    work = _correlation_term_specs(static)
-    nstrong_terms = sum(spec[0] == "strong" for spec in work)
-    nweak_terms = len(work) - nstrong_terms
+    all_work = _correlation_term_specs(static)
+    work = tuple(spec for spec in all_work if spec[0] == "strong")
+    weak_work = tuple(spec for spec in all_work if spec[0] == "weak")
+    nstrong_terms, nweak_terms = len(work), len(weak_work)
     local_energy = np.zeros((), dtype=common.s1e.dtype)
     mf_bar, _ = _zero_term_cotangents(mf, common)
     if rank == root:
@@ -274,25 +444,16 @@ def correlation_value_and_grad(
         common_bar_root = None
         term_results_root = None
 
-    # One bounded batch contains at most one correlation term per rank.  Root
-    # supplies the exact orbital frame for each term, workers return only its
-    # frame cotangent, and root closes those bars before constructing the next
-    # batch.  Peak orbital-frame storage is therefore O(nproc), not O(nfrag).
+    # Strong EDs retain bounded root-gauge batches.  Weak endpoint values,
+    # compact pair contractions, and endpoint response form a separate phase.
     nbatch = (len(work) + nproc - 1) // nproc
     _report_progress(
         reporter,
-        f"correlation pullback: {nstrong_terms} strong ED rows + "
-        f"{nweak_terms} weak pairs in {nbatch} batches on {nproc} ranks",
+        f"correlation pullback: {nstrong_terms} strong ED rows in {nbatch} "
+        f"batches + {nweak_terms} endpoint-factored weak pairs on {nproc} ranks",
     )
     for batch_index in range(nbatch):
         if rank == root:
-            first_term = batch_index * nproc + 1
-            last_term = min((batch_index + 1) * nproc, len(work))
-            _report_progress(
-                reporter,
-                f"batch {batch_index + 1}/{nbatch}: building orbital "
-                f"frames for terms {first_term}-{last_term}",
-            )
             batch_payloads = []
             for slot in range(nproc):
                 work_index = batch_index * nproc + slot
@@ -300,370 +461,154 @@ def correlation_value_and_grad(
                     batch_payloads.append(None)
                     continue
                 spec = work[work_index]
-                kind, left, right = spec
+                _, left, _ = spec
                 profile_frame_build = resource_profile.start()
-                frame_start = (
-                    time.perf_counter() if collect_timing else None
+                frame_start = time.perf_counter() if collect_timing else None
+                frame, pullback = jax.vjp(
+                    lambda common_: build_strong_ed_domain(common_, static, left),
+                    common,
                 )
-                if kind == "strong":
-                    frame, pullback = jax.vjp(
-                        lambda common_, _left=left:
-                            build_strong_ed_domain(
-                                common_, static, _left
-                            ),
-                        common,
-                    )
-                else:
-                    left_frame, left_pullback = jax.vjp(
-                        lambda common_, _left=left:
-                            build_weak_multipole_screen(
-                                common_, static, _left
-                            ),
-                        common,
-                    )
-                    right_frame, right_pullback = jax.vjp(
-                        lambda common_, _right=right:
-                            build_weak_multipole_screen(
-                                common_, static, _right
-                            ),
-                        common,
-                    )
-                    frame = (left_frame, right_frame)
-                    pullback = (left_pullback, right_pullback)
                 del pullback
                 frame_host = jax.tree_util.tree_map(_to_host_leaf, frame)
                 frame_digest = _array_tree_digest(frame)
                 resource_profile.finish(
-                    "dlno.mp2_mpi.correlation.frame_build",
-                    profile_frame_build,
-                    batch_index=batch_index,
-                    term_index=work_index,
-                    kind=kind,
-                    left_fragment=left,
-                    right_fragment=(
-                        None if int(right) == -1 else right
-                    ),
+                    "dlno.mp2_mpi.correlation.frame_build", profile_frame_build,
+                    batch_index=batch_index, term_index=work_index,
+                    kind="strong", left_fragment=left, right_fragment=None,
                 )
-                if collect_timing:
-                    frame_build_seconds = (
-                        time.perf_counter() - frame_start
-                    )
-                    batch_payloads.append((
-                        spec,
-                        frame_host,
-                        frame_digest,
-                        frame_build_seconds,
-                    ))
-                else:
-                    batch_payloads.append((
-                        spec, frame_host, frame_digest
-                    ))
-                if kind == "weak":
-                    del (
-                        left_frame,
-                        right_frame,
-                        left_pullback,
-                        right_pullback,
-                    )
+                batch_payloads.append((
+                    spec, frame_host, frame_digest,
+                    time.perf_counter() - frame_start if collect_timing else 0.0,
+                ))
                 del frame
                 gc.collect()
         else:
             batch_payloads = None
-
         local_payload = comm.scatter(batch_payloads, root=root)
-        if local_payload is None:
-            local_result = None
-        else:
-            if collect_timing:
-                (
-                    spec,
-                    frame_host,
-                    frame_digest,
-                    frame_build_seconds,
-                ) = local_payload
-            else:
-                spec, frame_host, frame_digest = local_payload
+        local_result = None
+        if local_payload is not None:
+            spec, frame_host, frame_digest, _ = local_payload
+            _, left, _ = spec
             frame = jax.tree_util.tree_map(_to_device_leaf, frame_host)
             if _array_tree_digest(frame) != frame_digest:
-                raise RuntimeError(
-                    f"MPI corrupted the root-gauge frame for term {spec}"
-                )
-            del frame_host, frame_digest
-            kind, left, right = spec
+                raise RuntimeError(f"MPI corrupted root-gauge strong frame {spec}")
             work_index = batch_index * nproc + rank
-            profile_term_forward = resource_profile.start()
-            forward_start = (
-                time.perf_counter() if collect_timing else None
+            profile_forward = resource_profile.start()
+            start = time.perf_counter() if collect_timing else None
+            term_energy, pullback = jax.vjp(
+                lambda mf_, domain_: strong_domain_energy(
+                    mf_, domain_, static, left
+                ).total, mf, frame,
             )
-            if kind == "strong":
-                def term(mf_, domain_, _left=left):
-                    return strong_domain_energy(
-                        mf_, domain_, static, _left
-                    ).total
-
-                term_energy, pullback = jax.vjp(term, mf, frame)
-            else:
-                def term(
-                    mf_, left_screen_, right_screen_,
-                    _left=left, _right=right,
-                ):
-                    return weak_screen_pair_energy(
-                        mf_,
-                        left_screen_,
-                        right_screen_,
-                        static,
-                        _left,
-                        _right,
-                    )
-
-                term_energy, pullback = jax.vjp(
-                    term, mf, frame[0], frame[1]
-                )
-
-            if collect_timing or profile_term_forward is not None:
+            if collect_timing or profile_forward is not None:
                 jax.block_until_ready(term_energy)
             resource_profile.finish(
-                "dlno.mp2_mpi.correlation.term_forward",
-                profile_term_forward,
-                batch_index=batch_index,
-                term_index=work_index,
-                kind=kind,
-                left_fragment=left,
-                right_fragment=None if int(right) == -1 else right,
+                "dlno.mp2_mpi.correlation.term_forward", profile_forward,
+                batch_index=batch_index, term_index=work_index,
+                kind="strong", left_fragment=left, right_fragment=None,
             )
-            if collect_timing:
-                forward_seconds = time.perf_counter() - forward_start
-                reverse_start = time.perf_counter()
-            profile_term_reverse = resource_profile.start()
-            if kind == "strong":
-                term_mf_bar, frame_bar = pullback(
-                    np.ones((), dtype=term_energy.dtype)
-                )
-            else:
-                (
-                    term_mf_bar,
-                    left_frame_bar,
-                    right_frame_bar,
-                ) = pullback(np.ones((), dtype=term_energy.dtype))
-                frame_bar = (left_frame_bar, right_frame_bar)
-                del left_frame_bar, right_frame_bar
-
+            forward_seconds = time.perf_counter() - start if collect_timing else 0.0
+            start = time.perf_counter() if collect_timing else None
+            profile_reverse = resource_profile.start()
+            term_mf_bar, frame_bar = pullback(np.ones((), dtype=term_energy.dtype))
             local_energy = local_energy + term_energy
-            mf_bar = jax.tree_util.tree_map(
-                _add_cotangent, mf_bar, term_mf_bar
-            )
+            mf_bar = jax.tree_util.tree_map(_add_cotangent, mf_bar, term_mf_bar)
             jax.block_until_ready((local_energy, mf_bar, frame_bar))
-            frame_bar_host = jax.tree_util.tree_map(
-                _to_host_leaf, frame_bar
-            )
+            frame_bar_host = jax.tree_util.tree_map(_to_host_leaf, frame_bar)
             resource_profile.finish(
-                "dlno.mp2_mpi.correlation.term_reverse",
-                profile_term_reverse,
-                batch_index=batch_index,
-                term_index=work_index,
-                kind=kind,
-                left_fragment=left,
-                right_fragment=None if int(right) == -1 else right,
+                "dlno.mp2_mpi.correlation.term_reverse", profile_reverse,
+                batch_index=batch_index, term_index=work_index,
+                kind="strong", left_fragment=left, right_fragment=None,
             )
-            if collect_timing:
-                reverse_seconds = time.perf_counter() - reverse_start
-                local_result = (
-                    spec,
-                    frame_bar_host,
-                    float(jax.device_get(term_energy)),
-                    forward_seconds,
-                    reverse_seconds,
-                    rank,
-                )
-            else:
-                local_result = (spec, frame_bar_host)
-            del (
-                frame,
-                frame_bar,
-                pullback,
-                term,
-                term_energy,
-                term_mf_bar,
+            local_result = (
+                spec, frame_bar_host, float(jax.device_get(term_energy)),
+                forward_seconds,
+                time.perf_counter() - start if collect_timing else 0.0,
+                rank,
             )
+            del frame, frame_bar, pullback, term_mf_bar, term_energy
             gc.collect()
-
         gathered = comm.gather(local_result, root=root)
         if rank == root:
-            for slot, (sent, result) in enumerate(zip(
-                batch_payloads, gathered
-            )):
+            for slot, (sent, result) in enumerate(zip(batch_payloads, gathered)):
                 if sent is None:
                     if result is not None:
-                        raise RuntimeError(
-                            "an idle MPI rank returned a correlation bar"
-                        )
+                        raise RuntimeError("idle MPI rank returned a strong bar")
                     continue
-                if collect_timing:
-                    (
-                        spec,
-                        _,
-                        expected_digest,
-                        frame_build_seconds,
-                    ) = sent
-                else:
-                    spec, _, expected_digest = sent
+                spec, _, expected_digest, frame_build_seconds = sent
                 if result is None or result[0] != spec:
+                    raise RuntimeError(f"MPI returned wrong strong term for {spec}")
+                _, left, _ = spec
+                frame_bar = jax.tree_util.tree_map(_to_device_leaf, result[1])
+                profile_replay = resource_profile.start()
+                start = time.perf_counter() if collect_timing else None
+                rebuilt, pullback = jax.vjp(
+                    lambda common_: build_strong_ed_domain(common_, static, left),
+                    common,
+                )
+                if _array_tree_digest(rebuilt) != expected_digest:
                     raise RuntimeError(
-                        f"MPI returned the wrong correlation term for {spec}"
+                        f"root strong-domain gauge changed on replay: {left}"
                     )
-                frame_bar = jax.tree_util.tree_map(
-                    _to_device_leaf, result[1]
-                )
-                kind, left, right = spec
-                profile_frame_replay = resource_profile.start()
-                replay_start = (
-                    time.perf_counter() if collect_timing else None
-                )
-                if kind == "strong":
-                    rebuilt, pullback = jax.vjp(
-                        lambda common_, _left=left:
-                            build_strong_ed_domain(
-                                common_, static, _left
-                            ),
-                        common,
-                    )
-                    if _array_tree_digest(rebuilt) != expected_digest:
-                        raise RuntimeError(
-                            "rank-0 strong-domain gauge changed while "
-                            f"replaying fragment {int(left) + 1}"
-                        )
-                    term_common_bar, = pullback(frame_bar)
-                else:
-                    rebuilt_left, left_pullback = jax.vjp(
-                        lambda common_, _left=left:
-                            build_weak_multipole_screen(
-                                common_, static, _left
-                            ),
-                        common,
-                    )
-                    rebuilt_right, right_pullback = jax.vjp(
-                        lambda common_, _right=right:
-                            build_weak_multipole_screen(
-                                common_, static, _right
-                            ),
-                        common,
-                    )
-                    if (
-                        _array_tree_digest(
-                            (rebuilt_left, rebuilt_right)
-                        ) != expected_digest
-                    ):
-                        raise RuntimeError(
-                            "rank-0 weak-screen gauge changed while "
-                            f"replaying pair ({int(left) + 1}, "
-                            f"{int(right) + 1})"
-                        )
-                    left_common_bar, = left_pullback(frame_bar[0])
-                    right_common_bar, = right_pullback(frame_bar[1])
-                    term_common_bar = jax.tree_util.tree_map(
-                        _add_cotangent,
-                        left_common_bar,
-                        right_common_bar,
-                    )
-                    del (
-                        rebuilt_left,
-                        rebuilt_right,
-                        left_pullback,
-                        right_pullback,
-                        left_common_bar,
-                        right_common_bar,
-                    )
+                term_common_bar, = pullback(frame_bar)
                 common_bar_root = jax.tree_util.tree_map(
-                    _add_cotangent,
-                    common_bar_root,
-                    term_common_bar,
+                    _add_cotangent, common_bar_root, term_common_bar
                 )
-                if collect_timing or profile_frame_replay is not None:
+                if collect_timing or profile_replay is not None:
                     jax.block_until_ready(common_bar_root)
                 resource_profile.finish(
-                    "dlno.mp2_mpi.correlation.frame_replay",
-                    profile_frame_replay,
+                    "dlno.mp2_mpi.correlation.frame_replay", profile_replay,
                     batch_index=batch_index,
                     term_index=batch_index * nproc + slot,
-                    kind=kind,
-                    left_fragment=left,
-                    right_fragment=(
-                        None if int(right) == -1 else right
-                    ),
+                    kind="strong", left_fragment=left, right_fragment=None,
                 )
                 if collect_timing:
-                    frame_replay_seconds = (
-                        time.perf_counter() - replay_start
-                    )
-                    term_result = MP2TermResult(
-                        kind=str(kind),
-                        left_fragment=int(left),
-                        right_fragment=(
-                            None if int(right) == -1 else int(right)
-                        ),
-                        energy=float(result[2]),
-                        forward_seconds=float(result[3]),
+                    row = MP2TermResult(
+                        kind="strong", left_fragment=int(left), right_fragment=None,
+                        energy=float(result[2]), forward_seconds=float(result[3]),
                         reverse_seconds=float(result[4]),
                         frame_build_seconds=float(frame_build_seconds),
-                        frame_replay_seconds=float(frame_replay_seconds),
+                        frame_replay_seconds=float(time.perf_counter() - start),
                         worker_rank=int(result[5]),
                     )
-                    term_results_root.append(term_result)
-                    progress_energy_root += term_result.energy
-                    term_number = batch_index * nproc + slot + 1
-                    if kind == "strong":
-                        fragment = static.fragments[int(left)]
-                        n_atoms = numpy.asarray(
-                            fragment.extended_atoms
-                        ).size
-                        n_ao = numpy.asarray(
-                            fragment.extended_ao_indices
-                        ).size
-                        n_occ = numpy.asarray(
-                            fragment.strong_occ_metric_keep
-                        ).size
-                        n_vir = numpy.asarray(
-                            fragment.strong_virtual.metric_keep
-                        ).size
-                        label = (
-                            f"strong ED fragment {int(left) + 1} "
-                            f"[atoms={n_atoms}, AO={n_ao}, "
-                            f"occ={n_occ}, vir={n_vir}]"
-                        )
-                    else:
-                        label = (
-                            f"weak pair ({int(left) + 1},"
-                            f"{int(right) + 1})"
-                        )
+                    term_results_root.append(row)
+                    progress_energy_root += row.energy
                     _report_progress(
                         reporter,
-                        f"term {term_number}/{len(work)} {label} "
-                        f"[rank {term_result.worker_rank}]: "
-                        f"E={term_result.energy:+.10f} Eh; "
-                        f"forward/reverse="
-                        f"{term_result.forward_seconds:.1f}/"
-                        f"{term_result.reverse_seconds:.1f} s; "
-                        f"frame build/replay="
-                        f"{term_result.frame_build_seconds:.1f}/"
-                        f"{term_result.frame_replay_seconds:.1f} s; "
-                        f"elapsed={time.perf_counter() - total_start:.1f} s",
+                        f"term {batch_index * nproc + slot + 1}/{len(all_work)} "
+                        f"strong ED fragment {left + 1} [rank {row.worker_rank}]: "
+                        f"E={row.energy:+.10f} Eh; forward/reverse="
+                        f"{row.forward_seconds:.1f}/{row.reverse_seconds:.1f} s; "
+                        f"frame build/replay={row.frame_build_seconds:.1f}/"
+                        f"{row.frame_replay_seconds:.1f} s",
                     )
-                del frame_bar, term_common_bar
-                if kind == "strong":
-                    del rebuilt, pullback
+                del rebuilt, pullback, frame_bar, term_common_bar
                 gc.collect()
-            if collect_timing:
-                _report_progress(
-                    reporter,
-                    f"batch {batch_index + 1}/{nbatch}: complete; "
-                    f"accumulated E_corr={progress_energy_root:+.10f} Eh; "
-                    f"elapsed={time.perf_counter() - total_start:.1f} s",
-                )
-            del batch_payloads, gathered, sent, result
-        else:
-            del gathered
-        del local_payload, local_result
+            del batch_payloads
+        del local_payload, local_result, gathered
         gc.collect()
+
+    weak_energy, weak_mf_bar, weak_common_bar, weak_results = (
+        _weak_endpoint_correlation_pullback(
+            mf, common, static, weak_work, comm=comm, root=root,
+            collect_timing=collect_timing, reporter=reporter,
+        )
+    )
+    local_energy = local_energy + weak_energy
+    mf_bar = jax.tree_util.tree_map(_add_cotangent, mf_bar, weak_mf_bar)
+    weak_common_bar_root = _tree_sum_to_root(comm, weak_common_bar, root=root)
+    if rank == root:
+        common_bar_root = jax.tree_util.tree_map(
+            _add_cotangent, common_bar_root, weak_common_bar_root
+        )
+        if collect_timing:
+            term_results_root.extend(weak_results)
+            spec_order = {spec: index for index, spec in enumerate(all_work)}
+            term_results_root.sort(key=lambda row: spec_order[(
+                row.kind, row.left_fragment,
+                -1 if row.right_fragment is None else row.right_fragment,
+            )])
+    del weak_mf_bar, weak_common_bar, weak_common_bar_root, weak_results
 
     _report_progress(reporter, "reducing correlation energy and cotangents")
     corr_energy = comm.allreduce(float(local_energy), op=MPI.SUM)

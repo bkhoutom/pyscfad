@@ -24,6 +24,28 @@ retain the original singleton topology. `scope="system"` retains the complete
 active-space energy and system sampling policy. Its independent controls and
 canonical specialization remain available through the low-level full solver.
 
+Domain selection and the domain driver lazily enable persistent JAX compilation
+caching in `$XDG_CACHE_HOME/pyscfad/jax`, falling back to `~/.cache/pyscfad/jax`.
+The automatic policy retains small kernels for reuse in subsequent processes.
+MPI launcher ranks use separate `mpi-rank-N` subdirectories.
+Numerical endpoint values and response tapes are rebuilt for each calculation.
+This JAX setting is process-wide. Set `JAX_ENABLE_COMPILATION_CACHE=false` to opt
+out. An explicit JAX cache directory retains its existing threshold policy;
+a custom cache needs `JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0` and
+`JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=-1` to retain all small kernels.
+An unavailable automatic cache warns and allows the calculation to continue.
+
+Weak response releases endpoint values, cotangents and reverse tapes as they
+are consumed and explicitly collects garbage once after the weak stage.
+Automatic Python collection and strong-group cleanup remain active.
+
+Endpoint replay aligns real virtual-orbital signs to the saved forward moments
+inside the differentiated function, so JAX applies the same phase factors in
+the reverse pass. The consistency check compares each moment order's Cartesian
+RMS per virtual column with `atol=rtol=1e-9`; canceled components use their
+column's scale. Centers and energy gaps retain componentwise checks. Changes
+beyond signs and these roundoff bounds are rejected.
+
 ## Array and native contract
 
 All numerical requests contain exactly `foo(oo)`, `fvv(vv)`, and `B(Pia)` as
@@ -41,14 +63,17 @@ Laplace quadrature weights and mathematical sampling probabilities are retained.
 
 ## Sampling budget
 
-Public `energy_tolerance` is the total requested budget in Eh. It is divided
-exactly once by the number of actual grouped strong solver jobs. Sixteen targets
-in four groups receive `0.0003 / 4 = 0.000075 Eh` per job. With merging disabled,
-they receive `0.00001875 Eh`. Caller dictionaries are copied. Weak pairs and MPI
-replicas do not enter the divisor; fixed-count overrides and replica reduction
-retain their previous meaning. A group standard error describes energy, never
-force uncertainty. Reused or unverified sampling streams do not justify summing
-group variances as an independent combined uncertainty.
+Public `energy_tolerance` is the total requested sampling standard error in Eh.
+It is divided exactly once by the square root of the number of actual grouped
+strong solver jobs: `group_tolerance = energy_tolerance / sqrt(group_count)`.
+This assigns equal variance budgets, whose sum is `energy_tolerance**2` for
+independent group streams. Sixteen targets in four groups receive
+`0.0003 / sqrt(4) = 0.00015 Eh` per job. With merging disabled, they receive
+`0.0003 / sqrt(16) = 0.000075 Eh`. Caller dictionaries are copied. Weak pairs
+and MPI replicas do not enter the divisor; fixed-count overrides and replica
+reduction retain their previous meaning. A group standard error describes
+energy, never force uncertainty. Reused or unverified sampling streams do not
+justify summing group variances as an independent combined uncertainty.
 
 ## Disk exchange and restart
 
@@ -84,6 +109,8 @@ candidates, AO/auxiliary supports, saved PAO anchors, `local_before_fock_v1`,
 group membership and sampling budget. Budget metadata stores `total_tolerance`,
 `original_target_count`, `group_count`, and `effective_tolerance`. Replay does
 not allocate again. Responses must echo the selected identities and frame.
+Saved multi-group packets using the previous linear allocation must be
+regenerated before replay; budget validation requires the square-root rule.
 
 The existing STC `RestartManager` stores concrete selections and typed grouping
 metadata; its registry accepts only required STC-owned classes. The model tag is

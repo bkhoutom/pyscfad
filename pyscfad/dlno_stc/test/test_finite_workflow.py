@@ -36,8 +36,8 @@ def test_grouped_export_deserialize_solve_and_replay(boys_water_dimer, tmp_path,
         assert metadata['energy_kind'] == 'finite_boys_target_mp2_v1'
         assert metadata['budget'] == dict(total_tolerance=.0003,
             original_target_count=8, group_count=len(groups),
-            effective_tolerance=.0003/len(groups))
-        assert effective['energy_tolerance'] == .0003/len(groups)
+            effective_tolerance=.0003/np.sqrt(len(groups)))
+        assert effective['energy_tolerance'] == .0003/np.sqrt(len(groups))
         assert set(inputs) == set(result['cotangents']) == {'foo','fvv','B'}
     with pytest.raises(ValueError, match='controls'):
         load_finite_static_from_run(mf, tmp_path, frozen=2,
@@ -65,7 +65,7 @@ def test_packet_replay_rejects_changed_identity(boys_water_dimer):
     group = groups[0]
     inputs = mp2.prepare_boys_group_inputs(mf, common, static, group)
     budget = dict(total_tolerance=.0003, original_target_count=8,
-                  group_count=len(groups), effective_tolerance=.0003/len(groups))
+                  group_count=len(groups), effective_tolerance=.0003/np.sqrt(len(groups)))
     controls = dict(energy_tolerance=budget['effective_tolerance'])
     metadata = mp2._packet_metadata(mf, static, 0, group, inputs, groups, budget)
     for field, replacement in [('target_indices', [99]), ('candidate_order', []),

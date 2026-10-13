@@ -18,6 +18,7 @@ import scipy.linalg
 from pyscfad.lno import df as lno_df
 from pyscfad.lno.tools import autofrag, map_lo_to_frag
 from pyscfad.mp import dfmp2
+from pyscfad.lib._compilation_cache import configure_compilation_cache
 
 from . import multipole_numpy as static_multipole, pao as dlno_pao, tools
 from .fragment_mp2 import build_fragment_occupied_data, fragment_pair_energy_from_lov
@@ -1031,6 +1032,7 @@ def build_domain_topology(
     if model not in valid_models:
         raise ValueError(f"unknown pair_energy_model: {pair_energy_model}")
 
+    configure_compilation_cache()
     # 1. Reference orbitals, target fragments, and active-virtual PAOs.
     mol = mf.mol
     s1e = numpy.asarray(mol.intor_symmetric("int1e_ovlp"))

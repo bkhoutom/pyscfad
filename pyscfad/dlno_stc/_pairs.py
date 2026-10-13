@@ -1,10 +1,12 @@
 """Weightless Boys multipole screening and weak-pair response.
 
-Moment translation, rank-aware Cartesian JVP, and pair contractions are copied
-from ``pyscfad/dlno/multipole.py``. Fixed primary-screen reconstruction follows
-``dlno_base.build_weak_multipole_screen`` with its singleton Boys target only.
-No native DLNO module is imported by this implementation.
+Moment translation, Cartesian response contractions, and pair kernels are
+shared through ``pyscfad.lib._multipole``. Fixed primary-screen reconstruction
+uses each singleton Boys target. Weak pairs accumulate compact endpoint
+cotangents before replaying each endpoint response once; no native DLNO
+module is imported by this implementation.
 """
+import gc
 from functools import partial
 from typing import NamedTuple
 
@@ -13,8 +15,12 @@ import jax.numpy as jnp
 import numpy as np
 
 from pyscfad.lno.tools import fake_mol_by_atom, project_mo
-
-einsum = jnp.einsum
+from pyscfad.lib._compilation_cache import configure_compilation_cache
+from pyscfad.lib._multipole import (
+    align_endpoint_signs, coordinate_moment_jvp, endpoint_matches_reference,
+    pair_energy as _multipole_pair_energy,
+    pair_energy_and_grad, transition_moments,
+)
 
 
 class WeakScreen(NamedTuple):
@@ -66,16 +72,10 @@ def _raw_cartesian_moment_coordinate_jvp(fake_mol, coords_t, rank):
     bra = bra.reshape(3, ncart, nao, nao)
     ket = ket.reshape(ncart, 3, nao, nao).transpose(1, 0, 2, 3)
 
-    tangent = jnp.zeros((ncart, nao, nao), dtype=bra.dtype)
+    ao_owner = np.empty(nao, dtype=np.int32)
     for atom, (_, _, p0, p1) in enumerate(fake_mol.aoslice_by_atom()):
-        bra_atom = jnp.einsum(
-            'x,xpuv->puv', coords_t[atom], bra[:, :, p0:p1, :]
-        )
-        ket_atom = jnp.einsum(
-            'x,xpuv->puv', coords_t[atom], ket[:, :, :, p0:p1]
-        )
-        tangent = tangent.at[:, p0:p1, :].add(bra_atom)
-        tangent = tangent.at[:, :, p0:p1].add(ket_atom)
+        ao_owner[p0:p1] = atom
+    tangent = coordinate_moment_jvp(bra, ket, coords_t, ao_owner)
     return tangent.reshape((3,) * rank + (nao, nao))
 
 
@@ -149,61 +149,6 @@ def _origin_zero_moments(fake_mol, order):
     return overlap, r, rr, rrr
 
 
-def _multipole_pair_energy(left, right, order):
-    """Contract precomputed multipoles for one ordered orbital pair."""
-    Ri, mu_ai, e_ai, theta_ai, omega_ai = left
-    Rj, mu_bj, e_bj, theta_bj, omega_bj = right
-
-    R = jnp.linalg.norm(Rj - Ri)
-    R_bar = (Rj - Ri) / R
-
-    aibj_2 = mu_ai.T @ mu_bj
-    tmp_ai = R_bar @ mu_ai
-    tmp_bj = R_bar @ mu_bj
-    aibj_2 -= jnp.outer(tmp_ai, tmp_bj * 3)
-    aibj_2 /= R**3
-
-    aibj = aibj_2
-    if order > 2:
-        RR = jnp.outer(R_bar, R_bar)
-        tmp1_ai = RR.ravel() @ theta_ai.reshape(9, -1)
-        tmp1_bj = RR.ravel() @ theta_bj.reshape(9, -1)
-        aibj_3 = jnp.outer(tmp_ai, tmp1_bj * 5)
-        aibj_3 -= jnp.outer(tmp1_ai, tmp_bj * 5)
-
-        mu_R_ai = einsum('xa,y->xya', mu_ai, R_bar).reshape(9, -1)
-        mu_R_bj = einsum('xb,y->xyb', mu_bj, R_bar).reshape(9, -1)
-        aibj_3 -= (2 * mu_R_ai.T) @ theta_bj.reshape(9, -1)
-        aibj_3 += theta_ai.reshape(9, -1).T @ (mu_R_bj * 2)
-        aibj_3 /= R**4
-        aibj += aibj_3
-
-    if order > 3:
-        RR = jnp.outer(R_bar, R_bar)
-        RRR = einsum('x,y,z->xyz', R_bar, R_bar, R_bar)
-
-        aibj_4 = einsum('xa,xyzb,yz->ab', mu_ai, omega_bj, RR * 9)
-        aibj_4 += einsum('xy,xyza,zb->ab', RR * 9, omega_ai, mu_bj)
-
-        omega_R3_ai = RRR.ravel() @ omega_ai.reshape(27, -1)
-        omega_R3_bj = RRR.ravel() @ omega_bj.reshape(27, -1)
-        aibj_4 -= jnp.outer(tmp_ai, omega_R3_bj * 21)
-        aibj_4 -= jnp.outer(omega_R3_ai, tmp_bj * 21)
-        aibj_4 += jnp.outer(tmp1_ai, tmp1_bj * 35)
-
-        tmp2_ai = einsum('xya,y->xa', theta_ai, R_bar)
-        tmp2_bj = einsum('xyb,y->xb', theta_bj, R_bar)
-        aibj_4 -= tmp2_ai.T @ (tmp2_bj * 20)
-        aibj_4 += theta_ai.reshape(9, -1).T @ (
-            theta_bj.reshape(9, -1) * 2
-        )
-        aibj_4 /= (3 * R**5)
-        aibj += aibj_4
-
-    aibj2 = aibj * aibj / (e_ai[:, None] + e_bj[None, :])
-    return -4 * jnp.sum(aibj2)
-
-
 def _multipole_orbital_data(mol, screen, atoms, order):
     """Build the one Boys endpoint using translated raw transition moments."""
     if order not in (2, 3, 4):
@@ -214,39 +159,17 @@ def _multipole_orbital_data(mol, screen, atoms, order):
         raise ValueError("a Boys weak screen requires one occupied target")
     if virtual.ndim != 2 or virtual.shape[0] != occupied.shape[0]:
         raise ValueError("weak-screen occupied and virtual AO dimensions differ")
-    occupied = occupied[:, 0]
     fake_mol = _fake_mol_with_traced_centers(mol, atoms)
     overlap, dipole, second, third = _origin_zero_moments(
         fake_mol, max(1, order - 1)
     )
-    center = jnp.einsum('u,xuv,v->x', occupied.conj(), dipole, occupied)
-    transition_overlap = jnp.einsum('ua,uv,v->a', virtual.conj(), overlap, occupied)
-    mu = jnp.einsum('ua,xuv,v->xa', virtual.conj(), dipole, occupied)
+    center, mu, theta, omega = transition_moments(
+        occupied, virtual, overlap, dipole, second, third, order
+    )
     excitation = jnp.asarray(screen.virtual_energy) - jnp.asarray(screen.occupied_energy)[0]
-    theta = omega = None
-    if order > 2:
-        raw_second = jnp.einsum('ua,xyuv,v->xya', virtual.conj(), second, occupied)
-        translated_second = (raw_second - jnp.einsum('x,ya->xya', center, mu)
-                             - jnp.einsum('y,xa->xya', center, mu)
-                             + jnp.einsum('x,y,a->xya', center, center, transition_overlap))
-        theta = .5 * (3 * translated_second - jnp.einsum(
-            'xy,a->xya', jnp.eye(3), jnp.trace(translated_second)))
-    if order > 3:
-        raw_third = jnp.einsum('ua,xyzuv,v->xyza', virtual.conj(), third, occupied)
-        translated_third = (raw_third - jnp.einsum('x,yza->xyza', center, raw_second)
-                            - jnp.einsum('y,xza->xyza', center, raw_second)
-                            - jnp.einsum('z,xya->xyza', center, raw_second)
-                            + jnp.einsum('x,y,za->xyza', center, center, mu)
-                            + jnp.einsum('x,z,ya->xyza', center, center, mu)
-                            + jnp.einsum('y,z,xa->xyza', center, center, mu)
-                            - jnp.einsum('x,y,z,a->xyza', center, center, center,
-                                         transition_overlap))
-        identity = jnp.eye(3)
-        omega = .5 * (5 * translated_third
-                      - jnp.einsum('yz,xa->xyza', identity, jnp.trace(translated_third, axis1=1, axis2=2))
-                      - jnp.einsum('xz,ya->xyza', identity, jnp.trace(translated_third, axis1=2, axis2=0))
-                      - jnp.einsum('xy,za->xyza', identity, jnp.trace(translated_third, axis1=0, axis2=1)))
-    return center, mu, excitation, theta, omega
+    return (center[0], mu[0], excitation,
+            None if theta is None else theta[0],
+            None if omega is None else omega[0])
 
 
 def build_weak_multipole_screen(common, static, fragment_index):
@@ -308,13 +231,32 @@ def weak_screen_pair_energy(mf, left, right, static, left_index, right_index):
     return jnp.real(_multipole_pair_energy(lhs, rhs, order))
 
 
-def weak_pair_energy(mf, common, static, left_index, right_index):
-    left_index, right_index = _validate_weak_pair(static, left_index, right_index)
-    return weak_screen_pair_energy(
-        mf, build_weak_multipole_screen(common, static, left_index),
-        build_weak_multipole_screen(common, static, right_index),
-        static, left_index, right_index,
+def build_weak_endpoint(mf, common, static, fragment_index):
+    """Build one compact endpoint; its AO response is replayed separately."""
+    configure_compilation_cache()
+    screen = build_weak_multipole_screen(common, static, fragment_index)
+    if screen is None:
+        raise RuntimeError(f"a fixed weak endpoint {fragment_index} has no multipole screen")
+    return _multipole_orbital_data(
+        mf.mol, screen, static.fragments[fragment_index].primary_atoms,
+        static.thresholds.multipole_order,
     )
+
+
+def _replay_weak_endpoint(mf, common, static, fragment_index, reference):
+    """Rebuild moments in their saved frame, including in the reverse rule."""
+    return align_endpoint_signs(
+        build_weak_endpoint(mf, common, static, fragment_index), reference)
+
+
+def weak_pair_energy(mf, common, static, left_index, right_index):
+    """Evaluate one pair using the same endpoint boundary as the full sum."""
+    left_index, right_index = _validate_weak_pair(static, left_index, right_index)
+    return jnp.real(_multipole_pair_energy(
+        build_weak_endpoint(mf, common, static, left_index),
+        build_weak_endpoint(mf, common, static, right_index),
+        static.thresholds.multipole_order,
+    ))
 
 
 def weak_pair_indices(static):
@@ -324,19 +266,67 @@ def weak_pair_indices(static):
                  if not bool(static.strong_mask[left, right]))
 
 
-def weak_pair_energy_and_grad(mf, common, static):
-    """Accumulate independent pair pullbacks, releasing each tape immediately."""
+def _weak_endpoints(mf, common, static, pairs):
+    indices = sorted({index for pair in pairs for index in pair})
+    return {index: build_weak_endpoint(mf, common, static, index) for index in indices}
+
+
+def _check_endpoint_replay(rebuilt, original, index):
+    if not endpoint_matches_reference(rebuilt, original):
+        raise RuntimeError(f"weak endpoint gauge changed on replay: {index}")
+
+
+def weak_pair_energy_sum(mf, common, static, *, pairs=None):
+    """Evaluate all weak edges while constructing each endpoint only once."""
+    pairs = weak_pair_indices(static) if pairs is None else tuple(pairs)
+    endpoints = _weak_endpoints(mf, common, static, pairs)
+    energy = jnp.zeros((), dtype=common.s1e.dtype)
+    for left, right in pairs:
+        energy += _multipole_pair_energy(
+            endpoints[left], endpoints[right], static.thresholds.multipole_order)
+    return jnp.real(energy)
+
+
+def weak_pair_energy_and_grad(mf, common, static, *, pairs=None):
+    """Accumulate compact endpoint bars, then replay one endpoint tape at a time.
+
+    Endpoint values are shared across all incident pairs. Only their compact
+    transition-moment cotangents persist; the large AO integral and local-space
+    reverse tape is constructed and released once per participating fragment.
+    Replay aligns orbital signs inside the differentiated function so the
+    saved cotangents and its pullback use the same virtual frame.
+    """
     from .adjoint import add_cotangent, zero_term_cotangents
+    configure_compilation_cache()
+    pairs = weak_pair_indices(static) if pairs is None else tuple(pairs)
     bars = zero_term_cotangents(mf, common)
     energy = jnp.zeros((), dtype=common.s1e.dtype)
-    for left, right in weak_pair_indices(static):
-        value, pullback = jax.vjp(lambda mf_, common_: weak_pair_energy(
-            mf_, common_, static, left, right), mf, common)
-        pair_bars = pullback(jnp.ones_like(value))
-        bars = jax.tree_util.tree_map(add_cotangent, bars, pair_bars)
+    endpoints = _weak_endpoints(mf, common, static, pairs)
+    endpoint_bars = {index: jax.tree_util.tree_map(jnp.zeros_like, value)
+                     for index, value in endpoints.items()}
+    for left, right in pairs:
+        value, (left_bar, right_bar) = pair_energy_and_grad(
+            endpoints[left], endpoints[right], static.thresholds.multipole_order)
+        endpoint_bars[left] = jax.tree_util.tree_map(add_cotangent, endpoint_bars[left], left_bar)
+        endpoint_bars[right] = jax.tree_util.tree_map(add_cotangent, endpoint_bars[right], right_bar)
         energy += value
-        del pullback, pair_bars
-    return energy, bars
+        del left_bar, right_bar
+    for index in tuple(endpoint_bars):
+        endpoint_bar = endpoint_bars.pop(index)
+        original = endpoints.pop(index)
+        rebuilt, pullback = jax.vjp(
+            partial(_replay_weak_endpoint, static=static, fragment_index=index,
+                    reference=original), mf, common)
+        _check_endpoint_replay(rebuilt, original, index)
+        contribution = pullback(endpoint_bar)
+        bars = jax.tree_util.tree_map(add_cotangent, bars, contribution)
+        jax.block_until_ready(bars)
+        del rebuilt, original, pullback, contribution, endpoint_bar
+    if pairs:
+        # Release each tape promptly, but scan the Python heap only after
+        # the complete weak response. Automatic collection remains enabled.
+        gc.collect()
+    return jnp.real(energy), bars
 
 
 def _exact_boys_pair_scores(mf, common, static):

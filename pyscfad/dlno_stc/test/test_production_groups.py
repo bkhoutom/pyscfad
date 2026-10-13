@@ -19,9 +19,12 @@ def test_total_budget_uses_actual_group_jobs_without_mutating_controls():
     controls = {'energy_tolerance': .0003, 'production_samples': 100}
     allocate = getattr(_workflow, 'allocate_domain_controls', None)
     assert callable(allocate), 'shared strong-job budget allocator is missing'
-    assert allocate(controls, 4)['energy_tolerance'] == .000075
-    assert allocate(controls, 16)['energy_tolerance'] == .00001875
+    assert allocate(controls, 1)['energy_tolerance'] == .0003
+    assert allocate(controls, 4)['energy_tolerance'] == .00015
+    np.testing.assert_allclose(allocate(controls, 9)['energy_tolerance'], .0001)
+    assert allocate(controls, 16)['energy_tolerance'] == .000075
     assert allocate(controls, 0) == controls
+    assert allocate({'production_samples': 100}, 4) == {'production_samples': 100}
     assert controls == {'energy_tolerance': .0003, 'production_samples': 100}
 
 
@@ -54,15 +57,19 @@ def test_direct_sixteen_targets_four_groups_budget(monkeypatch):
         return dict(energy=np.float64(0), variance=0., weak_pairs=((0, 4),),
                     mf=None, common=None, mf_bar=None, common_bar=None)
     monkeypatch.setattr(driver, '_prepare', lambda *a: (None, {}, None))
-    monkeypatch.setattr(driver, 'weak_pair_energy', lambda *a: np.float64(-.25))
-    monkeypatch.setattr(driver, '_finish', lambda state, **k: state['energy'])
+    monkeypatch.setattr(driver, 'weak_pair_energy_sum', lambda *a, **k: np.float64(-.25))
+    def finish(state, **kwargs):
+        np.testing.assert_allclose(state['variance'], .0003**2, rtol=1e-14)
+        return state['energy']
+    monkeypatch.setattr(driver, '_finish', finish)
     captured = []
     def capture(inputs, metadata, controls, backend, **kwargs):
         captured.append((metadata, controls.copy()))
-        return dict(energy=np.float64(-len(metadata['target_indices'])), energy_standard_error=0.)
+        return dict(energy=np.float64(-len(metadata['target_indices'])),
+                    energy_standard_error=controls['energy_tolerance'])
     monkeypatch.setattr(driver, 'run_backend', capture)
     controls = dict(mode='stochastic', energy_tolerance=.0003, production_samples=32)
-    for merge, count, tolerance in ((True, 4, 7.5e-5), (False, 16, 1.875e-5)):
+    for merge, count, tolerance in ((True, 4, 1.5e-4), (False, 16, 7.5e-5)):
         captured.clear()
         value = driver._run_domain(initialize, static, controls, None,
                                    with_grad=False, merge_identical=merge)

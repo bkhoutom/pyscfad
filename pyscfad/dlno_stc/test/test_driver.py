@@ -50,7 +50,23 @@ def test_finite_grouped_energy_gradient_weak_and_hf():
     assert any(len(f.extended_ao_indices) < mol.nao for f in static.fragments)
     assert tuple(weak_pair_indices(static))
     controls = accept.controls()
-    energy, bar = dlno_stc.value_and_grad(mol, accept.build_mf, static, controls=controls)
+    calls = dict(scf=0, selection=0)
+
+    def build_mf(current):
+        calls['scf'] += 1
+        return accept.build_mf(current)
+
+    def build_static(reference):
+        calls['selection'] += 1
+        selected = accept.selection(reference)
+        # Selection-only caches must not change the live SCF output tree
+        # retained by its pullback, or remove its orbital-energy response.
+        reference.mo_energy = None
+        return selected
+
+    energy, bar = dlno_stc.value_and_grad(
+        mol, build_mf, build_static=build_static, controls=controls)
+    assert calls == dict(scf=1, selection=1)
     singleton, singleton_bar = dlno_stc.value_and_grad(
         mol, accept.build_mf, static, controls=controls, merge_identical=False)
     np.testing.assert_allclose(energy, singleton, atol=2e-10, rtol=0)
@@ -91,3 +107,19 @@ def test_finite_grouped_energy_gradient_weak_and_hf():
     mf.mo_occ = np.asarray(mf.mo_occ).copy(); mf.mo_occ[0] = 1
     with pytest.raises(NotImplementedError, match='closed.shell'):
         dlno_stc.kernel(mf, static, controls=controls)
+
+
+@pytest.mark.parametrize('options, error, match', [
+    ({'build_static': object()}, TypeError, 'callable'),
+    ({'static': object(), 'build_static': accept.selection}, ValueError, 'static'),
+    ({'scope': 'system', 'build_static': accept.selection}, ValueError, 'domain'),
+])
+def test_domain_builder_options_are_rejected_before_scf(options, error, match):
+    from pyscfad import dlno_stc
+
+    def forbidden_scf(mol):
+        raise AssertionError('invalid domain builder options reached SCF')
+
+    with pytest.raises(error, match=match):
+        dlno_stc.value_and_grad(
+            accept.molecule(), forbidden_scf, controls=accept.controls(), **options)

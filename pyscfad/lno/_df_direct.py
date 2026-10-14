@@ -48,11 +48,11 @@ def _local_direct_int3c_block_mb():
     """Memory target for the two raw-int3c buffers in direct local AO2MO."""
     try:
         return max(
-            float(os.environ.get('PYSCFAD_LNO_LOCAL_DIRECT_INT3C_BLOCK_MB', 256.0)),
+            float(os.environ.get('PYSCFAD_LNO_LOCAL_DIRECT_INT3C_BLOCK_MB', 512.0)),
             1.0,
         )
     except ValueError:
-        return 256.0
+        return 512.0
 
 
 def _local_direct_effective_max_memory(max_memory, naux, nkl):

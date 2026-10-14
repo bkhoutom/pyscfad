@@ -143,7 +143,7 @@ def test_integral_direct_local_lov_preserves_coeff_and_coordinate_vjps():
 
 @pytest.mark.parametrize(
     ("configured_mb", "expected_mb"),
-    ((None, 256.0), (7.0, 7.0)),
+    ((None, 512.0), (7.0, 7.0), ("invalid", 512.0)),
 )
 def test_integral_direct_coordinate_vjp_uses_forward_block_budget(
     monkeypatch, configured_mb, expected_mb

@@ -31,10 +31,17 @@ def main():
         mf.kernel()
         return mf
 
+    static = None
+
+    def build_static(mf):
+        nonlocal static
+        # The gradient path selects domains from the detached single-SCF
+        # reference supplied by value_and_grad, outside differentiation.
+        static = dlno_stc.build_domain_selections(mf, frozen=args.frozen,
+            thresholds=dlno_stc.BoysDomainThresholds(pair_energy=args.pair_energy))
+        return static
+
     started = time.perf_counter()
-    mf = build_mf(mol)
-    static = dlno_stc.build_domain_selections(mf, frozen=args.frozen,
-        thresholds=dlno_stc.BoysDomainThresholds(pair_energy=args.pair_energy))
     roots, weights = default_laplace_grid()
     controls = dict(mode=args.mode, laplace_roots=roots, laplace_weights=weights,
                     energy_tolerance=args.energy_tolerance, global_seed=args.seed)
@@ -42,11 +49,13 @@ def main():
         controls['production_samples'] = args.production_samples
     from pyscfad.dlno_stc.driver import kernel, value_and_grad
     if args.energy_only:
+        mf = build_mf(mol)
+        static = build_static(mf)
         energy = kernel(mf, static, scope='domain', controls=controls,
                         merge_identical=not args.unmerged)
         gradient = None
     else:
-        energy, gradient = value_and_grad(mol, build_mf, static, scope='domain',
+        energy, gradient = value_and_grad(mol, build_mf, build_static=build_static, scope='domain',
             controls=controls, include_hf=False, merge_identical=not args.unmerged)
     groups = dlno_stc.build_domain_groups(static, merge_identical=not args.unmerged)
     print(json.dumps(dict(scope='domain', correlation_energy=float(energy),

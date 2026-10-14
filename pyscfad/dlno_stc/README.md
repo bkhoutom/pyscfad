@@ -11,10 +11,19 @@ from pyscfad import dlno_stc
 static = dlno_stc.build_domain_selections(mf, frozen=4)
 energy = dlno_stc.kernel(mf, static, scope="domain", controls={"mode": "deterministic"})
 energy, gradient = dlno_stc.value_and_grad(
-    mol, build_mf, static, scope="domain", controls={"mode": "deterministic"},
+    mol, build_mf, build_static=lambda mf: dlno_stc.build_domain_selections(mf, frozen=4),
+    scope="domain", controls={"mode": "deterministic"},
     include_hf=True,
 )
 ```
+
+For gradients, ``build_static`` selects domains from the result of one SCF
+performed under ``jax.vjp``. The driver retains that SCF pullback for the final
+nuclear response, so no preliminary SCF is needed. The callback runs outside
+differentiation on a detached reference, protecting the live SCF object's
+structure from selection-only DF caches. Alternatively, pass existing
+``DomainSelections`` as ``static``; do not supply both. System gradients need
+only ``mol`` and ``build_mf`` with ``scope="system"`` and a frozen-space setting.
 
 Nuclear gradients require coordinate-only molecule leaves
 (`mol.build(trace_exp=False, trace_ctr_coeff=False)`). Selections, domains,
@@ -23,6 +32,11 @@ RI factors, Boys localization and SCF are differentiated. Weak corrections
 retain the original singleton topology. `scope="system"` retains the complete
 active-space energy and system sampling policy. Its independent controls and
 canonical specialization remain available through the low-level full solver.
+
+The integral-direct local-DF buffer target defaults to `512`. Set
+`PYSCFAD_LNO_LOCAL_DIRECT_INT3C_BLOCK_MB` to override it. The forward allowance
+uses decimal MB, while backward block targets use MiB; this is a workspace
+target rather than a process-memory limit.
 
 Domain selection and the domain driver lazily enable persistent JAX compilation
 caching in `$XDG_CACHE_HOME/pyscfad/jax`, falling back to `~/.cache/pyscfad/jax`.

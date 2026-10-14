@@ -28,10 +28,15 @@ def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
 
 
 def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
-                   controls, comm=None, include_hf=False, lo_kwargs=None, merge_identical=True):
-    """Run domain or whole-system coordinate energy and gradient."""
+                   controls, comm=None, include_hf=False, lo_kwargs=None, merge_identical=True,
+                   build_static=None):
+    """Run coordinate energy and gradient with one differentiated SCF.
+
+    Domain calls accept fixed ``static`` selections or a ``build_static(mf)``
+    callback that selects them from the returned SCF reference.
+    """
     from .driver import value_and_grad as domain_value_and_grad
     return domain_value_and_grad(mol, build_mf, static, scope=scope, frozen=frozen,
                                    controls=controls,
                                    comm=comm, include_hf=include_hf, lo_kwargs=lo_kwargs,
-                                   merge_identical=merge_identical)
+                                   merge_identical=merge_identical, build_static=build_static)

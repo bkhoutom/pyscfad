@@ -15,6 +15,7 @@ import jax
 import numpy
 from pyscf import df as pyscf_df, lib
 from pyscfad import config_update, numpy as np
+from pyscfad.ops import stop_trace
 from pyscfad.lib._compilation_cache import configure_compilation_cache
 from pyscfad.tools import resource_profile
 from ._selection import DomainSelections, _extract_active_indices, build_domain_groups
@@ -169,7 +170,7 @@ def _initialize(mf, static, controls, *, with_grad, scf_pullback=None):
             common = rebuild_domain_data(mf, static)
             common_pullback = mf_bar = common_bar = None
         jax.block_until_ready(common)
-    return {"mf": mf, "common": common, "common_pullback": common_pullback,
+    return {"mf": mf, "static": static, "common": common, "common_pullback": common_pullback,
             "scf_pullback": scf_pullback, "mf_bar": mf_bar, "common_bar": common_bar,
             "energy": np.zeros((), dtype=common.s1e.dtype), "variance": 0.0,
             "weak_pairs": tuple(weak_pair_indices(static))}
@@ -229,6 +230,8 @@ def _run_domain(initializer, static, controls, comm, *, with_grad, include_hf=Fa
     rank = 0 if comm is None else comm.Get_rank()
     with resource_profile.section('stc.domain.initialize'):
         state = _root_call(comm, rank, initializer, "initial preparation")
+    if rank == 0 and static is None:
+        static = state["static"]
     groups = _root_call(comm, rank,
                         lambda: build_domain_groups(static, merge_identical=merge_identical),
                         "group selection")
@@ -518,7 +521,8 @@ def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
 
 
 def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
-                   controls, comm=None, include_hf=False, lo_kwargs=None, merge_identical=True):
+                   controls, comm=None, include_hf=False, lo_kwargs=None, merge_identical=True,
+                   build_static=None):
     """Return ``(energy, mol_bar)`` on root; worker ranks return ``None``.
 
     Discrete selections and the Laplace grid are fixed. System scope fixes
@@ -533,6 +537,11 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
     because the SCF eigensolver masks their internal rotation response.
     System ``lo_kwargs`` are passed to the shared Boys localization; domain
     calls take their saved localization options from ``static``.
+    Domain calls may instead supply ``build_static(mf)``. It runs once on
+    a detached, phase-fixed reference after the single differentiated SCF,
+    and returns fixed ``DomainSelections``. Selection-only mutations cannot
+    change the live SCF tree retained by its pullback. ``static`` and
+    ``build_static`` are mutually exclusive; system scope uses neither.
     Identical domain frames share one selected solve/VJP unless the diagnostic
     option ``merge_identical=False`` is supplied. Public targets stay singleton.
     Stochastic energy uncertainty does not bound gradient uncertainty.
@@ -544,16 +553,26 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
 
     def initialize():
         _coordinate_only(mol)
-        if scope == "domain":
+        if build_static is not None:
+            if scope != "domain":
+                raise ValueError("build_static is only supported for domain scope")
+            if static is not None:
+                raise ValueError("supply either static or build_static, not both")
+            if not callable(build_static):
+                raise TypeError("build_static must be callable")
+        elif scope == "domain":
             _validate_static(static)
-        _validate_controls(controls)
         with (resource_profile.section('stc.domain.scf') if scope == 'domain' else nullcontext()):
             mf, scf_pullback = _initialize_scf(mol, build_mf)
         if scope == "system":
             return _initialize_system(mf, frozen, controls, with_grad=True,
                                       scf_pullback=scf_pullback, lo_kwargs=lo_kwargs,
                                       fock_from_scf=True)
-        return _initialize(mf, static, controls, with_grad=True,
+        selected = static
+        if build_static is not None:
+            with resource_profile.section('stc.domain.selection'):
+                selected = stop_trace(build_static)(mf)
+        return _initialize(mf, selected, controls, with_grad=True,
                            scf_pullback=scf_pullback)
 
     if scope == "system":

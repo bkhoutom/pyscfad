@@ -60,6 +60,78 @@ RMS per virtual column with `atol=rtol=1e-9`; canceled components use their
 column's scale. Centers and energy gaps retain componentwise checks. Changes
 beyond signs and these roundoff bounds are rejected.
 
+## MPI across domains
+
+For `scope="domain"` and a communicator with more than one rank, complete
+group jobs are distributed round-robin. Each owner prepares its three tensors,
+runs the local STC solver with OpenMP, and applies its saved preparation VJP.
+Weak endpoints are prepared and replayed once globally; pair work is separately
+partitioned. Cotangents are summed, and communicator rank zero drives the common
+and SCF response once, including HF once when requested. Only rank zero returns
+the public energy or `(energy, mol_bar)`; other ranks return `None`.
+
+Multi-rank domain calls enable `parallel_scf_jk=True` by default. The existing
+MPI DF executor distributes SCF J/K contractions, their density response, and
+the independent three-center coordinate derivative blocks. Root retains the
+SCF iteration and differentiation tape, localization, and coupled metric
+response. Common Fock preparation and its pullback use the same executor.
+Workers serve these collective phases, then resume their independent domain
+work. Set `parallel_scf_jk=False` to retain root-only SCF/common response.
+
+Every rank calls the driver with the same molecule and configured MF type.
+Only root supplies controls and either `static` or `build_static`. The gradient
+builder must support a worker branch that adopts root's canonical reference
+without SCF:
+
+```python
+def build_mf(mol, *, mo_coeff_init=None, mo_energy_init=None,
+             mo_occ_init=None, e_tot_init=None):
+    mf = scf.RHF(mol).density_fit(auxbasis=auxbasis)
+    mf.chkfile = None
+    if mo_coeff_init is None:
+        mf.kernel()
+    else:
+        mf.mo_coeff, mf.mo_energy = mo_coeff_init, mo_energy_init
+        mf.mo_occ, mf.e_tot = mo_occ_init, e_tot_init
+        mf.converged = True
+    return mf
+```
+
+Workers use root's signed canonical/common arrays and matching basis definitions.
+With MPI SCF enabled, the worker builder first receives placeholder canonical
+arrays to create an unrun RHF/DF reference. The driver builds its global DF
+factors for the service phase; it later calls the builder with root's converged
+canonical arrays for domain work. Configure identical auxiliary bases and
+real float64 DF factors on every rank. The service packs flattened full
+in-core AO-pair factors automatically and verifies factor contents and
+molecular definitions before its first contraction. Its private source view distributes coordinate
+derivatives for both in-core and out-of-core factors. If attaching an
+out-of-core CDERI file, attach it before the worker branch returns and make it
+accessible to every rank. With `parallel_scf_jk=False`, workers need no global
+CDERI. For energy-only `kernel`, workers supply matching MF skeletons and the
+driver installs root's canonical state; its MPI DF service covers common
+preparation, while any SCF performed before calling `kernel` is caller-owned.
+`comm=None` and communicator size one retain serial domain execution. System
+scope and low-level independent-replica MPI retain their existing behavior.
+The total sampling tolerance is divided by `sqrt(global_group_count)` once,
+and group seeds are independent of the owner rank.
+
+Set numerical thread limits before importing JAX/NumPy. For example, with eight
+allocated physical cores:
+
+```bash
+OMP_NUM_THREADS=2 OMP_THREAD_LIMIT=2 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+PYSCFAD_DENSE_BLAS_THREADS=2 XLA_FLAGS=--xla_cpu_multi_thread_eigen=false \
+mpiexec -n 4 python examples/dlno_stc/water_tetramer.py \
+  --mpi --xyz-file water_4.xyz --basis cc-pvtz --auxbasis cc-pvtz-jkfit \
+  --output results/water4.json
+```
+
+Memory limits apply per process. Round-robin balances group counts rather than
+runtime, so large domains can accumulate on one rank; the slowest owner limits
+each phase. Rank-specific JAX caches remain persistent, and cold compilation
+should be separated from warm scaling measurements.
+
 ## Array and native contract
 
 All numerical requests contain exactly `foo(oo)`, `fvv(vv)`, and `B(Pia)` as

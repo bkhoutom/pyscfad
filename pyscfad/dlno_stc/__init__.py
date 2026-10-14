@@ -19,17 +19,17 @@ __all__ = [
 
 
 def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
-           lo_kwargs=None, merge_identical=True):
+           lo_kwargs=None, merge_identical=True, parallel_scf_jk=True):
     """Run in-memory domain or whole-system STC correlation energy."""
     from .driver import kernel as domain_kernel
     return domain_kernel(mf, static, scope=scope, frozen=frozen,
                            controls=controls, comm=comm, lo_kwargs=lo_kwargs,
-                           merge_identical=merge_identical)
+                           merge_identical=merge_identical, parallel_scf_jk=parallel_scf_jk)
 
 
 def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
                    controls, comm=None, include_hf=False, lo_kwargs=None, merge_identical=True,
-                   build_static=None):
+                   build_static=None, parallel_scf_jk=True):
     """Run coordinate energy and gradient with one differentiated SCF.
 
     Domain calls accept fixed ``static`` selections or a ``build_static(mf)``
@@ -39,4 +39,5 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
     return domain_value_and_grad(mol, build_mf, static, scope=scope, frozen=frozen,
                                    controls=controls,
                                    comm=comm, include_hf=include_hf, lo_kwargs=lo_kwargs,
-                                   merge_identical=merge_identical, build_static=build_static)
+                                   merge_identical=merge_identical, build_static=build_static,
+                                   parallel_scf_jk=parallel_scf_jk)

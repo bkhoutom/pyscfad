@@ -24,12 +24,21 @@ def record_result(name, values):
         (destination / (name + ".json")).write_text(json.dumps(values, indent=2) + "\n")
 
 
-def build_mf(mol):
+def build_mf(mol, *, mo_coeff_init=None, mo_energy_init=None,
+             mo_occ_init=None, e_tot_init=None):
     from pyscfad.dlno_stc.adjoint import fix_restart_mo_phases
 
     mf = scf.RHF(mol).density_fit()
     mf.conv_tol = 1e-12
     mf.conv_tol_grad = 1e-9
+    if mo_coeff_init is not None:
+        # MPI workers install the root gauge without running SCF or fixing phases.
+        mf.mo_coeff = mo_coeff_init
+        mf.mo_energy = mo_energy_init
+        mf.mo_occ = mo_occ_init
+        mf.e_tot = e_tot_init
+        mf.converged = True
+        return mf
     mf.kernel()
     return fix_restart_mo_phases(mf)
 

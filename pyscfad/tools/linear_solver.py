@@ -13,11 +13,31 @@
 # limitations under the License.
 
 from functools import partial
+from contextlib import contextmanager
+from contextvars import ContextVar
 import numpy
 from scipy.sparse.linalg import LinearOperator
 from jax.scipy.sparse.linalg import gmres as jax_gmres
 from pyscfad.scipy.sparse.linalg import gmres as pyscfad_gmres
 from pyscfad.scipy.sparse.linalg import gmres_safe
+
+_EAGER_GMRES = ContextVar('pyscfad_eager_gmres', default=False)
+
+
+@contextmanager
+def eager_gmres():
+    """Select an eager host solver for closures containing host operations.
+
+    The override affects solver construction only. Existing tolerances and
+    numerical/integral configuration remain unchanged, and the previous
+    selection is restored when the context exits.
+    """
+    token = _EAGER_GMRES.set(True)
+    try:
+        yield
+    finally:
+        _EAGER_GMRES.reset(token)
+
 
 class GMRESDisp:
     def __init__(self, disp=False):
@@ -45,7 +65,7 @@ def gen_gmres_with_default_kwargs(tol=1e-6, atol=1e-12, maxiter=30,
                                   callback=None, callback_type=None,
                                   safe=False, **kwargs):
     from pyscfad import config
-    if config.moleintor_opt:
+    if config.moleintor_opt or _EAGER_GMRES.get():
         if safe:
             gmres = partial(gmres_safe,
                             tol=tol, atol=atol, maxiter=maxiter,

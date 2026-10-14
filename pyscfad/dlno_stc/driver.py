@@ -495,11 +495,17 @@ def _run_system(initializer, controls, comm, *, with_grad, include_hf=False):
 
 
 def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
-           lo_kwargs=None, merge_identical=True):
+           lo_kwargs=None, merge_identical=True, parallel_scf_jk=True):
     """Return correlation energy on root.
 
     Domain jobs share identical saved frames by default. ``merge_identical=False``
     runs each singleton separately for diagnostic comparisons.
+    With a multi-rank domain communicator, each rank supplies a matching MF
+    object; workers may use an unconverged skeleton. Root's canonical state
+    is installed on workers without SCF. Only root needs selections/controls.
+    ``parallel_scf_jk=True`` distributes common-preparation DF J/K work for
+    multi-rank domain calls. SCF preceding this energy-only API is caller-owned.
+    System, serial and single-rank calls retain their existing behavior.
     """
     scope = _shared_scope(static, scope, frozen, comm, lo_kwargs)
     rank = 0 if comm is None else comm.Get_rank()
@@ -516,13 +522,28 @@ def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
 
     if scope == "system":
         return _run_system(initialize, controls, comm, with_grad=False)
+    if comm is not None and comm.Get_size() > 1:
+        from ._mpi import _run_domain_mpi
+
+        def initialize_worker(canonical):
+            if mf is None:
+                raise ValueError("domain MPI kernel requires an MF skeleton on every rank")
+            for name, value in canonical.items():
+                setattr(mf, name, np.asarray(value))
+            mf.converged = True
+            return mf
+
+        return _run_domain_mpi(initialize, initialize_worker, static, controls, comm,
+                               with_grad=False, merge_identical=merge_identical,
+                               parallel_scf_jk=parallel_scf_jk,
+                               scf_worker_initializer=lambda: mf)
     return _run_domain(initialize, static, controls, comm, with_grad=False,
                        merge_identical=merge_identical)
 
 
 def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
                    controls, comm=None, include_hf=False, lo_kwargs=None, merge_identical=True,
-                   build_static=None):
+                   build_static=None, parallel_scf_jk=True):
     """Return ``(energy, mol_bar)`` on root; worker ranks return ``None``.
 
     Discrete selections and the Laplace grid are fixed. System scope fixes
@@ -545,6 +566,18 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
     Identical domain frames share one selected solve/VJP unless the diagnostic
     option ``merge_identical=False`` is supplied. Public targets stay singleton.
     Stochastic energy uncertainty does not bound gradient uncertainty.
+    Multi-rank domain calls distribute whole groups and weak endpoints.
+    Worker ``build_mf`` must accept ``mo_coeff_init``, ``mo_energy_init``,
+    ``mo_occ_init`` and ``e_tot_init``, adopt their supplied values, and skip
+    SCF. Workers may pass ``None`` for selections and controls; ``build_static``
+    runs only on root. Results are returned only on communicator rank zero.
+    Multi-rank domain calls also distribute DF J/K contractions in SCF,
+    common-data preparation and their coordinate pullbacks by default.
+    Workers first build an unrun reference with placeholder canonical arrays
+    to prepare compatible global DF factors, then adopt root's converged state.
+    An attached out-of-core CDERI source must be available on every rank.
+    ``parallel_scf_jk=False`` retains root-only SCF and common response.
+    System, serial and single-rank calls never activate this executor.
     """
     scope = _shared_scope(static, scope, frozen, comm, lo_kwargs)
     rank = 0 if comm is None else comm.Get_rank()
@@ -577,5 +610,33 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
 
     if scope == "system":
         return _run_system(initialize, controls, comm, with_grad=True, include_hf=include_hf)
+    if comm is not None and comm.Get_size() > 1:
+        from ._mpi import _run_domain_mpi
+
+        def initialize_worker(canonical):
+            _coordinate_only(mol)
+            try:
+                return build_mf(mol, **{name + "_init": value
+                                        for name, value in canonical.items()})
+            except TypeError as exc:
+                raise TypeError(
+                    "domain MPI worker build_mf must accept mo_coeff_init, "
+                    "mo_energy_init, mo_occ_init, and e_tot_init without running SCF"
+                ) from exc
+
+        def initialize_scf_worker():
+            nao = mol.nao
+            occupation = numpy.zeros(nao)
+            occupation[:mol.nelectron // 2] = 2.0
+            return initialize_worker({
+                "mo_coeff": numpy.eye(nao), "mo_energy": numpy.zeros(nao),
+                "mo_occ": occupation, "e_tot": numpy.asarray(0.0),
+            })
+
+        return _run_domain_mpi(initialize, initialize_worker, static, controls, comm,
+                               with_grad=True, include_hf=include_hf,
+                               merge_identical=merge_identical,
+                               parallel_scf_jk=parallel_scf_jk,
+                               scf_worker_initializer=initialize_scf_worker)
     return _run_domain(initialize, static, controls, comm, with_grad=True, include_hf=include_hf,
                        merge_identical=merge_identical)

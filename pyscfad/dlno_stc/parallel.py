@@ -42,8 +42,9 @@ def run_backend(inputs, metadata, controls, backend, *, comm=None,
     The backend owns reductions and normalization. Its collective failures
     require application-level MPI abort; preflight failures are propagated
     before any numeric broadcast. MPI is imported only for a supplied comm.
+    Single-rank communicators use the serial path without tensor collectives.
     """
-    if comm is None:
+    if comm is None or comm.Get_size() == 1:
         _preflight(inputs, metadata, controls, backend, array_names)
         return backend(inputs, metadata, controls, comm=None)
 

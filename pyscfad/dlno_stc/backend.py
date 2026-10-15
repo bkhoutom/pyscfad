@@ -59,7 +59,10 @@ def solve(inputs, metadata, controls, *, comm=None, with_grad=True, aux_offsets=
     Local import, conversion, numerical, and result-validation errors are
     collected before any numeric reductions, so every rank raises together.
     MPI transport failures remain the calling application's responsibility.
+    A single-rank communicator needs no reductions and follows the serial path.
     """
+    if comm is not None and comm.Get_size() == 1:
+        comm = None
     rank = 0 if comm is None else comm.Get_rank()
     size = 1 if comm is None else comm.Get_size()
     try:

@@ -21,6 +21,42 @@ class Common(NamedTuple):
     s1e: object
 
 
+@pytest.mark.parametrize('order', [2, 3, 4])
+def test_orbital_screen_is_built_once_and_its_forward_pullback_is_reused(monkeypatch, order):
+    mf, common, static, endpoint = _fixture(order)
+    calls = Counter()
+
+    def screen(c, static, fragment_index):
+        index = fragment_index
+        calls[index] += 1
+        if calls[index] > 1:
+            raise AssertionError('orbital frame rebuilt during weak response')
+        return c.s1e
+
+    def moments(m, saved, static, fragment_index):
+        return endpoint(m, Common(saved), static, fragment_index)
+
+    def direct(m, c):
+        return sum(_pairs._multipole_pair_energy(endpoint(m, c, static, i),
+                   endpoint(m, c, static, j), order)
+                   for i, j in _pairs.weak_pair_indices(static))
+
+    expected, expected_bars = jax.value_and_grad(direct, argnums=(0, 1))(mf, common)
+    monkeypatch.setattr(_pairs, 'build_weak_multipole_screen', screen)
+    monkeypatch.setattr(_pairs, '_weak_endpoint_from_screen', moments)
+
+    def forbidden(*args):
+        raise AssertionError('response used the forward-only endpoint builder')
+
+    monkeypatch.setattr(_pairs, 'build_weak_endpoint', forbidden)
+    actual, actual_bars = _pairs.weak_pair_energy_and_grad(mf, common, static)
+    np.testing.assert_allclose(actual, expected, rtol=2e-12, atol=1e-14)
+    for got, want in zip(jax.tree_util.tree_leaves(actual_bars),
+                         jax.tree_util.tree_leaves(expected_bars)):
+        np.testing.assert_allclose(got, want, rtol=2e-11, atol=1e-13)
+    assert calls == Counter({0: 1, 1: 1, 2: 1})
+
+
 def _fixture(order):
     mf = Inputs(jnp.array([[0., .1, .2], [.2, .1, -.1], [-.1, .3, .2]]), jnp.array(.7))
     common = Common(jnp.array([.2, .4, .6]))
@@ -41,6 +77,23 @@ def _fixture(order):
     return mf, common, static, endpoint
 
 
+def _install_split(monkeypatch, endpoint, screen_calls=None, moment_calls=None):
+    def screen(c, static, fragment_index):
+        index = fragment_index
+        if screen_calls is not None:
+            screen_calls[index] += 1
+        return c.s1e
+
+    def moments(m, saved, static, fragment_index):
+        index = fragment_index
+        if moment_calls is not None:
+            moment_calls[index] += 1
+        return endpoint(m, Common(saved), static, index)
+
+    monkeypatch.setattr(_pairs, 'build_weak_multipole_screen', screen)
+    monkeypatch.setattr(_pairs, '_weak_endpoint_from_screen', moments)
+
+
 @pytest.mark.parametrize('order', [2, 3, 4])
 def test_staged_response_matches_direct_chain_rule_with_shared_endpoints(monkeypatch, order):
     build = getattr(_pairs, 'build_weak_endpoint', None)
@@ -53,18 +106,14 @@ def test_staged_response_matches_direct_chain_rule_with_shared_endpoints(monkeyp
                    endpoint(m, c, static, j), order) for i, j in indices)
 
     expected, expected_bars = jax.value_and_grad(direct, argnums=(0, 1))(mf, common)
-    calls = Counter()
-
-    def counted(m, c, s, index):
-        calls[index] += 1
-        return endpoint(m, c, s, index)
-
-    monkeypatch.setattr(_pairs, 'build_weak_endpoint', counted)
+    screen_calls, moment_calls = Counter(), Counter()
+    _install_split(monkeypatch, endpoint, screen_calls, moment_calls)
     actual, actual_bars = _pairs.weak_pair_energy_and_grad(mf, common, static)
     np.testing.assert_allclose(actual, expected, rtol=2e-12, atol=1e-14)
     for got, want in zip(jax.tree_util.tree_leaves(actual_bars), jax.tree_util.tree_leaves(expected_bars)):
         np.testing.assert_allclose(got, want, rtol=2e-11, atol=1e-13)
-    assert calls == Counter({0: 2, 1: 2, 2: 2})  # value pass, then one bounded VJP replay
+    assert screen_calls == Counter({0: 1, 1: 1, 2: 1})
+    assert moment_calls == Counter({0: 2, 1: 2, 2: 2})
 
 
 @pytest.mark.parametrize('order', [2, 3, 4])
@@ -101,46 +150,15 @@ def test_empty_weak_graph_has_zero_response(monkeypatch):
         np.testing.assert_array_equal(leaf, np.zeros_like(leaf))
 
 
-@pytest.mark.parametrize('order', [2, 3, 4])
-def test_endpoint_replay_aligns_virtual_signs_inside_pullback(monkeypatch, order):
-    mf, common, static, endpoint = _fixture(order)
-    pairs = _pairs.weak_pair_indices(static)
-    calls = Counter()
-
-    def direct(m, c):
-        return sum(_pairs._multipole_pair_energy(endpoint(m, c, static, i),
-                   endpoint(m, c, static, j), order) for i, j in pairs)
-
-    expected, expected_bars = jax.value_and_grad(direct, argnums=(0, 1))(mf, common)
-
-    def changed_signs(m, c, s, index):
-        calls[index] += 1
-        value = endpoint(m, c, s, index)
-        if calls[index] > 1:
-            center, mu, gap, theta, omega = value
-            signs = jnp.array([-1., 1.]) if index % 2 == 0 else jnp.array([1., -1.])
-            return (center, mu * signs, gap,
-                    None if theta is None else theta * signs,
-                    None if omega is None else omega * signs)
-        return value
-
-    monkeypatch.setattr(_pairs, 'build_weak_endpoint', changed_signs)
-    actual, actual_bars = _pairs.weak_pair_energy_and_grad(mf, common, static)
-    np.testing.assert_allclose(actual, expected, rtol=2e-12, atol=1e-14)
-    for got, want in zip(jax.tree_util.tree_leaves(actual_bars),
-                         jax.tree_util.tree_leaves(expected_bars)):
-        np.testing.assert_allclose(got, want, rtol=2e-11, atol=1e-13)
-    assert calls == Counter({0: 2, 1: 2, 2: 2})
-
-
 @pytest.mark.parametrize('change', ['gap', 'moment', 'rotation'])
-def test_endpoint_replay_rejects_changes_beyond_virtual_signs(monkeypatch, change):
+def test_moment_replay_rejects_changed_values_in_the_saved_screen(monkeypatch, change):
     mf, common, static, endpoint = _fixture(4)
     calls = Counter()
 
-    def changed_endpoint(m, c, s, index):
+    def changed_moments(m, saved, static, fragment_index):
+        index = fragment_index
         calls[index] += 1
-        value = endpoint(m, c, s, index)
+        value = endpoint(m, Common(saved), static, index)
         if index == 0 and calls[index] > 1:
             center, mu, gap, theta, omega = value
             if change == 'gap':
@@ -155,8 +173,9 @@ def test_endpoint_replay_rejects_changes_beyond_virtual_signs(monkeypatch, chang
             return center, mu, gap, theta, omega
         return value
 
-    monkeypatch.setattr(_pairs, 'build_weak_endpoint', changed_endpoint)
-    with pytest.raises(RuntimeError, match='endpoint gauge changed on replay'):
+    _install_split(monkeypatch, endpoint)
+    monkeypatch.setattr(_pairs, '_weak_endpoint_from_screen', changed_moments)
+    with pytest.raises(RuntimeError, match='weak AO-moment values changed on replay'):
         _pairs.weak_pair_energy_and_grad(mf, common, static)
 
 
@@ -197,8 +216,8 @@ def test_domain_collects_once_after_complete_weak_response(monkeypatch, with_gra
     from pyscfad.dlno_stc.adjoint import zero_term_cotangents
     mf, common, static, endpoint = _fixture(4)
     pairs = _pairs.weak_pair_indices(static)
-    calls, collections = Counter(), []
-    compact_values = []
+    screen_calls, moment_calls, collections = Counter(), Counter(), []
+    compact_values, orbital_pullbacks = [], []
 
     def direct(m, c):
         return sum(_pairs._multipole_pair_energy(endpoint(m, c, static, i),
@@ -206,23 +225,33 @@ def test_domain_collects_once_after_complete_weak_response(monkeypatch, with_gra
 
     expected, expected_bars = jax.value_and_grad(direct, argnums=(0, 1))(mf, common)
 
-    def counted(m, c, s, index):
-        calls[index] += 1
-        result = endpoint(m, c, s, index)
-        if calls[index] == 1:
-            compact_values.append(weakref.ref(result[0]))
-        return result
+    _install_split(monkeypatch, endpoint, screen_calls, moment_calls)
+    real_prepare = _pairs._prepare_weak_endpoint
+    real_forward = _pairs.build_weak_endpoint
+
+    def prepare(*args):
+        value, linearization = real_prepare(*args)
+        compact_values.append(weakref.ref(value[0]))
+        orbital_pullbacks.append(weakref.ref(linearization[1]))
+        return value, linearization
+
+    def forward(*args):
+        value = real_forward(*args)
+        compact_values.append(weakref.ref(value[0]))
+        return value
 
     def collect():
-        collections.append(calls.copy())
+        collections.append(screen_calls.copy())
         assert all(value() is None for value in compact_values)
+        assert all(value() is None for value in orbital_pullbacks)
 
     def initialize():
         mf_bar, common_bar = zero_term_cotangents(mf, common)
         return dict(energy=jnp.asarray(0.), variance=0., weak_pairs=pairs,
                     mf=mf, common=common, mf_bar=mf_bar, common_bar=common_bar)
 
-    monkeypatch.setattr(_pairs, 'build_weak_endpoint', counted)
+    monkeypatch.setattr(_pairs, '_prepare_weak_endpoint', prepare)
+    monkeypatch.setattr(_pairs, 'build_weak_endpoint', forward)
     monkeypatch.setattr(driver, 'build_domain_groups', lambda *a, **k: ())
     monkeypatch.setattr(driver, '_finish', lambda state, **k:
                         (state['energy'], (state['mf_bar'], state['common_bar'])))
@@ -234,6 +263,7 @@ def test_domain_collects_once_after_complete_weak_response(monkeypatch, with_gra
         for got, want in zip(jax.tree_util.tree_leaves(actual_bars),
                              jax.tree_util.tree_leaves(expected_bars)):
             np.testing.assert_allclose(got, want, rtol=2e-11, atol=1e-13)
-    assert collections == [Counter({0: 2 if with_grad else 1,
+    assert collections == [Counter({0: 1, 1: 1, 2: 1})]
+    assert moment_calls == Counter({0: 2 if with_grad else 1,
                                     1: 2 if with_grad else 1,
-                                    2: 2 if with_grad else 1})]
+                                    2: 2 if with_grad else 1})

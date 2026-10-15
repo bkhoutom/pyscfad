@@ -17,10 +17,11 @@ import numpy as np
 from pyscfad.lno.tools import fake_mol_by_atom, project_mo
 from pyscfad.lib._compilation_cache import configure_compilation_cache
 from pyscfad.lib._multipole import (
-    align_endpoint_signs, coordinate_moment_jvp, endpoint_matches_reference,
+    coordinate_moment_jvp, endpoint_matches_reference,
     pair_energy as _multipole_pair_energy,
     pair_energy_and_grad, transition_moments,
 )
+from pyscfad.lib._weak_endpoint import prepare_endpoint, replay_endpoint
 
 
 class WeakScreen(NamedTuple):
@@ -232,9 +233,14 @@ def weak_screen_pair_energy(mf, left, right, static, left_index, right_index):
 
 
 def build_weak_endpoint(mf, common, static, fragment_index):
-    """Build one compact endpoint; its AO response is replayed separately."""
+    """Build a forward-only endpoint without retaining orbital pullbacks."""
     configure_compilation_cache()
     screen = build_weak_multipole_screen(common, static, fragment_index)
+    return _weak_endpoint_from_screen(mf, screen, static, fragment_index)
+
+
+def _weak_endpoint_from_screen(mf, screen, static, fragment_index):
+    """Contract AO moments using the supplied, differentiable orbital screen."""
     if screen is None:
         raise RuntimeError(f"a fixed weak endpoint {fragment_index} has no multipole screen")
     return _multipole_orbital_data(
@@ -243,10 +249,19 @@ def build_weak_endpoint(mf, common, static, fragment_index):
     )
 
 
-def _replay_weak_endpoint(mf, common, static, fragment_index, reference):
-    """Rebuild moments in their saved frame, including in the reverse rule."""
-    return align_endpoint_signs(
-        build_weak_endpoint(mf, common, static, fragment_index), reference)
+def _prepare_weak_endpoint(mf, common, static, fragment_index):
+    """Retain the orbital reverse rule from the actual forward evaluation."""
+    return prepare_endpoint(
+        partial(build_weak_multipole_screen, static=static, fragment_index=fragment_index),
+        partial(_weak_endpoint_from_screen, static=static, fragment_index=fragment_index),
+        mf, common)
+
+
+def _replay_weak_endpoint(mf, linearization, static, fragment_index):
+    """Replay AO moments in the saved screen and compose its orbital response."""
+    return replay_endpoint(
+        partial(_weak_endpoint_from_screen, static=static, fragment_index=fragment_index),
+        mf, linearization)
 
 
 def weak_pair_energy(mf, common, static, left_index, right_index):
@@ -273,7 +288,7 @@ def _weak_endpoints(mf, common, static, pairs):
 
 def _check_endpoint_replay(rebuilt, original, index):
     if not endpoint_matches_reference(rebuilt, original):
-        raise RuntimeError(f"weak endpoint gauge changed on replay: {index}")
+        raise RuntimeError(f"weak AO-moment values changed on replay: endpoint {index}")
 
 
 def weak_pair_energy_sum(mf, common, static, *, pairs=None):
@@ -288,20 +303,22 @@ def weak_pair_energy_sum(mf, common, static, *, pairs=None):
 
 
 def weak_pair_energy_and_grad(mf, common, static, *, pairs=None):
-    """Accumulate compact endpoint bars, then replay one endpoint tape at a time.
+    """Reuse orbital pullbacks and replay one AO-moment tape at a time.
 
-    Endpoint values are shared across all incident pairs. Only their compact
-    transition-moment cotangents persist; the large AO integral and local-space
-    reverse tape is constructed and released once per participating fragment.
-    Replay aligns orbital signs inside the differentiated function so the
-    saved cotangents and its pullback use the same virtual frame.
+    Each orbital screen and its reverse rule come from one forward VJP.
+    Pair contractions share compact transition moments. Their accumulated
+    bars pass through AO-moment replay using the exact saved screen, then
+    through its retained orbital pullback. No eigensolver is replayed.
     """
     from .adjoint import add_cotangent, zero_term_cotangents
     configure_compilation_cache()
     pairs = weak_pair_indices(static) if pairs is None else tuple(pairs)
     bars = zero_term_cotangents(mf, common)
     energy = jnp.zeros((), dtype=common.s1e.dtype)
-    endpoints = _weak_endpoints(mf, common, static, pairs)
+    endpoints, linearizations = {}, {}
+    for index in sorted({index for pair in pairs for index in pair}):
+        endpoints[index], linearizations[index] = _prepare_weak_endpoint(
+            mf, common, static, index)
     endpoint_bars = {index: jax.tree_util.tree_map(jnp.zeros_like, value)
                      for index, value in endpoints.items()}
     for left, right in pairs:
@@ -314,14 +331,13 @@ def weak_pair_energy_and_grad(mf, common, static, *, pairs=None):
     for index in tuple(endpoint_bars):
         endpoint_bar = endpoint_bars.pop(index)
         original = endpoints.pop(index)
-        rebuilt, pullback = jax.vjp(
-            partial(_replay_weak_endpoint, static=static, fragment_index=index,
-                    reference=original), mf, common)
+        linearization = linearizations.pop(index)
+        rebuilt, pullback = _replay_weak_endpoint(mf, linearization, static, index)
         _check_endpoint_replay(rebuilt, original, index)
         contribution = pullback(endpoint_bar)
         bars = jax.tree_util.tree_map(add_cotangent, bars, contribution)
         jax.block_until_ready(bars)
-        del rebuilt, original, pullback, contribution, endpoint_bar
+        del rebuilt, original, pullback, contribution, endpoint_bar, linearization
     if pairs:
         # Release each tape promptly, but scan the Python heap only after
         # the complete weak response. Automatic collection remains enabled.

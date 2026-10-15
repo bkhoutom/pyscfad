@@ -48,8 +48,7 @@ from .mp2 import (
     _correlation_term_specs, _details_from_restart_metadata,
     _details_restart_metadata, _fix_restart_mo_phases, _make_decomposition,
     _serial_restart_scientific_payload, strong_domain_energy,
-    build_weak_endpoint, _check_weak_endpoint_gauge,
-    _align_weak_endpoint_signs,
+    _prepare_weak_endpoint, _replay_weak_endpoint, _check_weak_endpoint_moments,
     _weak_endpoint_pair_value_and_grad,
 )
 from .targets import resolve_target_options, semantic_tuple as _semantic_tuple
@@ -111,9 +110,9 @@ def _weak_endpoint_correlation_pullback(
 ):
     """Distribute compact weak pairs and close each endpoint on its owner.
 
-    Endpoint values are small enough to share on every rank.  The much
-    larger AO moment VJP is constructed only on the endpoint's owning rank,
-    used once with the reduced incident-pair cotangent, and released.
+    Share compact values while retaining each orbital pullback on its owner.
+    Build the AO moment VJP in that same saved frame only after pair bars
+    have been reduced, consume it once, and release both pullbacks.
     """
     configure_compilation_cache()
     rank, nproc = comm.Get_rank(), comm.Get_size()
@@ -126,12 +125,14 @@ def _weak_endpoint_correlation_pullback(
 
     _report_progress(reporter, f"weak endpoints: preparing {len(indices)} fragments")
     prepared = []
+    linearizations = {}
     profile_prepare = resource_profile.start()
     for index in indices:
         if owners[index] != rank:
             continue
         start = time.perf_counter() if collect_timing else None
-        endpoint = build_weak_endpoint(mf, common, static, index)
+        endpoint, linearization = _prepare_weak_endpoint(mf, common, static, index)
+        linearizations[index] = linearization
         if collect_timing or profile_prepare is not None:
             jax.block_until_ready(endpoint)
         prepared.append((
@@ -139,7 +140,7 @@ def _weak_endpoint_correlation_pullback(
             _array_tree_digest(endpoint),
             time.perf_counter() - start if collect_timing else 0.0,
         ))
-        del endpoint
+        del endpoint, linearization
     resource_profile.finish(
         "dlno.mp2_mpi.weak_endpoints.prepare", profile_prepare,
         n_endpoints=len(prepared),
@@ -213,14 +214,11 @@ def _weak_endpoint_correlation_pullback(
         endpoint_bar = owned_bars.pop(index)
         start = time.perf_counter() if collect_timing else None
         reference = endpoints.pop(index)
-        # Owner-local alignment is part of the differentiated map; pair bars
-        # remain in their shared forward frame and need no manual correction.
-        rebuilt, pullback = jax.vjp(
-            lambda mf_, common_: _align_weak_endpoint_signs(
-                build_weak_endpoint(mf_, common_, static, index), reference
-            ), mf, common,
+        linearization = linearizations.pop(index)
+        rebuilt, pullback = _replay_weak_endpoint(
+            mf, linearization, static, index
         )
-        _check_weak_endpoint_gauge(
+        _check_weak_endpoint_moments(
             rebuilt, reference, index, "MPI response replay"
         )
         endpoint_mf_bar, endpoint_common_bar = pullback(endpoint_bar)
@@ -231,11 +229,11 @@ def _weak_endpoint_correlation_pullback(
         jax.block_until_ready((mf_bar, common_bar))
         if collect_timing:
             response_seconds[index] = time.perf_counter() - start
-        del reference, rebuilt, pullback
+        del reference, rebuilt, pullback, linearization
         del endpoint_mf_bar, endpoint_common_bar, endpoint_bar
     if owned_indices:
-        # Keep only one live endpoint tape and collect after the entire
-        # owned response, rather than scanning the heap for every endpoint.
+        # The large AO tape lives for one endpoint; saved orbital tapes are
+        # released progressively and collected once after the owned stage.
         gc.collect()
     resource_profile.finish(
         "dlno.mp2_mpi.weak_endpoints.response", profile_response,

@@ -46,10 +46,19 @@ it is consumed, then explicitly collects garbage once at the weak-response
 boundary. Automatic Python collection and strong-domain cleanup remain active.
 The MPI driver retains its existing work distribution.
 
-Endpoint replay aligns real orbital signs to the saved forward moments inside
-the differentiated function. JAX applies the phase factors to the reverse pass
-automatically. Serial restart also aligns new forward moments to the saved
-checkpoint frame before accumulating pending and new pair cotangents.
+Each weak orbital screen and its algebra pullback are built together once per
+endpoint. Pair contractions accumulate compact moment cotangents as before.
+Response replays only AO moments in the saved orbital frame, then sends the
+resulting orbital cotangents through the retained screen pullback. Orbital
+response remains differentiated, without rebuilding an arbitrary eigenvector
+frame. The large AO-moment derivative tape lives for one endpoint at a time;
+the smaller screen pullbacks are released progressively on their owning rank.
+
+Serial checkpoints retain completed strong work and, once closed, the full
+weak response. An interrupted weak stage is recomputed on resume because live
+orbital pullbacks cannot be checkpointed safely. Partial weak cotangents and
+orbital-frame snapshots are no longer stored. Older fully closed checkpoints
+remain usable; older partial weak checkpoints require a fresh checkpoint.
 Consistency checks compare each moment order's Cartesian RMS per virtual
 column with `atol=rtol=1e-9`, so canceled components use their column's scale.
 Energies, centers and mode weights retain componentwise checks. Changed

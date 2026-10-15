@@ -16,7 +16,8 @@ import numpy
 
 from pyscfad import numpy as np
 from pyscfad.lib._compilation_cache import configure_compilation_cache
-from pyscfad.lib._multipole import align_endpoint_signs, endpoint_matches_reference
+from pyscfad.lib._multipole import endpoint_matches_reference
+from pyscfad.lib._weak_endpoint import prepare_endpoint, replay_endpoint
 from pyscfad.tools import resource_profile
 
 from . import multipole
@@ -938,13 +939,17 @@ def _validate_weak_pair(static, left_index, right_index):
 def build_weak_endpoint(mf, common, static, fragment_index):
     """Return weighted transition moments for one fragment's weak pairs.
 
-    Only these compact mode records survive the forward phase.  The screen
-    and AO moment intermediates are rebuilt under one VJP after all incident
-    pair cotangents have been accumulated.
+    Energy-only callers do not retain an orbital response linearization.
+    Gradient drivers use ``_prepare_weak_endpoint`` instead.
     """
     configure_compilation_cache()
     fragment_index = int(fragment_index)
     screen = build_weak_multipole_screen(common, static, fragment_index)
+    return _weak_endpoint_from_screen(mf, screen, static, fragment_index)
+
+
+def _weak_endpoint_from_screen(mf, screen, static, fragment_index):
+    """Evaluate AO moments in an already selected, fixed orbital frame."""
     if screen is None:
         raise RuntimeError(
             f"fragment {fragment_index} has fixed weak pairs but no "
@@ -958,6 +963,30 @@ def build_weak_endpoint(mf, common, static, fragment_index):
         static.thresholds.multipole_order,
     )
     return screen.weights, tuple(records)
+
+
+def _prepare_weak_endpoint(mf, common, static, fragment_index):
+    """Build an orbital frame once and retain only its algebra pullback."""
+    configure_compilation_cache()
+    return prepare_endpoint(
+        lambda common_: build_weak_multipole_screen(
+            common_, static, fragment_index
+        ),
+        lambda mf_, screen: _weak_endpoint_from_screen(
+            mf_, screen, static, fragment_index
+        ),
+        mf, common,
+    )
+
+
+def _replay_weak_endpoint(mf, linearization, static, fragment_index):
+    """Differentiate moments in the retained frame, then its orbital map."""
+    return replay_endpoint(
+        lambda mf_, screen: _weak_endpoint_from_screen(
+            mf_, screen, static, fragment_index
+        ),
+        mf, linearization,
+    )
 
 
 @partial(jax.jit, static_argnums=(2,))
@@ -1235,24 +1264,8 @@ def _zero_term_cotangents(mf, common):
     return pullback(np.ones((), dtype=common.s1e.dtype))
 
 
-def _align_weak_endpoint_signs(endpoint, reference):
-    """Express every occupied mode in the reference virtual-orbital phases.
-
-    Mode weights are independent of virtual phases. Structural changes pass
-    through unchanged so the consistency check can reject them explicitly.
-    """
-    if (jax.tree_util.tree_structure(endpoint)
-            != jax.tree_util.tree_structure(reference)):
-        return endpoint
-    weights, records = endpoint
-    return weights, tuple(
-        align_endpoint_signs(record, saved)
-        for record, saved in zip(records, reference[1])
-    )
-
-
-def _check_weak_endpoint_gauge(endpoint, reference, fragment_index, stage):
-    """Reject changes beyond aligned signs and column-scaled roundoff."""
+def _check_weak_endpoint_moments(endpoint, reference, fragment_index, stage):
+    """Check repeated AO moments in the same retained orbital frame."""
     compatible = (
         jax.tree_util.tree_structure(endpoint)
         == jax.tree_util.tree_structure(reference)
@@ -1271,8 +1284,8 @@ def _check_weak_endpoint_gauge(endpoint, reference, fragment_index, stage):
         )
     if not compatible:
         raise RuntimeError(
-            f"weak endpoint gauge changed for fragment {fragment_index} "
-            f"during {stage} after orbital-sign alignment; endpoint values "
+            f"weak endpoint moments changed for fragment {fragment_index} "
+            f"during {stage} in its retained orbital frame; endpoint values "
             "or spaces changed beyond roundoff"
         )
 
@@ -1280,174 +1293,123 @@ def _check_weak_endpoint_gauge(endpoint, reference, fragment_index, stage):
 def _progressive_correlation_pullback(
     mf, common, static, *, return_details=False, restart=None
 ):
-    """Differentiate strong rows and factor weak response by endpoint.
+    """Retain orbital response once, then close accumulated weak pair bars.
 
-    A progressive prefix contains the strong ``mf``/``common`` bars plus
-    compact, accumulated weak endpoint bars.  Endpoint response is closed
-    once after the pair phase, and a final prefix record contains the full
-    input cotangents.  No AO moment pullback survives between endpoints.
+    Checkpoints contain completed strong response until all weak response is
+    closed. Live orbital pullbacks cannot be serialized, so an interrupted
+    weak stage is recomputed on resume without repeating completed strong rows.
     """
     work = _correlation_term_specs(static)
     energy = np.zeros((), dtype=common.s1e.dtype)
-    mf_bar = None
-    common_bar = None
+    mf_bar = common_bar = None
+    strong_energy = energy
     term_results = []
-    completed_count = 0
+    completed_specs = set()
+    weak_response_closed = False
+    checkpoint_enabled = _restart_is_enabled(restart)
     previous_elapsed = 0.0
     total_start = time.perf_counter() if return_details else None
-    saved_endpoint_bars = {}
-    saved_endpoint_values = {}
 
     if _restart_is_resuming(restart):
         zero_mf_bar, zero_common_bar = _zero_term_cotangents(mf, common)
         progress = restart.load_record(
             "correlation_progress",
-            templates={
-                "mf_bar": zero_mf_bar,
-                "common_bar": zero_common_bar,
-            },
+            templates={"mf_bar": zero_mf_bar, "common_bar": zero_common_bar},
             missing_ok=True,
         )
         if progress is not None:
-            completed_count = int(progress.scalars["completed_count"])
-            if completed_count < 0 or completed_count > len(work):
-                raise RuntimeError(
-                    "serial MP2 restart completed-term count is invalid"
-                )
             saved_specs = tuple(
                 (str(row[0]), int(row[1]), int(row[2]))
                 for row in progress.metadata.get("completed_specs", ())
             )
-            if saved_specs != work[:completed_count]:
+            count = int(progress.scalars["completed_count"])
+            weak_response_closed = bool(
+                progress.metadata.get("weak_response_closed", False)
+            )
+            version = progress.metadata.get("weak_response_version", 1)
+            if version not in (1, 2) or (version == 1 and not weak_response_closed):
                 raise RuntimeError(
-                    "serial MP2 restart term prefix does not match the "
-                    "fixed topology"
+                    "serial MP2 checkpoint contains an older partial weak "
+                    "response; use a fresh checkpoint for retained orbital replay"
                 )
-            energy = np.asarray(
-                progress.scalars["energy"], dtype=common.s1e.dtype
-            )
-            mf_bar = progress.trees["mf_bar"]
-            common_bar = progress.trees["common_bar"]
-            previous_elapsed = float(
-                progress.scalars.get("elapsed_seconds", 0.0)
-            )
-            saved_endpoint_bars = dict(
-                progress.metadata.get("weak_endpoint_bars", ())
-            )
-            saved_endpoint_values = dict(
-                progress.metadata.get("weak_endpoint_values", ())
-            )
-            if set(saved_endpoint_values) != set(saved_endpoint_bars):
+            saved_set = set(saved_specs)
+            if (count != len(saved_specs) or len(saved_set) != count
+                    or tuple(spec for spec in work if spec in saved_set)
+                    != saved_specs or (not weak_response_closed and any(
+                        spec[0] != "strong" for spec in saved_specs))):
                 raise RuntimeError(
-                    "serial MP2 checkpoint has pending weak endpoint bars "
-                    "without matching endpoint gauge values; recompute "
-                    "with a fresh checkpoint"
+                    "serial MP2 restart completed terms do not match the fixed topology"
                 )
+            completed_specs = saved_set
+            energy = np.asarray(progress.scalars["energy"], dtype=common.s1e.dtype)
+            mf_bar, common_bar = progress.trees["mf_bar"], progress.trees["common_bar"]
+            strong_energy = energy
+            previous_elapsed = float(progress.scalars.get("elapsed_seconds", 0.0))
             if return_details:
                 term_results = [
                     _term_result_from_metadata(row)
                     for row in progress.metadata.get("term_results", ())
                 ]
-                if len(term_results) != completed_count:
-                    raise RuntimeError(
-                        "serial MP2 restart term diagnostics are incomplete"
-                    )
+                if len(term_results) != count:
+                    raise RuntimeError("serial MP2 restart term diagnostics are incomplete")
         del progress, zero_mf_bar, zero_common_bar
 
-    remaining_weak = tuple(
-        spec for spec in work[completed_count:] if spec[0] == "weak"
-    )
+    remaining_work = tuple(spec for spec in work if spec not in completed_specs)
+    remaining_weak = tuple(spec for spec in remaining_work if spec[0] == "weak")
+    if weak_response_closed and remaining_weak:
+        raise RuntimeError("serial MP2 restart has an incomplete closed weak response")
     endpoint_indices = sorted(
         {index for _, left, right in remaining_weak for index in (left, right)}
-        | set(saved_endpoint_bars)
     )
-    valid_endpoints = {
-        index for kind, left, right in work if kind == "weak"
-        for index in (left, right)
-    }
-    if not set(saved_endpoint_bars).issubset(valid_endpoints):
-        raise RuntimeError("serial MP2 restart weak endpoint index is invalid")
-    endpoints = {}
-    endpoint_bars = {}
+    endpoints, endpoint_bars, linearizations = {}, {}, {}
     endpoint_build_seconds = {}
     profile_prepare = resource_profile.start()
     for index in endpoint_indices:
         endpoint_start = time.perf_counter() if return_details else None
-        endpoint = build_weak_endpoint(mf, common, static, index)
-        if index in saved_endpoint_bars:
-            # Pending bars belong to the saved forward frame. Express newly
-            # accumulated pair bars in that same frame before adding them.
-            endpoint = _align_weak_endpoint_signs(
-                endpoint, saved_endpoint_values[index]
-            )
-            _check_weak_endpoint_gauge(
-                endpoint, saved_endpoint_values[index], index, "restart"
-            )
+        endpoint, linearization = _prepare_weak_endpoint(mf, common, static, index)
         endpoints[index] = endpoint
-        endpoint_bar = jax.tree_util.tree_map(np.zeros_like, endpoint)
-        if index in saved_endpoint_bars:
-            saved_bar = saved_endpoint_bars[index]
-            if (jax.tree_util.tree_structure(saved_bar)
-                    != jax.tree_util.tree_structure(endpoint_bar)):
-                raise RuntimeError("serial MP2 restart endpoint shape changed")
-            if any(
-                numpy.shape(saved) != numpy.shape(live)
-                for saved, live in zip(
-                    jax.tree_util.tree_leaves(saved_bar),
-                    jax.tree_util.tree_leaves(endpoint_bar),
-                )
-            ):
-                raise RuntimeError("serial MP2 restart endpoint shape changed")
-            endpoint_bar = jax.tree_util.tree_map(np.asarray, saved_bar)
-            del saved_bar
-        endpoint_bars[index] = endpoint_bar
+        linearizations[index] = linearization
+        endpoint_bars[index] = jax.tree_util.tree_map(np.zeros_like, endpoint)
         if return_details:
             jax.block_until_ready(endpoint)
             endpoint_build_seconds[index] = time.perf_counter() - endpoint_start
-        del endpoint, endpoint_bar
+        del endpoint, linearization
     resource_profile.finish(
         "dlno.mp2.weak_endpoints.prepare", profile_prepare,
         n_endpoints=len(endpoint_indices), n_pairs=len(remaining_weak),
     )
-    del saved_endpoint_bars, saved_endpoint_values
 
-    def checkpoint(count, *, weak_response_closed=False):
-        if not _restart_is_enabled(restart):
+    def checkpoint():
+        if not checkpoint_enabled:
             return
+        closed = not endpoint_bars
+        saved_specs = tuple(
+            spec for spec in work if spec in completed_specs
+            and (closed or spec[0] == "strong")
+        )
+        saved_results = [
+            item for item in term_results if closed or item.kind == "strong"
+        ]
         elapsed_seconds = previous_elapsed
         if return_details:
             elapsed_seconds += time.perf_counter() - total_start
         restart.save_record(
             "correlation_progress",
             scalars={
-                "energy": float(jax.device_get(energy)),
-                "completed_count": int(count),
+                "energy": float(jax.device_get(energy if closed else strong_energy)),
+                "completed_count": len(saved_specs),
                 "elapsed_seconds": float(elapsed_seconds),
             },
+            # Until closure these input bars contain only strong response;
+            # pending weak response exists solely in endpoint_bars.
             trees={"mf_bar": mf_bar, "common_bar": common_bar},
             metadata={
-                "completed_specs": [
-                    [str(kind), int(left), int(right)]
-                    for kind, left, right in work[:count]
-                ],
+                "completed_specs": [list(spec) for spec in saved_specs],
                 "term_results": [
-                    _term_result_metadata(item) for item in term_results
+                    _term_result_metadata(item) for item in saved_results
                 ] if return_details else [],
-                # RestartManager stores these arrays in HDF5 datasets, not
-                # JSON.  Keep the legacy input-tree templates unchanged.
-                "weak_endpoint_bars": tuple(
-                    (index, jax.tree_util.tree_map(
-                        lambda leaf: numpy.asarray(jax.device_get(leaf)), bar
-                    ))
-                    for index, bar in endpoint_bars.items()
-                ) if not weak_response_closed else (),
-                "weak_endpoint_values": tuple(
-                    (index, jax.tree_util.tree_map(
-                        lambda leaf: numpy.asarray(jax.device_get(leaf)),
-                        endpoints[index],
-                    )) for index in endpoint_bars
-                ) if not weak_response_closed else (),
-                "weak_response_closed": bool(weak_response_closed),
+                "weak_response_version": 2,
+                "weak_response_closed": closed,
             },
         )
 
@@ -1458,14 +1420,11 @@ def _progressive_correlation_pullback(
         for index in endpoint_indices:
             replay_start = time.perf_counter() if return_details else None
             reference = endpoints.pop(index)
-            # Differentiate the aligned moments so the pullback applies the
-            # same frozen signs to the original, accumulated endpoint bars.
-            rebuilt, pullback = jax.vjp(
-                lambda mf_, common_: _align_weak_endpoint_signs(
-                    build_weak_endpoint(mf_, common_, static, index), reference
-                ), mf, common,
+            linearization = linearizations.pop(index)
+            rebuilt, pullback = _replay_weak_endpoint(
+                mf, linearization, static, index
             )
-            _check_weak_endpoint_gauge(
+            _check_weak_endpoint_moments(
                 rebuilt, reference, index, "response replay"
             )
             endpoint_bar = endpoint_bars.pop(index)
@@ -1479,7 +1438,7 @@ def _progressive_correlation_pullback(
             jax.block_until_ready((mf_bar, common_bar))
             if return_details:
                 replay_seconds += time.perf_counter() - replay_start
-            del reference, rebuilt, pullback
+            del reference, rebuilt, pullback, linearization
             del endpoint_mf_bar, endpoint_common_bar, endpoint_bar
         if endpoint_indices:
             # Compact values/bars and each large tape have been released.
@@ -1491,7 +1450,6 @@ def _progressive_correlation_pullback(
         )
         if return_details and endpoint_indices:
             # Charge endpoint preparation/replay once to a weak diagnostic row.
-            # This also covers a resume after the final pending pair checkpoint.
             first_weak = next(
                 i for i, result in enumerate(term_results) if result.kind == "weak"
             )
@@ -1506,9 +1464,7 @@ def _progressive_correlation_pullback(
                 ),
             )
 
-    for term_index, spec in enumerate(
-        work[completed_count:], start=completed_count
-    ):
+    for spec in remaining_work:
         kind, left, right = spec
         forward_start = time.perf_counter() if return_details else None
         profile_pairs = resource_profile.start() if kind == "weak" else None
@@ -1534,6 +1490,8 @@ def _progressive_correlation_pullback(
                 common_bar = jax.tree_util.tree_map(
                     _add_cotangent, common_bar, term_common_bar
                 )
+            if checkpoint_enabled:
+                strong_energy = strong_energy + term_energy
             del pullback, term_mf_bar, term_common_bar
         else:
             # A single compiled value-and-gradient call contracts only the
@@ -1580,18 +1538,22 @@ def _progressive_correlation_pullback(
             ))
         if kind == "weak" and spec == remaining_weak[-1]:
             close_endpoint_response()
-        checkpoint(term_index + 1, weak_response_closed=not endpoint_bars)
+        completed_specs.add(spec)
+        if kind == "strong" or not endpoint_bars:
+            checkpoint()
         if kind == "strong":
             gc.collect()
 
     if mf_bar is None:
         raise ValueError("fixed topology must contain at least one fragment")
-    if endpoint_bars:
-        # A resume can start after the last weak pair but before its response
-        # was closed by an older checkpoint implementation.
-        close_endpoint_response()
-        checkpoint(len(work), weak_response_closed=True)
+    if endpoint_bars or linearizations:
+        raise RuntimeError("weak endpoint response was not completely consumed")
     if return_details:
+        spec_order = {spec: index for index, spec in enumerate(work)}
+        term_results.sort(key=lambda item: spec_order[(
+            item.kind, item.left_fragment,
+            -1 if item.right_fragment is None else item.right_fragment,
+        )])
         strong_results = tuple(
             item for item in term_results if item.kind == "strong"
         )

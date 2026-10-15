@@ -49,16 +49,21 @@ a custom cache needs `JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0` and
 `JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=-1` to retain all small kernels.
 An unavailable automatic cache warns and allows the calculation to continue.
 
-Weak response releases endpoint values, cotangents and reverse tapes as they
-are consumed and explicitly collects garbage once after the weak stage.
-Automatic Python collection and strong-group cleanup remain active.
+Weak response builds each orbital screen once under `jax.vjp`, retaining the
+returned screen and its orbital-algebra pullback. Compact transition moments
+are shared by all incident pairs. Response replays only AO moments using that
+exact screen, then applies the retained orbital pullback. Orbital and energy
+response remain differentiated; there is no eigensolver reconstruction or
+orbital-sign matching during replay.
 
-Endpoint replay aligns real virtual-orbital signs to the saved forward moments
-inside the differentiated function, so JAX applies the same phase factors in
-the reverse pass. The consistency check compares each moment order's Cartesian
-RMS per virtual column with `atol=rtol=1e-9`; canceled components use their
-column's scale. Centers and energy gaps retain componentwise checks. Changes
-beyond signs and these roundoff bounds are rejected.
+Only one AO-moment derivative tape lives at a time. Orbital pullbacks retain
+local algebra residuals until consumed; their memory can exceed the saved
+orbital coefficients alone. Endpoint values, cotangents and both pullbacks
+are released progressively, with one explicit garbage collection after the
+weak stage. Automatic collection and strong-group cleanup remain active.
+The AO-moment consistency check compares each moment order's Cartesian RMS
+per virtual column with `atol=rtol=1e-9`; centers and energy gaps retain
+componentwise checks.
 
 ## MPI across domains
 

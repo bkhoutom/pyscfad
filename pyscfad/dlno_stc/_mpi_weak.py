@@ -1,9 +1,9 @@
 """Owner-distributed compact weak endpoints and their bounded response.
 
-Only compact numerical endpoint values cross MPI. AO preparations and reverse
-mode tapes stay on their deterministic endpoint owner, one tape at a time.
+Only compact numerical endpoint values cross MPI. Orbital-screen pullbacks
+stay on their deterministic endpoint owner; AO-moment tapes are replayed
+and released one endpoint at a time.
 """
-from functools import partial
 import gc
 import time
 
@@ -112,7 +112,9 @@ def weak_pair_contribution(mf, common, static, pairs, comm, *, with_grad):
 
     Pair positions and sorted incident endpoint positions have independent
     round-robin owners. Compact endpoint bars are summed to owners before any
-    owner enters its independently sized local response loop. MPI never runs
+    owner enters its independently sized local response loop. Each owner
+    retains its screens and their pullbacks, so response reuses the exact
+    orbital frame used for the distributed pair contractions. MPI never runs
     inside a differentiated function. Energy-only calls return ``None`` bars
     and skip cotangent preparation entirely.
     """
@@ -135,6 +137,7 @@ def weak_pair_contribution(mf, common, static, pairs, comm, *, with_grad):
         bars = zero_term_cotangents(mf, common) if with_grad else None
         energy = jnp.zeros((), dtype=common.s1e.dtype)
         prepared = {}
+        linearizations = {}
         # Allocate the owner map before the ordered numerical reductions.
         owned_bars = dict.fromkeys(owned_indices)
     except Exception as exc:
@@ -148,7 +151,11 @@ def weak_pair_contribution(mf, common, static, pairs, comm, *, with_grad):
     start, error, index = time.perf_counter(), None, None
     try:
         for index in owned_indices:
-            prepared[index] = _pairs.build_weak_endpoint(mf, common, static, index)
+            if with_grad:
+                prepared[index], linearizations[index] = _pairs._prepare_weak_endpoint(
+                    mf, common, static, index)
+            else:
+                prepared[index] = _pairs.build_weak_endpoint(mf, common, static, index)
             diagnostics['n_endpoint_builds'] += 1
         jax.block_until_ready(prepared)
     except Exception as exc:
@@ -203,18 +210,16 @@ def weak_pair_contribution(mf, common, static, pairs, comm, *, with_grad):
             for index in owned_indices:
                 original = endpoints.pop(index)
                 endpoint_bar = owned_bars.pop(index)
-                # Alignment must be inside the VJP to put its derivative in
-                # the original frame used by the distributed pair bars.
-                rebuilt, pullback = jax.vjp(
-                    partial(_pairs._replay_weak_endpoint, static=static,
-                            fragment_index=index, reference=original), mf, common)
+                linearization = linearizations.pop(index)
+                rebuilt, pullback = _pairs._replay_weak_endpoint(
+                    mf, linearization, static, index)
                 _pairs._check_endpoint_replay(rebuilt, original, index)
                 contribution = pullback(endpoint_bar)
                 bars = jax.tree_util.tree_map(add_cotangent, bars, contribution)
                 jax.block_until_ready(bars)
                 diagnostics['n_endpoint_replays'] += 1
-                del rebuilt, pullback, original, contribution, endpoint_bar
-        del endpoints, owned_bars
+                del rebuilt, pullback, original, contribution, endpoint_bar, linearization
+        del endpoints, owned_bars, linearizations
         gc.collect()
     except Exception as exc:
         error = _error(rank, 'endpoint response', exc, index)

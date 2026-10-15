@@ -132,38 +132,8 @@ def transition_moments(occupied, virtual, overlap, dipole, second, third, order)
     )
 
 
-@jax.jit
-def align_endpoint_signs(endpoint, reference):
-    """Express real transition moments in the saved endpoint's phase frame.
-
-    Choose one fixed sign per virtual column from all available moments.
-    Keeping this multiplication inside a replay VJP automatically expresses
-    its cotangents in the same frame. Centers and excitation energies are
-    phase invariant. Zero moment columns need no normalization or division.
-
-    Structural changes are passed through for the caller's consistency check;
-    this function reconciles signs, never rotations or changed orbital spaces.
-    """
-    if jax.tree_util.tree_structure(endpoint) != jax.tree_util.tree_structure(reference):
-        return endpoint
-    if any(live.shape != saved.shape for live, saved in zip(
-            jax.tree_util.tree_leaves(endpoint), jax.tree_util.tree_leaves(reference))):
-        return endpoint
-    center, mu, gap, theta, omega = endpoint
-    score = jnp.zeros(mu.shape[-1], dtype=jnp.real(mu).dtype)
-    for slot in (1, 3, 4):
-        live, saved = endpoint[slot], reference[slot]
-        if live is not None:
-            axes = tuple(range(live.ndim - 1))
-            score = score + jnp.real(jnp.sum(live.conj()*saved, axis=axes))
-    signs = jax.lax.stop_gradient(jnp.where(score < 0, -1., 1.))
-    return (center, mu*signs, gap,
-            None if theta is None else theta*signs,
-            None if omega is None else omega*signs)
-
-
 def endpoint_matches_reference(endpoint, reference, *, rtol=1e-9, atol=1e-9):
-    """Check concrete, sign-aligned endpoint values before reusing their bars.
+    """Check AO-moment replay against its original forward endpoint values.
 
     Compare each moment family's Cartesian RMS per virtual column. This
     scale is independent of the Cartesian axes and remains meaningful for

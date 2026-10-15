@@ -178,7 +178,8 @@ def check_system_memory(mf, nocc, nvir, *, with_grad, virtual_block_size=16,
     auxmol = pyscf_df.addons.make_auxmol(mf.mol.to_pyscf(), with_df.auxbasis)
     naux, nao = int(auxmol.nao), int(mf.mol.nao)
     ngroup = (naux + int(auxiliary_group_size) - 1) // int(auxiliary_group_size)
-    elements = (12 if with_grad else 6) * naux * nocc * nvir
+    # Budget six full B-sized buffers for preparation and solver work.
+    elements = 6 * naux * nocc * nvir
     elements += (6 if with_grad else 4) * naux * naux
     elements += (12 if with_grad else 6) * (nocc * nocc + nvir * nvir)
     # Four residual models with occupied-pair conditional virtual tables,

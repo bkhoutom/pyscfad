@@ -107,7 +107,7 @@ def test_full_static_records_round_trip_with_stc_class_identity(tmp_path):
     idx = np.array([0], dtype=np.int32)
     pao = FixedPAOSubspaceSelection(*(idx.copy() for _ in range(6)))
     fragment = FragmentDomainSelection(0, idx, idx, idx, idx, idx, idx, idx, pao,
-                                       idx, idx, idx, idx, idx, pao, 0, (0,))
+                                       idx, idx, idx, idx, idx, pao, 0)
     static = DomainSelections(None, BoysDomainThresholds(), idx, np.array([1], dtype=np.int32),
                               idx, idx, np.array([0, -1], dtype=np.int32), (idx,), (idx,),
                               np.ones((1, 1), dtype=bool), (fragment,),
@@ -124,7 +124,7 @@ def test_full_static_records_round_trip_with_stc_class_identity(tmp_path):
     manager.close()
 
 
-@pytest.mark.parametrize('field,value', [('equation_id', 'weighted-domain-v0'), ('algorithm_abi', -1)])
+@pytest.mark.parametrize('field,value', [('equation_id', 'weighted-domain-v0'), ('algorithm_abi', -1), ('algorithm_abi', 1)])
 def test_checkpoint_equation_mismatch_is_rejected(tmp_path, field, value):
     restart = _restart()
     manager = _manager(tmp_path)
@@ -157,7 +157,7 @@ def _grouped_selections():
     pao = FixedPAOSubspaceSelection(*(idx.copy() for _ in range(6)))
     first = FragmentDomainSelection(
         0, np.array([1], dtype=np.int32), idx, partners, idx, idx, idx,
-        partners, pao, idx, idx, idx, idx, idx, pao, 0, (0,))
+        partners, pao, idx, idx, idx, idx, idx, pao, 0)
     second = replace(first, fragment_index=1, iao_indices=idx, target_index=1)
     static = DomainSelections(
         None, BoysDomainThresholds(), partners, np.array([2], dtype=np.int32),
@@ -187,14 +187,14 @@ def test_group_worklist_round_trip_and_replay_identity(tmp_path):
     assert restored['groups'][0].representative_index == 0
     assert restored['groups'][0].target_indices == (0, 1)
     assert tuple(int(x[0]) for x in restored['static'].frag_lolist) == (1, 0)
-    assert restored['static'].fragments[0].virtual_anchor_columns == (0,)
+    np.testing.assert_array_equal(restored['static'].fragments[0].strong_virtual.metric_keep, [0])
     saved = resumed.load_record('group', key=0).metadata
     assert restart.validate_grouping_payload(saved, static, groups) is None
     resumed.close()
 
 
 @pytest.mark.parametrize('change', [
-    'membership', 'representative', 'targets', 'partners', 'anchors', 'reference',
+    'membership', 'representative', 'targets', 'partners', 'virtual-rank', 'reference',
     'convention', 'fingerprint', 'metadata',
 ])
 def test_group_replay_rejects_changed_scientific_identity(change):
@@ -213,8 +213,9 @@ def test_group_replay_rejects_changed_scientific_identity(change):
         fragments = (replace(static.fragments[0], strong_fragments=np.array([1, 0], dtype=np.int32)),
                      static.fragments[1])
         static = replace(static, fragments=fragments)
-    elif change == 'anchors':
-        fragments = (replace(static.fragments[0], virtual_anchor_columns=(1,)), static.fragments[1])
+    elif change == 'virtual-rank':
+        virtual = replace(static.fragments[0].strong_virtual, metric_keep=np.array([], dtype=np.int32))
+        fragments = (replace(static.fragments[0], strong_virtual=virtual), static.fragments[1])
         static = replace(static, fragments=fragments)
     elif change == 'reference':
         static = replace(static, target_reference_coeff=-np.eye(2))

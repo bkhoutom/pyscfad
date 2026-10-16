@@ -32,15 +32,12 @@ def projection(request, monkeypatch):
         target_reference_coeff=coeff[:, occupied] @ occupied_rotation,
         target_reference_coords=np.zeros((1, 3)), lo_kwargs={},
     )
-    virtual_anchor_columns = np.arange(len(virtual), dtype=np.int32)
 
-    def local_frame(mf, occupied_, virtual_, *, boys_reference,
-                    virtual_anchor_columns):
+    def local_frame(mf, occupied_, virtual_, *, boys_reference):
         return SimpleNamespace(
             occupied_coeff=mf.mo_coeff[:, occupied_] @ occupied_rotation,
             virtual_coeff=mf.mo_coeff[:, virtual_] @ virtual_rotation,
             boys_reference=boys_reference,
-            virtual_anchor_columns=virtual_anchor_columns,
         )
 
     monkeypatch.setattr(prepare, 'build_system_local_frame', local_frame)
@@ -59,7 +56,6 @@ def projection(request, monkeypatch):
         )
         return prepare.prepare_system_inputs(
             mf, occupied, virtual, boys_reference=boys_reference,
-            virtual_anchor_columns=virtual_anchor_columns,
         )
 
     return (inputs, adnp.asarray(fock), adnp.asarray(coeff), factors,

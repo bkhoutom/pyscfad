@@ -30,7 +30,7 @@ def grouping_fixture():
         np.array([0, 1, 2, 3]), np.array([0, 1]), np.arange(8), virtual,
         np.array([i % 2]), np.array([i % 4]), np.array([i % 2]),
         np.array([i % 2]), np.array([0]), None,
-        int(np.flatnonzero(partners == i)[0]), (0, 1),
+        int(np.flatnonzero(partners == i)[0]),
     ) for i, label in enumerate(labels))
     return DomainSelections(
         0, BoysDomainThresholds(), np.arange(8), np.array([8, 9]),
@@ -51,7 +51,9 @@ def test_grouping_exact_keys_and_partition():
     fragments[3] = replace(fragments[3], strong_virtual=replace(
         fragments[3].strong_virtual, completeness_keep=np.array([0, 2]),
     ))
-    fragments[5] = replace(fragments[5], virtual_anchor_columns=(1, 0))
+    fragments[5] = replace(fragments[5], strong_virtual=replace(
+        fragments[5].strong_virtual, metric_keep=np.array([1, 2]),
+    ))
     short = np.array([0, 5, 7])
     fragments[7] = replace(fragments[7], strong_fragments=short,
                            strong_occ_metric_keep=np.arange(3), target_index=2)

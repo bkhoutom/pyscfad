@@ -85,7 +85,6 @@ class FragmentDomainSelection:
     weak_occ_span_metric_keep: numpy.ndarray
     weak_virtual: FixedPAOSubspaceSelection | None
     target_index: int
-    virtual_anchor_columns: tuple[int, ...] | None = None
 
     @property
     def has_weak_screen(self):
@@ -153,13 +152,11 @@ def _strong_preparation_key(static, fragment, index, labels):
     """Use exactly the saved strong replay frame; exclude weak/target fields.
 
     The Boys frame projects all ordered partners, applies metric Cholesky,
-    replays the PAO selections, and fixes its gauge with the saved anchors.
+    and replays the retained PAO subspace selections.
     None of those continuous operations uses the central singleton target.
     ``extended_atoms`` also determines the local auxiliary support in DF.
     Reference orbitals, frozen spaces and DF setup are shared by ``static``.
     """
-    from .domain import _validate_virtual_anchor_columns
-
     partners = _grouping_indices(fragment.strong_fragments, len(labels),
                                  f"Boys domain {index} ordered strong partners")
     slot = _grouping_target_slot(fragment.target_index, len(partners),
@@ -189,11 +186,8 @@ def _strong_preparation_key(static, fragment, index, labels):
     overlap = _grouping_indices(selection.overlap_keep, len(canonical), "overlap PAO keep")
     completeness = _grouping_indices(selection.completeness_keep, len(overlap), "completeness PAO keep")
     metric = _grouping_indices(selection.metric_keep, len(completeness), "metric PAO keep")
-    if fragment.virtual_anchor_columns is None:
-        raise ValueError(f"Boys domain {index} requires saved virtual anchors before grouping")
-    anchors = _validate_virtual_anchor_columns(fragment.virtual_anchor_columns, parent, len(metric))
     return (partners, candidates, keep, supports,
-            (parent, support, canonical, overlap, completeness, metric), anchors), candidates, slot
+            (parent, support, canonical, overlap, completeness, metric)), candidates, slot
 
 
 def build_domain_groups(static, *, merge_identical=True) -> tuple[DomainGroup, ...]:
@@ -567,12 +561,12 @@ def build_domain_selections(
     mf, *, frozen, thresholds=None, lo_kwargs=None, target_coeff=None,
     frag_lolist=None, pair_energy_model="multipole", force_full_domains=False,
 ):
-    """Select Boys domains, full occupied labels and fixed virtual anchors.
+    """Select Boys domains, full occupied labels and retained virtual subspaces.
 
     Fragment order is independent of global Boys column order. Thresholds,
-    ranks, graph and pivots are chosen only from concrete reference data.
+    ranks and graph are chosen only from concrete reference data.
     """
-    from .domain import DomainData, TargetOccupiedData, build_boys_ed_frame
+    from .domain import DomainData, TargetOccupiedData
     from ._pairs import screen_pairs
 
     thresholds = BoysDomainThresholds() if thresholds is None else thresholds
@@ -678,7 +672,4 @@ def build_domain_selections(
                                  target_index=int(numpy.flatnonzero(partners == i)[0])))
     static = replace(static, fragments=tuple(fragments), strong_mask=strong, pair_energy=pair,
                      weak_pair_energy=weak_pair, forced_strong_mask=forced)
-    # Persist anchors now; traced frame rebuilding never selects pivots.
-    fragments = tuple(replace(fragment, virtual_anchor_columns=build_boys_ed_frame(common, static, i).virtual_anchor_columns)
-                      for i, fragment in enumerate(static.fragments))
-    return replace(static, fragments=fragments)
+    return static

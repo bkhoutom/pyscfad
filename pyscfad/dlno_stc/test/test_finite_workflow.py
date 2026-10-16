@@ -69,7 +69,7 @@ def test_packet_replay_rejects_changed_identity(boys_water_dimer):
     controls = dict(energy_tolerance=budget['effective_tolerance'])
     metadata = mp2._packet_metadata(mf, static, 0, group, inputs, groups, budget)
     for field, replacement in [('target_indices', [99]), ('candidate_order', []),
-            ('frame_convention', 'semicanonical'), ('virtual_anchor_parent_columns', []),
+            ('frame_convention', 'semicanonical'),
             ('global_target_orbitals', []), ('grouping_fingerprint', '0'*64),
             ('frozen', 0), ('molecular_fingerprint', '0'*64)]:
         changed = deepcopy(metadata)

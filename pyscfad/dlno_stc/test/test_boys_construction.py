@@ -23,7 +23,7 @@ def reference():
     return mf
 
 
-def test_public_selection_preserves_permuted_labels_and_concrete_anchors(reference):
+def test_public_selection_preserves_permuted_labels_and_retained_virtuals(reference):
     assert hasattr(dlno_stc, "build_domain_selections")
     static = dlno_stc.build_domain_selections(
         reference, frozen=1, frag_lolist=[[3], [1], [0], [2]],
@@ -35,7 +35,7 @@ def test_public_selection_preserves_permuted_labels_and_concrete_anchors(referen
         frame = domain.build_boys_ed_frame(common, static, index)
         assert frame.target_index == index
         assert fragment.target_index == index
-        assert len(fragment.virtual_anchor_columns) == 2
+        assert frame.virtual_coeff.shape[1] == 2
         ao = fragment.extended_ao_indices
         s22 = np.asarray(common.s1e)[np.ix_(ao, ao)]
         candidates = np.asarray(common.iao_coeff)[:, [3, 1, 0, 2]]
@@ -75,7 +75,6 @@ def test_standalone_system_frame_replays_frozen_virtual_and_continuous_response(
     seed = jax.numpy.asarray(np.random.default_rng(4).normal(size=frame.virtual_coeff.shape))
     _, pullback = jax.vjp(lambda mf: domain.build_system_local_frame(
         mf, occupied, virtual, boys_reference=frame.boys_reference,
-        virtual_anchor_columns=frame.virtual_anchor_columns,
     ).virtual_coeff, reference)
     bar, = pullback(seed)
     assert np.linalg.norm(np.asarray(bar.mo_coeff)) > 1e-6

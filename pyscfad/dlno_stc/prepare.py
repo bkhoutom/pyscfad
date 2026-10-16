@@ -44,9 +44,9 @@ def prepare_inputs(mf, common, static, fragment_index):
     """Prepare exactly three tensors in one fixed, labelled finite Boys frame.
 
     ``common`` is rebuilt by the independent Boys ``rebuild_domain_data``.
-    The saved selection owns the target's local slot and concrete virtual
-    anchors; callers obtain that discrete metadata from ``build_boys_ed_frame``
-    rather than placing it in this differentiable tensor packet. Local AO and
+    The saved selection owns the target's local slot and retained virtual
+    subspace ranks; that discrete metadata stays outside the differentiable
+    tensor packet. Local AO and
     auxiliary supports remain finite through ``get_local_Lov``.
     """
     frame = build_boys_ed_frame(common, static, fragment_index)
@@ -68,12 +68,12 @@ def prepare_boys_group_inputs(mf, common, static, group):
 
 def prepare_system_inputs(
     mf, active_occ_indices, active_vir_indices, *, boys_reference=None,
-    virtual_anchor_columns=None, fock_from_scf=False,
+    fock_from_scf=False,
 ):
     """Project full Fock blocks and fitted factors into one complete local frame.
 
-    Active occupied Boys orbitals and complete PAO-derived active virtuals use
-    fixed reference labels and AO anchors selected before tracing. Their
+    Active occupied Boys orbitals use fixed reference labels selected before
+    tracing; active virtual columns are retained directly. Their
     current continuous coefficients remain in the preparation graph. Attached
     out-of-core factors and their response are streamed without reconstructing
     the AO-pair tensor; the integral-direct fallback does not build a DF leaf.
@@ -88,7 +88,6 @@ def prepare_system_inputs(
     """
     frame = build_system_local_frame(
         mf, active_occ_indices, active_vir_indices, boys_reference=boys_reference,
-        virtual_anchor_columns=virtual_anchor_columns,
     )
     return _project_system_frame(
         mf, frame, active_occ_indices, active_vir_indices,
@@ -115,7 +114,7 @@ def _project_system_frame(mf, frame, active_occ_indices, active_vir_indices, *,
         )
     if fock_from_scf:
         # FC = SC eps holds along the converged SCF solution. Keep eps, C,
-        # S, and the Boys/PAO frame in the graph; independent partial VJPs
+        # S, and the orbital frame in the graph; independent partial VJPs
         # differ from the AO-Fock path until the SCF pullback is applied.
         overlap = mf.get_ovlp()
         foo = _scf_fock_block(mf, overlap, active_occ_indices, co)

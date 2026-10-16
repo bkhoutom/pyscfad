@@ -4,7 +4,7 @@ STC owns Boys selection, exact-frame grouping, weak-pair correction, restart
 serialization, three-tensor preparation and molecular response. Production
 modules and examples do not import native DLNO. Public `frag_lolist` remains
 a complete singleton partition. Internal `DomainGroup` entries merge only
-identical saved supports, candidate ordering, metric ranks and virtual anchors.
+identical saved supports, candidate ordering and retained virtual subspace ranks.
 
 ```python
 from pyscfad import dlno_stc
@@ -27,8 +27,11 @@ only ``mol`` and ``build_mf`` with ``scope="system"`` and a frozen-space setting
 
 Nuclear gradients require coordinate-only molecule leaves
 (`mol.build(trace_exp=False, trace_ctr_coeff=False)`). Selections, domains,
-Laplace grid and anchors remain fixed through response; orbitals, Fock blocks,
-RI factors, Boys localization and SCF are differentiated. Weak corrections
+Laplace grid and retained ranks remain fixed through response; orbitals, Fock blocks,
+RI factors, Boys localization and SCF are differentiated. Finite domains use
+the reconstructed retained PAO virtual space directly; system scope retains
+the selected active virtual MO columns. No virtual anchor selection or extra
+virtual gauge rotation is performed. Weak corrections
 retain the original singleton topology. `scope="system"` retains the complete
 active-space energy and system sampling policy. Its independent controls and
 canonical specialization remain available through the low-level full solver.
@@ -196,7 +199,7 @@ Partial job replay requires both `include_hf=False` and `include_weak=False`.
 
 Fingerprints cover tensors, controls, molecular preparation, frozen space,
 original/global target identities, actual local `target_indices`, ordered Boys
-candidates, AO/auxiliary supports, saved PAO anchors, `local_before_fock_v1`,
+candidates, AO/auxiliary supports, retained PAO ranks, `local_before_fock_v2`,
 group membership and sampling budget. Budget metadata stores `total_tolerance`,
 `original_target_count`, `group_count`, and `effective_tolerance`. Replay does
 not allocate again. Responses must echo the selected identities and frame.
@@ -231,3 +234,8 @@ The optional extension links Armadillo and OpenMP; it requires no Q-Chem or MPI
 library. Imports do not compile or download anything. Examples include the
 small disk workflow, finite `water_tetramer.py`, and unchanged system-scope
 `water_tetramer_full.py`.
+
+Restart algorithm ABI 2 and grouping convention `boys_exact_domain_groups_v2`
+require fresh checkpoints after virtual-frame changes. Older finite packets
+using `local_before_fock_v1` must be re-exported; the outer tensor exchange
+schema and checkpoint container version remain 1.

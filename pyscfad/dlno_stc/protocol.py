@@ -90,10 +90,10 @@ def _check_metadata(metadata, nocc=None):
         raise ValueError("basis_frame must be orthonormal_local")
     if metadata["energy_kind"] == "finite_boys_target_mp2_v1":
         for field in ("global_target_orbitals", "candidate_order", "frame_convention",
-                      "virtual_anchor_parent_columns", "grouping_fingerprint", "budget"):
+                      "grouping_fingerprint", "budget"):
             if field not in metadata:
                 raise ValueError(f"metadata missing {field}")
-        if metadata["frame_convention"] != "local_before_fock_v1":
+        if metadata["frame_convention"] != "local_before_fock_v2":
             raise ValueError("unsupported frame_convention")
         budget = metadata["budget"]
         required = {"total_tolerance", "original_target_count", "group_count", "effective_tolerance"}
@@ -284,7 +284,7 @@ def validate_result(result, inputs, metadata, *, controls=None,
             raise ValueError(f"result {field} does not match request")
     if metadata["energy_kind"] == "finite_boys_target_mp2_v1":
         for field in ("frame_convention", "global_target_orbitals", "candidate_order",
-                      "virtual_anchor_parent_columns", "grouping_fingerprint", "budget"):
+                      "grouping_fingerprint", "budget"):
             if field not in result_md or canonical_json(result_md[field]) != canonical_json(metadata[field]):
                 raise ValueError(f"result {field} does not match request")
     if result_md["request_fingerprint"] != expected_fingerprint:

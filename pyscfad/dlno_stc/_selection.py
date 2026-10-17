@@ -521,6 +521,43 @@ def _validate_boys_target_groups(frag_lolist, nocc):
     return tuple(groups)
 
 
+def _boys_atom_groups(mol, targets, singleton_groups):
+    """Assign active Boys columns by Löwdin population, returning record indices."""
+    nocc = numpy.shape(targets)[1]
+    singletons = _validate_boys_target_groups(singleton_groups, nocc)
+    atom_groups = tools.autofrag(mol, H2heavy=True)
+    column_groups = tools.map_lo_to_frag(mol, targets, atom_groups, verbose=0)
+    columns = tuple(_grouping_indices(group, nocc, "Boys atom-group indices")
+                    for group in column_groups if len(group))
+    if sorted(column for group in columns for column in group) != list(range(nocc)):
+        raise ValueError("Boys atom groups require a disjoint complete partition")
+    column_to_record = {int(group[0]): record
+                        for record, group in enumerate(singletons)}
+    return tuple(numpy.asarray([column_to_record[column] for column in group],
+                               dtype=numpy.int32) for group in columns)
+
+
+def _expand_group_strong_mask(orbital_mask, groups):
+    """Lift any-member adjacency to complete physical-group blocks."""
+    orbital_mask = numpy.asarray(orbital_mask, dtype=bool)
+    if orbital_mask.ndim != 2 or orbital_mask.shape[0] != orbital_mask.shape[1]:
+        raise ValueError("Boys strong graph must be square")
+    nfrag = orbital_mask.shape[0]
+    groups = tuple(_grouping_indices(group, nfrag, "Boys physical-group indices")
+                   for group in groups)
+    if (any(not group for group in groups)
+            or sorted(index for group in groups for index in group) != list(range(nfrag))):
+        raise ValueError("Boys physical groups require a disjoint complete partition")
+    orbital_mask = orbital_mask | orbital_mask.T
+    effective = numpy.zeros_like(orbital_mask)
+    for left, members_left in enumerate(groups):
+        for right, members_right in enumerate(groups):
+            block = numpy.ix_(members_left, members_right)
+            if left == right or numpy.any(orbital_mask[block]):
+                effective[block] = True
+    return effective
+
+
 def _validate_reference(mf, frozen):
     if not isinstance(mf, RHF) or isinstance(mf, KohnShamDFT):
         raise NotImplementedError("Boys STC requires a restricted Hartree-Fock (RHF) reference")
@@ -560,11 +597,14 @@ def _validate_reference(mf, frozen):
 def build_domain_selections(
     mf, *, frozen, thresholds=None, lo_kwargs=None, target_coeff=None,
     frag_lolist=None, pair_energy_model="multipole", force_full_domains=False,
+    boys_grouping="singleton",
 ):
     """Select Boys domains, full occupied labels and retained virtual subspaces.
 
     Fragment order is independent of global Boys column order. Thresholds,
     ranks and graph are chosen only from concrete reference data.
+    ``boys_grouping="atom"`` shares strong frames within Löwdin atom groups;
+    weak screens and target records remain individual occupied orbitals.
     """
     from .domain import DomainData, TargetOccupiedData
     from ._pairs import screen_pairs
@@ -572,6 +612,8 @@ def build_domain_selections(
     thresholds = BoysDomainThresholds() if thresholds is None else thresholds
     if not isinstance(thresholds, BoysDomainThresholds):
         raise TypeError("thresholds must be BoysDomainThresholds")
+    if boys_grouping not in ("singleton", "atom"):
+        raise ValueError("boys_grouping must be 'singleton' or 'atom'")
     _validate_reference(mf, frozen)
     options = _resolve_boys_options(lo_kwargs)
     model = str(pair_energy_model).lower().replace("_", "-")
@@ -600,6 +642,9 @@ def build_domain_selections(
             or numpy.max(abs(residual)) > 1e-8):
         raise ValueError("Boys targets must span the active occupied space")
     groups = _validate_boys_target_groups(frag_lolist, active_occ.size)
+    physical_groups = (_boys_atom_groups(mol, targets, groups)
+                       if boys_grouping == "atom" else
+                       tuple(numpy.array([i], dtype=numpy.int32) for i in range(len(groups))))
     out = _host_array(mf.mo_coeff)[:, projected_out]
     raw_pao = numpy.eye(mol.nao) - out @ (out.T @ overlap)
     norms = numpy.sqrt(numpy.einsum("ui,uv,vi->i", raw_pao, overlap, raw_pao))
@@ -615,6 +660,16 @@ def build_domain_selections(
     nfrag = len(groups)
     if force_full_domains:
         compact, primary_bp, tight, primary = [tuple(numpy.arange(mol.natm, dtype=numpy.int32) for _ in groups) for _ in range(4)]
+    if boys_grouping == "atom":
+        # Each orbital keeps its own weak target on the group's common support.
+        # Compact lists stay individual for the existing near-distance forcing.
+        primary_bp, primary = list(primary_bp), list(primary)
+        for members in physical_groups:
+            common_bp = _union_index_lists([primary_bp[i] for i in members])
+            common_primary = _union_index_lists([primary[i] for i in members])
+            for i in members:
+                primary_bp[i], primary[i] = common_bp, common_primary
+        primary_bp, primary = tuple(primary_bp), tuple(primary)
     empty = numpy.zeros(0, dtype=numpy.int32)
     fragments = []
     for i, group in enumerate(groups):
@@ -646,8 +701,11 @@ def build_domain_selections(
                               compact_bp_domain=compact, primary_bp_domain=primary_bp, tight_bp_domain=tight,
                               pao_bp_domain=pao_bp, primary_domain=primary, pair_energy_model=model)
     pair, weak_pair, forced, strong = screen_pairs(mf, common, static, model=model, force_full_domains=force_full_domains)
-    fragments = []
-    for i, fragment in enumerate(static.fragments):
+    if boys_grouping == "atom":
+        strong = _expand_group_strong_mask(strong, physical_groups)
+    fragments = list(static.fragments)
+    for members in physical_groups:
+        i = int(members[0])
         partners = numpy.flatnonzero(strong[i]).astype(numpy.int32)
         if numpy.count_nonzero(partners == i) != 1:
             raise RuntimeError(f"Boys domain {i} must include its target exactly once")
@@ -667,9 +725,15 @@ def build_domain_selections(
         )
         if not coeff.shape[1]:
             raise RuntimeError(f"Boys domain {i} has no retained virtual space; rebuild domains")
-        fragments.append(replace(fragment, strong_fragments=partners, extended_atoms=atoms, extended_ao_indices=ao,
-                                 pao_center_atoms=centers, strong_occ_metric_keep=keep, strong_virtual=selection,
-                                 target_index=int(numpy.flatnonzero(partners == i)[0])))
+        for member in members:
+            member = int(member)
+            slots = numpy.flatnonzero(partners == member)
+            if slots.size != 1:
+                raise RuntimeError(f"Boys domain {member} must include its target exactly once")
+            fragments[member] = replace(fragments[member], strong_fragments=partners,
+                                       extended_atoms=atoms, extended_ao_indices=ao,
+                                       pao_center_atoms=centers, strong_occ_metric_keep=keep,
+                                       strong_virtual=selection, target_index=int(slots[0]))
     static = replace(static, fragments=tuple(fragments), strong_mask=strong, pair_energy=pair,
                      weak_pair_energy=weak_pair, forced_strong_mask=forced)
     return static

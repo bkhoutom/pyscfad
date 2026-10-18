@@ -148,7 +148,7 @@ def solve(inputs, metadata, controls, *, comm=None, with_grad=True, aux_offsets=
             "replica_count": size,
         })
     for name in ("frame_convention", "global_target_orbitals", "candidate_order",
-                 "grouping_fingerprint", "budget"):
+                 "virtual_anchor_parent_columns", "grouping_fingerprint", "budget"):
         if name in metadata:
             result["metadata"][name] = metadata[name]
     if with_grad:

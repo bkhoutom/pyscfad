@@ -190,6 +190,7 @@ def grouped_preparation_and_response(output_dir):
                          'global_targets': labels, 'local_targets': list(group.target_indices),
                          'representative': group.representative_index,
                          'ordered_partner_labels': partners,
+                         'virtual_anchors': list(representative.virtual_anchor_columns),
                          'extended_atoms': representative.extended_atoms.tolist(),
                          'extended_ao_indices': representative.extended_ao_indices.tolist(),
                          'dimensions': [naux, nocc, nvir]})
@@ -198,6 +199,7 @@ def grouped_preparation_and_response(output_dir):
                          'members': json.dumps(group.fragment_indices), 'local_slot': slot,
                          'representative': group.representative_index,
                          'ordered_partner_labels': json.dumps(partners),
+                         'virtual_anchors': json.dumps(representative.virtual_anchor_columns),
                          'atom_support_size': len(representative.extended_atoms),
                          'ao_support_size': len(representative.extended_ao_indices),
                          'pao_support_size': len(representative.strong_virtual.parent_columns),

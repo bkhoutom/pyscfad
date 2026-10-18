@@ -31,6 +31,7 @@ def grouping_fixture():
         np.array([i % 2]), np.array([i % 4]), np.array([i % 2]),
         np.array([i % 2]), np.array([0]), None,
         int(np.flatnonzero(partners == i)[0]),
+        virtual_anchor_columns=(0, 1),
     ) for i, label in enumerate(labels))
     return DomainSelections(
         0, BoysDomainThresholds(), np.arange(8), np.array([8, 9]),
@@ -111,6 +112,71 @@ def test_grouping_preserves_order_and_rejects_invalid_saved_labels():
         dlno_stc.build_domain_groups(replace(
             static, frag_lolist=(np.array([2**32]),) + static.frag_lolist[1:],
         ))
+
+
+def test_grouping_requires_identical_saved_virtual_anchors():
+    static = grouping_fixture()
+    changed = replace(static.fragments[1], virtual_anchor_columns=(1, 0))
+    groups = dlno_stc.build_domain_groups(replace(
+        static, fragments=(static.fragments[0], changed) + static.fragments[2:],
+    ))
+    assert groups[0].fragment_indices == (0, 2, 3, 4, 5, 6, 7)
+    assert groups[1].fragment_indices == (1,)
+
+
+@pytest.mark.parametrize("anchors", [
+    None, (0,), (0, 0), (0, 3), (0, True), (0, 1.0),
+    np.array([0, 2**32], dtype=np.uint64),
+])
+def test_grouping_rejects_invalid_virtual_anchors(anchors):
+    static = grouping_fixture()
+    broken = replace(static.fragments[0], virtual_anchor_columns=anchors)
+    with pytest.raises(ValueError, match="anchor"):
+        dlno_stc.build_domain_groups(replace(
+            static, fragments=(broken,) + static.fragments[1:],
+        ))
+
+
+@pytest.mark.parametrize("boys_grouping", ["singleton", "atom"])
+def test_strong_selection_and_qr_run_once_per_unique_frame(
+    boys_water_dimer, monkeypatch, boys_grouping,
+):
+    from pyscfad.dlno_stc import _selection, domain
+
+    mf, _common, reference = boys_water_dimer
+    strong_selections, qr_calls = [], []
+    original_selection = _selection._reference_pao_overlap_selection
+    original_qr = _selection.scipy_linalg.qr
+
+    def counted_selection(*args, **kwargs):
+        if kwargs["completeness_threshold"] == reference.thresholds.ed_pao:
+            strong_selections.append(kwargs)
+        return original_selection(*args, **kwargs)
+
+    def counted_qr(*args, **kwargs):
+        qr_calls.append(args[0].shape)
+        return original_qr(*args, **kwargs)
+
+    def unexpected_frame_replay(*args, **kwargs):
+        pytest.fail("anchor selection must reuse the retained reference subspace")
+
+    monkeypatch.setattr(_selection, "_reference_pao_overlap_selection", counted_selection)
+    monkeypatch.setattr(_selection.scipy_linalg, "qr", counted_qr)
+    monkeypatch.setattr(domain, "build_boys_ed_frame", unexpected_frame_replay)
+    static = dlno_stc.build_domain_selections(
+        mf, frozen=reference.frozen, target_coeff=reference.target_reference_coeff,
+        force_full_domains=True, pair_energy_model="all-strong",
+        boys_grouping=boys_grouping,
+    )
+    assert len(dlno_stc.build_domain_groups(static)) == 1
+    assert len(strong_selections) == len(qr_calls) == 1
+    anchors = static.fragments[0].virtual_anchor_columns
+    assert isinstance(anchors, tuple)
+    for fragment in static.fragments:
+        assert fragment.virtual_anchor_columns == anchors
+        assert len(anchors) == len(fragment.strong_virtual.metric_keep)
+        assert len(set(anchors)) == len(anchors)
+        assert set(anchors) <= set(fragment.strong_virtual.parent_columns)
 
 
 def test_grouped_selected_energy_and_three_bars():

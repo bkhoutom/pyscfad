@@ -72,6 +72,7 @@ def isolated_smoke(output_dir):
         lambda x: prepare_system_inputs(
             x, static.active_occ_indices, static.active_vir_indices,
             boys_reference=frame.boys_reference,
+            virtual_anchor_columns=frame.virtual_anchor_columns,
         ), mf,
     )
     assert set(packet) == set(system) == {"foo", "fvv", "B"}

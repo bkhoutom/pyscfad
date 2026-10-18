@@ -63,7 +63,7 @@ def _check_mapping(value, name):
         raise ValueError(f"{name} must be a dictionary")
 
 
-def _check_metadata(metadata, nocc=None):
+def _check_metadata(metadata, nocc=None, nvir=None):
     _check_mapping(metadata, "metadata")
     for field in _IDENTITY_FIELDS + _DESCRIPTIVE_FIELDS:
         if field not in metadata:
@@ -90,11 +90,17 @@ def _check_metadata(metadata, nocc=None):
         raise ValueError("basis_frame must be orthonormal_local")
     if metadata["energy_kind"] == "finite_boys_target_mp2_v1":
         for field in ("global_target_orbitals", "candidate_order", "frame_convention",
-                      "grouping_fingerprint", "budget"):
+                      "virtual_anchor_parent_columns", "grouping_fingerprint", "budget"):
             if field not in metadata:
                 raise ValueError(f"metadata missing {field}")
-        if metadata["frame_convention"] != "local_before_fock_v2":
+        if metadata["frame_convention"] != "local_before_fock_v3":
             raise ValueError("unsupported frame_convention")
+        anchors = metadata["virtual_anchor_parent_columns"]
+        if (not isinstance(anchors, (list, tuple))
+                or (nvir is not None and len(anchors) != nvir)
+                or any(type(column) is not int or column < 0 for column in anchors)
+                or len(set(anchors)) != len(anchors)):
+            raise ValueError("virtual_anchor_parent_columns must contain one distinct nonnegative PAO label per virtual orbital")
         budget = metadata["budget"]
         required = {"total_tolerance", "original_target_count", "group_count", "effective_tolerance"}
         if not isinstance(budget, dict) or set(budget) != required:
@@ -183,7 +189,7 @@ def validate_inputs(inputs, metadata):
     nocc, nvir = foo.shape[0], fvv.shape[0]
     if nocc == 0:
         raise ValueError("empty occupied space is a host-side no-work case")
-    _check_metadata(metadata, nocc)
+    _check_metadata(metadata, nocc, nvir)
     _check_array(foo, "foo", (nocc, nocc), symmetric=True)
     _check_array(fvv, "fvv", (nvir, nvir), symmetric=True)
     _check_array(B, "B", (B.shape[0], nocc, nvir))
@@ -284,7 +290,7 @@ def validate_result(result, inputs, metadata, *, controls=None,
             raise ValueError(f"result {field} does not match request")
     if metadata["energy_kind"] == "finite_boys_target_mp2_v1":
         for field in ("frame_convention", "global_target_orbitals", "candidate_order",
-                      "grouping_fingerprint", "budget"):
+                      "virtual_anchor_parent_columns", "grouping_fingerprint", "budget"):
             if field not in result_md or canonical_json(result_md[field]) != canonical_json(metadata[field]):
                 raise ValueError(f"result {field} does not match request")
     if result_md["request_fingerprint"] != expected_fingerprint:

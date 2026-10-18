@@ -34,6 +34,9 @@ def test_grouped_export_deserialize_solve_and_replay(boys_water_dimer, tmp_path,
         inputs, metadata, effective, result = mp2.load_disk_packet(tmp_path, i)
         assert tuple(metadata['target_indices']) == group.target_indices
         assert metadata['energy_kind'] == 'finite_boys_target_mp2_v1'
+        assert metadata['frame_convention'] == 'local_before_fock_v3'
+        assert metadata['virtual_anchor_parent_columns'] == list(
+            static.fragments[group.representative_index].virtual_anchor_columns)
         assert metadata['budget'] == dict(total_tolerance=.0003,
             original_target_count=8, group_count=len(groups),
             effective_tolerance=.0003/np.sqrt(len(groups)))
@@ -70,6 +73,7 @@ def test_packet_replay_rejects_changed_identity(boys_water_dimer):
     metadata = mp2._packet_metadata(mf, static, 0, group, inputs, groups, budget)
     for field, replacement in [('target_indices', [99]), ('candidate_order', []),
             ('frame_convention', 'semicanonical'),
+            ('virtual_anchor_parent_columns', []),
             ('global_target_orbitals', []), ('grouping_fingerprint', '0'*64),
             ('frozen', 0), ('molecular_fingerprint', '0'*64)]:
         changed = deepcopy(metadata)

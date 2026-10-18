@@ -53,9 +53,9 @@ __all__ = [
 _FORMAT_NAME = "pyscfad-dlno-stc-boys-restart"
 _FORMAT_VERSION = 1
 # Invalidate cotangents when the selected three-input Boys equations change.
-_ALGORITHM_ABI = 2
+_ALGORITHM_ABI = 3
 _EQUATION_ID = "boys-selected-three-input-v1"
-_GROUPING_CONVENTION = "boys_exact_domain_groups_v2"
+_GROUPING_CONVENTION = "boys_exact_domain_groups_v3"
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 # Tests may monkeypatch this callable.  It is invoked after a temporary HDF5
@@ -440,7 +440,7 @@ def grouping_payload(static, groups):
     """Fingerprint a grouped worklist with its original singleton selections.
 
     The saved selections retain ordered occupied labels, supports, PAO ranks,
-    reference frames; typed groups retain membership and target
+    reference frames and anchors; typed groups retain membership and target
     slots. Singleton checkpoints need no grouping payload or migration.
     """
     payload = {

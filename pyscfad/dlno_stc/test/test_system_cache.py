@@ -45,19 +45,23 @@ def _holder(mol, coeff, with_df):
 
 
 def _frame_selections(mf):
-    # Select the discrete occupied Boys branch before either VJP.
+    # Select the discrete Boys branch and PAO anchors before either VJP.
     return {
         "boys_reference": domain.select_system_boys_reference(mf, OCCUPIED),
+        "virtual_anchor_columns": domain.select_system_virtual_anchor_columns(
+            mf, VIRTUAL,
+        ),
     }
 
 
-def _direct_B(mol, coeff, *, boys_reference):
+def _direct_B(mol, coeff, *, boys_reference, virtual_anchor_columns):
     with_df = df.DF(mol, auxbasis="weigend")
     holder = _holder(mol, coeff, with_df)
     # This oracle tests fitted-factor reuse in the tracked local frame; the
     # independent local-frame tests cover the localization itself.
     frame = domain.build_system_local_frame(
         holder, OCCUPIED, VIRTUAL, boys_reference=boys_reference,
+        virtual_anchor_columns=virtual_anchor_columns,
     )
     active_coeff = adnp.concatenate(
         (frame.occupied_coeff, frame.virtual_coeff), axis=1,

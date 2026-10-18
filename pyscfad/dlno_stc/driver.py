@@ -35,7 +35,7 @@ from ._workflow import check_system_memory, check_domain_memory, allocate_domain
 from .adjoint import apply_full_pullback, apply_selected_pullback
 from .controls import DEFAULT_ENERGY_TOLERANCE, default_laplace_grid
 from .domain import (
-    select_system_boys_reference,
+    select_system_boys_reference, select_system_virtual_anchor_columns,
 )
 from .parallel import run_backend
 from .prepare import prepare_system_inputs, prepare_boys_group_inputs
@@ -438,9 +438,13 @@ def _prepare_system(state, controls, with_grad):
     state["boys_reference"] = select_system_boys_reference(
         state["mf"], state["occupied"], lo_kwargs=state["lo_kwargs"],
     )
+    state["virtual_anchor_columns"] = select_system_virtual_anchor_columns(
+        state["mf"], state["virtual"],
+    )
     prepare = lambda mf_: prepare_system_inputs(
         mf_, state["occupied"], state["virtual"],
         boys_reference=state["boys_reference"],
+        virtual_anchor_columns=state["virtual_anchor_columns"],
         fock_from_scf=state["fock_from_scf"],
     )
     with warnings.catch_warnings():
@@ -543,7 +547,7 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
     """Return ``(energy, mol_bar)`` on root; worker ranks return ``None``.
 
     Discrete selections and the Laplace grid are fixed. System scope fixes
-    Boys reference labels and retains active virtual columns, while coordinate
+    Boys reference labels and complete PAO virtual anchors, while coordinate
     response includes localization, projections, Cholesky orthonormalization,
     full Fock blocks, fitted factors and SCF.
     For system scope, ``build_mf`` must return converged canonical orbitals

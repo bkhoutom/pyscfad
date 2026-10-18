@@ -85,6 +85,7 @@ class FragmentDomainSelection:
     weak_occ_span_metric_keep: numpy.ndarray
     weak_virtual: FixedPAOSubspaceSelection | None
     target_index: int
+    virtual_anchor_columns: tuple[int, ...] | None = None
 
     @property
     def has_weak_screen(self):
@@ -148,11 +149,56 @@ def _grouping_target_slot(value, nocc, label):
     return int(value)
 
 
+def _validate_virtual_anchor_columns(columns, parent, nvir):
+    """Validate saved PAO-column labels before replaying a virtual frame."""
+    try:
+        columns = tuple(columns)
+    except TypeError as err:
+        raise ValueError("virtual anchor columns must be a sequence") from err
+    allowed = set(int(index) for index in parent)
+    if (len(columns) != nvir
+            or any(not isinstance(index, numbers.Integral)
+                   or isinstance(index, (bool, numpy.bool_))
+                   or int(index) not in allowed for index in columns)):
+        raise ValueError(
+            "virtual anchor columns must be distinct selected PAO parents "
+            "with one column per retained virtual orbital"
+        )
+    normalized = tuple(int(index) for index in columns)
+    if len(set(normalized)) != nvir:
+        raise ValueError(
+            "virtual anchor columns must be distinct selected PAO parents "
+            "with one column per retained virtual orbital"
+        )
+    return normalized
+
+
+def _select_virtual_anchor_columns(coeff, overlap21, pao_coeff, parent):
+    """Choose pivots from an already retained reference virtual subspace.
+
+    The reference coefficients are metric orthonormal. Contracting directly
+    with the global parents gives the same cross metric as projecting every
+    parent onto the ED, without another frame build or local linear solve.
+    """
+    parent = numpy.asarray(parent)
+    nvir = coeff.shape[1]
+    if not nvir:
+        return ()
+    cross = coeff.T.conj() @ overlap21 @ pao_coeff[:, parent]
+    _, triangular, pivots = scipy_linalg.qr(
+        cross, pivoting=True, mode="economic", check_finite=True,
+    )
+    diagonal = numpy.abs(numpy.diag(triangular))
+    if diagonal.size < nvir or numpy.min(diagonal[:nvir]) < 1e-10:
+        raise RuntimeError("selected PAO parent anchors lost rank")
+    return tuple(int(parent[index]) for index in pivots[:nvir])
+
+
 def _strong_preparation_key(static, fragment, index, labels):
     """Use exactly the saved strong replay frame; exclude weak/target fields.
 
     The Boys frame projects all ordered partners, applies metric Cholesky,
-    and replays the retained PAO subspace selections.
+    and replays the retained PAO subspace in its saved parent-anchor gauge.
     None of those continuous operations uses the central singleton target.
     ``extended_atoms`` also determines the local auxiliary support in DF.
     Reference orbitals, frozen spaces and DF setup are shared by ``static``.
@@ -186,8 +232,13 @@ def _strong_preparation_key(static, fragment, index, labels):
     overlap = _grouping_indices(selection.overlap_keep, len(canonical), "overlap PAO keep")
     completeness = _grouping_indices(selection.completeness_keep, len(overlap), "completeness PAO keep")
     metric = _grouping_indices(selection.metric_keep, len(completeness), "metric PAO keep")
+    if fragment.virtual_anchor_columns is None:
+        raise ValueError(f"Boys domain {index} requires saved virtual anchors before grouping")
+    anchors = _validate_virtual_anchor_columns(
+        fragment.virtual_anchor_columns, parent, len(metric),
+    )
     return (partners, candidates, keep, supports,
-            (parent, support, canonical, overlap, completeness, metric)), candidates, slot
+            (parent, support, canonical, overlap, completeness, metric), anchors), candidates, slot
 
 
 def build_domain_groups(static, *, merge_identical=True) -> tuple[DomainGroup, ...]:
@@ -599,10 +650,10 @@ def build_domain_selections(
     frag_lolist=None, pair_energy_model="multipole", force_full_domains=False,
     boys_grouping="singleton",
 ):
-    """Select Boys domains, full occupied labels and retained virtual subspaces.
+    """Select Boys domains, occupied labels, virtual ranks and fixed anchors.
 
     Fragment order is independent of global Boys column order. Thresholds,
-    ranks and graph are chosen only from concrete reference data.
+    ranks, graph and pivots are chosen only from concrete reference data.
     ``boys_grouping="atom"`` shares strong frames within Löwdin atom groups;
     weak screens and target records remain individual occupied orbitals.
     """
@@ -704,6 +755,7 @@ def build_domain_selections(
     if boys_grouping == "atom":
         strong = _expand_group_strong_mask(strong, physical_groups)
     fragments = list(static.fragments)
+    strong_frames = {}
     for members in physical_groups:
         i = int(members[0])
         partners = numpy.flatnonzero(strong[i]).astype(numpy.int32)
@@ -711,20 +763,32 @@ def build_domain_selections(
             raise RuntimeError(f"Boys domain {i} must include its target exactly once")
         centers = _union_index_lists([compact[p] for p in partners])
         atoms = _union_index_lists([tight[p] for p in partners])
-        ao = tools.ao_index_by_atom(mol, atoms).astype(numpy.int32)
-        s22 = overlap[numpy.ix_(ao, ao)]
-        candidates = numpy.concatenate([targets[:, groups[p]] for p in partners], axis=1)
-        projected = tools.project_mo(candidates, overlap[ao], s22)
-        occupied_local, keep = _reference_metric_space(projected, s22, thresholds.metric_rank)
-        if keep.size != partners.size:
-            raise RuntimeError(f"Boys domain {i} loses occupied target/partner labels; rebuild domains with tighter support")
-        selection, coeff = _reference_pao_overlap_selection(
-            mol, pao_coeff, ao2pao, overlap, parent_atoms=centers, support_atoms=atoms, representation_atoms=atoms,
-            completeness_threshold=thresholds.ed_pao, overlap_threshold=thresholds.domain_pao,
-            occupied_for_projection=occupied_local, metric_threshold=thresholds.metric_rank,
+        # Ordered partners and supports determine the complete strong frame;
+        # the central target slot and weak records do not enter its build.
+        frame_key = tuple(
+            tuple(int(index) for index in indices)
+            for indices in (partners, centers, atoms)
         )
-        if not coeff.shape[1]:
-            raise RuntimeError(f"Boys domain {i} has no retained virtual space; rebuild domains")
+        if frame_key not in strong_frames:
+            ao = tools.ao_index_by_atom(mol, atoms).astype(numpy.int32)
+            s22 = overlap[numpy.ix_(ao, ao)]
+            candidates = numpy.concatenate([targets[:, groups[p]] for p in partners], axis=1)
+            projected = tools.project_mo(candidates, overlap[ao], s22)
+            occupied_local, keep = _reference_metric_space(projected, s22, thresholds.metric_rank)
+            if keep.size != partners.size:
+                raise RuntimeError(f"Boys domain {i} loses occupied target/partner labels; rebuild domains with tighter support")
+            selection, coeff = _reference_pao_overlap_selection(
+                mol, pao_coeff, ao2pao, overlap, parent_atoms=centers, support_atoms=atoms, representation_atoms=atoms,
+                completeness_threshold=thresholds.ed_pao, overlap_threshold=thresholds.domain_pao,
+                occupied_for_projection=occupied_local, metric_threshold=thresholds.metric_rank,
+            )
+            if not coeff.shape[1]:
+                raise RuntimeError(f"Boys domain {i} has no retained virtual space; rebuild domains")
+            anchors = _select_virtual_anchor_columns(
+                coeff, overlap[ao], pao_coeff, selection.parent_columns,
+            )
+            strong_frames[frame_key] = ao, keep, selection, anchors
+        ao, keep, selection, anchors = strong_frames[frame_key]
         for member in members:
             member = int(member)
             slots = numpy.flatnonzero(partners == member)
@@ -733,7 +797,8 @@ def build_domain_selections(
             fragments[member] = replace(fragments[member], strong_fragments=partners,
                                        extended_atoms=atoms, extended_ao_indices=ao,
                                        pao_center_atoms=centers, strong_occ_metric_keep=keep,
-                                       strong_virtual=selection, target_index=int(slots[0]))
+                                       strong_virtual=selection, target_index=int(slots[0]),
+                                       virtual_anchor_columns=anchors)
     static = replace(static, fragments=tuple(fragments), strong_mask=strong, pair_energy=pair,
                      weak_pair_energy=weak_pair, forced_strong_mask=forced)
     return static

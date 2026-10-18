@@ -12,6 +12,7 @@ from pyscfad.lno.lno_base import SEMICANONICAL_DEG_THRESH
 from ._selection import (
     DomainSelections, _PAO_ORTH_THRESHOLD, _host_array, _hermitian_numpy,
     _orthogonalize, _build_boys_targets, _resolve_boys_options,
+    _validate_virtual_anchor_columns,
 )
 
 
@@ -24,18 +25,19 @@ class SystemBoysReference(NamedTuple):
 
 
 class SystemLocalFrame(NamedTuple):
-    """Complete active spaces, with fixed occupied Boys reference labels."""
+    """Complete active spaces, with discrete Boys and AO-anchor metadata."""
 
     occupied_coeff: object
     virtual_coeff: object
     boys_reference: SystemBoysReference | None
+    virtual_anchor_columns: tuple[int, ...]
 
 
 def _require_concrete_system_selection(mf):
     if any(isinstance(leaf, jax.core.Tracer)
            for leaf in jax.tree_util.tree_leaves((mf.mol, mf.mo_coeff))):
         raise ValueError(
-            "select the system Boys reference "
+            "select the system Boys reference and virtual anchor columns "
             "from concrete data before tracing preparation"
         )
 
@@ -60,24 +62,55 @@ def select_system_boys_reference(mf, active_occ_indices, *, lo_kwargs=None):
     )
 
 
+def select_system_virtual_anchor_columns(mf, active_vir_indices):
+    """Select exactly nvir independent projected AO columns, without domains."""
+    _require_concrete_system_selection(mf)
+    virtual = mf.mo_coeff[:, active_vir_indices]
+    nvir = virtual.shape[1]
+    if not nvir:
+        return ()
+    overlap = mf.mol.intor_symmetric("int1e_ovlp")
+    cross = _host_array(virtual.T.conj() @ overlap)
+    _, triangular, pivots = scipy_linalg.qr(
+        cross, pivoting=True, mode="economic", check_finite=True,
+    )
+    diagonal = numpy.abs(numpy.diag(triangular))
+    if diagonal.size < nvir or numpy.min(diagonal[:nvir]) < 1e-10:
+        raise ValueError("system projected AO anchors do not span the active virtual space")
+    return tuple(int(column) for column in pivots[:nvir])
+
+
 def build_system_local_frame(
     mf, active_occ_indices, active_vir_indices, *, boys_reference=None,
+    virtual_anchor_columns=None,
 ):
-    """Replay occupied Boys labels and retain the active virtual columns.
+    """Rebuild one complete Boys/PAO frame with only discrete choices fixed.
 
     Frozen occupied and virtual columns must already be excluded by the
-    supplied active indices. Concrete calls may select their Boys reference;
-    a preparation VJP must receive that selection from its caller. Current
-    occupied localization and virtual coefficients remain differentiable.
-    No ED support selection or virtual rank truncation occurs.
+    supplied active indices. Concrete calls may select their reference and
+    anchors; a preparation VJP must receive both selections from its caller.
+    Current Boys coefficients, AO projections, overlap and Cholesky remain
+    differentiable. No ED support selection or virtual rank truncation occurs.
     """
+
     occupied = mf.mo_coeff[:, active_occ_indices]
     virtual = mf.mo_coeff[:, active_vir_indices]
     if boys_reference is None and occupied.shape[1]:
         boys_reference = select_system_boys_reference(mf, active_occ_indices)
+    if virtual_anchor_columns is None:
+        virtual_anchor_columns = select_system_virtual_anchor_columns(mf, active_vir_indices)
+    columns = _validate_virtual_anchor_columns(
+        virtual_anchor_columns, numpy.arange(mf.mol.nao), virtual.shape[1],
+    )
     co = (_rebuild_boys_targets(mf, occupied, boys_reference)
           if occupied.shape[1] else occupied)
-    return SystemLocalFrame(co, virtual, boys_reference)
+    if virtual.shape[1]:
+        overlap = mf.mol.intor_symmetric("int1e_ovlp")
+        anchors = virtual @ (virtual.T.conj() @ overlap[:, columns])
+        cv = _cholesky_metric_orthonormalize(anchors, overlap)
+    else:
+        cv = virtual
+    return SystemLocalFrame(co, cv, boys_reference, columns)
 
 
 def _fragment_support(static, fragment_index):
@@ -158,6 +191,30 @@ def _rebuild_local_virtual_subspace(
     return _fixed_metric_orthonormalize(
         candidate, overlap22, selection.metric_keep
     )
+
+
+def _stable_virtual_frame(
+    common, fragment, ao, overlap22, virtual_subspace,
+    virtual_anchor_columns,
+):
+    """Replay the retained-space projector onto saved QR-selected parents.
+
+    Only discrete parent labels are fixed. The projector, PAOs, overlap and
+    Cholesky normalization retain their full response. Contracting S21 with
+    selected parents directly avoids the historical all-parent ED solve:
+    V^H S22 solve(S22, S21 P) = V^H S21 P.
+    """
+    columns = _validate_virtual_anchor_columns(
+        virtual_anchor_columns, fragment.strong_virtual.parent_columns,
+        virtual_subspace.shape[1],
+    )
+    if not columns:
+        return virtual_subspace, columns
+    cross = virtual_subspace.T.conj() @ (
+        common.s1e[ao] @ common.pao_coeff[:, columns]
+    )
+    projected = virtual_subspace @ cross
+    return _cholesky_metric_orthonormalize(projected, overlap22), columns
 
 
 # Boys replay and metric operations copied from dlno/dlno_base.py.
@@ -382,14 +439,15 @@ class BoysEDFrame(NamedTuple):
     extended_ao_indices: numpy.ndarray
     extended_atoms: numpy.ndarray
     target_index: int
+    virtual_anchor_columns: tuple[int, ...]
 
 
-def build_boys_ed_frame(common, static, fragment_index):
+def build_boys_ed_frame(common, static, fragment_index, *, virtual_anchor_columns=None):
     """Replay a finite Boys ED with full ordered occupied label retention.
 
     The target slot is the position of its fragment in strong_fragments. It
     labels an orthogonalized column, not the original projected Boys orbital.
-    Saved reference orbitals, supports and ranks do not freeze response.
+    Saved reference orbitals, supports and anchors do not freeze response.
     """
     if not isinstance(static, DomainSelections) or static.lo_type != "boys":
         raise TypeError("static must be STC Boys DomainSelections")
@@ -415,5 +473,10 @@ def build_boys_ed_frame(common, static, fragment_index):
     occupied = occupied * _positive_pivot_phases(occupied)
     virtual = _rebuild_local_virtual_subspace(common, fragment.strong_virtual, ao, occupied,
                                               boys_metric_threshold=static.thresholds.metric_rank)
+    if virtual_anchor_columns is None:
+        virtual_anchor_columns = fragment.virtual_anchor_columns
+    if virtual_anchor_columns is None:
+        raise ValueError("select virtual anchors from concrete data before preparing the domain")
+    virtual, columns = _stable_virtual_frame(common, fragment, ao, overlap22, virtual, virtual_anchor_columns)
     virtual = virtual * _positive_pivot_phases(virtual)
-    return BoysEDFrame(occupied, virtual, ao, atoms, fragment.target_index)
+    return BoysEDFrame(occupied, virtual, ao, atoms, fragment.target_index, columns)

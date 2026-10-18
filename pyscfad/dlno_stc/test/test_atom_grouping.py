@@ -124,13 +124,22 @@ def test_atom_public_builder_shares_strong_frames_and_preserves_endpoints(
     monkeypatch.setattr(_pairs, "screen_pairs", inspect_screen)
     original_frame = domain.build_boys_ed_frame
     original_qr = domain.scipy_linalg.qr
-    def reject_virtual_anchor_pivoting(*args, **kwargs):
-        assert not kwargs.get("pivoting", False), "atom grouping restored virtual-anchor QR"
+    pivoted_frames = []
+    def count_virtual_anchor_pivoting(*args, **kwargs):
+        if kwargs.get("pivoting", False):
+            pivoted_frames.append(args[0].shape)
         return original_qr(*args, **kwargs)
-    monkeypatch.setattr(domain.scipy_linalg, "qr", reject_virtual_anchor_pivoting)
+    monkeypatch.setattr(domain.scipy_linalg, "qr", count_virtual_anchor_pivoting)
     combined = dlno_stc.build_domain_selections(
         mf, frozen=2, target_coeff=targets, frag_lolist=singleton_groups,
         boys_grouping="atom")
+    jobs = dlno_stc.build_domain_groups(combined)
+    assert len(pivoted_frames) == len(jobs)
+
+    def reject_replayed_virtual_anchor_pivoting(*args, **kwargs):
+        assert not kwargs.get("pivoting", False), "frame replay must reuse saved QR pivots"
+        return original_qr(*args, **kwargs)
+    monkeypatch.setattr(domain.scipy_linalg, "qr", reject_replayed_virtual_anchor_pivoting)
     assert tuple(int(group[0]) for group in combined.frag_lolist) == labels
     _assert_saved_selection_equal(combined.compact_bp_domain,
                                   baseline_permuted.compact_bp_domain)
@@ -161,7 +170,8 @@ def test_atom_public_builder_shares_strong_frames_and_preserves_endpoints(
             assert provisional.iao_indices.size == 1
             assert provisional.weak_occ_norm_keep.size == 1
             for field in ("strong_fragments", "extended_atoms", "extended_ao_indices",
-                          "pao_center_atoms", "strong_occ_metric_keep", "strong_virtual"):
+                          "pao_center_atoms", "strong_occ_metric_keep", "strong_virtual",
+                          "virtual_anchor_columns"):
                 _assert_saved_selection_equal(getattr(fragment, field),
                                               getattr(representative, field))
             slot = fragment.target_index
@@ -170,7 +180,6 @@ def test_atom_public_builder_shares_strong_frames_and_preserves_endpoints(
             assert labels[int(fragment.strong_fragments[slot])] == labels[index]
             assert original_frame(common, combined, index).target_index == slot
         assert len(set(slots)) == len(members)
-    jobs = dlno_stc.build_domain_groups(combined)
     assert all(any(set(map(int, members)).issubset(job.fragment_indices)
                    for job in jobs) for members in expected_physical)
     with pytest.raises(ValueError, match="boys_grouping"):

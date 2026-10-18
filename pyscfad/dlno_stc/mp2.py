@@ -21,7 +21,7 @@ from ._workflow import (check_memory, format_domain_dimensions, revision_status,
 
 _METHOD = "dlno-stc-selected-mp2"
 _ENERGY_KIND = "finite_boys_target_mp2_v1"
-_FRAME = "local_before_fock_v2"
+_FRAME = "local_before_fock_v3"
 
 def solve_request(input_path, result_path, backend, *, comm=None):
     """Call a backend for one saved domain; only the team root writes output."""
@@ -108,11 +108,12 @@ def _packet_metadata(mf, static, group_id, group, inputs, groups, budget, *, ide
         "fragment_indices": list(group.fragment_indices),
         "representative_index": group.representative_index,
         "candidate_order": candidates,
+        "virtual_anchor_parent_columns": list(fragment.virtual_anchor_columns),
         "frame_convention": _FRAME, "basis_frame": "orthonormal_local", "B_axes": "Pia",
         "units": {"energy": "Eh", "length": "bohr"},
         "frozen": numpy.asarray(static.frozen).tolist(),
         "orbital_order": {"occupied": "saved Boys candidates, metric Cholesky before Fock diagonalization",
-                          "virtual": "retained PAO subspace, metric orthonormalization before Fock diagonalization"},
+                          "virtual": "saved PAO anchors, metric Cholesky before Fock diagonalization"},
         "auxiliary_order": {"atoms": numpy.asarray(fragment.extended_atoms).tolist(),
                             "auxbasis": str(mf.with_df.auxbasis)},
         **identity,

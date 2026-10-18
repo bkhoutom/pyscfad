@@ -72,7 +72,8 @@ def finite_metadata():
     md = metadata()
     md.update(energy_kind="finite_boys_target_mp2_v1",
               global_target_orbitals=[5], candidate_order=[2, 5],
-              frame_convention="local_before_fock_v2",
+              frame_convention="local_before_fock_v3",
+              virtual_anchor_parent_columns=[4, 7, 9],
               grouping_fingerprint="a" * 64,
               budget={"total_tolerance": .0003, "original_target_count": 2,
                       "group_count": 1, "effective_tolerance": .0003})
@@ -82,8 +83,9 @@ def finite_metadata():
 def test_finite_packet_declares_selected_mp2_and_rejects_old_identity():
     inputs, md = packet(), finite_metadata()
     validate_inputs(inputs, md)
-    with pytest.raises(ValueError, match="frame_convention"):
-        validate_inputs(inputs, {**md, "frame_convention": "local_before_fock_v1"})
+    for old_frame in ("local_before_fock_v1", "local_before_fock_v2"):
+        with pytest.raises(ValueError, match="frame_convention"):
+            validate_inputs(inputs, {**md, "frame_convention": old_frame})
     for kind in ("finite_three_tensor_v1", "boys_target_mp2_v1"):
         with pytest.raises(ValueError, match="energy_kind"):
             validate_inputs(inputs, {**md, "energy_kind": kind})
@@ -121,12 +123,36 @@ def test_invalid_selected_targets(targets):
 
 
 @pytest.mark.parametrize("field", ["global_target_orbitals", "candidate_order",
-    "frame_convention", "grouping_fingerprint", "budget"])
+    "frame_convention", "virtual_anchor_parent_columns", "grouping_fingerprint", "budget"])
 def test_finite_packet_requires_complete_frame_identity(field):
     md = finite_metadata()
     md.pop(field)
     with pytest.raises(ValueError, match=field):
         validate_inputs(packet(), md)
+
+
+@pytest.mark.parametrize("anchors", [None, [], [0, 1], [0, 0, 2], [-1, 1, 2],
+                                     [True, 1, 2], [0.0, 1, 2], "012"])
+def test_finite_packet_rejects_invalid_saved_virtual_anchors(anchors):
+    md = {**finite_metadata(), "virtual_anchor_parent_columns": anchors}
+    with pytest.raises(ValueError, match="virtual_anchor_parent_columns"):
+        validate_inputs(packet(), md)
+
+
+def test_finite_anchor_labels_define_request_and_result_identity():
+    inputs, md = packet(), finite_metadata()
+    controls = {"energy_tolerance": md["budget"]["effective_tolerance"]}
+    changed = {**md, "virtual_anchor_parent_columns": [4, 9, 7]}
+    assert request_fingerprint(inputs, md, controls) != request_fingerprint(inputs, changed, controls)
+    answer = result(inputs, md, controls)
+    validate_result(answer, inputs, md, controls=controls)
+    for value in (None, changed["virtual_anchor_parent_columns"]):
+        if value is None:
+            answer["metadata"].pop("virtual_anchor_parent_columns")
+        else:
+            answer["metadata"]["virtual_anchor_parent_columns"] = value
+        with pytest.raises(ValueError, match="virtual_anchor_parent_columns"):
+            validate_result(answer, inputs, md, controls=controls)
 
 
 @pytest.mark.parametrize("change, match", [

@@ -81,7 +81,7 @@ def test_boys_packet_uses_finite_ao_aux_support_and_fixed_frame(boys_water_dimer
     ao = numpy.asarray(frame.extended_ao_indices)
     assert len(ao) < mf.mol.nao
     assert frame.target_index == tuple(fragment.strong_fragments).index(0)
-    assert frame.virtual_coeff.shape[1] == len(fragment.strong_virtual.metric_keep)
+    assert tuple(frame.virtual_anchor_columns) == tuple(fragment.virtual_anchor_columns)
     co, cv = numpy.asarray(frame.occupied_coeff), numpy.asarray(frame.virtual_coeff)
     nocc, nvir = co.shape[1], cv.shape[1]
     fock = numpy.asarray(common.fock)[numpy.ix_(ao, ao)]
@@ -123,7 +123,7 @@ def test_boys_three_bar_fock_direction_and_disk_replay(boys_water_dimer):
         numpy.testing.assert_allclose(direct, finite, rtol=1e-6, atol=1e-8)
 
 
-def test_boys_B_bar_follows_retained_pao_response(boys_water_dimer):
+def test_boys_B_bar_follows_fixed_anchor_pao_response(boys_water_dimer):
     mf, common, static = boys_water_dimer
     fragment = static.fragments[0]
     perturbation = numpy.zeros_like(common.pao_coeff)
@@ -157,7 +157,7 @@ def test_system_preparation_preserves_active_spectra(boys_water_dimer, fock_from
     frame = domain.build_system_local_frame(mf, occupied, virtual)
     packet = prepare.prepare_system_inputs(
         mf, occupied, virtual, boys_reference=frame.boys_reference,
-        fock_from_scf=fock_from_scf)
+        virtual_anchor_columns=frame.virtual_anchor_columns, fock_from_scf=fock_from_scf)
     assert set(packet) == {"foo", "fvv", "B"}
     for name, indices in (("foo", occupied), ("fvv", virtual)):
         numpy.testing.assert_allclose(numpy.linalg.eigvalsh(packet[name]),
@@ -203,6 +203,7 @@ def test_independent_system_streamed_and_direct_three_bar_response(
     virtual = numpy.asarray(static.active_vir_indices)
     frame = domain.build_system_local_frame(mf, occupied, virtual)
     options = dict(boys_reference=frame.boys_reference,
+                   virtual_anchor_columns=frame.virtual_anchor_columns,
                    fock_from_scf=True)
     expected, expected_pullback = jax.vjp(
         lambda value: prepare.prepare_system_inputs(value, occupied, virtual, **options), mf)

@@ -48,16 +48,16 @@ def _controls():
 def _local_prepare(mf, frame, virtual=VIRTUAL):
     return prepare.prepare_system_inputs(
         mf, OCCUPIED, virtual, boys_reference=frame.boys_reference,
+        virtual_anchor_columns=frame.virtual_anchor_columns,
     )
 
 
-def test_system_preparation_localizes_occupied_and_retains_active_virtuals(reference):
-    # Occupied Boys replay preserves its Fock couplings; retaining canonical
-    # active virtuals leaves their physical Fock block diagonal.
+def test_system_preparation_uses_nondiagonal_local_fock_blocks(reference):
+    # Replacing the local frame with active canonical MOs loses both local
+    # Fock couplings, even though the resulting MP2 energy is invariant.
     inputs = prepare.prepare_system_inputs(reference, OCCUPIED, VIRTUAL)
     assert _off_diagonal_norm(inputs["foo"]) > 1e-3
-    np.testing.assert_allclose(inputs["fvv"], np.diag(reference.mo_energy[VIRTUAL]),
-                               atol=5e-10, rtol=0)
+    assert _off_diagonal_norm(inputs["fvv"]) > 1e-3
 
 
 @pytest.mark.parametrize("virtual", [VIRTUAL, VIRTUAL[1:]],
@@ -83,7 +83,9 @@ def test_local_frame_spans_exactly_the_selected_active_spaces(reference, virtual
                           np.concatenate((OCCUPIED, virtual)))
     np.testing.assert_allclose(canonical[:, frozen].T @ overlap @ joined,
                                0, atol=2e-10, rtol=0)
-    np.testing.assert_array_equal(cv, canonical[:, virtual])
+    anchors = tuple(frame.virtual_anchor_columns)
+    assert len(anchors) == len(set(anchors)) == len(virtual)
+    assert all(0 <= column < reference.mol.nao for column in anchors)
 
 
 @pytest.mark.parametrize("virtual", [VIRTUAL, VIRTUAL[1:]],
@@ -136,7 +138,7 @@ def test_scf_energy_local_focks_match_generic_without_building_fock(
     monkeypatch.setattr(type(current), "get_fock", forbidden_fock)
     actual, pullback = jax.vjp(lambda mf: prepare.prepare_system_inputs(
         mf, OCCUPIED, virtual, boys_reference=frame.boys_reference,
-        fock_from_scf=True,
+        virtual_anchor_columns=frame.virtual_anchor_columns, fock_from_scf=True,
     ), current)
     for name in expected:
         np.testing.assert_allclose(actual[name], expected[name], atol=5e-10, rtol=2e-10)
@@ -148,12 +150,45 @@ def test_scf_energy_local_focks_match_generic_without_building_fock(
     jax.block_until_ready(pullback(seeds))
 
 
-def test_traced_system_preparation_requires_concrete_occupied_boys_reference(reference):
-    # Boys branch selection must use concrete reference data before the VJP.
+def test_virtual_frame_is_the_cholesky_orthonormalized_ao_projection(reference):
+    # A further arbitrary virtual rotation preserves the active projector but
+    # changes this prescribed PAO anchor gauge and its coordinate response.
+    frame = domain.build_system_local_frame(reference, OCCUPIED, VIRTUAL)
+    overlap = np.asarray(reference.get_ovlp())
+    cv = np.asarray(reference.mo_coeff[:, VIRTUAL])
+    columns = np.asarray(frame.virtual_anchor_columns)
+    projected = cv @ (cv.T @ overlap[:, columns])
+    gram = projected.T @ overlap @ projected
+    lower = np.linalg.cholesky((gram + gram.T) / 2)
+    expected = np.linalg.solve(lower, projected.T).T
+    np.testing.assert_allclose(frame.virtual_coeff, expected, atol=2e-11, rtol=0)
+
+
+@pytest.mark.parametrize("metadata", ["none", "boys-only", "anchors-only"])
+def test_traced_system_preparation_requires_all_concrete_frame_metadata(reference, metadata):
+    frame = domain.build_system_local_frame(reference, OCCUPIED, VIRTUAL)
+    options = {}
+    if metadata == "boys-only":
+        options["boys_reference"] = frame.boys_reference
+    if metadata == "anchors-only":
+        options["virtual_anchor_columns"] = frame.virtual_anchor_columns
+    # Discrete pivoting or Boys branch selection during an input VJP would
+    # depend on tracer values instead of the fixed concrete reference.
     with pytest.raises(ValueError, match="concrete.*before tracing"):
         jax.vjp(lambda mf: prepare.prepare_system_inputs(
-            mf, OCCUPIED, VIRTUAL,
+            mf, OCCUPIED, VIRTUAL, **options,
         ), reference)
+
+
+@pytest.mark.parametrize("columns", [(5,), (5, 5), (0, 7)],
+                         ids=["wrong-count", "duplicate", "out-of-range"])
+def test_system_frame_rejects_invalid_fixed_virtual_anchors(reference, columns):
+    boys_reference = domain.select_system_boys_reference(reference, OCCUPIED)
+    with pytest.raises(ValueError, match="anchor columns"):
+        domain.build_system_local_frame(
+            reference, OCCUPIED, VIRTUAL, boys_reference=boys_reference,
+            virtual_anchor_columns=columns,
+        )
 
 
 def test_system_local_frame_handles_one_selected_occupied_orbital(reference):
@@ -163,6 +198,7 @@ def test_system_local_frame_handles_one_selected_occupied_orbital(reference):
                                atol=2e-11, rtol=0)
     inputs = prepare.prepare_system_inputs(
         reference, occupied, VIRTUAL, boys_reference=frame.boys_reference,
+        virtual_anchor_columns=frame.virtual_anchor_columns,
     )
     assert inputs["B"].shape[1:] == (1, 2)
     np.testing.assert_allclose(inputs["foo"], [[reference.mo_energy[occupied[0]]]],
@@ -193,7 +229,8 @@ def test_system_boys_response_is_stable_under_large_occupied_rotations(reference
         return domain.build_system_local_frame(
             current, OCCUPIED, VIRTUAL,
             boys_reference=frame.boys_reference,
-            ).occupied_coeff
+            virtual_anchor_columns=frame.virtual_anchor_columns,
+        ).occupied_coeff
 
     _, pullback = jax.vjp(localize, occupied)
     coeff_bar, = pullback(seed)
@@ -334,7 +371,7 @@ def test_local_energy_and_coordinate_gradient_match_canonical(coordinate_respons
 
 def test_local_preparation_coordinate_vjp_rebuilds_continuous_frame(coordinate_response):
     # An arbitrary tensor seed is not invariant under occupied/virtual
-    # rotations. This catches frozen Boys/virtual coefficients that an invariant
+    # rotations. This catches frozen Boys/PAO coefficients that an invariant
     # MP2 energy comparison alone cannot expose.
     state = coordinate_response
     rng = np.random.default_rng(217)
@@ -379,7 +416,8 @@ def test_scf_energy_local_fock_coordinate_vjp_matches_generic_and_differences(
         guard.setattr(type(state["mf"]), "get_fock", forbidden_fock)
         _, pullback = jax.vjp(lambda mf: prepare.prepare_system_inputs(
             mf, OCCUPIED, VIRTUAL, boys_reference=frame.boys_reference,
-                fock_from_scf=True,
+            virtual_anchor_columns=frame.virtual_anchor_columns,
+            fock_from_scf=True,
         ), state["mf"])
         fast_mf_bar, = pullback(seeds)
         jax.block_until_ready(fast_mf_bar)
@@ -435,6 +473,7 @@ def test_degenerate_scf_uses_full_local_fock_response_for_arbitrary_seed():
     generic, generic_pullback = jax.vjp(lambda current: prepare.prepare_system_inputs(
         current, state["occupied"], state["virtual"],
         boys_reference=state["boys_reference"],
+        virtual_anchor_columns=state["virtual_anchor_columns"],
     ), mf)
     for name in inputs:
         np.testing.assert_allclose(inputs[name], generic[name], atol=5e-10, rtol=2e-10)
@@ -469,8 +508,7 @@ def test_system_driver_passes_local_focks_and_matches_canonical_response(
 
     def local_solve(inputs, metadata, controls, **kwargs):
         assert _off_diagonal_norm(inputs["foo"]) > 1e-3
-        np.testing.assert_allclose(inputs["fvv"], np.diag(coordinate_response["mf"].mo_energy[VIRTUAL]),
-                               atol=5e-10, rtol=0)
+        assert _off_diagonal_norm(inputs["fvv"]) > 1e-3
         return real_solve(inputs, metadata, controls, **kwargs)
 
     monkeypatch.setattr(backend, "solve", local_solve)

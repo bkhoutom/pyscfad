@@ -360,11 +360,11 @@ def _outcore_nr_e2_fwd(mol, auxmol, mo_coeff, cderi_source, max_memory,
                        orbs_slice, aosym):
     out = _outcore_nr_e2(mol, auxmol, mo_coeff, cderi_source, max_memory,
                          orbs_slice, aosym)
-    return out, (mol, auxmol, mo_coeff)
+    return out, (mol, auxmol, mo_coeff, out)
 
 
 def _outcore_nr_e2_bwd(cderi_source, max_memory, orbs_slice, aosym, res, ybar):
-    mol, auxmol, mo_coeff = res
+    mol, auxmol, mo_coeff, out = res
     try:
         with _vjp_progress_section('global DF AO2MO MO-coeff backward'):
             mo_coeff_bar = _cderi_vjp.nr_e2_mo_coeff_vjp_from_cderi_source(
@@ -386,6 +386,7 @@ def _outcore_nr_e2_bwd(cderi_source, max_memory, orbs_slice, aosym, res, ybar):
                     int3c=mol._add_suffix('int3c2e'),
                     int2c=mol._add_suffix('int2c2e'),
                     aosym='s2ij',
+                    saved_output=out,
                 )
         except NotImplementedError:
             with _vjp_progress_section('global DF integral derivative backward'):

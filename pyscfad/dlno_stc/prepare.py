@@ -8,6 +8,7 @@ from pyscfad import numpy as np
 from pyscfad.lno import df as lno_df
 
 from .domain import build_boys_ed_frame, build_system_local_frame
+from ._profile import response
 
 
 def _symmetric_fock_block(fock, coeff):
@@ -17,15 +18,15 @@ def _symmetric_fock_block(fock, coeff):
     return 0.5 * (block + block.T)
 
 
-def _scf_fock_block(mf, overlap, indices, local_coeff):
+def _scf_fock_block(coeff, energies, overlap, indices, local_coeff):
     """Project canonical energies while retaining the complete SCF chain rule."""
-    canonical = mf.mo_coeff[:, indices]
+    canonical = coeff[:, indices]
     rotation = canonical.T @ overlap @ local_coeff
-    block = rotation.T @ (mf.mo_energy[indices, None] * rotation)
+    block = rotation.T @ (energies[indices, None] * rotation)
     return 0.5 * (block + block.T)
 
 
-def _project_inputs(mf, fock, occupied_coeff, virtual_coeff, atoms):
+def _project_inputs(mf, fock, occupied_coeff, virtual_coeff, atoms, *, group=None):
     """Use one occupied/virtual frame for both Fock blocks and DF factors."""
     co, cv = occupied_coeff, virtual_coeff
     nocc, nvir = co.shape[1], cv.shape[1]
@@ -33,9 +34,13 @@ def _project_inputs(mf, fock, occupied_coeff, virtual_coeff, atoms):
     B = lno_df.get_local_Lov(
         mf, coeff, nocc, atoms, integral_direct=True,
     )
+    foo, fvv = response('stc.domain.input_pullback.local_fock_blocks',
+                        lambda f, o, v: (_symmetric_fock_block(f, o),
+                                         _symmetric_fock_block(f, v)),
+                        fock, co, cv, group=group)
     return {
-        "foo": _symmetric_fock_block(fock, co),
-        "fvv": _symmetric_fock_block(fock, cv),
+        "foo": foo,
+        "fvv": fvv,
         "B": B.reshape((-1, nocc, nvir)),
     }
 
@@ -53,7 +58,7 @@ def prepare_inputs(mf, common, static, fragment_index):
     ao = numpy.asarray(frame.extended_ao_indices)
     return _project_inputs(
         mf, common.fock[numpy.ix_(ao, ao)], frame.occupied_coeff,
-        frame.virtual_coeff, frame.extended_atoms,
+        frame.virtual_coeff, frame.extended_atoms, group=fragment_index,
     )
 
 
@@ -118,12 +123,15 @@ def _project_system_frame(mf, frame, active_occ_indices, active_vir_indices, *,
         # S, and the Boys/PAO frame in the graph; independent partial VJPs
         # differ from the AO-Fock path until the SCF pullback is applied.
         overlap = mf.get_ovlp()
-        foo = _scf_fock_block(mf, overlap, active_occ_indices, co)
-        fvv = _scf_fock_block(mf, overlap, active_vir_indices, cv)
+        foo, fvv = response('stc.system.input_pullback.local_fock_blocks',
+            lambda c, e, s, o, v: (_scf_fock_block(c, e, s, active_occ_indices, o),
+                                   _scf_fock_block(c, e, s, active_vir_indices, v)),
+            mf.mo_coeff, mf.mo_energy, overlap, co, cv, mode='scf_energies')
     else:
-        fock = mf.get_fock()
-        foo = _symmetric_fock_block(fock, co)
-        fvv = _symmetric_fock_block(fock, cv)
+        fock = response('stc.system.input_pullback.ao_fock', lambda mf: mf.get_fock(), mf)
+        foo, fvv = response('stc.system.input_pullback.local_fock_blocks',
+            lambda f, o, v: (_symmetric_fock_block(f, o), _symmetric_fock_block(f, v)),
+            fock, co, cv, mode='ao_fock')
     return {
         "foo": foo,
         "fvv": fvv,

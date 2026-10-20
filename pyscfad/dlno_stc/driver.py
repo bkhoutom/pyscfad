@@ -220,8 +220,10 @@ def _finish_response(state, energy, mf_bar, *, include_hf):
         hf_energy = state["mf"].e_tot
         mf_bar.e_tot = _add_cotangent(mf_bar.e_tot, np.ones_like(hf_energy))
         energy = energy + hf_energy
-    mol_bar, = state["scf_pullback"](mf_bar)
-    jax.block_until_ready((energy, mol_bar))
+    scope = 'system' if 'fock_from_scf' in state else 'domain'
+    with resource_profile.section(f'stc.{scope}.scf_response'):
+        mol_bar, = state["scf_pullback"](mf_bar)
+        jax.block_until_ready((energy, mol_bar))
     return energy, mol_bar
 
 
@@ -360,6 +362,7 @@ def _initialize_system(mf, frozen, controls, *, with_grad, scf_pullback=None,
                        lo_kwargs=None, fock_from_scf=False):
     _validate_controls(controls)
     occupied, virtual = _system_active_indices(mf, frozen)
+    requested_fock_from_scf = fock_from_scf
     if fock_from_scf and len(occupied) and len(virtual):
         energies = numpy.asarray(mf.mo_energy)
         if (energies.shape != (mf.mo_coeff.shape[1],) or numpy.iscomplexobj(energies)
@@ -373,6 +376,9 @@ def _initialize_system(mf, frozen, controls, *, with_grad, scf_pullback=None,
         if any(numpy.any(numpy.diff(numpy.sort(energies[indices])) <= 1e-9)
                for indices in (occupied, virtual)):
             fock_from_scf = False
+    resource_profile.checkpoint('stc.system.fock_state',
+        requested_fock_from_scf=requested_fock_from_scf, fock_from_scf=fock_from_scf,
+        degeneracy_fallback=requested_fock_from_scf and not fock_from_scf)
     dtype = mf.mo_coeff.dtype
     return {"mf": mf, "occupied": occupied, "virtual": virtual,
             "lo_kwargs": lo_kwargs, "fock_from_scf": fock_from_scf,

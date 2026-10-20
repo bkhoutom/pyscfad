@@ -1741,13 +1741,15 @@ def _int3c_mo_deriv_coords_vjp(mol, auxmol, mo_coeff, z,
 def cholesky_eri_vjp_from_mo_coeff_ybar(mol, auxmol, cderi_source,
                                         mo_coeff, ybar, orbs_slice,
                                         max_memory, int3c=None, int2c=None,
-                                        aosym='s2ij'):
+                                        aosym='s2ij', saved_output=None):
     """Back-propagate through CDERI using MO-basis int3c derivatives.
 
     This avoids materializing the large packed AO-pair cotangent
     ``cderi_bar[naux, nao_pair]``. Coefficients must have global AO rows;
     a local domain is represented by zero rows outside its AO support while
     retaining the global auxiliary metric.
+    ``saved_output`` may supply the forward MO factors, avoiding their
+    reconstruction for the metric cotangent.
     """
     t_total = time.perf_counter()
     _profile_msg(
@@ -1805,14 +1807,18 @@ def cholesky_eri_vjp_from_mo_coeff_ybar(mol, auxmol, cderi_source,
     )
 
     t = time.perf_counter()
-    y = _stream_nr_e2_from_cderi_source(
-        cderi_source, mo_coeff, orbs_slice, max_memory, aosym='s2'
-    )
+    y = saved_output
+    if y is None:
+        y = _stream_nr_e2_from_cderi_source(
+            cderi_source, mo_coeff, orbs_slice, max_memory, aosym='s2'
+        )
+    else:
+        y = numpy.asarray(jax.device_get(y))
     with dense_blas_threads():
         low_bar = -numpy.dot(z, y.T)
     del y
     _profile_msg(
-        'cholesky_eri_vjp_from_mo_coeff_ybar stream y/low_bar done '
+        'cholesky_eri_vjp_from_mo_coeff_ybar B/low_bar done '
         f'{time.perf_counter() - t:.2f} s'
     )
 

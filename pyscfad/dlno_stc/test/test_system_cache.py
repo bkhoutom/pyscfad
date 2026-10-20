@@ -77,6 +77,53 @@ def _cotangent(B):
     return adnp.asarray(np.random.default_rng(109).normal(size=B.shape))
 
 
+@pytest.mark.parametrize("on_disk", (False, True))
+def test_system_outcore_reverse_reuses_forward_B(
+        reference, tmp_path, monkeypatch, on_disk):
+    """Saving B must bypass reconstruction without changing any VJP leaf."""
+    mol, coeff = reference.mol, reference.mo_coeff
+    auxmol = reference.with_df.auxmol
+    source = reference.with_df._cderi
+    if on_disk:
+        source = str(tmp_path / "saved-B-cderi.h5")
+        with h5py.File(source, "w") as handle:
+            handle.create_dataset("j3c", data=np.asarray(reference.with_df._cderi))
+    orbs_slice = (1, 5, 5, 7)
+
+    def cached_B(mol_, auxmol_, coeff_):
+        return _df_outcore._outcore_nr_e2(
+            mol_, auxmol_, coeff_, source, 1024, orbs_slice, "s2",
+        )
+
+    B, pullback = jax.vjp(cached_B, mol, auxmol, coeff)
+    B_bar = _cotangent(B)
+    original_vjp = _cderi_vjp.cholesky_eri_vjp_from_mo_coeff_ybar
+
+    def recomputed_vjp(*args, **kwargs):
+        kwargs.pop("saved_output", None)
+        return original_vjp(*args, **kwargs)
+
+    # Keep the no-saved-output branch as the numerical reference.
+    with monkeypatch.context() as patch:
+        patch.setattr(_cderi_vjp, "cholesky_eri_vjp_from_mo_coeff_ybar",
+                      recomputed_vjp)
+        expected = pullback(B_bar)
+
+    def forbidden_reconstruction(*args, **kwargs):
+        raise AssertionError("whole-system reverse must reuse forward B")
+
+    monkeypatch.setattr(_cderi_vjp, "_stream_nr_e2_from_cderi_source",
+                        forbidden_reconstruction)
+    actual = pullback(B_bar)
+    expected_leaves, expected_tree = jax.tree_util.tree_flatten(expected)
+    actual_leaves, actual_tree = jax.tree_util.tree_flatten(actual)
+    assert actual_tree == expected_tree
+    for result, reference_leaf in zip(actual_leaves, expected_leaves):
+        assert result.shape == reference_leaf.shape
+        assert result.dtype == reference_leaf.dtype
+        np.testing.assert_allclose(result, reference_leaf, atol=1e-10, rtol=1e-9)
+
+
 def test_system_outcore_cache_preserves_factors_coordinate_and_coefficient_vjps(
         reference, tmp_path, monkeypatch):
     mol, coeff = reference.mol, reference.mo_coeff

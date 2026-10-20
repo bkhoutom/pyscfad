@@ -1,6 +1,7 @@
 """STC-owned finite Boys and complete-system orbital frames."""
 
 from typing import NamedTuple
+from types import SimpleNamespace
 
 import jax
 import numpy
@@ -9,6 +10,7 @@ import scipy.linalg as scipy_linalg
 from pyscfad import numpy as np, scipy
 from pyscfad.lno import tools
 from pyscfad.lno.lno_base import SEMICANONICAL_DEG_THRESH
+from ._profile import response
 from ._selection import (
     DomainSelections, _PAO_ORTH_THRESHOLD, _host_array, _hermitian_numpy,
     _orthogonalize, _build_boys_targets, _resolve_boys_options,
@@ -105,9 +107,11 @@ def build_system_local_frame(
     co = (_rebuild_boys_targets(mf, occupied, boys_reference)
           if occupied.shape[1] else occupied)
     if virtual.shape[1]:
-        overlap = mf.mol.intor_symmetric("int1e_ovlp")
-        anchors = virtual @ (virtual.T.conj() @ overlap[:, columns])
-        cv = _cholesky_metric_orthonormalize(anchors, overlap)
+        overlap = response('stc.system.input_pullback.overlap',
+                           lambda mol: mol.intor_symmetric("int1e_ovlp"), mf.mol)
+        cv = response('stc.system.input_pullback.virtual_frame',
+                      lambda v, s: _cholesky_metric_orthonormalize(
+                          v @ (v.T.conj() @ s[:, columns]), s), virtual, overlap)
     else:
         cv = virtual
     return SystemLocalFrame(co, cv, boys_reference, columns)
@@ -252,7 +256,11 @@ def _rebuild_boys_targets(mf, occupied, static):
     # alignment is a coordinate choice; current occupied coefficients and
     # their localization response remain differentiated.
     options["init_guess"] = numpy.eye(occupied.shape[1])
-    localized = _build_boys_targets(mf.mol, occupied @ (left @ right), options)
+    parent = ('stc.system.input_pullback' if isinstance(static, SystemBoysReference)
+              else 'stc.domain.common_pullback')
+    localized = response(parent + '.boys_response_total',
+                         lambda mol, coeff: _build_boys_targets(mol, coeff, options),
+                         mf.mol, occupied @ (left @ right))
     current_localized = _host_array(jax.lax.stop_gradient(localized))
     overlaps = reference.T @ cross_overlap.T @ current_localized
     magnitude = numpy.abs(overlaps)
@@ -408,6 +416,13 @@ class DomainData(NamedTuple):
     fragment_occupied_data: tuple[TargetOccupiedData, ...]
 
 
+def _normalized_pao(projected_out, overlap, columns):
+    raw_pao = np.eye(overlap.shape[0], dtype=projected_out.dtype) - projected_out @ (projected_out.T.conj() @ overlap)
+    raw_pao = raw_pao[:, columns]
+    norm2 = np.real(np.einsum("ui,uv,vi->i", raw_pao.conj(), overlap, raw_pao, optimize=True))
+    return raw_pao / np.sqrt(norm2)[None, :]
+
+
 def rebuild_domain_data(mf, static):
     """Rebuild current Boys and PAOs with the saved concrete choices.
 
@@ -416,18 +431,20 @@ def rebuild_domain_data(mf, static):
     """
     if not isinstance(static, DomainSelections) or static.lo_type != "boys":
         raise TypeError("static must be STC Boys DomainSelections")
-    overlap = mf.mol.intor_symmetric("int1e_ovlp")
+    overlap = response('stc.domain.common_pullback.overlap',
+                       lambda mol: mol.intor_symmetric("int1e_ovlp"), mf.mol)
     mo_coeff, mo_energy = np.asarray(mf.mo_coeff), np.asarray(mf.mo_energy)
     occupied, virtual = (mo_coeff[:, indices] for indices in (static.active_occ_indices, static.active_vir_indices))
     targets = (_rebuild_boys_targets(mf, occupied, static)
                if occupied.shape[1] else occupied)
     projected_out = mo_coeff[:, static.pao_projected_out_indices]
-    raw_pao = np.eye(mf.mol.nao, dtype=mo_coeff.dtype) - projected_out @ (projected_out.T.conj() @ overlap)
-    raw_pao = raw_pao[:, static.pao_parent_ao_indices]
-    norm2 = np.real(np.einsum("ui,uv,vi->i", raw_pao.conj(), overlap, raw_pao, optimize=True))
-    return DomainData(overlap, mf.get_fock(), occupied, virtual,
+    pao = response('stc.domain.common_pullback.pao',
+                   lambda coeff, s: _normalized_pao(coeff, s, static.pao_parent_ao_indices),
+                   projected_out, overlap)
+    fock = response('stc.domain.common_pullback.ao_fock', lambda mf: mf.get_fock(), mf)
+    return DomainData(overlap, fock, occupied, virtual,
                       mo_energy[static.active_occ_indices], mo_energy[static.active_vir_indices],
-                      targets, raw_pao / np.sqrt(norm2)[None, :],
+                      targets, pao,
                       tuple(TargetOccupiedData(targets[:, indices]) for indices in static.frag_lolist))
 
 
@@ -471,12 +488,21 @@ def build_boys_ed_frame(common, static, fragment_index, *, virtual_anchor_column
                                static.thresholds.metric_rank, f"domain {fragment_index} occupied target/partner ED")
     occupied = _cholesky_metric_orthonormalize(occupied, overlap22)
     occupied = occupied * _positive_pivot_phases(occupied)
-    virtual = _rebuild_local_virtual_subspace(common, fragment.strong_virtual, ao, occupied,
-                                              boys_metric_threshold=static.thresholds.metric_rank)
     if virtual_anchor_columns is None:
         virtual_anchor_columns = fragment.virtual_anchor_columns
     if virtual_anchor_columns is None:
         raise ValueError("select virtual anchors from concrete data before preparing the domain")
-    virtual, columns = _stable_virtual_frame(common, fragment, ao, overlap22, virtual, virtual_anchor_columns)
-    virtual = virtual * _positive_pivot_phases(virtual)
+    columns = tuple(virtual_anchor_columns)
+
+    def virtual_frame(pao, overlap, occupied):
+        data = SimpleNamespace(pao_coeff=pao, s1e=overlap)
+        virtual = _rebuild_local_virtual_subspace(
+            data, fragment.strong_virtual, ao, occupied,
+            boys_metric_threshold=static.thresholds.metric_rank)
+        virtual, _ = _stable_virtual_frame(
+            data, fragment, ao, overlap[numpy.ix_(ao, ao)], virtual, columns)
+        return virtual * _positive_pivot_phases(virtual)
+
+    virtual = response('stc.domain.input_pullback.virtual_frame', virtual_frame,
+                       common.pao_coeff, common.s1e, occupied, group=fragment_index)
     return BoysEDFrame(occupied, virtual, ao, atoms, fragment.target_index, columns)

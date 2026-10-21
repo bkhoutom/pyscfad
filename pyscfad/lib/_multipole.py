@@ -11,6 +11,36 @@ import jax.numpy as jnp
 import numpy as np
 
 
+def pad_endpoint(endpoint, bucket_size=32):
+    """Reuse pair executables across nearby compact virtual-space sizes.
+
+    Call outside the compiled pair kernel, once per endpoint. Dummy moments
+    vanish and dummy excitation gaps stay positive, so their energy and
+    cotangents vanish without changing any physical virtual-space selection.
+    """
+    nvir = endpoint[2].shape[0]
+    width = bucket_size * ((nvir + bucket_size - 1) // bucket_size)
+    if width == nvir:
+        return endpoint
+    leaves = [endpoint[0]]
+    for slot, value in enumerate(endpoint[1:], start=1):
+        if value is None:
+            leaves.append(None)
+        else:
+            padding = ((0, 0),) * (value.ndim - 1) + ((0, width - nvir),)
+            leaves.append(jnp.pad(value, padding, constant_values=1.0 if slot == 2 else 0.0))
+    return tuple(leaves)
+
+
+def crop_endpoint_cotangent(cotangent, original_endpoint):
+    """Undo endpoint padding after all pair cotangents have been summed."""
+    nvir = original_endpoint[2].shape[0]
+    return (cotangent[0],) + tuple(
+        None if value is None else value[..., :nvir]
+        for value in cotangent[1:]
+    )
+
+
 @jax.jit
 def coordinate_moment_jvp(bra, ket, coords_t, ao_owner):
     """Contract canonical bra/ket derivatives with their atom tangents.

@@ -170,6 +170,12 @@ def weak_pair_contribution(mf, common, static, pairs, comm, *, with_grad):
 
     start, error, pair = time.perf_counter(), None, None
     try:
+        # Keep raw owner values for replay checks. All ranks pad the same
+        # exchanged endpoints, so numerical reductions have identical shapes.
+        originals = ({index: endpoints[index] for index in owned_indices}
+                     if with_grad else {})
+        endpoints = {index: _pairs.pad_endpoint(value)
+                     for index, value in endpoints.items()}
         endpoint_bars = ({index: jax.tree_util.tree_map(jnp.zeros_like, endpoints[index])
                           for index in indices} if with_grad else None)
         for pair in pairs[rank::size]:
@@ -208,18 +214,19 @@ def weak_pair_contribution(mf, common, static, pairs, comm, *, with_grad):
     try:
         if with_grad:
             for index in owned_indices:
-                original = endpoints.pop(index)
+                del endpoints[index]
+                original = originals.pop(index)
                 endpoint_bar = owned_bars.pop(index)
                 linearization = linearizations.pop(index)
                 rebuilt, pullback = _pairs._replay_weak_endpoint(
                     mf, linearization, static, index)
                 _pairs._check_endpoint_replay(rebuilt, original, index)
-                contribution = pullback(endpoint_bar)
+                contribution = pullback(_pairs.crop_endpoint_cotangent(endpoint_bar, original))
                 bars = jax.tree_util.tree_map(add_cotangent, bars, contribution)
                 jax.block_until_ready(bars)
                 diagnostics['n_endpoint_replays'] += 1
                 del rebuilt, pullback, original, contribution, endpoint_bar, linearization
-        del endpoints, owned_bars, linearizations
+        del endpoints, originals, owned_bars, linearizations
         gc.collect()
     except Exception as exc:
         error = _error(rank, 'endpoint response', exc, index)

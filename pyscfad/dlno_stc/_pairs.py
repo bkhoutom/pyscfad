@@ -18,6 +18,7 @@ from pyscfad.lno.tools import fake_mol_by_atom, project_mo
 from pyscfad.lib._compilation_cache import configure_compilation_cache
 from pyscfad.lib._multipole import (
     coordinate_moment_jvp, endpoint_matches_reference,
+    pad_endpoint, crop_endpoint_cotangent,
     pair_energy as _multipole_pair_energy,
     pair_energy_and_grad, transition_moments,
 )
@@ -229,7 +230,7 @@ def weak_screen_pair_energy(mf, left, right, static, left_index, right_index):
     order = static.thresholds.multipole_order
     lhs = _multipole_orbital_data(mf.mol, left, static.fragments[left_index].primary_atoms, order)
     rhs = _multipole_orbital_data(mf.mol, right, static.fragments[right_index].primary_atoms, order)
-    return jnp.real(_multipole_pair_energy(lhs, rhs, order))
+    return jnp.real(_multipole_pair_energy(pad_endpoint(lhs), pad_endpoint(rhs), order))
 
 
 def build_weak_endpoint(mf, common, static, fragment_index):
@@ -268,8 +269,8 @@ def weak_pair_energy(mf, common, static, left_index, right_index):
     """Evaluate one pair using the same endpoint boundary as the full sum."""
     left_index, right_index = _validate_weak_pair(static, left_index, right_index)
     return jnp.real(_multipole_pair_energy(
-        build_weak_endpoint(mf, common, static, left_index),
-        build_weak_endpoint(mf, common, static, right_index),
+        pad_endpoint(build_weak_endpoint(mf, common, static, left_index)),
+        pad_endpoint(build_weak_endpoint(mf, common, static, right_index)),
         static.thresholds.multipole_order,
     ))
 
@@ -294,7 +295,8 @@ def _check_endpoint_replay(rebuilt, original, index):
 def weak_pair_energy_sum(mf, common, static, *, pairs=None):
     """Evaluate all weak edges while constructing each endpoint only once."""
     pairs = weak_pair_indices(static) if pairs is None else tuple(pairs)
-    endpoints = _weak_endpoints(mf, common, static, pairs)
+    endpoints = {index: pad_endpoint(value) for index, value in
+                 _weak_endpoints(mf, common, static, pairs).items()}
     energy = jnp.zeros((), dtype=common.s1e.dtype)
     for left, right in pairs:
         energy += _multipole_pair_energy(
@@ -315,10 +317,11 @@ def weak_pair_energy_and_grad(mf, common, static, *, pairs=None):
     pairs = weak_pair_indices(static) if pairs is None else tuple(pairs)
     bars = zero_term_cotangents(mf, common)
     energy = jnp.zeros((), dtype=common.s1e.dtype)
-    endpoints, linearizations = {}, {}
+    originals, linearizations = {}, {}
     for index in sorted({index for pair in pairs for index in pair}):
-        endpoints[index], linearizations[index] = _prepare_weak_endpoint(
+        originals[index], linearizations[index] = _prepare_weak_endpoint(
             mf, common, static, index)
+    endpoints = {index: pad_endpoint(value) for index, value in originals.items()}
     endpoint_bars = {index: jax.tree_util.tree_map(jnp.zeros_like, value)
                      for index, value in endpoints.items()}
     for left, right in pairs:
@@ -330,11 +333,12 @@ def weak_pair_energy_and_grad(mf, common, static, *, pairs=None):
         del left_bar, right_bar
     for index in tuple(endpoint_bars):
         endpoint_bar = endpoint_bars.pop(index)
-        original = endpoints.pop(index)
+        del endpoints[index]
+        original = originals.pop(index)
         linearization = linearizations.pop(index)
         rebuilt, pullback = _replay_weak_endpoint(mf, linearization, static, index)
         _check_endpoint_replay(rebuilt, original, index)
-        contribution = pullback(endpoint_bar)
+        contribution = pullback(crop_endpoint_cotangent(endpoint_bar, original))
         bars = jax.tree_util.tree_map(add_cotangent, bars, contribution)
         jax.block_until_ready(bars)
         del rebuilt, original, pullback, contribution, endpoint_bar, linearization
@@ -389,8 +393,8 @@ def screen_pairs(mf, common, static, model='multipole', force_full_domains=False
                 np.ones((nfrag, nfrag), dtype=bool), np.ones((nfrag, nfrag), dtype=bool))
     screens = [build_weak_multipole_screen(common, static, index) for index in range(nfrag)]
     order = static.thresholds.multipole_order
-    endpoints = [None if screen is None else _multipole_orbital_data(
-        mf.mol, screen, static.fragments[index].primary_atoms, order)
+    endpoints = [None if screen is None else pad_endpoint(_multipole_orbital_data(
+        mf.mol, screen, static.fragments[index].primary_atoms, order))
         for index, screen in enumerate(screens)]
     weak = np.zeros((nfrag, nfrag))
     forced = np.eye(nfrag, dtype=bool)

@@ -45,6 +45,7 @@ def _run_mpi(initializer, worker_initializer, comm, *, with_grad,
             groups = tuple(group for group in groups
                            if wanted.intersection(group.fragment_indices))
         options = dict(include_hf=include_hf, verbose_imp=verbose_imp, ccsd_t=ccsd_t,
+                       triples_controls=state['cc_triples_controls'],
                        return_components=return_components, include_baseline=include_baseline,
                        fragment_indices=indices)
         return (static, baseline, matrix, groups, state['weak_pairs'], options,
@@ -87,6 +88,7 @@ def _run_mpi(initializer, worker_initializer, comm, *, with_grad,
             records.extend(ccsd._run_group(
                 state, static, group, allocated, matrix, with_grad=with_grad,
                 verbose_imp=options['verbose_imp'], ccsd_t=options['ccsd_t'],
+                triples_controls=options['triples_controls'],
                 include_baseline=options['include_baseline'],
                 fragment_indices=options['fragment_indices']))
             gc.collect()

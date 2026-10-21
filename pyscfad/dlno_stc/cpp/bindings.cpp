@@ -19,6 +19,7 @@
 
 namespace py = pybind11;
 namespace stc = pyscfad::dlno_stc;
+namespace pyscfad { namespace dlno_stc { void bind_triples(py::module_&); }}
 namespace {
 #ifdef __linux__
 struct WorkerPlacement {
@@ -459,6 +460,7 @@ py::dict solve_full(py::handle foo, py::handle fvv, py::handle B,
 }  // namespace
 PYBIND11_MODULE(_stc_mp2,m) {
     stc::bind_matrices(m);
+    stc::bind_triples(m);
     m.def("parallel_runtime_info",&parallel_runtime_info,py::arg("runtime_path")=py::none());
     m.doc()="STC-MP2 with bounded pair contractions and an explicit canonical-system specialization";
     m.def("solve_selected",&solve_selected,py::arg("foo"),py::arg("fvv"),py::arg("B"),

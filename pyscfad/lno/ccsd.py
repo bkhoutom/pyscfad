@@ -457,12 +457,17 @@ _impurity_solve_jax.defvjp(_impurity_solve_jax_fwd, _impurity_solve_jax_bwd)
 def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
                          frag_prescreen=None,
                          verbose_imp=0, ccsd_t=False, dcsd=False,
-                         profile_info=None, profile_pass=None):
+                         profile_info=None, profile_pass=None,
+                         triples_solver=None):
     '''Numerical core of :func:`impurity_solve`; see that function for docs.
 
     Takes ``fock`` and ``s1e`` directly (rather than the parent ``eris``
     container) so the function is callable from a ``jax.custom_vjp`` whose
     diff inputs must be plain pytrees of arrays.
+
+    An optional ``triples_solver`` returns ``(energy, diagnostics)``. When
+    supplied, this core returns ``((emp2, ecc, et), diagnostics)``; otherwise
+    it retains the legacy three-energy return value.
     '''
     log = logger.new_logger(mf)
     maskocc = mf.mo_occ > lno_base.THRESH_OCC
@@ -572,6 +577,7 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
         diis_space=diis_space,
     )
 
+    triples_diagnostics = {}
     if ccsd_t and not dcsd:
         #for tests
         #from pyscfad.lno import ccsd_t_slow
@@ -582,7 +588,12 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
         #elcorr_cc_t = gccsd_t.kernel(mcc, prjlo, t1=t1, t2=t2)
         phase_start = time.perf_counter()
         profile_phase = resource_profile.start()
-        elcorr_cc_t = ccsd_t_mod.kernel(mcc, imp_eris, prjlo, t1=t1, t2=t2, verbose=verbose_imp)
+        if triples_solver is None:
+            elcorr_cc_t = ccsd_t_mod.kernel(
+                mcc, imp_eris, prjlo, t1=t1, t2=t2, verbose=verbose_imp)
+        else:
+            elcorr_cc_t, triples_diagnostics = triples_solver(
+                mcc, imp_eris, prjlo, t1=t1, t2=t2, verbose=verbose_imp)
         phase_times['triples_s'] = time.perf_counter() - phase_start
         resource_profile.finish(
             'solver.perturbative_triples',
@@ -614,7 +625,8 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
     )
     t1 = t2 = imp_eris = mcc = None
     del log
-    return (elcorr_pt2, elcorr_cc, elcorr_cc_t)
+    energies = (elcorr_pt2, elcorr_cc, elcorr_cc_t)
+    return energies if triples_solver is None else (energies, triples_diagnostics)
 
 def get_maskact(frozen, nmo):
     if frozen is None:

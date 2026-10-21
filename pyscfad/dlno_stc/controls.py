@@ -51,6 +51,41 @@ def _finite_control(name, value, *, positive=True):
     return value
 
 
+def normalize_triples_controls(controls, *, ccsd_t):
+    """Validate triples independently of baseline and D/W selection settings.
+
+    Omitted controls preserve the existing deterministic correction. The
+    stochastic interface initially supports a fixed number of samples only.
+    """
+    if not ccsd_t:
+        if controls is not None:
+            raise ValueError('triples_controls requires ccsd_t=True')
+        return None
+    if controls is None:
+        return {'mode': 'deterministic'}
+    if not isinstance(controls, dict):
+        raise TypeError('triples_controls must be a dictionary')
+    settings = controls.copy()
+    unknown = set(settings) - {'mode', 'nsamples', 'global_seed'}
+    if unknown:
+        raise ValueError('unsupported triples controls: '
+                         + ', '.join(sorted(map(str, unknown))))
+    mode = settings.setdefault('mode', 'deterministic')
+    if mode not in ('deterministic', 'stochastic'):
+        raise ValueError('triples mode must be deterministic or stochastic')
+    if mode == 'deterministic':
+        if set(settings) - {'mode'}:
+            raise ValueError('deterministic triples do not accept sampling controls')
+        return settings
+    if 'nsamples' not in settings:
+        raise ValueError('stochastic triples require integer nsamples >= 2')
+    settings['nsamples'] = _integer_control('nsamples', settings['nsamples'], minimum=2)
+    settings['global_seed'] = _integer_control('global_seed', settings.get('global_seed', 71), minimum=0)
+    if settings['global_seed'] >= 2**64:
+        raise ValueError('global_seed must fit in uint64')
+    return settings
+
+
 def normalize_matrix_controls(controls, matrix_kind):
     """Copy and validate the explicit native D/W interface controls.
 

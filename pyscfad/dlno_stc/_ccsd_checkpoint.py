@@ -23,6 +23,9 @@ def open_checkpoint(state, static, groups, *, checkpoint_dir, resume, options):
                    native_version=_stc_mp2.matrix_kernel_version,
                    cc_convergence=(RCCSD.conv_tol, RCCSD.conv_tol_normt, RCCSD.max_cycle),
                    controls=static.controls_identity, options=options, groups=groups)
+    triples = options.get('triples_controls')
+    if triples is not None and triples['mode'] == 'stochastic':
+        payload['native_triples_version'] = _stc_mp2.TRIPLES_VERSION
     manager = RestartManager(checkpoint_dir, resume=resume, method='stc-ccsd',
                              scientific_payload=payload)
     try:

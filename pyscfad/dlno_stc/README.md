@@ -395,8 +395,37 @@ completion; `e_mp2_weak` reports its included weak part. The MP2-LIS subtraction
 uses the shared solver's exact denominators. The native matrix energy is a
 diagnostic and receives zero energy seed in the correction reverse. The
 six-point baseline can therefore leave the expected MP2 quadrature residual
-relative to conventional full-space CC. `ccsd_t=True` retains the shared
-solver's existing triples option; its convergence defaults are unchanged.
+relative to conventional full-space CC. `ccsd_t=True` uses the shared solver's
+existing deterministic triples by default. Explicit
+`triples_controls={'mode': 'deterministic'}` selects the same route. With
+`ccsd_t=False`, explicitly supplied triples controls are rejected.
+
+Choose the supplied stochastic selected-orbital triples formula independently
+of the MP2 baseline and D/W controls:
+
+```python
+energy, gradient, components = ccsd.value_and_grad(
+    mol, build_mf, selected, baseline_controls=baseline_controls,
+    matrix_controls=matrix_controls, ccsd_t=True,
+    triples_controls={'mode': 'stochastic', 'nsamples': 20000, 'global_seed': 71},
+    include_hf=True, return_components=True)
+```
+
+`kernel` accepts the same triples controls. Stochastic triples requires integer
+`nsamples >= 2`; the seed defaults to 71 and must fit in uint64. Fixed-count
+sampling is the only public stochastic allocation mode. Deterministic triples
+accepts no sampling settings. Changing triples mode, count or seed reuses the
+saved LIS selections. Each LIS receives a distinct stream derived from the
+global seed, a triples tag and its fragment index, independently of MPI rank
+and work order. Energy-only and fused energy/VJP calls use different native
+proposals; their same-seed energies need not be identical. Gradients use the
+fused native energy/VJP once and its saved unit-energy cotangents.
+
+The supplied stochastic formula omits the Fvo contribution retained in the
+existing deterministic implementation. Compare sampling errors against a
+matching Fvo-zero reference and report that fixed formula difference
+separately. This option retains dense OVVV and reverse storage, so it does
+not improve the underlying memory scaling.
 
 Baseline and matrix precision controls stay separate. Stochastic D/W requires
 positive Laplace weights. W allocation targets matrix accuracy, so its matrix
@@ -407,6 +436,15 @@ The component `baseline_standard_error` and the CC console SE refer to the
 separately evaluated MP2 baseline. Inspect native target flags for sampling
 allocation misses. Budget LIS CC tensors and shared orbital/SCF response in
 addition to the native workspace memory guard.
+
+Fragment components expose `triples_method`, `triples_standard_error`,
+`triples_samples`, `triples_timings` and compact `triples_diagnostics` (including
+native pilot and thread counts). `components.triples_standard_error` combines
+independent fragment energy errors as `sqrt(sum(fragment_SE**2))`, separately
+from baseline uncertainty. It estimates neither gradient error nor total CC
+uncertainty when D/W is stochastic; assess gradient uncertainty from independent
+seed variation. Validation drivers keep `--triples-mode` separate from MP2/D
+mode controls.
 
 `fragment_indices=(i,)` restricts CC corrections. The baseline remains complete
 unless `include_baseline=False`, which returns only the selected correction
@@ -425,5 +463,9 @@ checkpoint machinery. Fixed selections and completed scalar/host-cotangent
 contributions are saved atomically; SCF/common response closes on the current
 live reference after restoration. Identity includes matrix kind, cutoffs,
 scientific controls, signed canonical state, group worklist, native version
-and CC convergence settings. MPI progress checkpoints are explicitly rejected;
+and CC convergence settings. Normalized triples controls also enter the CC
+checkpoint identity, with the native triples source version for stochastic
+triples. Changing mode, sample count, seed or that version invalidates resume.
+Completed triples diagnostics are saved with the fragment contributions. MPI
+progress checkpoints are explicitly rejected;
 there is no distributed D/W replay serialization.

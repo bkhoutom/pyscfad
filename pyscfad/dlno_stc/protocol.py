@@ -209,6 +209,12 @@ def request_fingerprint(inputs, metadata, controls):
     digest = hashlib.sha256()
     digest.update(b"dlno_stc_request_v1\0")
     digest.update(canonical_json({"metadata": problem, "controls": requested}).encode("utf-8"))
+    _update_input_digest(digest, inputs)
+    return digest.hexdigest()
+
+
+def _update_input_digest(digest, inputs):
+    """Hash tensors in bounded blocks, preserving the exchange byte convention."""
     for name in ARRAY_NAMES:
         array = inputs[name]
         digest.update(name.encode("ascii") + b"\0")
@@ -216,6 +222,21 @@ def request_fingerprint(inputs, metadata, controls):
         for slices in _block_slices(array.shape):
             block = np.asarray(array[slices], dtype="<f8", order="C")
             digest.update(block.tobytes(order="C"))
+
+
+def matrix_request_fingerprint(inputs, metadata, controls, matrix_kind, aux_offsets):
+    """Identify the frame, native version and resolved options of a matrix call."""
+    validate_full_inputs(inputs)
+    _check_mapping(metadata, "matrix metadata")
+    _check_mapping(controls, "matrix controls")
+    if matrix_kind not in ("D", "W"):
+        raise ValueError("matrix_kind must be D or W")
+    digest = hashlib.sha256(b"dlno_stc_matrix_request_v2\0")
+    digest.update(canonical_json({
+        "metadata": metadata, "controls": controls, "matrix_kind": matrix_kind,
+        "aux_offsets": aux_offsets,
+    }).encode("utf-8"))
+    _update_input_digest(digest, inputs)
     return digest.hexdigest()
 
 
@@ -384,3 +405,41 @@ def validate_full_result(result, inputs, *, with_grad=True):
     """Check whole-system energy and its three unit-seed numerical bars."""
     validate_full_inputs(inputs)
     _validate_memory_result(result, inputs, ARRAY_NAMES, with_grad=with_grad)
+
+
+def validate_input_cotangents(cotangents, inputs):
+    """Check already-seeded bars independently of the scalar energy contract."""
+    _check_mapping(cotangents, "input cotangents")
+    if set(cotangents) != set(ARRAY_NAMES):
+        raise ValueError("input cotangents must contain exactly foo, fvv, and B")
+    for name in ARRAY_NAMES:
+        _check_array(cotangents[name], name + " cotangent", inputs[name].shape,
+                     symmetric=name in ("foo", "fvv"))
+
+
+def validate_matrix_result(result, inputs):
+    """Validate matrix primals without requiring scalar unit-energy bars."""
+    _check_mapping(result, "matrix result")
+    for field in ("energy", "occupied", "virtual", "diagnostics", "replay"):
+        if field not in result:
+            raise ValueError(f"matrix result missing {field}")
+    energy = np.asarray(result["energy"])
+    if (energy.shape != () or energy.dtype != np.dtype("float64")
+            or not np.isfinite(energy)):
+        raise ValueError("matrix energy must be a finite float64 scalar")
+    _check_array(result["occupied"], "occupied matrix", inputs["foo"].shape,
+                 symmetric=True)
+    _check_array(result["virtual"], "virtual matrix", inputs["fvv"].shape,
+                 symmetric=True)
+    _check_mapping(result["diagnostics"], "matrix diagnostics")
+    diagnostics = result["diagnostics"]
+    for name in ("energy_standard_error", "occupied_frobenius_se", "virtual_frobenius_se"):
+        value = np.asarray(diagnostics.get(name))
+        if (value.shape != () or value.dtype.kind not in "fi"
+                or not np.isfinite(value) or value < 0):
+            raise ValueError(f"matrix {name} must be finite and nonnegative")
+    for name, source in (("occupied", "foo"), ("virtual", "fvv")):
+        error = diagnostics.get(name+"_standard_error")
+        _check_array(error, name+" standard error", inputs[source].shape)
+        if np.any(error < 0):
+            raise ValueError(f"{name} standard error must be nonnegative")

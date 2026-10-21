@@ -156,7 +156,104 @@ within-group covariance. `_stc_mp2.solve_full` retains the complete-system
 algorithm. The old orbital-weight solver and five-array boundary are removed.
 Laplace quadrature weights and mathematical sampling probabilities are retained.
 
-## Sampling budget
+## Native D/W matrices and delayed reverse
+
+`backend.solve_matrices` and `backend.pullback_matrices` are explicit host calls.
+They use the same three prepared tensors and local occupied/virtual frames as
+the energy solver. D is the native MP2 selection density, with its native
+normalization; W is a separate signed energy-weighted approximation. Neither
+call constructs a relaxed physical one-particle RDM.
+
+Native v2 W energy is `0.5 * (trace(Woo) + trace(Wvv))`. Its reported energy
+SE includes covariance between the occupied and virtual trace samples; it is
+not obtained by combining their marginal errors independently. Consequently,
+an energy-only W seed is equivalent to half-identity seeds on both matrices,
+using the same saved production plan. Deterministic W has both traces equal
+to its energy within numerical tolerance.
+
+```python
+import jax
+import numpy as np
+from pyscfad.dlno_stc import adjoint, backend, prepare
+
+# mf, common, static and fragment_index are the existing preparation objects.
+inputs, preparation_vjp = jax.vjp(
+    lambda current_mf, current_common: prepare.prepare_inputs(
+        current_mf, current_common, static, fragment_index), mf, common)
+metadata = {"fragment_id": fragment_index, "target_indices": (0,)}
+forward = backend.solve_matrices(
+    inputs, metadata, {"mode": "deterministic", "target_batch_size": 1},
+    matrix_kind="D")
+# Supply downstream output bars later, in the same input frame.
+input_bars = backend.pullback_matrices(
+    inputs, forward, energy_bar=0.,
+    occupied_bar=np.eye(inputs["foo"].shape[0]),
+    virtual_bar=np.eye(inputs["fvv"].shape[0]))
+mf_bar, common_bar = adjoint.apply_input_pullback(
+    preparation_vjp, inputs, input_bars)
+```
+
+Use the actual saved local target slot(s) in `metadata["target_indices"]`;
+`(0,)` above is only an example. Group outputs are sums, not a per-target stack.
+The reverse differentiates `energy_bar*E + sum(occupied_bar*Xoo) +
+sum(virtual_bar*Xvv)` with the full Frobenius convention, including asymmetric
+seeds. Its three input bars are already seeded: do not multiply them by another
+energy bar. Numerical inputs, target/frame metadata, grid, resolved native
+options, native version and auxiliary offsets are fingerprinted. Reusing a
+forward with changed inputs, controls or native version raises an error. Replay
+records are owned in memory and are not serializable; v1 records cannot be used
+with v2.
+
+Matrix controls are separate from the established stochastic energy controls:
+
+| Control | Matrix behavior |
+| --- | --- |
+| `mode`, `laplace_roots`, `laplace_weights` | Deterministic or stochastic; the existing six-point grid is the default. Stochastic D/W requires strictly positive weights. |
+| `global_seed`, `threads` | Explicit seed and native thread count; matrix default threads is 1. Seeds are derived per fragment and batch. |
+| `target_batch_size` | Explicit target batch, default 1; full orbital spaces are retained. |
+| `memory_limit_mb` | Optional decimal-MB cap on current RSS plus conservatively estimated additional matrix workspace, checked before new host/native tensor allocation. Diagnostics include the breakdown and estimated process peak. |
+| `auxiliary_group_size` | Default 32 rows per group when `aux_offsets` is omitted; an explicit partition takes precedence and is included in memory/replay accounting. |
+| `matrix_tolerance` | Stochastic D/W Frobenius SE target for each summed matrix, default `1e-4`. Inspect measured SEs and `target_met`; allocation is not an attainment guarantee. |
+| `domain_tau`, `virtual_domain_tau` | Stochastic occupied/virtual exact-core thresholds, defaults `.003` and `.0003`. |
+| `pair_pilot_samples`, `min_samples` | Stochastic matrix pilot and production minimum, defaults 100000 and 64. |
+| `resident_points` | Stochastic D only: 2 or 3, default 3. W retains its fixed and dressed factors and rejects this ineffective setting. |
+| `energy_tolerance`, `system_workload_cutoff` | Stochastic D only, defaults `3e-4` and `.0065`. W's half-trace energy and covariance-aware energy SE come from matrix samples; W has no separate energy allocation target. |
+
+Deterministic matrices reject sampling controls. Matrix calls reject fixed-count
+energy options (`production_samples`, `pilot_samples`, production limits) and
+unknown settings. Those existing controls continue to work on the separate
+stochastic energy solver. New deterministic energy calls accept
+`target_batch_size` and optional `threads`; stochastic energy uses the existing
+OpenMP settings and rejects these new deterministic-only controls.
+
+The W adapter explicitly enables virtual `w_virtual_reform`, matching the
+supplied v2 driver. Other sampler options retain the supplied defaults,
+including occupied stratum mixtures and virtual splitting. Effective options
+are reported per batch and included in replay identity; experimental switches
+are not exposed as new host controls.
+
+Each stochastic batch receives independent streams and `1/sqrt(batch_count)`
+of the requested SE budget. The returned SE is the square root of the sum of
+batch variances, and the combined target flags use that measured uncertainty.
+Each W batch contributes its full native energy variance, including its
+occupied/virtual covariance, before independent batch variances are summed.
+No matrix SE or energy SE is a nuclear-gradient uncertainty estimate.
+
+Memory diagnostics include atom-weight arrays, simultaneous B/C proposal
+caches, striped locks and bounded reverse update/radix buffers, as well as
+factors, compact caches and matrix accumulators. Delayed reverse rechecks
+current RSS because downstream arrays may have been allocated after forward.
+
+Deterministic energy uses the supplied Laplace energy-only/fused kernel; it
+does not build D/W. Explicit target batches bound its selected pair-Gram cache.
+Current QR-anchor/Cholesky orbital construction, weak completion, MPI ownership,
+unit-energy scalar bars and the gradient sign convention remain as before.
+Adapter/source differences and original hashes are listed in
+`cpp/native/SOURCE_MANIFEST.txt`. Existing restart identities are retained:
+the scalar Laplace equations are unchanged, while their grids and scientific
+controls remain covered by request fingerprints.
+
+## Energy sampling budget
 
 Public `energy_tolerance` is the total requested sampling standard error in Eh.
 It is divided exactly once by the square root of the number of actual grouped

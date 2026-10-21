@@ -5,7 +5,7 @@ import math
 import jax
 from pyscfad import numpy as np
 
-from .protocol import check_replay, validate_full_result
+from .protocol import check_replay, validate_full_result, validate_input_cotangents
 
 
 def pullback_inputs(prepare_fn, primals, saved_inputs, result, *,
@@ -70,6 +70,13 @@ def apply_selected_pullback(pullback, inputs, result, *, energy_bar=1.0):
     """
     return _apply_preparation_pullback(pullback, inputs, result,
                                        validate_full_result, energy_bar)
+
+
+def apply_input_pullback(pullback, inputs, cotangents):
+    """Apply matrix VJP bars, which already include all output cotangent seeds."""
+    validate_input_cotangents(cotangents, inputs)
+    return pullback({name: np.asarray(cotangents[name], dtype=value.dtype)
+                     for name, value in inputs.items()})
 
 
 def fix_restart_mo_phases(mf):

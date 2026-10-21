@@ -1,5 +1,6 @@
 #include "stc_mp2_kernel.h"
 #include "stc_mp2_selected.h"
+#include "stc_mp2_matrices.h"
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -8,6 +9,7 @@
 #include <limits>
 #include <algorithm>
 #include <array>
+#include <set>
 #include <omp.h>
 #ifdef __linux__
 #include <dlfcn.h>
@@ -154,8 +156,43 @@ double real_control(const py::dict& controls,const char* key,double fallback,
         throw py::value_error(std::string(key)+" is out of range");
     return number;
 }
+void check_energy_controls(const py::dict& controls) {
+    // auxiliary_group_size is consumed by the Python host before this call.
+    const std::set<std::string> allowed = {
+        "mode", "laplace_roots", "laplace_weights", "global_seed",
+        "canonical_fock", "auxiliary_group_size", "virtual_block_size",
+        "target_batch_size", "threads", "production_samples",
+        "min_production_samples", "pilot_samples", "max_production_samples",
+        "system_workload_cutoff", "workload_cutoff", "virtual_keep_fraction",
+        "uniform_mixture", "energy_tolerance"
+    };
+    for (auto item : controls) {
+        const auto key = py::cast<std::string>(item.first);
+        if (!allowed.count(key)) {
+            throw py::value_error("unsupported native energy control: " + key);
+        }
+    }
+}
+void deterministic_controls(const py::dict& controls, stc::Controls& settings) {
+    if (settings.stochastic) {
+        if (controls.contains("target_batch_size") || controls.contains("threads")) {
+            throw py::value_error(
+                "target_batch_size and threads apply only to deterministic energy; "
+                "use the existing OpenMP settings for stochastic energy");
+        }
+        return;
+    }
+    settings.target_batch_size = integer_control(controls,"target_batch_size",1);
+    const auto threads = controls.contains("threads")
+        ? integer_control(controls,"threads",1) : 0;
+    if (threads > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        throw py::value_error("threads is too large");
+    }
+    settings.threads = static_cast<int>(threads);
+}
 py::dict solve_binding(py::handle foo, py::handle fvv, py::handle B,
                py::dict controls, py::object aux_offsets, bool with_grad) {
+    check_energy_controls(controls);
     bool canonical_fock=false;
     if (controls.contains("canonical_fock")) {
         if (!py::isinstance<py::bool_>(controls["canonical_fock"]))
@@ -192,6 +229,7 @@ py::dict solve_binding(py::handle foo, py::handle fvv, py::handle B,
         if (!std::isfinite(v)) throw py::value_error("laplace_weights must be finite");
     settings.adaptive=controls.contains("energy_tolerance") && !controls.contains("production_samples");
     settings.virtual_block_size=integer_control(controls,"virtual_block_size",16);
+    deterministic_controls(controls,settings);
     settings.production_samples=integer_control(controls,"production_samples",4096,2);
     settings.min_production_samples=integer_control(controls,"min_production_samples",settings.adaptive ? 10000:32,2);
     settings.pilot_samples=integer_control(controls,"pilot_samples",100000,2);
@@ -277,6 +315,7 @@ py::dict solve_binding(py::handle foo, py::handle fvv, py::handle B,
 py::dict solve_selected(py::handle foo, py::handle fvv, py::handle B,
                         py::handle target_indices,
                py::dict controls, py::object aux_offsets, bool with_grad) {
+    check_energy_controls(controls);
     if (controls.contains("canonical_fock") && py::cast<bool>(controls["canonical_fock"]))
         throw py::value_error("canonical_fock is supported only by solve_full");
     const auto fo = checked_array(foo,"foo",2), fv = checked_array(fvv,"fvv",2);
@@ -324,6 +363,7 @@ py::dict solve_selected(py::handle foo, py::handle fvv, py::handle B,
         if (!std::isfinite(v)) throw py::value_error("laplace_weights must be finite");
     settings.adaptive=controls.contains("energy_tolerance") && !controls.contains("production_samples");
     settings.virtual_block_size=integer_control(controls,"virtual_block_size",16);
+    deterministic_controls(controls,settings);
     settings.production_samples=integer_control(controls,"production_samples",4096,2);
     settings.min_production_samples=integer_control(controls,"min_production_samples",10000,2);
     settings.pilot_samples=integer_control(controls,"pilot_samples",100000,2);
@@ -418,6 +458,7 @@ py::dict solve_full(py::handle foo, py::handle fvv, py::handle B,
 }
 }  // namespace
 PYBIND11_MODULE(_stc_mp2,m) {
+    stc::bind_matrices(m);
     m.def("parallel_runtime_info",&parallel_runtime_info,py::arg("runtime_path")=py::none());
     m.doc()="STC-MP2 with bounded pair contractions and an explicit canonical-system specialization";
     m.def("solve_selected",&solve_selected,py::arg("foo"),py::arg("fvv"),py::arg("B"),

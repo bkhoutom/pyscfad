@@ -1,6 +1,7 @@
 // Selected-target port of authoritative src_code_domain numerical routines.
 // Host adaptations and explicit test controls are documented in phase1/kernel_implementation.md.
 #include "stc_mp2_selected.h"
+#include "stc_mp2_matrices.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -1014,6 +1015,7 @@ void stc_mp2_kernel::backpropagate_laplace_point(
 Result solve_selected(Inputs& inputs, const std::vector<arma::uword>& targets,
                       const SelectedControls& selected_controls, bool with_grad) {
     const Controls& controls=selected_controls.numerical;
+    if(!controls.stochastic) return solve_deterministic_energy(inputs,targets,controls,with_grad);
     Result result;
     const size_t no=inputs.foo.n_rows,nv=inputs.fvv.n_rows,np=inputs.B.n_rows;
     if(with_grad) {

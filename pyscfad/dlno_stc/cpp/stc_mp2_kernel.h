@@ -8,6 +8,8 @@ namespace pyscfad { namespace dlno_stc {
 struct Controls {
     std::vector<double> roots, weights;
     arma::uword virtual_block_size = 16;
+    std::size_t target_batch_size = 1;
+    int threads = 0;
     std::uint64_t global_seed = 0;
     bool stochastic = false, adaptive = false;
     // Explicit system specialization: diagonal canonical energies are the only

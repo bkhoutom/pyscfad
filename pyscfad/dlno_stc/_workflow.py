@@ -11,11 +11,17 @@ from pyscf import lib as pyscf_lib
 from ._restart import df_source_fingerprint
 
 
-def _native_workspace_mb(naux, nocc, nvir, *, with_grad, system):
+def _native_workspace_mb(naux, nocc, nvir, *, with_grad, system,
+                         mode="stochastic", target_batch_size=1, threads=None):
     """Account for bounded OpenMP scratch, without private full B tensors."""
     # Query the runtime so lib.num_threads() overrides are counted too. Using
     # its requested maximum conservatively covers a smaller OMP_THREAD_LIMIT.
-    threads = max(1, int(pyscf_lib.num_threads()))
+    inherited_threads = max(1, int(pyscf_lib.num_threads()))
+    if threads is not None:
+        from .controls import _integer_control
+        threads = _integer_control("threads", threads, minimum=0)
+    # Preparation uses the inherited team; the native call may request more.
+    threads = max(inherited_threads, threads or inherited_threads)
     owners = min(threads, nocc)
     # Exact pair GEMMs have a 64 MiB worker ceiling and a tiled fallback.
     # A single auxiliary column is the unavoidable lower bound on scratch.
@@ -30,7 +36,16 @@ def _native_workspace_mb(naux, nocc, nvir, *, with_grad, system):
     # At most 32 batches retain 131072 four-role records plus a pointer
     # partition (7 MiB together); reserve 8 MiB including small wave metadata.
     scatter = 8 * 1024**2 if with_grad else 0
-    return (max(exact, transform) + scatter) / 1e6
+    workspace = max(exact, transform) + scatter
+    if mode == "deterministic":
+        from .controls import _integer_control
+        batch = min(nocc, _integer_control("target_batch_size", target_batch_size))
+        # Conservatively reserve the selected Gram cache and reverse scratch
+        # beyond the DF/layout buffers counted by the caller. No all-target
+        # cache is retained unless the caller explicitly requests that batch.
+        workspace += 8 * nocc * nvir * nvir * ((2 if with_grad else 1) * batch
+                                                + (4 if with_grad else 1))
+    return workspace / 1e6
 
 
 def format_domain_dimensions(rows):
@@ -113,7 +128,8 @@ def check_memory(mf, nocc, nvir):
 
 
 def check_domain_memory(mf, static, fragment_index, *, with_grad,
-                          virtual_block_size=16):
+                          virtual_block_size=16, mode="stochastic",
+                          target_batch_size=1, threads=None):
     """Guard one finite domain using its local auxiliary basis and buffers.
 
     This estimates the local solver/RI working set, not a measured process
@@ -141,7 +157,9 @@ def check_domain_memory(mf, static, fragment_index, *, with_grad,
     elements += 8 * block * block + 6 * naux * block
     estimate_mb = elements * 8 / 1e6 + _local_direct_int3c_block_mb()
     estimate_mb += _native_workspace_mb(naux, nocc, nvir,
-                                        with_grad=with_grad, system=False)
+                                        with_grad=with_grad, system=False,
+                                        mode=mode, target_batch_size=target_batch_size,
+                                        threads=threads)
     limit_mb = float(getattr(mf, "max_memory", mf.mol.max_memory))
     if estimate_mb > limit_mb:
         raise MemoryError(
@@ -153,7 +171,8 @@ def check_domain_memory(mf, static, fragment_index, *, with_grad,
 
 
 def check_system_memory(mf, nocc, nvir, *, with_grad, virtual_block_size=16,
-                        auxiliary_group_size=32):
+                        auxiliary_group_size=32, mode="stochastic",
+                        target_batch_size=1, threads=None):
     """Guard one complete replica plus root preparation/SCF residency.
 
     Conservative counts include tensor layout/host/AD copies, the dense
@@ -198,7 +217,9 @@ def check_system_memory(mf, nocc, nvir, *, with_grad, virtual_block_size=16,
     estimate_mb = (8 * elements + (3 if with_grad else 1) * resident_bytes) / 1e6
     estimate_mb += _local_direct_int3c_block_mb() + scatter_mb
     estimate_mb += _native_workspace_mb(naux, nocc, nvir,
-                                        with_grad=with_grad, system=True)
+                                        with_grad=with_grad, system=True,
+                                        mode=mode, target_batch_size=target_batch_size,
+                                        threads=threads)
     limit_mb = float(getattr(mf, "max_memory", mf.mol.max_memory))
     if estimate_mb > limit_mb:
         raise MemoryError(

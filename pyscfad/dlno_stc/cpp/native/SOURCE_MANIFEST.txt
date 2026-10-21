@@ -1,0 +1,64 @@
+Source: TEST_general/dlno_stc_test/stc_mp2_native/src_code_rdm_v2
+Native version: src_code_rdm_v2:427459d9b91fc70f:standalone-1
+Combined supplied directory SHA256 (sorted name + NUL + file bytes): 427459d9b91fc70fd4fc3ffed3dbb73b21201593ec3c81fcdee8f2ed89a2e21c
+
+SHA256 of all supplied v2 files:
+5f0837247968e9fbe2cddce229c391015c0db238e56e9ca1ecff32b740d0a320  README.md
+ae028b5a2bcb1676ee00ec134da8d3be3ffb8c575abee3fbcf3bc6f44f155803  stc_mp2_deterministic_d_w.h
+776b9bf10a007596bfefbea82155f573e4c92e4f8282d1fc9d1717349149e0ca  stc_mp2_deterministic_energy.h
+182b2b988bd446df63e21d5b754190c84d4c18394dfc0a9aba584fa3b0ff097a  stc_mp2_driver_helpers.h
+7f19d1472486b35bcd603865df04df29333c7adbbd8ed809ed4547f242d7e885  stc_mp2_energy_qchem.C
+7d21bdbaa4fde074e59004ed10d8b904798590e039632c06f9800426c1dcd496  stc_mp2_energy_qchem.h
+88f89d871812dedefe08866775ee8c7ff8578d621295cf9786e6b9b4ab1ab49e  stc_mp2_gradient_qchem.C
+1c87fa302146272b033ff261ecbe4fd75c157ab9ce7b03226ac963392de8c7fe  stc_mp2_gradient_qchem.h
+c9e495d14a9d80cf37d2dce818e8bf3cbd9421c658719e698e561bca20e2441d  stc_mp2_kernel_helpers.h
+73917fde3923bab13ce4346b49684900f7167e8015a444dfe43ddf6d84997d58  stc_mp2_kernel_qchem.C
+6b89f7367b63d0ee2ffe8be2bc1c1e52da00466fc65760c41f3058d28bb9ce7c  stc_mp2_kernel_qchem.h
+9e4cb81aa5271faa170916c0fc9ed6205a02024688416a7394bbd8f01e269136  stc_mp2_selected_driver.h
+fd2f3013608ec3293dfea4f42084ad264b61fd28eb6cf11fb7a0507f1357dfe9  stc_mp2_selected_energy.h
+35a8319aeaa2e094030f0cc4fe67a8454d98a86e76aced7a9d72f83b710abdc0  stc_mp2_selected_energy_density.h
+d377011211bfdb11aa8d8222b93678e80673eeff55dd9bf07bbdb91285414de1  stc_mp2_stochastic_density.h
+a775c22096afc21290c5a5dd2d172b4f924de384a4f6419bb854b116f493dbf8  stc_mp2_stochastic_w.h
+
+SHA256 of adapted native source files:
+ae028b5a2bcb1676ee00ec134da8d3be3ffb8c575abee3fbcf3bc6f44f155803  stc_mp2_deterministic_d_w.h
+776b9bf10a007596bfefbea82155f573e4c92e4f8282d1fc9d1717349149e0ca  stc_mp2_deterministic_energy.h
+1414da61595bc0674be42479f354881f2f6e1ad0e84e3e3d6a1dac9170923bbd  stc_mp2_gradient_numerical.cpp
+f174fde96e48f492698d842d7707609f3d55570b0864173230b9e8d6779db0f4  stc_mp2_kernel_helpers.h
+473f021ea697de2dbbf5536d344a627afe33c8916731696bfcc8faf9edb918da  stc_mp2_kernel_numerical.cpp
+20a5a520d3f4b748a67735faa36f104620d2cb6f2546ce6517e327dd91851410  stc_mp2_kernel_qchem.h
+fd2f3013608ec3293dfea4f42084ad264b61fd28eb6cf11fb7a0507f1357dfe9  stc_mp2_selected_energy.h
+35a8319aeaa2e094030f0cc4fe67a8454d98a86e76aced7a9d72f83b710abdc0  stc_mp2_selected_energy_density.h
+1179608573466fc102196263118a47093a349554f1c01342bbc2425cbd4159b8  stc_mp2_stochastic_density.h
+a775c22096afc21290c5a5dd2d172b4f924de384a4f6419bb854b116f493dbf8  stc_mp2_stochastic_w.h
+
+Standalone adaptations (same as preserved Part 1):
+- Five public numerical headers are byte-identical to v2: deterministic_energy,
+  deterministic_d_w, stochastic_w, selected_energy, selected_energy_density.
+- kernel_qchem.h omits Q-Chem basis include/setup, uses standalone array
+  construction and explicit seed/domain tau. Original v1/v2 headers identical.
+- kernel_numerical.cpp retains source from estimate_n_sample to namespace
+  closes with explicit instance domain tau and direct/exchange seeds.
+  Original v1/v2 kernel .C is identical; adapted .cpp unchanged from baseline.
+- gradient_numerical.cpp retains methods starting at right_multiply_panels;
+  CL_DAXPY calls linked BLAS and Q-Chem driver/export code is excluded.
+  Original v1/v2 gradient .C is identical; adapted .cpp unchanged from baseline.
+- helpers effective_sample_threads uses the explicit per-call OpenMP scope
+  without QCHEM_SAMPLE_THREADS. V2 spectral getters retained verbatim.
+- stochastic_density uses dense cotangent buffers, independent of
+  QCHEM_STC_SPARSE_COTANGENT. All other numerical source text retained.
+No contractions, signs, prefactors, allocation, RNG, or replay rules changed.
+Energy pilot counts 100000/1000000 and minimum production 10000 retained.
+Native seed maps uint64 to unsigned by low32 XOR high32.
+
+Adapter integration:
+- Matrix forward and reverse use supplied group overloads. Results sum the
+  selected targets; no separate per-target output matrix is introduced.
+- Stochastic W sets virtual w_virtual_reform=true, matching the supplied
+  driver; all other sampling-affecting source defaults are retained.
+- Native W energy and covariance-aware SE are returned without replacement.
+- Replay owns effective options/plans/version; batch diagnostics expose
+  native_version and effective_options. The module exposes matrix_kernel_version.
+- Legacy scalar stochastic implementation files are unchanged from baseline.
+
+Three-way exact diffs are recorded in part1_update/native_source_diffs.

@@ -177,9 +177,14 @@ def _initialize(mf, static, controls, *, with_grad, scf_pullback=None):
 
 
 def _prepare(state, static, group, controls, with_grad):
+    memory_controls = ({"mode": "deterministic",
+                        "target_batch_size": controls.get("target_batch_size", 1),
+                        "threads": controls.get("threads")}
+                       if controls.get("mode", "deterministic") == "deterministic" else {})
     check_domain_memory(state["mf"], static, group.representative_index,
                         with_grad=with_grad,
-                        virtual_block_size=controls.get("virtual_block_size", 16))
+                        virtual_block_size=controls.get("virtual_block_size", 16),
+                        **memory_controls)
     prepare = lambda mf_, common_: prepare_boys_group_inputs(mf_, common_, static, group)
     with warnings.catch_warnings():
         warnings.filterwarnings("error", message="integral-direct local Lov is unavailable.*",
@@ -434,10 +439,15 @@ def _validate_system_metric(mf):
 
 
 def _prepare_system(state, controls, with_grad):
+    memory_controls = ({"mode": "deterministic",
+                        "target_batch_size": controls.get("target_batch_size", 1),
+                        "threads": controls.get("threads")}
+                       if controls.get("mode", "deterministic") == "deterministic" else {})
     check_system_memory(state["mf"], len(state["occupied"]), len(state["virtual"]),
                         with_grad=with_grad,
                         virtual_block_size=controls.get("virtual_block_size", 16),
-                        auxiliary_group_size=controls.get("auxiliary_group_size", 32))
+                        auxiliary_group_size=controls.get("auxiliary_group_size", 32),
+                        **memory_controls)
     _validate_system_metric(state["mf"])
     # Save discrete labels before building the VJP; rebuild all continuous
     # coefficients inside it. System scope needs no domain selections.

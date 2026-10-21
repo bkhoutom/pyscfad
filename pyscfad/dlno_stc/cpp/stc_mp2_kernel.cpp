@@ -1,4 +1,5 @@
 #include "stc_mp2_helpers.h"
+#include "stc_mp2_matrices.h"
 #include <algorithm>
 #include <numeric>
 
@@ -94,6 +95,11 @@ Result solve_numerical(const Inputs& x, const Controls& requested_controls, bool
 }
 }  // namespace
 Result solve_full(const Inputs& x, const Controls& controls, bool with_grad) {
+    if(!controls.stochastic) {
+        std::vector<arma::uword> targets(x.foo.n_rows);
+        std::iota(targets.begin(),targets.end(),0);
+        return solve_deterministic_energy(x,targets,controls,with_grad);
+    }
     return solve_numerical(x,controls,with_grad);
 }
 }}  // namespace pyscfad::dlno_stc

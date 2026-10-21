@@ -141,8 +141,11 @@ def _static_registry():
         BoysDomainThresholds, FixedPAOSubspaceSelection,
         FragmentDomainSelection, DomainSelections, DomainGroup,
     )
+    from .lis import FragmentLISSelection, LISSelections
+    from .ccsd import CCSDSelections
     classes = (BoysDomainThresholds, FixedPAOSubspaceSelection,
-               FragmentDomainSelection, DomainSelections, DomainGroup)
+               FragmentDomainSelection, DomainSelections, DomainGroup,
+               FragmentLISSelection, LISSelections, CCSDSelections)
     return {_class_tag(cls): cls for cls in classes}
 
 

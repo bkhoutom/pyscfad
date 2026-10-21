@@ -338,3 +338,92 @@ require fresh checkpoints after restoring the anchored virtual frame. Older
 finite packets using `local_before_fock_v1` or `local_before_fock_v2` must be
 re-exported; the outer tensor exchange schema and checkpoint container version
 remain 1.
+
+## D/W-selected LIS and CCSD(T)
+
+`pyscfad.dlno_stc.ccsd` supplies `build_static_selections`, `kernel` and
+`value_and_grad`. Each original Boys target has its own native D or W pair
+and LIS. Identical ED frames share preparation, while CC retains the global
+active-HF reference, the original Boys target overlaps, and the established
+stopped rotation of discarded orbitals. Retained orbitals, target overlaps,
+embedding maps and numerical ED frames respond to differentiation.
+
+```python
+from pyscfad import gto, scf
+from pyscfad.dlno_stc import build_domain_selections, ccsd
+
+mol = gto.Mole(atom='O 0 0 0; H .1 -.75 .57; H 0 .8 .61',
+               basis='sto-3g', verbose=0)
+mol.build(trace_exp=False, trace_ctr_coeff=False)
+
+def build_mf(current):
+    mf = scf.RHF(current).density_fit()
+    mf.conv_tol = 1e-12
+    mf.conv_tol_grad = 1e-9
+    mf.kernel()
+    return mf
+
+mf = build_mf(mol)
+domains = build_domain_selections(
+    mf, frozen=1, force_full_domains=True,
+    lo_kwargs={'conv_tol': 1e-12, 'conv_tol_grad': 1e-9})
+baseline_controls = {'mode': 'deterministic', 'threads': 1}
+matrix_controls = {'mode': 'deterministic', 'threads': 1}
+selected = ccsd.build_static_selections(
+    mf, domains, matrix_kind='D', thresh_occ=1e-4, thresh_vir=1e-5,
+    baseline_controls=baseline_controls, matrix_controls=matrix_controls)
+energy, gradient, components = ccsd.value_and_grad(
+    mol, build_mf, selected, baseline_controls=baseline_controls,
+    matrix_controls=matrix_controls, include_hf=True, return_components=True)
+force = -gradient.coords
+```
+
+For W, select `matrix_kind='W'` and supply its occupied/virtual cutoffs
+explicitly, for example `thresh_occ=3e-4, thresh_vir=1e-4`. These example
+cutoffs are independent of the D cutoffs; inspect the reported LIS dimensions.
+The strict rule is `abs(eigenvalue) > cutoff`, including signed W eigenvalues.
+A zero cutoff retains the whole corresponding global active-HF manifold.
+Saved labels remain fixed during derivatives and finite differences; numerical
+orbitals and eigenvectors are rebuilt at the current geometry.
+The implicit Boys response requires a stationary localization. Use sufficiently
+tight saved `lo_kwargs` and check convergence before a force comparison; loose
+localization can leave fragment-specific derivative errors even with a full LIS.
+
+The correlation accounting is
+`MP2 baseline + sum(CCSD + (T) - MP2-LIS)`. `e_mp2_base` includes weak-pair
+completion; `e_mp2_weak` reports its included weak part. The MP2-LIS subtraction
+uses the shared solver's exact denominators. The native matrix energy is a
+diagnostic and receives zero energy seed in the correction reverse. The
+six-point baseline can therefore leave the expected MP2 quadrature residual
+relative to conventional full-space CC. `ccsd_t=True` retains the shared
+solver's existing triples option; its convergence defaults are unchanged.
+
+Baseline and matrix precision controls stay separate. Stochastic D/W requires
+positive Laplace weights. W allocation targets matrix accuracy, so its matrix
+controls reject an energy tolerance. Matrix standard errors do not bound the
+nonlinear CC energy or nuclear gradient error. Components retain compact native
+sampling diagnostics, without per-element error arrays or replay handles.
+The component `baseline_standard_error` and the CC console SE refer to the
+separately evaluated MP2 baseline. Inspect native target flags for sampling
+allocation misses. Budget LIS CC tensors and shared orbital/SCF response in
+addition to the native workspace memory guard.
+
+`fragment_indices=(i,)` restricts CC corrections. The baseline remains complete
+unless `include_baseline=False`, which returns only the selected correction
+and forbids `include_hf=True`. This is the representative-fragment C20 API;
+such a result is not a complete molecular CC energy or force.
+
+For MPI, pass `comm`; complete groups run on round-robin owners and root closes
+common/SCF response once. Worker `build_mf` must accept `mo_coeff_init`,
+`mo_energy_init`, `mo_occ_init`, and `e_tot_init`, adopt those arrays without
+SCF, and return a matching density-fitted skeleton. Only root needs controls
+and selections; only root returns a result. Shared SCF/J/K work runs on root
+in this initial CC path. Native replay and pullback closures remain local.
+
+Optional serial `checkpoint_dir` and `resume=True` reuse the existing safe STC
+checkpoint machinery. Fixed selections and completed scalar/host-cotangent
+contributions are saved atomically; SCF/common response closes on the current
+live reference after restoration. Identity includes matrix kind, cutoffs,
+scientific controls, signed canonical state, group worklist, native version
+and CC convergence settings. MPI progress checkpoints are explicitly rejected;
+there is no distributed D/W replay serialization.

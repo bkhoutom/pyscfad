@@ -203,10 +203,11 @@ def _add_bars(state, mf_bar, common_bar):
                                               state["common_bar"], common_bar)
 
 
-def _finish(state, *, with_grad, include_hf):
+def _finish(state, *, with_grad, include_hf,
+            uncertainty_label="stochastic standard error"):
     energy = state["energy"]
-    lib.logger.info(state["mf"], "STC correlation energy %.12g; stochastic standard error %.6g",
-                    float(energy), math.sqrt(state["variance"]))
+    lib.logger.info(state["mf"], "STC correlation energy %.12g; %s %.6g",
+                    float(energy), uncertainty_label, math.sqrt(state["variance"]))
     if not with_grad:
         jax.block_until_ready(energy)
         return energy

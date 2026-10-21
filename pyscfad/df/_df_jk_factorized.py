@@ -3,10 +3,18 @@
 The input is S, with D=S S.T. Its reverse never constructs the generic
 AO-square density cotangent or the auxiliary-by-AO-pair integral cotangent.
 Coordinate work uses thin occupied factors and one bounded integral pass.
+
+Runtime memory budgets (MiB) can be set with
+``PYSCFAD_FACTOR_PANEL_MEMORY_MB`` (combined panel threshold, default 256)
+and ``PYSCFAD_SOLVE_MEMORY_MB`` (solve workspace target, default 64).
+Finite nonnegative values are accepted; unset or invalid values use the defaults.
+Zero forces disk panels or single-column solve slabs, respectively.
 """
 
 from functools import partial
 from contextlib import contextmanager
+import math
+import os
 import time
 
 import jax
@@ -26,6 +34,15 @@ _FACTOR_PANEL_MEMORY_MB = 256.0
 _SOLVE_MEMORY_MB = 64.0
 
 
+def _memory_mb(name, default):
+    """Read a runtime budget without changing the fallback module constants."""
+    try:
+        value = float(os.environ.get(name, default))
+    except ValueError:
+        return default
+    return value if math.isfinite(value) and value >= 0 else default
+
+
 @contextmanager
 def _factor_panels(naux, nao, rank, with_k):
     """Keep small thin panels in RAM; spill large ones to owned scratch."""
@@ -33,7 +50,8 @@ def _factor_panels(naux, nao, rank, with_k):
         yield None, None
         return
     shape = (naux, nao * rank)
-    if 2 * numpy.prod(shape) * 8 <= _FACTOR_PANEL_MEMORY_MB * 1024**2:
+    panel_memory = _memory_mb('PYSCFAD_FACTOR_PANEL_MEMORY_MB', _FACTOR_PANEL_MEMORY_MB)
+    if 2 * numpy.prod(shape) * 8 <= panel_memory * 1024**2:
         yield numpy.empty(shape), numpy.empty(shape)
     else:
         # Every later read/solve is a bounded slab. The file is closed and
@@ -120,7 +138,8 @@ def _reverse(with_j, with_k, factor_response, residual, cotangents, T, Rtilde):
     if with_k:
         # Each triangular solve requires all auxiliary rows but only a
         # bounded column slab; overwrite the R panels with L^-T R.
-        width = max(1, int(_SOLVE_MEMORY_MB * 1024**2 / (3 * 8 * naux)))
+        solve_memory = _memory_mb('PYSCFAD_SOLVE_MEMORY_MB', _SOLVE_MEMORY_MB)
+        width = max(1, int(solve_memory * 1024**2 / (3 * 8 * naux)))
         for begin in range(0, Rtilde.shape[1], width):
             end = min(begin + width, Rtilde.shape[1])
             with dense_blas_threads():

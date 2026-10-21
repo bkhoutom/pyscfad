@@ -443,3 +443,76 @@ def test_deterministic_default_resume_accepts_explicit_mode_without_new_native(t
     assert default[1] == explicit[1]
     assert default[1].fragments[0].triples_method == 'deterministic'
     assert default[1].triples_standard_error == 0.
+
+
+def test_cc_mpi_worker_supports_frozen_orbital_lists_with_jax_initial_values():
+    """Static worker occupations must work with PySCF's frozen-list count."""
+    from pyscfad import gto, scf
+    from pyscfad.dlno_stc import _mpi_ccsd
+    from pyscfad.dlno_stc._mpi import _reference_signature
+    from pyscfad.lno.ccsd import RCCSD
+
+    mol = gto.Mole(atom='H 0 0 0; H 0 0 1; H 0 0 2; H 0 0 3',
+                   basis='sto-3g', verbose=0)
+    mol.build(trace_exp=False, trace_ctr_coeff=False)
+    reference = scf.RHF(mol).density_fit()
+    canonical = dict(mo_coeff=np.eye(4), mo_energy=np.array([-1., -.5, .2, .8]),
+                     mo_occ=np.array([2., 2., 0., 0.]), e_tot=np.array(-1.2))
+    for name, value in canonical.items():
+        setattr(reference, name, value)
+
+    def initialize(initial):
+        worker = scf.RHF(mol).density_fit()
+        for name, value in initial.items():
+            setattr(worker, name, jnp.asarray(value))
+        worker.converged = True
+        return worker
+
+    build_worker = getattr(_mpi_ccsd, '_build_cc_worker', None)
+    assert callable(build_worker), 'CC worker metadata boundary is missing'
+    worker = build_worker(initialize, canonical, _reference_signature(reference))
+    cc = RCCSD(worker, frozen=np.array([0, 3], dtype=np.int32))
+    assert cc.nocc == 1 and cc.nmo == 2
+    for name, expected in canonical.items():
+        actual = getattr(worker, name)
+        np.testing.assert_array_equal(actual, expected)
+        assert actual.dtype == expected.dtype
+
+
+def test_cc_mpi_worker_preserves_disk_df_factors_for_finite_domain(tmp_path):
+    """A worker must retain the root's global-auxiliary finite-domain fitting."""
+    from pyscf import df as conventional_df
+    from pyscfad import gto, scf
+    from pyscfad.dlno_stc._mpi import _reference_signature
+    from pyscfad.dlno_stc._mpi_ccsd import _build_cc_worker
+    from pyscfad.lno.df import transform_df_to_mo
+
+    mol = gto.Mole(atom='O 0 0 0; H .1 -.75 .57; H 0 .8 .61; '
+                        'O 0 0 8; H .13 -.74 8.57; H .02 .81 8.61',
+                   basis='sto-3g', verbose=0)
+    mol.build(trace_exp=False, trace_ctr_coeff=False)
+    path = str(tmp_path / 'global-df.h5')
+    reference = scf.RHF(mol).density_fit()
+    reference.with_df.attach_outcore_cderi(path)
+    conventional_df.outcore.cholesky_eri(
+        mol.to_pyscf(), path, auxmol=reference.with_df.auxmol.to_pyscf(), verbose=0)
+    nao = mol.nao
+    canonical = dict(mo_coeff=np.eye(nao), mo_energy=np.linspace(-1., 1., nao),
+                     mo_occ=np.array([2.] * 10 + [0.] * (nao - 10)), e_tot=np.array(-150.))
+    for name, value in canonical.items():
+        setattr(reference, name, value)
+
+    def initialize(initial):
+        worker = scf.RHF(mol).density_fit()
+        worker.with_df.attach_outcore_cderi(path)
+        for name, value in initial.items():
+            setattr(worker, name, jnp.asarray(value))
+        worker.converged = True
+        return worker
+
+    worker = _build_cc_worker(initialize, canonical, _reference_signature(reference))
+    local = (0, 1, 2)
+    coeff = jnp.asarray(canonical['mo_coeff'][:, :4])
+    root_factors = transform_df_to_mo(reference, coeff, (0, 2, 2, 4), atmlst=local)
+    worker_factors = transform_df_to_mo(worker, coeff, (0, 2, 2, 4), atmlst=local)
+    np.testing.assert_allclose(worker_factors, root_factors, atol=1e-13, rtol=0.)

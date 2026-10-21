@@ -6,6 +6,7 @@ host cotangents cross MPI. Native matrix replay and Python pullbacks stay local.
 import gc
 
 import jax
+import numpy
 from pyscfad import numpy as np
 
 from . import driver
@@ -17,6 +18,20 @@ from ._mpi import (
 from ._selection import build_domain_groups
 from ._workflow import allocate_domain_controls
 from .adjoint import zero_term_cotangents
+
+
+def _build_cc_worker(worker_initializer, canonical, signature):
+    """Construct the worker reference used by the shared CC impurity solver."""
+    mf = _build_worker(worker_initializer, canonical, signature)
+    # Occupations are static metadata. PySCF's frozen-list orbital count
+    # updates a mask derived from them, requiring a host NumPy array.
+    mf.mo_occ = numpy.asarray(mf.mo_occ)
+    # Keep a declared disk DF source in its original global auxiliary frame.
+    # Without its placeholder, finite CC domains choose a local fitting model.
+    source = getattr(mf.with_df, '_cderi_to_save', None)
+    if source is not None and getattr(mf.with_df, '_prefer_cderi_to_save', False):
+        mf.with_df.attach_outcore_cderi(source)
+    return mf
 
 
 def _run_mpi(initializer, worker_initializer, comm, *, with_grad,
@@ -63,7 +78,7 @@ def _run_mpi(initializer, worker_initializer, comm, *, with_grad,
     def setup():
         nonlocal state
         if rank != 0:
-            mf = _build_worker(worker_initializer, payload['canonical'], signature)
+            mf = _build_cc_worker(worker_initializer, payload['canonical'], signature)
             state = dict(mf=mf, common=jax.tree_util.tree_map(np.asarray, payload['common']),
                          static=static.mp2_static, common_pullback=None,
                          scf_pullback=None, weak_pairs=pairs)

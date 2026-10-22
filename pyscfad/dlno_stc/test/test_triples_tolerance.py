@@ -187,3 +187,32 @@ def test_positive_tolerance_that_underflows_per_fragment_target_fails_early(
     with pytest.raises(ValueError, match='energy_tolerance.*too small'):
         _public_call(api, static, settings, triples_controls=dict(
             mode='stochastic', nsamples=20, energy_tolerance=np.nextafter(0., 1.)))
+
+
+@pytest.mark.parametrize('value', [
+    complex(1e-4, 0.), np.complex128(1e-4 + 0j),
+    np.complex128(1e-4 + 1j), np.complex128(complex(1e-4, np.nan)),
+    np.clongdouble('0.0001+0j'), '1e-4',
+])
+def test_tolerance_requires_real_values_representable_without_underflow(value):
+    with pytest.raises(ValueError, match='energy_tolerance'):
+        controls.normalize_triples_controls(
+            dict(mode='stochastic', nsamples=20, energy_tolerance=value), ccsd_t=True)
+
+
+@pytest.mark.parametrize('literal', ['1e-400', '-1e-400'])
+def test_extended_precision_tolerance_cannot_narrow_to_zero(literal):
+    if np.finfo(np.longdouble).minexp >= np.finfo(np.float64).minexp:
+        pytest.skip('longdouble does not extend the float64 exponent range')
+    value = np.longdouble(literal)
+    with pytest.raises(ValueError, match='energy_tolerance'):
+        controls.normalize_triples_controls(
+            dict(mode='stochastic', nsamples=20, energy_tolerance=value), ccsd_t=True)
+
+
+@pytest.mark.parametrize('value', [np.longdouble('0.0001'), np.longdouble('0'),
+                                  np.longdouble('-0'), 1])
+def test_representable_real_scalars_keep_tolerance_semantics(value):
+    normalized = controls.normalize_triples_controls(
+        dict(mode='stochastic', nsamples=20, energy_tolerance=value), ccsd_t=True)
+    assert normalized.get('energy_tolerance', 0.) == float(value)

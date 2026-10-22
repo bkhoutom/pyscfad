@@ -1,5 +1,7 @@
 """Shared defaults for high-level STC-MP2 drivers."""
 
+from numbers import Real
+
 import numpy
 
 DEFAULT_ENERGY_TOLERANCE = 3e-4  # Hartree (0.3 mHa)
@@ -85,7 +87,16 @@ def normalize_triples_controls(controls, *, ccsd_t):
     if settings['global_seed'] >= 2**64:
         raise ValueError('global_seed must fit in uint64')
     if 'energy_tolerance' in settings:
-        tolerance = _finite_control('energy_tolerance', settings['energy_tolerance'], positive=False)
+        raw_tolerance = settings['energy_tolerance']
+        if (isinstance(raw_tolerance, (bool, numpy.bool_))
+                or not isinstance(raw_tolerance, Real) or raw_tolerance < 0):
+            raise ValueError('energy_tolerance must be a finite nonnegative real scalar')
+        try:
+            tolerance = float(raw_tolerance)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError('energy_tolerance must be representable as float64') from exc
+        if not numpy.isfinite(tolerance) or (raw_tolerance != 0 and tolerance == 0.):
+            raise ValueError('energy_tolerance must be finite and representable as float64')
         if tolerance:
             settings['energy_tolerance'] = tolerance
         else:

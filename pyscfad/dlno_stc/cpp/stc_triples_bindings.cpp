@@ -62,9 +62,20 @@ double standard_error_target(py::handle value) {
     if (PyBool_Check(value.ptr()) ||
         !py::isinstance(value, py::module_::import("numbers").attr("Real")))
         throw py::type_error("target_standard_error must be a real number");
+    const py::int_ zero(0);
+    const auto negative=PyObject_RichCompareBool(value.ptr(),zero.ptr(),Py_LT);
+    if (negative<0) throw py::error_already_set();
+    if (negative)
+        throw py::value_error("target_standard_error must be finite and nonnegative");
     const auto target=py::cast<double>(value);
     if (!std::isfinite(target) || target<0)
         throw py::value_error("target_standard_error must be finite and nonnegative");
+    if (target==0) {
+        const auto nonzero=PyObject_RichCompareBool(value.ptr(),zero.ptr(),Py_NE);
+        if (nonzero<0) throw py::error_already_set();
+        if (nonzero)
+            throw py::value_error("target_standard_error is too small for float64");
+    }
     return target;
 }
 

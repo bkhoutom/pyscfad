@@ -201,6 +201,20 @@ def test_native_triples_rejects_invalid_tolerance(with_grad, target):
         function(**triples_fixture(), nsamples=17, target_standard_error=target)
 
 
+@pytest.mark.parametrize('with_grad', [False, True])
+@pytest.mark.parametrize('literal', ['1e-400', '-1e-400'])
+def test_native_triples_rejects_tolerance_that_underflows_float64(with_grad, literal):
+    target = np.longdouble(literal)
+    if target == 0:
+        pytest.skip('longdouble does not preserve values below the float64 range')
+    module = triples_native()
+    function = (module.triples_selected_energy_vjp if with_grad
+                else module.triples_selected_energy)
+    # Narrowing first would silently select fixed-count sampling for either sign.
+    with pytest.raises(ValueError, match='target_standard_error'):
+        function(**triples_fixture(), nsamples=17, target_standard_error=target)
+
+
 def test_native_triples_reference_rejects_positive_tolerance():
     with pytest.raises(ValueError, match='target_standard_error'):
         triples_native().triples_selected_energy(

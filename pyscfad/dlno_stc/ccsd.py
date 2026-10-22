@@ -202,6 +202,16 @@ def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_v
     return CCSDSelections(lis, _scientific_identity(baseline, matrix))
 
 
+def _allocate_triples_controls(controls, nfragments):
+    """Allocate a total triples SE budget over globally requested singletons."""
+    if controls is None or 'energy_tolerance' not in controls:
+        return controls
+    target = controls['energy_tolerance'] / numpy.sqrt(nfragments) if nfragments else 0.
+    if nfragments and target == 0.:
+        raise ValueError('energy_tolerance is too small for a nonzero per-fragment target')
+    return dict(controls, target_standard_error=float(target))
+
+
 def _triples_fragment_seed(global_seed, fragment_index):
     """Derive a triples stream from fragment identity, independent of ownership."""
     sequence = numpy.random.SeedSequence([global_seed, 0x54524950, fragment_index])
@@ -408,7 +418,9 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
     ``return_components=True`` returns ``(energy, CCSDComponents)``. The MP2
     baseline includes weak completion and is independent of matrix precision.
     With ``ccsd_t=True``, omitted ``triples_controls`` preserves deterministic
-    triples; stochastic mode requires a fixed ``nsamples >= 2``.
+    triples; stochastic mode requires integer ``nsamples >= 2``. A positive
+    ``energy_tolerance`` targets the total triples energy SE in Hartree and
+    makes ``nsamples`` the pilot count; omitted/zero uses a fixed count.
     ``fragment_indices`` restricts corrections (default: all saved LIS ranks).
     The complete baseline remains included unless ``include_baseline=False``;
     that option returns only selected CC-minus-MP2-LIS corrections and forbids HF.
@@ -419,6 +431,7 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
             raise ValueError('include_hf requires include_baseline=True')
         baseline, matrix = _validate_run(static, baseline_controls, matrix_controls, matrix_kind)
         indices = _fragment_indices(static, fragment_indices)
+        triples = _allocate_triples_controls(triples, len(indices))
         if any(isinstance(x, jax.core.Tracer) for x in jax.tree_util.tree_leaves(mf)):
             raise TypeError('STC CC kernel is forward-only; use value_and_grad')
         state = driver._initialize(mf, static.mp2_static, baseline, with_grad=False)
@@ -472,6 +485,7 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
         selected = stop_trace(build_static)(mf) if build_static is not None else static
         baseline, matrix = _validate_run(selected, baseline_controls, matrix_controls, matrix_kind)
         indices = _fragment_indices(selected, fragment_indices)
+        triples = _allocate_triples_controls(triples, len(indices))
         state = driver._initialize(mf, selected.mp2_static, baseline, with_grad=True,
                                    scf_pullback=scf_pullback)
         state['cc_fragment_indices'] = indices

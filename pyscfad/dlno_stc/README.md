@@ -407,15 +407,28 @@ of the MP2 baseline and D/W controls:
 energy, gradient, components = ccsd.value_and_grad(
     mol, build_mf, selected, baseline_controls=baseline_controls,
     matrix_controls=matrix_controls, ccsd_t=True,
-    triples_controls={'mode': 'stochastic', 'nsamples': 20000, 'global_seed': 71},
+    triples_controls={'mode': 'stochastic', 'energy_tolerance': 1e-4,
+                      'nsamples': 20000, 'global_seed': 11},
     include_hf=True, return_components=True)
 ```
 
 `kernel` accepts the same triples controls. Stochastic triples requires integer
-`nsamples >= 2`; the seed defaults to 71 and must fit in uint64. Fixed-count
-sampling is the only public stochastic allocation mode. Deterministic triples
-accepts no sampling settings. Changing triples mode, count or seed reuses the
-saved LIS selections. Each LIS receives a distinct stream derived from the
+`nsamples >= 2`; the seed defaults to 71 and must fit in uint64. The optional
+`energy_tolerance` is a finite, nonnegative total estimated one-sigma triples
+energy error in Hartree. Omission or zero keeps fixed-count sampling with
+exactly `nsamples` samples. A positive tolerance makes `nsamples` the pilot
+count, not a maximum; the native sampler continues when its estimated energy
+SE requires more samples. Deterministic triples accepts no sampling settings.
+Changing triples mode, count, seed or tolerance reuses the saved LIS selections.
+
+Before MPI distribution or checkpoint restoration, the total triples tolerance
+is divided by `sqrt(N)`, where `N` is the number of globally requested singleton
+LIS fragments, independent of merged groups, MPI rank ownership and completed
+checkpoint work. A `fragment_indices` subset receives its own total budget; an
+empty subset makes no triples calls. With 16 requested fragments, total budgets
+of `1e-4` and `5e-5` Eh give per-LIS targets of `2.5e-5` and `1.25e-5` Eh.
+The derived `target_standard_error` is internal and is not a public control.
+Each LIS receives a distinct stream derived from the
 global seed, a triples tag and its fragment index, independently of MPI rank
 and work order. Energy-only and fused energy/VJP calls use different native
 proposals; their same-seed energies need not be identical. Gradients use the
@@ -441,10 +454,13 @@ Fragment components expose `triples_method`, `triples_standard_error`,
 `triples_samples`, `triples_timings` and compact `triples_diagnostics` (including
 native pilot and thread counts). `components.triples_standard_error` combines
 independent fragment energy errors as `sqrt(sum(fragment_SE**2))`, separately
-from baseline uncertainty. It estimates neither gradient error nor total CC
-uncertainty when D/W is stochastic; assess gradient uncertainty from independent
-seed variation. Validation drivers keep `--triples-mode` separate from MP2/D
-mode controls.
+from baseline uncertainty. These are achieved ordinary energy SE estimates,
+not sequential confidence bounds for the adaptive stopping rule. The actual
+sample count and achieved SE remain available for both energy-only and fused
+energy/VJP calls. An energy tolerance does not impose a gradient tolerance.
+The SE estimates neither gradient error nor total CC uncertainty when D/W is
+stochastic; assess gradient uncertainty from independent seed variation.
+Validation drivers keep `--triples-mode` separate from MP2/D mode controls.
 
 `fragment_indices=(i,)` restricts CC corrections. The baseline remains complete
 unless `include_baseline=False`, which returns only the selected correction
@@ -465,7 +481,9 @@ live reference after restoration. Identity includes matrix kind, cutoffs,
 scientific controls, signed canonical state, group worklist, native version
 and CC convergence settings. Normalized triples controls also enter the CC
 checkpoint identity, with the native triples source version for stochastic
-triples. Changing mode, sample count, seed or that version invalidates resume.
+triples. Changing mode, sample count, seed, positive energy tolerance or that
+version invalidates resume. Omitted and zero energy tolerances share the same
+fixed-count identity.
 Completed triples diagnostics are saved with the fragment contributions. MPI
 progress checkpoints are explicitly rejected;
 there is no distributed D/W replay serialization.

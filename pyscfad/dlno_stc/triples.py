@@ -16,12 +16,13 @@ from pyscfad import numpy as np
 _INPUT_NAMES = ('t1', 't2', 'Bvo', 'Boo', 'Bvv', 'eocc', 'evir', 'U')
 
 
-def _native_call(inputs, *, nsamples, seed, with_grad):
+def _native_call(inputs, *, nsamples, seed, target_standard_error, with_grad):
     native = importlib.import_module('pyscfad.dlno_stc._stc_mp2')
     function = (native.triples_selected_energy_vjp if with_grad
                 else native.triples_selected_energy)
     result = function(*(numpy.asarray(x) for x in inputs),
-                      nsamples=nsamples, seed=seed)
+                      nsamples=nsamples, seed=seed,
+                      target_standard_error=target_standard_error)
     diagnostics = {name: value for name, value in result.items()
                    if name not in ('energy', 'cotangents')}
     output = (np.asarray(result['energy']),
@@ -35,14 +36,18 @@ def make_solver(controls, *, with_grad):
     """Build the optional LIS solver from normalized stochastic controls.
 
     ``global_seed`` is the fragment seed already derived by the CC driver.
+    ``target_standard_error`` is the allocated per-LIS energy target; zero
+    keeps fixed-count sampling and a positive target makes ``nsamples`` a pilot.
     Diagnostics contain only numeric array leaves, so they can travel through
     the driver's ``jax.vjp(..., has_aux=True)`` path without native objects.
     """
     nsamples = controls['nsamples']
     seed = controls['global_seed']
+    target_standard_error = controls.get('target_standard_error', 0.0)
 
     def native_call(*inputs):
         return _native_call(inputs, nsamples=nsamples, seed=seed,
+                            target_standard_error=target_standard_error,
                             with_grad=with_grad)
 
     if with_grad:

@@ -58,6 +58,16 @@ std::uint64_t unsigned_integer(py::handle value, const char* name) {
     return number;
 }
 
+double standard_error_target(py::handle value) {
+    if (PyBool_Check(value.ptr()) ||
+        !py::isinstance(value, py::module_::import("numbers").attr("Real")))
+        throw py::type_error("target_standard_error must be a real number");
+    const auto target=py::cast<double>(value);
+    if (!std::isfinite(target) || target<0)
+        throw py::value_error("target_standard_error must be finite and nonnegative");
+    return target;
+}
+
 arma::mat matrix(const InputArray& input) {
     arma::mat result(input.size(0), input.size(1));
     for (py::ssize_t i=0; i<input.size(0); ++i)
@@ -103,9 +113,13 @@ py::array_t<double> df_array(const arma::mat& input, py::ssize_t n1, py::ssize_t
 py::dict selected(py::handle t1_value, py::handle t2_value,
                   py::handle bvo_value, py::handle boo_value, py::handle bvv_value,
                   py::handle eo_value, py::handle ev_value, py::handle u_value,
-                  py::handle sample_value, py::handle seed_value, bool with_vjp) {
+                  py::handle sample_value, py::handle seed_value,
+                  py::handle target_value, bool with_vjp) {
     const auto samples=unsigned_integer(sample_value,"nsamples");
     const auto seed=unsigned_integer(seed_value,"seed");
+    const auto target=standard_error_target(target_value);
+    if (target>0 && samples==0)
+        throw py::value_error("positive target_standard_error requires stochastic nsamples");
     if (samples > std::numeric_limits<size_t>::max())
         throw py::value_error("nsamples is too large");
     if (samples==1 || (with_vjp && samples==0))
@@ -145,10 +159,10 @@ py::dict selected(py::handle t1_value, py::handle t2_value,
         py::gil_scoped_release release;
         if (with_vjp)
             result=Triples::selected_energy_vjp(singles,doubles,Bvo,Boo,Bvv,
-                eocc,evir,subspace,size_t(samples),bars,seed,0.0,1.0);
+                eocc,evir,subspace,size_t(samples),bars,seed,target,1.0);
         else
             result=Triples::selected_energy(singles,doubles,Bvo,Boo,Bvv,
-                eocc,evir,subspace,size_t(samples),seed,0.0);
+                eocc,evir,subspace,size_t(samples),seed,target);
     }
     py::dict out;
     out["energy"]=result.energy; out["standard_error"]=result.standard_error;
@@ -193,20 +207,26 @@ void bind_triples(py::module_& module) {
     // str is immutable; identity is fixed by the two byte-identical vendored sources.
     module.attr("TRIPLES_VERSION")=
         "stc_triples:sha256:h=273f7818f5cde71f7c07f62127bbdcca37e42b045748434424a737c7de569f2c:"
-        "C=a7fc2b8488255ca4fa36968a632f817b88fb7c60e8f67de336d30ab297eec384:binding-1";
+        "C=a7fc2b8488255ca4fa36968a632f817b88fb7c60e8f67de336d30ab297eec384:binding-2";
     module.def("triples_selected_energy", [](py::handle t1, py::handle t2,
         py::handle Bvo, py::handle Boo, py::handle Bvv, py::handle eocc,
-        py::handle evir, py::handle U, py::handle nsamples, py::handle seed) {
-        return selected(t1,t2,Bvo,Boo,Bvv,eocc,evir,U,nsamples,seed,false);
+        py::handle evir, py::handle U, py::handle nsamples, py::handle seed,
+        py::handle target_standard_error) {
+        return selected(t1,t2,Bvo,Boo,Bvv,eocc,evir,U,nsamples,seed,target_standard_error,false);
     }, py::arg("t1"),py::arg("t2"),py::arg("Bvo"),py::arg("Boo"),py::arg("Bvv"),
        py::arg("eocc"),py::arg("evir"),py::arg("U"),py::arg("nsamples"),py::arg("seed")=71,
-       "Selected stochastic (T); nsamples=0 is a small deterministic reference only.");
+       py::arg("target_standard_error")=0.0,
+       "Selected stochastic (T); positive target_standard_error makes nsamples a pilot count. "
+       "nsamples=0 is a small deterministic reference only.");
     module.def("triples_selected_energy_vjp", [](py::handle t1, py::handle t2,
         py::handle Bvo, py::handle Boo, py::handle Bvv, py::handle eocc,
-        py::handle evir, py::handle U, py::handle nsamples, py::handle seed) {
-        return selected(t1,t2,Bvo,Boo,Bvv,eocc,evir,U,nsamples,seed,true);
+        py::handle evir, py::handle U, py::handle nsamples, py::handle seed,
+        py::handle target_standard_error) {
+        return selected(t1,t2,Bvo,Boo,Bvv,eocc,evir,U,nsamples,seed,target_standard_error,true);
     }, py::arg("t1"),py::arg("t2"),py::arg("Bvo"),py::arg("Boo"),py::arg("Bvv"),
        py::arg("eocc"),py::arg("evir"),py::arg("U"),py::arg("nsamples"),py::arg("seed")=71,
-       "Fused sampled selected (T) energy and unit-energy VJP of the eight DF inputs.");
+       py::arg("target_standard_error")=0.0,
+       "Fused sampled selected (T) energy and unit-energy VJP of the eight DF inputs; "
+       "positive target_standard_error makes nsamples a pilot count.");
 }
 }}  // namespace pyscfad::dlno_stc

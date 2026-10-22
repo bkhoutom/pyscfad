@@ -55,7 +55,8 @@ def normalize_triples_controls(controls, *, ccsd_t):
     """Validate triples independently of baseline and D/W selection settings.
 
     Omitted controls preserve the existing deterministic correction. The
-    stochastic interface initially supports a fixed number of samples only.
+    stochastic interface uses fixed counts unless a positive total energy
+    tolerance is supplied; then nsamples is the adaptive sampler pilot count.
     """
     if not ccsd_t:
         if controls is not None:
@@ -66,7 +67,7 @@ def normalize_triples_controls(controls, *, ccsd_t):
     if not isinstance(controls, dict):
         raise TypeError('triples_controls must be a dictionary')
     settings = controls.copy()
-    unknown = set(settings) - {'mode', 'nsamples', 'global_seed'}
+    unknown = set(settings) - {'mode', 'nsamples', 'global_seed', 'energy_tolerance'}
     if unknown:
         raise ValueError('unsupported triples controls: '
                          + ', '.join(sorted(map(str, unknown))))
@@ -83,6 +84,13 @@ def normalize_triples_controls(controls, *, ccsd_t):
     settings['global_seed'] = _integer_control('global_seed', settings.get('global_seed', 71), minimum=0)
     if settings['global_seed'] >= 2**64:
         raise ValueError('global_seed must fit in uint64')
+    if 'energy_tolerance' in settings:
+        tolerance = _finite_control('energy_tolerance', settings['energy_tolerance'], positive=False)
+        if tolerance:
+            settings['energy_tolerance'] = tolerance
+        else:
+            # Zero and omission share one fixed-count checkpoint identity.
+            del settings['energy_tolerance']
     return settings
 
 

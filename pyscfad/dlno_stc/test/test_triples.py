@@ -151,13 +151,70 @@ def test_native_triples_vjp_requires_samples():
         triples_native().triples_selected_energy_vjp(**triples_fixture(), nsamples=0)
 
 
-def triples_adapter_function(with_grad):
+@pytest.mark.parametrize('with_grad', [False, True])
+def test_native_triples_adaptive_continues_beyond_pilot(with_grad):
+    module = triples_native()
+    function = (module.triples_selected_energy_vjp if with_grad
+                else module.triples_selected_energy)
+    # A missing tolerance forwarding would leave the 17-sample pilot unchanged.
+    result = function(**triples_fixture(), nsamples=17, seed=19,
+                      target_standard_error=2e-5)
+    assert result['pilot_samples'] == 17
+    assert result['pilot_standard_error'] > 2e-5
+    assert result['samples'] > 17
+    assert 0. < result['standard_error'] <= 2e-5
+    assert np.isfinite(result['energy'])
+    for name, value in result['timings'].items():
+        assert value >= 0. and value == result[name]
+    if with_grad:
+        assert set(result['cotangents']) == set(TRIPLES_KEYS)
+        assert all(np.all(np.isfinite(bar)) for bar in result['cotangents'].values())
+
+
+@pytest.mark.parametrize('with_grad', [False, True])
+def test_native_triples_zero_tolerance_preserves_fixed_samples(with_grad):
+    module = triples_native()
+    function = (module.triples_selected_energy_vjp if with_grad
+                else module.triples_selected_energy)
+    omitted = function(**triples_fixture(), nsamples=257, seed=29)
+    zero = function(**triples_fixture(), nsamples=257, seed=29,
+                    target_standard_error=np.float64(0.))
+    for key in ('energy', 'standard_error', 'samples', 'pilot_samples',
+                'pilot_standard_error'):
+        assert zero[key] == omitted[key]
+    assert zero['samples'] == 257
+    if with_grad:
+        for name in TRIPLES_KEYS:
+            np.testing.assert_array_equal(zero['cotangents'][name],
+                                          omitted['cotangents'][name])
+
+
+@pytest.mark.parametrize('with_grad', [False, True])
+@pytest.mark.parametrize('target', [-1., np.nan, np.inf, -np.inf,
+                                    True, np.bool_(False), 1j, '0.1', None,
+                                    np.array(0.1)])
+def test_native_triples_rejects_invalid_tolerance(with_grad, target):
+    module = triples_native()
+    function = (module.triples_selected_energy_vjp if with_grad
+                else module.triples_selected_energy)
+    with pytest.raises((TypeError, ValueError), match='target_standard_error'):
+        function(**triples_fixture(), nsamples=17, target_standard_error=target)
+
+
+def test_native_triples_reference_rejects_positive_tolerance():
+    with pytest.raises(ValueError, match='target_standard_error'):
+        triples_native().triples_selected_energy(
+            **triples_fixture(), nsamples=0, target_standard_error=1e-4)
+
+
+def triples_adapter_function(with_grad, *, nsamples=257, target_standard_error=None):
     from types import SimpleNamespace
     from pyscfad import lib
     from pyscfad.dlno_stc.triples import make_solver
-    solver = make_solver(
-        {'mode': 'stochastic', 'nsamples': 257, 'global_seed': 19},
-        with_grad=with_grad)
+    settings = {'mode': 'stochastic', 'nsamples': nsamples, 'global_seed': 19}
+    if target_standard_error is not None:
+        settings['target_standard_error'] = target_standard_error
+    solver = make_solver(settings, with_grad=with_grad)
 
     def evaluate(t1, t2, Bvo, Boo, Bvv, eocc, evir, U):
         eris = SimpleNamespace(Lov=Bvo, Loo=Boo, Lvv=lib.pack_tril(Bvv),
@@ -167,12 +224,15 @@ def triples_adapter_function(with_grad):
     return evaluate
 
 
-def test_triples_adapter_energy_only_and_numeric_aux(monkeypatch):
+@pytest.mark.parametrize('target', [None, 0., 2e-5])
+def test_triples_adapter_energy_only_and_numeric_aux(monkeypatch, target):
     import jax
     module = triples_native()
     inputs = triples_fixture()
-    expected = module.triples_selected_energy(**inputs, nsamples=257, seed=19)
-    evaluate = triples_adapter_function(False)
+    nsamples = 17 if target else 257
+    options = {} if target is None else {'target_standard_error': target}
+    expected = module.triples_selected_energy(**inputs, nsamples=nsamples, seed=19, **options)
+    evaluate = triples_adapter_function(False, nsamples=nsamples, target_standard_error=target)
     real_energy = module.triples_selected_energy
     calls = []
 
@@ -184,17 +244,22 @@ def test_triples_adapter_energy_only_and_numeric_aux(monkeypatch):
     value, aux = evaluate(*(jnp.asarray(inputs[k]) for k in TRIPLES_KEYS))
     assert len(calls) == 1
     assert float(value) == expected['energy']
-    assert int(aux['samples']) == 257
+    assert int(aux['samples']) == expected['samples']
+    assert float(aux['standard_error']) == expected['standard_error']
+    assert int(aux['pilot_samples']) == expected['pilot_samples']
     assert 'cotangents' not in aux
     assert all(hasattr(x, 'dtype') for x in jax.tree_util.tree_leaves(aux))
 
 
-def test_triples_adapter_retains_all_bars_and_scales_cotangent(monkeypatch):
+@pytest.mark.parametrize('target', [None, 0., 2e-5])
+def test_triples_adapter_retains_all_bars_and_scales_cotangent(monkeypatch, target):
     import jax
     module = triples_native()
     inputs = triples_fixture()
-    expected = module.triples_selected_energy_vjp(**inputs, nsamples=257, seed=19)
-    evaluate = triples_adapter_function(True)
+    nsamples = 17 if target else 257
+    options = {} if target is None else {'target_standard_error': target}
+    expected = module.triples_selected_energy_vjp(**inputs, nsamples=nsamples, seed=19, **options)
+    evaluate = triples_adapter_function(True, nsamples=nsamples, target_standard_error=target)
     real_fused = module.triples_selected_energy_vjp
     calls = []
 
@@ -224,7 +289,9 @@ def test_triples_adapter_retains_all_bars_and_scales_cotangent(monkeypatch):
         np.testing.assert_allclose(one, expected_bar, rtol=1e-11, atol=1e-13, err_msg=name)
         np.testing.assert_allclose(bar, -2.5 * expected_bar, rtol=1e-11, atol=1e-13, err_msg=name)
         np.testing.assert_array_equal(z, np.zeros_like(z))
-    assert int(aux['samples']) == 257
+    assert int(aux['samples']) == expected['samples']
+    assert float(aux['standard_error']) == expected['standard_error']
+    assert int(aux['pilot_samples']) == expected['pilot_samples']
 
 
 def test_impurity_triples_hook_preserves_default_and_returns_aux():

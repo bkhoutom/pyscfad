@@ -291,7 +291,7 @@ Matrix controls are separate from the established stochastic energy controls:
 | `mode`, `laplace_roots`, `laplace_weights` | Deterministic or stochastic; the existing six-point grid is the default. Stochastic D/W requires strictly positive weights. |
 | `global_seed`, `threads` | Explicit seed and native thread count; matrix default threads is 1. Seeds are derived per fragment and batch. |
 | `target_batch_size` | Explicit target batch, default 1; full orbital spaces are retained. |
-| `memory_limit_mb` | Optional decimal-MB cap on current RSS plus conservatively estimated additional matrix workspace, checked before new host/native tensor allocation. Diagnostics include the breakdown and estimated process peak. |
+| `memory_limit_mb` | Optional advisory budget in decimal MB for current RSS plus estimated additional matrix workspace. Exceedance warns and continues. Checks run before both forward and reverse host/native allocations; diagnostics include the breakdown and estimated process peak (unknown when RSS is unavailable). |
 | `auxiliary_group_size` | Default 32 rows per group when `aux_offsets` is omitted; an explicit partition takes precedence and is included in memory/replay accounting. |
 | `matrix_tolerance` | Stochastic D/W Frobenius SE target for each summed matrix, default `1e-4`. Inspect measured SEs and `target_met`; allocation is not an attainment guarantee. |
 | `domain_tau`, `virtual_domain_tau` | Stochastic occupied/virtual exact-core thresholds, defaults `.003` and `.0003`. |
@@ -305,6 +305,32 @@ unknown settings. Those existing controls continue to work on the separate
 stochastic energy solver. New deterministic energy calls accept
 `target_batch_size` and optional `threads`; stochastic energy uses the existing
 OpenMP settings and rejects these new deterministic-only controls.
+
+The STC packet, finite-domain, system and D/W matrix memory guards treat
+`max_memory` and `memory_limit_mb` as advisory. They warn when a conservative
+estimate exceeds the configured budget, or a process-peak forecast exceeds
+90% of a detected planning allowance. Estimates above 100% also continue.
+`max_memory` still controls existing block sizes, and native tiling and cache
+fallbacks retain their existing behavior. Generic MP2, RCCSD, RPA, Davidson
+and DIIS memory checks are outside this policy.
+
+Each public calculation emits at most one warning per stage and rank. Warnings
+show the estimate, RSS, configured budget, detected hard limit, advisory
+headroom and planning allowance with their sources. Linux detection follows
+the process's cgroup v1/v2 membership and visible ancestor hard limits. V1
+ancestor limits require verified hierarchical accounting; ambiguous mount
+membership, unreadable values and unlimited readings remain unknown. Slurm node or CPU allocations
+are divided by known local ranks for planning, never by global MPI size.
+Uncertain local-rank mappings supply no Slurm per-rank allowance.
+
+A guard raises `MemoryError` only if a justified unavoidable new array exceeds
+a verified finite cgroup memory-plus-swap capacity (v2 RAM plus swap limits,
+or the v1 combined `memory.memsw` limit). RAM alone is advisory when swap
+capacity is unknown or unlimited. Safety multipliers, RSS plus estimated workspace,
+cgroup usage/headroom, host `MemAvailable`, and Slurm allocations cannot prove
+an allocation impossible. Packet export lacks an exact local auxiliary size,
+so its global auxiliary estimate can only warn. Allocation failures and integer
+overflow checks continue to propagate through the existing MPI error paths.
 
 The W adapter explicitly enables virtual `w_virtual_reform`, matching the
 supplied v2 driver. Other sampler options retain the supplied defaults,

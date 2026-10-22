@@ -13,6 +13,7 @@ from pyscfad.lno.ccsd import _impurity_solve_core
 from pyscfad.ops import stop_trace
 
 from . import backend, driver
+from ._memory import memory_calculation
 from ._selection import build_domain_groups
 from ._workflow import allocate_domain_controls
 from .adjoint import apply_input_pullback, apply_selected_pullback
@@ -408,6 +409,7 @@ def _run(initializer, worker_initializer, comm, *, checkpoint_dir, resume, **opt
                        checkpoint_dir=checkpoint_dir, resume=resume, **options)
 
 
+@memory_calculation
 def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
            ccsd_t=False, triples_controls=None, verbose_imp=0, include_hf=False,
            return_components=False,
@@ -454,6 +456,7 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
                 checkpoint_dir=checkpoint_dir, resume=resume)
 
 
+@memory_calculation
 def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_controls,
                    matrix_kind=None, ccsd_t=False, triples_controls=None,
                    verbose_imp=0, include_hf=False,

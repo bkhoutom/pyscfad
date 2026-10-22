@@ -18,6 +18,7 @@ from .prepare import prepare_boys_group_inputs
 from .protocol import validate_result, canonical_json
 from ._workflow import (check_memory, format_domain_dimensions, revision_status,
                         run_payload, allocate_domain_controls)
+from ._memory import memory_calculation
 
 _METHOD = "dlno-stc-selected-mp2"
 _ENERGY_KIND = "finite_boys_target_mp2_v1"
@@ -135,6 +136,7 @@ def _validate_packet_identity(mf, static, group_id, group, inputs, metadata, con
             raise ValueError(f"request {field} does not match replay")
 
 
+@memory_calculation
 def export_run(mf, static, workdir, *, controls, reporter=None, merge_identical=True):
     """Export one selected MP2 packet per exact group and allocate once."""
     if not isinstance(static, DomainSelections):

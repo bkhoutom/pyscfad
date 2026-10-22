@@ -293,12 +293,21 @@ def estimate_matrix_memory(naux, nocc, nvir, ntarget, controls, *, matrix_kind,
     return breakdown
 
 
-def check_solver_memory(estimate, limit_mb):
-    """Reject the estimated new matrix working set above an optional MB cap."""
+def check_solver_memory(estimate, limit_mb, *, stage='matrix solver',
+                        estimate_kind='workspace', unavoidable_bytes=0,
+                        warned=None, observation=None):
+    """Warn on matrix forecasts; reject only a proven impossible allocation.
+
+    The optional configured MB budget is advisory. ``estimate_kind`` states
+    whether residency is already included in the forecast. Keep the original
+    two positional arguments and estimated-MB return value for callers.
+    """
+    from ._memory import assess_memory
+
     total_mb = int(estimate['total_bytes']) / 1e6
     if limit_mb is not None:
         limit_mb = _finite_control('memory_limit_mb', limit_mb)
-        if total_mb > limit_mb:
-            raise MemoryError(f'estimated matrix solver memory {total_mb:.1f} MB '
-                              f'exceeds configured {limit_mb:.1f} MB')
+    assess_memory(stage, total_mb, configured_mb=limit_mb,
+                  estimate_kind=estimate_kind, unavoidable_bytes=unavoidable_bytes,
+                  warned=warned, observation=observation)
     return total_mb

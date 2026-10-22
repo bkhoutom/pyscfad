@@ -9,6 +9,7 @@ from pyscf import df as pyscf_df
 from pyscf import lib as pyscf_lib
 
 from ._restart import df_source_fingerprint
+from ._memory import assess_memory
 
 
 def _native_workspace_mb(naux, nocc, nvir, *, with_grad, system,
@@ -106,7 +107,7 @@ def revision_status():
 
 
 def check_memory(mf, nocc, nvir):
-    """Reject a clearly oversized in-core DF packet before its allocation.
+    """Warn about a potentially oversized in-core DF packet before allocation.
 
     The factor eight allows for input, imported bar, replay, and AD temporaries;
     it is a conservative prototype estimate, not a measured peak guarantee.
@@ -119,11 +120,9 @@ def check_memory(mf, nocc, nvir):
         auxmol = pyscf_df.addons.make_auxmol(mf.mol.to_pyscf(), with_df.auxbasis)
     estimate_mb = 8 * int(auxmol.nao) * int(nocc) * int(nvir) * 8 / 1e6
     limit_mb = float(getattr(mf, "max_memory", mf.mol.max_memory))
-    if estimate_mb > limit_mb:
-        raise MemoryError(
-            f"estimated STC packet/replay memory {estimate_mb:.1f} MB "
-            f"exceeds configured {limit_mb:.1f} MB"
-        )
+    # The global auxiliary size is an upper estimate for finite packets, so it
+    # cannot establish the unavoidable size of the actual local factor.
+    assess_memory('packet', estimate_mb, configured_mb=limit_mb)
     return estimate_mb
 
 
@@ -161,12 +160,10 @@ def check_domain_memory(mf, static, fragment_index, *, with_grad,
                                         mode=mode, target_batch_size=target_batch_size,
                                         threads=threads)
     limit_mb = float(getattr(mf, "max_memory", mf.mol.max_memory))
-    if estimate_mb > limit_mb:
-        raise MemoryError(
-            f"estimated finite STC domain memory {estimate_mb:.1f} MB "
-            f"(local naux={naux}, nocc={nocc}, nvir={nvir}) "
-            f"exceeds configured {limit_mb:.1f} MB"
-        )
+    # One local float64 B[P,i,a] is unavoidable; all copy/scratch factors above
+    # remain forecasts and cannot justify a stop.
+    assess_memory('domain', estimate_mb, configured_mb=limit_mb,
+                  unavoidable_bytes=naux * nocc * nvir * numpy.dtype('float64').itemsize)
     return estimate_mb
 
 
@@ -221,12 +218,11 @@ def check_system_memory(mf, nocc, nvir, *, with_grad, virtual_block_size=16,
                                         mode=mode, target_batch_size=target_batch_size,
                                         threads=threads)
     limit_mb = float(getattr(mf, "max_memory", mf.mol.max_memory))
-    if estimate_mb > limit_mb:
-        raise MemoryError(
-            f"estimated system STC replica/preparation/SCF memory {estimate_mb:.1f} MB "
-            f"(naux={naux}, nocc={nocc}, nvir={nvir}) "
-            f"exceeds configured {limit_mb:.1f} MB"
-        )
+    # The estimator includes one existing resident copy (and, for gradients,
+    # two forecast copies). Remove only that existing copy before adding RSS.
+    assess_memory('system', estimate_mb - resident_bytes / 1e6,
+                  configured_mb=limit_mb, budget_estimate_mb=estimate_mb,
+                  unavoidable_bytes=naux * nocc * nvir * numpy.dtype('float64').itemsize)
     return estimate_mb
 
 

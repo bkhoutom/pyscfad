@@ -3,7 +3,7 @@
 import importlib
 import math
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -168,6 +168,7 @@ class _MatrixReplay:
     aux_offsets: np.ndarray
     batches: tuple
     native_version: str
+    memory_warned: set = field(default_factory=set, compare=False, repr=False)
 
 
 def _matrix_kernel_version(extension):
@@ -216,18 +217,35 @@ def _matrix_batch_controls(settings, batch_count, seed):
     return local
 
 
-def _check_matrix_memory(inputs, ntarget, settings, matrix_kind, offsets):
+def _check_matrix_memory(inputs, ntarget, settings, matrix_kind, offsets, *,
+                         stage="forward", warned=None):
     """Check each staged call against current residency before tensor copies."""
-    from pyscf import lib
+    from ._memory import observe_memory
     from .controls import estimate_matrix_memory, check_solver_memory
 
     naux, nocc, nvir = inputs["B"].shape
     estimate = estimate_matrix_memory(naux, nocc, nvir, ntarget, settings,
                                       matrix_kind=matrix_kind, with_grad=True,
                                       auxiliary_group_count=len(offsets)-1)
-    resident_mb = float(lib.current_memory()[0])
-    peak_bytes = estimate["total_bytes"] + int(resident_mb*1e6)
-    check_solver_memory({"total_bytes": peak_bytes}, settings.get("memory_limit_mb"))
+    observation = observe_memory()
+    resident_mb = observation.rss_mb
+    peak_bytes = (None if resident_mb is None else
+                  estimate["total_bytes"] + int(resident_mb*1e6))
+    # Every call creates occupied/virtual output matrices. Nonempty native
+    # calls unconditionally copy all three inputs into owned Armadillo arrays;
+    # reverse also creates input-shaped bars, including on the empty fast path.
+    # Count the largest single new allocation, never original input residency
+    # or the conservative estimator's safety factors, as a proven lower bound.
+    names = ARRAY_NAMES if (stage == "reverse" or (naux and nvir)) else ("foo", "fvv")
+    unavoidable_bytes = max(
+        math.prod(inputs[name].shape) * np.dtype(inputs[name].dtype).itemsize
+        for name in names)
+    forecast = estimate if peak_bytes is None else {"total_bytes": peak_bytes}
+    check_solver_memory(forecast, settings.get("memory_limit_mb"),
+                        stage=f"matrix {matrix_kind} {stage}",
+                        estimate_kind="workspace" if peak_bytes is None else "peak",
+                        unavoidable_bytes=unavoidable_bytes, warned=warned,
+                        observation=observation)
     return estimate, resident_mb, peak_bytes
 
 
@@ -246,8 +264,9 @@ def solve_matrices(inputs, metadata, controls, *, matrix_kind="D", aux_offsets=N
     naux, nocc, nvir = inputs["B"].shape
     targets = _matrix_targets(metadata, nocc)
     offsets = _matrix_aux_offsets(naux, aux_offsets, settings["auxiliary_group_size"])
+    memory_warned = set()
     estimate, resident_mb, peak_bytes = _check_matrix_memory(
-        inputs, len(targets), settings, matrix_kind, offsets)
+        inputs, len(targets), settings, matrix_kind, offsets, warned=memory_warned)
     # Check before making host/layout copies or entering the native allocator.
     arrays = host_inputs(inputs)
     saved_metadata = deepcopy(metadata)
@@ -299,7 +318,7 @@ def solve_matrices(inputs, metadata, controls, *, matrix_kind="D", aux_offsets=N
         "batch_count": len(plans), "batch_seeds": seeds,
         "batches": batch_diagnostics, "production_draws": production_draws,
         "memory_estimate_bytes": estimate, "current_rss_mb": resident_mb,
-        "estimated_process_peak_mb": peak_bytes/1e6,
+        "estimated_process_peak_mb": None if peak_bytes is None else peak_bytes/1e6,
         "uncertainty_convention": "independent_batch_sum",
         "energy_standard_error": math.sqrt(variance["energy"]),
     }
@@ -313,7 +332,8 @@ def solve_matrices(inputs, metadata, controls, *, matrix_kind="D", aux_offsets=N
     # Fingerprint resolved source defaults as well as the requested controls.
     fingerprint = matrix_request_fingerprint(arrays, saved_metadata, settings,
                                              matrix_kind, offsets)
-    result["replay"] = _MatrixReplay(fingerprint, offsets, tuple(plans), native_version)
+    result["replay"] = _MatrixReplay(fingerprint, offsets, tuple(plans), native_version,
+                                     memory_warned)
     validate_matrix_result(result, arrays)
     return result
 
@@ -336,7 +356,8 @@ def pullback_matrices(inputs, forward, *, energy_bar, occupied_bar, virtual_bar)
         raise ValueError("matrix replay native version differs from the loaded extension")
     # Downstream work may have allocated memory since the forward call.
     _check_matrix_memory(inputs, len(forward["metadata"]["target_indices"]),
-                         forward["controls"], forward["matrix_kind"], replay.aux_offsets)
+                         forward["controls"], forward["matrix_kind"], replay.aux_offsets,
+                         stage="reverse", warned=replay.memory_warned)
     seed = np.asarray(energy_bar)
     if seed.shape != () or not np.isfinite(seed):
         raise ValueError("energy_bar must be a finite scalar")

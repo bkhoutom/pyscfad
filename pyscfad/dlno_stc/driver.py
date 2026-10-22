@@ -31,6 +31,7 @@ from ._pairs import weak_pair_energy_and_grad, weak_pair_energy_sum, weak_pair_i
 
 
 from . import backend
+from ._memory import memory_calculation
 from ._workflow import check_system_memory, check_domain_memory, allocate_domain_controls
 from .adjoint import apply_full_pullback, apply_selected_pullback
 from .controls import DEFAULT_ENERGY_TOLERANCE, default_laplace_grid
@@ -511,6 +512,7 @@ def _run_system(initializer, controls, comm, *, with_grad, include_hf=False):
                                                     include_hf=include_hf), "final response")
 
 
+@memory_calculation
 def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
            lo_kwargs=None, merge_identical=True, parallel_scf_jk=True):
     """Return correlation energy on root.
@@ -558,6 +560,7 @@ def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
                        merge_identical=merge_identical)
 
 
+@memory_calculation
 def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
                    controls, comm=None, include_hf=False, lo_kwargs=None, merge_identical=True,
                    build_static=None, parallel_scf_jk=True):

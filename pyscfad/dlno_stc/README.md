@@ -69,6 +69,86 @@ The AO-moment consistency check compares each moment order's Cartesian RMS
 per virtual column with `atol=rtol=1e-9`; centers and energy gaps retain
 componentwise checks.
 
+## Fixed or molecule-fitted Laplace grids
+
+`pyscfad.dlno_stc.laplace.make_laplace_grid` returns independent float64 roots,
+weights, and a JSON-compatible diagnostics dictionary. The default remains the
+original six-point grid, including its factor of 2.6. Fitting parameters are
+ignored for `kind="default"`. `kind="fitted"` fits positive nodes and weights to
+the active canonical orbital-energy distribution; fitted values have no extra
+2.6 scaling. Fit once on the controlling rank, after SCF and outside JAX tracing:
+
+```python
+import numpy as np
+from pyscfad.dlno_stc.laplace import make_laplace_grid
+
+laplace_grid = "default"        # default | fitted
+laplace_points = 6              # fitted only
+laplace_lambda_gradient = 0.1   # fitted only
+
+# mf is the converged restricted DF-SCF reference. These saved full-MO
+# indices already exclude frozen occupied and virtual orbitals.
+static = dlno_stc.build_domain_selections(mf, frozen=4)
+energies = np.asarray(mf.mo_energy)
+roots, weights, diagnostics = make_laplace_grid(
+    energies[static.active_occ_indices], energies[static.active_vir_indices],
+    kind=laplace_grid, points=laplace_points,
+    lambda_gradient=laplace_lambda_gradient,
+)
+grid = dict(laplace_roots=roots, laplace_weights=weights)
+controls = dict(mode="deterministic", **grid)
+energy = dlno_stc.kernel(mf, static, controls=controls)
+system_energy = dlno_stc.kernel(mf, scope="system", frozen=4, controls=controls)
+```
+
+Grid choice is independent of deterministic/stochastic solver mode. Existing
+callers can continue passing explicit arrays. Pass only the resolved arrays to
+solver controls; `laplace_grid`, `laplace_points`, and
+`laplace_lambda_gradient` are Python driver options. Arrays remain part of the
+existing restart and replay fingerprints. Save them and the diagnostics with
+the run, and reuse exactly those arrays for gradients and displaced geometries.
+Do not refit inside `build_mf`, a response callback, or individual domains.
+
+For CCSD, supply the same arrays to both controls **before LIS selection**:
+
+```python
+from pyscfad.dlno_stc import ccsd
+
+baseline_controls = dict(mode="deterministic", **grid)
+matrix_controls = dict(mode="deterministic", **grid)
+selected = ccsd.build_static_selections(
+    mf, static, matrix_kind="D", thresh_occ=1e-6, thresh_vir=1e-6,
+    baseline_controls=baseline_controls, matrix_controls=matrix_controls,
+)
+energy = ccsd.kernel(mf, selected, baseline_controls=baseline_controls,
+                     matrix_controls=matrix_controls)
+```
+
+The fit uses 600 single-gap points and three positive least-squares starts.
+Diagnostics include fitting seconds, exact molecular denominator bounds,
+histogram-weighted energy RMS, Delta-scaled derivative RMS (without lambda),
+and maximum relative errors for `1/Delta` and `1/Delta**2` sampled at 10001
+equally spaced denominators. `make_laplace_grid()` needs no spectra for the
+default grid; numerical diagnostics then contain `None` and fitting time is
+zero. Fitted mode rejects invalid spectra, nonpositive gaps, invalid fit
+parameters, and failed fits without falling back to the default.
+
+Gradients differentiate the energy with roots and weights held fixed. They do
+not differentiate the optimizer or a refitted grid as geometry changes. The
+diagnostics measure quadrature errors, not MP2 energy/force error bounds;
+stochastic standard errors exclude quadrature bias. For local coverage use
+`laplace_grid_diagnostics` with `eigvalsh(foo)` and `eigvalsh(fvv)`, rather than
+local diagonal entries. A molecular fit does not guarantee local accuracy.
+
+The workstation acceptance driver is
+`TEST_general/dlno_stc_test/fitted_LT_test/test_water4_lt_fit.py` in the parent
+project. It compares both choices using one central SCF, cached complete-domain
+tensors, and two displaced SCFs. Its `--laplace-grid`, `--laplace-points`, and
+`--laplace-lambda-gradient` options also configure the optional
+`--ccsd-matrix-kind D|W` calculation before LIS selection. It saves grids,
+diagnostics, gradients, matrix seeds, and integration checks in its results
+directory; no C++ changes or reference-script runtime imports are required.
+
 ## MPI across domains
 
 For `scope="domain"` and a communicator with more than one rank, complete

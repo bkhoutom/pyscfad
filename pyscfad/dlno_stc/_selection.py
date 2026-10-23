@@ -118,6 +118,34 @@ class DomainSelections:
     pair_energy: object = None
     weak_pair_energy: object = None
     forced_strong_mask: object = None
+    boys_grouping: str = "singleton"
+    physical_groups: tuple[tuple[int, ...], ...] = ()
+
+    def __post_init__(self):
+        # Synthetic new selections retain the historical singleton default.
+        # Pickle loading bypasses this hook; CC selections validate their schema.
+        if not self.physical_groups and self.boys_grouping == "singleton":
+            object.__setattr__(self, "physical_groups",
+                               tuple((i,) for i in range(len(self.fragments))))
+
+
+def _physical_groups(static):
+    """Return the saved physical partition in orbital-record coordinates."""
+    if isinstance(static, DomainSelections) and not {'boys_grouping', 'physical_groups'} <= vars(static).keys():
+        raise ValueError("incompatible domain selections; rebuild domains to save physical fragment grouping")
+    groups = getattr(static, "physical_groups", ())
+    mode = getattr(static, "boys_grouping", "singleton")
+    if mode not in ("singleton", "atom"):
+        raise ValueError("boys_grouping must be 'singleton' or 'atom'")
+    if not groups and mode == "singleton":
+        groups = tuple((i,) for i in range(len(static.fragments)))
+    normalized = tuple(_grouping_indices(group, len(static.fragments),
+                                         "physical fragment membership") for group in groups)
+    if (any(not group for group in normalized)
+            or sorted(i for group in normalized for i in group) != list(range(len(static.fragments)))
+            or (mode == "singleton" and any(len(group) != 1 for group in normalized))):
+        raise ValueError("physical fragment membership must partition orbital records exactly once")
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -750,7 +778,10 @@ def build_domain_selections(
                               ao2pao, groups, (None,) * nfrag, numpy.zeros((nfrag, nfrag), dtype=bool), tuple(fragments),
                               lo_kwargs=options, target_reference_coeff=targets.copy(), target_reference_coords=_host_array(mol.atom_coords()).copy(),
                               compact_bp_domain=compact, primary_bp_domain=primary_bp, tight_bp_domain=tight,
-                              pao_bp_domain=pao_bp, primary_domain=primary, pair_energy_model=model)
+                              pao_bp_domain=pao_bp, primary_domain=primary, pair_energy_model=model,
+                              boys_grouping=boys_grouping,
+                              physical_groups=tuple(tuple(int(i) for i in members)
+                                                    for members in physical_groups))
     pair, weak_pair, forced, strong = screen_pairs(mf, common, static, model=model, force_full_domains=force_full_domains)
     if boys_grouping == "atom":
         strong = _expand_group_strong_mask(strong, physical_groups)

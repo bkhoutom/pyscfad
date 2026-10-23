@@ -52,9 +52,14 @@ def public_reference(monkeypatch):
     """Keep real normalization/selection validation, replace SCF and CC solves."""
     settings = dict(mode='deterministic', threads=1)
     baseline, matrix = ccsd._normalize_controls(settings, settings, 'D')
-    domain = SimpleNamespace(fragments=(object(),) * 16)
+    domain = SimpleNamespace(fragments=(object(),) * 16,
+        frag_lolist=tuple((i,) for i in range(16)), boys_grouping='singleton',
+        physical_groups=tuple((i,) for i in range(16)))
     lis = LISSelections(domain, 'D', 0., 0., 1e-6, (object(),) * 16)
     static = ccsd.CCSDSelections(lis, ccsd._scientific_identity(baseline, matrix))
+    monkeypatch.setattr(ccsd, '_group_cc_fragments', lambda static, group:
+        tuple((i, (target,)) for i, target in
+              zip(group.fragment_indices, group.target_indices)))
     monkeypatch.setattr(ccsd.driver, '_coordinate_only', lambda mol: None)
     monkeypatch.setattr(ccsd.driver, '_initialize_scf', lambda mol, build: (None, None))
     monkeypatch.setattr(ccsd.driver, '_initialize', lambda *a, **k: dict(

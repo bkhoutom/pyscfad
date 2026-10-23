@@ -2,9 +2,14 @@
 
 STC owns Boys selection, exact-frame grouping, weak-pair correction, restart
 serialization, three-tensor preparation and molecular response. Production
-modules and examples do not import native DLNO. Public `frag_lolist` remains
-a complete singleton partition. Internal `DomainGroup` entries merge only
-identical saved supports, candidate ordering, retained virtual ranks and PAO anchors.
+modules and examples do not import native DLNO. Saved orbital records and
+`frag_lolist` retain a complete singleton partition. `boys_grouping` separately
+chooses physical CC fragments: `singleton` uses one original active occupied
+Boys orbital; `atom` uses the existing Löwdin assignment and hydrogen-to-heavy
+atom groups. `DomainSelections.physical_groups` stores ordered orbital-record
+membership, and its position is the stable physical fragment ID. Internal
+`DomainGroup` entries merge preparation only when saved supports, candidate
+ordering, retained virtual ranks and PAO anchors are identical.
 
 ```python
 from pyscfad import dlno_stc
@@ -448,11 +453,20 @@ remain 1.
 ## D/W-selected LIS and CCSD(T)
 
 `pyscfad.dlno_stc.ccsd` supplies `build_static_selections`, `kernel` and
-`value_and_grad`. Each original Boys target has its own native D or W pair
-and LIS. Identical ED frames share preparation, while CC retains the global
-active-HF reference, the original Boys target overlaps, and the established
-stopped rotation of discarded orbitals. Retained orbitals, target overlaps,
-embedding maps and numerical ED frames respond to differentiation.
+`value_and_grad`. Each physical fragment receives one native D or W pair,
+one LIS and one CCSD(T) correction. In `boys_grouping="atom"`, matrices sum the
+selected target contributions in the shared ED frame without division by
+`n_F`, the number of occupied targets. The LIS retains all `n_F` internal
+occupied directions and uses their full column block in the CC projector.
+Physical fragments with identical ED frames may share preparation while keeping
+separate matrices, LISs and corrections. `merge_identical=False` changes this
+preparation sharing and preserves each physical fragment. Atom and singleton
+modes retain their respective existing MP2 baseline constructions and weak-pair
+completion. CC retains the global active-HF reference, original Boys target
+overlaps and established stopped rotation of discarded orbitals. Retained
+orbitals, target columns, embedding maps and numerical ED frames respond to
+differentiation; each physical matrix pair receives its own delayed native
+matrix pullback.
 
 ```python
 from pyscfad import gto, scf
@@ -471,7 +485,7 @@ def build_mf(current):
 
 mf = build_mf(mol)
 domains = build_domain_selections(
-    mf, frozen=1, force_full_domains=True,
+    mf, frozen=1, force_full_domains=True, boys_grouping='atom',
     lo_kwargs={'conv_tol': 1e-12, 'conv_tol_grad': 1e-9})
 baseline_controls = {'mode': 'deterministic', 'threads': 1}
 matrix_controls = {'mode': 'deterministic', 'threads': 1}
@@ -528,14 +542,16 @@ SE requires more samples. Deterministic triples accepts no sampling settings.
 Changing triples mode, count, seed or tolerance reuses the saved LIS selections.
 
 Before MPI distribution or checkpoint restoration, the total triples tolerance
-is divided by `sqrt(N)`, where `N` is the number of globally requested singleton
-LIS fragments, independent of merged groups, MPI rank ownership and completed
-checkpoint work. A `fragment_indices` subset receives its own total budget; an
+is divided by `sqrt(N)`, where `N` is the number of globally requested physical
+CC fragments, independent of preparation merging, MPI rank ownership and
+completed checkpoint work. A `fragment_indices` subset receives its own total budget; an
 empty subset makes no triples calls. With 16 requested fragments, total budgets
 of `1e-4` and `5e-5` Eh give per-LIS targets of `2.5e-5` and `1.25e-5` Eh.
+Four atom fragments with four occupied targets each instead receive `5e-5` Eh
+per fragment for a total `1e-4` Eh request.
 The derived `target_standard_error` is internal and is not a public control.
 Each LIS receives a distinct stream derived from the
-global seed, a triples tag and its fragment index, independently of MPI rank
+global seed, a triples tag and its stable physical fragment ID, independently of MPI rank
 and work order. Energy-only and fused energy/VJP calls use different native
 proposals; their same-seed energies need not be identical. Gradients use the
 fused native energy/VJP once and its saved unit-energy cotangents.
@@ -568,7 +584,11 @@ The SE estimates neither gradient error nor total CC uncertainty when D/W is
 stochastic; assess gradient uncertainty from independent seed variation.
 Validation drivers keep `--triples-mode` separate from MP2/D mode controls.
 
-`fragment_indices=(i,)` restricts CC corrections. The baseline remains complete
+`fragment_indices=(i,)` selects physical fragment ID `i` in
+`DomainSelections.physical_groups`; it does not select an orbital preparation
+job or a local target slot. Component `fragment_index` uses the same physical
+ID. Selection subsets, correction-only execution and MPI run each requested
+physical correction exactly once. The baseline remains complete
 unless `include_baseline=False`, which returns only the selected correction
 and forbids `include_hf=True`. This is the representative-fragment C20 API;
 such a result is not a complete molecular CC energy or force.
@@ -584,7 +604,8 @@ Optional serial `checkpoint_dir` and `resume=True` reuse the existing safe STC
 checkpoint machinery. Fixed selections and completed scalar/host-cotangent
 contributions are saved atomically; SCF/common response closes on the current
 live reference after restoration. Identity includes matrix kind, cutoffs,
-scientific controls, signed canonical state, group worklist, native version
+scientific controls, signed canonical state, preparation worklist, grouping
+mode, ordered physical membership, CC selection schema version, native version
 and CC convergence settings. Normalized triples controls also enter the CC
 checkpoint identity, with the native triples source version for stochastic
 triples. Changing mode, sample count, seed, positive energy tolerance or that
@@ -592,4 +613,11 @@ version invalidates resume. Omitted and zero energy tolerances share the same
 fixed-count identity.
 Completed triples diagnostics are saved with the fragment contributions. MPI
 progress checkpoints are explicitly rejected;
-there is no distributed D/W replay serialization.
+there is no distributed D/W replay serialization. Older CC selections lacking
+the physical-fragment schema must be rebuilt, along with their checkpoints;
+there is no migration. Shared `DomainSelections` checkpoints from the earlier
+schema also require rebuilding, including MP2-only checkpoints.
+
+Grouping-aware cluster drivers pass `--boys-grouping singleton|atom` through to
+`build_domain_selections` and report physical fragment count, occupied target
+membership and `n_F`, preparation-group count, and LIS dimensions separately.

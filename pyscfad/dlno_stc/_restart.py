@@ -414,6 +414,15 @@ def _decode_value(node, reader):
         if not isinstance(fields, list):
             raise RestartCorruptionError("malformed dataclass fields")
         names = tuple(pair[0] for pair in fields)
+        required_grouping = {
+            "DomainSelections": {"boys_grouping", "physical_groups"},
+            "CCSDSelections": {"schema_version"},
+        }.get(cls.__name__, set())
+        if not required_grouping.issubset(names):
+            raise RestartMismatchError(
+                f"legacy {cls.__name__} checkpoint lacks physical fragment metadata. "
+                "Rebuild selections and checkpoints; migration is unsupported."
+            )
         if names != expected:
             raise RestartCorruptionError(
                 f"dataclass {tag} fields changed: {names} != {expected}"
@@ -422,6 +431,13 @@ def _decode_value(node, reader):
             name: _decode_value(value, reader)
             for name, value in fields
         }
+        if cls.__name__ == "CCSDSelections":
+            from .ccsd import CC_SELECTIONS_SCHEMA_VERSION
+            if kwargs["schema_version"] != CC_SELECTIONS_SCHEMA_VERSION:
+                raise RestartMismatchError(
+                    "CC selection schema is incompatible. Rebuild selections and "
+                    "checkpoints; migration is unsupported."
+                )
         try:
             return cls(**kwargs)
         except Exception as err:
@@ -440,11 +456,11 @@ def scientific_digest(value):
 
 
 def grouping_payload(static, groups):
-    """Fingerprint a grouped worklist with its original singleton selections.
+    """Fingerprint preparation work and saved physical-fragment selections.
 
-    The saved selections retain ordered occupied labels, supports, PAO ranks,
-    reference frames and anchors; typed groups retain membership and target
-    slots. Singleton checkpoints need no grouping payload or migration.
+    The selections retain grouping mode, physical membership, occupied labels,
+    supports, PAO ranks, reference frames and anchors; typed groups separately
+    retain preparation membership and target slots. Old schemas require rebuild.
     """
     payload = {
         "convention": _GROUPING_CONVENTION,
@@ -1003,7 +1019,8 @@ class RestartManager:
         }
         if mismatches:
             raise RestartMismatchError(
-                f"checkpoint manifest does not match this run: {mismatches}"
+                f"checkpoint manifest does not match this run: {mismatches}. "
+                "Rebuild incompatible selections and checkpoints; migration is unsupported."
             )
         if "static_digest" not in manifest:
             raise RestartManifestError(

@@ -1,4 +1,4 @@
-"""Singleton Boys CCSD(T) corrections to the separately controlled STC baseline.
+"""Physical Boys-fragment CCSD(T) corrections to the separately controlled STC baseline.
 
 Discrete domains and LIS ranks are fixed. Native D/W chooses each LIS in its
 STC frame; the shared Python solver retains the original Boys energy target.
@@ -14,11 +14,15 @@ from pyscfad.ops import stop_trace
 
 from . import backend, driver
 from ._memory import memory_calculation
-from ._selection import build_domain_groups
+from ._selection import (DomainSelections, _physical_groups, _strong_preparation_key,
+                         build_domain_groups)
 from ._workflow import allocate_domain_controls
 from .adjoint import apply_input_pullback, apply_selected_pullback
 from .controls import normalize_matrix_controls, normalize_triples_controls
 from .domain import build_boys_ed_frame
+
+
+CC_SELECTIONS_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -26,6 +30,7 @@ class CCSDSelections:
     """Fixed LIS choices and the scientific settings used to select them."""
     lis_static: object
     controls_identity: tuple
+    schema_version: int = CC_SELECTIONS_SCHEMA_VERSION
 
     @property
     def mp2_static(self):
@@ -122,6 +127,8 @@ def _scientific_identity(baseline, matrix):
 def _validate_run(static, baseline_controls, matrix_controls, matrix_kind):
     if not isinstance(static, CCSDSelections):
         raise TypeError('static must be CCSDSelections from build_static_selections')
+    if vars(static).get('schema_version') != CC_SELECTIONS_SCHEMA_VERSION:
+        raise ValueError('incompatible CC selections; rebuild CC selections with physical fragment grouping')
     kind = static.matrix_kind if matrix_kind is None else matrix_kind
     if kind != static.matrix_kind:
         raise ValueError('matrix_kind differs from the saved LIS selection')
@@ -132,7 +139,9 @@ def _validate_run(static, baseline_controls, matrix_controls, matrix_kind):
 
 
 def _fragment_indices(static, indices, *, selecting=False):
-    available = tuple(i for i, fragment in enumerate(static.fragments)
+    fragments = (_physical_groups(static) if selecting and isinstance(static, DomainSelections)
+                 else static.fragments)
+    available = tuple(i for i, fragment in enumerate(fragments)
                       if selecting or fragment is not None)
     if indices is None:
         return available
@@ -143,6 +152,40 @@ def _fragment_indices(static, indices, *, selecting=False):
     if len(set(indices)) != len(indices) or any(i not in available for i in indices):
         raise ValueError('fragment_indices must be unique available LIS selections')
     return tuple(int(i) for i in indices)
+
+
+def _group_cc_fragments(static, group):
+    """Map physical IDs to target slots in their first member's preparation job.
+
+    Preparation merging affects ownership only. Every physical member must
+    have exactly the representative's ordered strong frame, even when the
+    preparation jobs themselves are left unmerged.
+    """
+    domains = static.mp2_static if hasattr(static, 'mp2_static') else static
+    if not isinstance(domains, DomainSelections):
+        raise TypeError('physical CC grouping requires STC Boys DomainSelections')
+    physical = _physical_groups(domains)
+    owned = [(index, members) for index, members in enumerate(physical)
+             if members[0] in group.fragment_indices]
+    if not owned:
+        return ()
+    labels = tuple(int(columns[0]) for columns in domains.frag_lolist)
+    representative = group.representative_index
+    frame_key, _, _ = _strong_preparation_key(
+        domains, domains.fragments[representative], representative, labels)
+    partners = tuple(int(i) for i in domains.fragments[representative].strong_fragments)
+    result = []
+    for index, members in owned:
+        targets = []
+        for member in members:
+            key, _, _ = _strong_preparation_key(domains, domains.fragments[member], member, labels)
+            if key != frame_key or partners.count(member) != 1:
+                raise ValueError(f'physical CC fragment {index} has incompatible preparation frames; rebuild domains')
+            targets.append(partners.index(member))
+        if len(set(targets)) != len(members):
+            raise ValueError(f'physical CC fragment {index} must map each target exactly once')
+        result.append((index, tuple(targets)))
+    return tuple(result)
 
 
 def _fragment_dimensions(static, index):
@@ -165,7 +208,7 @@ def _bar_norm(*trees):
 def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_vir,
                             baseline_controls, matrix_controls,
                             internal_rank_threshold=1e-6, merge_identical=True, fragment_indices=None):
-    """Select singleton LIS ranks from explicit D or W cutoffs and controls.
+    """Select physical-fragment LIS ranks from explicit D or W cutoffs and controls.
 
     ``mp2_static`` is a concrete Boys ``DomainSelections``. D and W use
     separately supplied absolute-eigenvalue cutoffs, with no conversion.
@@ -176,21 +219,31 @@ def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_v
     baseline, matrix = _normalize_controls(baseline_controls, matrix_controls, matrix_kind)
     state = driver._initialize(mf, mp2_static, baseline, with_grad=False)
     indices = _fragment_indices(mp2_static, fragment_indices, selecting=True)
-    selections = [None] * len(mp2_static.fragments)
-    for group in build_domain_groups(mp2_static, merge_identical=merge_identical):
-        if not set(group.fragment_indices).intersection(indices):
+    physical = _physical_groups(mp2_static)
+    selections = [None] * len(physical)
+    groups = build_domain_groups(mp2_static, merge_identical=merge_identical)
+    driver.lib.logger.info(mf, 'STC CC physical fragments %d; Boys grouping %s; preparation groups %d',
+                           len(physical), mp2_static.boys_grouping, len(groups))
+    for index, members in enumerate(physical):
+        targets = tuple(int(mp2_static.frag_lolist[member][0]) for member in members)
+        driver.lib.logger.info(mf, 'STC CC fragment %d; orbital records %s; targets %s; n_F=%d',
+                               index, members, targets, len(members))
+    for group in groups:
+        corrections = _group_cc_fragments(mp2_static, group)
+        if not any(index in indices for index, _ in corrections):
             continue
         inputs, host, _ = driver._prepare(state, mp2_static, group, baseline, False)
-        for index, target in zip(group.fragment_indices, group.target_indices):
+        frame = build_boys_ed_frame(state['common'], mp2_static, group.representative_index)
+        for index, targets in corrections:
             if index not in indices:
                 continue
-            frame = build_boys_ed_frame(state['common'], mp2_static, index)
-            forward = backend.solve_matrices(host, {'fragment_id': index, 'target_indices': (target,)},
+            forward = backend.solve_matrices(host, {'fragment_id': index, 'target_indices': targets},
                                              matrix, matrix_kind=matrix_kind)
             selections[index] = build_fragment_lis_selection(
                 mf, mp2_static, index,
                 matrices={name: np.asarray(forward[name]) for name in ('occupied', 'virtual')},
                 matrix_kind=matrix_kind, common=state['common'], frame=frame,
+                frame_fragment_index=group.representative_index,
                 thresh_occ=thresh_occ, thresh_vir=thresh_vir,
                 internal_rank_threshold=internal_rank_threshold)
             del forward
@@ -200,11 +253,15 @@ def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_v
                         thresh_occ=thresh_occ, thresh_vir=thresh_vir,
                         internal_rank_threshold=internal_rank_threshold,
                         fragments=tuple(selections))
-    return CCSDSelections(lis, _scientific_identity(baseline, matrix))
+    static = CCSDSelections(lis, _scientific_identity(baseline, matrix))
+    for index in indices:
+        driver.lib.logger.info(mf, 'STC CC fragment %d; LIS occupied %d; LIS virtual %d',
+                               index, *_fragment_dimensions(static, index))
+    return static
 
 
 def _allocate_triples_controls(controls, nfragments):
-    """Allocate a total triples SE budget over globally requested singletons."""
+    """Allocate a total triples SE budget over globally requested physical fragments."""
     if controls is None or 'energy_tolerance' not in controls:
         return controls
     target = controls['energy_tolerance'] / numpy.sqrt(nfragments) if nfragments else 0.
@@ -223,9 +280,11 @@ def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
                     verbose_imp, ccsd_t, triples_controls=None, with_grad=False):
     """Return MP2-LIS, CCSD and triples; stochastic calls also return diagnostics."""
     from .lis import build_fragment_lis
-    frame = build_boys_ed_frame(common, static.mp2_static, fragment_index)
+    representative = group.representative_index
+    frame = build_boys_ed_frame(common, static.mp2_static, representative)
     lis = build_fragment_lis(mf, common, static.lis_static, fragment_index,
-                             matrices=matrices, frame=frame)
+                             matrices=matrices, frame=frame,
+                             frame_fragment_index=representative)
     stochastic = triples_controls is not None and triples_controls['mode'] == 'stochastic'
     if not lis.active_occupied_coeff.shape[1] or not lis.active_virtual_coeff.shape[1]:
         zero = np.zeros((), dtype=common.s1e.dtype)
@@ -233,7 +292,7 @@ def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
         return (values, {}) if stochastic else values
     metadata = {'fragment_index': int(fragment_index),
                 'extended_primary_domain': numpy.asarray(
-                    static.mp2_static.fragments[fragment_index].extended_atoms, dtype=numpy.int32)}
+                    static.mp2_static.fragments[representative].extended_atoms, dtype=numpy.int32)}
     options = {}
     if stochastic:
         from .triples import make_solver
@@ -249,7 +308,7 @@ def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
 def _run_group(state, static, group, baseline_controls, matrix_controls, *,
                with_grad, verbose_imp, ccsd_t, triples_controls=None,
                include_baseline=True, fragment_indices=None):
-    """Complete one owned group's preparation, baseline and singleton responses.
+    """Complete one owned group's preparation, baseline and physical-fragment responses.
 
     All process-local VJPs and matrix replay records are consumed here. Only
     scalar component records and the accumulated numerical host bars survive.
@@ -267,11 +326,11 @@ def _run_group(state, static, group, baseline_controls, matrix_controls, *,
             driver._add_bars(state, *apply_selected_pullback(prepare_pullback, inputs, baseline))
         del baseline
     records = []
-    for index, target in zip(group.fragment_indices, group.target_indices):
+    for index, targets in _group_cc_fragments(static, group):
         if fragment_indices is not None and index not in fragment_indices:
             continue
         forward = backend.solve_matrices(
-            host, {'fragment_id': index, 'target_indices': (target,)},
+            host, {'fragment_id': index, 'target_indices': targets},
             matrix_controls, matrix_kind=static.matrix_kind)
         matrices = {name: np.asarray(forward[name]) for name in ('occupied', 'virtual')}
         def correction(mf, common, blocks):
@@ -361,7 +420,9 @@ def _run_serial(state, static, baseline, matrix, *, with_grad, include_hf,
             raise ValueError('CC checkpoint progress is outside the saved group worklist')
         for position in range(start, len(groups)):
             group = groups[position]
-            if include_baseline or set(group.fragment_indices).intersection(fragment_indices):
+            corrections = _group_cc_fragments(static, group)
+            if include_baseline or any(fragment_indices is None or index in fragment_indices
+                                       for index, _ in corrections):
                 records.extend(_run_group(
                     state, static, group, allocated, matrix, with_grad=with_grad,
                     verbose_imp=verbose_imp, ccsd_t=ccsd_t,

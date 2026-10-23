@@ -23,10 +23,10 @@ def triples_native():
     return module
 
 
-def triples_fixture():
+def triples_fixture(*, grouped=False):
     """Real DF factors and pair-symmetric amplitudes, with mixed occupied U."""
     rng = np.random.default_rng(1907)
-    no, nv, naux = 2, 3, 4
+    no, nv, naux = (3 if grouped else 2), 3, 4
     t1 = rng.normal(scale=.02, size=(no, nv))
     t2 = rng.normal(scale=.03, size=(no, no, nv, nv))
     t2 = .5 * (t2 + t2.transpose(1, 0, 3, 2))
@@ -36,8 +36,11 @@ def triples_fixture():
     Bvv = rng.normal(scale=.15, size=(naux, nv, nv))
     Bvv = .5 * (Bvv + Bvv.swapaxes(1, 2))
     return dict(zip(TRIPLES_KEYS, (
-        t1, t2, Bvo, Boo, Bvv, np.array([-1.1, -.6]),
-        np.array([.2, .5, .9]), np.array([[.6], [-.8]]))))
+        t1, t2, Bvo, Boo, Bvv,
+        np.array([-1.1, -.8, -.6]) if grouped else np.array([-1.1, -.6]),
+        np.array([.2, .5, .9]),
+        np.array([[.6, 0.], [-.8, 0.], [0., 1.]]) if grouped else
+        np.array([[.6], [-.8]]))))
 
 
 def fvo_zero_reference(t1, t2, Bvo, Boo, Bvv, eocc, evir, U):
@@ -69,6 +72,31 @@ def test_native_triples_reference_energy():
     assert isinstance(module.TRIPLES_VERSION, str)
     assert 'sha256' in module.TRIPLES_VERSION
 
+
+
+def test_multicolumn_selected_triples_matches_fvo_zero_energy_and_u_response():
+    import jax
+    module = triples_native()
+    inputs = triples_fixture(grouped=True)
+    # Two target columns span a proper subspace of three occupied orbitals.
+    # Comparing against U U.T also catches dropping or averaging target columns.
+    expected, expected_u = jax.value_and_grad(lambda u: fvo_zero_reference(
+        **{**{key: jnp.asarray(value) for key, value in inputs.items()}, 'U': u}
+    ))(jnp.asarray(inputs['U']))
+    exact = module.triples_selected_energy(**inputs, nsamples=0)
+    np.testing.assert_allclose(exact['energy'], expected, atol=1e-10, rtol=0.)
+    draws = [module.triples_selected_energy_vjp(**inputs, nsamples=32768, seed=seed)
+             for seed in (17, 29, 37, 53)]
+    energies = np.array([draw['energy'] for draw in draws])
+    bars = np.array([draw['cotangents']['U'] for draw in draws])
+    assert np.linalg.norm(expected_u) > 1e-8
+    energy_se = np.sqrt(sum(draw['standard_error']**2 for draw in draws)) / 4
+    assert abs(energies.mean() - float(expected)) <= 8 * energy_se + 1e-10
+    # Independent replicate variance checks the selected-projector cotangent;
+    # finite differences of resampled proposals are not a pathwise derivative.
+    bar_se = bars.std(axis=0, ddof=1) / 2
+    assert np.all(np.abs(bars.mean(axis=0) - np.asarray(expected_u))
+                  <= 8 * bar_se + 1e-9)
 
 def test_native_triples_accepts_strides_without_changing_tensor_order():
     module = triples_native()
@@ -490,6 +518,7 @@ def test_group_carries_triples_diagnostics_through_response(monkeypatch, with_gr
                         'amplitude_packing_seconds': .004, 'vjp_reverse_seconds': .005,
                         'timings': {'sampling_seconds': jnp.asarray(.02)}}
     monkeypatch.setattr(ccsd.driver, '_prepare', prepared)
+    monkeypatch.setattr(ccsd, '_group_cc_fragments', lambda static, group: ((0, (0,)),))
     monkeypatch.setattr(ccsd, '_solve_fragment', fragment)
     state = dict(mf=jnp.asarray(.2), common=jnp.asarray(-.1), energy=jnp.zeros(()),
                  variance=0., mf_bar=jnp.zeros(()), common_bar=jnp.zeros(()))

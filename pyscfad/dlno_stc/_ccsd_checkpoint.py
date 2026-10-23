@@ -22,7 +22,10 @@ def open_checkpoint(state, static, groups, *, checkpoint_dir, resume, options):
                               for name in ('mo_coeff', 'mo_energy', 'mo_occ', 'e_tot')},
                    native_version=_stc_mp2.matrix_kernel_version,
                    cc_convergence=(RCCSD.conv_tol, RCCSD.conv_tol_normt, RCCSD.max_cycle),
-                   controls=static.controls_identity, options=options, groups=groups)
+                   controls=static.controls_identity, options=options, groups=groups,
+                   cc_selection_schema=static.schema_version,
+                   boys_grouping=static.mp2_static.boys_grouping,
+                   physical_groups=static.mp2_static.physical_groups)
     triples = options.get('triples_controls')
     if triples is not None and triples['mode'] == 'stochastic':
         payload['native_triples_version'] = _stc_mp2.TRIPLES_VERSION

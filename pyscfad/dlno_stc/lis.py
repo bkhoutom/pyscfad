@@ -15,7 +15,7 @@ import scipy.linalg as scipy_linalg
 from pyscfad import numpy as np, scipy
 from pyscfad.ops import stop_grad
 from pyscfad.lno import lno_base
-from ._selection import DomainSelections
+from ._selection import DomainSelections, _physical_groups
 from .domain import BoysEDFrame, DomainData, build_boys_ed_frame, rebuild_domain_data
 
 LIS_INTERNAL_RANK_THRESHOLD = 1e-6
@@ -33,7 +33,7 @@ class FragmentLISSelection:
     corresponding reference eigenproblem.  ``internal_*_keep`` index the
     target-row Gram matrix. ``*_lno_keep`` index the external density in the
     global active occupied or virtual manifold, after removing the internal
-    target span. A Boys target always retains its single occupied direction
+    target span. A physical Boys fragment retains every original occupied target direction
     and has no internal virtual directions.
     """
 
@@ -149,9 +149,15 @@ def _fixed_row_space(matrix, keep):
     return np.linalg.solve(chol, candidate.T.conj()).T.conj()
 
 
-def _internal_projection_matrices(common, fragment_index):
-    """Original global Boys target overlaps; Boys has no internal virtual span."""
-    target = common.fragment_occupied_data[int(fragment_index)].iao_coeff
+def _physical_target_block(common, static, fragment_index):
+    members = _physical_groups(static)[fragment_index]
+    return np.concatenate(tuple(common.fragment_occupied_data[member].iao_coeff
+                                for member in members), axis=1)
+
+
+def _internal_projection_matrices(common, static, fragment_index):
+    """Original global Boys block overlaps; Boys has no internal virtual span."""
+    target = _physical_target_block(common, static, fragment_index)
     occupied = target.T.conj() @ common.s1e @ common.occupied_coeff
     return occupied, np.zeros((0, common.virtual_coeff.shape[1]), dtype=occupied.dtype)
 
@@ -351,10 +357,11 @@ def _fragment_index(static, fragment_index):
     if not isinstance(static, DomainSelections) or static.lo_type != 'boys':
         raise TypeError('mp2_static must be STC Boys DomainSelections')
     index = int(fragment_index)
-    if not 0 <= index < len(static.fragments):
-        raise IndexError(f'fragment_index={index} is outside [0, {len(static.fragments)})')
-    if len(static.frag_lolist[index]) != 1:
-        raise ValueError('Boys LIS requires one original Boys target per fragment')
+    physical = _physical_groups(static)
+    if not 0 <= index < len(physical):
+        raise IndexError(f'fragment_index={index} is outside [0, {len(physical)})')
+    if any(len(static.frag_lolist[member]) != 1 for member in physical[index]):
+        raise ValueError('Boys LIS requires one original Boys target per orbital record')
     return index
 
 
@@ -401,7 +408,7 @@ def _matrices_in_active_spaces(common, frame, occupied, virtual):
 
 def build_fragment_lis_selection(
     mf, mp2_static, fragment_index, *, matrices, matrix_kind, common=None,
-    frame=None, thresh_occ=1e-4, thresh_vir=1e-5,
+    frame=None, frame_fragment_index=None, thresh_occ=1e-4, thresh_vir=1e-5,
     internal_rank_threshold=LIS_INTERNAL_RANK_THRESHOLD,
 ):
     """Save target rank and LNO eigenvector labels from one supplied D/W pair.
@@ -417,13 +424,13 @@ def build_fragment_lis_selection(
     index = _fragment_index(mp2_static, fragment_index)
     if common is None:
         common = rebuild_domain_data(mf, mp2_static)
-    frame, occupied, virtual = _frame_and_matrices(common, mp2_static, index, frame, matrices)
+    representative = (_physical_groups(mp2_static)[index][0] if frame_fragment_index is None
+                      else frame_fragment_index)
+    frame, occupied, virtual = _frame_and_matrices(common, mp2_static, representative, frame, matrices)
     occupied, virtual = _matrices_in_active_spaces(common, frame, occupied, virtual)
-    occ_projection, vir_projection = _internal_projection_matrices(common, index)
-    if occ_projection.shape[0] != 1:
-        raise ValueError('Boys LIS requires one original Boys target per fragment')
-    # Boys always retains its occupied target, independent of the rank cutoff.
-    occ_keep = numpy.array([0], dtype=numpy.int32)
+    occ_projection, vir_projection = _internal_projection_matrices(common, mp2_static, index)
+    # Retain all n_F original occupied targets, independent of the rank cutoff.
+    occ_keep = numpy.arange(occ_projection.shape[0], dtype=numpy.int32)
     vir_keep = numpy.zeros(0, dtype=numpy.int32)
     occ_internal = _fixed_row_space(occ_projection, occ_keep)
     vir_internal = _fixed_row_space(vir_projection, vir_keep)
@@ -435,7 +442,7 @@ def build_fragment_lis_selection(
 
 
 def build_fragment_lis(mf, common, static, fragment_index, *, matrices,
-                       matrix_kind=None, frame=None):
+                       matrix_kind=None, frame=None, frame_fragment_index=None):
     """Replay fixed LIS labels with current D/W blocks and the matching ED frame.
 
     The output contains the original global-HF six-block MO layout, original
@@ -453,10 +460,12 @@ def build_fragment_lis(mf, common, static, fragment_index, *, matrices,
     selection = static.fragments[index]
     if selection.fragment_index != index:
         raise ValueError('fragment selection order is inconsistent')
+    representative = (_physical_groups(static.mp2_static)[index][0] if frame_fragment_index is None
+                      else frame_fragment_index)
     frame, occupied_ed, virtual_ed = _frame_and_matrices(
-        common, static.mp2_static, index, frame, matrices)
+        common, static.mp2_static, representative, frame, matrices)
     occupied, virtual = _matrices_in_active_spaces(common, frame, occupied_ed, virtual_ed)
-    occ_projection, vir_projection = _internal_projection_matrices(common, index)
+    occ_projection, vir_projection = _internal_projection_matrices(common, static.mp2_static, index)
     occ_internal = _fixed_row_space(occ_projection, selection.internal_occ_keep)
     vir_internal = _fixed_row_space(vir_projection, selection.internal_vir_keep)
     occ_rotation = _fixed_density_space(occupied, occ_internal, selection.occupied_lno_keep,
@@ -466,7 +475,7 @@ def build_fragment_lis(mf, common, static, fragment_index, *, matrices,
     full_coeff, frozen, occ_coeff, vir_coeff = _assemble_full_mo_layout(
         mf, static.mp2_static, common.occupied_coeff, common.virtual_coeff,
         common.fock, occ_rotation, vir_rotation, static.internal_rank_threshold)
-    target = common.fragment_occupied_data[index].iao_coeff
+    target = _physical_target_block(common, static.mp2_static, index)
     return FragmentLIS(
         mo_coeff=full_coeff, frozen=frozen,
         fragment_occupied_anchor=common.occupied_coeff @ occ_projection.T.conj(),

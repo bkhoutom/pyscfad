@@ -58,7 +58,8 @@ def _run_mpi(initializer, worker_initializer, comm, *, with_grad,
         if not include_baseline:
             wanted = set(indices)
             groups = tuple(group for group in groups
-                           if wanted.intersection(group.fragment_indices))
+                           if any(index in wanted for index, _ in
+                                  ccsd._group_cc_fragments(static, group)))
         options = dict(include_hf=include_hf, verbose_imp=verbose_imp, ccsd_t=ccsd_t,
                        triples_controls=state['cc_triples_controls'],
                        return_components=return_components, include_baseline=include_baseline,

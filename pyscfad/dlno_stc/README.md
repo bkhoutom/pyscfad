@@ -6,7 +6,9 @@ modules and examples do not import native DLNO. Saved orbital records and
 `frag_lolist` retain a complete singleton partition. `boys_grouping` separately
 chooses physical CC fragments: `singleton` uses one original active occupied
 Boys orbital; `atom` uses the existing Löwdin assignment and hydrogen-to-heavy
-atom groups. `DomainSelections.physical_groups` stores ordered orbital-record
+atom groups; `molecule` puts all active occupied Boys orbitals in one physical
+fragment and automatically enables full molecular domains.
+`DomainSelections.physical_groups` stores ordered orbital-record
 membership, and its position is the stable physical fragment ID. Internal
 `DomainGroup` entries merge preparation only when saved supports, candidate
 ordering, retained virtual ranks and PAO anchors are identical.
@@ -454,7 +456,8 @@ remain 1.
 
 `pyscfad.dlno_stc.ccsd` supplies `build_static_selections`, `kernel` and
 `value_and_grad`. Each physical fragment receives one native D or W pair,
-one LIS and one CCSD(T) correction. In `boys_grouping="atom"`, matrices sum the
+one LIS and one CCSD(T) correction. In `boys_grouping="atom"` and
+`boys_grouping="molecule"`, matrices sum the
 selected target contributions in the shared ED frame without division by
 `n_F`, the number of occupied targets. The LIS retains all `n_F` internal
 occupied directions and uses their full column block in the CC projector.
@@ -497,6 +500,18 @@ energy, gradient, components = ccsd.value_and_grad(
     matrix_controls=matrix_controls, include_hf=True, return_components=True)
 force = -gradient.coords
 ```
+
+For a single molecular fragment, replace the domain construction above with:
+
+```python
+domains = build_domain_selections(mf, frozen=1, boys_grouping="molecule")
+```
+
+Frozen core still applies. The LIS retains every active occupied orbital at
+positive occupied cutoffs; `thresh_vir` controls truncation of the global virtual
+space. Zero cutoffs retain the full corresponding active spaces. Molecule mode
+has all-strong pairs and no weak-pair correction, and gives one physical CC
+fragment even with `merge_identical=False`.
 
 For W, select `matrix_kind='W'` and supply its occupied/virtual cutoffs
 explicitly, for example `thresh_occ=3e-4, thresh_vir=1e-4`. These example
@@ -618,6 +633,8 @@ the physical-fragment schema must be rebuilt, along with their checkpoints;
 there is no migration. Shared `DomainSelections` checkpoints from the earlier
 schema also require rebuilding, including MP2-only checkpoints.
 
-Grouping-aware cluster drivers pass `--boys-grouping singleton|atom` through to
-`build_domain_selections` and report physical fragment count, occupied target
-membership and `n_F`, preparation-group count, and LIS dimensions separately.
+The active workstation MP2 driver accepts
+`--boys-grouping singleton|atom|molecule` and forwards it unchanged to
+`build_domain_selections`. Grouping-aware CC drivers report physical fragment
+count, occupied target membership and `n_F`, preparation-group count, and LIS
+dimensions separately; their parser choices depend on the driver copy.

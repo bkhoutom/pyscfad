@@ -135,8 +135,8 @@ def _physical_groups(static):
         raise ValueError("incompatible domain selections; rebuild domains to save physical fragment grouping")
     groups = getattr(static, "physical_groups", ())
     mode = getattr(static, "boys_grouping", "singleton")
-    if mode not in ("singleton", "atom"):
-        raise ValueError("boys_grouping must be 'singleton' or 'atom'")
+    if mode not in ("singleton", "atom", "molecule"):
+        raise ValueError("boys_grouping must be 'singleton', 'atom' or 'molecule'")
     if not groups and mode == "singleton":
         groups = tuple((i,) for i in range(len(static.fragments)))
     normalized = tuple(_grouping_indices(group, len(static.fragments),
@@ -145,6 +145,8 @@ def _physical_groups(static):
             or sorted(i for group in normalized for i in group) != list(range(len(static.fragments)))
             or (mode == "singleton" and any(len(group) != 1 for group in normalized))):
         raise ValueError("physical fragment membership must partition orbital records exactly once")
+    if mode == "molecule" and normalized != (tuple(range(len(static.fragments))),):
+        raise ValueError("molecule physical fragment membership must contain every orbital record in one complete group")
     return normalized
 
 
@@ -684,6 +686,8 @@ def build_domain_selections(
     ranks, graph and pivots are chosen only from concrete reference data.
     ``boys_grouping="atom"`` shares strong frames within Löwdin atom groups;
     weak screens and target records remain individual occupied orbitals.
+    ``boys_grouping="molecule"`` automatically uses full molecular domains
+    and puts every active occupied target in one physical fragment.
     """
     from .domain import DomainData, TargetOccupiedData
     from ._pairs import screen_pairs
@@ -691,8 +695,9 @@ def build_domain_selections(
     thresholds = BoysDomainThresholds() if thresholds is None else thresholds
     if not isinstance(thresholds, BoysDomainThresholds):
         raise TypeError("thresholds must be BoysDomainThresholds")
-    if boys_grouping not in ("singleton", "atom"):
-        raise ValueError("boys_grouping must be 'singleton' or 'atom'")
+    if boys_grouping not in ("singleton", "atom", "molecule"):
+        raise ValueError("boys_grouping must be 'singleton', 'atom' or 'molecule'")
+    force_full_domains = force_full_domains or boys_grouping == "molecule"
     _validate_reference(mf, frozen)
     options = _resolve_boys_options(lo_kwargs)
     model = str(pair_energy_model).lower().replace("_", "-")
@@ -721,9 +726,12 @@ def build_domain_selections(
             or numpy.max(abs(residual)) > 1e-8):
         raise ValueError("Boys targets must span the active occupied space")
     groups = _validate_boys_target_groups(frag_lolist, active_occ.size)
-    physical_groups = (_boys_atom_groups(mol, targets, groups)
-                       if boys_grouping == "atom" else
-                       tuple(numpy.array([i], dtype=numpy.int32) for i in range(len(groups))))
+    if boys_grouping == "molecule":
+        physical_groups = (numpy.arange(len(groups), dtype=numpy.int32),)
+    elif boys_grouping == "atom":
+        physical_groups = _boys_atom_groups(mol, targets, groups)
+    else:
+        physical_groups = tuple(numpy.array([i], dtype=numpy.int32) for i in range(len(groups)))
     out = _host_array(mf.mo_coeff)[:, projected_out]
     raw_pao = numpy.eye(mol.nao) - out @ (out.T @ overlap)
     norms = numpy.sqrt(numpy.einsum("ui,uv,vi->i", raw_pao, overlap, raw_pao))

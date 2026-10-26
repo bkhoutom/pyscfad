@@ -16,9 +16,10 @@ from ._memory import memory_calculation
 from ._selection import (DomainSelections, _physical_groups, _strong_preparation_key,
                          build_domain_groups)
 from ._workflow import allocate_domain_controls
-from .adjoint import apply_input_pullback, apply_selected_pullback
+from .adjoint import apply_input_pullback
 from .controls import normalize_matrix_controls, normalize_triples_controls
 from .domain import build_boys_ed_frame
+from .protocol import validate_full_result, validate_input_cotangents
 
 
 CC_SELECTIONS_SCHEMA_VERSION = 2
@@ -311,18 +312,22 @@ def _run_group(state, static, group, baseline_controls, matrix_controls, *,
 
     All process-local VJPs and matrix replay records are consumed here. Only
     scalar component records and the accumulated numerical host bars survive.
+    One preparation pullback consumes the sum of its input cotangents.
     """
     inputs, host, prepare_pullback = driver._prepare(
         state, static.mp2_static, group, baseline_controls, with_grad)
     metadata = {'fragment_id': group.representative_index,
                 'target_indices': group.target_indices}
+    input_bars = None
     if include_baseline:
         baseline = backend.solve(host, metadata, baseline_controls, with_grad=with_grad)
         state['energy'] = state['energy'] + baseline['energy']
         state['baseline_energy'] = state.get('baseline_energy', 0.) + float(baseline['energy'])
         state['variance'] += float(baseline['energy_standard_error']) ** 2
         if with_grad:
-            driver._add_bars(state, *apply_selected_pullback(prepare_pullback, inputs, baseline))
+            validate_full_result(baseline, inputs)
+            input_bars = {name: numpy.array(value, dtype=numpy.float64, copy=True)
+                          for name, value in baseline['cotangents'].items()}
         del baseline
     records = []
     for index, targets in _group_cc_fragments(static, group):
@@ -351,13 +356,16 @@ def _run_group(state, static, group, baseline_controls, matrix_controls, *,
             bars = backend.pullback_matrices(
                 host, forward, energy_bar=0., occupied_bar=matrix_bars['occupied'],
                 virtual_bar=matrix_bars['virtual'])
-            native_bars = apply_input_pullback(prepare_pullback, inputs, bars)
-            native_norm = _bar_norm(*native_bars)
-            driver._add_bars(state, *native_bars)
-            del native_bars
+            validate_input_cotangents(bars, inputs)
+            if input_bars is None:
+                input_bars = {name: numpy.array(value, dtype=numpy.float64, copy=True)
+                              for name, value in bars.items()}
+            else:
+                for name in inputs:
+                    input_bars[name] += bars[name]
             del correction_pullback, mf_bar, common_bar, matrix_bars, bars
         else:
-            direct_norm = native_norm = None
+            direct_norm = None
             energy, auxiliary = correction(state['mf'], state['common'], matrices)
         values, diagnostics = auxiliary
         diagnostics = jax.tree_util.tree_map(lambda value: numpy.asarray(value).item(), diagnostics)
@@ -366,7 +374,7 @@ def _run_group(state, static, group, baseline_controls, matrix_controls, *,
         records.append(FragmentComponents(index, *(float(value) for value in values),
                                            float(forward['energy']),
                                            *_fragment_dimensions(static, index),
-                                           direct_norm, native_norm,
+                                           direct_norm, None,
                                            {key: value for key, value in forward['diagnostics'].items()
                                             if key not in ('occupied_standard_error',
                                                            'virtual_standard_error')},
@@ -380,6 +388,10 @@ def _run_group(state, static, group, baseline_controls, matrix_controls, *,
                                            triples_diagnostics=diagnostics or None))
         del forward, matrices, correction, energy, values, auxiliary, diagnostics
         gc.collect()
+    if input_bars is not None:
+        driver._add_bars(state, *apply_input_pullback(prepare_pullback, inputs, input_bars))
+        del input_bars
+        jax.block_until_ready((state['mf_bar'], state['common_bar']))
     return records
 
 

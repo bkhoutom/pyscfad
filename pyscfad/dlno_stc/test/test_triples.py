@@ -535,6 +535,8 @@ def test_group_carries_triples_diagnostics_through_response(monkeypatch, with_gr
     import json
     assert json.loads(json.dumps(row.triples_diagnostics))['timings']['sampling_seconds'] == .02
     if with_grad:
+        assert row.direct_host_bar_norm > 0.
+        assert row.native_host_bar_norm is None
         assert np.isfinite(float(state['mf_bar'])) and np.isfinite(float(state['common_bar']))
         assert abs(float(state['mf_bar'])) > 0. and abs(float(state['common_bar'])) > 0.
 

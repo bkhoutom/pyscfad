@@ -19,7 +19,7 @@ from pyscfad.ops import stop_trace
 from pyscfad.lib._compilation_cache import configure_compilation_cache
 from pyscfad.tools import resource_profile
 from ._selection import DomainSelections, _extract_active_indices, build_domain_groups
-from .domain import rebuild_domain_data
+from .domain import build_scf_data, rebuild_domain_data
 from ._selection import _validate_boys_target_groups as validate_boys_target_groups
 from .adjoint import (
     add_cotangent as _add_cotangent,
@@ -158,17 +158,53 @@ def _coordinate_only(mol):
         )
 
 
-def _initialize(mf, static, controls, *, with_grad, scf_pullback=None):
+def _select_domain_reference(mf, build_static):
+    """Share live S/F with a callback through its detached numerical reference."""
+    with resource_profile.section('stc.domain.scf_data_prepare'):
+        scf_data, scf_data_pullback = jax.vjp(build_scf_data, mf)
+        jax.block_until_ready(scf_data)
+        host_data = tuple(numpy.asarray(jax.device_get(value)) for value in scf_data)
+
+    def select(reference):
+        # Only the detached copy carries this selection-time cache. In
+        # particular, it must never become metadata on the live SCF pytree.
+        reference._stc_scf_data = host_data
+        try:
+            return build_static(reference)
+        finally:
+            reference.__dict__.pop('_stc_scf_data', None)
+
+    with resource_profile.section('stc.domain.selection'):
+        selected = stop_trace(select)(mf)
+    return selected, scf_data, scf_data_pullback
+
+
+def _initialize(mf, static, controls, *, with_grad, scf_pullback=None,
+                scf_data=None, scf_data_pullback=None):
     _validate_static(static)
     _validate_controls(controls)
     _validate_reference(mf, static)
     configure_compilation_cache()
     with resource_profile.section('stc.domain.common_prepare'):
         if with_grad:
-            common, common_pullback = jax.vjp(lambda mf_: rebuild_domain_data(mf_, static), mf)
+            if scf_data is None:
+                scf_data, scf_data_pullback = jax.vjp(build_scf_data, mf)
+            if scf_data_pullback is None:
+                raise ValueError('live S/F data require their pullback for gradients')
+            common, construction_pullback = jax.vjp(
+                lambda current, data: rebuild_domain_data(current, static, scf_data=data),
+                mf, scf_data)
+
+            def common_pullback(common_bar):
+                direct, data_bar = construction_pullback(common_bar)
+                via_scf_data, = scf_data_pullback(data_bar)
+                return (jax.tree_util.tree_map(_add_cotangent, direct, via_scf_data),)
+
             mf_bar, common_bar = _zero_term_cotangents(mf, common)
         else:
-            common = rebuild_domain_data(mf, static)
+            if scf_data is None:
+                scf_data = getattr(mf, '_stc_scf_data', None)
+            common = rebuild_domain_data(mf, static, scf_data=scf_data)
             common_pullback = mf_bar = common_bar = None
         jax.block_until_ready(common)
     return {"mf": mf, "static": static, "common": common, "common_pullback": common_pullback,
@@ -580,7 +616,9 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
     calls take their saved localization options from ``static``.
     Domain calls may instead supply ``build_static(mf)``. It runs once on
     a detached, phase-fixed reference after the single differentiated SCF,
-    and returns fixed ``DomainSelections``. Selection-only mutations cannot
+    and returns fixed ``DomainSelections``. AO overlap/Fock data are built
+    once and shared by selection and differentiable common preparation.
+    Selection-only mutations cannot
     change the live SCF tree retained by its pullback. ``static`` and
     ``build_static`` are mutually exclusive; system scope uses neither.
     Identical domain frames share one selected solve/VJP unless the diagnostic
@@ -622,11 +660,12 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
                                       scf_pullback=scf_pullback, lo_kwargs=lo_kwargs,
                                       fock_from_scf=True)
         selected = static
+        scf_data = scf_data_pullback = None
         if build_static is not None:
-            with resource_profile.section('stc.domain.selection'):
-                selected = stop_trace(build_static)(mf)
+            selected, scf_data, scf_data_pullback = _select_domain_reference(mf, build_static)
         return _initialize(mf, selected, controls, with_grad=True,
-                           scf_pullback=scf_pullback)
+                           scf_pullback=scf_pullback, scf_data=scf_data,
+                           scf_data_pullback=scf_data_pullback)
 
     if scope == "system":
         return _run_system(initialize, controls, comm, with_grad=True, include_hf=include_hf)

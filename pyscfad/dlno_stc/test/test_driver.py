@@ -41,8 +41,8 @@ def test_unsupported_public_targets_are_rejected_before_scf():
             dlno_stc.value_and_grad(mol, forbidden_scf, invalid, controls=accept.controls())
 
 
-def test_finite_grouped_energy_gradient_weak_and_hf():
-    from pyscfad import dlno_stc
+def test_finite_grouped_energy_gradient_weak_and_hf(monkeypatch):
+    from pyscfad import dlno_stc, scf
     from pyscfad.dlno_stc._pairs import weak_pair_indices
     mol = accept.molecule()
     mf = accept.build_mf(mol)
@@ -50,7 +50,13 @@ def test_finite_grouped_energy_gradient_weak_and_hf():
     assert any(len(f.extended_ao_indices) < mol.nao for f in static.fragments)
     assert tuple(weak_pair_indices(static))
     controls = accept.controls()
-    calls = dict(scf=0, selection=0)
+    calls = dict(scf=0, selection=0, fock=0)
+    get_fock = scf.hf.SCF.get_fock
+
+    def counted_fock(mf, *args, **kwargs):
+        if not args and not kwargs:
+            calls['fock'] += 1
+        return get_fock(mf, *args, **kwargs)
 
     def build_mf(current):
         calls['scf'] += 1
@@ -64,9 +70,11 @@ def test_finite_grouped_energy_gradient_weak_and_hf():
         reference.mo_energy = None
         return selected
 
-    energy, bar = dlno_stc.value_and_grad(
-        mol, build_mf, build_static=build_static, controls=controls)
-    assert calls == dict(scf=1, selection=1)
+    with monkeypatch.context() as context:
+        context.setattr(scf.hf.SCF, 'get_fock', counted_fock)
+        energy, bar = dlno_stc.value_and_grad(
+            mol, build_mf, build_static=build_static, controls=controls)
+    assert calls == dict(scf=1, selection=1, fock=1)
     singleton, singleton_bar = dlno_stc.value_and_grad(
         mol, accept.build_mf, static, controls=controls, merge_identical=False)
     np.testing.assert_allclose(energy, singleton, atol=2e-10, rtol=0)

@@ -423,16 +423,19 @@ def _normalized_pao(projected_out, overlap, columns):
     return raw_pao / np.sqrt(norm2)[None, :]
 
 
-def rebuild_domain_data(mf, static):
-    """Rebuild current Boys and PAOs with the saved concrete choices.
-
-    Copied from the Boys branch of dlno_base.rebuild_domain_data, omitting
-    raw occupied overlaps and all additive orbital projection weights.
-    """
-    if not isinstance(static, DomainSelections) or static.lo_type != "boys":
-        raise TypeError("static must be STC Boys DomainSelections")
+def build_scf_data(mf):
+    """Build the differentiable AO overlap and Fock shared by domain setup."""
     overlap = response('stc.domain.common_pullback.overlap',
                        lambda mol: mol.intor_symmetric("int1e_ovlp"), mf.mol)
+    fock = response('stc.domain.common_pullback.ao_fock', lambda mf: mf.get_fock(), mf)
+    return overlap, fock
+
+
+def rebuild_domain_data(mf, static, *, scf_data=None):
+    """Rebuild Boys and PAOs, optionally using an existing live AO S/F pair."""
+    if not isinstance(static, DomainSelections) or static.lo_type != "boys":
+        raise TypeError("static must be STC Boys DomainSelections")
+    overlap, fock = build_scf_data(mf) if scf_data is None else scf_data
     mo_coeff, mo_energy = np.asarray(mf.mo_coeff), np.asarray(mf.mo_energy)
     occupied, virtual = (mo_coeff[:, indices] for indices in (static.active_occ_indices, static.active_vir_indices))
     targets = (_rebuild_boys_targets(mf, occupied, static)
@@ -441,7 +444,6 @@ def rebuild_domain_data(mf, static):
     pao = response('stc.domain.common_pullback.pao',
                    lambda coeff, s: _normalized_pao(coeff, s, static.pao_parent_ao_indices),
                    projected_out, overlap)
-    fock = response('stc.domain.common_pullback.ao_fock', lambda mf: mf.get_fock(), mf)
     return DomainData(overlap, fock, occupied, virtual,
                       mo_energy[static.active_occ_indices], mo_energy[static.active_vir_indices],
                       targets, pao,

@@ -10,7 +10,6 @@ import jax
 import numpy
 from pyscfad import numpy as np
 from pyscfad.lno.ccsd import _impurity_solve_core
-from pyscfad.ops import stop_trace
 
 from . import backend, driver
 from ._memory import memory_calculation
@@ -546,12 +545,16 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
         else:
             _validate_run(static, baseline_controls, matrix_controls, matrix_kind)
         mf, scf_pullback = driver._initialize_scf(mol, build_mf)
-        selected = stop_trace(build_static)(mf) if build_static is not None else static
+        selected = static
+        scf_data = scf_data_pullback = None
+        if build_static is not None:
+            selected, scf_data, scf_data_pullback = driver._select_domain_reference(mf, build_static)
         baseline, matrix = _validate_run(selected, baseline_controls, matrix_controls, matrix_kind)
         indices = _fragment_indices(selected, fragment_indices)
         triples = _allocate_triples_controls(triples, len(indices))
         state = driver._initialize(mf, selected.mp2_static, baseline, with_grad=True,
-                                   scf_pullback=scf_pullback)
+                                   scf_pullback=scf_pullback, scf_data=scf_data,
+                                   scf_data_pullback=scf_data_pullback)
         state['cc_fragment_indices'] = indices
         state['cc_triples_controls'] = triples
         return state, selected, baseline, matrix

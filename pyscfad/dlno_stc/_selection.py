@@ -689,7 +689,7 @@ def build_domain_selections(
     ``boys_grouping="molecule"`` automatically uses full molecular domains
     and puts every active occupied target in one physical fragment.
     """
-    from .domain import DomainData, TargetOccupiedData
+    from .domain import DomainData, TargetOccupiedData, build_scf_data
     from ._pairs import screen_pairs
 
     thresholds = BoysDomainThresholds() if thresholds is None else thresholds
@@ -705,7 +705,8 @@ def build_domain_selections(
         raise ValueError(f"unknown pair_energy_model: {pair_energy_model}")
     configure_compilation_cache()
     mol = mf.mol
-    overlap, fock = map(_host_array, (mol.intor_symmetric("int1e_ovlp"), mf.get_fock()))
+    scf_data = getattr(mf, '_stc_scf_data', None)
+    overlap, fock = map(_host_array, build_scf_data(mf) if scf_data is None else scf_data)
     if numpy.iscomplexobj(overlap) or numpy.iscomplexobj(fock):
         raise NotImplementedError("Boys STC requires real overlap and Fock matrices")
     if not numpy.isfinite(overlap).all() or not numpy.isfinite(fock).all():

@@ -141,6 +141,39 @@ def test_integral_direct_local_lov_preserves_coeff_and_coordinate_vjps():
     )
 
 
+@pytest.mark.parametrize("metric_kind", ("singular", "indefinite", "nan", "inf"))
+def test_integral_direct_reverse_rejects_invalid_metric_before_streaming(
+    monkeypatch, metric_kind,
+):
+    mol, fake_mol, auxmol, coeff, orbs_slice, lov = _direct_local_problem()
+    metric = numpy.eye(auxmol.nao)
+    metric[0, 0] = {
+        "singular": 0.0,
+        "indefinite": -1.0,
+        "nan": numpy.nan,
+        "inf": numpy.inf,
+    }[metric_kind]
+    original_intor = type(auxmol).intor
+
+    def invalid_metric(self, intor, *args, **kwargs):
+        if intor.startswith("int2c2e"):
+            return np.asarray(metric)
+        return original_intor(self, intor, *args, **kwargs)
+
+    def forbidden_streaming(*args, **kwargs):
+        raise AssertionError("Invalid metric must be rejected before integral streaming")
+
+    monkeypatch.setattr(type(auxmol), "intor", invalid_metric)
+    monkeypatch.setattr(
+        lno_df_direct, "_local_direct_mo_coeff_vjp", forbidden_streaming,
+    )
+    with pytest.raises(NotImplementedError, match="auxiliary-metric eigenvalue fallback"):
+        lno_df_direct._local_direct_nr_e2_bwd(
+            mol.max_memory, orbs_slice, (fake_mol, auxmol, coeff, lov),
+            np.ones_like(lov),
+        )
+
+
 @pytest.mark.parametrize(
     ("configured_mb", "expected_mb"),
     ((None, 512.0), (7.0, 7.0), ("invalid", 512.0)),

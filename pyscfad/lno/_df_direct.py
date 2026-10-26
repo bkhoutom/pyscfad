@@ -238,17 +238,23 @@ def _local_direct_nr_e2_bwd(max_memory, orbs_slice, res, fitted_mo_bar):
             'derivatives.'
         )
 
-    j2c = numpy.asarray(
-        jax.device_get(auxmol.intor(auxmol._add_suffix('int2c2e'), hermi=1))
-    )
-    try:
-        low = scipy_linalg.cholesky(j2c, lower=True, check_finite=False)
-    except scipy_linalg.LinAlgError as err:
+    def metric_cholesky(auxmol_):
+        return jsp_linalg.cholesky(
+            auxmol_.intor(auxmol_._add_suffix('int2c2e'), hermi=1),
+            lower=True,
+        )
+
+    low, metric_pullback = jax.vjp(metric_cholesky, auxmol)
+    low = numpy.asarray(jax.device_get(low))
+    if (
+        low.shape != (auxmol.nao, auxmol.nao)
+        or not numpy.all(numpy.isfinite(low))
+        or numpy.any(numpy.diag(low) <= 0)
+    ):
         raise NotImplementedError(
             'Integral-direct local Lov VJP does not yet support the '
             'linear-dependent auxiliary-metric eigenvalue fallback.'
-        ) from err
-    del j2c
+        )
 
     fitted_mo_np = numpy.asarray(jax.device_get(fitted_mo))
     fitted_mo_bar_np = numpy.asarray(jax.device_get(fitted_mo_bar))
@@ -265,6 +271,12 @@ def _local_direct_nr_e2_bwd(max_memory, orbs_slice, res, fitted_mo_bar):
     low_bar = -numpy.dot(z, fitted_mo_np.T)
     del fitted_mo_np, fitted_mo_bar_np, fitted_mo, fitted_mo_bar, low
 
+    # Consume the metric tape before streaming the three-center integrals.
+    # Its pullback uses only the lower triangle of the factor cotangent.
+    _cderi_vjp._zero_strict_upper_inplace(low_bar)
+    aux_metric_bar = metric_pullback(np.asarray(low_bar))[0]
+    del metric_pullback, low_bar
+
     mo_coeff_bar = _local_direct_mo_coeff_vjp(
         mol, auxmol, mo_coeff, z, orbs_slice
     )
@@ -280,18 +292,6 @@ def _local_direct_nr_e2_bwd(max_memory, orbs_slice, res, fitted_mo_bar):
     )
     del z
 
-    def metric_cholesky(auxmol_):
-        return jsp_linalg.cholesky(
-            auxmol_.intor(auxmol_._add_suffix('int2c2e'), hermi=1),
-            lower=True,
-        )
-
-    _, metric_pullback = jax.vjp(metric_cholesky, auxmol)
-    # The Cholesky pullback consumes only the stored lower triangle.  Zero the
-    # unused half in place rather than allocating another naux-by-naux array.
-    _cderi_vjp._zero_strict_upper_inplace(low_bar)
-    aux_metric_bar = metric_pullback(np.asarray(low_bar))[0]
-    del metric_pullback, low_bar
     auxmol_bar = _tree_add(auxmol_bar, aux_metric_bar)
     return mol_bar, auxmol_bar, mo_coeff_bar
 

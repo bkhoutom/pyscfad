@@ -93,3 +93,65 @@ def test_nested_external_pullback_clears_parent_solve_phase(fail_external):
         assert not is_implicit_diff_external_vjp()
     assert not is_implicit_diff_solve_matvec()
     assert phases == [False]
+
+
+def test_fixed_point_aux_preserves_arguments_and_nested_phase():
+    from pyscfad._src.implicit_diff import custom_fixed_point
+    observed = []
+
+    def fixed_point(root, parameter, fixed_root):
+        density = fixed_root if is_implicit_diff_external_vjp() else root
+        return parameter + .5 * density, jnp.array(17.)
+
+    def preconditioner(aux, parameter, fixed_root):
+        assert not is_implicit_diff_external_vjp()
+        observed.append((float(aux), float(parameter), float(fixed_root)))
+        return None
+
+    @custom_fixed_point(fixed_point, solve=_scalar_solve, has_aux=True,
+                        nondiff_argnums=(2,), use_converged_args={2: 1},
+                        optfn_has_aux=True, gen_precond=preconditioner)
+    def solver(initial, parameter, fixed_root):
+        return 2 * parameter, 2 * parameter
+
+    with _implicit_diff_external_vjp():
+        derivative = jax.grad(lambda p: solver(jnp.array(0.), p, None)[0])(jnp.array(3.))
+        assert float(derivative) == 2.
+        assert is_implicit_diff_external_vjp()
+    assert observed == [(17., 3., 6.)]
+
+
+def test_traced_host_solver_fallback_does_not_build_host_preconditioner():
+    from pyscfad.scipy.sparse.linalg import gmres
+
+    def preconditioner(aux, parameter, *, solver):
+        raise AssertionError('host preconditioner constructed during traced solve')
+
+    def differentiate(seed):
+        return root_vjp(lambda root, p: (p - root, jnp.array(17.)),
+                        jnp.array(3.), (jnp.array(3.),), seed,
+                        solve=gmres, optfn_has_aux=True,
+                        gen_precond=preconditioner, gen_precond_host_only=True)[0]
+
+    assert float(jax.jit(differentiate)(jnp.array(1.))) == 1.
+
+
+def test_jax_preconditioner_is_preserved_by_traced_implicit_response():
+    """A native JAX preconditioner must also run in a limited JIT solve."""
+    from functools import partial
+    from jax.scipy.sparse.linalg import gmres
+    diagonal = jnp.array([1., 10., 100.])
+    parameter = jnp.ones(3)
+    solver = partial(gmres, restart=1, maxiter=1, tol=1e-12, atol=1e-12)
+
+    def preconditioner(aux, parameter):
+        return lambda vector: vector / aux
+
+    def differentiate(seed):
+        return root_vjp(lambda root, p: (p - diagonal * root, diagonal),
+                        parameter / diagonal, (parameter,), seed, solve=solver,
+                        optfn_has_aux=True, gen_precond=preconditioner)[0]
+
+    expected = jnp.array([1., .1, .01])
+    assert jnp.allclose(differentiate(jnp.ones(3)), expected, atol=1e-12, rtol=0)
+    assert jnp.allclose(jax.jit(differentiate)(jnp.ones(3)), expected, atol=1e-12, rtol=0)

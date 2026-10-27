@@ -120,8 +120,72 @@ def _scf_fixed_point(dm, mf, s1e, h1e, root_factors=None):
     mo_occ = mf.get_occ(mo_energy, mo_coeff)
     _stash_dfjk_mo_data(mf, mo_coeff, mo_occ, s1e)
     dm = mf.make_rdm1(mo_coeff, mo_occ)
-    del mo_energy, mo_occ
-    return dm
+    return dm, (mo_energy, mo_coeff, mo_occ)
+
+
+def _gen_precond(aux, mf, s1e, h1e, root_factors=None, *, solver=None):
+    """Invert the Coulomb part of the RHF response Jacobian on the host.
+
+    Adapted from upstream PySCFAD. In the occupied/virtual space the
+    Woodbury correction inverts e + 4 B.T B; exchange remains in GMRES.
+    Unsupported layouts, occupations and traced/JAX solves use no preconditioner.
+    The implicit wrapper supplies its captured solver; direct callers may omit
+    it to use the solver selected in their current context.
+    """
+    from scipy.sparse.linalg import LinearOperator
+    from pyscf.lib import dot
+    from pyscfad.df.df import DF
+    from pyscfad.df import addons
+    from pyscfad.df._df_jk_opt import gen_coulomb_precond
+    from pyscfad.tools import linear_solver
+
+    if solver is None:
+        solver = linear_solver.gen_gmres()
+    while isinstance(solver, partial):
+        solver = solver.func
+    host_solver = solver in (linear_solver.pyscfad_gmres, linear_solver.gmres_safe)
+    if (not config.scf_df_precond or not host_solver
+            or not isinstance(mf, pyscf_hf.RHF)
+            or isinstance(mf, pyscf_hf.KohnShamDFT)
+            or not isinstance(getattr(mf, 'with_df', None), DF)
+            or _has_tracer(aux, mf, s1e, h1e, root_factors)):
+        return None
+    mo_energy, mo_coeff, mo_occ = map(numpy.asarray, aux)
+    s1e = numpy.asarray(s1e)
+    if (mo_coeff.ndim != 2 or mo_occ.ndim != 1 or mo_energy.ndim != 1
+            or any(numpy.iscomplexobj(x) for x in (mo_energy, mo_coeff, mo_occ, s1e))
+            or not numpy.all((mo_occ == 0) | (mo_occ == 2))):
+        return None
+    orbo = mo_coeff[:, mo_occ > 0]
+    orbv = mo_coeff[:, mo_occ == 0]
+    e_ai = mo_energy[mo_occ == 0, None] - mo_energy[mo_occ > 0]
+    if e_ai.size == 0 or not numpy.isfinite(e_ai).all() or e_ai.min() <= 0:
+        return None
+    nao = mo_coeff.shape[0]
+    # Inspect source metadata only: disk factors must keep streaming through
+    # DF.loop, and full AO-pair factors are not accepted by packed AO2MO.
+    source = mf.with_df._get_cderi_source()
+    if source is None:
+        return None
+    with addons.load(source, 'j3c') as factors:
+        if (getattr(factors, 'ndim', None) != 2
+                or factors.shape[0] == 0
+                or factors.shape[1] != nao * (nao + 1) // 2
+                or numpy.dtype(factors.dtype).kind != 'f'):
+            return None
+
+    log = logger.new_logger(mf)
+    coul = gen_coulomb_precond(mf.with_df, orbo, orbv, e_ai)
+    sorbo = dot(s1e, orbo)
+    sorbv = dot(s1e, orbv)
+
+    def precond(u):
+        u = u.reshape(nao, nao)
+        response = dot(orbv.T, dot(u + u.T, orbo))
+        return (dot(dot(sorbv, coul(response)), sorbo.T) - u).ravel()
+
+    log.timer('_gen_precond')
+    return LinearOperator((nao * nao,) * 2, matvec=precond, dtype=numpy.double)
 
 
 def _scf_with_factors(dm, mf, s1e, h1e, root_factors=None, **kwargs):
@@ -569,6 +633,9 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         optimality_cond=_scf_fixed_point,
         solver=gen_gmres(),
         has_aux=True,
+        optimality_fun_has_aux=True,
+        gen_precond=_gen_precond,
+        gen_precond_host_only=True,
         nondiff_argnums=(4,),
         use_converged_args={4: 6},
     )

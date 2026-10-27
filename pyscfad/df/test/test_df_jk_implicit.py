@@ -196,7 +196,7 @@ def test_implicit_scf_lowrank_df_k_matches_dense(
         h1e = mf.get_hcore(s1e=s1e)
 
         def optimality(dm_):
-            return hf._scf_fixed_point(dm_, mf, s1e, h1e) - dm_
+            return hf._scf_fixed_point(dm_, mf, s1e, h1e)[0] - dm_
 
         _, pullback = jax.vjp(optimality, dm)
 

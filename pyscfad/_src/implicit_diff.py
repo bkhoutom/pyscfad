@@ -85,7 +85,7 @@ def root_vjp(optimality_fun, sol, args, cotangent,
              solve=gmres, nondiff_argnums=(),
              optfn_has_aux=False, solver_kwargs=None,
              gen_precond=None,
-             custom_vjp_from_optcond=False):
+             custom_vjp_from_optcond=False, gen_precond_host_only=False):
     if solver_kwargs is None:
         solver_kwargs = {}
 
@@ -104,7 +104,16 @@ def root_vjp(optimality_fun, sol, args, cotangent,
             else:
                 _, vjp_fun_sol, optfn_aux = jax.vjp(fun_sol, sol, has_aux=True)
             if gen_precond is not None:
-                M = gen_precond(optfn_aux)
+                if gen_precond_host_only:
+                    # A captured host solver may fall back to JAX under tracing.
+                    # Only host callbacks are suppressed; native JAX callbacks
+                    # must retain their behavior in traced iterative solves.
+                    traced = any(isinstance(x, jax.core.Tracer) for x in
+                                 jax.tree_util.tree_leaves((sol, args, cotangent)))
+                    if not traced:
+                        M = gen_precond(optfn_aux, *args, solver=solve)
+                else:
+                    M = gen_precond(optfn_aux, *args)
         else:
             _, vjp_fun_sol = jax.vjp(fun_sol, sol)
 
@@ -135,7 +144,7 @@ def _custom_root(solver_fun, optimality_fun, solve,
                  has_aux=False, nondiff_argnums=(), use_converged_args=None,
                  optfn_has_aux=False, solver_kwargs=None,
                  gen_precond=None,
-                 custom_vjp_from_optcond=False):
+                 custom_vjp_from_optcond=False, gen_precond_host_only=False):
     solver_fun_sig = inspect.signature(solver_fun)
     optimality_fun_sig = inspect.signature(optimality_fun)
 
@@ -174,7 +183,8 @@ def _custom_root(solver_fun, optimality_fun, solve,
                             optfn_has_aux=optfn_has_aux,
                             solver_kwargs=solver_kwargs,
                             gen_precond=gen_precond,
-                            custom_vjp_from_optcond=custom_vjp_from_optcond)
+                            custom_vjp_from_optcond=custom_vjp_from_optcond,
+                            gen_precond_host_only=gen_precond_host_only)
             vjps = (None,) + vjps
             return vjps
 
@@ -192,7 +202,7 @@ def custom_root(optimality_fun, solve=None, has_aux=False,
                 nondiff_argnums=(), use_converged_args=None,
                 optfn_has_aux=False, solver_kwargs=None,
                 gen_precond=None,
-                custom_vjp_from_optcond=False):
+                custom_vjp_from_optcond=False, gen_precond_host_only=False):
     if solve is None:
         solve = gmres
 
@@ -203,7 +213,8 @@ def custom_root(optimality_fun, solve=None, has_aux=False,
                             optfn_has_aux=optfn_has_aux,
                             solver_kwargs=solver_kwargs,
                             gen_precond=gen_precond,
-                            custom_vjp_from_optcond=custom_vjp_from_optcond)
+                            custom_vjp_from_optcond=custom_vjp_from_optcond,
+                            gen_precond_host_only=gen_precond_host_only)
 
     return wrapper
 
@@ -211,10 +222,14 @@ def custom_fixed_point(fixed_point_fun, solve=None, has_aux=False,
                        nondiff_argnums=(), use_converged_args=None,
                        optfn_has_aux=False, solver_kwargs=None,
                        gen_precond=None,
-                       custom_vjp_from_optcond=False):
+                       custom_vjp_from_optcond=False, gen_precond_host_only=False):
 
     def optimality_fun(x0, *args):
-        return _Sub(fixed_point_fun(x0, *args), x0)
+        result = fixed_point_fun(x0, *args)
+        if optfn_has_aux:
+            value, aux = result
+            return _Sub(value, x0), aux
+        return _Sub(result, x0)
 
     optimality_fun.__wrapped__ = fixed_point_fun
 
@@ -224,14 +239,15 @@ def custom_fixed_point(fixed_point_fun, solve=None, has_aux=False,
                        optfn_has_aux=optfn_has_aux,
                        solver_kwargs=solver_kwargs,
                        gen_precond=gen_precond,
-                       custom_vjp_from_optcond=custom_vjp_from_optcond)
+                       custom_vjp_from_optcond=custom_vjp_from_optcond,
+                       gen_precond_host_only=gen_precond_host_only)
 
 def make_implicit_diff(fn, implicit_diff=False, fixed_point=True,
                        optimality_cond=None, solver=None, has_aux=False,
                        nondiff_argnums=(), use_converged_args=None,
                        optimality_fun_has_aux=False,
                        solver_kwargs=None, gen_precond=None,
-                       custom_vjp_from_optcond=False):
+                       custom_vjp_from_optcond=False, gen_precond_host_only=False):
     """Wrap a function for implicit differentiation.
 
     Parameters
@@ -269,9 +285,14 @@ def make_implicit_diff(fn, implicit_diff=False, fixed_point=True,
     gen_precond : object, optional
         A function which generates the preconditioner
         for the linear solver. `gen_precond` should
-        take the auxiliary data returned by the optimality function as
-        its argument, and return the preconditioner recognized by the
-        linear solver, which is usually a function or an array.
+        take the auxiliary data returned by the optimality function followed
+        by its arguments other than the solution, and return the preconditioner
+        recognized by the linear solver, usually a function or an array.
+
+    gen_precond_host_only : bool, optional
+        If True, skip the callback for traced solves and pass the actual captured
+        linear solver as its keyword argument ``solver``. Default is False, so
+        JAX-native preconditioner callbacks remain available under tracing.
 
     Returns
     -------
@@ -295,6 +316,7 @@ def make_implicit_diff(fn, implicit_diff=False, fixed_point=True,
                       optfn_has_aux=optimality_fun_has_aux,
                       solver_kwargs=solver_kwargs,
                       gen_precond=gen_precond,
-                      custom_vjp_from_optcond=custom_vjp_from_optcond)(fn)
+                      custom_vjp_from_optcond=custom_vjp_from_optcond,
+                      gen_precond_host_only=gen_precond_host_only)(fn)
     else:
         return fn

@@ -19,8 +19,10 @@ def run(mode, output):
     import jax
     import numpy as np
     from mpi4py import MPI
-    from pyscfad import dlno_stc
+    from pyscfad import config_update, dlno_stc
     from pyscfad.df import mpi_df_jk, df
+    from pyscfad.scf import hf
+    from scipy.sparse.linalg import LinearOperator
     from pyscfad.dlno_stc import driver
     from pyscfad.dlno_stc.test import _boys_acceptance as accept
 
@@ -29,6 +31,7 @@ def run(mode, output):
     expect_service = mode not in ('disabled', 'serial', 'system') and comm.size > 1
     shared_phases = dict(common_forward=0, common_reverse=0, scf_reverse=0)
     counts = dict(forward=0, density_vjp=0, coordinate_vjp=0)
+    preconditioner_counts = dict(setup=0, apply=0)
     norms = dict(forward=0., density_vjp=0., coordinate_vjp=0.)
     phase_counts = {name: dict.fromkeys(counts, 0) for name in ('initialize', 'response')}
     phase = 'initialize'
@@ -46,6 +49,17 @@ def run(mode, output):
     close_response = driver._finish
     prepare_group = driver._prepare
     rebuild_common = driver.rebuild_domain_data
+    gen_precond = hf._gen_precond
+
+    def counted_precond(*args, **kwargs):
+        precond = gen_precond(*args, **kwargs)
+        if precond is None:
+            return None
+        preconditioner_counts['setup'] += 1
+        def apply(vector):
+            preconditioner_counts['apply'] += 1
+            return precond @ vector
+        return LinearOperator(precond.shape, matvec=apply, dtype=precond.dtype)
 
     def counted_forward(self, dfobj, payload):
         result = forward(self, dfobj, payload)
@@ -139,6 +153,10 @@ def run(mode, output):
                         'group-failure': 'paused group failure'}.get(mode)
     failed = False
     with ExitStack() as stack:
+        # Packed factors make this acceptance exercise the host response
+        # preconditioner in both the serial reference and root-owned MPI solve.
+        stack.enter_context(config_update('pyscfad_moleintor_opt', True))
+        stack.enter_context(patch.object(hf, '_gen_precond', counted_precond))
         stack.enter_context(patch.object(cls, '_execute_forward', counted_forward))
         stack.enter_context(patch.object(cls, '_execute_density_vjp', counted_density))
         stack.enter_context(patch.object(cls, '_execute_coordinate_vjp_block', counted_coordinate))
@@ -161,6 +179,7 @@ def run(mode, output):
     assert set(mpi_df_jk._EXECUTORS) == before_tokens, 'executor registry token leaked'
     assert mpi_df_jk.get_active_executor() is before_executor, 'active executor leaked'
     observations = comm.allgather(dict(counts=counts, norms=norms, failed=failed,
+        preconditioner=preconditioner_counts,
         phases=phase_counts, shared_phases=shared_phases, source_builds=source_builds,
         builder_calls=builder_calls, serves=serves))
     if expected_failure:
@@ -168,6 +187,8 @@ def run(mode, output):
         values = {'failure': expected_failure, 'observations': observations}
     else:
         enabled = expect_service
+        assert all(value > 0 for value in observations[0]['preconditioner'].values()), observations
+        assert all(not any(row['preconditioner'].values()) for row in observations[1:]), observations
         if mode != 'system':
             assert observations[0]['shared_phases'] == dict(
                 common_forward=1, common_reverse=1, scf_reverse=1), observations

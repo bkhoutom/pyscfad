@@ -466,14 +466,17 @@ def _finish(state, static, records, *, with_grad, include_hf, return_components)
     return result
 
 
-def _run(initializer, worker_initializer, comm, *, checkpoint_dir, resume, **options):
+def _run(initializer, worker_initializer, comm, *, checkpoint_dir, resume,
+         parallel_scf_jk=True, scf_worker_initializer=None, **options):
     if comm is not None and comm.Get_size() > 1:
         from ._mpi_ccsd import _run_mpi
         def check_options():
             if checkpoint_dir is not None or resume:
                 raise NotImplementedError('CC progress checkpoints currently require serial execution')
         driver._root_call(comm, comm.Get_rank(), check_options, 'CC checkpoint option validation')
-        return _run_mpi(initializer, worker_initializer, comm, **options)
+        return _run_mpi(initializer, worker_initializer, comm,
+                        parallel_scf_jk=parallel_scf_jk,
+                        scf_worker_initializer=scf_worker_initializer, **options)
     state, static, baseline, matrix = initializer()
     options['fragment_indices'] = state.pop('cc_fragment_indices')
     options['triples_controls'] = state.pop('cc_triples_controls')
@@ -486,7 +489,7 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
            ccsd_t=False, triples_controls=None, verbose_imp=0, include_hf=False,
            return_components=False,
            merge_identical=True, comm=None, fragment_indices=None, include_baseline=True,
-           checkpoint_dir=None, resume=False):
+           checkpoint_dir=None, resume=False, parallel_scf_jk=True):
     """Return correlation energy, or total energy with ``include_hf=True``.
 
     ``return_components=True`` returns ``(energy, CCSDComponents)``. The MP2
@@ -498,6 +501,10 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
     ``fragment_indices`` restricts corrections (default: all saved LIS ranks).
     The complete baseline remains included unless ``include_baseline=False``;
     that option returns only selected CC-minus-MP2-LIS corrections and forbids HF.
+    Multi-rank calls distribute common-preparation DF J/K work by default.
+    Each rank must supply a matching MF skeleton; preceding SCF is caller-owned.
+    ``parallel_scf_jk=False`` retains root-only shared work. Serial and
+    single-rank calls keep their existing behavior.
     """
     def initialize():
         triples = normalize_triples_controls(triples_controls, ccsd_t=ccsd_t)
@@ -525,7 +532,8 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
                 merge_identical=merge_identical, verbose_imp=verbose_imp,
                 ccsd_t=ccsd_t, return_components=return_components,
                 fragment_indices=fragment_indices, include_baseline=include_baseline,
-                checkpoint_dir=checkpoint_dir, resume=resume)
+                checkpoint_dir=checkpoint_dir, resume=resume,
+                parallel_scf_jk=parallel_scf_jk, scf_worker_initializer=lambda: mf)
 
 
 @memory_calculation
@@ -533,7 +541,8 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
                    matrix_kind=None, ccsd_t=False, triples_controls=None,
                    verbose_imp=0, include_hf=False,
                    return_components=False, merge_identical=True, comm=None, build_static=None,
-                   fragment_indices=None, include_baseline=True, checkpoint_dir=None, resume=False):
+                   fragment_indices=None, include_baseline=True, checkpoint_dir=None, resume=False,
+                   parallel_scf_jk=True):
     """Return ``(energy, mol_bar)``; ``mol_bar.coords`` is a nuclear gradient.
 
     Include HF once with ``include_hf=True``. Append ``CCSDComponents`` with
@@ -543,6 +552,13 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
     correction-only subset closes common-data and implicit SCF response once.
     ``triples_controls`` has the same independent sampling semantics as in
     :func:`kernel`; the reported triples SE estimates energy uncertainty only.
+    Multi-rank calls distribute DF J/K work in SCF, common preparation and
+    their coordinate pullbacks by default. Worker ``build_mf`` must accept
+    ``mo_coeff_init``, ``mo_energy_init``, ``mo_occ_init`` and ``e_tot_init``,
+    adopt these values and skip SCF. An attached out-of-core CDERI source
+    must be available on every rank. ``parallel_scf_jk=False`` retains
+    root-only SCF and shared response. Serial and single-rank calls keep
+    their existing behavior.
     """
     def initialize():
         triples = normalize_triples_controls(triples_controls, ccsd_t=ccsd_t)
@@ -575,8 +591,19 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
         driver._coordinate_only(mol)
         return build_mf(mol, **{name + '_init': value for name, value in canonical.items()})
 
+    def initialize_scf_worker():
+        nao = mol.nao
+        occupation = numpy.zeros(nao)
+        occupation[:mol.nelectron // 2] = 2.0
+        return initialize_worker({
+            'mo_coeff': numpy.eye(nao), 'mo_energy': numpy.zeros(nao),
+            'mo_occ': occupation, 'e_tot': numpy.asarray(0.0),
+        })
+
     return _run(initialize, initialize_worker, comm, with_grad=True, include_hf=include_hf,
                 merge_identical=merge_identical, verbose_imp=verbose_imp,
                 ccsd_t=ccsd_t, return_components=return_components,
                 fragment_indices=fragment_indices, include_baseline=include_baseline,
-                checkpoint_dir=checkpoint_dir, resume=resume)
+                checkpoint_dir=checkpoint_dir, resume=resume,
+                parallel_scf_jk=parallel_scf_jk,
+                scf_worker_initializer=initialize_scf_worker)

@@ -37,18 +37,45 @@ def _build_cc_worker(worker_initializer, canonical, signature):
 def _run_mpi(initializer, worker_initializer, comm, *, with_grad,
              include_hf=False, merge_identical=True, verbose_imp=0,
              ccsd_t=False, return_components=False, include_baseline=True,
-             fragment_indices=None):
-    """Run round-robin group ownership with one root common/SCF response.
+             fragment_indices=None, parallel_scf_jk=True, scf_worker_initializer=None):
+    """Run CC owner jobs between optional distributed SCF/reference sessions."""
+    _collective_call(comm, _check_mpi_thread_support, 'CC MPI thread preflight')
+    rank = comm.Get_rank()
 
-    ``initializer`` runs only on root and returns state, selections, baseline
-    controls and matrix controls. Workers install its signed canonical state
-    without SCF. This initial CC path uses root-only shared SCF/J/K work.
-    """
+    def select_service():
+        if not isinstance(parallel_scf_jk, bool):
+            raise TypeError('parallel_scf_jk must be a bool')
+        return parallel_scf_jk
+
+    enabled = driver._root_call(comm, rank, select_service, 'CC SCF service option')
+    enabled = comm.bcast(enabled, root=0)
+    service = None
+    try:
+        if enabled:
+            from ._mpi_scf import DomainSCFService
+            service = DomainSCFService(comm, scf_worker_initializer)
+        return _run_jobs(initializer, worker_initializer, comm,
+                         with_grad=with_grad, include_hf=include_hf,
+                         merge_identical=merge_identical, verbose_imp=verbose_imp,
+                         ccsd_t=ccsd_t, return_components=return_components,
+                         include_baseline=include_baseline,
+                         fragment_indices=fragment_indices, scf_service=service)
+    finally:
+        # Collective failures after PAUSE leave all ranks outside serve().
+        # Release executor tokens retained by root's shared pullback closures.
+        if service is not None:
+            service.close_local()
+
+
+def _run_jobs(initializer, worker_initializer, comm, *, with_grad,
+              include_hf, merge_identical, verbose_imp, ccsd_t,
+              return_components, include_baseline, fragment_indices, scf_service):
+    """Keep round-robin CC ownership paused between the two shared phases."""
     from . import ccsd
 
     rank, size = comm.Get_rank(), comm.Get_size()
-    _collective_call(comm, _check_mpi_thread_support, 'CC MPI thread preflight')
-    initialized = driver._root_call(comm, rank, initializer, 'CC initial preparation')
+    initialized = (driver._root_call(comm, rank, initializer, 'CC initial preparation')
+                   if scf_service is None else scf_service.run_initial(initializer))
     state = initialized[0] if rank == 0 else None
 
     def root_metadata():
@@ -131,4 +158,5 @@ def _run_mpi(initializer, worker_initializer, comm, *, with_grad,
                             include_hf=options['include_hf'],
                             return_components=options['return_components'])
 
-    return driver._root_call(comm, rank, finish, 'CC final shared response')
+    return (driver._root_call(comm, rank, finish, 'CC final shared response')
+            if scf_service is None else scf_service.run_final(finish))

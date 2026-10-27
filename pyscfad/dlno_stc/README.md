@@ -609,11 +609,20 @@ and forbids `include_hf=True`. This is the representative-fragment C20 API;
 such a result is not a complete molecular CC energy or force.
 
 For MPI, pass `comm`; complete groups run on round-robin owners and root closes
-common/SCF response once. Worker `build_mf` must accept `mo_coeff_init`,
-`mo_energy_init`, `mo_occ_init`, and `e_tot_init`, adopt those arrays without
-SCF, and return a matching density-fitted skeleton. Only root needs controls
-and selections; only root returns a result. Shared SCF/J/K work runs on root
-in this initial CC path. Native replay and pullback closures remain local.
+common/SCF response once. With multiple ranks, `parallel_scf_jk=True` (the
+default) also distributes supported DF J/K and three-center coordinate-response
+contractions during initialization and final response. Set
+`parallel_scf_jk=False` to keep that shared work on root while distributing
+CC groups. Whitening and two-center metric response remain on root.
+Worker `build_mf` must accept `mo_coeff_init`, `mo_energy_init`, `mo_occ_init`,
+and `e_tot_init`, adopt those arrays without SCF, and return a matching
+density-fitted skeleton. The enabled service builds an initial worker skeleton
+before root runs SCF, then installs root's converged state for correlation.
+For energy-only `kernel(mf, ...)`, supply a matching worker MF skeleton;
+SCF performed before calling `kernel` remains the caller's responsibility.
+Only root needs controls and selections; only root returns a result. Native
+replay and pullback closures remain local. Serial execution is unchanged, and
+`pyscfad_scf_df_precond` remains disabled by default.
 
 Optional serial `checkpoint_dir` and `resume=True` reuse the existing safe STC
 checkpoint machinery. Fixed selections and completed scalar/host-cotangent

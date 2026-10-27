@@ -1,4 +1,5 @@
 # Copyright 2021-2025 Xing Zhang
+# Portions copyright 2021-2026 The PySCFAD Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -180,14 +181,14 @@ class DF(pyscf_df.DF):
             blksize = self.blockdim
 
         with addons.load(self._get_cderi_source(), 'j3c') as feri:
-            if is_array(feri):
+            if is_array(feri) or isinstance(feri, numpy.ndarray):
+                # Convert resident device arrays once, before block slicing
+                # (adapted from upstream PySCFAD's DF.loop).
+                if to_numpy:
+                    feri = numpy.asarray(feri, order='C')
                 naoaux = feri.shape[0]
                 for b0, b1 in self.prange(0, naoaux, blksize):
-                    if to_numpy:
-                        out = numpy.asarray(feri[b0:b1], order='C')
-                    else:
-                        out = feri[b0:b1]
-                    yield out
+                    yield feri[b0:b1]
             elif hasattr(feri, 'shape'):
                 naoaux = feri.shape[0]
                 for b0, b1 in self.prange(0, naoaux, blksize):

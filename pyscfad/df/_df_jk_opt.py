@@ -1,4 +1,5 @@
 # Copyright 2021-2025 Xing Zhang
+# Portions copyright 2021-2026 The PySCFAD Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,6 +21,7 @@ import os
 import time
 import h5py
 import numpy
+from scipy.linalg.lapack import dpstrf
 import jax
 import jax.numpy as jnp
 from jax import custom_vjp
@@ -176,6 +178,90 @@ def _tag_dm_for_fast_exchange(dfobj, dm):
     ):
         return dm
     return lib.tag_array(dm, mo_coeff=mo_coeff, mo_occ=mo_occ)
+
+
+def _density_factors(dm, hermi=1):
+    """Return validated real factors ``D[k] = X[k] @ X[k].T``, or None.
+
+    The tuple follows flattened leading density dimensions. Each factor is
+    float64 and Fortran contiguous, with occupations absorbed as sqrt weights.
+    Valid orbital tags take priority; otherwise use upstream PySCFAD's pivoted
+    Cholesky factorization (db0acafb, The PySCFAD Authors, Apache-2.0).
+    Unsupported densities and any failed reconstruction retain the dense path.
+    """
+    dms = numpy.asarray(dm)
+    if (hermi != 1 or dms.ndim < 2 or dms.shape[-2] != dms.shape[-1]
+            or dms.dtype.kind != 'f' or not numpy.all(numpy.isfinite(dms))):
+        return None
+    nao = dms.shape[-1]
+    if nao == 0:
+        return None
+    dms = numpy.asarray(dms, dtype=numpy.float64).reshape(-1, nao, nao)
+    if len(dms) == 0:
+        return None
+    # Scale with the density, including near-zero densities; a fixed absolute
+    # tolerance could accept stale tags or indefinite matrices at small scale.
+    scales = numpy.max(numpy.abs(dms), axis=(1, 2))
+    tolerances = 10 * nao * numpy.finfo(numpy.float64).eps * scales
+    if numpy.any(numpy.max(numpy.abs(dms - dms.transpose(0, 2, 1)),
+                           axis=(1, 2)) > tolerances):
+        return None
+
+    def valid(xs):
+        return all(numpy.max(numpy.abs(d - x @ x.T)) <= tol
+                   for d, x, tol in zip(dms, xs, tolerances))
+
+    coeff = getattr(dm, 'mo_coeff', None)
+    occ = getattr(dm, 'mo_occ', None)
+    if coeff is not None and occ is not None:
+        try:
+            coeff, occ = numpy.asarray(coeff), numpy.asarray(occ)
+        except (TypeError, ValueError):
+            # Malformed optional tags must not invalidate the actual density.
+            coeff = occ = None
+    if coeff is not None and occ is not None:
+        if (coeff.ndim >= 2 and coeff.shape[-2] == nao
+                and coeff.dtype.kind == 'f' and occ.dtype.kind in 'fi'
+                and numpy.all(numpy.isfinite(coeff))
+                and numpy.all(numpy.isfinite(occ)) and numpy.all(occ >= 0)
+                and coeff.shape[-1] > 0
+                and coeff.size == len(dms) * nao * coeff.shape[-1]
+                and occ.size == len(dms) * coeff.shape[-1]):
+            coeff = coeff.reshape(len(dms), nao, -1)
+            occ = occ.reshape(len(dms), -1)
+            xs = tuple(numpy.asarray(c[:, o > 0] * numpy.sqrt(o[o > 0]),
+                                     dtype=numpy.float64, order='F')
+                       for c, o in zip(coeff, occ))
+            if valid(xs):
+                return xs
+
+    xs = []
+    for d in dms:
+        c, piv, rank, info = dpstrf(d, lower=1)
+        if info < 0:
+            return None
+        x = numpy.zeros((nao, rank), order='F')
+        x[piv - 1] = numpy.tril(c[:, :rank])
+        xs.append(x)
+    return tuple(xs) if valid(xs) else None
+
+
+def _tag_dm(dm, hermi=1):
+    """Give PySCF validated factors, stripping stale tags on dense fallback."""
+    xs = _density_factors(dm, hermi)
+    dms = numpy.asarray(dm)
+    if xs is None:
+        return dms
+    nao = dms.shape[-1]
+    # PySCF reshapes tags with an inferred dimension, which needs at least
+    # one (unoccupied) column even for an identically zero density.
+    rank = max(1, max(x.shape[1] for x in xs))
+    coeff = numpy.zeros((len(xs), nao, rank))
+    occ = numpy.zeros((len(xs), rank))
+    for k, x in enumerate(xs):
+        coeff[k, :, :x.shape[1]] = x
+        occ[k, :x.shape[1]] = 1
+    return lib.tag_array(dms, mo_coeff=coeff, mo_occ=occ)
 
 
 def _implicit_lowrank_df_k_enabled():
@@ -447,7 +533,9 @@ def _has_tracer(*xs):
 
 @partial(custom_vjp, nondiff_argnums=(2,3,4,5))
 def get_jk(dfobj, dm, hermi=1, with_j=True, with_k=True, direct_scf_tol=1e-13):
-    dm_forward = _tag_dm_for_fast_exchange(dfobj, dm)
+    dm_forward = dm
+    if with_k:
+        dm_forward = _tag_dm(_tag_dm_for_fast_exchange(dfobj, dm), hermi)
     return pyscf_df_jk.get_jk(dfobj, dm_forward, hermi=hermi,
                               with_j=with_j, with_k=with_k,
                               direct_scf_tol=direct_scf_tol)

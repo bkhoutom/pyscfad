@@ -53,6 +53,7 @@ def test_coulomb_preconditioner_matches_independent_orbital_hessian():
 def test_packed_preconditioner_supports_both_host_solver_selections(eager):
     mf, overlap, aux = _packed_reference()
     with (config_update('pyscfad_moleintor_opt', not eager),
+          config_update('pyscfad_scf_df_precond', True),
           eager_gmres() if eager else nullcontext()):
         precond = hf._gen_precond(aux, mf, overlap, None)
         assert isinstance(precond, LinearOperator)
@@ -74,7 +75,8 @@ def test_scf_preconditioner_uses_captured_solver_across_contexts(captured_host):
         setups.append(result is not None)
         return result
 
-    with config_update('pyscfad_moleintor_opt', False):
+    with (config_update('pyscfad_moleintor_opt', False),
+          config_update('pyscfad_scf_df_precond', True)):
         with eager_gmres() if captured_host else nullcontext():
             solver = gen_gmres(tol=1e-12)
             wrapped = make_implicit_diff(
@@ -93,7 +95,8 @@ def test_scf_preconditioner_uses_captured_solver_across_contexts(captured_host):
 def test_packed_disk_preconditioner_matches_resident_factors(tmp_path):
     import h5py
     mf, overlap, aux = _packed_reference()
-    with config_update('pyscfad_moleintor_opt', True):
+    with (config_update('pyscfad_moleintor_opt', True),
+          config_update('pyscfad_scf_df_precond', True)):
         resident = hf._gen_precond(aux, mf, overlap, None)
         path = tmp_path / 'packed.h5'
         with h5py.File(path, 'w') as output:
@@ -112,7 +115,8 @@ def test_preconditioner_rejects_traced_inputs(traced):
         key = dict(aux='aux', overlap='s1e', hcore='h1e', root_factors='root_factors')[traced]
         arguments[key] = (value, aux[1], aux[2]) if traced == 'aux' else value
         return hf._gen_precond(**arguments) is None
-    with config_update('pyscfad_moleintor_opt', True):
+    with (config_update('pyscfad_moleintor_opt', True),
+          config_update('pyscfad_scf_df_precond', True)):
         assert bool(jax.jit(dispatch)(jax.numpy.asarray(aux[0])))
 
 
@@ -178,6 +182,7 @@ def test_nonstationary_scf_response_preconditioned_gradient_agrees(monkeypatch):
         return mf.e_tot + jax.numpy.vdot(projections, projections).real
 
     with (config_update('pyscfad_moleintor_opt', True),
+          config_update('pyscfad_scf_df_precond', True),
           config_update('pyscfad_scf_implicit_diff', True)):
         with config_update('pyscfad_scf_df_precond', False):
             value_off, grad_off = jax.value_and_grad(objective)(mol)

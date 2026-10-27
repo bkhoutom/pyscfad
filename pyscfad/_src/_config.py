@@ -40,7 +40,7 @@ class _Config:
 config = _Config()
 
 config.set_default('pyscfad_scf_implicit_diff', False)
-config.set_default('pyscfad_scf_df_precond', True)
+config.set_default('pyscfad_scf_df_precond', False)
 config.set_default('pyscfad_scf_first_order_custom', False)
 config.set_default('pyscfad_ccsd_implicit_diff', False)
 config.set_default('pyscfad_dfccsd_custom_response', True)

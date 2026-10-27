@@ -156,6 +156,7 @@ def run(mode, output):
         # Packed factors make this acceptance exercise the host response
         # preconditioner in both the serial reference and root-owned MPI solve.
         stack.enter_context(config_update('pyscfad_moleintor_opt', True))
+        stack.enter_context(config_update('pyscfad_scf_df_precond', True))
         stack.enter_context(patch.object(hf, '_gen_precond', counted_precond))
         stack.enter_context(patch.object(cls, '_execute_forward', counted_forward))
         stack.enter_context(patch.object(cls, '_execute_density_vjp', counted_density))

@@ -105,18 +105,22 @@ def _service_get_jk(token, dfobj, dm, hermi=1, with_j=True, with_k=True,
 
 def _service_get_jk_fwd(token, dfobj, dm, hermi, with_j, with_k, direct_scf_tol):
     from pyscfad.df.mpi_df_jk import _executor_from_token
+    from pyscfad.df import _df_jk_opt
+    dfobj, dm, activity = _df_jk_opt._unwrap_jk_primals(dfobj, dm)
+    # A service view closes over physical factors while keeping geometry live.
+    activity = (activity[0], False, activity[2], activity[3])
     executor = _executor_from_token(token)
     view = executor.source_view(dfobj)
     result = executor._forward(view, dm, hermi=hermi, with_j=with_j,
                                with_k=with_k, direct_scf_tol=direct_scf_tol)
-    return result, (dfobj, view, dm)
+    return result, (dfobj, view, dm, activity)
 
 
 def _service_get_jk_bwd(token, hermi, with_j, with_k, direct_scf_tol, residual, bars):
     from pyscfad.df.mpi_df_jk import _mpi_get_jk_bwd
-    original, view, dm = residual
+    original, view, dm, activity = residual
     view_bar, dm_bar = _mpi_get_jk_bwd(
-        token, hermi, with_j, with_k, direct_scf_tol, (view, dm), bars)
+        token, hermi, with_j, with_k, direct_scf_tol, (view, dm, activity), bars)
     if view_bar is None:
         return None, dm_bar
     # The native placeholder pullback returns explicit molecular/auxiliary
@@ -131,7 +135,7 @@ def _service_get_jk_bwd(token, hermi, with_j, with_k, direct_scf_tol, residual, 
     return original_bar, dm_bar
 
 
-_service_get_jk.defvjp(_service_get_jk_fwd, _service_get_jk_bwd)
+_service_get_jk.defvjp(_service_get_jk_fwd, _service_get_jk_bwd, symbolic_zeros=True)
 
 
 def _verify_sources(comm, dfobj):

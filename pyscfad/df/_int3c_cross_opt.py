@@ -1,4 +1,5 @@
 # Copyright 2021-2025 Xing Zhang
+# Portions copyright 2021-2026 The PySCFAD Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,7 +18,6 @@ import ctypes
 import numpy
 from jax import custom_vjp
 from jax.tree_util import tree_flatten, tree_unflatten
-from pyscf import lib as pyscf_lib
 from pyscf.lib import logger
 from pyscf.gto.moleintor import (
     ascint3,
@@ -73,6 +73,9 @@ def int3c_cross_bwd(intor, comp, aosym, shls_slice, out,
     assert intor.startswith('int3c2e') and not 'spinor' in intor
     assert aosym == 's2ij'
     assert comp == 1
+    if shls_slice is None:
+        shls_slice = (0, mol.nbas, 0, mol.nbas, mol.nbas,
+                      mol.nbas + auxmol.nbas)
     assert shls_slice[5] - shls_slice[4] == auxmol.nbas
 
     natm = mol.natm
@@ -97,24 +100,26 @@ def int3c_cross_bwd(intor, comp, aosym, shls_slice, out,
     drv = libcgto.GTOnr3c_ij_r0_vjp
     fill = getattr(libcgto, 'GTOnr3c_ij_r0_vjp_'+aosym)
 
-    cintopt = make_cintopt(atm, bas, env, intor1)
-    drv(getattr(libcgto, intor1), fill,
-        vjp.ctypes.data_as(ctypes.c_void_p),
-        ybar.ctypes.data_as(ctypes.c_void_p),
-        ctypes.c_int(comp), (ctypes.c_int*6)(*shls_slice),
-        ao_loc.ctypes.data_as(ctypes.c_void_p), cintopt,
-        c_atm, ctypes.c_int(len(atm)), ctypes.c_int(natm),
-        c_bas, ctypes.c_int(len(bas)), c_env)
-
-    intor2 = 'int3c2e_ip2'
-    ints1 = int3c_cross(mol, auxmol, intor=intor2, comp=3, aosym='s2ij',
-                        shls_slice=shls_slice)
-
-    vjp_aux = numpy.zeros_like(vjp)
-    aoslices = auxmol.aoslice_by_atom()
-    for ia in range(auxmol.natm):
-        p0, p1 = aoslices[ia,2:]
-        vjp_aux[ia] += pyscf_lib.einsum('xil,il->x', ints1[:,:,p0:p1], ybar[:,p0:p1])
+    # Adapted from upstream PySCFAD db0acafb (Apache-2.0): translation
+    # invariance gives the auxiliary derivative from the two AO derivatives.
+    # Keep the public (pair, aux) layout and pass contiguous auxiliary slices
+    # to the existing driver; it handles each slice's AO-pair row offset.
+    vjp_aux = numpy.zeros((auxmol.natm, comp))
+    for ia, (b0, b1, p0, p1) in enumerate(auxmol.aoslice_by_atom()):
+        if b0 == b1:
+            continue
+        vjp_ia = numpy.zeros_like(vjp)
+        ybar_ia = numpy.asarray(ybar[:, p0:p1], order='F')
+        drv(getattr(libcgto, intor1), fill,
+            vjp_ia.ctypes.data_as(ctypes.c_void_p),
+            ybar_ia.ctypes.data_as(ctypes.c_void_p),
+            ctypes.c_int(comp),
+            (ctypes.c_int*6)(*shls_slice[:4], shls_slice[4]+b0, shls_slice[4]+b1),
+            ao_loc.ctypes.data_as(ctypes.c_void_p), cintopt,
+            c_atm, ctypes.c_int(len(atm)), ctypes.c_int(natm),
+            c_bas, ctypes.c_int(len(bas)), c_env)
+        vjp += vjp_ia
+        vjp_aux[ia] = -vjp_ia.sum(axis=0)
 
     _, mol_tree = tree_flatten(mol)
     mol_bar = tree_unflatten(mol_tree, [-vjp,])

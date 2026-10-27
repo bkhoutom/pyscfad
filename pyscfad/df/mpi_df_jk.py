@@ -514,6 +514,7 @@ def _mpi_get_jk_fwd(
     with_k,
     direct_scf_tol,
 ):
+    dfobj, dm, activity = _df_jk_opt._unwrap_jk_primals(dfobj, dm)
     result = mpi_get_jk(
         executor_token,
         dfobj,
@@ -523,7 +524,7 @@ def _mpi_get_jk_fwd(
         with_k,
         direct_scf_tol,
     )
-    return result, (dfobj, dm)
+    return result, (dfobj, dm, activity)
 
 
 def _mpi_get_jk_bwd(
@@ -536,17 +537,22 @@ def _mpi_get_jk_bwd(
     output_bar,
 ):
     executor = _executor_from_token(executor_token)
-    dfobj, dm = residual
-    vj_bar, vk_bar = output_bar
+    dfobj, dm, activity = _df_jk_opt._jk_residual(residual)
+    vj_bar = _df_jk_opt._active_output_bar(output_bar[0], with_j)
+    vk_bar = _df_jk_opt._active_output_bar(output_bar[1], with_k)
+    if vj_bar is None and vk_bar is None:
+        return None, None
     if is_implicit_diff_solve_matvec():
+        if not activity[0]:
+            return None, None
         dm_bar = executor._density_vjp(
             dfobj,
             dm,
-            vj_bar,
-            vk_bar,
+            numpy.zeros_like(dm) if vj_bar is None else vj_bar,
+            numpy.zeros_like(dm) if vk_bar is None else vk_bar,
             hermi=hermi,
-            with_j=with_j,
-            with_k=with_k,
+            with_j=vj_bar is not None,
+            with_k=vk_bar is not None,
         )
         return None, dm_bar
 
@@ -555,13 +561,13 @@ def _mpi_get_jk_bwd(
         with_j,
         with_k,
         direct_scf_tol,
-        (dfobj, dm),
+        (dfobj, dm, activity),
         (vj_bar, vk_bar),
         coordinate_vjp=executor._coordinate_vjp,
     )
 
 
-mpi_get_jk.defvjp(_mpi_get_jk_fwd, _mpi_get_jk_bwd)
+mpi_get_jk.defvjp(_mpi_get_jk_fwd, _mpi_get_jk_bwd, symbolic_zeros=True)
 
 
 def _remote_error(operation, rank):

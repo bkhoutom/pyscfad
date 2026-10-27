@@ -25,7 +25,8 @@ from scipy.linalg.lapack import dpstrf
 import jax
 import jax.numpy as jnp
 from jax import custom_vjp
-from jax.tree_util import tree_flatten, tree_unflatten
+from jax.custom_derivatives import CustomVJPPrimal, SymbolicZero
+from jax.tree_util import tree_flatten, tree_unflatten, tree_map
 from pyscf import lib
 from pyscf.lib import logger
 from pyscf.df import df_jk as pyscf_df_jk
@@ -36,6 +37,7 @@ from pyscfad._src.implicit_diff import is_implicit_diff_solve_matvec
 
 libao2mo = lib.load_library('libao2mo')
 _FAST_EXCHANGE_DM_DATA = OrderedDict()
+_DF_VK_VJP_LOWRANK = getattr(libvhf, 'df_vk_vjp_lowrank', None)
 _DF_VK_DM_VJP = getattr(libvhf, 'df_vk_dm_vjp', None)
 if _DF_VK_DM_VJP is not None:
     _DF_VK_DM_VJP.argtypes = [
@@ -86,8 +88,8 @@ def _get_jk_gen_jax(dfobj, dm, hermi=1, with_j=True, with_k=True,
         tmp = jnp.einsum('Lpq,xpq->xL', Lpq, dms)
         vj = jnp.einsum('Lpq,xL->xpq', Lpq, tmp)
     if with_k:
-        tmp = jnp.einsum('Lij,xjk->xLki', Lpq, dms)
-        vk = jnp.einsum('Lki,xLkj->xij', Lpq, tmp)
+        tmp = jnp.einsum('Lij,xjk->xLik', Lpq, dms)
+        vk = jnp.einsum('xLik,Lkj->xij', tmp, Lpq)
     return vj.reshape(dm.shape), vk.reshape(dm.shape)
 
 
@@ -358,7 +360,7 @@ def _implicit_lowrank_exchange_factors(dfobj, vj_bar, vk_bar, hermi,
     # In RHF get_veff = J - K/2.  This relation makes the route specific to
     # the SCF fixed-point response rather than to arbitrary implicit solves
     # that happen to contain a DF get_jk call.
-    scale = max(float(numpy.linalg.norm(vk_bar[0])), 1.0)
+    scale = max(float(numpy.linalg.norm(vk_bar[0])), numpy.finfo(float).tiny)
     relation_error = float(
         numpy.linalg.norm(vk_bar[0] + 0.5 * vj_bar[0]) / scale
     )
@@ -541,259 +543,236 @@ def get_jk(dfobj, dm, hermi=1, with_j=True, with_k=True, direct_scf_tol=1e-13):
                               direct_scf_tol=direct_scf_tol)
 
 
+def _unwrap_jk_primals(dfobj, dm):
+    """Capture independent density, physical-factor and geometry activity.
+
+    Adapted from upstream PySCFAD db0acafb (Apache-2.0). Unlike the upstream
+    resident-only rule, an inactive disk placeholder does not freeze geometry.
+    """
+    def active(value):
+        return any(isinstance(x, CustomVJPPrimal) and x.perturbed
+                   for x in tree_flatten(value)[0])
+    activity = (active(dm), active(dfobj._cderi),
+                active(dfobj.mol), active(dfobj.auxmol))
+    unwrap = lambda x: x.value if isinstance(x, CustomVJPPrimal) else x
+    return tree_map(unwrap, dfobj), unwrap(dm), activity
+
+
+def _jk_residual(res):
+    if len(res) == 2:
+        # Compatibility for direct callers predating symbolic activity.
+        return res[0], res[1], (True, True, True, True)
+    return res
+
+
+def _active_output_bar(bar, enabled):
+    return bar if enabled and not isinstance(bar, SymbolicZero) else None
+
+
 def get_jk_fwd(dfobj, dm, hermi, with_j, with_k, direct_scf_tol):
+    dfobj, dm, activity = _unwrap_jk_primals(dfobj, dm)
     vj, vk = get_jk(dfobj, dm, hermi, with_j, with_k, direct_scf_tol)
-    return (vj, vk), (dfobj, dm)
+    return (vj, vk), (dfobj, dm, activity)
 
 
 def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
                res, ybar, *, coordinate_vjp=None):
     t_bwd = time.perf_counter()
-    _profile_msg(
-        f'get_jk_bwd start hermi={hermi} with_j={with_j} with_k={with_k}'
-    )
-    dfobj, dm = res
-    vj_bar, vk_bar = ybar
+    _profile_msg(f'get_jk_bwd start hermi={hermi} with_j={with_j} with_k={with_k}')
+    dfobj, dm, activity = _jk_residual(res)
+    dm_active, eri_active, mol_active, aux_active = activity
+    vj_bar = _active_output_bar(ybar[0], with_j)
+    vk_bar = _active_output_bar(ybar[1], with_k)
     solution_only = is_implicit_diff_solve_matvec()
-
+    if vj_bar is None and vk_bar is None:
+        return None, None
     if _has_tracer(dfobj, dm, vj_bar, vk_bar):
-        _profile_msg('get_jk_bwd tracer fallback start')
-        def fn(dfobj_, dm_):
+        if (not solution_only and (mol_active or aux_active)
+                and dfobj.auxmol is not None
+                and getattr(dfobj._cderi, 'shape', None) == (0, 0)):
+            raise NotImplementedError(
+                'traced DF geometry with a disk/source CDERI placeholder '
+                'is not supported')
+        # The generic tensor algebra depends on resident factors and density.
+        # Differentiate only active inputs, matching the eager rule's absent
+        # factor/geometry bars instead of returning materialized inactive bars.
+        factor_active = eri_active and not solution_only
+        if not (factor_active or dm_active):
+            return None, None
+        primals = ((dfobj._cderi,) if factor_active else ())
+        primals += (dm,) if dm_active else ()
+        def fn(*active):
+            dfobj_ = dfobj
+            if factor_active:
+                dfobj_ = tree_map(lambda x: x, dfobj)
+                dfobj_._cderi = active[0]
+            dm_ = active[-1] if dm_active else dm
             return _get_jk_gen_jax(
                 dfobj_, dm_, hermi=hermi, with_j=with_j, with_k=with_k,
-                direct_scf_tol=direct_scf_tol,
-            )
-        _, vjp = jax.vjp(fn, dfobj, dm)
-        out = vjp((vj_bar, vk_bar))
-        _profile_msg(
-            'get_jk_bwd tracer fallback done '
-            f'{time.perf_counter() - t_bwd:.2f} s'
-        )
-        return out
+                direct_scf_tol=direct_scf_tol)
+        _, vjp = jax.vjp(fn, *primals)
+        zeros = jnp.zeros_like(dm)
+        bars = vjp((zeros if vj_bar is None else vj_bar,
+                    zeros if vk_bar is None else vk_bar))
+        df_bar = None
+        if factor_active:
+            df_bar = tree_map(lambda x: None, dfobj)
+            df_bar._cderi = bars[0]
+        return df_bar, bars[-1] if dm_active else None
 
     log = logger.new_logger(dfobj)
-    fmmm = libao2mo.AO2MOmmm_bra_nr_s2
-    fdrv = libao2mo.AO2MOnr_e2_drv
-    ftrans = libao2mo.AO2MOtranse2_nr_s2
-    vjpdrv = libvhf.df_vk_vjp
-    null = lib.c_null_ptr()
-
     dms = numpy.asarray(dm)
     dm_shape = dms.shape
     nao = dm_shape[-1]
     nao_pair = nao * (nao + 1) // 2
-    dms = dms.reshape(-1,nao,nao)
-    nset = dms.shape[0]
-
-    vj_bar = numpy.asarray(vj_bar).reshape(-1,nao,nao)
-    if with_j:
-        idx = numpy.arange(nao)
-        dmtril = lib.pack_tril(dms + dms.conj().transpose(0,2,1))
-        dmtril[:,idx*(idx+1)//2+idx] *= .5
-
-        vj_bar_tril = lib.pack_tril(vj_bar + vj_bar.conj().transpose(0,2,1))
-        vj_bar_tril[:,idx*(idx+1)//2+idx] *= .5
-
+    dms = dms.reshape(-1, nao, nao)
+    nset = len(dms)
     naoaux = dfobj.get_naoaux()
     eri_bar_shape = (naoaux, nao_pair)
-    leaves, tree = tree_flatten(dfobj)
-    cderi_leaf = leaves[-1] if leaves else None
-    return_cderi_bar_leaf = (
-        hasattr(cderi_leaf, 'shape')
-        and tuple(cderi_leaf.shape) == eri_bar_shape
-    )
-    dms_bar = [numpy.zeros((nao,nao), order='F'),] * nset
-
-    vk_bar_array = numpy.asarray(vk_bar).reshape(-1,nao,nao)
-    lowrank_factors = None
-    if solution_only:
-        lowrank_factors = _implicit_lowrank_exchange_factors(
-            dfobj, vj_bar, vk_bar_array, hermi, with_j, with_k
-        )
-    use_lowrank_exchange = lowrank_factors is not None
-    vk_bar = [numpy.asarray(x, order='F') for x in vk_bar_array]
+    physical_cderi = (hasattr(dfobj._cderi, 'shape')
+                      and tuple(dfobj._cderi.shape) == eri_bar_shape)
+    return_cderi_bar = physical_cderi and eri_active and not solution_only
+    geometry_active = (not physical_cderi and (mol_active or aux_active)
+                       and dfobj.auxmol is not None and not solution_only)
+    need_eri = return_cderi_bar or geometry_active
+    if not (dm_active or need_eri):
+        return None, None
+    if vj_bar is not None:
+        vj_bar = numpy.asarray(vj_bar).reshape(-1, nao, nao)
+        idx = numpy.arange(nao)
+        vj_bar_tril = lib.pack_tril(vj_bar + vj_bar.transpose(0, 2, 1))
+        vj_bar_tril[:, idx*(idx+1)//2+idx] *= .5
+        if need_eri:
+            dmtril = lib.pack_tril(dms + dms.transpose(0, 2, 1))
+            dmtril[:, idx*(idx+1)//2+idx] *= .5
+    vk_array = (None if vk_bar is None else
+                numpy.asarray(vk_bar).reshape(-1, nao, nao))
+    response_factors = None
+    if solution_only and dm_active and vj_bar is not None and vk_array is not None:
+        response_factors = _implicit_lowrank_exchange_factors(
+            dfobj, vj_bar, vk_array, hermi, with_j, with_k)
+    xs = (_density_factors(_tag_dm_for_fast_exchange(dfobj, dm), hermi)
+          if need_eri and vk_array is not None and _DF_VK_VJP_LOWRANK is not None
+          else None)
+    vk_f = ([numpy.asarray(x, order='F') for x in vk_array]
+            if vk_array is not None else None)
+    symmetric_vk = (numpy.asarray(vk_array + vk_array.transpose(0, 2, 1), order='C')
+                    if xs is not None else None)
     dms = [numpy.asarray(x, order='F') for x in dms]
-
-    rargs = (ctypes.c_int(nao), (ctypes.c_int*4)(0, nao, 0, nao),
-             null, ctypes.c_int(0))
     max_memory = dfobj.max_memory - lib.current_memory()[0]
     blksize = max(4, int(min(dfobj.blockdim, max_memory*.3e6/8/nao**2)))
-    # The native density-only exchange transpose needs neither the forward
-    # ``L D`` buffer nor an auxiliary-integral cotangent.  Keep the old
-    # block-local fallback for an extension module built before
-    # ``df_vk_dm_vjp`` was added; it still avoids the global HDF5 cotangent
-    # and all nuclear/metric work.
-    need_full_vk_vjp = (
-        not solution_only
-        or (not use_lowrank_exchange and _DF_VK_DM_VJP is None)
-    )
-    buf = (
-        numpy.empty((blksize,nao,nao))
-        if need_full_vk_vjp else None
-    )
-    if use_lowrank_exchange:
-        occ_coeff, response_coeff = lowrank_factors
-        response_rank = occ_coeff.shape[1]
-        lowrank_buf_occ = numpy.empty((blksize * response_rank, nao))
-        lowrank_buf_response = numpy.empty_like(lowrank_buf_occ)
-    else:
-        occ_coeff = response_coeff = None
-        lowrank_buf_occ = lowrank_buf_response = None
-    stream_eri_bar = (
-        not solution_only
-        and dfobj.auxmol is not None
-        and not return_cderi_bar_leaf
-    )
-    eri_bar = None
-    eri_bar_file = None
-    eri_bar_path = None
-    eri_bar_h5 = None
-    if stream_eri_bar:
-        fd, eri_bar_path = tempfile.mkstemp(
-            suffix='.h5', prefix='pyscfad_dfjk_eri_bar_', dir=lib.param.TMPDIR
-        )
-        os.close(fd)
-        eri_bar_file = h5py.File(eri_bar_path, 'w')
-        chunk_pair = min(nao_pair, 1024)
-        chunk_aux = min(naoaux, max(blksize, 16))
-        eri_bar_h5 = eri_bar_file.create_dataset(
-            'eri_bar_T',
-            shape=(nao_pair, naoaux),
-            dtype=numpy.float64,
-            chunks=(chunk_pair, chunk_aux),
-        )
-    elif not solution_only:
-        eri_bar = numpy.zeros(eri_bar_shape)
-
+    # Dense fallback computes both bars in one native call. Its unused outputs
+    # are bounded block-local scratch, never global factor storage.
+    dense_k = vk_array is not None and (
+        (need_eri and xs is None)
+        or (dm_active and response_factors is None and _DF_VK_DM_VJP is None))
+    dms_bar = ([numpy.zeros((nao, nao), order='F') for _ in range(nset)]
+               if dm_active or dense_k else None)
+    buf = numpy.empty((blksize, nao, nao)) if dense_k else None
+    if response_factors is not None:
+        occ_coeff, response_coeff = response_factors
+        buf_occ = numpy.empty((blksize * occ_coeff.shape[1], nao))
+        buf_response = numpy.empty_like(buf_occ)
+    stream_eri_bar = geometry_active
+    eri_bar = numpy.zeros(eri_bar_shape) if return_cderi_bar else None
+    eri_bar_file = eri_bar_path = eri_bar_h5 = None
     p1 = 0
     try:
+        if stream_eri_bar:
+            fd, eri_bar_path = tempfile.mkstemp(
+                suffix='.h5', prefix='pyscfad_dfjk_eri_bar_', dir=lib.param.TMPDIR)
+            os.close(fd)
+            eri_bar_file = h5py.File(eri_bar_path, 'w')
+            eri_bar_h5 = eri_bar_file.create_dataset(
+                'eri_bar_T', shape=(nao_pair, naoaux), dtype=numpy.float64,
+                chunks=(min(nao_pair, 1024), min(naoaux, max(blksize, 16))))
         t_loop = time.perf_counter()
         for eri1 in dfobj.loop(blksize):
-            naux, nao_pair_blk = eri1.shape
-            if nao_pair_blk != nao_pair:
-                raise RuntimeError(
-                    f'DF block has pair dimension {nao_pair_blk}, '
-                    f'expected {nao_pair}.'
-                )
+            naux, pair = eri1.shape
+            if pair != nao_pair:
+                raise RuntimeError(f'DF block has pair dimension {pair}, expected {nao_pair}.')
             p0, p1 = p1, p1 + naux
-            if solution_only:
-                # Only needed by the compatibility fallback below.  It is
-                # bounded by one auxiliary block and is never written to
-                # disk or propagated to the DF object.
-                eri_bar_blk = (
-                    numpy.zeros((naux, nao_pair), dtype=eri1.dtype)
-                    if (
-                        not use_lowrank_exchange
-                        and _DF_VK_DM_VJP is None
-                    ) else None
-                )
-            elif stream_eri_bar:
-                eri_bar_blk = numpy.zeros((naux, nao_pair), dtype=eri1.dtype)
-            else:
-                eri_bar_blk = eri_bar[p0:p1]
-            if with_j:
+            eri_blk = (eri_bar[p0:p1] if return_cderi_bar else
+                       numpy.zeros((naux, nao_pair)) if need_eri or dense_k else None)
+            if vj_bar is not None:
                 rho_bar = vj_bar_tril @ eri1.T
-                dmtril_bar = rho_bar @ eri1
-                dms_bar += lib.unpack_tril(dmtril_bar)
-
-                if not solution_only:
-                    rho = dmtril @ eri1.T
-                    eri_bar_blk += rho.T @ vj_bar_tril
-                    eri_bar_blk += rho_bar.T @ dmtril
-
-            for k in range(nset):
-                if use_lowrank_exchange:
-                    _df_vk_dm_vjp_lowrank(
-                        dms_bar[k], eri1, occ_coeff, response_coeff,
-                        lowrank_buf_occ, lowrank_buf_response,
-                    )
-                    continue
-                if solution_only and _DF_VK_DM_VJP is not None:
-                    _DF_VK_DM_VJP(
-                        dms_bar[k].ctypes.data_as(ctypes.c_void_p),
-                        vk_bar[k].ctypes.data_as(ctypes.c_void_p),
-                        eri1.ctypes.data_as(ctypes.c_void_p),
-                        ctypes.c_int(naux), ctypes.c_int(nao),
-                    )
-                    continue
-                #TODO save buf1 on disk to avoid recomputation
-                buf1 = buf[:naux]
-                fdrv(ftrans, fmmm,
-                     buf1.ctypes.data_as(ctypes.c_void_p),
-                     eri1.ctypes.data_as(ctypes.c_void_p),
-                     dms[k].ctypes.data_as(ctypes.c_void_p),
-                     ctypes.c_int(naux), *rargs)
-
-                vjpdrv(eri_bar_blk.ctypes.data_as(ctypes.c_void_p),
-                       dms_bar[k].ctypes.data_as(ctypes.c_void_p),
-                       vk_bar[k].ctypes.data_as(ctypes.c_void_p),
-                       buf1.ctypes.data_as(ctypes.c_void_p),
-                       eri1.ctypes.data_as(ctypes.c_void_p),
-                       dms[k].ctypes.data_as(ctypes.c_void_p),
-                       ctypes.c_int(naux), ctypes.c_int(nao))
+                if dm_active:
+                    # Keep each native output independent and Fortran ordered.
+                    dense_dm_bar = lib.unpack_tril(rho_bar @ eri1)
+                    for k in range(nset):
+                        dms_bar[k] += dense_dm_bar[k]
+                if need_eri:
+                    eri_blk += (dmtril @ eri1.T).T @ vj_bar_tril
+                    eri_blk += rho_bar.T @ dmtril
+            if vk_array is not None:
+                for k in range(nset):
+                    if dense_k:
+                        buf1 = buf[:naux]
+                        libao2mo.AO2MOnr_e2_drv(
+                            libao2mo.AO2MOtranse2_nr_s2, libao2mo.AO2MOmmm_bra_nr_s2,
+                            buf1.ctypes.data_as(ctypes.c_void_p),
+                            eri1.ctypes.data_as(ctypes.c_void_p),
+                            dms[k].ctypes.data_as(ctypes.c_void_p), ctypes.c_int(naux),
+                            ctypes.c_int(nao), (ctypes.c_int*4)(0, nao, 0, nao),
+                            lib.c_null_ptr(), ctypes.c_int(0))
+                        libvhf.df_vk_vjp(
+                            eri_blk.ctypes.data_as(ctypes.c_void_p),
+                            dms_bar[k].ctypes.data_as(ctypes.c_void_p),
+                            vk_f[k].ctypes.data_as(ctypes.c_void_p),
+                            buf1.ctypes.data_as(ctypes.c_void_p),
+                            eri1.ctypes.data_as(ctypes.c_void_p),
+                            dms[k].ctypes.data_as(ctypes.c_void_p),
+                            ctypes.c_int(naux), ctypes.c_int(nao))
+                    else:
+                        if need_eri and xs[k].shape[1]:
+                            _DF_VK_VJP_LOWRANK(
+                                eri_blk.ctypes.data_as(ctypes.c_void_p),
+                                symmetric_vk[k].ctypes.data_as(ctypes.c_void_p),
+                                xs[k].ctypes.data_as(ctypes.c_void_p),
+                                eri1.ctypes.data_as(ctypes.c_void_p),
+                                ctypes.c_int(naux), ctypes.c_int(nao),
+                                ctypes.c_int(xs[k].shape[1]))
+                        if dm_active:
+                            if response_factors is not None:
+                                _df_vk_dm_vjp_lowrank(dms_bar[k], eri1, occ_coeff,
+                                                     response_coeff, buf_occ, buf_response)
+                            else:
+                                _DF_VK_DM_VJP(
+                                    dms_bar[k].ctypes.data_as(ctypes.c_void_p),
+                                    vk_f[k].ctypes.data_as(ctypes.c_void_p),
+                                    eri1.ctypes.data_as(ctypes.c_void_p),
+                                    ctypes.c_int(naux), ctypes.c_int(nao))
             if stream_eri_bar:
-                eri_bar_h5[:, p0:p1] = eri_bar_blk.T
-            eri_bar_blk = None
-        _profile_msg(
-            f'get_jk_bwd DF block loop done naux={p1} blksize={blksize} '
-            f'{time.perf_counter() - t_loop:.2f} s'
-        )
-
-        dm_bar = numpy.asarray(dms_bar).reshape(dm_shape)
-        if solution_only:
-            _profile_msg(
-                'get_jk_bwd density-only implicit-solve matvec done '
-                f'{time.perf_counter() - t_bwd:.2f} s'
-            )
-            return (None, dm_bar)
-        #TODO need a better way to add vjps for objects
-        bar_leaves = []
-        mol_bar = auxmol_bar = None
-        if len(leaves) >= 3 and not return_cderi_bar_leaf:
+                eri_bar_h5[:, p0:p1] = eri_blk.T
+        _profile_msg(f'get_jk_bwd DF block loop done naux={p1} blksize={blksize} '
+                     f'{time.perf_counter() - t_loop:.2f} s')
+        dm_bar = numpy.asarray(dms_bar).reshape(dm_shape) if dm_active else None
+        if not need_eri:
+            log.timer('get_jk_bwd')
+            if solution_only:
+                _profile_msg('get_jk_bwd density-only implicit-solve matvec done '
+                             f'{time.perf_counter() - t_bwd:.2f} s')
+            return None, dm_bar
+        df_bar = tree_map(lambda x: None, dfobj)
+        if return_cderi_bar:
+            df_bar._cderi = eri_bar
+        if geometry_active:
             t_cderi = time.perf_counter()
             _profile_msg('get_jk_bwd cderi mol/aux vjp start')
-            if stream_eri_bar:
-                eri_bar_file.flush()
-
-                def eri_bar_block_fn(q0, q1):
-                    return numpy.asarray(eri_bar_h5[q0:q1, :]).T
-
-                if coordinate_vjp is None:
-                    mol_bar, auxmol_bar = _cderi_mol_aux_vjp_from_block_fn(
-                        dfobj, eri_bar_block_fn
-                    )
-                else:
-                    mol_bar, auxmol_bar = coordinate_vjp(
-                        dfobj, eri_bar_block_fn
-                    )
-            else:
-                if coordinate_vjp is None:
-                    mol_bar, auxmol_bar = _cderi_mol_aux_vjp(dfobj, eri_bar)
-                else:
-                    mol_bar, auxmol_bar = coordinate_vjp(
-                        dfobj, lambda p0, p1: eri_bar[:, p0:p1]
-                    )
-            _profile_msg(
-                'get_jk_bwd cderi mol/aux vjp done '
-                f'{time.perf_counter() - t_cderi:.2f} s'
-            )
-        for i, leaf in enumerate(leaves):
-            if i == 0:
-                bar_leaves.append(mol_bar)
-            elif i == 1:
-                bar_leaves.append(auxmol_bar)
-            elif i == len(leaves) - 1:
-                if return_cderi_bar_leaf:
-                    bar_leaves.append(eri_bar)
-                elif hasattr(leaf, 'shape'):
-                    bar_leaves.append(numpy.zeros(leaf.shape))
-                else:
-                    bar_leaves.append(None)
-            elif hasattr(leaf, 'shape'):
-                bar_leaves.append(numpy.zeros(leaf.shape))
-            else:
-                bar_leaves.append(None)
-        dfobj_bar = tree_unflatten(tree, bar_leaves)
+            eri_bar_file.flush()
+            def eri_bar_block_fn(q0, q1):
+                return numpy.asarray(eri_bar_h5[q0:q1, :]).T
+            pullback = (_cderi_mol_aux_vjp_from_block_fn
+                        if coordinate_vjp is None else coordinate_vjp)
+            mol_bar, aux_bar = pullback(dfobj, eri_bar_block_fn)
+            _profile_msg('get_jk_bwd cderi mol/aux vjp done '
+                         f'{time.perf_counter() - t_cderi:.2f} s')
+            if mol_active:
+                _, mol_tree = tree_flatten(dfobj.mol)
+                df_bar.mol = tree_unflatten(mol_tree, [mol_bar])
+            if aux_active:
+                _, aux_tree = tree_flatten(dfobj.auxmol)
+                df_bar.auxmol = tree_unflatten(aux_tree, [aux_bar])
     finally:
         if eri_bar_file is not None:
             eri_bar_file.close()
@@ -803,9 +782,8 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
             except OSError:
                 pass
     log.timer('get_jk_bwd')
-    del log
     _profile_msg(f'get_jk_bwd done {time.perf_counter() - t_bwd:.2f} s')
-    return (dfobj_bar, dm_bar)
+    return df_bar, dm_bar
 
 
-get_jk.defvjp(get_jk_fwd, get_jk_bwd)
+get_jk.defvjp(get_jk_fwd, get_jk_bwd, symbolic_zeros=True)

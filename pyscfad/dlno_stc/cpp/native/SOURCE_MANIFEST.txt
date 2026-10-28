@@ -64,12 +64,14 @@ Adapter integration:
 Three-way exact diffs are recorded in part1_update/native_source_diffs.
 
 Selected stochastic (T) addition:
-Source: TEST_general/dlno_stc_test/stc_mp2_native/src_code_stc_T
-Native version: stc_triples:sha256:h=273f7818f5cde71f7c07f62127bbdcca37e42b045748434424a737c7de569f2c:C=a7fc2b8488255ca4fa36968a632f817b88fb7c60e8f67de336d30ab297eec384:binding-1
+Source: TEST_general/dlno_stc_test/stc_mp2_native/src_code_stc_T/updates
+Native version: stc_triples:sha256:h=72dafa4934ba1f6462638908ef1a1d4d38a325271e16e3e99087e7ff6ddf4825:C=842d28759061c13474fb2f69bf62120ff50ab63035aa12623f24599d27e49a0f:binding-3
 SHA256 of supplied and vendored files (byte-identical, no source edits):
-273f7818f5cde71f7c07f62127bbdcca37e42b045748434424a737c7de569f2c  stc_triples.h
-a7fc2b8488255ca4fa36968a632f817b88fb7c60e8f67de336d30ab297eec384  stc_triples.C
+72dafa4934ba1f6462638908ef1a1d4d38a325271e16e3e99087e7ff6ddf4825  stc_triples.h
+842d28759061c13474fb2f69bf62120ff50ab63035aa12623f24599d27e49a0f  stc_triples.C
 Binding explicitly packs arbitrary NumPy strides into Armadillo matrices.
-Only eight DF input cotangents are copied to Python; dense integral bars
-remain internal to the unchanged supplied kernel. Fixed-count calls always
-pass target_standard_error=0; nsamples=0 is exposed only for energy reference.
+Nine DF input cotangents are copied to Python, including fov even when its
+optional value is None (zero); dense integral bars remain internal to the
+unchanged supplied kernel. The trailing fov keyword preserves positional
+sampling controls. Zero target_standard_error selects fixed-count sampling;
+positive targets use nsamples as a pilot. nsamples=0 is energy-reference only.

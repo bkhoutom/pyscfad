@@ -125,7 +125,7 @@ py::dict selected(py::handle t1_value, py::handle t2_value,
                   py::handle bvo_value, py::handle boo_value, py::handle bvv_value,
                   py::handle eo_value, py::handle ev_value, py::handle u_value,
                   py::handle sample_value, py::handle seed_value,
-                  py::handle target_value, bool with_vjp) {
+                  py::handle target_value, py::handle fov_value, bool with_vjp) {
     const auto samples=unsigned_integer(sample_value,"nsamples");
     const auto seed=unsigned_integer(seed_value,"seed");
     const auto target=standard_error_target(target_value);
@@ -144,6 +144,14 @@ py::dict selected(py::handle t1_value, py::handle t2_value,
     t2.shape({no,no,nv,nv}); bvo.shape({naux,no,nv});
     boo.shape({naux,no,no}); bvv.shape({naux,nv,nv});
     eo.shape({no}); ev.shape({nv});
+    arma::mat fov;
+    const arma::mat* fov_ptr=nullptr;
+    if (!fov_value.is_none()) {
+        InputArray input(fov_value,"fov",2);
+        input.shape({no,nv});
+        fov=matrix(input);
+        fov_ptr=&fov;
+    }
     if (u.size(0)!=no || u.size(1)<1 || u.size(1)>no)
         throw py::value_error("U must have shape (nocc, nselected) with 1 <= nselected <= nocc");
     const auto eocc=vector(eo), evir=vector(ev);
@@ -170,10 +178,10 @@ py::dict selected(py::handle t1_value, py::handle t2_value,
         py::gil_scoped_release release;
         if (with_vjp)
             result=Triples::selected_energy_vjp(singles,doubles,Bvo,Boo,Bvv,
-                eocc,evir,subspace,size_t(samples),bars,seed,target,1.0);
+                eocc,evir,subspace,size_t(samples),bars,seed,target,1.0,fov_ptr);
         else
             result=Triples::selected_energy(singles,doubles,Bvo,Boo,Bvv,
-                eocc,evir,subspace,size_t(samples),seed,target);
+                eocc,evir,subspace,size_t(samples),seed,target,fov_ptr);
     }
     py::dict out;
     out["energy"]=result.energy; out["standard_error"]=result.standard_error;
@@ -207,6 +215,7 @@ py::dict selected(py::handle t1_value, py::handle t2_value,
         cotangents["Bvv"]=df_array(bars.Bvv,nv,nv);
         cotangents["eocc"]=array(bars.eocc); cotangents["evir"]=array(bars.evir);
         cotangents["U"]=array(bars.occupied_subspace);
+        cotangents["fov"]=array(bars.fov);
         out["cotangents"]=cotangents;
     }
     return out;
@@ -217,27 +226,28 @@ namespace pyscfad { namespace dlno_stc {
 void bind_triples(py::module_& module) {
     // str is immutable; identity is fixed by the two byte-identical vendored sources.
     module.attr("TRIPLES_VERSION")=
-        "stc_triples:sha256:h=273f7818f5cde71f7c07f62127bbdcca37e42b045748434424a737c7de569f2c:"
-        "C=a7fc2b8488255ca4fa36968a632f817b88fb7c60e8f67de336d30ab297eec384:binding-2";
+        "stc_triples:sha256:h=72dafa4934ba1f6462638908ef1a1d4d38a325271e16e3e99087e7ff6ddf4825:"
+        "C=842d28759061c13474fb2f69bf62120ff50ab63035aa12623f24599d27e49a0f:binding-3";
     module.def("triples_selected_energy", [](py::handle t1, py::handle t2,
         py::handle Bvo, py::handle Boo, py::handle Bvv, py::handle eocc,
         py::handle evir, py::handle U, py::handle nsamples, py::handle seed,
-        py::handle target_standard_error) {
-        return selected(t1,t2,Bvo,Boo,Bvv,eocc,evir,U,nsamples,seed,target_standard_error,false);
+        py::handle target_standard_error, py::handle fov) {
+        return selected(t1,t2,Bvo,Boo,Bvv,eocc,evir,U,nsamples,seed,target_standard_error,fov,false);
     }, py::arg("t1"),py::arg("t2"),py::arg("Bvo"),py::arg("Boo"),py::arg("Bvv"),
        py::arg("eocc"),py::arg("evir"),py::arg("U"),py::arg("nsamples"),py::arg("seed")=71,
-       py::arg("target_standard_error")=0.0,
+       py::arg("target_standard_error")=0.0,py::kw_only(),py::arg("fov")=py::none(),
        "Selected stochastic (T); positive target_standard_error makes nsamples a pilot count. "
-       "nsamples=0 is a small deterministic reference only.");
+       "nsamples=0 is a small deterministic reference only. Optional fov has shape (nocc,nvir).");
     module.def("triples_selected_energy_vjp", [](py::handle t1, py::handle t2,
         py::handle Bvo, py::handle Boo, py::handle Bvv, py::handle eocc,
         py::handle evir, py::handle U, py::handle nsamples, py::handle seed,
-        py::handle target_standard_error) {
-        return selected(t1,t2,Bvo,Boo,Bvv,eocc,evir,U,nsamples,seed,target_standard_error,true);
+        py::handle target_standard_error, py::handle fov) {
+        return selected(t1,t2,Bvo,Boo,Bvv,eocc,evir,U,nsamples,seed,target_standard_error,fov,true);
     }, py::arg("t1"),py::arg("t2"),py::arg("Bvo"),py::arg("Boo"),py::arg("Bvv"),
        py::arg("eocc"),py::arg("evir"),py::arg("U"),py::arg("nsamples"),py::arg("seed")=71,
-       py::arg("target_standard_error")=0.0,
-       "Fused sampled selected (T) energy and unit-energy VJP of the eight DF inputs; "
+       py::arg("target_standard_error")=0.0,py::kw_only(),py::arg("fov")=py::none(),
+       "Fused sampled selected (T) energy and unit-energy VJP of the nine DF inputs; "
+       "fov defaults to zero and its cotangent is always returned. "
        "positive target_standard_error makes nsamples a pilot count.");
 }
 }}  // namespace pyscfad::dlno_stc

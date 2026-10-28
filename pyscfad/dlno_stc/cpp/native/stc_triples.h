@@ -28,6 +28,7 @@ public:
         arma::field<arma::vec> t1;
         arma::field<arma::mat> t2;
         arma::vec eocc, evir;
+        arma::mat fov;
         arma::vec occupied_projector;
         arma::mat occupied_subspace;
         arma::mat ovvv, ovoo, ovov;
@@ -38,53 +39,61 @@ public:
         const arma::field<arma::vec>& t1, const arma::field<arma::mat>& t2,
         const arma::mat& ovvv, const arma::mat& ovoo, const arma::mat& ovov,
         const arma::vec& eocc, const arma::vec& evir,
-        const arma::vec& occupied_projector);
+        const arma::vec& occupied_projector,
+        const arma::mat* fov = nullptr);
     static double projected_triples_integrals(
         const arma::field<arma::vec>& t1, const arma::field<arma::mat>& t2,
         const arma::mat& ovvv, const arma::mat& ovoo, const arma::mat& ovov,
         const arma::vec& eocc, const arma::vec& evir,
-        const arma::mat& occupied_subspace);
+        const arma::mat& occupied_subspace,
+        const arma::mat* fov = nullptr);
     static triples_result projected_triples_stochastic_integrals(
         const arma::field<arma::vec>& t1, const arma::field<arma::mat>& t2,
         const arma::mat& ovvv, const arma::mat& ovoo, const arma::mat& ovov,
         const arma::vec& eocc, const arma::vec& evir,
         const arma::vec& occupied_projector, size_t nsamples,
         std::uint64_t seed = 1, double target_standard_error = 0,
-        triples_vjp* vjp = nullptr, double cotangent = 1.0);
+        triples_vjp* vjp = nullptr, double cotangent = 1.0,
+        const arma::mat* fov = nullptr);
     static triples_result projected_triples_stochastic_integrals(
         const arma::field<arma::vec>& t1, const arma::field<arma::mat>& t2,
         const arma::mat& ovvv, const arma::mat& ovoo, const arma::mat& ovov,
         const arma::vec& eocc, const arma::vec& evir,
         const arma::mat& occupied_subspace, size_t nsamples,
         std::uint64_t seed = 1, double target_standard_error = 0,
-        triples_vjp* vjp = nullptr, double cotangent = 1.0);
+        triples_vjp* vjp = nullptr, double cotangent = 1.0,
+        const arma::mat* fov = nullptr);
     // Fused whole-system energy and optional input VJP.
     static triples_result whole_triples(
         const arma::field<arma::vec>& t1, const arma::field<arma::mat>& t2,
         const arma::mat& Bvo, const arma::mat& Boo, const arma::mat& Bvv,
         const arma::vec& eocc, const arma::vec& evir, size_t nsamples,
         std::uint64_t seed = 1, double target_standard_error = 0,
-        triples_vjp* vjp = nullptr, double cotangent = 1.0);
+        triples_vjp* vjp = nullptr, double cotangent = 1.0,
+        const arma::mat* fov = nullptr);
     static triples_result whole_triples_integrals(
         const arma::field<arma::vec>& t1, const arma::field<arma::mat>& t2,
         const arma::mat& ovvv, const arma::mat& ovoo, const arma::mat& ovov,
         const arma::vec& eocc, const arma::vec& evir, size_t nsamples,
         std::uint64_t seed = 1, double target_standard_error = 0,
-        triples_vjp* vjp = nullptr, double cotangent = 1.0);
+        triples_vjp* vjp = nullptr, double cotangent = 1.0,
+        const arma::mat* fov = nullptr);
     static triples_result projected_triples_stochastic(
         const arma::field<arma::vec>& t1, const arma::field<arma::mat>& t2,
         const arma::mat& Bvo, const arma::mat& Boo, const arma::mat& Bvv,
         const arma::vec& eocc, const arma::vec& evir,
         const arma::vec& occupied_projector, size_t nsamples,
         std::uint64_t seed = 1, double target_standard_error = 0,
-        triples_vjp* vjp = nullptr, double cotangent = 1.0);
+        triples_vjp* vjp = nullptr, double cotangent = 1.0,
+        const arma::mat* fov = nullptr);
     static triples_result projected_triples_stochastic(
         const arma::field<arma::vec>& t1, const arma::field<arma::mat>& t2,
         const arma::mat& Bvo, const arma::mat& Boo, const arma::mat& Bvv,
         const arma::vec& eocc, const arma::vec& evir,
         const arma::mat& occupied_subspace, size_t nsamples,
         std::uint64_t seed = 1, double target_standard_error = 0,
-        triples_vjp* vjp = nullptr, double cotangent = 1.0);
+        triples_vjp* vjp = nullptr, double cotangent = 1.0,
+        const arma::mat* fov = nullptr);
 
     // Four explicit DF entry points for autodiff callers. The VJP calls
     // compute the energy and input cotangents together in one sampled pass.
@@ -92,27 +101,30 @@ public:
         const arma::field<arma::vec>& t1, const arma::field<arma::mat>& t2,
         const arma::mat& Bvo, const arma::mat& Boo, const arma::mat& Bvv,
         const arma::vec& eocc, const arma::vec& evir, size_t nsamples,
-        std::uint64_t seed = 1, double target_standard_error = 0) {
+        std::uint64_t seed = 1, double target_standard_error = 0,
+        const arma::mat* fov = nullptr) {
         return whole_triples(t1,t2,Bvo,Boo,Bvv,eocc,evir,
-            nsamples,seed,target_standard_error);
+            nsamples,seed,target_standard_error,nullptr,1.0,fov);
     }
     static triples_result whole_energy_vjp(
         const arma::field<arma::vec>& t1, const arma::field<arma::mat>& t2,
         const arma::mat& Bvo, const arma::mat& Boo, const arma::mat& Bvv,
         const arma::vec& eocc, const arma::vec& evir, size_t nsamples,
         triples_vjp& bar, std::uint64_t seed = 1,
-        double target_standard_error = 0, double cotangent = 1.0) {
+        double target_standard_error = 0, double cotangent = 1.0,
+        const arma::mat* fov = nullptr) {
         return whole_triples(t1,t2,Bvo,Boo,Bvv,eocc,evir,
-            nsamples,seed,target_standard_error,&bar,cotangent);
+            nsamples,seed,target_standard_error,&bar,cotangent,fov);
     }
     static triples_result selected_energy(
         const arma::field<arma::vec>& t1, const arma::field<arma::mat>& t2,
         const arma::mat& Bvo, const arma::mat& Boo, const arma::mat& Bvv,
         const arma::vec& eocc, const arma::vec& evir,
         const arma::vec& occupied_projector, size_t nsamples,
-        std::uint64_t seed = 1, double target_standard_error = 0) {
+        std::uint64_t seed = 1, double target_standard_error = 0,
+        const arma::mat* fov = nullptr) {
         return projected_triples_stochastic(t1,t2,Bvo,Boo,Bvv,eocc,evir,
-            occupied_projector,nsamples,seed,target_standard_error);
+            occupied_projector,nsamples,seed,target_standard_error,nullptr,1.0,fov);
     }
     static triples_result selected_energy_vjp(
         const arma::field<arma::vec>& t1, const arma::field<arma::mat>& t2,
@@ -120,18 +132,20 @@ public:
         const arma::vec& eocc, const arma::vec& evir,
         const arma::vec& occupied_projector, size_t nsamples,
         triples_vjp& bar, std::uint64_t seed = 1,
-        double target_standard_error = 0, double cotangent = 1.0) {
+        double target_standard_error = 0, double cotangent = 1.0,
+        const arma::mat* fov = nullptr) {
         return projected_triples_stochastic(t1,t2,Bvo,Boo,Bvv,eocc,evir,
-            occupied_projector,nsamples,seed,target_standard_error,&bar,cotangent);
+            occupied_projector,nsamples,seed,target_standard_error,&bar,cotangent,fov);
     }
     static triples_result selected_energy(
         const arma::field<arma::vec>& t1, const arma::field<arma::mat>& t2,
         const arma::mat& Bvo, const arma::mat& Boo, const arma::mat& Bvv,
         const arma::vec& eocc, const arma::vec& evir,
         const arma::mat& occupied_subspace, size_t nsamples,
-        std::uint64_t seed = 1, double target_standard_error = 0) {
+        std::uint64_t seed = 1, double target_standard_error = 0,
+        const arma::mat* fov = nullptr) {
         return projected_triples_stochastic(t1,t2,Bvo,Boo,Bvv,eocc,evir,
-            occupied_subspace,nsamples,seed,target_standard_error);
+            occupied_subspace,nsamples,seed,target_standard_error,nullptr,1.0,fov);
     }
     static triples_result selected_energy_vjp(
         const arma::field<arma::vec>& t1, const arma::field<arma::mat>& t2,
@@ -139,9 +153,10 @@ public:
         const arma::vec& eocc, const arma::vec& evir,
         const arma::mat& occupied_subspace, size_t nsamples,
         triples_vjp& bar, std::uint64_t seed = 1,
-        double target_standard_error = 0, double cotangent = 1.0) {
+        double target_standard_error = 0, double cotangent = 1.0,
+        const arma::mat* fov = nullptr) {
         return projected_triples_stochastic(t1,t2,Bvo,Boo,Bvv,eocc,evir,
-            occupied_subspace,nsamples,seed,target_standard_error,&bar,cotangent);
+            occupied_subspace,nsamples,seed,target_standard_error,&bar,cotangent,fov);
     }
 private:
     static triples_result evaluate_integrals(
@@ -151,7 +166,8 @@ private:
         size_t nsamples, std::uint64_t seed, double target_standard_error,
         triples_vjp* vjp, double cotangent,
         const arma::vec* occupied_projector = nullptr,
-        const arma::mat* occupied_subspace = nullptr);
+        const arma::mat* occupied_subspace = nullptr,
+        const arma::mat* fov = nullptr);
 };
 
 }}

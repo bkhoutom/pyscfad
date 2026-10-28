@@ -571,10 +571,13 @@ and work order. Energy-only and fused energy/VJP calls use different native
 proposals; their same-seed energies need not be identical. Gradients use the
 fused native energy/VJP once and its saved unit-energy cotangents.
 
-The supplied stochastic formula omits the Fvo contribution retained in the
-existing deterministic implementation. Compare sampling errors against a
-matching Fvo-zero reference and report that fixed formula difference
-separately. This option retains dense OVVV and reverse storage, so it does
+The stochastic formula includes the occupied–virtual Fock contribution used
+by the deterministic implementation. The live block is passed as
+`fov = eris.fock[nocc:, :nocc].T`; its cotangent propagates through the existing
+full-Fock and orbital response, including when the block is zero. The native
+fused call returns nine input cotangents: `t1`, `t2`, `Bvo`, `Boo`, `Bvv`,
+`eocc`, `evir`, `U`, and `fov`. Compare sampling errors against ordinary
+deterministic (T). This option retains dense OVVV and reverse storage, so it does
 not improve the underlying memory scaling.
 
 Baseline and matrix precision controls stay separate. Stochastic D/W requires

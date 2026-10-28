@@ -108,17 +108,19 @@ double stc_triples::projected_triples_integrals(
     const arma::field<arma::vec>& t1, const arma::field<arma::mat>& t2,
     const arma::mat& ovvv, const arma::mat& ovoo, const arma::mat& ovov,
     const arma::vec& eocc, const arma::vec& evir,
-    const arma::vec& u) {
+    const arma::vec& u, const arma::mat* fov) {
     return projected_triples_integrals(t1,t2,ovvv,ovoo,ovov,eocc,evir,
-        arma::mat(u));
+        arma::mat(u),fov);
 }
 
 double stc_triples::projected_triples_integrals(
     const arma::field<arma::vec>& t1, const arma::field<arma::mat>& t2,
     const arma::mat& ovvv, const arma::mat& ovoo, const arma::mat& ovov,
     const arma::vec& eocc, const arma::vec& evir,
-    const arma::mat& u) {
+    const arma::mat& u, const arma::mat* fov) {
     const size_t no=eocc.n_elem, nv=evir.n_elem;
+    if(fov && (fov->n_rows!=no || fov->n_cols!=nv || !fov->is_finite()))
+        throw std::invalid_argument("Projected (T): invalid Fov dimensions or values");
     if(u.n_rows!=no || u.n_cols==0 || u.n_cols>no || !u.is_finite() ||
        t1.n_elem!=no ||
        t2.n_rows!=no || t2.n_cols!=no ||
@@ -170,7 +172,8 @@ double stc_triples::projected_triples_integrals(
         for(size_t p=0;p<6;++p) {
             index_type y=x;
             for(size_t d=0;d<3;++d) y[d]=x[perm[p][d]];
-            const double v=ovov(y[0]*nv+y[3],y[1]*nv+y[4])*t1(y[2])(y[5]);
+            const double v=ovov(y[0]*nv+y[3],y[1]*nv+y[4])*t1(y[2])(y[5])+
+                (fov ? (*fov)(y[2],y[5])*t2(y[0],y[1])(y[3],y[4]) : 0.0);
             value+=rweight[p]*((p==0 ? identity_w : w(y))+0.5*v);
         }
         return value;
@@ -215,9 +218,9 @@ stc_triples::triples_result stc_triples::projected_triples_stochastic_integrals(
     const arma::vec& eocc, const arma::vec& evir,
     const arma::vec& occupied_projector, size_t nsamples,
     std::uint64_t seed, double target_standard_error,
-    triples_vjp* vjp, double cotangent) {
+    triples_vjp* vjp, double cotangent, const arma::mat* fov) {
     return evaluate_integrals(t1,t2,ovvv,ovoo,ovov,eocc,evir,
-        nsamples,seed,target_standard_error,vjp,cotangent,&occupied_projector);
+        nsamples,seed,target_standard_error,vjp,cotangent,&occupied_projector,nullptr,fov);
 }
 
 stc_triples::triples_result stc_triples::projected_triples_stochastic_integrals(
@@ -226,9 +229,9 @@ stc_triples::triples_result stc_triples::projected_triples_stochastic_integrals(
     const arma::vec& eocc, const arma::vec& evir,
     const arma::mat& occupied_subspace, size_t nsamples,
     std::uint64_t seed, double target_standard_error,
-    triples_vjp* vjp, double cotangent) {
+    triples_vjp* vjp, double cotangent, const arma::mat* fov) {
     return evaluate_integrals(t1,t2,ovvv,ovoo,ovov,eocc,evir,
-        nsamples,seed,target_standard_error,vjp,cotangent,nullptr,&occupied_subspace);
+        nsamples,seed,target_standard_error,vjp,cotangent,nullptr,&occupied_subspace,fov);
 }
 
 stc_triples::triples_result stc_triples::whole_triples(
@@ -236,14 +239,14 @@ stc_triples::triples_result stc_triples::whole_triples(
     const arma::mat& Bvo, const arma::mat& Boo, const arma::mat& Bvv,
     const arma::vec& eocc, const arma::vec& evir, size_t nsamples,
     std::uint64_t seed, double target_standard_error,
-    triples_vjp* vjp, double cotangent) {
+    triples_vjp* vjp, double cotangent, const arma::mat* fov) {
     const size_t no=eocc.n_elem,nv=evir.n_elem;
     if (Bvo.n_cols!=no*nv || Boo.n_cols!=no*no || Bvv.n_cols!=nv*nv ||
         Bvo.n_rows!=Boo.n_rows || Bvo.n_rows!=Bvv.n_rows)
         throw std::invalid_argument("(T): inconsistent DF tensor dimensions");
     const auto result=whole_triples_integrals(t1,t2,Bvv.t()*Bvo,
         Bvo.t()*Boo,Bvo.t()*Bvo,eocc,evir,nsamples,seed,
-        target_standard_error,vjp,cotangent);
+        target_standard_error,vjp,cotangent,fov);
     if(vjp) pullback_df_bars(*vjp,Bvo,Boo,Bvv);
     return result;
 }
@@ -253,9 +256,9 @@ stc_triples::triples_result stc_triples::whole_triples_integrals(
     const arma::mat& ovvv, const arma::mat& ovoo, const arma::mat& ovov,
     const arma::vec& eocc, const arma::vec& evir, size_t nsamples,
     std::uint64_t seed, double target_standard_error,
-    triples_vjp* vjp, double cotangent) {
+    triples_vjp* vjp, double cotangent, const arma::mat* fov) {
     return evaluate_integrals(t1,t2,ovvv,ovoo,ovov,eocc,evir,
-        nsamples,seed,target_standard_error,vjp,cotangent);
+        nsamples,seed,target_standard_error,vjp,cotangent,nullptr,nullptr,fov);
 }
 
 stc_triples::triples_result stc_triples::projected_triples_stochastic(
@@ -264,14 +267,14 @@ stc_triples::triples_result stc_triples::projected_triples_stochastic(
     const arma::vec& eocc, const arma::vec& evir,
     const arma::vec& occupied_projector, size_t nsamples,
     std::uint64_t seed, double target_standard_error,
-    triples_vjp* vjp, double cotangent) {
+    triples_vjp* vjp, double cotangent, const arma::mat* fov) {
     const size_t no=eocc.n_elem,nv=evir.n_elem;
     if (Bvo.n_cols!=no*nv || Boo.n_cols!=no*no || Bvv.n_cols!=nv*nv ||
         Bvo.n_rows!=Boo.n_rows || Bvo.n_rows!=Bvv.n_rows)
         throw std::invalid_argument("(T): inconsistent DF tensor dimensions");
     const auto result=projected_triples_stochastic_integrals(t1,t2,
         Bvv.t()*Bvo,Bvo.t()*Boo,Bvo.t()*Bvo,eocc,evir,occupied_projector,
-        nsamples,seed,target_standard_error,vjp,cotangent);
+        nsamples,seed,target_standard_error,vjp,cotangent,fov);
     if(vjp) pullback_df_bars(*vjp,Bvo,Boo,Bvv);
     return result;
 }
@@ -282,14 +285,14 @@ stc_triples::triples_result stc_triples::projected_triples_stochastic(
     const arma::vec& eocc, const arma::vec& evir,
     const arma::mat& occupied_subspace, size_t nsamples,
     std::uint64_t seed, double target_standard_error,
-    triples_vjp* vjp, double cotangent) {
+    triples_vjp* vjp, double cotangent, const arma::mat* fov) {
     const size_t no=eocc.n_elem,nv=evir.n_elem;
     if (Bvo.n_cols!=no*nv || Boo.n_cols!=no*no || Bvv.n_cols!=nv*nv ||
         Bvo.n_rows!=Boo.n_rows || Bvo.n_rows!=Bvv.n_rows)
         throw std::invalid_argument("(T): inconsistent DF tensor dimensions");
     const auto result=projected_triples_stochastic_integrals(t1,t2,
         Bvv.t()*Bvo,Bvo.t()*Boo,Bvo.t()*Bvo,eocc,evir,occupied_subspace,
-        nsamples,seed,target_standard_error,vjp,cotangent);
+        nsamples,seed,target_standard_error,vjp,cotangent,fov);
     if(vjp) pullback_df_bars(*vjp,Bvo,Boo,Bvv);
     return result;
 }
@@ -301,8 +304,11 @@ stc_triples::triples_result stc_triples::evaluate_integrals(
     size_t nsamples, std::uint64_t seed, double target_standard_error,
     triples_vjp* vjp, double cotangent,
     const arma::vec* occupied_projector,
-    const arma::mat* occupied_subspace) {
+    const arma::mat* occupied_subspace,
+    const arma::mat* fov) {
     const size_t no=eocc.n_elem, nv=evir.n_elem;
+    if(fov && (fov->n_rows!=no || fov->n_cols!=nv || !fov->is_finite()))
+        throw std::invalid_argument("(T): invalid Fov dimensions or values");
     const bool projected=occupied_projector || occupied_subspace;
     if(occupied_projector && occupied_subspace)
         throw std::invalid_argument("(T): choose one selected-projector representation");
@@ -360,7 +366,7 @@ stc_triples::triples_result stc_triples::evaluate_integrals(
             vjp->t1(i).zeros(nv);
             for(size_t j=0;j<no;++j) vjp->t2(i,j).zeros(nv,nv);
         }
-        vjp->eocc.zeros(no); vjp->evir.zeros(nv);
+        vjp->eocc.zeros(no); vjp->evir.zeros(nv); vjp->fov.zeros(no,nv);
         if(occupied_projector) vjp->occupied_projector.zeros(no);
         if(projected)
             vjp->occupied_subspace.zeros(no,selected_orbitals.n_cols);
@@ -370,7 +376,7 @@ stc_triples::triples_result stc_triples::evaluate_integrals(
     if (no == 0 || nv == 0) return {0.0, 0.0, 0};
     if(projected && nsamples==0) {
         triples_result result={projected_triples_integrals(t1,t2,ovvv,ovoo,ovov,
-            eocc,evir,selected_orbitals),0.0,0};
+            eocc,evir,selected_orbitals,fov),0.0,0};
         return result;
     }
     // A positive occupied/virtual gap bounds every denominator away from zero.
@@ -438,7 +444,8 @@ stc_triples::triples_result stc_triples::evaluate_integrals(
         for (size_t p=0; p<6; ++p) {
             index_type y = x;
             for (size_t d=0; d<3; ++d) y[d] = x[perm[p][d]];
-            const double v = ovov(y[0]*nv+y[3],y[1]*nv+y[4])*t1(y[2])(y[5]);
+            const double v = ovov(y[0]*nv+y[3],y[1]*nv+y[4])*t1(y[2])(y[5])+
+                (fov ? (*fov)(y[2],y[5])*t2(y[0],y[1])(y[3],y[4]) : 0.0);
             // The identity occupied permutation reuses the already computed w(x).
             value += rweight[p]*((p==0 ? identity_w : w(y))+0.5*v);
         }
@@ -495,7 +502,8 @@ stc_triples::triples_result stc_triples::evaluate_integrals(
         for(size_t p=0;p<6;++p) for(size_t q=0;q<6;++q) {
             const size_t term=6*p+q;
             const auto& a=z[term];
-            const double v=ovov(a[0]*nv+a[3],a[1]*nv+a[4])*t1(a[2])(a[5]);
+            const double v=ovov(a[0]*nv+a[3],a[1]*nv+a[4])*t1(a[2])(a[5])+
+                (fov ? (*fov)(a[2],a[5])*t2(a[0],a[1])(a[3],a[4]) : 0.0);
             value+=rweight[q]*(virtual_part[term]-occupied_part[term]+0.5*v);
         }
         return value;
@@ -525,6 +533,8 @@ stc_triples::triples_result stc_triples::evaluate_integrals(
         const size_t i=x[0],j=x[1],k=x[2],a=x[3],b=x[4],c=x[5];
         add_bar(vjp->ovov(i*nv+a,j*nv+b),bar*t1(k)(c));
         add_bar(vjp->t1(k)(c),bar*ovov(i*nv+a,j*nv+b));
+        add_bar(vjp->fov(k,c),bar*t2(i,j)(a,b));
+        if(fov) add_bar(vjp->t2(i,j)(a,b),bar*(*fov)(k,c));
     };
     auto backward=[&](const index_type& x,double pw,double prz,double weight) {
         if(!vjp || cotangent==0) return;
@@ -768,7 +778,7 @@ stc_triples::triples_result stc_triples::evaluate_integrals(
         double bar_pw,bar_prz,bar_d;
     };
     struct reverse_worker {
-        arma::mat t1;
+        arma::mat t1,fov;
         arma::vec eocc,evir;
         arma::mat occupied_subspace;
     };
@@ -784,6 +794,7 @@ stc_triples::triples_result stc_triples::evaluate_integrals(
         for(size_t worker=0;worker<reverse_workers.size();++worker) {
             auto& local=reverse_workers[worker];
             local.t1.zeros(nv,no);
+            local.fov.zeros(no,nv);
             local.eocc.zeros(no); local.evir.zeros(nv);
             if(projected)
                 local.occupied_subspace.zeros(no,selected_orbitals.n_cols);
@@ -851,6 +862,7 @@ stc_triples::triples_result stc_triples::evaluate_integrals(
                 const double gv=ovov(row,j*nv+b);
                 vjp->ovov(row,j*nv+b)+=bar_v*t1(k)(c);
                 local.t1(c,k)+=bar_v*gv;
+                local.fov(k,c)+=bar_v*t2(z[0],j)(z[3],b);
                 if(p==0 && r==0) {
                     for(size_t leg=0;leg<3;++leg) {
                         local.eocc(sample.x[leg])+=sample.bar_d;
@@ -891,6 +903,8 @@ stc_triples::triples_result stc_triples::evaluate_integrals(
                 double* amplitude_bar=t2_virtual_bar.colptr(k*no+owner)+c*nv;
                 for(size_t f=0;f<nv;++f)
                     amplitude_bar[f]+=bar_w*integral[f];
+                if(fov) t2_virtual_bar(b+nv*z[3],z[0]*no+owner)+=
+                    0.5*sample.bar_prz*rweight[r]*(*fov)(k,c);
             }
             for(size_t entry=pair_offsets[no+owner];entry<pair_offsets[no+owner+1];++entry) {
                 const size_t event=pair_events[entry];
@@ -1090,6 +1104,7 @@ stc_triples::triples_result stc_triples::evaluate_integrals(
             for(const auto& local:reverse_workers) {
                 for(size_t i=0;i<no;++i) vjp->t1(i)+=local.t1.col(i);
                 vjp->eocc+=local.eocc; vjp->evir+=local.evir;
+                vjp->fov+=local.fov;
                 if(projected) vjp->occupied_subspace+=local.occupied_subspace;
             }
             vjp_reverse_seconds+=omp_get_wtime()-reduction_start;
@@ -1100,6 +1115,7 @@ stc_triples::triples_result stc_triples::evaluate_integrals(
             for(size_t j=0;j<no;++j) vjp->t2(i,j)*=scale;
         }
         vjp->eocc*=scale; vjp->evir*=scale;
+        vjp->fov*=scale;
         if(projected) {
             vjp->occupied_subspace*=scale;
             if(occupied_projector) {

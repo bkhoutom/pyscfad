@@ -1,4 +1,4 @@
-"""Selected stochastic triples: native interface and matching Fvo-zero reference."""
+"""Selected stochastic triples: native interface and differentiable LNO reference."""
 import importlib
 import inspect
 import os
@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 from pyscfad.dlno_stc import ccsd, controls
 
-TRIPLES_KEYS = ('t1', 't2', 'Bvo', 'Boo', 'Bvv', 'eocc', 'evir', 'U')
+TRIPLES_KEYS = ('t1', 't2', 'Bvo', 'Boo', 'Bvv', 'eocc', 'evir', 'U', 'fov')
 
 
 def triples_native():
@@ -40,11 +40,11 @@ def triples_fixture(*, grouped=False):
         np.array([-1.1, -.8, -.6]) if grouped else np.array([-1.1, -.6]),
         np.array([.2, .5, .9]),
         np.array([[.6, 0.], [-.8, 0.], [0., 1.]]) if grouped else
-        np.array([[.6], [-.8]]))))
+        np.array([[.6], [-.8]]), np.zeros((no, nv)))))
 
 
-def fvo_zero_reference(t1, t2, Bvo, Boo, Bvv, eocc, evir, U):
-    """Differentiable existing LNO reference graph, omitting only its Fvo term."""
+def triples_reference(t1, t2, Bvo, Boo, Bvv, eocc, evir, U, fov):
+    """Differentiable existing LNO expression with the supplied Fov block."""
     from pyscfad.lno.ccsd_t_slow import _compute_et
     no, nv = t1.shape
     ovvv = jnp.einsum('Pia,Pbc->iabc', Bvo, Bvv)
@@ -57,15 +57,18 @@ def fvo_zero_reference(t1, t2, Bvo, Boo, Bvv, eocc, evir, U):
     return _compute_et(
         U @ U.T, t1, t2, ovvv.transpose(1, 3, 0, 2),
         ovoo.transpose(1, 0, 3, 2), ovov.transpose(1, 3, 0, 2),
-        jnp.zeros((nv, no), dtype=t1.dtype), eijk, evir,
+        fov.T, eijk, evir,
         jnp.asarray(indices, dtype=jnp.int32), jnp.asarray(factors))
 
 
-def test_native_triples_reference_energy():
+@pytest.mark.parametrize('nonzero_fov', [False, True])
+def test_native_triples_reference_energy(nonzero_fov):
     module = triples_native()
     inputs = triples_fixture()
+    if nonzero_fov:
+        inputs['fov'] = np.array([[.03, -.02, .01], [-.04, .05, -.06]])
     result = module.triples_selected_energy(**inputs, nsamples=0)
-    expected = fvo_zero_reference(**{k: jnp.asarray(v) for k, v in inputs.items()})
+    expected = triples_reference(**{k: jnp.asarray(v) for k, v in inputs.items()})
     np.testing.assert_allclose(result['energy'], expected, atol=1e-10, rtol=0)
     assert result['samples'] == 0
     assert result['standard_error'] == 0.
@@ -73,14 +76,85 @@ def test_native_triples_reference_energy():
     assert 'sha256' in module.TRIPLES_VERSION
 
 
+@pytest.mark.parametrize('with_grad', [False, True])
+def test_native_triples_optional_fov_preserves_positional_sampling(with_grad):
+    module = triples_native()
+    function = module.triples_selected_energy_vjp if with_grad else module.triples_selected_energy
+    inputs = triples_fixture()
+    fov = inputs.pop('fov')
+    # Legacy sampling controls must retain their original positional slots.
+    omitted = function(*inputs.values(), 257, 29, 0.)
+    none = function(*inputs.values(), 257, 29, 0., fov=None)
+    zero = function(*inputs.values(), 257, 29, 0., fov=fov)
+    for actual in (none, zero):
+        assert actual['energy'] == omitted['energy']
+        assert actual['samples'] == 257
+        assert actual['standard_error'] == omitted['standard_error']
+        if with_grad:
+            for name in TRIPLES_KEYS:
+                np.testing.assert_allclose(actual['cotangents'][name],
+                                           omitted['cotangents'][name], rtol=1e-13, atol=1e-15)
+    if with_grad:
+        assert np.linalg.norm(omitted['cotangents']['fov']) > 1e-8
 
-def test_multicolumn_selected_triples_matches_fvo_zero_energy_and_u_response():
+
+@pytest.mark.parametrize('nonzero_fov', [False, True])
+def test_native_triples_fov_directional_derivative(nonzero_fov):
+    module = triples_native()
+    inputs = triples_fixture()
+    direction = np.array([[.3, -.7, .2], [-.4, .6, -.5]])
+    if nonzero_fov:
+        inputs['fov'] = .1 * direction
+    options = dict(nsamples=4096, seed=29, target_standard_error=0.)
+    baseline = module.triples_selected_energy_vjp(**inputs, **options)
+    # Fov never enters the proposal; these fused calls use identical tuples.
+    step = 1e-4
+    plus = module.triples_selected_energy_vjp(
+        **{**inputs, 'fov': inputs['fov'] + step * direction}, **options)
+    minus = module.triples_selected_energy_vjp(
+        **{**inputs, 'fov': inputs['fov'] - step * direction}, **options)
+    finite_difference = (plus['energy'] - minus['energy']) / (2 * step)
+    bar = baseline['cotangents']['fov']
+    assert np.linalg.norm(bar) > 1e-8
+    np.testing.assert_allclose(np.sum(bar * direction), finite_difference,
+                               rtol=1e-8, atol=1e-11)
+
+
+def test_native_triples_nonzero_fov_t2_response():
+    module = triples_native()
+    inputs = triples_fixture()
+    options = dict(nsamples=4096, seed=29, target_standard_error=0.)
+    zero = module.triples_selected_energy_vjp(**inputs, **options)
+    inputs['fov'] = np.array([[.03, -.02, .01], [-.04, .05, -.06]])
+    nonzero = module.triples_selected_energy_vjp(**inputs, **options)
+    delta_energy = nonzero['energy'] - zero['energy']
+    delta_bar = nonzero['cotangents']['t2'] - zero['cotangents']['t2']
+    # At fixed proposal the Fov-dependent term W(t2)*V_fov(t2) is quadratic
+    # in t2. Omitting the explicit V_fov reverse term loses half this bar.
+    assert abs(delta_energy) > 1e-8
+    np.testing.assert_allclose(np.sum(inputs['t2'] * delta_bar), 2 * delta_energy,
+                               rtol=1e-10, atol=1e-13)
+
+
+@pytest.mark.parametrize('with_grad', [False, True])
+@pytest.mark.parametrize('shape', [(3, 2), (2, 2), (6,)])
+def test_native_triples_rejects_invalid_fov_shape(with_grad, shape):
+    module = triples_native()
+    function = module.triples_selected_energy_vjp if with_grad else module.triples_selected_energy
+    inputs = triples_fixture()
+    inputs['fov'] = np.zeros(shape)
+    with pytest.raises(ValueError, match='fov'):
+        function(**inputs, nsamples=2)
+
+
+
+def test_multicolumn_selected_triples_matches_reference_energy_and_u_response():
     import jax
     module = triples_native()
     inputs = triples_fixture(grouped=True)
     # Two target columns span a proper subspace of three occupied orbitals.
     # Comparing against U U.T also catches dropping or averaging target columns.
-    expected, expected_u = jax.value_and_grad(lambda u: fvo_zero_reference(
+    expected, expected_u = jax.value_and_grad(lambda u: triples_reference(
         **{**{key: jnp.asarray(value) for key, value in inputs.items()}, 'U': u}
     ))(jnp.asarray(inputs['U']))
     exact = module.triples_selected_energy(**inputs, nsamples=0)
@@ -258,12 +332,43 @@ def triples_adapter_function(with_grad, *, nsamples=257, target_standard_error=N
         settings['target_standard_error'] = target_standard_error
     solver = make_solver(settings, with_grad=with_grad)
 
-    def evaluate(t1, t2, Bvo, Boo, Bvv, eocc, evir, U):
+    def evaluate(t1, t2, Bvo, Boo, Bvv, eocc, evir, U, fov):
+        no, nv = t1.shape
+        fock = jnp.zeros((no + nv, no + nv)).at[no:, :no].set(fov.T)
         eris = SimpleNamespace(Lov=Bvo, Loo=Boo, Lvv=lib.pack_tril(Bvv),
-                               mo_energy=jnp.concatenate((eocc, evir)))
+                               mo_energy=jnp.concatenate((eocc, evir)), fock=fock)
         return solver(None, eris, U.T, t1=t1, t2=t2)
 
     return evaluate
+
+
+def test_triples_adapter_transports_fov_bar_to_full_fock():
+    import jax
+    from types import SimpleNamespace
+    from pyscfad import lib
+    from pyscfad.dlno_stc.triples import make_solver
+    inputs = triples_fixture()
+    no, nv = inputs['t1'].shape
+    # Deliberately different OV/VO blocks expose choosing the wrong half.
+    fock = np.arange((no + nv)**2, dtype=float).reshape(no + nv, no + nv) * .01
+    solver = make_solver(dict(nsamples=257, global_seed=19), with_grad=True)
+
+    def evaluate(full_fock):
+        eris = SimpleNamespace(Lov=jnp.asarray(inputs['Bvo']), Loo=jnp.asarray(inputs['Boo']),
+            Lvv=lib.pack_tril(jnp.asarray(inputs['Bvv'])),
+            mo_energy=jnp.concatenate((inputs['eocc'], inputs['evir'])), fock=full_fock)
+        return solver(None, eris, jnp.asarray(inputs['U'].T),
+                      t1=jnp.asarray(inputs['t1']), t2=jnp.asarray(inputs['t2']))
+
+    expected = triples_native().triples_selected_energy_vjp(
+        **{**inputs, 'fov': fock[no:, :no].T.copy()}, nsamples=257, seed=19)
+    value, pullback, _ = jax.vjp(evaluate, jnp.asarray(fock), has_aux=True)
+    np.testing.assert_allclose(value, expected['energy'], rtol=1e-13, atol=1e-15)
+    expected_bar = np.zeros_like(fock)
+    expected_bar[no:, :no] = -2.5 * expected['cotangents']['fov'].T
+    assert np.linalg.norm(expected_bar) > 1e-8
+    np.testing.assert_allclose(pullback(jnp.asarray(-2.5))[0], expected_bar,
+                               rtol=1e-11, atol=1e-13)
 
 
 @pytest.mark.parametrize('target', [None, 0., 2e-5])

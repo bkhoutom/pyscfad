@@ -13,14 +13,15 @@ from pyscfad import lib
 from pyscfad import numpy as np
 
 
-_INPUT_NAMES = ('t1', 't2', 'Bvo', 'Boo', 'Bvv', 'eocc', 'evir', 'U')
+_INPUT_NAMES = ('t1', 't2', 'Bvo', 'Boo', 'Bvv', 'eocc', 'evir', 'U', 'fov')
 
 
 def _native_call(inputs, *, nsamples, seed, target_standard_error, with_grad):
     native = importlib.import_module('pyscfad.dlno_stc._stc_mp2')
     function = (native.triples_selected_energy_vjp if with_grad
                 else native.triples_selected_energy)
-    result = function(*(numpy.asarray(x) for x in inputs),
+    result = function(*(numpy.asarray(x) for x in inputs[:-1]),
+                      fov=numpy.asarray(inputs[-1]),
                       nsamples=nsamples, seed=seed,
                       target_standard_error=target_standard_error)
     diagnostics = {name: value for name, value in result.items()
@@ -75,6 +76,6 @@ def make_solver(controls, *, with_grad):
         return evaluate(t1, t2, eris.Lov, eris.Loo,
                         lib.unpack_tril(eris.Lvv),
                         eris.mo_energy[:nocc], eris.mo_energy[nocc:],
-                        prjlo.T)
+                        prjlo.T, eris.fock[nocc:, :nocc].T)
 
     return solver

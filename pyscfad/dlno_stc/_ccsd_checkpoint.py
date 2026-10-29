@@ -27,7 +27,8 @@ def open_checkpoint(state, static, groups, *, checkpoint_dir, resume, options):
                    boys_grouping=static.mp2_static.boys_grouping,
                    physical_groups=static.mp2_static.physical_groups)
     triples = options.get('triples_controls')
-    if triples is not None and triples['mode'] == 'stochastic':
+    if triples is not None and (triples['mode'] == 'stochastic'
+                               or static.lis_static.smooth_frames is not None):
         payload['native_triples_version'] = _stc_mp2.TRIPLES_VERSION
     manager = RestartManager(checkpoint_dir, resume=resume, method='stc-ccsd',
                              scientific_payload=payload)

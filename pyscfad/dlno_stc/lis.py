@@ -53,6 +53,8 @@ class LISSelections:
     ``mp2_static`` holds :class:`DomainSelections`; its historical field name
     is part of the checkpoint format. Zero occupied or virtual LNO thresholds
     retain the corresponding full global active-HF space.
+    ``smooth_frames`` and ``smooth_grid``, when present, are tuples indexed
+    by physical fragment. Empty or unselected fragments have None entries.
     """
 
     mp2_static: DomainSelections
@@ -61,6 +63,8 @@ class LISSelections:
     thresh_vir: float
     internal_rank_threshold: float
     fragments: tuple[FragmentLISSelection, ...]
+    smooth_frames: object = None
+    smooth_grid: object = None
 
 
 @dataclass(frozen=True)
@@ -250,6 +254,26 @@ def _active_complement(selected, threshold):
     return stop_grad(_orthonormalize_complement(residual, thresh=threshold))
 
 
+def _smooth_density_space(density, internal, keep, full_space, coeff, overlap, frame):
+    """Transport fixed anchors through the current retained D/W projector.
+
+    Only retained/discarded eigenvalue gaps enter its custom derivative.
+    The internal target projector and the parent AO coefficients also respond.
+    """
+    from .smooth import spectral_projector, orthonormalize
+    identity = np.eye(density.shape[0], dtype=density.dtype)
+    if full_space:
+        return identity
+    projector = internal @ internal.T.conj()
+    if len(keep):
+        external = _external_density(density, internal)
+        selected = spectral_projector(tuple(int(i) for i in keep))(external)
+        complement = identity - projector
+        projector = projector + complement @ selected @ complement
+    candidate = projector @ (coeff.T.conj() @ overlap @ np.asarray(frame.anchor))
+    return orthonormalize(candidate, identity)
+
+
 def _semicanonical_space(coeff, fock):
     """Diagonalize the Fock matrix within a possibly empty AO-space block."""
 
@@ -267,6 +291,8 @@ def _assemble_full_mo_layout(
     occupied_rotation,
     virtual_rotation,
     rank_threshold,
+    smooth_frames=None,
+    overlap=None,
 ):
     """Complete the LIS to the occupied-first MO layout of the impurity solver.
 
@@ -304,14 +330,15 @@ def _assemble_full_mo_layout(
     vir_complement = _active_complement(
         virtual_rotation, rank_threshold
     )
-    occupied_lis_coeff = _semicanonical_space(
-        occupied_coeff @ occupied_rotation,
-        fock,
-    )
-    virtual_lis_coeff = _semicanonical_space(
-        virtual_coeff @ virtual_rotation,
-        fock,
-    )
+    if smooth_frames is None:
+        occupied_lis_coeff = _semicanonical_space(occupied_coeff @ occupied_rotation, fock)
+        virtual_lis_coeff = _semicanonical_space(virtual_coeff @ virtual_rotation, fock)
+    else:
+        from .smooth import rebuild_frame
+        occupied_lis_coeff = rebuild_frame(occupied_coeff @ occupied_rotation, overlap,
+                                           fock, smooth_frames[0])
+        virtual_lis_coeff = rebuild_frame(virtual_coeff @ virtual_rotation, overlap,
+                                          fock, smooth_frames[1])
     occupied_discarded_coeff = occupied_coeff @ occ_complement
     virtual_discarded_coeff = virtual_coeff @ vir_complement
 
@@ -466,15 +493,30 @@ def build_fragment_lis(mf, common, static, fragment_index, *, matrices,
         common, static.mp2_static, representative, frame, matrices)
     occupied, virtual = _matrices_in_active_spaces(common, frame, occupied_ed, virtual_ed)
     occ_projection, vir_projection = _internal_projection_matrices(common, static.mp2_static, index)
-    occ_internal = _fixed_row_space(occ_projection, selection.internal_occ_keep)
-    vir_internal = _fixed_row_space(vir_projection, selection.internal_vir_keep)
-    occ_rotation = _fixed_density_space(occupied, occ_internal, selection.occupied_lno_keep,
-                                        selection.full_occupied_space)
-    vir_rotation = _fixed_density_space(virtual, vir_internal, selection.virtual_lno_keep,
-                                        selection.full_virtual_space)
+    smooth_frames = None if static.smooth_frames is None else static.smooth_frames[index]
+    if smooth_frames is None:
+        occ_internal = _fixed_row_space(occ_projection, selection.internal_occ_keep)
+        vir_internal = _fixed_row_space(vir_projection, selection.internal_vir_keep)
+        occ_rotation = _fixed_density_space(occupied, occ_internal, selection.occupied_lno_keep,
+                                            selection.full_occupied_space)
+        vir_rotation = _fixed_density_space(virtual, vir_internal, selection.virtual_lno_keep,
+                                            selection.full_virtual_space)
+    else:
+        from .smooth import orthonormalize
+        # Every original Boys target is retained. Cholesky avoids choosing
+        # eigenvectors inside its (often exactly degenerate) Gram matrix.
+        occ_internal = orthonormalize(occ_projection.T, np.eye(occupied.shape[0]))
+        vir_internal = np.zeros((virtual.shape[0], 0), dtype=virtual.dtype)
+        occ_rotation = _smooth_density_space(occupied, occ_internal,
+            selection.occupied_lno_keep, selection.full_occupied_space,
+            common.occupied_coeff, common.s1e, smooth_frames[0])
+        vir_rotation = _smooth_density_space(virtual, vir_internal,
+            selection.virtual_lno_keep, selection.full_virtual_space,
+            common.virtual_coeff, common.s1e, smooth_frames[1])
     full_coeff, frozen, occ_coeff, vir_coeff = _assemble_full_mo_layout(
         mf, static.mp2_static, common.occupied_coeff, common.virtual_coeff,
-        common.fock, occ_rotation, vir_rotation, static.internal_rank_threshold)
+        common.fock, occ_rotation, vir_rotation, static.internal_rank_threshold,
+        smooth_frames=smooth_frames, overlap=common.s1e)
     target = _physical_target_block(common, static.mp2_static, index)
     return FragmentLIS(
         mo_coeff=full_coeff, frozen=frozen,

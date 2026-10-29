@@ -458,7 +458,7 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
                          frag_prescreen=None,
                          verbose_imp=0, ccsd_t=False, dcsd=False,
                          profile_info=None, profile_pass=None,
-                         triples_solver=None):
+                         triples_solver=None, mp2_solver=None):
     '''Numerical core of :func:`impurity_solve`; see that function for docs.
 
     Takes ``fock`` and ``s1e`` directly (rather than the parent ``eris``
@@ -552,8 +552,11 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
     # correction is added separately by the outer DLNO driver.
     phase_start = time.perf_counter()
     profile_phase = resource_profile.start()
-    t1, t2 = mcc.init_amps(eris=imp_eris)[1:]
-    elcorr_pt2 = mp2_fragment_energy(imp_eris, t2, prjlo)
+    if mp2_solver is None:
+        t1, t2 = mcc.init_amps(eris=imp_eris)[1:]
+        elcorr_pt2 = mp2_fragment_energy(imp_eris, t2, prjlo)
+    else:
+        elcorr_pt2, t1, t2 = mp2_solver(imp_eris, prjlo)
     phase_times['mp2_s'] = time.perf_counter() - phase_start
     resource_profile.finish(
         'solver.mp2_reference',

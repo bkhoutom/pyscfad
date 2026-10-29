@@ -221,3 +221,51 @@ def test_representable_real_scalars_keep_tolerance_semantics(value):
     normalized = controls.normalize_triples_controls(
         dict(mode='stochastic', nsamples=20, energy_tolerance=value), ccsd_t=True)
     assert normalized.get('energy_tolerance', 0.) == float(value)
+
+
+def test_fragment_energy_variance_budget_and_subset_are_global(public_reference):
+    from dataclasses import replace
+    static, _ = public_reference
+    energies = tuple(-float(i + 1) for i in range(16))
+    static = replace(static, mp2_fragment_energies=energies)
+    indices = (0, 3, 7)
+    supplied = dict(mode='stochastic', nsamples=20, energy_tolerance=5e-5)
+    allocated = ccsd._allocate_triples_controls(supplied, len(indices), static=static, indices=indices)
+    targets = np.array([allocated['fragment_standard_errors'][i] for i in indices])
+    np.testing.assert_allclose(targets**2 / (5e-5)**2, [1/13, 4/13, 8/13], rtol=1e-14)
+    np.testing.assert_allclose(np.linalg.norm(targets), 5e-5, rtol=1e-14)
+    assert 'fragment_standard_errors' not in supplied
+    local = ccsd._fragment_triples_controls(allocated, 3)
+    assert local['fragment_reference_energy'] == -4
+    assert local['fragment_variance_fraction'] == 4/13
+
+
+def test_explicit_ccsd_energies_override_mp2_budget(public_reference):
+    from dataclasses import replace
+    static, _ = public_reference
+    static = replace(static, mp2_fragment_energies=(-1.,)*16)
+    controls = dict(mode='stochastic', nsamples=20, energy_tolerance=1e-4,
+                    fragment_energies=(-3., -1.) + (-1.,)*14)
+    result = ccsd._allocate_triples_controls(controls, 2, static=static, indices=(0, 1))
+    np.testing.assert_allclose(list(result['fragment_variance_fractions'].values()), [.75, .25])
+    with pytest.raises(ValueError, match='one energy per physical S'):
+        ccsd._allocate_triples_controls({**controls, 'fragment_energies': (-1.,)}, 2,
+                                        static=static, indices=(0, 1))
+
+
+@pytest.mark.parametrize('energies', [(0.,)*16, (-1.,)+(0.,)*15])
+def test_zero_mp2_proxies_keep_sampling_support(public_reference, energies):
+    from dataclasses import replace
+    static, _ = public_reference
+    static = replace(static, mp2_fragment_energies=energies)
+    result = ccsd._allocate_triples_controls(dict(energy_tolerance=5e-5), 16, static=static)
+    targets = np.array(list(result['fragment_standard_errors'].values()))
+    assert np.all(targets > 0)
+    np.testing.assert_allclose(np.linalg.norm(targets), 5e-5, rtol=1e-14)
+
+
+@pytest.mark.parametrize('value', [0, 1, 1.5, True])
+def test_laplace_pilot_count_must_be_integer_at_least_two(value):
+    with pytest.raises(ValueError, match='pilot_samples'):
+        controls.normalize_triples_controls(dict(mode='stochastic', nsamples=20,
+            pilot_samples=value), ccsd_t=True)

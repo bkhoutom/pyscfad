@@ -1,4 +1,4 @@
-// Packing and validation only; the supplied numerical kernel is unchanged.
+// Packing and validation for the native triples kernels.
 #include "native/stc_triples.h"
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
@@ -125,7 +125,11 @@ py::dict selected(py::handle t1_value, py::handle t2_value,
                   py::handle bvo_value, py::handle boo_value, py::handle bvv_value,
                   py::handle eo_value, py::handle ev_value, py::handle u_value,
                   py::handle sample_value, py::handle seed_value,
-                  py::handle target_value, py::handle fov_value, bool with_vjp) {
+                  py::handle target_value, py::handle fov_value, bool with_vjp,
+                  bool whole = false, bool weighted = false,
+                  py::object pilot_value = py::none(),
+                  py::object right_value = py::none()) {
+    const bool asymmetric=!right_value.is_none();
     const auto samples=unsigned_integer(sample_value,"nsamples");
     const auto seed=unsigned_integer(seed_value,"seed");
     const auto target=standard_error_target(target_value);
@@ -133,11 +137,29 @@ py::dict selected(py::handle t1_value, py::handle t2_value,
         throw py::value_error("positive target_standard_error requires stochastic nsamples");
     if (samples > std::numeric_limits<size_t>::max())
         throw py::value_error("nsamples is too large");
-    if (samples==1 || (with_vjp && samples==0))
+    if (samples==1 || (with_vjp && samples==0 && !whole && !weighted && !asymmetric))
         throw py::value_error("nsamples must be at least two (zero is energy reference only)");
+    Triples::pilot_controls pilot{};
+    const Triples::pilot_controls* pilot_ptr=nullptr;
+    if(!pilot_value.is_none()) {
+        if(!py::isinstance<py::dict>(pilot_value))
+            throw py::type_error("pilot must be a dict or None");
+        const auto settings=pilot_value.cast<py::dict>();
+        if(settings.size()!=3 || !settings.contains("samples") ||
+           !settings.contains("seed") || !settings.contains("allocation_target"))
+            throw py::value_error("pilot requires samples, seed and allocation_target");
+        const auto count=unsigned_integer(settings["samples"],"pilot samples");
+        const auto pilot_seed=unsigned_integer(settings["seed"],"pilot seed");
+        const double allocation_target=standard_error_target(settings["allocation_target"]);
+        if(count<2 || count>std::numeric_limits<size_t>::max() || samples<2 ||
+           allocation_target<=0 || pilot_seed==seed || (!whole && !weighted && !asymmetric))
+            throw py::value_error("pilot requires distinct seeds, positive allocation_target and sample counts >=2");
+        pilot={size_t(count),pilot_seed,allocation_target};
+        pilot_ptr=&pilot;
+    }
     InputArray t1(t1_value,"t1",2), t2(t2_value,"t2",4);
     InputArray bvo(bvo_value,"Bvo",3), boo(boo_value,"Boo",3), bvv(bvv_value,"Bvv",3);
-    InputArray eo(eo_value,"eocc",1), ev(ev_value,"evir",1), u(u_value,"U",2);
+    InputArray eo(eo_value,"eocc",1), ev(ev_value,"evir",1), u(u_value,asymmetric ? "L" : "U",2);
     const auto no=t1.size(0), nv=t1.size(1), naux=bvo.size(0);
     if (no<=0 || nv<=0 || naux<=0)
         throw py::value_error("triples requires nonempty occupied, virtual, and auxiliary dimensions");
@@ -158,7 +180,15 @@ py::dict selected(py::handle t1_value, py::handle t2_value,
     if (evir.min()<=eocc.max())
         throw py::value_error("triples requires a positive occupied-virtual gap");
     const auto subspace=matrix(u);
-    if (arma::norm(subspace.t()*subspace-arma::eye<arma::mat>(u.size(1),u.size(1)),"fro")>1e-8)
+    arma::mat right;
+    if(asymmetric) {
+        InputArray input(right_value,"R",2);
+        input.shape({no,u.size(1)});
+        right=matrix(input);
+    }
+    if (weighted && u.size(1)!=no)
+        throw py::value_error("M must have shape (nocc, nocc)");
+    if (!weighted && !asymmetric && arma::norm(subspace.t()*subspace-arma::eye<arma::mat>(u.size(1),u.size(1)),"fro")>1e-8)
         throw py::value_error("U columns must be orthonormal (Frobenius tolerance 1e-8)");
     arma::field<arma::vec> singles(no);
     arma::field<arma::mat> doubles(no,no);
@@ -176,7 +206,19 @@ py::dict selected(py::handle t1_value, py::handle t2_value,
     Triples::triples_vjp bars;
     {
         py::gil_scoped_release release;
-        if (with_vjp)
+        if (asymmetric)
+            result=Triples::asymmetric_triples(singles,doubles,Bvo,Boo,Bvv,
+                subspace,right,size_t(samples),seed,target,
+                with_vjp ? &bars : nullptr,1.0,fov_ptr,pilot_ptr);
+        else if (weighted)
+            result=Triples::weighted_triples(singles,doubles,Bvo,Boo,Bvv,
+                eocc,evir,subspace,size_t(samples),seed,target,
+                with_vjp ? &bars : nullptr,1.0,fov_ptr,pilot_ptr);
+        else if (whole)
+            result=Triples::whole_triples(singles,doubles,Bvo,Boo,Bvv,
+                eocc,evir,size_t(samples),seed,target,
+                with_vjp ? &bars : nullptr,1.0,fov_ptr,pilot_ptr);
+        else if (with_vjp)
             result=Triples::selected_energy_vjp(singles,doubles,Bvo,Boo,Bvv,
                 eocc,evir,subspace,size_t(samples),bars,seed,target,1.0,fov_ptr);
         else
@@ -193,11 +235,27 @@ py::dict selected(py::handle t1_value, py::handle t2_value,
     out["sampling_seconds"]=result.sampling_seconds;
     out["amplitude_packing_seconds"]=result.amplitude_packing_seconds;
     out["vjp_reverse_seconds"]=result.vjp_reverse_seconds;
+    out["independent_pilot_samples"]=result.independent_pilot_samples;
+    out["independent_pilot_standard_error"]=result.independent_pilot_standard_error;
+    out["independent_pilot_seconds"]=result.independent_pilot_seconds;
+    out["projection_setup_seconds"]=result.projection_setup_seconds;
+    out["resident_tensor_bytes"]=result.resident_tensor_bytes;
+    out["proposal_bytes"]=result.proposal_bytes;
+    out["reverse_buffer_bytes"]=result.reverse_buffer_bytes;
+    out["vjp_grouping_seconds"]=result.vjp_grouping_seconds;
+    out["vjp_accumulation_seconds"]=result.vjp_accumulation_seconds;
+    out["vjp_finalize_seconds"]=result.vjp_finalize_seconds;
+
     py::dict timings;
     timings["probability_setup_seconds"]=result.probability_setup_seconds;
     timings["sampling_seconds"]=result.sampling_seconds;
     timings["amplitude_packing_seconds"]=result.amplitude_packing_seconds;
     timings["vjp_reverse_seconds"]=result.vjp_reverse_seconds;
+    timings["independent_pilot_seconds"]=result.independent_pilot_seconds;
+    timings["projection_setup_seconds"]=result.projection_setup_seconds;
+    timings["vjp_grouping_seconds"]=result.vjp_grouping_seconds;
+    timings["vjp_accumulation_seconds"]=result.vjp_accumulation_seconds;
+    timings["vjp_finalize_seconds"]=result.vjp_finalize_seconds;
     out["timings"]=timings;
     if (with_vjp) {
         py::dict cotangents;
@@ -213,8 +271,15 @@ py::dict selected(py::handle t1_value, py::handle t2_value,
         cotangents["Bvo"]=df_array(bars.Bvo,no,nv);
         cotangents["Boo"]=df_array(bars.Boo,no,no);
         cotangents["Bvv"]=df_array(bars.Bvv,nv,nv);
-        cotangents["eocc"]=array(bars.eocc); cotangents["evir"]=array(bars.evir);
-        cotangents["U"]=array(bars.occupied_subspace);
+        if (!asymmetric) {
+            cotangents["eocc"]=array(bars.eocc); cotangents["evir"]=array(bars.evir);
+        }
+        if (asymmetric) {
+            cotangents["L"]=array(bars.occupied_left);
+            cotangents["R"]=array(bars.occupied_right);
+        }
+        else if (weighted) cotangents["M"]=array(bars.occupied_matrix);
+        else if (!whole) cotangents["U"]=array(bars.occupied_subspace);
         cotangents["fov"]=array(bars.fov);
         out["cotangents"]=cotangents;
     }
@@ -223,11 +288,73 @@ py::dict selected(py::handle t1_value, py::handle t2_value,
 }  // namespace
 
 namespace pyscfad { namespace dlno_stc {
+void bind_triples_dressing(py::module_& module);
 void bind_triples(py::module_& module) {
-    // str is immutable; identity is fixed by the two byte-identical vendored sources.
+    bind_triples_dressing(module);
+    // Immutable identity covers the extended native numerical sources and binding.
     module.attr("TRIPLES_VERSION")=
-        "stc_triples:sha256:h=72dafa4934ba1f6462638908ef1a1d4d38a325271e16e3e99087e7ff6ddf4825:"
-        "C=842d28759061c13474fb2f69bf62120ff50ab63035aa12623f24599d27e49a0f:binding-3";
+        "stc_triples:sha256:h=3f1f01843d80421cf3f7be5562bc88002892872eb2a037cb6320ad6e2e6ff05a:C=ada2f62e1e8c857e6973821983dc3381c2ad19f6cb6b09c1f1038f2b78fbacf4:asym=d1a7bbf897b12a1a4469ef685245108e563e9ede32ca3dde2dff74badb46b4e8:sampler=3cb84a2fd873ab706d3b67b9f0f9f3119981d22a9ca291535075dd78072f7a96:dressing=f68478f3099ab8979264aa6ab94d32ed8679363f7f0c2d13db77dbdebcccce37:mp2_gradient=496fea31c8e455f6d6e6d84238d6aff9915607cde3649c3434fbe21f0efcc573:binding-8";
+    for (bool vjp : {false,true}) {
+        module.def(vjp ? "triples_asymmetric_energy_vjp" : "triples_asymmetric_energy",
+            [vjp](py::handle t1,py::handle t2,py::handle Bvo,py::handle Boo,
+                  py::handle Bvv,py::handle L,py::object R,py::handle nsamples,
+                  py::handle seed,py::handle target_standard_error,py::handle fov,py::object pilot) {
+                if(R.is_none()) throw py::type_error("R must be a NumPy float64 array");
+                InputArray singles(t1,"t1",2);
+                py::array_t<double> eo(singles.size(0)),ev(singles.size(1));
+                for(py::ssize_t i=0;i<singles.size(0);++i) eo.mutable_data()[i]=-1./3;
+                for(py::ssize_t a=0;a<singles.size(1);++a) ev.mutable_data()[a]=0.;
+                return selected(t1,t2,Bvo,Boo,Bvv,eo,ev,L,nsamples,seed,
+                    target_standard_error,fov,vjp,false,false,pilot,R);
+            },py::arg("t1"),py::arg("t2"),py::arg("Bvo"),py::arg("Boo"),py::arg("Bvv"),
+              py::arg("L"),py::arg("R"),py::arg("nsamples"),py::arg("seed")=71,
+              py::arg("target_standard_error")=0.,py::kw_only(),py::arg("fov")=py::none(),
+              py::arg("pilot")=py::none(),
+              "Laplace numerator with direct S contraction and M=L R^T; denominator is -1. "
+              "nsamples=0 enumerates an exact small-system reference.");
+    }
+    for (bool vjp : {false, true}) {
+        module.def(vjp ? "triples_weighted_energy_vjp" : "triples_weighted_energy",
+            [vjp](py::handle t1, py::handle t2, py::handle Bvo, py::handle Boo,
+                  py::handle Bvv, py::handle eocc, py::handle evir, py::handle M,
+                  py::handle nsamples, py::handle seed,
+                  py::handle target_standard_error, py::handle fov, py::object pilot) {
+                return selected(t1,t2,Bvo,Boo,Bvv,eocc,evir,M,nsamples,seed,
+                                target_standard_error,fov,vjp,false,true,pilot);
+            }, py::arg("t1"),py::arg("t2"),py::arg("Bvo"),py::arg("Boo"),
+               py::arg("Bvv"),py::arg("eocc"),py::arg("evir"),py::arg("M"),
+               py::arg("nsamples"),py::arg("seed")=71,
+               py::arg("target_standard_error")=0.0,
+               py::kw_only(),py::arg("fov")=py::none(),py::arg("pilot")=py::none(),
+               "General occupied weight M (including nonsymmetric Laplace dressing); "
+               "nsamples=0 enumerates a small deterministic energy/VJP reference. "
+               "Optional pilot={samples,seed,allocation_target} reuses preparation "
+               "and makes nsamples the minimum production count.");
+    }
+    // Whole-LIS entry points also expose the native deterministic VJP. The
+    // whole-space contractions are retained; U is only a packing placeholder.
+    for (bool vjp : {false, true}) {
+        module.def(vjp ? "triples_whole_energy_vjp" : "triples_whole_energy",
+            [vjp](py::handle t1, py::handle t2, py::handle Bvo, py::handle Boo,
+                  py::handle Bvv, py::handle eocc, py::handle evir,
+                  py::handle nsamples, py::handle seed,
+                  py::handle target_standard_error, py::handle fov, py::object pilot) {
+                InputArray singles(t1,"t1",2);
+                const auto no=singles.size(0);
+                py::array_t<double> identity({no,no});
+                auto u=identity.mutable_unchecked<2>();
+                for (py::ssize_t i=0; i<no; ++i)
+                    for (py::ssize_t j=0; j<no; ++j) u(i,j)=double(i==j);
+                return selected(t1,t2,Bvo,Boo,Bvv,eocc,evir,identity,
+                    nsamples,seed,target_standard_error,fov,vjp,true,false,pilot);
+            }, py::arg("t1"),py::arg("t2"),py::arg("Bvo"),py::arg("Boo"),
+               py::arg("Bvv"),py::arg("eocc"),py::arg("evir"),
+               py::arg("nsamples"),py::arg("seed")=71,
+               py::arg("target_standard_error")=0.0,
+               py::kw_only(),py::arg("fov")=py::none(),py::arg("pilot")=py::none(),
+               "Optional pilot={samples,seed,allocation_target} reuses preparation "
+               "and makes nsamples the minimum production count.");
+    }
     module.def("triples_selected_energy", [](py::handle t1, py::handle t2,
         py::handle Bvo, py::handle Boo, py::handle Bvv, py::handle eocc,
         py::handle evir, py::handle U, py::handle nsamples, py::handle seed,

@@ -7,7 +7,7 @@ find_package(Armadillo REQUIRED)
 find_package(OpenMP REQUIRED COMPONENTS CXX)
 pybind11_add_module(_stc_mp2 NO_EXTRAS bindings.cpp stc_mp2_kernel.cpp stc_mp2_gradient.cpp stc_mp2_full.cpp stc_mp2_selected.cpp stc_mp2_matrices.cpp
     native/stc_mp2_kernel_numerical.cpp native/stc_mp2_gradient_numerical.cpp
-    stc_triples_bindings.cpp native/stc_triples.C)
+    stc_triples_bindings.cpp stc_triples_dressing.cpp native/stc_triples.C native/stc_triples_asymmetric.C)
 target_compile_features(_stc_mp2 PRIVATE cxx_std_14)
 target_include_directories(_stc_mp2 PRIVATE ${ARMADILLO_INCLUDE_DIRS})
 target_link_libraries(_stc_mp2 PRIVATE ${ARMADILLO_LIBRARIES} OpenMP::OpenMP_CXX ${CMAKE_DL_LIBS})

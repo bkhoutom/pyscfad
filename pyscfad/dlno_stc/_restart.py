@@ -143,9 +143,10 @@ def _static_registry():
     )
     from .lis import FragmentLISSelection, LISSelections
     from .ccsd import CCSDSelections
+    from .smooth import BlockFrame
     classes = (BoysDomainThresholds, FixedPAOSubspaceSelection,
                FragmentDomainSelection, DomainSelections, DomainGroup,
-               FragmentLISSelection, LISSelections, CCSDSelections)
+               FragmentLISSelection, LISSelections, CCSDSelections, BlockFrame)
     return {_class_tag(cls): cls for cls in classes}
 
 
@@ -416,7 +417,7 @@ def _decode_value(node, reader):
         names = tuple(pair[0] for pair in fields)
         required_grouping = {
             "DomainSelections": {"boys_grouping", "physical_groups"},
-            "CCSDSelections": {"schema_version"},
+            "CCSDSelections": {"schema_version", "mp2_fragment_energies"},
         }.get(cls.__name__, set())
         if not required_grouping.issubset(names):
             raise RestartMismatchError(

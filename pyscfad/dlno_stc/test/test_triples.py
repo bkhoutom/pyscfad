@@ -188,7 +188,9 @@ def test_native_triples_accepts_strides_without_changing_tensor_order():
         assert actual['standard_error'] == expected['standard_error']
         if 'cotangents' in actual:
             for key in TRIPLES_KEYS:
-                np.testing.assert_array_equal(actual['cotangents'][key], expected['cotangents'][key])
+                # OpenMP worker reduction order can differ at the last bit.
+                np.testing.assert_allclose(actual['cotangents'][key], expected['cotangents'][key],
+                                           rtol=1e-13, atol=1e-16)
 
 
 def test_native_triples_fused_returns_only_df_input_cotangents():
@@ -287,8 +289,11 @@ def test_native_triples_zero_tolerance_preserves_fixed_samples(with_grad):
     assert zero['samples'] == 257
     if with_grad:
         for name in TRIPLES_KEYS:
-            np.testing.assert_array_equal(zero['cotangents'][name],
-                                          omitted['cotangents'][name])
+            # Parallel cotangent reductions may change their addition order.
+            # The sampling stream and scalar diagnostics above remain exact.
+            np.testing.assert_allclose(zero['cotangents'][name],
+                                       omitted['cotangents'][name],
+                                       rtol=1e-13, atol=1e-16)
 
 
 @pytest.mark.parametrize('with_grad', [False, True])

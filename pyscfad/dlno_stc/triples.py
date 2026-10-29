@@ -45,6 +45,8 @@ def make_solver(controls, *, with_grad):
     nsamples = controls['nsamples']
     seed = controls['global_seed']
     target_standard_error = controls.get('target_standard_error', 0.0)
+    if target_standard_error:
+        nsamples = controls.get('pilot_samples', nsamples)
 
     def native_call(*inputs):
         return _native_call(inputs, nsamples=nsamples, seed=seed,

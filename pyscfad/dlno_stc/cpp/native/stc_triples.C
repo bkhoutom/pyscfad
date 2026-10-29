@@ -1,4 +1,5 @@
 #include "stc_triples.h"
+#include "triples_block_sampler.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -17,79 +18,7 @@
 namespace libgmbpt { namespace qchem {
 
 namespace {
-// Alias-sample a row/block pair, then scan the selected final-index block.
-// Store only block sums and alias metadata; read element weights from the
-// original integral/amplitude tensor. No full conditional table is allocated.
-class triples_block_sampler {
-    size_t last_, block_size_, nblocks_;
-    std::vector<double> mass_, probability_;
-    std::vector<size_t> alias_;
-public:
-    double total;
-    triples_block_sampler(size_t rows, size_t last, size_t block_size) :
-        last_(last), block_size_(block_size), nblocks_((last-1)/block_size+1),
-        mass_(rows*nblocks_,0.0), probability_(rows*nblocks_,1.0),
-        alias_(rows*nblocks_), total(0.0) { }
-    // Distinct rows may be populated concurrently; finalize after the barrier.
-    void set_mass(size_t row,size_t block,double value) {
-        mass_[row*nblocks_+block]=value;
-    }
-    template<typename Value>
-    triples_block_sampler(size_t rows, size_t last, size_t block_size, Value value) :
-        triples_block_sampler(rows,last,block_size) {
-        for(size_t row=0;row<rows;++row) for(size_t b=0;b<nblocks_;++b) {
-            double sum=0;
-            for(size_t k=b*block_size_;k<std::min(last_,(b+1)*block_size_);++k) {
-                const double v=value(row*last_+k); sum+=v*v;
-            }
-            mass_[row*nblocks_+b]=sum;
-        }
-        finalize();
-    }
-    void finalize() {
-        // Preserve the original row/block summation order, independently of
-        // the schedule used to populate masses.
-        total=std::accumulate(mass_.begin(),mass_.end(),0.0);
-        if(!std::isfinite(total)) throw std::runtime_error("(T): block weights overflowed");
-        if(total==0) return; // A zero-weight channel is never sampled.
-        const size_t count=mass_.size();
-        std::vector<size_t> small,large;
-        for(size_t k=0;k<count;++k) {
-            alias_[k]=k;
-            probability_[k]=(mass_[k]/total)*double(count);
-            (probability_[k]<1 ? small : large).push_back(k);
-        }
-        while(!small.empty() && !large.empty()) {
-            const size_t a=small.back(); small.pop_back();
-            const size_t b=large.back(); large.pop_back();
-            alias_[a]=b;
-            probability_[b]=(probability_[b]+probability_[a])-1;
-            (probability_[b]<1 ? small : large).push_back(b);
-        }
-        for(size_t k:small) probability_[k]=1;
-        for(size_t k:large) probability_[k]=1;
-    }
-    template<typename Value>
-    size_t draw(std::mt19937_64& rng, Value value) const {
-        std::uniform_int_distribution<size_t> integer(0,mass_.size()-1);
-        std::uniform_real_distribution<double> uniform(0,1);
-        const size_t trial=integer(rng);
-        const size_t selected=uniform(rng)<probability_[trial] ? trial : alias_[trial];
-        const size_t row=selected/nblocks_, b=selected%nblocks_;
-        double remaining=uniform(rng)*mass_[selected];
-        size_t last_positive=row*last_+b*block_size_;
-        for(size_t k=b*block_size_;k<std::min(last_,(b+1)*block_size_);++k) {
-            const size_t index=row*last_+k;
-            const double v=value(index), weight=v*v;
-            if(weight>0) {
-                last_positive=index;
-                if(remaining<weight) return index;
-            }
-            remaining-=weight;
-        }
-        return last_positive; // Roundoff at the upper end of the block CDF.
-    }
-};
+using detail::triples_block_sampler;
 
 void pullback_df_bars(stc_triples::triples_vjp& bar,
                      const arma::mat& Bvo,const arma::mat& Boo,
@@ -239,14 +168,15 @@ stc_triples::triples_result stc_triples::whole_triples(
     const arma::mat& Bvo, const arma::mat& Boo, const arma::mat& Bvv,
     const arma::vec& eocc, const arma::vec& evir, size_t nsamples,
     std::uint64_t seed, double target_standard_error,
-    triples_vjp* vjp, double cotangent, const arma::mat* fov) {
+    triples_vjp* vjp, double cotangent, const arma::mat* fov,
+    const pilot_controls* pilot) {
     const size_t no=eocc.n_elem,nv=evir.n_elem;
     if (Bvo.n_cols!=no*nv || Boo.n_cols!=no*no || Bvv.n_cols!=nv*nv ||
         Bvo.n_rows!=Boo.n_rows || Bvo.n_rows!=Bvv.n_rows)
         throw std::invalid_argument("(T): inconsistent DF tensor dimensions");
-    const auto result=whole_triples_integrals(t1,t2,Bvv.t()*Bvo,
+    const auto result=evaluate_integrals(t1,t2,Bvv.t()*Bvo,
         Bvo.t()*Boo,Bvo.t()*Bvo,eocc,evir,nsamples,seed,
-        target_standard_error,vjp,cotangent,fov);
+        target_standard_error,vjp,cotangent,nullptr,nullptr,fov,nullptr,pilot);
     if(vjp) pullback_df_bars(*vjp,Bvo,Boo,Bvv);
     return result;
 }
@@ -297,6 +227,24 @@ stc_triples::triples_result stc_triples::projected_triples_stochastic(
     return result;
 }
 
+stc_triples::triples_result stc_triples::weighted_triples(
+    const arma::field<arma::vec>& t1, const arma::field<arma::mat>& t2,
+    const arma::mat& Bvo, const arma::mat& Boo, const arma::mat& Bvv,
+    const arma::vec& eocc, const arma::vec& evir, const arma::mat& weight,
+    size_t nsamples, std::uint64_t seed, double target_standard_error,
+    triples_vjp* vjp, double cotangent, const arma::mat* fov,
+    const pilot_controls* pilot) {
+    const size_t no=eocc.n_elem,nv=evir.n_elem;
+    if (Bvo.n_cols!=no*nv || Boo.n_cols!=no*no || Bvv.n_cols!=nv*nv ||
+        Bvo.n_rows!=Boo.n_rows || Bvo.n_rows!=Bvv.n_rows)
+        throw std::invalid_argument("(T): inconsistent DF tensor dimensions");
+    const auto result=evaluate_integrals(t1,t2,Bvv.t()*Bvo,Bvo.t()*Boo,
+        Bvo.t()*Bvo,eocc,evir,nsamples,seed,target_standard_error,
+        vjp,cotangent,nullptr,nullptr,fov,&weight,pilot);
+    if(vjp) pullback_df_bars(*vjp,Bvo,Boo,Bvv);
+    return result;
+}
+
 stc_triples::triples_result stc_triples::evaluate_integrals(
     const arma::field<arma::vec>& t1, const arma::field<arma::mat>& t2,
     const arma::mat& ovvv, const arma::mat& ovoo, const arma::mat& ovov,
@@ -305,15 +253,19 @@ stc_triples::triples_result stc_triples::evaluate_integrals(
     triples_vjp* vjp, double cotangent,
     const arma::vec* occupied_projector,
     const arma::mat* occupied_subspace,
-    const arma::mat* fov) {
+    const arma::mat* fov, const arma::mat* occupied_matrix,
+    const pilot_controls* pilot) {
     const size_t no=eocc.n_elem, nv=evir.n_elem;
+    if(pilot && (pilot->samples<2 || nsamples<2 || pilot->seed==seed ||
+                 !std::isfinite(pilot->allocation_target) || pilot->allocation_target<=0))
+        throw std::invalid_argument("(T): independent pilot needs distinct seeds, positive target and sample counts >=2");
     if(fov && (fov->n_rows!=no || fov->n_cols!=nv || !fov->is_finite()))
         throw std::invalid_argument("(T): invalid Fov dimensions or values");
-    const bool projected=occupied_projector || occupied_subspace;
-    if(occupied_projector && occupied_subspace)
+    const bool projected=occupied_projector || occupied_subspace || occupied_matrix;
+    if(int(bool(occupied_projector))+int(bool(occupied_subspace))+int(bool(occupied_matrix))>1)
         throw std::invalid_argument("(T): choose one selected-projector representation");
     arma::mat selected_orbitals;
-    if(projected) {
+    if(projected && !occupied_matrix) {
         selected_orbitals=occupied_subspace ? *occupied_subspace :
             arma::mat(*occupied_projector);
         if(selected_orbitals.n_rows!=no || selected_orbitals.n_cols==0 ||
@@ -323,8 +275,11 @@ stc_triples::triples_result stc_triples::evaluate_integrals(
                                     selected_orbitals.n_cols),"fro")>1e-8)
             throw std::invalid_argument("(T): selected occupied orbitals must be orthonormal");
     }
-    const arma::mat projector=projected ? selected_orbitals*selected_orbitals.t() :
-        arma::mat();
+    if(occupied_matrix && (occupied_matrix->n_rows!=no || occupied_matrix->n_cols!=no ||
+                          !occupied_matrix->is_finite()))
+        throw std::invalid_argument("(T): occupied weight must be a finite square matrix");
+    const arma::mat projector=occupied_matrix ? *occupied_matrix :
+        (projected ? arma::mat(selected_orbitals*selected_orbitals.t()) : arma::mat());
     const bool whole_vjp=vjp && !projected;
     const char* vjp_proposal_setting=std::getenv("STC_TRIPLES_VJP_PROPOSAL");
     if(!vjp_proposal_setting)
@@ -337,7 +292,7 @@ stc_triples::triples_result stc_triples::evaluate_integrals(
     const double abs_weight_sum=double(no);
     if(vjp && !std::isfinite(cotangent))
         throw std::invalid_argument("(T): VJP requires a finite cotangent");
-    if(projected && vjp && nsamples==0)
+    if(projected && !occupied_matrix && vjp && nsamples==0)
         throw std::invalid_argument("(T): projected VJP requires stochastic samples");
     if(!std::isfinite(target_standard_error) || target_standard_error<0 ||
         (target_standard_error>0 && nsamples==0))
@@ -368,13 +323,14 @@ stc_triples::triples_result stc_triples::evaluate_integrals(
         }
         vjp->eocc.zeros(no); vjp->evir.zeros(nv); vjp->fov.zeros(no,nv);
         if(occupied_projector) vjp->occupied_projector.zeros(no);
-        if(projected)
+        if(occupied_matrix) vjp->occupied_matrix.zeros(no,no);
+        else if(projected)
             vjp->occupied_subspace.zeros(no,selected_orbitals.n_cols);
         vjp->ovvv.zeros(nv*nv,no*nv); vjp->ovoo.zeros(no*nv,no*no);
         vjp->ovov.zeros(no*nv,no*nv);
     }
     if (no == 0 || nv == 0) return {0.0, 0.0, 0};
-    if(projected && nsamples==0) {
+    if(projected && !occupied_matrix && nsamples==0) {
         triples_result result={projected_triples_integrals(t1,t2,ovvv,ovoo,ovov,
             eocc,evir,selected_orbitals,fov),0.0,0};
         return result;
@@ -569,7 +525,40 @@ stc_triples::triples_result stc_triples::evaluate_integrals(
                                 const index_type x{{i,j,k,a,b,c}};
                                 double pw = 0;
                                 for (size_t p=0; p<6; ++p) pw += w(pair_permute(x,p));
-                                if(whole_vjp) {
+                                if(occupied_matrix) {
+                                    // M acts on the first occupied leg of the
+                                    // denominator-bearing numerator (the right side).
+                                    double cross=0.;
+                                    for(size_t q=0;q<no;++q) {
+                                        auto y=x; y[0]=q;
+                                        const double prz=rz_orbit_sum(y), d=denominator(y);
+                                        const double m=projector(i,q);
+                                        cross+=m*prz/d;
+                                        if(vjp && cotangent!=0) {
+                                            const double factor=cotangent*pw/3.;
+                                            add_bar(vjp->occupied_matrix(i,q),factor*prz/d);
+                                            const double bar_prz=factor*m/d;
+                                            const double bar_d=-bar_prz*prz/d;
+                                            for(size_t leg=0;leg<3;++leg) {
+                                                add_bar(vjp->eocc(y[leg]),bar_d);
+                                                add_bar(vjp->evir(y[leg+3]),-bar_d);
+                                            }
+                                            for(size_t p=0;p<6;++p) {
+                                                const auto z=pair_permute(y,p);
+                                                for(size_t r=0;r<6;++r) {
+                                                    auto u=z;
+                                                    for(size_t leg=0;leg<3;++leg) u[leg]=z[perm[r][leg]];
+                                                    backward_w(u,bar_prz*rweight[r]);
+                                                    backward_v(u,0.5*bar_prz*rweight[r]);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    energy+=pw*cross/3.;
+                                    if(vjp && cotangent!=0)
+                                        for(size_t p=0;p<6;++p)
+                                            backward_w(pair_permute(x,p),cotangent*cross/3.);
+                                } else if(whole_vjp) {
                                     // Sum the symmetrized integrand for the
                                     // fused whole-system VJP.
                                     double prz=0;
@@ -736,6 +725,11 @@ stc_triples::triples_result stc_triples::evaluate_integrals(
         const double floor=vjp ? 0.05*std::accumulate(projector_masses.begin(),
             projector_masses.end(),0.0)/double(no) : 0.;
         for(double& mass:projector_masses) mass+=floor;
+        // A zero general weight has zero energy but a nonzero derivative
+        // with respect to its entries. Preserve proposal support for that VJP.
+        if(occupied_matrix && std::accumulate(projector_masses.begin(),
+                                             projector_masses.end(),0.0)==0.)
+            std::fill(projector_masses.begin(),projector_masses.end(),1.);
     }
     const double projector_l1=std::accumulate(projector_masses.begin(),
         projector_masses.end(),0.0);
@@ -781,6 +775,7 @@ stc_triples::triples_result stc_triples::evaluate_integrals(
         arma::mat t1,fov;
         arma::vec eocc,evir;
         arma::mat occupied_subspace;
+        arma::mat occupied_matrix;
     };
     // One shared T2 adjoint in the same transposed virtual layout as the
     // forward contraction. The second event pass partitions its columns by
@@ -796,7 +791,8 @@ stc_triples::triples_result stc_triples::evaluate_integrals(
             local.t1.zeros(nv,no);
             local.fov.zeros(no,nv);
             local.eocc.zeros(no); local.evir.zeros(nv);
-            if(projected)
+            if(occupied_matrix) local.occupied_matrix.zeros(no,no);
+            else if(projected)
                 local.occupied_subspace.zeros(no,selected_orbitals.n_cols);
         }
     }
@@ -808,6 +804,8 @@ stc_triples::triples_result stc_triples::evaluate_integrals(
     auto reverse_chunk=[&](const std::vector<reverse_sample>& samples,
                            size_t first,size_t count) {
         if(count==0) return;
+        if(count>std::numeric_limits<std::uint32_t>::max()/36)
+            throw std::overflow_error("(T): reverse chunk exceeds 32-bit event capacity");
         const double started=omp_get_wtime();
         const size_t rows=no*nv;
         std::vector<size_t> offsets(rows+1,0);
@@ -828,8 +826,8 @@ stc_triples::triples_result stc_triples::evaluate_integrals(
         for(size_t owner=0;owner<2*no;++owner)
             pair_offsets[owner+1]+=pair_offsets[owner];
         std::vector<size_t> cursor(offsets.begin(),offsets.end()-1);
-        // A reverse chunk contains at most 16*2048*4 records, so its event
-        // IDs fit in 32 bits even for selected-S's 36 Pz events per record.
+        // Event IDs encode record*36 + permutation. The check above keeps
+        // these compact even as the chunk size follows the OpenMP team size.
         std::vector<std::uint32_t> events(offsets.back());
         for(size_t n=0;n<count;++n) for(size_t p=0;p<6;++p) {
             const auto y=pair_permute(samples[first+n].x,p);
@@ -921,21 +919,27 @@ stc_triples::triples_result stc_triples::evaluate_integrals(
         }
         vjp_reverse_seconds+=omp_get_wtime()-started;
     };
+    // Both streams use the same proposal, including its gradient-support
+    // mixture. The discarded pilot records no tensor adjoints.
+    auto sample_stream=[&](size_t nsamples,std::uint64_t seed,
+                            double target_standard_error,bool accumulate_gradient) {
     moments all{0,0.0,0.0};
     size_t round_samples=nsamples, batch_offset=0;
     double pilot_error=0, standard_error=0;
     do {
     const size_t nbatches=(round_samples-1)/batch_size+1;
     std::vector<moments> batches(nbatches, moments{0,0.0,0.0});
-    // Reverse each fixed group of logical batches before sampling the next.
+    // Reverse each group of logical batches before sampling the next.
     // This bounds the saved draws and event lists even for a large adaptive
     // continuation, while the per-batch RNG streams and merge order stay fixed.
-    const size_t reverse_batches=reverse_workers.empty() ? nbatches : size_t(16);
+    // Offer one batch per thread in the observed setup team, respecting
+    // OpenMP thread limits rather than assuming a fixed number of workers.
+    const size_t reverse_batches=accumulate_gradient ? size_t(setup_threads) : nbatches;
     for(size_t first_batch=0;first_batch<nbatches;first_batch+=reverse_batches) {
     const size_t block_batches=std::min(reverse_batches,nbatches-first_batch);
     const size_t block_draws=std::min(round_samples-first_batch*batch_size,
         block_batches*batch_size);
-    std::vector<reverse_sample> reverse_records(reverse_workers.empty() ? 0 :
+    std::vector<reverse_sample> reverse_records(!accumulate_gradient ? 0 :
         block_draws*(projected ? 4 : 1));
     #pragma omp parallel
     {
@@ -1025,11 +1029,12 @@ stc_triples::triples_result stc_triples::evaluate_integrals(
                                 reverse_records[record_offset+leg+1]={y,0.,
                                     factor*projector_weight/d,
                                     -factor*projector_weight*prz_cross/(d*d)};
-                                auto& bar_u=reverse_workers[size_t(omp_get_thread_num())].occupied_subspace;
-                                for(size_t s=0;s<selected_orbitals.n_cols;++s) {
-                                    const double bar_p=factor*prz_cross/d;
-                                    bar_u(x[leg],s)+=bar_p*selected_orbitals(i,s);
-                                    bar_u(i,s)+=bar_p*selected_orbitals(x[leg],s);
+                                auto& local=reverse_workers[size_t(omp_get_thread_num())];
+                                const double bar_p=factor*prz_cross/d;
+                                if(occupied_matrix) local.occupied_matrix(x[leg],i)+=bar_p;
+                                else for(size_t s=0;s<selected_orbitals.n_cols;++s) {
+                                    local.occupied_subspace(x[leg],s)+=bar_p*selected_orbitals(i,s);
+                                    local.occupied_subspace(i,s)+=bar_p*selected_orbitals(x[leg],s);
                                 }
                             }
                         }
@@ -1093,6 +1098,30 @@ stc_triples::triples_result stc_triples::evaluate_integrals(
     if(all.count>std::numeric_limits<size_t>::max()-round_samples)
         throw std::overflow_error("(T): adaptive sample count overflow");
     } while(true);
+    triples_result result{};
+    result.energy=all.mean;
+    result.standard_error=standard_error;
+    result.samples=all.count;
+    result.pilot_samples=nsamples;
+    result.pilot_standard_error=pilot_error;
+    return result;
+    };
+    size_t independent_pilot_samples=0;
+    double independent_pilot_error=0., independent_pilot_seconds=0.;
+    if(pilot) {
+        const double started=omp_get_wtime();
+        const auto trial=sample_stream(pilot->samples,pilot->seed,0.,false);
+        independent_pilot_samples=trial.samples;
+        independent_pilot_error=trial.standard_error;
+        const double sigma=trial.standard_error*std::sqrt(double(trial.samples));
+        const double ratio=sigma/pilot->allocation_target;
+        const double required=std::ceil(ratio*ratio);
+        if(!std::isfinite(required) || required>=double(std::numeric_limits<std::int64_t>::max()))
+            throw std::overflow_error("(T): pilot production allocation exceeds int64 capacity");
+        nsamples=std::max(nsamples,size_t(required));
+        independent_pilot_seconds=omp_get_wtime()-started;
+    }
+    auto result=sample_stream(nsamples,seed,target_standard_error,!reverse_workers.empty());
     if(vjp) {
         if(!reverse_workers.empty()) {
             const double reduction_start=omp_get_wtime();
@@ -1105,18 +1134,20 @@ stc_triples::triples_result stc_triples::evaluate_integrals(
                 for(size_t i=0;i<no;++i) vjp->t1(i)+=local.t1.col(i);
                 vjp->eocc+=local.eocc; vjp->evir+=local.evir;
                 vjp->fov+=local.fov;
-                if(projected) vjp->occupied_subspace+=local.occupied_subspace;
+                if(occupied_matrix) vjp->occupied_matrix+=local.occupied_matrix;
+                else if(projected) vjp->occupied_subspace+=local.occupied_subspace;
             }
             vjp_reverse_seconds+=omp_get_wtime()-reduction_start;
         }
-        const double scale=1.0/double(all.count);
+        const double scale=1.0/double(result.samples);
         for(size_t i=0;i<no;++i) {
             vjp->t1(i)*=scale;
             for(size_t j=0;j<no;++j) vjp->t2(i,j)*=scale;
         }
         vjp->eocc*=scale; vjp->evir*=scale;
         vjp->fov*=scale;
-        if(projected) {
+        if(occupied_matrix) vjp->occupied_matrix*=scale;
+        else if(projected) {
             vjp->occupied_subspace*=scale;
             if(occupied_projector) {
                 vjp->occupied_projector=arma::vec(vjp->occupied_subspace.col(0));
@@ -1125,9 +1156,16 @@ stc_triples::triples_result stc_triples::evaluate_integrals(
         }
         vjp->ovvv*=scale; vjp->ovoo*=scale; vjp->ovov*=scale;
     }
-    return {all.mean, standard_error, all.count, probability_seconds,
-        omp_get_wtime()-sampling_start, setup_threads, sampling_threads, nsamples,
-        pilot_error, packing_seconds, vjp_reverse_seconds};
+    result.probability_setup_seconds=probability_seconds;
+    result.sampling_seconds=omp_get_wtime()-sampling_start-independent_pilot_seconds;
+    result.setup_threads=setup_threads;
+    result.sampling_threads=sampling_threads;
+    result.amplitude_packing_seconds=packing_seconds;
+    result.vjp_reverse_seconds=vjp_reverse_seconds;
+    result.independent_pilot_samples=independent_pilot_samples;
+    result.independent_pilot_standard_error=independent_pilot_error;
+    result.independent_pilot_seconds=independent_pilot_seconds;
+    return result;
 }
 
 

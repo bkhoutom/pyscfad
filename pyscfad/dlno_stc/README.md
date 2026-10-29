@@ -552,18 +552,19 @@ energy, gradient, components = ccsd.value_and_grad(
 `energy_tolerance` is a finite, nonnegative total estimated one-sigma triples
 energy error in Hartree. Omission or zero keeps fixed-count sampling with
 exactly `nsamples` samples. A positive tolerance makes `nsamples` the pilot
-count, not a maximum; the native sampler continues when its estimated energy
+count unless `pilot_samples` overrides it; this is not a maximum. The native sampler continues when its estimated energy
 SE requires more samples. Deterministic triples accepts no sampling settings.
 Changing triples mode, count, seed or tolerance reuses the saved LIS selections.
 
-Before MPI distribution or checkpoint restoration, the total triples tolerance
-is divided by `sqrt(N)`, where `N` is the number of globally requested physical
-CC fragments, independent of preparation merging, MPI rank ownership and
-completed checkpoint work. A `fragment_indices` subset receives its own total budget; an
-empty subset makes no triples calls. With 16 requested fragments, total budgets
-of `1e-4` and `5e-5` Eh give per-LIS targets of `2.5e-5` and `1.25e-5` Eh.
-Four atom fragments with four occupied targets each instead receive `5e-5` Eh
-per fragment for a total `1e-4` Eh request.
+Before MPI distribution or checkpoint restoration, the total triples variance
+is divided in proportion to the magnitudes of the physical fragments' MP2
+correlation energies saved during D/W selection. Explicit `fragment_energies`
+can supply CCSD/MP2 proxies instead (one entry per physical S).
+The per-S SE is `energy_tolerance * sqrt(abs(E_S)/sum(abs(E_R)))`.
+The requested subset is normalized once, independently of preparation merging,
+MPI ownership and completed checkpoint work. An empty subset makes no triples
+calls. Zero proxies receive a tiny support floor; all-zero proxies, or manually
+constructed selections without proxies, retain equal variance allocation.
 The derived `target_standard_error` is internal and is not a public control.
 Each LIS receives a distinct stream derived from the
 global seed, a triples tag and its stable physical fragment ID, independently of MPI rank
@@ -601,6 +602,24 @@ energy/VJP calls. An energy tolerance does not impose a gradient tolerance.
 The SE estimates neither gradient error nor total CC uncertainty when D/W is
 stochastic; assess gradient uncertainty from independent seed variation.
 Validation drivers keep `--triples-mode` separate from MP2/D mode controls.
+
+Native stochastic triples gradients process 2048 draws per logical batch. Each
+sampling round offers one batch per thread in the observed OpenMP setup team
+(32 batches for a 32-thread team), followed by accumulation of the saved
+derivative contributions. The final round may have fewer batches. Batch seeds
+and energy-statistics merge order are independent of round size. The T2 adjoint
+remains shared; round size changes the sample/event buffers without allocating
+a full T2 adjoint per thread.
+
+Smooth triples runs with a positive energy tolerance also complete one Laplace
+point at a time. A single native call reuses the point's four-index integrals
+and probability tables for its independent pilot, production and adaptive
+extensions; the pilot does not accumulate discarded cotangents. Its dressed
+tensors and Laplace pullback are prepared once and released after the point.
+The trace exponent, independent streams and variance budgets are unchanged.
+Diagnostics expose `point_preparation_reused`; independent pilot sampling time
+is separated from the remaining native call, which includes shared setup.
+The legacy fixed-total-sample allocation still requires all point pilots.
 
 `fragment_indices=(i,)` selects physical fragment ID `i` in
 `DomainSelections.physical_groups`; it does not select an orbital preparation
@@ -650,3 +669,55 @@ The active workstation MP2 driver accepts
 `build_domain_selections`. Grouping-aware CC drivers report physical fragment
 count, occupied target membership and `n_F`, preparation-group count, and LIS
 dimensions separately; their parser choices depend on the driver copy.
+
+### Smooth forces for multiple groups and truncated LISs (opt-in)
+
+`ccsd.build_static_selections(..., smooth_gap=0.01)` saves per-group smooth anchored Fock
+clusters and enables full-Fock Laplace (T). CCSD/Lambda and the MP2 subtraction
+use the same smooth basis. Internal cluster eigenvector gaps never appear in
+the projector response; genuine inter-cluster and active-subspace response is
+retained. Truncated spaces follow their differentiable D/W-selected projectors.
+Partial occupied targets use the Laplace-dressed energy weight `O^-1 M O`,
+including its response. `boys_grouping="atom"` provides the heavy-atom groups.
+CC selections/checkpoints predating schema 4 must be rebuilt.
+
+Partial S targets default to `triples_controls['dressing']='asymmetric'`:
+factor the weight as `(O^-1 U)(O U)^T`, project the selected occupied leg,
+and sample it directly in S. All Fock mixing and projection derivatives remain
+included. The added S-projected blocks and T2 adjoints are shared across
+threads. `dressing='equal'` retains the earlier weighted estimator; the choice
+is saved in checkpoint controls. The full-target kernel is unchanged.
+The comparison runner accepts `--triples-dressing equal|asymmetric`.
+Smooth dressing defaults to `dressing_backend='native'`, reusing MP2's stable
+matrix exponential/VJP and bounded tensor panels. `dressing_backend='jax'`
+retains the reference implementation. The asymmetric reverse kernel uses
+precomputed update layouts and parallel event grouping, with shared T2 adjoints
+and bounded integer/panel scratch. See the [implementation and timing report](../../results/smooth_c6h14_s4_optimized/README.md).
+
+Smooth triples defaults to 10 fitted Laplace points and 10000 pilot samples per
+point. Set `smooth_laplace_points` at selection and `pilot_samples` in triples
+controls. Positive `energy_tolerance` first assigns the energy-weighted S
+budgets above, then assigns point variances using the MP2 trace-model scores
+`abs(w_q) * (trace(exp(t_q F_oo/2))*trace(exp(-t_q F_vv/2)))**p`, with
+`triples_controls['trace_exponent']` defaulting to **2.1**. Set it to 1.4 to
+reproduce the earlier ten-point benchmark. The 3/2 scaling from MP2 is a
+heuristic, not an optimal-variance result. The MP2 exponent is unchanged.
+Independent pilots choose production counts, with a 10000-sample minimum per
+point. Smooth sampling defaults to `triples_controls['adaptive']=True`: each
+native production stream is extended until its measured unweighted SE meets
+`sqrt(V_q)/abs(w_q)`. Pooled energy and gradient estimates use all production
+samples, so the combined reported SE meets the total budget. Sample SE is not
+a confidence bound on actual error. Set `adaptive=False` for the historical
+fixed-after-pilot behavior. The resolved flag is included in checkpoint identity.
+Target and measured point variances, initial/final counts, extension counts,
+energies and phase timings are returned.
+With a positive tolerance, `nsamples` does not set the smooth production budget;
+without it, the previous fixed-count mode remains available.
+
+See [the smooth-LIS guide](../../doc/source/user_guide/smooth_lis_triples.md)
+for the equations, sampling-budget semantics, quadrature checks and limits.
+The [complete smooth-basis README](../../README_SMOOTH_CCSD_T.md) explains the
+theory, implementation, corrected benchmarks, and reproduction commands.
+`examples/dlno_stc/smooth_force_compare.py` runs deterministic validation and
+stochastic force comparisons at 32 threads. The existing semicanonical path
+remains the default.

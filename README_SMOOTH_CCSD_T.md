@@ -1,4 +1,8 @@
-# Smooth-basis CCSD(T): implementation, theory, and force tests
+# Smooth-basis CCSD(T): theory and options
+
+Updated 2026-10-29. This README explains the formulation, the options introduced
+during development, and the selected production configuration. Section 7 is the
+options reference; section 10 gives runnable examples.
 
 ## 1. Purpose and scope
 
@@ -23,16 +27,34 @@ The main changes are:
 4. Reuse the existing native triples contractions and their reverse derivatives.
 5. Compare stochastic nuclear forces with a corrected deterministic reference.
 
-The performance extension reuses MP2's stable exponential/VJP routines for
-native block dressing and parallelizes asymmetric triples gradient grouping.
-`triples_controls['dressing_backend']='native'` is the new default;
-`'jax'` retains the previous dressing implementation. Both differentiate the
-same full Fock and fragment-orbital response. Full T2 cotangents remain shared,
-with one staging tensor and bounded per-worker panels. See the
-[implementation and timing report](results/smooth_c6h14_s4_optimized/README.md).
+The selectable formulations include conventional or smooth orbital frames,
+equal or asymmetric triples dressing, and native or JAX dressing backends.
+Sampling supports fixed counts or a total energy SE target, with MP2 or CCSD
+fragment weights and configurable Laplace-point allocation.
 
 All numerical benchmark runs use **32 threads** and an **800,000 MB memory cap**,
 leaving room within the approximately 900 GB available on the host.
+
+### Current production choices
+
+| Setting | Selected configuration |
+| --- | --- |
+| Physical groups and LIS | Heavy-atom S groups; occupied and virtual truncation supported |
+| Partial-S triples contraction | `dressing='asymmetric'`, direct contraction over S |
+| Dressing backend | `dressing_backend='native'` |
+| Triples quadrature | 10 fitted Laplace points per S |
+| Pilot | 10,000 independent samples per point |
+| Total molecular (T) energy SE target | 0.05 mEh, allocated as variances over S and points |
+| Variance proxy across S | Absolute reference MP2 energies; saved CCSD energies can override |
+| Point trace exponent | Explicitly set `trace_exponent=5.0`; the library/runner default remains 2.1 |
+| Production stopping | `adaptive=True`, extend until each reported point SE meets its budget |
+| Gradient rounds | One 2048-draw batch per active OpenMP worker, up to 32 batches per round |
+| Threads / PySCF memory cap | 32 / 800,000 MB |
+
+Native is the selected production backend because a calculation usually runs
+once. Avoiding the initial JAX compilation cost and bounding worker scratch are
+useful for that workload. Both backends retain the full Fock and target-orbital
+response described in section 5.
 
 ## 2. Why nearly degenerate orbitals can amplify force noise
 
@@ -95,7 +117,13 @@ a block are harmless provided the block remains separated from its complement.
 
 ### Choose a smooth basis inside each subspace
 
-The implementation first projects the saved AO coefficient anchors into the
+The **saved AO coefficient anchors** are the reference orbital coefficient
+matrix: rows label atomic basis functions and columns label reference orbitals.
+These numerical coefficients are saved once and held constant during the local
+derivative. The current orbitals still respond through the projectors, AO
+overlap and normalization.
+
+The implementation first projects these anchors into the
 current retained LIS using `C C^T S`, where C spans that LIS, `C^T S C = I`, and
 S is the AO overlap matrix. This makes the construction independent of arbitrary
 rotations among orbitals spanning the retained space. For an untruncated LIS,
@@ -148,6 +176,34 @@ H4 and water tests therefore used the same respective CCSD iteration counts
 as their conventional calculations: 38, 48 and 19. This does not establish
 unchanged convergence far from the anchor geometry.
 
+### Convergence when forces are requested
+
+Requesting forces does **not** automatically tighten the forward CCSD
+convergence settings in this checkout. The CCSD, DF-CCSD and LNO RCCSD classes
+inherit the installed PySCF class defaults. The comparison runner explicitly
+overrides them:
+
+| Criterion | Library default | Current comparison runner |
+| --- | ---: | ---: |
+| Energy change, `conv_tol` | `1e-7 Eh` | `1e-10 Eh` |
+| Packed amplitude-update norm, `conv_tol_normt` | `1e-5` | `1e-8` |
+| Maximum iterations, `max_cycle` | 50 | 200 |
+| DF-CCSD Lambda/adjoint update norm | Uses `conv_tol_normt`: `1e-5` | Uses `conv_tol_normt`: `1e-8` |
+
+Both forward conditions must pass: `abs(delta_E) < conv_tol` and
+`norm(delta_amplitudes) < conv_tol_normt`. The latter is the Euclidean norm of
+the packed t1/t2 update before DIIS, with no division by the number of
+amplitudes. The DF custom-response path also compares its packed Lambda update
+norm against `conv_tol_normt`. It is enabled by default in this checkout.
+There is no separate convergence threshold expressed as a nuclear-force error
+in mEh/bohr, and the stochastic energy SE target does not provide one.
+
+The runner accepts `--cc-conv-tol` and `--cc-conv-tol-normt`. See the
+[forward convergence check](pyscfad/cc/ccsd.py),
+[DF response settings](pyscfad/cc/dfccsd.py), and
+[runner overrides](examples/dlno_stc/smooth_force_compare.py).
+The tighter runner settings leave the inherited library defaults unchanged.
+
 Writing the converged amplitude equations as `R(T,x)=0`, with amplitudes `T`
 and molecular inputs `x`, the adjoint formulation is
 
@@ -185,8 +241,8 @@ $$
 The common deterministic MP2 baseline uses the original six-point fitted
 Laplace grid. Its baseline-minus-LIS difference in the reference is
 `-7.56535e-8 Eh`. Thus the benchmark reference is this complete workflow,
-including that small quadrature residual. The separate triples grid described
-below has 44 points.
+including that small quadrature residual. This original C5H6 benchmark used a
+44-point triples grid; the current production grid has ten fitted points per S.
 
 ## 5. Laplace triples in a noncanonical basis
 
@@ -252,8 +308,9 @@ Using the undressed M would give the wrong energy and Fock response whenever
 M and F_oo do not commute.
 
 M(t) is generally nonsymmetric. The `dressing='equal'` weighted-triples entry
-point accepts that full matrix and returns its full cotangent. Python
-differentiates the similarity transform and `M = U U^T`, including target response.
+point accepts that full matrix and returns its full cotangent. The selected
+dressing backend differentiates the similarity transform, and the outer
+pullback differentiates `M = U U^T`, including target response.
 For a complete orthonormal occupied target, M is the identity and the original
 whole-space native path is retained. Both CCSD and MP2 fragment energies use
 the same physical target partition; MP2 solves the full Fock resolvent before
@@ -288,8 +345,8 @@ $$
 
 The S index follows the selected occupied leg through every permutation.
 Both the usual singles term and the Fov*T2 term are included. The native VJP
-returns derivatives of the common tensors, L and R; the Python pullback then
-differentiates the exponentials and physical S coefficients.
+returns derivatives of the common tensors, L and R; the selected dressing
+backend then differentiates the exponentials and physical S coefficients.
 
 Samples now draw `(s,j,k,a,b,c)`, without an extra occupied projector index.
 The proposal is a 95% mixture of normalized left/right squared contraction-term
@@ -344,13 +401,34 @@ e^{a_i},&a_i=a_j.
 \end{cases}
 $$
 
-The coincident-eigenvalue limit is finite. Close arguments use a stable series
-evaluation. This differentiates the matrix function as a whole; general
+The coincident-eigenvalue limit is finite. The native implementation evaluates
+close differences with `expm1`; the JAX reference uses a stable series near
+coincidence. This differentiates the matrix function as a whole; general
 background is given by [Al-Mohy and Higham (2009)](https://eprints.maths.manchester.ac.uk/1218/).
 
 The matrices are evaluated block by block. Fock elements between different
 spectral blocks vanish analytically; the frame derivative carries the response
 between those blocks.
+
+### Native and JAX dressing backends
+
+`dressing_backend='native'` is the production default. It reuses MP2's stable
+matrix-exponential and reverse-derivative routines. `dressing_backend='jax'`
+retains the earlier implementation as an alternative and reference. Both
+implement the same tensor transforms and full Fock/target derivatives, for
+whole-LIS, equal and asymmetric contractions.
+
+**Warmed JAX** means an executable has already been compiled for compatible
+shapes, dtypes and static cluster layouts. It still evaluates fresh tensors
+and gradients on each call. Rebuilding the solver or changing these layouts
+can require compilation again. Warmed is an execution state, not a third
+backend or a different approximation. Native is our selected option for
+calculations that usually run once.
+
+Full T2 cotangents remain shared. Native dressing uses one shared staging tensor
+and bounded worker panels; the asymmetric reverse assigns output tiles to
+workers. Neither requires a full T2 gradient copy per thread. This does not
+remove the memory cost of the shared full tensors and CCSD intermediates.
 
 ## 6. Stochastic estimation and force calculation
 
@@ -358,7 +436,7 @@ The current tolerance-controlled sampler uses **10 fitted triples Laplace
 points per S and 10,000 independent pilot samples per point**. The positive
 grid is fitted over each retained LIS's full triples-denominator interval;
 both `1/D` and `1/D^2` enter the fit. The actual quadrature errors are recorded
-separately from sampling SE. The earlier benchmarks below used the older
+separately from sampling SE. Earlier saved benchmarks used the older
 adaptive Gaussian grids (40 or 44 points).
 
 For a total energy SE target `epsilon`, first divide the **variance** among
@@ -389,13 +467,15 @@ $$
 
 The default is now `p = 2.1`, configurable with
 `triples_controls['trace_exponent']` or `--triples-trace-exponent` in the example
-driver. The historical ten-point benchmark below used `p = 1.4`. Scaling the
+driver. The historical ten-point benchmark used `p = 1.4`. Scaling the
 MP2 exponent by `3/2` reflects the three gaps in a triples denominator versus
 two in MP2, but is a heuristic: the sampling variance also depends on amplitudes,
 integrals and the sampling proposal. It does not establish an optimal exponent.
 Log-space evaluation removes sensitivity to a common orbital-energy shift.
 The resolved exponent is saved in checkpoint controls and triples diagnostics.
-This control applies to smooth stochastic triples; the MP2 model is unchanged.
+The selected production setting is explicitly `p = 5.0`, based on the
+C6H14 scan; it is not a universal optimum. This control applies to smooth
+stochastic triples; the MP2 model is unchanged.
 
 Each pilot estimates the single-sample variance `s_pilot,Sq^2` of the
 **unweighted** node contraction. Its initial independent production count is
@@ -422,8 +502,8 @@ pullback, then release that point's intermediates. Pilot sampling retains the
 force proposal but skips accumulation of discarded tensor cotangents. The
 native production stream reuses both integrals and tables through adaptive
 extensions. Only one point's dressed tensors and differentiation intermediates
-are retained by this path. The exponent and variance-allocation model are
-unchanged; `point_preparation_reused` records the new execution policy.
+are retained by this path. This reuse works with any supported trace exponent;
+`point_preparation_reused` records the execution policy.
 
 Gradient sampling uses 2048 draws per logical batch and one batch per thread
 in the observed OpenMP setup team per round (32 for a 32-thread team). Partial
@@ -446,10 +526,7 @@ Set `triples_controls['adaptive']=False` or `--no-triples-adaptive` to reproduce
 the historical pilot-only production allocation. The resolved flag is part of
 the checkpoint controls. Per-point nodes, weights, targets, pilot SEs, initial
 and final production counts, extension counts, energies and measured variances
-are saved in `triples_diagnostics`. Timings separate dressing/pullback
-preparation, independent pilot sampling, the remaining native call (including
-shared integral/table setup and production), and Laplace pullbacks. Native
-reverse timings are nested within production and must not be added again.
+are saved in `triples_diagnostics`.
 The native fields `independent_pilot_*` describe the discarded stream;
 `pilot_samples` and `pilot_standard_error` retain their historical meaning of
 the initial production block. The smooth wrapper records these separately.
@@ -460,7 +537,6 @@ Without a positive energy tolerance, the older fixed-count mode remains:
 `pilot_samples` is explicit and defaults to 10000 per point in the smooth path.
 This legacy fixed-count allocation still needs pilots from all points and
 retains the older preparation path; it does not use per-point reuse.
-The original C5H6 runs used 45,056 pilot samples per calculation.
 
 The comparison runner defaults to total `0.05 mEh` and accepts
 `--triples-energy-tolerance-mha`, `--triples-laplace-points`,
@@ -483,147 +559,145 @@ against deterministic forces and across independent seeds. The exact summed
 formulation is orbital invariant up to numerical approximations, while finite
 sampling variance can depend strongly on the chosen orbital frame.
 
-## 7. C5H6 results
+## 7. Options and when to use them
 
-Configuration: user-supplied C5H6 geometry, cc-pVDZ, automatic auxiliary basis,
-five frozen core orbitals, one full LIS, deterministic MP2 baseline and W
-matrices. Both LNO thresholds are zero to explicitly retain the full active
-space. SCF tolerances are `1e-9 Eh` and `1e-6` for its gradient criterion; CCSD
-tolerances are `1e-10 Eh` and `1e-8` for its amplitude norm.
+The tables distinguish Python API defaults from the comparison runner's
+settings. The runner is
+[`examples/dlno_stc/smooth_force_compare.py`](examples/dlno_stc/smooth_force_compare.py).
+Its smooth calculation uses stochastic (T); it also computes or loads a
+conventional deterministic reference with matching LIS truncation.
 
-The smooth grouping threshold is `0.01 Eh`, producing 12 occupied and 69 virtual
-blocks. The largest virtual block contains four orbitals. The control uses
-`1e-6 Eh`, producing singleton blocks for all active orbitals.
+### Orbital spaces and physical groups
 
-Forces are `-dE/dR`. For the 11 atoms, the reported component RMS is
+| Option | Choices and meaning |
+| --- | --- |
+| `smooth_gap` in `build_static_selections` | API default `None`: ordinary semicanonical orbitals. A positive value enables anchored smooth Fock blocks. The runner's `--smooth-gap` defaults to `0.01 Eh`; zero is invalid. |
+| `--boys-grouping` | `molecule` (runner default): one physical S; `atom`: heavy-atom groups with attached hydrogens; `singleton`: one Boys occupied target per S. |
+| `matrix_kind` | API supports `W` or `D` selection. This comparison runner uses deterministic W. |
+| `thresh_occ`, `thresh_vir` | API thresholds for retained selection eigenvalues. Runner flags are `--lno-thresh-occ` and `--lno-thresh-vir`, both default zero for untruncated LISs. C6H14 uses `1e-4` and `1e-5`. All physical S occupied directions are retained. |
+| `--finite-domains` | Use finite Boys preparation domains. Without it, the runner uses full preparation domains. This choice is separate from subsequent LNO truncation. |
+| `--frozen` | Frozen occupied count; runner default zero. Examples use 5 for C5H6 and 6 for C6H14. |
 
-$$
-\mathrm{RMS}_{F}=1000\sqrt{\frac1{33}
-\sum_{A=1}^{11}\sum_{\alpha=x,y,z}
-\left(F_{A\alpha}^{stoch}-F_{A\alpha}^{det}\right)^2}
-\quad\mathrm{mEh/bohr}.
-$$
+A small positive `smooth_gap` that leaves every Fock block a singleton is a
+useful control for the effect of internal orbital rotations. It retains the
+Laplace formulation. The original semicanonical inverse-gap derivative cutoff
+and `smooth_gap` have different meanings, as explained in section 2.
 
-| Calculation | Production samples | Force RMS (mEh/bohr) | Energy SE (mEh) |
-| --- | ---: | ---: | ---: |
-| Conventional stochastic (T), seed 71 | 16,446,469 | 5.16533950 | 0.05000179 |
-| Laplace (T), singleton blocks, seed 71 | 16,446,508 | 1.22271312 | 0.02254147 |
-| Smooth blocks, seed 71 | 16,446,507 | 0.07303981 | 0.02254155 |
-| Smooth blocks, seed 72 | 16,446,503 | 0.07406564 | 0.02253537 |
-| Smooth blocks, seed 73 | 16,446,507 | 0.07832477 | 0.02260073 |
+### Triples formulation and backend
 
-The mean of the three smooth force arrays has RMS **0.03178465 mEh/bohr**,
-using approximately three times the production sampling work of one run.
+These API fields belong to `triples_controls` passed to `ccsd.kernel` with
+`ccsd_t=True`.
 
-With the same Laplace sampler, nominal sample budget, and seed, changing from
-singleton to smooth blocks lowers the observed force RMS by about **16.7 times**.
-This supports near-degenerate orbital response as a major noise source. Several
-orbital groups change, so this control does not identify virtual pair 19/20 as
-the sole cause.
+| API option | Choices, defaults and runner equivalent |
+| --- | --- |
+| `mode` | `deterministic` is the API default; `stochastic` samples the numerator. In a smooth frame, deterministic mode enumerates each Laplace node. The runner adds this small-system check with `--smooth-deterministic`. |
+| `dressing` | Smooth default `asymmetric`: contract directly over S with distinct left/right projected blocks. `equal`: use the full similarity-dressed weight matrix. CLI: `--triples-dressing`. |
+| `dressing_backend` | Smooth default `native`; `jax` retains the earlier backend. CLI: `--triples-dressing-backend`. |
+| `smooth_laplace_points` | Selection argument, **not** a triples-control field. Default `10` fits a positive grid to each LIS. API value `None` selects the older adaptive Gaussian grid. CLI: `--triples-laplace-points`, a positive integer. |
 
-Relative to the conventional stochastic calculation, the observed reduction is
-approximately **66–71 times**. That comparison includes changes to both the
-orbital frame and the triples sampling formulation. These are measured errors
-for this geometry and sample budget, rather than guaranteed force-error bounds.
+Equal and asymmetric dressing give the same exactly summed expression. Their
+finite-sample estimators and variances differ, so equal energy SE does not imply
+equal force error. The full occupied-target identity case uses the whole-space
+kernel. Native/JAX is an independent implementation choice, available with
+either dressing. Deterministic controls accept only `mode`, `dressing` and
+`dressing_backend`; sampling fields must be omitted.
+
+### Sampling and total SE control
+
+| API option | Default or selected value | Runner flag and effect |
+| --- | --- | --- |
+| `energy_tolerance` | API omission/zero: fixed count. Selected target `5e-5 Eh = 0.05 mEh`. | `--triples-energy-tolerance-mha`, default `0.05`; controls the total reported (T) energy SE over the requested S. |
+| `nsamples` | Required integer at least 2 in stochastic API controls, including tolerance mode. | `--samples`, default `16446469`; sets the nominal production count **per S only when the tolerance is zero**. Positive tolerance determines counts from variance instead. |
+| `pilot_samples` | Smooth default `10000` per point. | `--triples-pilot-samples`; independent pilots are discarded from production estimates. |
+| `fragment_energies` | Default: absolute reference MP2 energies saved during selection. | `--triples-budget-energy mp2` (default) or `ccsd`. CCSD proxies come from the deterministic reference. API overrides supply one reference energy per physical S. |
+| `trace_exponent` | Library/runner default `2.1`; selected production setting `5.0`. | `--triples-trace-exponent`; changes the allocation of variance among Laplace points. |
+| `adaptive` | Smooth default `True`. | `--triples-adaptive` extends production until measured point SEs satisfy their budgets. `--no-triples-adaptive` fixes counts after pilots and can miss the target. |
+| `global_seed` | API default `71`, with fragment-derived streams. | `--seeds`, runner default `71 72 73`; runs separate force estimates. |
+
+The exponent choices made during development were:
+
+- **1.4:** reuse the original MP2 trace-model exponent.
+- **2.1:** scale 1.4 by 3/2 for the three excitation gaps in (T). This is a heuristic.
+- **5.0:** explicit production choice informed by the C6H14 pilot scan. Changing
+  molecule, LIS or sampling proposal can change the preferred value.
+
+The trace allocation assigns all point budgets before preparing their
+integrals. In positive-tolerance mode, each point's preparation is reused for
+its pilot, production and adaptive extensions for **any** of these exponents.
+The selected 5.0 setting does not require a second integral transformation.
+
+Batch size is currently an implementation setting: 2048 draws per active
+OpenMP worker per round, so 32 workers give up to 32 batches per round.
+The runner fixes numerical threads at 32 and PySCF's memory cap at 800,000 MB;
+these are not additional CLI flags in this runner.
+
+### Reference, subset and convergence controls
+
+| Runner option | Meaning |
+| --- | --- |
+| `--reference PATH` | Load a matching deterministic reference; omit it to compute one. Match geometry, basis, frozen core, grouping and truncation. |
+| `--sampling-fragment INDEX` | Evaluate one zero-based physical S correction and gradient. Requires a saved full reference for setup; skips the full-molecule force comparison. |
+| `--fragment-deterministic` | Also compute the matching deterministic force for the selected S. Use with `--sampling-fragment`. |
+| `--canonical-stochastic` | Add the conventional semicanonical stochastic estimator using the first seed. |
+| `--selection-only` | Save selections and metadata without CCSD or force calculations. |
+| `--seeds` with no values | Skip stochastic evaluations, for example when generating a fragment reference. |
+| `--fd-coordinate ATOM AXIS`, `--fd-step` | Central finite-difference check of deterministic energies using fixed selections; zero-based indices and default step `1e-4 Bohr`. |
+| `--cc-conv-tol`, `--cc-conv-tol-normt` | Runner defaults `1e-10 Eh` and `1e-8`. See section 4 for forward and response convergence. |
+
+The single-S mode cannot be combined with `--smooth-deterministic`,
+`--canonical-stochastic` or `--fd-coordinate`. Its energy tolerance applies
+to the **selected S**, because allocation normalizes over the requested subset.
+To reproduce S4's share of the original molecular 0.05 mEh budget, use
+`--sampling-fragment 3 --triples-energy-tolerance-mha 0.02421051058826991`.
+Setting 0.05 for that subset instead gives S4 the entire 0.05 mEh target.
 
 ## 8. Validation and the corrected reference
 
-| Validation | Result |
-| --- | --- |
-| H4/cc-pVDZ: smooth versus conventional deterministic forces | RMS `3.48365e-7 mEh/bohr` |
-| H4: smooth stochastic (T) and its gradient, 262,183 production samples | RMS `0.14340960 mEh/bohr` |
-| Distorted water/STO-3G, frozen core: deterministic force comparison | RMS `1.62355e-8 mEh/bohr` |
-| Focused smooth-method derivative tests | 6 passed |
-| Selected existing regression tests | 113 passed |
+Forces are `-dE/dR`. The reported force error is the RMS over all Cartesian
+components, with energies in Hartree and coordinates in Bohr:
 
-The focused tests cover projector response at internal degeneracy, the matrix
-exponential derivative, response through the moving frame, noncanonical MP2,
-all physical triples input derivatives for non-diagonal Fock matrices with
-nonzero Fov, and the conventional native triples derivative. An existing test
-was adjusted to tolerate `4e-19` parallel-summation roundoff; sample counts and
-scalar diagnostics still require exact equality.
+$$
+\mathrm{RMS}_{F}=1000\sqrt{\frac1{3N_{\mathrm{atoms}}}
+\sum_{A,\alpha}\left(F_{A\alpha}^{stoch}-F_{A\alpha}^{det}\right)^2}
+\quad\mathrm{mEh/bohr}.
+$$
 
-The 44-point triples quadrature was checked at 10,001 denominators over the
-reference spectrum. Maximum checked relative errors were `1.01e-11` for `1/D`
-and `1.82e-10` for `1/D^2`. These checks address quadrature error separately
-from stochastic uncertainty.
+The saved checks include square H4, frozen-core water, a water dimer with
+multiple partial S targets and truncated occupied/virtual LISs, and six
+heavy-atom S groups for C6H14/def2-SV(P). Smooth and conventional deterministic
+forces agree in the small-system checks. The C5H6 singleton-versus-smooth
+comparison supports orbital-response noise as a major source of force error.
+Energy SE remains distinct from force uncertainty.
 
-**Reference correction:** my original local native-library build mixed two
-OpenMP runtimes. Its deterministic triples derivative reduction failed to
-accumulate all workers. I rebuilt the libraries against a consistent runtime
-and checked the derivative against an independent reference. The previously
-reported `6.688929 mEh/bohr` comparison is superseded. The corrected deterministic
-workflow reference energy is `-193.4464206792542 Eh`.
+The latest saved focused regression run passed **264 tests**. Coverage includes
+projector response at internal degeneracy, moving frames, full-Fock MP2,
+nonzero Fov, partial targets, and native/JAX dressing values and derivatives.
+See the [validation log](results/smooth_c6h14_s4_optimized/validation.log) and
+[identical-input derivative comparison](results/smooth_c6h14_s4_optimized/solver_bar_comparison.json).
+The latest native nuclear-force comparison covers S4; earlier full-molecule
+comparisons are linked in section 12. The independent complete S4 force runs
+have a small difference not yet attributed to a specific upstream response
+stage; identical-input triples derivatives agree to numerical precision.
 
-The corrected full C5H6 smooth calculation was tested stochastically. Direct
-smooth deterministic enumeration was validated on H4, water, and small tensor
-fixtures; it was not run for the full C5H6 system.
+### Deterministic (T) pullback: OpenMP linkage correction
 
-The multi-group extension additionally passes a two-group water-dimer test with
-both occupied and virtual truncation and four targets in each five-occupied LIS.
-Smooth deterministic forces agree with conventional deterministic forces to
-`9.32013e-6 mEh/bohr` RMS. A coordinate finite difference agrees within
-`2.29960e-5 mEh/bohr`. See the [partial-target validation report](results/smooth_water_dimer_partial/README.md).
+The original local `libcc_vjp.so` linked the system `libgomp.so.1`, while its
+reduction helper in `libvjp_util.so` used the wheel's
+`libgomp-e985bcbb.so.1.0.0`. During a **32-thread** triples pullback, the helper
+saw **one thread** and failed to combine other workers' gradient contributions.
+Forward energies were unaffected; deterministic forces were incorrect.
 
-For **C6H14/def2-SV(P)**, six heavy-atom groups retain 12–18 occupied and 44–70
-virtual orbitals per LIS, from 19 active occupied / 87 virtual orbitals. With
-W cutoffs `1e-4/1e-5` and 262144 nominal production samples per group, seed 71
-gives **0.739035 mEh/bohr force RMS error** against the deterministic reference
-using the same truncated LISs. The total actual production count is 1,573,060.
-All six native samplers report 32 threads. See the
-[hexane report and reproduction command](results/smooth_c6h14/README.md), including
-the generated geometry, fixed-budget qualification and Boys saddle diagnostic.
+The repair changed the build/link configuration and rebuilt the shared
+libraries against the same OpenMP runtime. **No deterministic C/C++ numerical
+kernel or Python pullback implementation was changed to fix this bug.**
+A Python regression test, `test_existing_deterministic_triples_vjp_reference`,
+was added against an independent JAX reference. The smooth-frame, asymmetric
+triples and native dressing features are separate numerical source changes.
 
-The updated **10-point, energy-weighted variance allocation**, using trace
-exponent **1.4**, was also run on the same six C6H14 LISs, with 10000 pilots per
-point and a total (T) SE target
-of 0.05 mEh. Seed 71 achieved **0.04185143 mEh** total energy SE and
-**0.21506693 mEh/bohr** force RMS error, using 39,653,122 production samples
-and 600,000 pilot samples. See the
-[allocation report and per-point variance data](results/smooth_c6h14_t005_10pt/README.md).
-
-An isolated **S4 exponent-2.1 test** then completed its correction and gradient
-at the same S4 target of 0.02421051 mEh. It used 7,947,172 production samples
-(30.95% fewer than 1.4) and measured a (T) SE of 0.02394365 mEh. The other five S
-were not rerun. A cheap scan of saved pilots predicts a sample-count minimum
-near p=5.1 for S4, or p=5.36 shared across all six S. See the
-[single-S report, exponent scan and reproduction command](results/smooth_c6h14_s4_p21/README.md).
-
-A subsequent **S4 exponent-5.0 production test** completed its correction and
-gradient with 4,917,293 production samples, exactly matching the saved-pilot
-prediction. This is 38.13% fewer than p=2.1, but the measured (T) SE of
-**0.02597251 mEh exceeded the S4 target by 7.28%**. Counts were fixed after the
-pilots; no adaptive production extension was performed. Rescaling the observed
-variance predicts approximately 5.66 million samples for the target, which has
-not been run. The default remains 2.1. See the
-[p=5.0 result and comparison](results/smooth_c6h14_s4_p50/README.md).
-
-The **full six-S p=5.0 rerun with adaptive production** then met every point/S
-budget and the total target: reported (T) SE **0.04895394 mEh**, force-component
-RMS error **0.27090431 mEh/bohr**, and 17,637,941 production samples (including
-1,062,205 extensions) plus 600,000 external pilots. All calculations used 32
-threads. Complete process wall time was **22 min 15.32 s**, with 267.42 s in
-the outer triples phase and 387.54 s in CCSD lambda response. Compared with
-the p=1.4 full run, production sampling fell by 55.52% and force-calculation
-time by 13.54%; the energy target does not control force error. See the
-[adaptive full-molecule report and timing breakdown](results/smooth_c6h14_p50_adaptive/README.md).
-
-The **asymmetric S4 implementation** was compared with a fresh equal-dressing
-run after the batching and preparation-reuse changes. With the same p=5.0,
-ten-point grid, seed 71 and S4 target, production decreased from **5,659,399 to
-620,323 samples**. Reported SEs were **0.02408279 and 0.02313872 mEh**, both
-below the **0.02421051 mEh** target. The triples energy/gradient phase fell from
-**74.69 to 18.33 seconds** (4.07x faster), while peak process RSS remained
-similar, **33.34 vs 32.63 GiB**. The S4 nuclear correction/force took 342.03 vs
-292.99 seconds; CCSD took the same 22 iterations. These are isolated S4,
-single-seed measurements. Against a newly computed deterministic S4 force,
-the force-component RMS was **0.06605219 mEh/bohr for equal dressing** and
-**0.10758395 mEh/bohr for asymmetric dressing**. Thus the energy-driven sample
-reduction gave a higher force error in this seed; the energy SE target does
-not enforce equal force accuracy. See the
-[asymmetric implementation report](results/smooth_c6h14_s4_asymmetric/README.md)
-for the matching deterministic force comparison, native memory breakdown and
-reproduction command.
+Corrected force references were regenerated. The original
+`6.688929 mEh/bohr` force-error comparison is invalid and superseded. See the
+[correction record and rebuild instructions](results/REFERENCE_CORRECTION.md)
+for affected result directories and the verification procedure.
 
 ## 9. Code map
 
@@ -635,9 +709,12 @@ reproduction command.
 | [ccsd.py](pyscfad/dlno_stc/ccsd.py) | Opt-in selection and solver integration |
 | [LNO CCSD core](pyscfad/lno/ccsd.py) | Hooks for the MP2 and triples solvers |
 | [Native bindings](pyscfad/dlno_stc/cpp/stc_triples_bindings.cpp) | Whole-LIS and general occupied-weight energy/VJP entry points |
+| [Native dressing](pyscfad/dlno_stc/cpp/stc_triples_dressing.cpp) | Cached cluster spectra, bounded tensor panels and explicit dressing pullback |
+| [MP2 exponential/VJP helpers](pyscfad/dlno_stc/cpp/stc_mp2_gradient.cpp) | Shared stable matrix-exponential and derivative routines |
 | [Asymmetric native kernel](pyscfad/dlno_stc/cpp/native/stc_triples_asymmetric.C) | Direct S projection, factor sampling and shared-gradient reverse |
 | [Comparison runner](examples/dlno_stc/smooth_force_compare.py) | Deterministic reference, stochastic seeds, force output and RMS |
 | [Focused tests](pyscfad/dlno_stc/test/test_smooth.py) | Numerical derivative validation |
+| [Native dressing tests](pyscfad/dlno_stc/test/test_triples_dressing.py) | All input derivatives, degeneracy, cluster layouts and panel boundaries |
 
 Restart serialization stores per-group frame and quadrature metadata. CC
 selection schema 4 requires rebuilding older CC selections/checkpoints.
@@ -645,59 +722,105 @@ The original whole-LIS implementation reused the supplied native numerical
 sources unchanged. The multi-group extension modifies `stc_triples.C/.h` to
 accept nonsymmetric occupied weights, differentiate them, and provide a small
 deterministic weighted reference. Existing selected-orbital entry points retain
-their original interface; the binding identity includes the new source hashes.
+their original interface; the binding identity includes the new source hashes,
+including native dressing and the reused MP2 gradient helpers. Resolved dressing
+backend, exponent and adaptive controls participate in checkpoint identity.
 
 ## 10. Running the calculation
 
-The Python API enables the option when selecting the LIS:
+For an existing mean-field calculation, domains and MP2 controls, the Python
+API enables the smooth frame and chooses its triples grid during LIS selection:
 
 ```python
 selected = ccsd.build_static_selections(
     mf, domains,
     matrix_kind="W", thresh_occ=0.0, thresh_vir=0.0,
     baseline_controls=baseline, matrix_controls=matrix,
-    smooth_gap=0.01,
+    smooth_gap=0.01, smooth_laplace_points=10,
+)
+
+# Pass this dictionary to ccsd.kernel(..., ccsd_t=True,
+#                                     triples_controls=triples_controls).
+triples_controls = dict(
+    mode="stochastic", nsamples=262144,  # Required; target mode chooses counts.
+    energy_tolerance=5e-5,              # Hartree: 0.05 mEh total over requested S.
+    pilot_samples=10000, global_seed=71,
+    trace_exponent=5.0, adaptive=True,
+    dressing="asymmetric", dressing_backend="native",
 )
 ```
 
-For the configured environment on this host (these commands use the current
-10-point, 0.05 mEh defaults; historical fixed-count results above are unchanged):
+For the configured environment on this host:
 
 ```bash
 cd /home/zhenling/scratch/pyscfad
 export LD_LIBRARY_PATH=/tmp/pyscfad-armadillo/lib:/home/zhenling/intel/oneapi/mkl/2025.1/lib/intel64:$LD_LIBRARY_PATH
 export XLA_FLAGS=--xla_cpu_multi_thread_eigen=false
-
-/tmp/pyscfad-venv/bin/python examples/dlno_stc/smooth_force_compare.py \
-  --xyz-file examples/dlno_stc/c5h6_force_compare.xyz \
-  --basis cc-pvdz --frozen 5 --smooth-gap 0.01 \
-  --canonical-stochastic --samples 16446469 --seeds 71 72 73 \
-  --output-dir results/smooth_c5h6_repeat
 ```
 
-This generates a new deterministic reference, a conventional stochastic result,
-and three smooth stochastic results. The driver sets the numerical thread
-limits to 32 and the memory cap to 800,000 MB.
+The runner sets 32 numerical threads and an 800,000 MB PySCF memory cap.
+Use a fresh output directory to preserve earlier results.
 
-For the singleton-block control using the existing corrected reference:
+### Current C6H14 production configuration
+
+After the environment exports above, the following runs all six physical S
+with the current selected options and the saved matching deterministic force
+reference:
+
+```bash
+/tmp/pyscfad-venv/bin/python examples/dlno_stc/smooth_force_compare.py \
+  --xyz-file examples/dlno_stc/c6h14.xyz \
+  --basis 'def2-SV(P)' --frozen 6 --boys-grouping atom \
+  --lno-thresh-occ 1e-4 --lno-thresh-vir 1e-5 --smooth-gap 0.01 \
+  --triples-dressing asymmetric --triples-dressing-backend native \
+  --triples-laplace-points 10 --triples-pilot-samples 10000 \
+  --triples-trace-exponent 5.0 --triples-budget-energy mp2 \
+  --triples-energy-tolerance-mha 0.05 --triples-adaptive \
+  --cc-conv-tol 1e-10 --cc-conv-tol-normt 1e-8 --seeds 71 \
+  --reference results/smooth_c6h14/canonical_deterministic.json \
+  --output-dir results/smooth_c6h14_native_production
+```
+
+For the matching single-S comparison, add `--sampling-fragment 3
+--fragment-deterministic`, change the target to `0.02421051058826991`, and choose
+a separate output directory. This computes the S4 correction and its force
+error against a deterministic S4 reference.
+
+### One full LIS and a singleton-block control
+
+For C5H6, generate a deterministic reference, a conventional stochastic result
+and three smooth stochastic results at the current total SE target:
 
 ```bash
 /tmp/pyscfad-venv/bin/python examples/dlno_stc/smooth_force_compare.py \
   --xyz-file examples/dlno_stc/c5h6_force_compare.xyz \
-  --basis cc-pvdz --frozen 5 --smooth-gap 1e-6 \
-  --reference results/smooth_c5h6/canonical_deterministic.json \
-  --samples 16446469 --seeds 71 \
-  --output-dir results/smooth_c5h6_singletons_repeat
+  --basis cc-pvdz --frozen 5 --boys-grouping molecule --smooth-gap 0.01 \
+  --triples-energy-tolerance-mha 0.05 --triples-trace-exponent 5.0 \
+  --canonical-stochastic --seeds 71 72 73 \
+  --output-dir results/smooth_c5h6_repeat
 ```
 
-For the square H4 validation:
+For the singleton-block control, change `--smooth-gap` to `1e-6`, omit
+`--canonical-stochastic`, and use a separate output directory. The corrected
+reference can be reused with `--reference
+results/smooth_c5h6/canonical_deterministic.json`.
+
+### Square H4 with fixed production counts
+
+This explicitly disables the energy-tolerance allocator and adds a smooth
+deterministic comparison:
 
 ```bash
 /tmp/pyscfad-venv/bin/python examples/dlno_stc/smooth_force_compare.py \
   --xyz-file examples/dlno_stc/square_h4.xyz --basis cc-pvdz \
-  --smooth-deterministic --samples 262144 --seeds 71 \
+  --smooth-deterministic --triples-energy-tolerance-mha 0 \
+  --samples 262144 --seeds 71 \
   --output-dir results/smooth_h4_repeat
 ```
+
+The nominal 262144 production samples are allocated among Laplace points for
+each S; rounding and point minima can increase the total. The default 10000
+independent pilot draws per point are additional.
 
 ## 11. Current limits
 
@@ -714,9 +837,9 @@ For the square H4 validation:
   mainly for small-system validation.
 - Three stochastic seeds provide a useful comparison, not a comprehensive
   statistical characterization or a force-error guarantee.
-- These runs establish numerical behavior for the tested cases. Concurrent
-  validation jobs and cache reuse prevent interpreting their timings as a
-  controlled performance benchmark.
+- The latest native backend was checked on S4 and small derivative fixtures.
+  Full six-S validation with that backend and memory requirements for
+  300–500-orbital LISs remain to be established.
 
 ## 12. Saved results
 
@@ -728,6 +851,10 @@ For the square H4 validation:
 - [Water validation](results/smooth_water_verified/comparison.json)
 - [Multiple-group, truncated-LIS validation](results/smooth_water_dimer_partial/README.md)
 - [C6H14/def2-SV(P), six truncated LISs](results/smooth_c6h14/README.md)
+- [Ten-point variance allocation](results/smooth_c6h14_t005_10pt/README.md)
+- [Full-molecule exponent-5.0 adaptive run](results/smooth_c6h14_p50_adaptive/README.md)
+- [Direct-S asymmetric dressing comparison](results/smooth_c6h14_s4_asymmetric/README.md)
+- [Native dressing derivative comparison](results/smooth_c6h14_s4_optimized/solver_bar_comparison.json)
 - [Native-library correction and rebuild instructions](results/REFERENCE_CORRECTION.md)
 
 The measured outcome is that smooth blocks substantially reduce stochastic

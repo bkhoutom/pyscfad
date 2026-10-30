@@ -10,7 +10,7 @@ PySCF with Auto-differentiation
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.6960749.svg)](https://doi.org/10.5281/zenodo.6960749)
 
 * [Documentation](https://fishjojo.github.io/pyscfad/index.html)
-* [Smooth-basis CCSD(T): implementation, theory, and force tests](README_SMOOTH_CCSD_T.md)
+* [Smooth-basis CCSD(T): theory and options](README_SMOOTH_CCSD_T.md)
 
 Installation
 ------------

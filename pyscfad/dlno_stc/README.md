@@ -458,6 +458,22 @@ remain 1.
 `value_and_grad`. Each physical Boys fragment has its own retained LIS and
 CCSD(T) correction; identical extended domains may share preparation.
 
+DF-CCSD uses the improved virtual ladder contractions from upstream PySCFAD.
+The default `vvvv_direct=False` caches the symmetry-packed virtual integrals
+for repeated CCSD and response iterations when the cache fits within 60% of
+remaining `max_memory`; otherwise the solver warns and uses the improved
+uncached contraction. Set `vvvv_direct=True` on `ccsd.kernel` or
+`ccsd.value_and_grad` to force the lower-memory mode. Canonical and LNO
+`RCCSD` objects expose the same attribute, set before `ao2mo`/`kernel`.
+Both modes retain the factor-based `ovvv`, lambda and triples paths.
+The float64 cache uses `16 * [nvir * (nvir + 1) / 2]**2` bytes per active
+fragment; concurrent MPI ranks each need their own cache allocation.
+The selected mode is included in serial CC checkpoint identity.
+The default analytical CCSD response keeps the cache cotangent symbolic.
+If `pyscfad_dfccsd_custom_response=False` selects generic implicit response,
+JAX can additionally materialize one cache-sized zero cotangent; use
+`vvvv_direct=True` when that extra memory is undesirable.
+
 The retained stochastic implementation uses full occupied/virtual LIS frames,
 native asymmetric Laplace triples, and physical selected-space restricted
 sampling. There are no internal Fock cluster projectors. Off-diagonal Fock,

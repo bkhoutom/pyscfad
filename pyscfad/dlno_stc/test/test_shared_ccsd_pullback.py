@@ -67,12 +67,14 @@ def group_case(monkeypatch):
     monkeypatch.setattr(ccsd.backend, 'solve', baseline)
     monkeypatch.setattr(ccsd.backend, 'pullback_matrices', replay)
 
-    def run(include_baseline=True, indices=(0, 1), with_grad=True, mf=.2, common=-.1):
+    def run(include_baseline=True, indices=(0, 1), with_grad=True, mf=.2, common=-.1,
+            vvvv_direct=False):
         state = dict(mf=jnp.asarray(mf), common=jnp.asarray(common), energy=jnp.zeros(()),
                      variance=0., mf_bar=jnp.asarray(.17), common_bar=jnp.asarray(-.23))
         rows = ccsd._run_group(state, static, group, controls, controls,
             with_grad=with_grad, verbose_imp=0, ccsd_t=True,
-            include_baseline=include_baseline, fragment_indices=indices)
+            include_baseline=include_baseline, fragment_indices=indices,
+            vvvv_direct=vvvv_direct)
         return state, rows
 
     return SimpleNamespace(run=run, preparations=preparations, packets=packets,
@@ -143,3 +145,16 @@ def test_each_incoming_packet_is_validated_before_accumulation(group_case, monke
     with pytest.raises((TypeError, ValueError)):
         group_case.run(include_baseline=source == 'baseline', indices=(0,))
     assert len(group_case.preparations[0]) == 0
+
+
+@pytest.mark.parametrize('direct', [False, True])
+def test_group_forwards_ladder_mode_to_each_fragment(group_case, monkeypatch, direct):
+    """Each physical fragment must honor its owner's requested cache policy."""
+    modes = []
+    original = ccsd._solve_fragment
+    def observed(*args, **options):
+        modes.append(options['vvvv_direct'])
+        return original(*args, **options)
+    monkeypatch.setattr(ccsd, '_solve_fragment', observed)
+    group_case.run(with_grad=False, vvvv_direct=direct)
+    assert modes == [direct, direct]

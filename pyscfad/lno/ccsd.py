@@ -346,7 +346,7 @@ def _make_df_eris_incore(cc, mo_coeff=None, fockao=None):
     # Lov/Lvv, so only unsupported dense fallbacks trigger the persistent
     # packed-ovvv allocation.
     Lpq = None
-    return eris
+    return dfccsd._maybe_cache_vvvv(cc, eris)
 
 
 def impurity_solve(mf, mo_coeff, lo_coeff, eris=None, frozen=None,
@@ -458,7 +458,7 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
                          frag_prescreen=None,
                          verbose_imp=0, ccsd_t=False, dcsd=False,
                          profile_info=None, profile_pass=None,
-                         triples_solver=None, mp2_solver=None):
+                         triples_solver=None, mp2_solver=None, vvvv_direct=False):
     '''Numerical core of :func:`impurity_solve`; see that function for docs.
 
     Takes ``fock`` and ``s1e`` directly (rather than the parent ``eris``
@@ -519,6 +519,7 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
         mcc = RDCSD(mf, mo_coeff=mo_coeff, frozen=frozen)
     else:
         mcc = RCCSD(mf, mo_coeff=mo_coeff, frozen=frozen)
+    mcc.vvvv_direct = vvvv_direct
     diis_space = int(os.environ.get('PYSCFAD_LNO_CCSD_DIIS_SPACE', '3'))
     if diis_space <= 0:
         mcc.diis = False
@@ -542,7 +543,7 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
         frag=frag_index,
         eris_mib=resource_profile.estimated_array_mib(
             *(vars(imp_eris).get(name) for name in (
-                'Loo', 'Lov', 'Lvv', 'oooo', 'ovoo', 'ovov', 'ovvv',
+                'Loo', 'Lov', 'Lvv', 'oooo', 'ovoo', 'ovov', 'ovvv', '_vvvv_pair',
             ))
         ),
     )

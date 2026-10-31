@@ -37,12 +37,15 @@ def _build_cc_worker(worker_initializer, canonical, signature):
 def _run_mpi(initializer, worker_initializer, comm, *, with_grad,
              include_hf=False, merge_identical=True, verbose_imp=0,
              ccsd_t=False, return_components=False, include_baseline=True,
-             fragment_indices=None, parallel_scf_jk=True, scf_worker_initializer=None):
+             fragment_indices=None, parallel_scf_jk=True, scf_worker_initializer=None,
+             vvvv_direct=False):
     """Run CC owner jobs between optional distributed SCF/reference sessions."""
     _collective_call(comm, _check_mpi_thread_support, 'CC MPI thread preflight')
     rank = comm.Get_rank()
 
     def select_service():
+        if not isinstance(vvvv_direct, bool):
+            raise TypeError('vvvv_direct must be a bool')
         if not isinstance(parallel_scf_jk, bool):
             raise TypeError('parallel_scf_jk must be a bool')
         return parallel_scf_jk
@@ -59,7 +62,8 @@ def _run_mpi(initializer, worker_initializer, comm, *, with_grad,
                          merge_identical=merge_identical, verbose_imp=verbose_imp,
                          ccsd_t=ccsd_t, return_components=return_components,
                          include_baseline=include_baseline,
-                         fragment_indices=fragment_indices, scf_service=service)
+                         fragment_indices=fragment_indices, scf_service=service,
+                         vvvv_direct=vvvv_direct)
     finally:
         # Collective failures after PAUSE leave all ranks outside serve().
         # Release executor tokens retained by root's shared pullback closures.
@@ -69,7 +73,8 @@ def _run_mpi(initializer, worker_initializer, comm, *, with_grad,
 
 def _run_jobs(initializer, worker_initializer, comm, *, with_grad,
               include_hf, merge_identical, verbose_imp, ccsd_t,
-              return_components, include_baseline, fragment_indices, scf_service):
+              return_components, include_baseline, fragment_indices, scf_service,
+              vvvv_direct):
     """Keep round-robin CC ownership paused between the two shared phases."""
     from . import ccsd
 
@@ -88,7 +93,7 @@ def _run_jobs(initializer, worker_initializer, comm, *, with_grad,
                            if any(index in wanted for index, _ in
                                   ccsd._group_cc_fragments(static, group)))
         options = dict(include_hf=include_hf, verbose_imp=verbose_imp, ccsd_t=ccsd_t,
-                       triples_controls=state['cc_triples_controls'],
+                       triples_controls=state['cc_triples_controls'], vvvv_direct=vvvv_direct,
                        return_components=return_components, include_baseline=include_baseline,
                        fragment_indices=indices)
         return (static, baseline, matrix, groups, state['weak_pairs'], options,
@@ -132,6 +137,7 @@ def _run_jobs(initializer, worker_initializer, comm, *, with_grad,
                 state, static, group, allocated, matrix, with_grad=with_grad,
                 verbose_imp=options['verbose_imp'], ccsd_t=options['ccsd_t'],
                 triples_controls=options['triples_controls'],
+                vvvv_direct=options['vvvv_direct'],
                 include_baseline=options['include_baseline'],
                 fragment_indices=options['fragment_indices']))
             gc.collect()

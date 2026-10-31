@@ -361,3 +361,16 @@ def test_cc_mpi_worker_preserves_disk_df_factors_for_finite_domain(tmp_path):
     root_factors = transform_df_to_mo(reference, coeff, (0, 2, 2, 4), atmlst=local)
     worker_factors = transform_df_to_mo(worker, coeff, (0, 2, 2, 4), atmlst=local)
     np.testing.assert_allclose(worker_factors, root_factors, atol=1e-13, rtol=0.)
+
+
+def test_cc_checkpoint_rejects_changed_ladder_mode(tmp_path, checkpoint_reference):
+    """Public cache mode must participate in the real serial checkpoint identity."""
+    from pyscfad.dlno_stc._restart import RestartMismatchError
+    mf, static = checkpoint_reference
+    controls = {'mode': 'deterministic', 'threads': 1}
+    options = dict(baseline_controls=controls, matrix_controls=controls,
+                   checkpoint_dir=tmp_path, ccsd_t=False)
+    energy = ccsd.kernel(mf, static, vvvv_direct=False, **options)
+    assert np.isfinite(energy)
+    with pytest.raises(RestartMismatchError):
+        ccsd.kernel(mf, static, vvvv_direct=True, resume=True, **options)

@@ -5,17 +5,15 @@ import pytest
 from pyscfad.dlno_stc.test.test_triples import triples_fixture, triples_native
 
 
-@pytest.mark.parametrize('weighted', [False, True])
 @pytest.mark.parametrize('with_grad', [False, True])
 @pytest.mark.parametrize('adaptive', [False, True])
-def test_reused_pilot_matches_separate_calls(weighted, with_grad, adaptive):
+def test_reused_pilot_matches_separate_calls(with_grad, adaptive):
     native = triples_native()
     inputs = triples_fixture()
-    inputs.pop('U')
+    u = inputs.pop('U'); inputs.pop('eocc'); inputs.pop('evir')
+    inputs.update(L=u, R=u)
     inputs['fov'] = np.array([[.03, -.02, .01], [-.04, .05, -.06]])
-    if weighted:
-        inputs['M'] = np.array([[.36, -.30], [-.768, .64]])
-    name = 'triples_' + ('weighted' if weighted else 'whole') + '_energy'
+    name = 'triples_asymmetric_energy'
     function = getattr(native, name + ('_vjp' if with_grad else ''))
     pilot_count, pilot_seed, production_seed = 4096, 29, 71
     trial = function(**inputs, nsamples=pilot_count, seed=pilot_seed)
@@ -51,7 +49,8 @@ def test_reused_pilot_matches_separate_calls(weighted, with_grad, adaptive):
 ])
 def test_invalid_independent_pilot_rejected(pilot):
     inputs = triples_fixture()
-    inputs.pop('U')
+    u = inputs.pop('U'); inputs.pop('eocc'); inputs.pop('evir')
+    inputs.update(L=u, R=u)
     with pytest.raises((TypeError, ValueError)):
-        triples_native().triples_whole_energy(**inputs, nsamples=10000, seed=71,
+        triples_native().triples_asymmetric_energy(**inputs, nsamples=10000, seed=71,
                                              pilot=pilot)

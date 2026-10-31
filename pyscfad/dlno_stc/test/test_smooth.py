@@ -7,10 +7,11 @@ import numpy as np
 import pytest
 
 from pyscfad.dlno_stc.smooth import (
-    BlockFrame, spectral_projector, symmetric_exp, noncanonical_mp2,
-    select_frame, rebuild_frame, block_exp,
+    AnchoredFrame, noncanonical_mp2,
+    select_frame, rebuild_frame,
 )
 from pyscfad.dlno_stc.smooth_triples import make_grid, make_solver
+from pyscfad.dlno_stc.test._triples_dressing_reference import symmetric_exp
 from pyscfad.dlno_stc.test.test_triples import triples_fixture, triples_reference
 
 
@@ -18,7 +19,8 @@ def test_projector_internal_degeneracy():
     matrix = jnp.diag(jnp.array([-.8, .2, .2, 1.]))
     rng = np.random.default_rng(9)
     d = rng.normal(size=(4, 4)); d = (d + d.T) / 2
-    projector = spectral_projector((1, 2))
+    from pyscfad.dlno_stc._retained_space import retained_projector
+    projector = retained_projector((1, 2))
     _, tangent = jax.jvp(projector, (matrix,), (jnp.asarray(d),))
     step = 1e-5
     fd = (projector(matrix + step*d) - projector(matrix - step*d)) / (2*step)
@@ -33,15 +35,48 @@ def test_exponential_degenerate_derivative():
     np.testing.assert_allclose(tangent, np.exp(.4) * direction, atol=1e-13)
 
 
+def test_full_block_frame_skips_projectors_and_retains_moving_subspace(monkeypatch):
+    from pyscfad.dlno_stc import smooth
+    rng = np.random.default_rng(161)
+    coeff = jnp.asarray(np.linalg.qr(rng.normal(size=(6, 4)))[0])
+    overlap = jnp.eye(6)
+    fock = coeff @ jnp.diag(jnp.array([-.8, -.8, .2, .2])) @ coeff.T
+    frame = select_frame(coeff, fock)
+
+    def forbidden(*args):
+        raise AssertionError('a full block must not construct a spectral projector')
+
+    monkeypatch.setattr(jnp.linalg, 'eigh', forbidden)
+    dc = jnp.asarray(rng.normal(size=(6, 4)) * .1)
+    ds = jnp.asarray(rng.normal(size=(6, 6)) * .1); ds = (ds + ds.T) / 2
+    df = jnp.asarray(rng.normal(size=(6, 6))); df = (df + df.T) / 2
+
+    def moving(x):
+        metric = overlap + x * ds
+        current = smooth.orthonormalize(coeff + x * dc, metric)
+        return rebuild_frame(current, metric, frame)
+
+    q, dq = jax.jvp(moving, (0.,), (1.,))
+    step = 1e-5
+    np.testing.assert_allclose(dq, (moving(step) - moving(-step)) / (2*step),
+                               rtol=2e-7, atol=2e-10)
+    np.testing.assert_allclose(q.T @ q, np.eye(4), atol=1e-13)
+    np.testing.assert_allclose(q @ q.T, coeff @ coeff.T, atol=1e-13)
+    np.testing.assert_allclose(dq.T @ q + q.T @ dq + q.T @ ds @ q, 0., atol=1e-12)
+    assert np.linalg.norm(dq) > .01
+    _, response = jax.jvp(lambda f: rebuild_frame(coeff, overlap, frame), (fock,), (df,))
+    np.testing.assert_array_equal(response, 0.)
+
+
 def test_block_frame_preserves_full_matrix_response():
     a = jnp.diag(jnp.array([-.8, -.799, .2, .5, .502]))
     identity = jnp.eye(5)
-    frame = select_frame(identity, a, .01)
+    frame = select_frame(identity, a)
     rng = np.random.default_rng(17)
     b = rng.normal(size=(5, 5)); b = jnp.asarray((b+b.T)/2)
     def in_frame(fock):
-        q = rebuild_frame(identity, identity, fock, frame)
-        return jnp.sum((q.T @ b @ q) * block_exp(q.T @ fock @ q, -.6, frame.clusters))
+        q = rebuild_frame(identity, identity, frame)
+        return jnp.sum((q.T @ b @ q) * symmetric_exp(-.6 * (q.T @ fock @ q)))
     def direct(fock):
         return jnp.sum(b * symmetric_exp(-.6*fock))
     actual, derivative = jax.value_and_grad(in_frame)(a)
@@ -55,7 +90,7 @@ def inputs_and_reference():
     x['U'] = jnp.eye(2)
     x['fov'] = jnp.array([[.03, -.02, .01], [-.04, .05, -.06]])
     foo, fvv = jnp.diag(x['eocc']), jnp.diag(x['evir'])
-    frames = (BlockFrame(np.eye(2), ((0, 1),)), BlockFrame(np.eye(3), ((0, 1, 2),)))
+    frames = (AnchoredFrame(np.eye(2)), AnchoredFrame(np.eye(3)))
     grid = make_grid(x['eocc'], x['evir'])
     return x, foo, fvv, frames, grid
 
@@ -86,7 +121,7 @@ def test_deterministic_laplace_energy_and_all_cotangents():
     # Off-diagonal Fock tests the noncanonical equation, not just diagonal scaling.
     foo = foo.at[0, 1].set(.02).at[1, 0].set(.02)
     fvv = fvv.at[0, 1].set(.03).at[1, 0].set(.03)
-    solver = make_solver({'mode': 'deterministic'}, frames, grid, with_grad=True)
+    solver = make_solver({'mode': 'deterministic'}, grid, with_grad=True)
     actual, bars = jax.value_and_grad(lambda x, fo, fv: evaluate(solver, x, fo, fv),
                                     argnums=(0, 1, 2))(x, foo, fvv)
     reference, expected = jax.value_and_grad(canonical_reference, argnums=(0, 1, 2))(x, foo, fvv)
@@ -132,14 +167,13 @@ def test_existing_deterministic_triples_vjp_reference():
     np.testing.assert_allclose(derivative, reference, atol=1e-12)
 
 
-@pytest.mark.parametrize('dressing', ['equal', 'asymmetric'])
-def test_partial_target_laplace_all_responses(dressing):
+def test_partial_target_laplace_all_responses():
     """Noncommuting fragment projector, off-diagonal Fock and nonzero Fov."""
     x, foo, fvv, frames, grid = inputs_and_reference()
     x['U'] = jnp.array([[.6], [-.8]])
     foo = foo.at[0, 1].set(.02).at[1, 0].set(.02)
     fvv = fvv.at[0, 1].set(.03).at[1, 0].set(.03)
-    solver = make_solver({'mode': 'deterministic', 'dressing': dressing}, frames, grid, with_grad=True)
+    solver = make_solver({'mode': 'deterministic'}, grid, with_grad=True)
     actual, bars = jax.value_and_grad(lambda x, fo, fv: evaluate(solver, x, fo, fv),
                                      argnums=(0, 1, 2))(x, foo, fvv)
     expected, refbars = jax.value_and_grad(canonical_reference, argnums=(0, 1, 2))(x, foo, fvv)
@@ -159,7 +193,7 @@ def test_truncated_anchored_frame_w_response_and_internal_degeneracy():
     matrix = q @ jnp.diag(jnp.array([0., .01, .01, .3, .3, .8])) @ q.T
     internal = q[:, :1]
     identity = jnp.eye(6)
-    frame = BlockFrame(np.asarray(q[:, [0, 3, 4, 5]]), ((0, 1, 2, 3),))
+    frame = AnchoredFrame(np.asarray(q[:, [0, 3, 4, 5]]))
     d = rng.normal(size=(6, 6)); d = jnp.asarray((d+d.T)/2)
     def project(w):
         c = _smooth_density_space(w, internal, (3, 4, 5), False, identity, identity, frame)
@@ -187,44 +221,10 @@ def test_partial_target_mp2_partition_and_response():
     np.testing.assert_allclose(bar, refbar, atol=1e-13)
 
 
-def test_weighted_stochastic_energy_and_matrix_response():
-    from pyscfad.dlno_stc.test.test_triples import triples_native
-    native = triples_native()
-    inputs = triples_fixture()
-    inputs.pop('U')
-    inputs['M'] = np.array([[.36, -.30], [-.768, .64]])
-    inputs['fov'] = np.array([[.03, -.02, .01], [-.04, .05, -.06]])
-    exact = native.triples_weighted_energy_vjp(**inputs, nsamples=0)
-    # This nonsymmetric weight exercises both sides of the fragment operator.
-    # Independent replicates check the mean VJP, not derivatives of resampling.
-    draws = [native.triples_weighted_energy_vjp(**inputs, nsamples=32768, seed=seed)
-             for seed in (17, 29, 37, 53)]
-    error = np.mean([d['energy'] for d in draws])-exact['energy']
-    se = np.sqrt(sum(d['standard_error']**2 for d in draws))/len(draws)
-    assert abs(error) <= 7*se+1e-12
-    for name in ('M', 't1', 'fov'):
-        bars = np.array([d['cotangents'][name] for d in draws])
-        se = bars.std(axis=0, ddof=1)/np.sqrt(len(draws))
-        assert np.all(abs(bars.mean(axis=0)-exact['cotangents'][name]) <= 8*se+1e-10)
-
-
-def test_weighted_zero_matrix_keeps_derivative_support():
-    from pyscfad.dlno_stc.test.test_triples import triples_native
-    inputs = triples_fixture()
-    inputs.pop('U')
-    inputs['M'] = np.zeros((2, 2))
-    result = triples_native().triples_weighted_energy_vjp(**inputs, nsamples=8192, seed=17)
-    assert result['energy'] == 0.
-    assert np.isfinite(result['cotangents']['M']).all()
-    assert np.linalg.norm(result['cotangents']['M']) > 1e-6
-    for name in ('t1', 't2', 'fov', 'Bvo', 'Boo', 'Bvv'):
-        np.testing.assert_array_equal(result['cotangents'][name], 0.)
-
-
 def test_complementary_fragment_targets_recover_whole_laplace():
     x, foo, fvv, frames, grid = inputs_and_reference()
     foo = foo.at[0, 1].set(.02).at[1, 0].set(.02)
-    solver = make_solver({'mode': 'deterministic'}, frames, grid, with_grad=True)
+    solver = make_solver({'mode': 'deterministic'}, grid, with_grad=True)
     def fragments(fo):
         return sum(evaluate(solver, {**x, 'U': u}, fo, fvv)
                    for u in (jnp.array([[.6], [-.8]]), jnp.array([[.8], [.6]])))
@@ -232,3 +232,19 @@ def test_complementary_fragment_targets_recover_whole_laplace():
     expected, refbar = jax.value_and_grad(lambda fo: evaluate(solver, x, fo, fvv))(foo)
     np.testing.assert_allclose(actual, expected, atol=1e-12)
     np.testing.assert_allclose(bar, refbar, atol=1e-11)
+
+
+def test_retained_frame_checkpoint_roundtrip_and_old_selection_rejection(tmp_path):
+    from pyscfad.dlno_stc import ccsd
+    from pyscfad.dlno_stc._restart import RestartManager, scientific_digest
+    frame = AnchoredFrame(np.eye(3))
+    manager = RestartManager(tmp_path, resume=False, method='full-lis-frame', scientific_payload={})
+    try:
+        manager.save_static(frame)
+        restored = manager.load_static(expected_type=AnchoredFrame)
+        assert scientific_digest(restored) == scientific_digest(frame)
+    finally:
+        manager.close()
+    previous = ccsd.CCSDSelections(None, (), schema_version=5)
+    with pytest.raises(ValueError, match='incompatible CC selections'):
+        ccsd._validate_run(previous, {}, {}, None)

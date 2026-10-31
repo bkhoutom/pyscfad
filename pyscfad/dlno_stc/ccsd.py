@@ -24,7 +24,7 @@ from .domain import build_boys_ed_frame
 from .protocol import validate_full_result, validate_input_cotangents
 
 
-CC_SELECTIONS_SCHEMA_VERSION = 4
+CC_SELECTIONS_SCHEMA_VERSION = 6
 
 
 @dataclass(frozen=True)
@@ -131,7 +131,7 @@ def _validate_run(static, baseline_controls, matrix_controls, matrix_kind):
     if not isinstance(static, CCSDSelections):
         raise TypeError('static must be CCSDSelections from build_static_selections')
     if vars(static).get('schema_version') != CC_SELECTIONS_SCHEMA_VERSION:
-        raise ValueError('incompatible CC selections; rebuild selections for fragment energy budgets')
+        raise ValueError('incompatible CC selections; rebuild selections for full-Fock smooth frames')
     kind = static.matrix_kind if matrix_kind is None else matrix_kind
     if kind != static.matrix_kind:
         raise ValueError('matrix_kind differs from the saved LIS selection')
@@ -211,7 +211,7 @@ def _bar_norm(*trees):
 def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_vir,
                             baseline_controls, matrix_controls,
                             internal_rank_threshold=1e-6, merge_identical=True, fragment_indices=None,
-                            smooth_gap=None, smooth_laplace_points=10):
+                            smooth=True, smooth_laplace_points=10):
     """Select physical-fragment LIS ranks from explicit D or W cutoffs and controls.
 
     ``mp2_static`` is a concrete Boys ``DomainSelections``. D and W use
@@ -219,16 +219,16 @@ def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_v
     ``fragment_indices`` selects only those LIS ranks; unselected entries
     remain absent while all domain metadata is retained.
 
-    ``smooth_gap`` (Eh) opts each retained LIS into anchored Fock clusters
-    and full-Fock Laplace triples. D/W subspace response is retained. Cluster
-    labels, ranks, anchors and per-fragment quadratures are fixed here.
-    ``smooth_laplace_points`` defaults to ten fitted points per LIS; None
-    retains the older adaptive Gaussian grid. MP2 fragment energy proxies
-    from D/W selection are saved for subsequent triples variance allocation.
+    Smooth anchored frames with full occupied and virtual Fock matrices are
+    the default. Set ``smooth=False`` only for a deterministic semicanonical reference.
+    D/W subspace and AO overlap response are retained; there are no internal
+    Fock cluster projectors. Ranks, anchors and quadratures are fixed here.
+    ``smooth_laplace_points`` defaults to ten fitted points per LIS.
+    MP2 fragment proxies from D/W selection allocate triples variance budgets.
     """
     from .lis import LISSelections, build_fragment_lis_selection, build_fragment_lis
-    if smooth_gap is not None and (not numpy.isfinite(smooth_gap) or smooth_gap <= 0):
-        raise ValueError('smooth_gap must be finite and positive (Eh)')
+    if not isinstance(smooth, (bool, numpy.bool_)):
+        raise TypeError('smooth must be a boolean')
     baseline, matrix = _normalize_controls(baseline_controls, matrix_controls, matrix_kind)
     state = driver._initialize(mf, mp2_static, baseline, with_grad=False)
     indices = _fragment_indices(mp2_static, fragment_indices, selecting=True)
@@ -262,7 +262,7 @@ def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_v
                 frame_fragment_index=group.representative_index,
                 thresh_occ=thresh_occ, thresh_vir=thresh_vir,
                 internal_rank_threshold=internal_rank_threshold)
-            if smooth_gap is not None:
+            if smooth:
                 from .smooth import select_frame
                 from .smooth_triples import make_grid
                 partial_lis = LISSelections(mp2_static, matrix_kind, thresh_occ, thresh_vir,
@@ -272,7 +272,7 @@ def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_v
                     frame=frame, frame_fragment_index=group.representative_index)
                 coefficients = (selected.active_occupied_coeff, selected.active_virtual_coeff)
                 if all(coeff.shape[1] for coeff in coefficients):
-                    frames[index] = tuple(select_frame(coeff, state['common'].fock, smooth_gap)
+                    frames[index] = tuple(select_frame(coeff, state['common'].fock)
                                           for coeff in coefficients)
                     spectra = [numpy.linalg.eigvalsh(item.anchor.T @
                         numpy.asarray(state['common'].fock) @ item.anchor) for item in frames[index]]
@@ -285,8 +285,8 @@ def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_v
                         thresh_occ=thresh_occ, thresh_vir=thresh_vir,
                         internal_rank_threshold=internal_rank_threshold,
                         fragments=tuple(selections),
-                        smooth_frames=tuple(frames) if smooth_gap is not None else None,
-                        smooth_grid=tuple(grids) if smooth_gap is not None else None)
+                        smooth_frames=tuple(frames) if smooth else None,
+                        smooth_grid=tuple(grids) if smooth else None)
     static = CCSDSelections(lis, _scientific_identity(baseline, matrix),
                             mp2_fragment_energies=tuple(mp2_energies))
     for index in indices:
@@ -298,22 +298,12 @@ def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_v
 def _allocate_triples_controls(controls, nfragments, *, static=None, indices=None):
     """Allocate a total triples SE budget over globally requested physical fragments."""
     smooth = getattr(getattr(static, 'lis_static', None), 'smooth_frames', None) is not None
-    if controls is not None:
-        if smooth:
-            controls = dict(controls)
-            controls.setdefault('dressing', 'asymmetric')
-            controls.setdefault('dressing_backend', 'native')
-        elif 'dressing' in controls or 'dressing_backend' in controls:
-            raise ValueError('dressing requires the smooth Laplace triples path')
     if controls is not None and controls.get('mode') == 'stochastic':
-        if smooth:
-            # Resolve the default before checkpoint/MPI identity is recorded.
-            # Changing this default must not silently reuse older production.
-            controls = dict(controls)
-            controls.setdefault('trace_exponent', DEFAULT_TRIPLES_TRACE_EXPONENT)
-            controls.setdefault('adaptive', True)
-        elif 'trace_exponent' in controls or 'adaptive' in controls:
-            raise ValueError('trace_exponent/adaptive requires the smooth Laplace triples path')
+        if not smooth:
+            raise ValueError('stochastic triples requires full-LIS smooth frames; '
+                             'canonical triples sampling has been removed')
+        controls = dict(controls)
+        controls.setdefault('trace_exponent', DEFAULT_TRIPLES_TRACE_EXPONENT)
     if controls is None or 'energy_tolerance' not in controls:
         return controls
     energies = controls.get('fragment_energies', getattr(static, 'mp2_fragment_energies', None))
@@ -385,14 +375,10 @@ def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
             local_controls['global_seed'] = _triples_fragment_seed(
                 local_controls.get('global_seed', 71), fragment_index)
             options['triples_solver'] = make_solver(local_controls,
-                static.lis_static.smooth_frames[fragment_index],
                 static.lis_static.smooth_grid[fragment_index],
                 with_grad=with_grad)
     elif stochastic:
-        from .triples import make_solver
-        local_controls = dict(triples_controls, global_seed=_triples_fragment_seed(
-            triples_controls['global_seed'], fragment_index))
-        options['triples_solver'] = make_solver(local_controls, with_grad=with_grad)
+        raise ValueError('canonical triples sampling has been removed; rebuild smooth selections')
     return _impurity_solve_core(
         mf, lis.mo_coeff, lis.fragment_iao_coeff, common.fock, common.s1e,
         frozen=lis.frozen, frag_prescreen=metadata, verbose_imp=verbose_imp,

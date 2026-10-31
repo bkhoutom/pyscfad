@@ -26,7 +26,6 @@ from pyscf.gto import ANG_OF, NPRIM_OF, NCTR_OF, PTR_COEFF
 from pyscfad import numpy as np
 from pyscfad.ops import (
     custom_jvp,
-    vmap,
     jit,
 )
 from pyscfad import config
@@ -285,55 +284,41 @@ def _int3c_jvp_aux_exp(mol, auxmol, auxmol_t, intor, comp, aosym):
         tangent_out = tangent_out[0]
     return tangent_out
 
+def _int3c_ao_displacements(mol, mol_t, nao):
+    """Gather atomic displacements by AO, without an atom-batched integral tape."""
+    aoslices = mol.aoslice_by_atom()[:, 2:4]
+    owners = numpy.repeat(numpy.arange(len(aoslices), dtype=numpy.int32),
+                          aoslices[:, 1] - aoslices[:, 0])
+    return mol_t.coords[owners[:nao]]
+
+
 @jit
 def _int3c_fill_jvp_r0_ip1(mol, mol_t, ints):
-    naoi = ints.shape[1]
-    idx = np.arange(naoi)[None,:,None,None]
-    aoslices = mol.aoslice_by_atom()[:,2:4]
-    def _fill(sl, coord):
-        mask = (idx >= sl[0]) & (idx < sl[1])
-        grad = np.where(mask, ints, np.array(0, dtype=ints.dtype))
-        return np.einsum('xijk,x->ijk', grad, coord)
-    jvp = np.sum(vmap(_fill)(aoslices, mol_t.coords), axis=0)
+    displacement = _int3c_ao_displacements(mol, mol_t, ints.shape[1])
+    jvp = np.einsum('xijk,ix->ijk', ints, displacement)
     jvp += jvp.transpose(1,0,2)
     return jvp
 
 @jit
 def _int3c_fill_jvp_r0_ip2(mol, mol_t, ints):
-    naux = ints.shape[-1]
-    idx = np.arange(naux)[None,None,None,:]
-    aoslices = mol.aoslice_by_atom()[:,2:4]
-    def _fill(sl, coord):
-        mask = (idx >= sl[0]) & (idx < sl[1])
-        grad = np.where(mask, ints, np.array(0, dtype=ints.dtype))
-        return np.einsum('xijk,x->ijk', grad, coord)
-    jvp = np.sum(vmap(_fill)(aoslices, mol_t.coords), axis=0)
-    return jvp
+    displacement = _int3c_ao_displacements(mol, mol_t, ints.shape[-1])
+    return np.einsum('xijk,kx->ijk', ints, displacement)
 
 
 def _int3c_fill_jvp_r0_ip1_comp(mol, mol_t, ints, axis=0):
     if axis == 0:
-        idx = np.arange(ints.shape[2])[None,None,:,None,None]
+        displacement = _int3c_ao_displacements(mol, mol_t, ints.shape[2])
+        return np.einsum('xcijk,ix->cijk', ints, displacement)
     elif axis == 1:
-        idx = np.arange(ints.shape[3])[None,None,None,:,None]
+        displacement = _int3c_ao_displacements(mol, mol_t, ints.shape[3])
+        return np.einsum('xcijk,jx->cijk', ints, displacement)
     else:
         raise NotImplementedError
-    aoslices = mol.aoslice_by_atom()[:,2:4]
-    def _fill(sl, coord):
-        mask = (idx >= sl[0]) & (idx < sl[1])
-        grad = np.where(mask, ints, np.array(0, dtype=ints.dtype))
-        return np.einsum('xcijk,x->cijk', grad, coord)
-    return np.sum(vmap(_fill)(aoslices, mol_t.coords), axis=0)
 
 
 def _int3c_fill_jvp_r0_ip2_comp(mol, mol_t, ints):
-    idx = np.arange(ints.shape[-1])[None,None,None,None,:]
-    aoslices = mol.aoslice_by_atom()[:,2:4]
-    def _fill(sl, coord):
-        mask = (idx >= sl[0]) & (idx < sl[1])
-        grad = np.where(mask, ints, np.array(0, dtype=ints.dtype))
-        return np.einsum('xcijk,x->cijk', grad, coord)
-    return np.sum(vmap(_fill)(aoslices, mol_t.coords), axis=0)
+    displacement = _int3c_ao_displacements(mol, mol_t, ints.shape[-1])
+    return np.einsum('xcijk,kx->cijk', ints, displacement)
 
 
 def cholesky_eri(mol, auxmol=None, auxbasis='weigend+etb',

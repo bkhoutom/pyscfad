@@ -2,6 +2,32 @@
 
 import os
 from pathlib import Path
+import resource
+import sys
+
+
+def ensure_worker_stack(minimum_bytes=16 * 1024 * 1024):
+    """Start Linux benchmark workers with enough stack for threaded LAPACK.
+
+    Call only at a CLI entry point, before numerical imports or opening files.
+    An unlimited startup RLIMIT_STACK gives glibc threads just 2 MiB. Recursive
+    OpenBLAS GETRF can exceed this for C20-sized matrices. glibc caches the
+    startup limit, so changing it requires re-executing this Python command.
+    The CPU budget and numerical thread counts are unaffected.
+    """
+    if sys.platform != "linux":
+        return
+    soft, hard = resource.getrlimit(resource.RLIMIT_STACK)
+    if soft != resource.RLIM_INFINITY and soft >= minimum_bytes:
+        return
+    if hard != resource.RLIM_INFINITY and hard < minimum_bytes:
+        raise RuntimeError(
+            f"benchmark workers require at least {minimum_bytes} stack bytes; "
+            f"the hard stack limit is {hard}")
+    resource.setrlimit(resource.RLIMIT_STACK, (minimum_bytes, hard))
+    print(f"[RUNTIME] Restarting with {minimum_bytes // (1024 * 1024)} MiB "
+          "default worker stacks", flush=True)
+    os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
 
 
 def choose_cpus(allowed, count):
@@ -72,5 +98,6 @@ def check_worker_affinity(cpus):
         masks.append(mask)
     return dict(cpu_affinity=sorted(allowed), runtime_threads=len(masks),
                 worker_affinity_verified=True,
+                stack_limit_bytes=resource.getrlimit(resource.RLIMIT_STACK)[0],
                 memory_mappings=len(Path("/proc/self/maps").read_text().splitlines()),
                 max_map_count=int(Path("/proc/sys/vm/max_map_count").read_text()))

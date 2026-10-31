@@ -63,15 +63,15 @@ Adapter integration:
 
 Three-way exact diffs are recorded in part1_update/native_source_diffs.
 
-Selected stochastic (T) addition:
-Source: TEST_general/dlno_stc_test/stc_mp2_native/src_code_stc_T/updates
-Native version: stc_triples:sha256:h=72dafa4934ba1f6462638908ef1a1d4d38a325271e16e3e99087e7ff6ddf4825:C=842d28759061c13474fb2f69bf62120ff50ab63035aa12623f24599d27e49a0f:binding-3
-SHA256 of supplied and vendored files (byte-identical, no source edits):
-72dafa4934ba1f6462638908ef1a1d4d38a325271e16e3e99087e7ff6ddf4825  stc_triples.h
-842d28759061c13474fb2f69bf62120ff50ab63035aa12623f24599d27e49a0f  stc_triples.C
-Binding explicitly packs arbitrary NumPy strides into Armadillo matrices.
-Nine DF input cotangents are copied to Python, including fov even when its
-optional value is None (zero); dense integral bars remain internal to the
-unchanged supplied kernel. The trailing fov keyword preserves positional
-sampling controls. Zero target_standard_error selects fixed-count sampling;
-positive targets use nsamples as a pilot. nsamples=0 is energy-reference only.
+Asymmetric Laplace (T) cleanup, 2026-10-30:
+Only the denominator-free asymmetric numerator and selected-space restricted
+sampler are retained. Canonical and weighted sampling entry points were removed.
+The native binding exposes energy and fused energy/VJP, including fov, L and R.
+nsamples=0 enumerates an exact reference. A separate discarded pilot may choose
+production counts; a positive SE target extends the production stream.
+Historical imported-source hashes are archived in
+results/triples_cleanup_20261030/before/pyscfad/dlno_stc/cpp/native/SOURCE_MANIFEST.txt.
+SHA256 of current retained triples sources:
+962b3da2176b7a267fad82179681cde04a0495310f9ec58eae1027aef38c4adb  stc_triples.h
+73b292face29e1c712a06cee5901e48ac3618a03cfb021962d38bfea7f9532b1  stc_triples_asymmetric.C
+3cb84a2fd873ab706d3b67b9f0f9f3119981d22a9ca291535075dd78072f7a96  triples_block_sampler.h

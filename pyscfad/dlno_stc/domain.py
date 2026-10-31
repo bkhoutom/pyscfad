@@ -4,6 +4,7 @@ from typing import NamedTuple
 from types import SimpleNamespace
 
 import jax
+from jax.scipy.linalg import solve_triangular
 import numpy
 import scipy.linalg as scipy_linalg
 
@@ -141,6 +142,14 @@ def _all_columns(indices, count):
     )
 
 
+def _project_to_ao_support(coeff, overlap, ao):
+    """The projection onto the entire current AO basis is exactly identity."""
+    if _all_columns(ao, overlap.shape[0]):
+        # Avoid solving S X = S C, including its cancelling overlap VJP.
+        return coeff
+    return tools.project_mo(coeff, overlap[ao], overlap[numpy.ix_(ao, ao)])
+
+
 def _rebuild_local_virtual_subspace(
     common, selection, ao, occupied_local, *, boys_metric_threshold=None,
 ):
@@ -181,9 +190,8 @@ def _rebuild_local_virtual_subspace(
         candidate = pao_orth @ overlap_vectors[:, selection.overlap_keep]
         candidate = candidate[:, selection.completeness_keep]
 
-    overlap21 = overlap[ao]
     overlap22 = overlap[numpy.ix_(ao, ao)]
-    candidate = tools.project_mo(candidate, overlap21, overlap22)
+    candidate = _project_to_ao_support(candidate, overlap, ao)
     candidate = _orthogonalize(
         occupied_local, candidate, overlap22
     )
@@ -280,8 +288,8 @@ def _cholesky_metric_orthonormalize(coeff, overlap):
     metric = coeff.T.conj() @ overlap @ coeff
     metric = 0.5 * (metric + metric.T.conj())
     metric_cholesky = np.linalg.cholesky(metric)
-    return np.linalg.solve(
-        metric_cholesky, coeff.T.conj()
+    return solve_triangular(
+        metric_cholesky, coeff.T.conj(), lower=True
     ).T.conj()
 
 
@@ -380,9 +388,8 @@ def _rebuild_selected_pao_space(
     representation_ao = numpy.asarray(
         representation_ao_indices, dtype=numpy.int32
     )
-    s21 = s1e[representation_ao]
     s22 = s1e[numpy.ix_(representation_ao, representation_ao)]
-    candidate = tools.project_mo(candidate, s21, s22)
+    candidate = _project_to_ao_support(candidate, s1e, representation_ao)
     candidate = _orthogonalize(
         occupied_for_projection, candidate, s22
     )
@@ -485,7 +492,7 @@ def build_boys_ed_frame(common, static, fragment_index, *, virtual_anchor_column
     candidate = np.concatenate([common.fragment_occupied_data[int(partner)].iao_coeff for partner in partners], axis=1)
     if candidate.shape[1] != nocc:
         raise ValueError("Boys targets require a complete singleton partition")
-    occupied = tools.project_mo(candidate, common.s1e[ao], overlap22)
+    occupied = _project_to_ao_support(candidate, common.s1e, ao)
     _validate_boys_metric_rank(occupied, overlap22, fragment.strong_occ_metric_keep,
                                static.thresholds.metric_rank, f"domain {fragment_index} occupied target/partner ED")
     occupied = _cholesky_metric_orthonormalize(occupied, overlap22)

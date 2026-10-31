@@ -6,10 +6,9 @@ The existing native kernel then evaluates the dressed numerator with D=-1.
 Full Fock-block response enters through stable matrix-function derivatives.
 
 For a partial occupied target M=U U.T, the numerator weight is O^-1 M O.
-The asymmetric path factors this as L R.T, L=O^-1 U, R=O U, and contracts
-directly over S. The equal path retains the full nonsymmetric weight matrix.
+The numerator factors this as L R.T, L=O^-1 U, R=O U, and contracts
+directly over the physical selected space S. Whole-LIS targets use U=I.
 """
-from functools import partial
 import importlib
 import time
 
@@ -18,75 +17,45 @@ import jax.numpy as jnp
 import numpy as np
 
 from pyscfad import lib
-from .smooth import block_exp
 from .controls import DEFAULT_TRIPLES_TRACE_EXPONENT, _finite_control
 
 NAMES = ('t1', 't2', 'Bvo', 'Boo', 'Bvv', 'fov')
 
 
-def make_grid(eocc, evir, tolerance=1e-11, *, points=10):
-    """Positive fitted triples quadrature, fixed during AD.
+def make_grid(eocc, evir, *, points=10):
+    """Positive fitted triples quadrature, fixed during differentiation.
 
-    The default is exactly ten points. Both 1/D and 1/D^2 enter the fit and
-    their measured errors are recorded separately from stochastic uncertainty.
-    ``points=None`` retains the older adaptive log-time Gaussian grid.
+    Both 1/D and 1/D^2 enter the fit. Their measured errors are reported
+    separately from stochastic uncertainty; the default is ten points.
     """
+    from .controls import _integer_control
+    from .laplace import fit_grid
+    points = _integer_control('smooth_laplace_points', points)
     lo = 3 * float(np.min(evir) - np.max(eocc))
     hi = 3 * float(np.max(evir) - np.min(eocc))
     if lo <= 0:
         raise ValueError('smooth triples requires a positive occupied-virtual gap')
-    if points is not None:
-        from .controls import _integer_control
-        from .laplace import fit_grid
-        points = _integer_control('smooth_laplace_points', points)
-        # Relative energy/derivative residuals over the full triples interval.
-        # Scaling the objective avoids premature absolute solver termination.
-        delta = np.geomspace(lo, hi, 300)
-        probability = (delta / hi)**2
-        probability /= probability.sum()
-        try:
-            nodes, weights = fit_grid(delta, 100 * probability, points, .1)
-        except RuntimeError:
-            # Retain the requested point count if the tighter objective does
-            # not converge. The actual kernel errors below remain explicit.
-            nodes, weights = fit_grid(delta, probability, points, .1)
-        dense = np.geomspace(lo, hi, 10001)
-        kernel = np.exp(-dense[:, None] * nodes)
-        return nodes, weights, dict(kind='fitted', denominator_bounds=[lo, hi],
-            points=points, lambda_gradient=.1,
-            max_relative_energy_error=float(np.max(np.abs(dense * (kernel @ weights) - 1))),
-            max_relative_derivative_error=float(np.max(np.abs(
-                dense**2 * (kernel @ (weights * nodes)) - 1))))
-    from scipy.special import roots_legendre
-    # Integrate [0, small] directly, then [small, large] in logarithmic time.
-    # This avoids spending many nodes on an almost constant integrand near 0.
-    small, large = .05 / hi, -np.log(tolerance * .01) / lo
-    x0, w0 = roots_legendre(4)
-    first_nodes, first_weights = (x0 + 1) * small / 2, w0 * small / 2
-    denominators = np.geomspace(lo, hi, 10001)
-    half = np.log(large / small) / 2
-    center = np.log(large * small) / 2
-    for count in range(16, 97, 4):
-        x, w = roots_legendre(count)
-        log_nodes = np.exp(center + half * x)
-        nodes = np.r_[first_nodes, log_nodes]
-        weights = np.r_[first_weights, half * w * log_nodes]
-        expval = np.exp(-denominators[:, None] * nodes)
-        diagnostics = dict(denominator_bounds=[lo, hi], points=len(nodes),
-            max_relative_energy_error=float(np.max(np.abs(denominators * (expval @ weights) - 1))),
-            max_relative_derivative_error=float(np.max(np.abs(
-                denominators**2 * (expval @ (weights * nodes)) - 1))))
-        if max(diagnostics['max_relative_energy_error'],
-               diagnostics['max_relative_derivative_error']) < 1e-9:
-            return nodes, weights, diagnostics
-    raise ValueError('Laplace quadrature failed its energy/derivative check')
+    delta = np.geomspace(lo, hi, 300)
+    probability = (delta / hi)**2
+    probability /= probability.sum()
+    try:
+        nodes, weights = fit_grid(delta, 100 * probability, points, .1)
+    except RuntimeError:
+        nodes, weights = fit_grid(delta, probability, points, .1)
+    dense = np.geomspace(lo, hi, 10001)
+    kernel = np.exp(-dense[:, None] * nodes)
+    return nodes, weights, dict(kind='fitted', denominator_bounds=[lo, hi],
+        points=points, lambda_gradient=.1,
+        max_relative_energy_error=float(np.max(np.abs(dense * (kernel @ weights) - 1))),
+        max_relative_derivative_error=float(np.max(np.abs(
+            dense**2 * (kernel @ (weights * nodes)) - 1))))
 
 
 def point_variance_fractions(foo, fvv, nodes, weights, *, exponent=DEFAULT_TRIPLES_TRACE_EXPONENT):
     """Trace-model variance shares, evaluated in log space.
 
     score_q = |w_q| [Tr exp(t_q F_oo/2) Tr exp(-t_q F_vv/2)]**exponent.
-    The default 2.1 scales the empirical MP2 exponent 1.4 by 3/2 for triples.
+    The default is 5.0 for triples; the MP2 trace model uses 1.4.
     Spectra here choose sampling budgets only; no eigenvector AD is involved.
     """
     from scipy.special import logsumexp
@@ -103,83 +72,27 @@ def point_variance_fractions(foo, fvv, nodes, weights, *, exponent=DEFAULT_TRIPL
     return fractions / fractions.sum()
 
 
-def production_allocation(weighted_sigmas, fractions, target, *, minimum=10000):
-    """Independent pilot estimates set counts for fixed weighted variance targets."""
-    with np.errstate(over='ignore', divide='ignore', invalid='ignore'):
-        counts = np.ceil((weighted_sigmas / (target * np.sqrt(fractions)))**2)
-    if (not np.isfinite(counts).all() or np.any(counts < 0)
-            or np.any(counts >= np.iinfo(np.int64).max)):
-        raise ValueError('triples production sample budget exceeds int64 capacity')
-    return np.maximum(minimum, counts.astype(np.int64))
-
-
-@partial(jax.jit, static_argnames=('occupied_clusters', 'virtual_clusters'))
-def dress(t1, t2, Bvo, Boo, Bvv, fov, foo, fvv, node, *,
-          occupied_clusters, virtual_clusters):
-    o = block_exp(foo, node / 2, occupied_clusters)
-    v = block_exp(fvv, -node / 2, virtual_clusters)
-    oi = block_exp(foo, -node / 2, occupied_clusters)
-    vi = block_exp(fvv, node / 2, virtual_clusters)
-    return (o @ t1 @ v,
-            jnp.einsum('ip,jq,ar,bs,pqrs->ijab', o, o, v, v, t2,
-                       optimize='optimal'),
-            jnp.einsum('ij,Pjb,ba->Pia', o, Bvo, v, optimize='optimal'),
-            jnp.einsum('ij,Pjk,kl->Pil', o, Boo, oi, optimize='optimal'),
-            jnp.einsum('ab,Pbc,cd->Pad', v, Bvv, vi, optimize='optimal'),
-            o @ fov @ v)
-
-
 def _native(inputs, samples, seed, target=0., with_grad=True, *, pilot=None):
     native = importlib.import_module('pyscfad.dlno_stc._stc_mp2')
     values = [np.asarray(x, dtype=np.float64) for x in inputs]
     options = {} if pilot is None else {'pilot': pilot}
-    if len(inputs) == 8:
-        function = (native.triples_asymmetric_energy_vjp if with_grad
-                    else native.triples_asymmetric_energy)
-        return function(*values[:5], *values[6:], nsamples=int(samples), seed=int(seed),
-                        target_standard_error=float(target), fov=values[5], **options)
-    weighted = len(inputs) == 7
-    function = (native.triples_weighted_energy_vjp if with_grad else native.triples_weighted_energy) if weighted else (
-        native.triples_whole_energy_vjp if with_grad else native.triples_whole_energy)
-    no, nv = values[0].shape
-    extra = (values[6],) if weighted else ()
-    return function(*values[:5], -np.ones(no) / 3, np.zeros(nv), *extra,
-                    nsamples=int(samples), seed=int(seed),
+    function = (native.triples_asymmetric_energy_vjp if with_grad
+                else native.triples_asymmetric_energy)
+    return function(*values[:5], *values[6:], nsamples=int(samples), seed=int(seed),
                     target_standard_error=float(target), fov=values[5], **options)
 
 
-def _make_dresser(inputs, occupied, virtual, asymmetric):
+def _make_dresser(inputs):
     native = importlib.import_module('pyscfad.dlno_stc._stc_mp2')
-    return native.TriplesDressing(tuple(np.asarray(x, dtype=np.float64) for x in inputs),
-        occupied.clusters, virtual.clusters, asymmetric)
+    return native.TriplesDressing(tuple(np.asarray(x, dtype=np.float64) for x in inputs))
 
 
-def make_solver(controls, frames, grid, *, with_grad):
+def make_solver(controls, grid, *, with_grad):
     nodes, weights, _ = grid
-    occupied, virtual = frames
-    dressing = controls.get('dressing', 'asymmetric')
-    backend = controls.get('dressing_backend', 'native')
-    if backend not in ('native', 'jax'):
-        raise ValueError('triples dressing_backend must be native or jax')
-    if dressing not in ('equal', 'asymmetric'):
-        raise ValueError('triples dressing must be equal or asymmetric')
-    dress_tensors = partial(dress, occupied_clusters=occupied.clusters,
-                            virtual_clusters=virtual.clusters)
-    @jax.jit
-    def transform(*args):
-        inputs, node = args[:-1], args[-1]
-        values = dress_tensors(*inputs[:8], node)
-        if len(inputs) == 9:
-            foo, matrix = inputs[6], inputs[8]
-            left = block_exp(foo, -node / 2, occupied.clusters)
-            right = block_exp(foo, node / 2, occupied.clusters)
-            if dressing == 'asymmetric':
-                values = (*values, left @ matrix, right @ matrix)
-            else:
-                values = (*values, left @ matrix @ right)
-        return values
+    removed = {'dressing', 'dressing_backend', 'adaptive'} & controls.keys()
+    if removed:
+        raise ValueError('removed triples options: ' + ', '.join(sorted(removed)))
     stochastic = controls['mode'] == 'stochastic'
-    adaptive = bool(controls.get('adaptive', True))
     trace_exponent = _finite_control('trace_exponent',
         controls.get('trace_exponent', DEFAULT_TRIPLES_TRACE_EXPONENT))
     seed = controls.get('global_seed', 71)
@@ -199,10 +112,8 @@ def make_solver(controls, frames, grid, *, with_grad):
         pilot_counts = np.zeros(count, dtype=np.int64)
         allocation = np.zeros(count, dtype=np.int64)
         phase = time.perf_counter()
-        dresser = (_make_dresser(inputs, occupied, virtual, dressing == 'asymmetric')
-                   if backend == 'native' else None)
-        prepare = (dresser.prepare if dresser is not None else
-                   lambda node: transform(*inputs, float(node)))
+        dresser = _make_dresser(inputs)
+        prepare = dresser.prepare
         prepare_seconds, pilot_seconds = time.perf_counter() - phase, 0.
         prepared = None
         if stochastic and not target:
@@ -225,7 +136,7 @@ def make_solver(controls, frames, grid, *, with_grad):
             del pilots
             pilot_seconds += time.perf_counter() - phase
         energy, variance, samples = 0., 0., 0
-        bars = tuple((np if dresser is not None else jnp).zeros_like(x) for x in inputs) if with_grad else None
+        bars = tuple(np.zeros_like(x) for x in inputs) if with_grad else None
         native_seconds = 0.
         production_seconds, pullback_seconds = 0., 0.
         native_timings = {name: 0. for name in ('probability_setup_seconds',
@@ -237,15 +148,7 @@ def make_solver(controls, frames, grid, *, with_grad):
         point_energies, point_variances, point_samples, initial_errors = [], [], [], []
         for i, (node, weight) in enumerate(zip(nodes, weights)):
             phase = time.perf_counter()
-            if dresser is not None:
-                transformed = prepare(float(node)) if prepared is None else prepared[i]
-                pullback = lambda cotangents: dresser.pullback(float(node), cotangents)
-            elif with_grad:
-                # Build the primal and its pullback once, keeping only this
-                # point's intermediates until its production has completed.
-                transformed, pullback = jax.vjp(lambda *x: transform(*x, float(node)), *inputs)
-            else:
-                transformed = transform(*inputs, float(node)) if prepared is None else prepared[i]
+            transformed = prepare(float(node)) if prepared is None else prepared[i]
             values = transformed if prepared is None else prepared[i]
             jax.block_until_ready(values)
             prepare_seconds += time.perf_counter() - phase
@@ -262,8 +165,7 @@ def make_solver(controls, frames, grid, *, with_grad):
                 # The native loop pools moments and cotangents, retaining every
                 # production draw. A tiny inward rounding margin protects the
                 # summed target from floating-point division/multiplication.
-                if adaptive:
-                    native_target = point_target * (1 - 1e-12)
+                native_target = point_target * (1 - 1e-12)
             phase = time.perf_counter()
             options = {} if pilot is None else {'pilot': pilot}
             result = _native(values, number, seeds[count + i], target=native_target,
@@ -299,19 +201,13 @@ def make_solver(controls, frames, grid, *, with_grad):
             sampling_threads = max(sampling_threads, int(result.get('sampling_threads', 0)))
             if with_grad:
                 phase = time.perf_counter()
-                names = NAMES
-                if len(inputs) == 9:
-                    names = (*names, 'L', 'R') if dressing == 'asymmetric' else (*names, 'M')
-                xp = np if dresser is not None else jnp
-                transformed_bars = tuple(xp.asarray(result['cotangents'][name]) * weight for name in names)
-                contribution = pullback(transformed_bars)
-                if dresser is not None:
-                    for a, b in zip(bars, contribution):
-                        np.add(a, b, out=a)
-                else:
-                    bars = tuple(a + b for a, b in zip(bars, contribution))
+                transformed_bars = tuple(np.asarray(result['cotangents'][name]) * weight
+                                         for name in (*NAMES, 'L', 'R'))
+                contribution = dresser.pullback(float(node), transformed_bars)
+                for a, b in zip(bars, contribution):
+                    np.add(a, b, out=a)
                 jax.block_until_ready(bars)
-                del pullback, contribution, transformed_bars
+                del contribution, transformed_bars
                 pullback_seconds += time.perf_counter() - phase
             if prepared is not None:
                 prepared[i] = None
@@ -328,10 +224,10 @@ def make_solver(controls, frames, grid, *, with_grad):
             setup_threads=setup_threads, sampling_threads=sampling_threads,
             target_standard_error=target,
             trace_exponent=trace_exponent,
-            adaptive=bool(stochastic and target and adaptive),
+            adaptive=bool(stochastic and target),
             point_preparation_reused=bool(stochastic and target),
-            asymmetric_dressing=bool(dressing == 'asymmetric' and len(inputs) == 9),
-            native_dressing=bool(dresser is not None),
+            asymmetric_dressing=True,
+            native_dressing=True,
             target_met=bool(not target or np.sqrt(variance) <= target),
             laplace_nodes=np.asarray(nodes), laplace_weights=np.asarray(weights),
             point_variance_fractions=fractions, point_variance_targets=point_targets,
@@ -361,10 +257,12 @@ def make_solver(controls, frames, grid, *, with_grad):
 
     def solver(mcc, eris, prjlo, *, t1, t2, verbose=0):
         no = t1.shape[0]
+        # The identity frame projector and the physical fragment target are
+        # different objects. A partial S retains U and its full response.
+        u = jnp.eye(no, dtype=t1.dtype) if prjlo.shape == (no, no) else prjlo.T
         inputs = (t1, t2, eris.Lov, eris.Loo, lib.unpack_tril(eris.Lvv),
-                  eris.fock[:no, no:], eris.fock[:no, :no], eris.fock[no:, no:])
-        if prjlo.shape != (no, no):
-            inputs = (*inputs, prjlo.T if dressing == 'asymmetric' else prjlo.T @ prjlo)
-        return evaluate(*inputs) if with_grad else run(inputs)[0]
+                  eris.fock[:no, no:], eris.fock[:no, :no], eris.fock[no:, no:], u)
+        energy, diagnostics = evaluate(*inputs) if with_grad else run(inputs)[0]
+        return energy, diagnostics
 
     return solver

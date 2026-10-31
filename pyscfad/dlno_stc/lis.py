@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 import jax
+from jax.scipy.linalg import solve_triangular
 import numpy
 import scipy.linalg as scipy_linalg
 from pyscfad import numpy as np, scipy
@@ -77,7 +78,7 @@ class FragmentLIS:
     virtual, discarded active virtual, original frozen virtual. ``frozen``
     indexes all columns outside the two LIS blocks, as required by
     :mod:`pyscfad.lno.ccsd`. The ``active_*_coeff`` fields contain those two
-    semicanonical LIS blocks, of shapes ``(nao, nocc_lis)`` and
+    semicanonical or smooth LIS blocks, of shapes ``(nao, nocc_lis)`` and
     ``(nao, nvir_lis)``.
 
     ``occupied_projector`` and ``density_occupied_active`` have shape
@@ -150,7 +151,7 @@ def _fixed_row_space(matrix, keep):
     # The fixed reference rank guarantees a nonsingular retained Gram matrix.
     metric = _hermitize(candidate.T.conj() @ candidate)
     chol = np.linalg.cholesky(metric)
-    return np.linalg.solve(chol, candidate.T.conj()).T.conj()
+    return solve_triangular(chol, candidate.T.conj(), lower=True).T.conj()
 
 
 def _physical_target_block(common, static, fragment_index):
@@ -213,7 +214,7 @@ def _fixed_density_space(density, internal, keep, full_space):
     # but Cholesky normalization makes the rebuilt span explicitly orthonormal.
     metric = _hermitize(lno.T.conj() @ lno)
     chol = np.linalg.cholesky(metric)
-    lno = np.linalg.solve(chol, lno.T.conj()).T.conj()
+    lno = solve_triangular(chol, lno.T.conj(), lower=True).T.conj()
     return np.concatenate((internal, lno), axis=1)
 
 
@@ -260,14 +261,15 @@ def _smooth_density_space(density, internal, keep, full_space, coeff, overlap, f
     Only retained/discarded eigenvalue gaps enter its custom derivative.
     The internal target projector and the parent AO coefficients also respond.
     """
-    from .smooth import spectral_projector, orthonormalize
+    from ._retained_space import retained_projector
+    from .smooth import orthonormalize
     identity = np.eye(density.shape[0], dtype=density.dtype)
     if full_space:
         return identity
     projector = internal @ internal.T.conj()
     if len(keep):
         external = _external_density(density, internal)
-        selected = spectral_projector(tuple(int(i) for i in keep))(external)
+        selected = retained_projector(tuple(int(i) for i in keep))(external)
         complement = identity - projector
         projector = projector + complement @ selected @ complement
     candidate = projector @ (coeff.T.conj() @ overlap @ np.asarray(frame.anchor))
@@ -299,8 +301,9 @@ def _assemble_full_mo_layout(
     ``occupied_coeff`` and ``virtual_coeff`` have global AO rows and span the
     active-HF manifolds. The corresponding ``*_rotation`` arrays have shapes
     ``(nocc_active, nocc_lis)`` and ``(nvir_active, nvir_lis)``. Only the selected
-    LIS blocks are semicanonicalized; the discarded complements use a frozen
-    rotation gauge, and originally frozen MOs keep their original columns.
+    LIS blocks use semicanonical or anchored smooth frames; the discarded
+    complements use a frozen rotation gauge, and originally frozen MOs keep
+    their original columns.
     """
 
     # Identify original HF columns excluded by the global frozen selection.
@@ -336,9 +339,9 @@ def _assemble_full_mo_layout(
     else:
         from .smooth import rebuild_frame
         occupied_lis_coeff = rebuild_frame(occupied_coeff @ occupied_rotation, overlap,
-                                           fock, smooth_frames[0])
+                                           smooth_frames[0])
         virtual_lis_coeff = rebuild_frame(virtual_coeff @ virtual_rotation, overlap,
-                                          fock, smooth_frames[1])
+                                          smooth_frames[1])
     occupied_discarded_coeff = occupied_coeff @ occ_complement
     virtual_discarded_coeff = virtual_coeff @ vir_complement
 
@@ -513,11 +516,11 @@ def build_fragment_lis(mf, common, static, fragment_index, *, matrices,
         vir_rotation = _smooth_density_space(virtual, vir_internal,
             selection.virtual_lno_keep, selection.full_virtual_space,
             common.virtual_coeff, common.s1e, smooth_frames[1])
+    target = _physical_target_block(common, static.mp2_static, index)
     full_coeff, frozen, occ_coeff, vir_coeff = _assemble_full_mo_layout(
         mf, static.mp2_static, common.occupied_coeff, common.virtual_coeff,
         common.fock, occ_rotation, vir_rotation, static.internal_rank_threshold,
         smooth_frames=smooth_frames, overlap=common.s1e)
-    target = _physical_target_block(common, static.mp2_static, index)
     return FragmentLIS(
         mo_coeff=full_coeff, frozen=frozen,
         fragment_occupied_anchor=common.occupied_coeff @ occ_projection.T.conj(),

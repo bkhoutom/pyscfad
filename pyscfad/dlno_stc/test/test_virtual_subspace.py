@@ -12,6 +12,21 @@ from pyscfad.dlno_stc import domain
 from pyscfad.dlno_stc.test.test_boys_construction import reference
 
 
+@pytest.mark.parametrize('indices', [np.arange(5), np.array([0, 2, 4])])
+def test_ao_support_projection_value_and_response(indices):
+    rng = np.random.default_rng(91)
+    raw = jnp.asarray(rng.normal(size=(5, 5)))
+    overlap = raw.T @ raw + jnp.eye(5)
+    coeff = jnp.asarray(rng.normal(size=(5, 3)))
+    dc = jnp.asarray(rng.normal(size=coeff.shape))
+    ds = jnp.asarray(rng.normal(size=overlap.shape)); ds = (ds + ds.T) / 2
+    expected = lambda c, s: jnp.linalg.solve(s[np.ix_(indices, indices)], s[indices] @ c)
+    actual = lambda c, s: domain._project_to_ao_support(c, s, indices)
+    for got, want in zip(jax.jvp(actual, (coeff, overlap), (dc, ds)),
+                         jax.jvp(expected, (coeff, overlap), (dc, ds))):
+        np.testing.assert_allclose(got, want, rtol=2e-12, atol=2e-12)
+
+
 def test_saved_anchor_replay_is_invariant_to_internal_rotations_and_keeps_response():
     rng = np.random.default_rng(58)
     parent = rng.normal(size=(5, 4))
@@ -51,6 +66,9 @@ def test_real_boys_replay_uses_saved_anchors_without_qr(reference, monkeypatch):
         raise AssertionError("preparation must reuse saved QR pivots")
 
     monkeypatch.setattr(domain.scipy_linalg, "qr", forbidden_qr)
+    def forbidden_lu(*args, **kwargs):
+        raise AssertionError("full-AO frame replay needs no general LU solve")
+    monkeypatch.setattr(jnp.linalg, "solve", forbidden_lu)
     assert len(dlno_stc.build_domain_groups(static)) == 1
     for index, fragment in enumerate(static.fragments):
         frame = domain.build_boys_ed_frame(common, static, index)
@@ -63,6 +81,12 @@ def test_real_boys_replay_uses_saved_anchors_without_qr(reference, monkeypatch):
             common, fragment.strong_virtual, frame.extended_ao_indices,
             frame.occupied_coeff, boys_metric_threshold=static.thresholds.metric_rank)
         np.testing.assert_allclose(virtual @ virtual.T, raw @ raw.T, atol=1e-9)
+    def coefficients(current):
+        rebuilt = domain.build_boys_ed_frame(current, static, 0)
+        return rebuilt.occupied_coeff, rebuilt.virtual_coeff
+    values, reverse = jax.vjp(coefficients, common)
+    bars = reverse(jax.tree_util.tree_map(jnp.ones_like, values))
+    assert all(np.isfinite(np.asarray(x)).all() for x in jax.tree_util.tree_leaves(bars))
 
 
 def test_system_saved_anchors_replay_without_qr(reference, monkeypatch):

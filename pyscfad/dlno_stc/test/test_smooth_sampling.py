@@ -7,7 +7,6 @@ import numpy as np
 import pytest
 
 from pyscfad.dlno_stc import smooth_triples as triples
-from pyscfad.dlno_stc.smooth import BlockFrame
 
 
 def test_ten_point_grid_covers_c6h14_triples_denominators():
@@ -32,7 +31,6 @@ def test_trace_model_matches_mp2_and_is_invariant_to_energy_zero(exponent):
 @pytest.mark.parametrize('exponent', [1.4, 2.1, 5.0])
 def test_pilots_set_counts_for_each_variance_target_and_preserve_gradient(monkeypatch, exponent):
     nodes, weights = np.array([.1, .4]), np.array([.3, .7])
-    frames = (BlockFrame(np.eye(1), ((0,),)),) * 2
     calls = []
     sigmas = np.array([2., 5.])
     def native(values, samples, seed, target=0., with_grad=True, *, pilot=None):
@@ -46,14 +44,14 @@ def test_pilots_set_counts_for_each_variance_target_and_preserve_gradient(monkey
                       independent_pilot_standard_error=sigmas[q]/np.sqrt(pilot['samples']),
                       independent_pilot_seconds=0.)
         if with_grad:
-            result['cotangents'] = dict(zip(triples.NAMES, [2*np.asarray(values[0]),
+            result['cotangents'] = dict(zip((*triples.NAMES, 'L', 'R'), [2*np.asarray(values[0]),
                 *(np.zeros_like(v) for v in values[1:])]))
         return result
     monkeypatch.setattr(triples, '_native', native)
     target = .01
     solver = triples.make_solver(dict(mode='stochastic', nsamples=7,
-        target_standard_error=target, global_seed=71, trace_exponent=exponent, adaptive=False),
-        frames, (nodes, weights, {}), with_grad=True)
+        target_standard_error=target, global_seed=71, trace_exponent=exponent),
+        (nodes, weights, {}), with_grad=True)
     eris = SimpleNamespace(Lov=jnp.ones((1, 1, 1)), Loo=jnp.ones((1, 1, 1)),
         Lvv=jnp.ones((1, 1)), fock=jnp.diag(jnp.array([-1., 1.])))
     t1 = jnp.array([[.2]])
@@ -78,12 +76,6 @@ def test_pilots_set_counts_for_each_variance_target_and_preserve_gradient(monkey
     assert diagnostics['point_preparation_reused']
 
 
-def test_allocation_maintains_production_for_zero_variance_pilot():
-    counts = triples.production_allocation(np.array([0., 2.]), np.array([.5, .5]), .1)
-    assert counts[0] == 10000
-    assert np.all(counts >= 10000)
-
-
 @pytest.mark.parametrize('exponent', [0., -1., float('nan'), float('inf'), True])
 def test_invalid_trace_exponent_rejected(exponent):
     from pyscfad.dlno_stc.controls import normalize_triples_controls
@@ -97,35 +89,23 @@ def test_default_exponent_is_explicit_in_checkpoint_controls():
     static = SimpleNamespace(lis_static=SimpleNamespace(smooth_frames=(object(),)))
     controls = dict(mode='stochastic', nsamples=2)
     resolved = _allocate_triples_controls(controls, 1, static=static)
-    assert resolved['trace_exponent'] == 2.1
-    assert resolved['adaptive'] is True
-    assert resolved['dressing'] == 'asymmetric'
-    assert _allocate_triples_controls(dict(controls, dressing='equal'), 1,
-        static=static)['dressing'] == 'equal'
-    assert _allocate_triples_controls(dict(controls, adaptive=False), 1,
-        static=static)['adaptive'] is False
+    assert resolved['trace_exponent'] == 5.0
     assert 'trace_exponent' not in controls
     assert _allocate_triples_controls(dict(controls, trace_exponent=1.4),
         1, static=static)['trace_exponent'] == 1.4
-    with pytest.raises(ValueError, match='requires the smooth'):
-        _allocate_triples_controls(dict(controls, trace_exponent=2.1), 1)
-    with pytest.raises(ValueError, match='requires the smooth'):
-        _allocate_triples_controls(dict(controls, dressing='asymmetric'), 1)
+    with pytest.raises(ValueError, match='canonical triples sampling has been removed'):
+        _allocate_triples_controls(controls, 1)
 
 
-@pytest.mark.parametrize('mode', ['deterministic', 'stochastic'])
-def test_dressing_control_is_validated(mode):
+@pytest.mark.parametrize('option,value', [('dressing', 'equal'), ('dressing', 'asymmetric'),
+    ('dressing_backend', 'jax'), ('dressing_backend', 'native'), ('adaptive', False)])
+def test_removed_alternative_controls_rejected(option, value):
     from pyscfad.dlno_stc.controls import normalize_triples_controls
-    controls = dict(mode=mode, **({'nsamples': 2} if mode == 'stochastic' else {}))
-    for dressing in ('equal', 'asymmetric'):
-        assert normalize_triples_controls(dict(controls, dressing=dressing),
-                                          ccsd_t=True)['dressing'] == dressing
-    with pytest.raises(ValueError, match='dressing'):
-        normalize_triples_controls(dict(controls, dressing='unknown'), ccsd_t=True)
+    with pytest.raises(ValueError, match=option):
+        normalize_triples_controls(dict(mode='stochastic', nsamples=2, **{option:value}), ccsd_t=True)
 
 
 def test_adaptive_production_uses_point_target_and_keeps_extended_gradient(monkeypatch):
-    frames = (BlockFrame(np.eye(1), ((0,),)),) * 2
     calls = []
     def native(values, samples, seed, target=0., with_grad=True, *, pilot=None):
         calls.append((samples, seed, target, pilot))
@@ -138,13 +118,13 @@ def test_adaptive_production_uses_point_target_and_keeps_extended_gradient(monke
             independent_pilot_standard_error=.1/np.sqrt(pilot['samples']),
             independent_pilot_seconds=0.)
         if with_grad:
-            result['cotangents'] = dict(zip(triples.NAMES, [2*np.asarray(values[0]),
+            result['cotangents'] = dict(zip((*triples.NAMES, 'L', 'R'), [2*np.asarray(values[0]),
                 *(np.zeros_like(v) for v in values[1:])]))
         return result
     monkeypatch.setattr(triples, '_native', native)
     solver = triples.make_solver(dict(mode='stochastic', nsamples=2,
         target_standard_error=.001, trace_exponent=5.),
-        frames, (np.array([.2]), np.array([1.]), {}), with_grad=True)
+        (np.array([.2]), np.array([1.]), {}), with_grad=True)
     eris = SimpleNamespace(Lov=jnp.ones((1,1,1)), Loo=jnp.ones((1,1,1)),
         Lvv=jnp.ones((1,1)), fock=jnp.diag(jnp.array([-1., 1.])))
     def evaluate(t1):
@@ -169,11 +149,10 @@ def test_invalid_adaptive_control_rejected(value):
 
 @pytest.mark.parametrize('error', [1., np.nan])
 def test_adaptive_result_must_meet_target(monkeypatch, error):
-    frames = (BlockFrame(np.eye(1), ((0,),)),) * 2
     monkeypatch.setattr(triples, '_native', lambda values, samples, seed, target=0., **kw:
         dict(energy=0., standard_error=error if target else .1, samples=samples))
     solver = triples.make_solver(dict(mode='stochastic', nsamples=2, target_standard_error=.001),
-        frames, (np.array([.2]), np.array([1.]), {}), with_grad=False)
+        (np.array([.2]), np.array([1.]), {}), with_grad=False)
     eris = SimpleNamespace(Lov=jnp.ones((1,1,1)), Loo=jnp.ones((1,1,1)),
         Lvv=jnp.ones((1,1)), fock=jnp.diag(jnp.array([-1., 1.])))
     with pytest.raises(RuntimeError, match='point SE target'):

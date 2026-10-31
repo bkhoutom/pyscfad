@@ -371,6 +371,19 @@ def cholesky_eri(mol, auxmol=None, auxbasis='weigend+etb',
     shranges = _guess_shell_ranges(mol, buflen, aosym)
     log.debug1('shranges = %s', shranges)
 
+    if (use_moleintor_opt and tag == 'cd' and aosym in ('s2', 's2ij')
+            and int3c.startswith('int3c2e') and 'spinor' not in int3c
+            and numpy.dtype(low.dtype) == numpy.dtype(numpy.float64)
+            and all(getattr(m, name, None) is None for m in (mol, auxmol)
+                    for name in ('exp', 'ctr_coeff', 'r0'))):
+        # PR180: fill and whiten one resident packed factor in place. Keep
+        # ordinary cotangents; shared-buffer ownership is intentionally absent.
+        cderi = _int3c_cross_opt.int3c2e_cholesky(
+            mol, auxmol, low, int3c,
+            tuple((int(b0), int(b1), int(n)) for b0, b1, n in shranges))
+        log.timer('cholesky_eri', *t0)
+        return cderi
+
     for istep, sh_range in enumerate(shranges):
         log.debug('int3c2e [%d/%d], AO [%d:%d], nrow = %d',
                   istep+1, len(shranges), *sh_range)

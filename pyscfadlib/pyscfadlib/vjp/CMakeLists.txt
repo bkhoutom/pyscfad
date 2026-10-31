@@ -54,6 +54,15 @@ set_target_properties(cvhf_vjp PROPERTIES
 )
 target_link_libraries(cvhf_vjp PRIVATE np_helper_ad vjp_util ${VJP_MATH_LIBRARY} ${BLAS_LIBRARIES} ${OPENMP_C_PROPERTIES})
 
+#mp
+add_library(mp_vjp SHARED
+  mp/mp2_vjp.c
+)
+set_target_properties(mp_vjp PROPERTIES
+  LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}
+)
+target_link_libraries(mp_vjp PRIVATE ${BLAS_LIBRARIES} ${OPENMP_C_PROPERTIES})
+
 #cc
 add_library(cc_vjp SHARED
   cc/ccsd_t.c
@@ -78,7 +87,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
       np_helper_vjp
       ao2mo_vjp
       cvhf_vjp
-      cc_vjp)
+      cc_vjp
+      mp_vjp)
     target_link_options(${_vjp_target} PRIVATE "LINKER:-z,defs")
   endforeach()
 endif()

@@ -1,0 +1,64 @@
+[
+  {
+    "path": "pyscfad/mp/dfmp2.py",
+    "source": "/resnick/groups/sharmagroup/bkhou/src/pyscfad-perf-integrated/pyscfad/mp/dfmp2.py",
+    "sha256": "2d8ad10c80d05fec2ba1a05dd59a27d2a3b8e6bf2adfc41a1c95e1705fc45cb7",
+    "original_candidate_source": "/resnick/groups/sharmagroup/bkhou/src/pyscfad-perf-mp2/pyscfad/mp/dfmp2.py",
+    "original_candidate_sha256": "352362d1ce4cacf5338895cb31c28a185a89630556ce707385b5be44d08169b6"
+  },
+  {
+    "path": "pyscfad/mp/test/test_dfmp2_native.py",
+    "source": "/resnick/groups/sharmagroup/bkhou/src/pyscfad-perf-integrated/pyscfad/mp/test/test_dfmp2_native.py",
+    "sha256": "135b92fa86077b18b82bcb7ea9a5cfa1a9fa64809742f56816b6b727b9261b65",
+    "original_candidate_source": "/resnick/groups/sharmagroup/bkhou/src/pyscfad-perf-mp2/pyscfad/mp/test/test_dfmp2_native.py",
+    "original_candidate_sha256": "a2c326d8121d0ac36db0023e8c9d3706050135ae6dc6caf00f3d9ad8375a64c5"
+  },
+  {
+    "path": "pyscfadlib/pyscfadlib/__init__.py",
+    "source": "/resnick/groups/sharmagroup/bkhou/src/pyscfad-perf-integrated/pyscfadlib/pyscfadlib/__init__.py",
+    "sha256": "1bddd2c408166f782d88368fa2b5690fa3dafdae53164652219396d9768e3449",
+    "original_candidate_source": "/resnick/groups/sharmagroup/bkhou/src/pyscfad-perf-mp2/pyscfadlib/pyscfadlib/__init__.py",
+    "original_candidate_sha256": "1bddd2c408166f782d88368fa2b5690fa3dafdae53164652219396d9768e3449"
+  },
+  {
+    "path": "pyscfadlib/pyscfadlib/lib.py",
+    "source": "/resnick/groups/sharmagroup/bkhou/src/pyscfad-perf-integrated/pyscfadlib/pyscfadlib/lib.py",
+    "sha256": "ac839427be967496c7a78f8b111b774d83d191ab03f1b51cf4233b2db80f5402",
+    "original_candidate_source": "/resnick/groups/sharmagroup/bkhou/src/pyscfad-perf-mp2/pyscfadlib/pyscfadlib/lib.py",
+    "original_candidate_sha256": "ac839427be967496c7a78f8b111b774d83d191ab03f1b51cf4233b2db80f5402"
+  },
+  {
+    "path": "pyscfadlib/pyscfadlib/vjp/CMakeLists.txt",
+    "source": "/resnick/groups/sharmagroup/bkhou/src/pyscfad-perf-integrated/pyscfadlib/pyscfadlib/vjp/CMakeLists.txt",
+    "sha256": "9c97a3f68f685ef0a53f8126a8583f2b00482bab1195758eeeaf3e6519e50582",
+    "original_candidate_source": "/resnick/groups/sharmagroup/bkhou/src/pyscfad-perf-mp2/pyscfadlib/pyscfadlib/vjp/CMakeLists.txt",
+    "original_candidate_sha256": "9c97a3f68f685ef0a53f8126a8583f2b00482bab1195758eeeaf3e6519e50582"
+  },
+  {
+    "path": "pyscfadlib/pyscfadlib/vjp/mp/mp2_vjp.c",
+    "source": "/resnick/groups/sharmagroup/bkhou/src/pyscfad-perf-integrated/pyscfadlib/pyscfadlib/vjp/mp/mp2_vjp.c",
+    "sha256": "b543b5b33cde4f0819468b6ec79224cdf37ecf8c472d22688caad669c8dbd8f3",
+    "original_candidate_source": "/resnick/groups/sharmagroup/bkhou/src/pyscfad-perf-mp2/pyscfadlib/pyscfadlib/vjp/mp/mp2_vjp.c",
+    "original_candidate_sha256": "b543b5b33cde4f0819468b6ec79224cdf37ecf8c472d22688caad669c8dbd8f3"
+  },
+  {
+    "path": "pyscfad/df/_df_jk_opt.py",
+    "source": "/resnick/groups/sharmagroup/bkhou/src/pyscfad-perf-integrated/pyscfad/df/_df_jk_opt.py",
+    "sha256": "045c077568f03f6caf4dfa04dba1d997f2d9a4303b48cca9b74e7bf05646bcb1",
+    "original_candidate_source": "/resnick/groups/sharmagroup/bkhou/src/pyscfad-perf-scf/pyscfad/df/_df_jk_opt.py",
+    "original_candidate_sha256": "045c077568f03f6caf4dfa04dba1d997f2d9a4303b48cca9b74e7bf05646bcb1"
+  },
+  {
+    "path": "pyscfad/df/test/test_df_jk_lowrank.py",
+    "source": "/resnick/groups/sharmagroup/bkhou/src/pyscfad-perf-integrated/pyscfad/df/test/test_df_jk_lowrank.py",
+    "sha256": "6300a5fe88d3be2f2c26af9aa57af8631021bc8b75cd486b56c41cae249e7de3",
+    "original_candidate_source": "/resnick/groups/sharmagroup/bkhou/src/pyscfad-perf-scf/pyscfad/df/test/test_df_jk_lowrank.py",
+    "original_candidate_sha256": "9197551a7c87d370b6267497e7c323d073518181361b34c409107d71f29e7a41"
+  },
+  {
+    "path": "pyscfadlib/pyscfadlib/vjp/gto/fill_nr_3c_vjp.c",
+    "source": "/resnick/groups/sharmagroup/bkhou/src/pyscfad-perf-integrated/pyscfadlib/pyscfadlib/vjp/gto/fill_nr_3c_vjp.c",
+    "sha256": "1fe42f75e21191478fad5a1f8dee54d226246d92e86a1a02a413f98dacc13e02",
+    "change": "Optional dynamic scheduling; static deterministic default retained"
+  }
+]

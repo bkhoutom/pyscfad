@@ -1,0 +1,837 @@
+{
+  "status": "ok",
+  "input": {
+    "description": "Fresh-process PySCF 2.14.0 build comparison; coordinates in Angstrom, gradients in Eh/bohr.",
+    "repeats": 3,
+    "conv_tol": 1e-11,
+    "conv_tol_grad": 1e-07,
+    "max_cycle": 100,
+    "energy_tolerance_eh": 1e-08,
+    "gradient_tolerance_eh_per_bohr": 2e-07,
+    "pyscf": {
+      "geometry_source": "First four waters in examples/lno/water_24.xyz, copied here for reproducibility.",
+      "basis": "def2-tzvp",
+      "atom": [
+        [
+          "O",
+          [
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        [
+          "H",
+          [
+            0.8584387283,
+            -0.0162191956,
+            0.4310567321
+          ]
+        ],
+        [
+          "H",
+          [
+            -0.1285702914,
+            -0.9228632802,
+            -0.2657898937
+          ]
+        ],
+        [
+          "O",
+          [
+            0.3869432269,
+            2.2707048536,
+            -1.1777831426
+          ]
+        ],
+        [
+          "H",
+          [
+            1.2908364862,
+            2.3199976721,
+            -1.4424881911
+          ]
+        ],
+        [
+          "H",
+          [
+            0.1336742975,
+            1.3938921086,
+            -0.8395850391
+          ]
+        ],
+        [
+          "O",
+          [
+            -0.6129904528,
+            -2.5003769391,
+            -0.8732913774
+          ]
+        ],
+        [
+          "H",
+          [
+            -1.4314851482,
+            -2.9122221727,
+            -0.4692437
+          ]
+        ],
+        [
+          "H",
+          [
+            0.1599679895,
+            -3.1027971753,
+            -0.6367108512
+          ]
+        ],
+        [
+          "O",
+          [
+            2.2082455475,
+            -0.0902041186,
+            1.7266977708
+          ]
+        ],
+        [
+          "H",
+          [
+            2.6143039482,
+            -1.00868162,
+            1.835385184
+          ]
+        ],
+        [
+          "H",
+          [
+            2.7801446443,
+            0.6036957195,
+            1.2517647786
+          ]
+        ]
+      ]
+    },
+    "pyscfad": {
+      "geometry_source": "First water in examples/lno/water_dimer.xyz, copied here for reproducibility.",
+      "basis": "def2-svp",
+      "atom": [
+        [
+          "O",
+          [
+            -1.485163346097,
+            -0.114724564047,
+            0.0
+          ]
+        ],
+        [
+          "H",
+          [
+            -1.868415346097,
+            0.762298435953,
+            0.0
+          ]
+        ],
+        [
+          "H",
+          [
+            -0.533833346097,
+            0.040507435953,
+            0.0
+          ]
+        ]
+      ]
+    }
+  },
+  "execution_order": [
+    {
+      "variant": "stock",
+      "repeat": "warmup",
+      "result": "results/stock-warmup.json"
+    },
+    {
+      "variant": "native",
+      "repeat": "warmup",
+      "result": "results/native-warmup.json"
+    },
+    {
+      "variant": "integrals",
+      "repeat": "warmup",
+      "result": "results/integrals-warmup.json"
+    },
+    {
+      "variant": "stock",
+      "repeat": "0",
+      "result": "results/stock-0.json"
+    },
+    {
+      "variant": "native",
+      "repeat": "0",
+      "result": "results/native-0.json"
+    },
+    {
+      "variant": "integrals",
+      "repeat": "0",
+      "result": "results/integrals-0.json"
+    },
+    {
+      "variant": "native",
+      "repeat": "1",
+      "result": "results/native-1.json"
+    },
+    {
+      "variant": "integrals",
+      "repeat": "1",
+      "result": "results/integrals-1.json"
+    },
+    {
+      "variant": "stock",
+      "repeat": "1",
+      "result": "results/stock-1.json"
+    },
+    {
+      "variant": "integrals",
+      "repeat": "2",
+      "result": "results/integrals-2.json"
+    },
+    {
+      "variant": "stock",
+      "repeat": "2",
+      "result": "results/stock-2.json"
+    },
+    {
+      "variant": "native",
+      "repeat": "2",
+      "result": "results/native-2.json"
+    }
+  ],
+  "reference": "stock repeat 0, matching workload",
+  "timings": {
+    "direct_rhf": {
+      "stock": {
+        "raw_seconds": [
+          10.105153024196625,
+          9.824119865894318,
+          10.050732344388962
+        ],
+        "median_seconds": 10.050732344388962,
+        "speedup_vs_stock": 1.0
+      },
+      "native": {
+        "raw_seconds": [
+          9.75953470543027,
+          9.599793821573257,
+          9.781828586012125
+        ],
+        "median_seconds": 9.75953470543027,
+        "speedup_vs_stock": 1.0298372461134513
+      },
+      "integrals": {
+        "raw_seconds": [
+          9.90045765787363,
+          9.398993466049433,
+          9.634056333452463
+        ],
+        "median_seconds": 9.634056333452463,
+        "speedup_vs_stock": 1.0432503191298217
+      }
+    },
+    "df_rhf": {
+      "stock": {
+        "raw_seconds": [
+          0.8818059079349041,
+          0.8025350160896778,
+          0.904864139854908
+        ],
+        "median_seconds": 0.8818059079349041,
+        "speedup_vs_stock": 1.0
+      },
+      "native": {
+        "raw_seconds": [
+          0.7975028343498707,
+          0.7772021554410458,
+          0.960343424230814
+        ],
+        "median_seconds": 0.7975028343498707,
+        "speedup_vs_stock": 1.1057088074850014
+      },
+      "integrals": {
+        "raw_seconds": [
+          0.8043533712625504,
+          0.7823605611920357,
+          1.2653209045529366
+        ],
+        "median_seconds": 0.8043533712625504,
+        "speedup_vs_stock": 1.0962916790549166
+      }
+    },
+    "df_rhf_gradient": {
+      "stock": {
+        "raw_seconds": [
+          0.9007856920361519,
+          0.9696982949972153,
+          0.8637913838028908
+        ],
+        "median_seconds": 0.9007856920361519,
+        "speedup_vs_stock": 1.0
+      },
+      "native": {
+        "raw_seconds": [
+          0.8320586495101452,
+          0.8455793485045433,
+          1.0805835872888565
+        ],
+        "median_seconds": 0.8455793485045433,
+        "speedup_vs_stock": 1.065288188068032
+      },
+      "integrals": {
+        "raw_seconds": [
+          0.9566645249724388,
+          0.9159354642033577,
+          1.0174555070698261
+        ],
+        "median_seconds": 0.9566645249724388,
+        "speedup_vs_stock": 0.9415899393385609
+      }
+    },
+    "pyscfad_df_rhf_value_gradient_first": {
+      "stock": {
+        "raw_seconds": [
+          7.86031149700284,
+          6.182113081216812,
+          6.6759310476481915
+        ],
+        "median_seconds": 6.6759310476481915,
+        "speedup_vs_stock": 1.0
+      },
+      "native": {
+        "raw_seconds": [
+          6.641020584851503,
+          6.109910726547241,
+          6.31865181773901
+        ],
+        "median_seconds": 6.31865181773901,
+        "speedup_vs_stock": 1.0565435855962428
+      },
+      "integrals": {
+        "raw_seconds": [
+          6.120535474270582,
+          5.799884889274836,
+          6.332292839884758
+        ],
+        "median_seconds": 6.120535474270582,
+        "speedup_vs_stock": 1.090742971054146
+      }
+    },
+    "pyscfad_df_rhf_value_gradient_warmed": {
+      "stock": {
+        "raw_seconds": [
+          1.954345565289259,
+          1.2872035391628742,
+          1.4990438483655453
+        ],
+        "median_seconds": 1.4990438483655453,
+        "speedup_vs_stock": 1.0
+      },
+      "native": {
+        "raw_seconds": [
+          0.32314884290099144,
+          0.34619026631116867,
+          0.2613769471645355
+        ],
+        "median_seconds": 0.32314884290099144,
+        "speedup_vs_stock": 4.638864972896816
+      },
+      "integrals": {
+        "raw_seconds": [
+          0.2996719926595688,
+          0.28645411878824234,
+          0.2756570726633072
+        ],
+        "median_seconds": 0.28645411878824234,
+        "speedup_vs_stock": 5.2331027904461545
+      }
+    }
+  },
+  "comparisons": [
+    {
+      "variant": "stock",
+      "repeat": "warmup",
+      "workload": "direct_rhf",
+      "energy_abs_error_eh": 1.1368683772161603e-13,
+      "gradient_max_abs_error_eh_per_bohr": null,
+      "passed": true
+    },
+    {
+      "variant": "native",
+      "repeat": "warmup",
+      "workload": "direct_rhf",
+      "energy_abs_error_eh": 2.2737367544323206e-13,
+      "gradient_max_abs_error_eh_per_bohr": null,
+      "passed": true
+    },
+    {
+      "variant": "integrals",
+      "repeat": "warmup",
+      "workload": "direct_rhf",
+      "energy_abs_error_eh": 4.547473508864641e-13,
+      "gradient_max_abs_error_eh_per_bohr": null,
+      "passed": true
+    },
+    {
+      "variant": "stock",
+      "repeat": "0",
+      "workload": "direct_rhf",
+      "energy_abs_error_eh": 0.0,
+      "gradient_max_abs_error_eh_per_bohr": null,
+      "passed": true
+    },
+    {
+      "variant": "native",
+      "repeat": "0",
+      "workload": "direct_rhf",
+      "energy_abs_error_eh": 1.1368683772161603e-13,
+      "gradient_max_abs_error_eh_per_bohr": null,
+      "passed": true
+    },
+    {
+      "variant": "integrals",
+      "repeat": "0",
+      "workload": "direct_rhf",
+      "energy_abs_error_eh": 1.1368683772161603e-13,
+      "gradient_max_abs_error_eh_per_bohr": null,
+      "passed": true
+    },
+    {
+      "variant": "native",
+      "repeat": "1",
+      "workload": "direct_rhf",
+      "energy_abs_error_eh": 0.0,
+      "gradient_max_abs_error_eh_per_bohr": null,
+      "passed": true
+    },
+    {
+      "variant": "integrals",
+      "repeat": "1",
+      "workload": "direct_rhf",
+      "energy_abs_error_eh": 2.2737367544323206e-13,
+      "gradient_max_abs_error_eh_per_bohr": null,
+      "passed": true
+    },
+    {
+      "variant": "stock",
+      "repeat": "1",
+      "workload": "direct_rhf",
+      "energy_abs_error_eh": 3.410605131648481e-13,
+      "gradient_max_abs_error_eh_per_bohr": null,
+      "passed": true
+    },
+    {
+      "variant": "integrals",
+      "repeat": "2",
+      "workload": "direct_rhf",
+      "energy_abs_error_eh": 2.2737367544323206e-13,
+      "gradient_max_abs_error_eh_per_bohr": null,
+      "passed": true
+    },
+    {
+      "variant": "stock",
+      "repeat": "2",
+      "workload": "direct_rhf",
+      "energy_abs_error_eh": 1.1368683772161603e-13,
+      "gradient_max_abs_error_eh_per_bohr": null,
+      "passed": true
+    },
+    {
+      "variant": "native",
+      "repeat": "2",
+      "workload": "direct_rhf",
+      "energy_abs_error_eh": 3.410605131648481e-13,
+      "gradient_max_abs_error_eh_per_bohr": null,
+      "passed": true
+    },
+    {
+      "variant": "stock",
+      "repeat": "warmup",
+      "workload": "df_rhf",
+      "energy_abs_error_eh": 0.0,
+      "gradient_max_abs_error_eh_per_bohr": null,
+      "passed": true
+    },
+    {
+      "variant": "native",
+      "repeat": "warmup",
+      "workload": "df_rhf",
+      "energy_abs_error_eh": 3.410605131648481e-13,
+      "gradient_max_abs_error_eh_per_bohr": null,
+      "passed": true
+    },
+    {
+      "variant": "integrals",
+      "repeat": "warmup",
+      "workload": "df_rhf",
+      "energy_abs_error_eh": 4.547473508864641e-13,
+      "gradient_max_abs_error_eh_per_bohr": null,
+      "passed": true
+    },
+    {
+      "variant": "stock",
+      "repeat": "0",
+      "workload": "df_rhf",
+      "energy_abs_error_eh": 0.0,
+      "gradient_max_abs_error_eh_per_bohr": null,
+      "passed": true
+    },
+    {
+      "variant": "native",
+      "repeat": "0",
+      "workload": "df_rhf",
+      "energy_abs_error_eh": 4.547473508864641e-13,
+      "gradient_max_abs_error_eh_per_bohr": null,
+      "passed": true
+    },
+    {
+      "variant": "integrals",
+      "repeat": "0",
+      "workload": "df_rhf",
+      "energy_abs_error_eh": 4.547473508864641e-13,
+      "gradient_max_abs_error_eh_per_bohr": null,
+      "passed": true
+    },
+    {
+      "variant": "native",
+      "repeat": "1",
+      "workload": "df_rhf",
+      "energy_abs_error_eh": 2.2737367544323206e-13,
+      "gradient_max_abs_error_eh_per_bohr": null,
+      "passed": true
+    },
+    {
+      "variant": "integrals",
+      "repeat": "1",
+      "workload": "df_rhf",
+      "energy_abs_error_eh": 5.684341886080801e-13,
+      "gradient_max_abs_error_eh_per_bohr": null,
+      "passed": true
+    },
+    {
+      "variant": "stock",
+      "repeat": "1",
+      "workload": "df_rhf",
+      "energy_abs_error_eh": 2.2737367544323206e-13,
+      "gradient_max_abs_error_eh_per_bohr": null,
+      "passed": true
+    },
+    {
+      "variant": "integrals",
+      "repeat": "2",
+      "workload": "df_rhf",
+      "energy_abs_error_eh": 0.0,
+      "gradient_max_abs_error_eh_per_bohr": null,
+      "passed": true
+    },
+    {
+      "variant": "stock",
+      "repeat": "2",
+      "workload": "df_rhf",
+      "energy_abs_error_eh": 2.2737367544323206e-13,
+      "gradient_max_abs_error_eh_per_bohr": null,
+      "passed": true
+    },
+    {
+      "variant": "native",
+      "repeat": "2",
+      "workload": "df_rhf",
+      "energy_abs_error_eh": 0.0,
+      "gradient_max_abs_error_eh_per_bohr": null,
+      "passed": true
+    },
+    {
+      "variant": "stock",
+      "repeat": "warmup",
+      "workload": "df_rhf_gradient",
+      "energy_abs_error_eh": 0.0,
+      "gradient_max_abs_error_eh_per_bohr": 4.6629367034256575e-14,
+      "passed": true
+    },
+    {
+      "variant": "native",
+      "repeat": "warmup",
+      "workload": "df_rhf_gradient",
+      "energy_abs_error_eh": 3.410605131648481e-13,
+      "gradient_max_abs_error_eh_per_bohr": 5.1958437552457326e-14,
+      "passed": true
+    },
+    {
+      "variant": "integrals",
+      "repeat": "warmup",
+      "workload": "df_rhf_gradient",
+      "energy_abs_error_eh": 4.547473508864641e-13,
+      "gradient_max_abs_error_eh_per_bohr": 5.46229728115577e-14,
+      "passed": true
+    },
+    {
+      "variant": "stock",
+      "repeat": "0",
+      "workload": "df_rhf_gradient",
+      "energy_abs_error_eh": 0.0,
+      "gradient_max_abs_error_eh_per_bohr": 0.0,
+      "passed": true
+    },
+    {
+      "variant": "native",
+      "repeat": "0",
+      "workload": "df_rhf_gradient",
+      "energy_abs_error_eh": 4.547473508864641e-13,
+      "gradient_max_abs_error_eh_per_bohr": 4.6407322429331543e-14,
+      "passed": true
+    },
+    {
+      "variant": "integrals",
+      "repeat": "0",
+      "workload": "df_rhf_gradient",
+      "energy_abs_error_eh": 4.547473508864641e-13,
+      "gradient_max_abs_error_eh_per_bohr": 4.929390229335695e-14,
+      "passed": true
+    },
+    {
+      "variant": "native",
+      "repeat": "1",
+      "workload": "df_rhf_gradient",
+      "energy_abs_error_eh": 2.2737367544323206e-13,
+      "gradient_max_abs_error_eh_per_bohr": 3.552713678800501e-14,
+      "passed": true
+    },
+    {
+      "variant": "integrals",
+      "repeat": "1",
+      "workload": "df_rhf_gradient",
+      "energy_abs_error_eh": 5.684341886080801e-13,
+      "gradient_max_abs_error_eh_per_bohr": 3.175237850427948e-14,
+      "passed": true
+    },
+    {
+      "variant": "stock",
+      "repeat": "1",
+      "workload": "df_rhf_gradient",
+      "energy_abs_error_eh": 2.2737367544323206e-13,
+      "gradient_max_abs_error_eh_per_bohr": 2.930988785010413e-14,
+      "passed": true
+    },
+    {
+      "variant": "integrals",
+      "repeat": "2",
+      "workload": "df_rhf_gradient",
+      "energy_abs_error_eh": 0.0,
+      "gradient_max_abs_error_eh_per_bohr": 3.863576125695545e-14,
+      "passed": true
+    },
+    {
+      "variant": "stock",
+      "repeat": "2",
+      "workload": "df_rhf_gradient",
+      "energy_abs_error_eh": 2.2737367544323206e-13,
+      "gradient_max_abs_error_eh_per_bohr": 2.5091040356528538e-14,
+      "passed": true
+    },
+    {
+      "variant": "native",
+      "repeat": "2",
+      "workload": "df_rhf_gradient",
+      "energy_abs_error_eh": 0.0,
+      "gradient_max_abs_error_eh_per_bohr": 2.19824158875781e-14,
+      "passed": true
+    },
+    {
+      "variant": "stock",
+      "repeat": "warmup",
+      "workload": "pyscfad_df_rhf_value_gradient_first",
+      "energy_abs_error_eh": 2.842170943040401e-14,
+      "gradient_max_abs_error_eh_per_bohr": 8.604228440844963e-15,
+      "passed": true
+    },
+    {
+      "variant": "native",
+      "repeat": "warmup",
+      "workload": "pyscfad_df_rhf_value_gradient_first",
+      "energy_abs_error_eh": 5.684341886080802e-14,
+      "gradient_max_abs_error_eh_per_bohr": 6.494804694057166e-15,
+      "passed": true
+    },
+    {
+      "variant": "integrals",
+      "repeat": "warmup",
+      "workload": "pyscfad_df_rhf_value_gradient_first",
+      "energy_abs_error_eh": 2.842170943040401e-14,
+      "gradient_max_abs_error_eh_per_bohr": 2.4424906541753444e-15,
+      "passed": true
+    },
+    {
+      "variant": "stock",
+      "repeat": "0",
+      "workload": "pyscfad_df_rhf_value_gradient_first",
+      "energy_abs_error_eh": 0.0,
+      "gradient_max_abs_error_eh_per_bohr": 0.0,
+      "passed": true
+    },
+    {
+      "variant": "native",
+      "repeat": "0",
+      "workload": "pyscfad_df_rhf_value_gradient_first",
+      "energy_abs_error_eh": 5.684341886080802e-14,
+      "gradient_max_abs_error_eh_per_bohr": 2.4702462297909733e-15,
+      "passed": true
+    },
+    {
+      "variant": "integrals",
+      "repeat": "0",
+      "workload": "pyscfad_df_rhf_value_gradient_first",
+      "energy_abs_error_eh": 5.684341886080802e-14,
+      "gradient_max_abs_error_eh_per_bohr": 7.355227538141662e-15,
+      "passed": true
+    },
+    {
+      "variant": "native",
+      "repeat": "1",
+      "workload": "pyscfad_df_rhf_value_gradient_first",
+      "energy_abs_error_eh": 1.4210854715202004e-14,
+      "gradient_max_abs_error_eh_per_bohr": 1.9984014443252818e-15,
+      "passed": true
+    },
+    {
+      "variant": "integrals",
+      "repeat": "1",
+      "workload": "pyscfad_df_rhf_value_gradient_first",
+      "energy_abs_error_eh": 2.842170943040401e-14,
+      "gradient_max_abs_error_eh_per_bohr": 3.802513859341161e-15,
+      "passed": true
+    },
+    {
+      "variant": "stock",
+      "repeat": "1",
+      "workload": "pyscfad_df_rhf_value_gradient_first",
+      "energy_abs_error_eh": 0.0,
+      "gradient_max_abs_error_eh_per_bohr": 3.3861802251067274e-15,
+      "passed": true
+    },
+    {
+      "variant": "integrals",
+      "repeat": "2",
+      "workload": "pyscfad_df_rhf_value_gradient_first",
+      "energy_abs_error_eh": 2.842170943040401e-14,
+      "gradient_max_abs_error_eh_per_bohr": 2.220446049250313e-15,
+      "passed": true
+    },
+    {
+      "variant": "stock",
+      "repeat": "2",
+      "workload": "pyscfad_df_rhf_value_gradient_first",
+      "energy_abs_error_eh": 4.263256414560601e-14,
+      "gradient_max_abs_error_eh_per_bohr": 3.3861802251067274e-15,
+      "passed": true
+    },
+    {
+      "variant": "native",
+      "repeat": "2",
+      "workload": "pyscfad_df_rhf_value_gradient_first",
+      "energy_abs_error_eh": 4.263256414560601e-14,
+      "gradient_max_abs_error_eh_per_bohr": 3.3861802251067274e-15,
+      "passed": true
+    },
+    {
+      "variant": "stock",
+      "repeat": "warmup",
+      "workload": "pyscfad_df_rhf_value_gradient_warmed",
+      "energy_abs_error_eh": 2.842170943040401e-14,
+      "gradient_max_abs_error_eh_per_bohr": 6.6058269965196814e-15,
+      "passed": true
+    },
+    {
+      "variant": "native",
+      "repeat": "warmup",
+      "workload": "pyscfad_df_rhf_value_gradient_warmed",
+      "energy_abs_error_eh": 1.4210854715202004e-14,
+      "gradient_max_abs_error_eh_per_bohr": 3.608224830031759e-15,
+      "passed": true
+    },
+    {
+      "variant": "integrals",
+      "repeat": "warmup",
+      "workload": "pyscfad_df_rhf_value_gradient_warmed",
+      "energy_abs_error_eh": 4.263256414560601e-14,
+      "gradient_max_abs_error_eh_per_bohr": 6.772360450213455e-15,
+      "passed": true
+    },
+    {
+      "variant": "stock",
+      "repeat": "0",
+      "workload": "pyscfad_df_rhf_value_gradient_warmed",
+      "energy_abs_error_eh": 0.0,
+      "gradient_max_abs_error_eh_per_bohr": 0.0,
+      "passed": true
+    },
+    {
+      "variant": "native",
+      "repeat": "0",
+      "workload": "pyscfad_df_rhf_value_gradient_warmed",
+      "energy_abs_error_eh": 1.4210854715202004e-14,
+      "gradient_max_abs_error_eh_per_bohr": 4.9404924595819466e-15,
+      "passed": true
+    },
+    {
+      "variant": "integrals",
+      "repeat": "0",
+      "workload": "pyscfad_df_rhf_value_gradient_warmed",
+      "energy_abs_error_eh": 4.263256414560601e-14,
+      "gradient_max_abs_error_eh_per_bohr": 6.439293542825908e-15,
+      "passed": true
+    },
+    {
+      "variant": "native",
+      "repeat": "1",
+      "workload": "pyscfad_df_rhf_value_gradient_warmed",
+      "energy_abs_error_eh": 1.4210854715202004e-14,
+      "gradient_max_abs_error_eh_per_bohr": 3.7192471324942744e-15,
+      "passed": true
+    },
+    {
+      "variant": "integrals",
+      "repeat": "1",
+      "workload": "pyscfad_df_rhf_value_gradient_warmed",
+      "energy_abs_error_eh": 7.105427357601002e-14,
+      "gradient_max_abs_error_eh_per_bohr": 6.6058269965196814e-15,
+      "passed": true
+    },
+    {
+      "variant": "stock",
+      "repeat": "1",
+      "workload": "pyscfad_df_rhf_value_gradient_warmed",
+      "energy_abs_error_eh": 0.0,
+      "gradient_max_abs_error_eh_per_bohr": 5.495603971894525e-15,
+      "passed": true
+    },
+    {
+      "variant": "integrals",
+      "repeat": "2",
+      "workload": "pyscfad_df_rhf_value_gradient_warmed",
+      "energy_abs_error_eh": 5.684341886080802e-14,
+      "gradient_max_abs_error_eh_per_bohr": 4.385380947269368e-15,
+      "passed": true
+    },
+    {
+      "variant": "stock",
+      "repeat": "2",
+      "workload": "pyscfad_df_rhf_value_gradient_warmed",
+      "energy_abs_error_eh": 8.526512829121202e-14,
+      "gradient_max_abs_error_eh_per_bohr": 3.941291737419306e-15,
+      "passed": true
+    },
+    {
+      "variant": "native",
+      "repeat": "2",
+      "workload": "pyscfad_df_rhf_value_gradient_warmed",
+      "energy_abs_error_eh": 8.526512829121202e-14,
+      "gradient_max_abs_error_eh_per_bohr": 4.884981308350689e-15,
+      "passed": true
+    }
+  ],
+  "note": "First AD call includes compilation; warmed AD call reuses in-process caches. Outer warmup processes are excluded from timing statistics."
+}

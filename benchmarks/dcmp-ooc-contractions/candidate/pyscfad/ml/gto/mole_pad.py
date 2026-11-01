@@ -1,0 +1,284 @@
+# Copyright 2025-2026 The PySCFAD Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+from typing import TYPE_CHECKING
+
+import numpy
+from pyscf.gto.mole import (
+    ATOM_OF,
+    ATM_SLOTS,
+    BAS_SLOTS,
+    CHARGE_OF,
+    NUC_MOD_OF,
+    NUC_POINT,
+    PTR_COORD,
+    PTR_ENV_START,
+    PTR_ZETA,
+    PTR_EXP,
+    PTR_COEFF,
+)
+
+from pyscfad import numpy as np
+from pyscfad import ops
+from pyscfad.gto import moleintor_lite
+from pyscfad.gto import MoleLite
+from pyscfad.experimental import moleintor_cuint
+
+if TYPE_CHECKING:
+    from pyscfad.typing import ArrayLike, Array
+    from pyscfad.ml.gto.basis_array import BasisArray
+
+def tot_electrons(mol: MolePad) -> Array:
+    nelectron = mol.atom_charges().sum()
+    nelectron -= mol.charge
+    nelectron_int = np.round(nelectron).astype(np.int32)
+    return nelectron_int
+
+
+class MolePad(MoleLite):
+    """Molecular information with padding (for batched calculations).
+
+    Parameters:
+        numbers: Atomic numbers.
+        coords: Atomic coordinates (in Bohr).
+        basis: Atom-centered contracted Gaussian basis set parameters
+            (including exponents and contraction coefficients).
+        charge: Total charge.
+        spin: 2S (number of alpha electrons minus number of beta electrons).
+        cart: Whether to use Cartesian Gaussian basis.
+        trace_coords: Whether to trace atomic coordinates for gradient calculations.
+        trace_basis: Whether to trace basis set parameters for gradient calculations.
+    """
+    def __init__(
+        self,
+        numbers: ArrayLike,
+        coords: ArrayLike,
+        basis: BasisArray | None = None,
+        charge: int = 0,
+        spin: int = 0,
+        cart: bool = False,
+        verbose: int = 3,
+        trace_coords: bool = False,
+        trace_basis: bool = False,
+        cuint_plan: moleintor_cuint.CuintPlan | None = None,
+        bas0: ArrayLike = None,
+        env0: ArrayLike = None,
+    ):
+        self.numbers = np.asarray(numbers, dtype=np.int32)
+        self.coords = np.asarray(coords, dtype=np.float64)
+        self.basis = basis
+        self.charge = charge
+        self.spin = spin
+        self.cart = cart
+        self.verbose = verbose
+        self.trace_coords = trace_coords
+        self.trace_basis = trace_basis
+        self.cuint_plan = cuint_plan
+
+        self.atom_mask = np.greater(self.numbers, 0)
+        self.shl_mask = None
+        self.ao_mask = None
+        self._atm = self._bas = self._env = None
+        if self.basis is not None:
+            self._atm, self._bas, self._env = make_env(self, bas0=bas0, env0=env0)
+
+            self.shl_mask = self.basis.mask_shl[self.numbers].ravel()
+            self.ao_mask = self.basis.make_ao_mask(
+                self.basis.mask_shl[self.numbers],
+                self.basis.mask_ctr[self.numbers],
+                cart=self.cart,
+            )
+
+        self._nao = None
+        self._pseudo = {}
+        self._ecpbas = numpy.zeros((0,8), dtype=numpy.int32)
+        self._built = True
+
+    def atom_charges(self) -> Array:
+        return self.numbers
+
+    def atom_nshells(self, atm_id: int) -> int:
+        del atm_id
+        return self.basis.nbas
+
+    @property
+    def nao(self) -> int:
+        if self._nao is None:
+            return self.nao_nr()
+        else:
+            return self._nao
+
+    def nao_nr(self, cart: bool | None = None) -> int:
+        if cart is None:
+            cart = self.cart
+        return self.basis.nao_nr(cart=cart) * self.natm
+
+    @property
+    def natm(self) -> int:
+        return len(self.numbers)
+
+    def copy(
+        self,
+        deep: bool = True,
+    ) -> MolePad:
+        import copy
+        newmol = self.view(self.__class__)
+        if not deep:
+            return newmol
+
+        newmol.coords = np.copy(self.coords)
+        newmol.basis = copy.deepcopy(self.basis)
+        newmol._atm = np.copy(self._atm)
+        newmol._bas = np.copy(self._bas)
+        newmol._env = np.copy(self._env)
+        return newmol
+
+    def intor(
+        self,
+        intor_name: str,
+        comp: int | None = None,
+        hermi: int = 0,
+        aosym: str = "s1",
+        out: ArrayLike | None = None,
+        shls_slice: tuple[int, ...] | None = None,
+        grids: ArrayLike | None = None,
+        cuint_plan: moleintor_cuint.CuintPlan | None = None,
+    ) -> Array:
+        del out, grids
+
+        intor_name = self._add_suffix(intor_name)
+        if "ECP" in intor_name:
+            raise NotImplementedError
+        if "_grids" in intor_name:
+            raise NotImplementedError
+
+        ao_loc = self.ao_loc
+        aoslices = self.aoslice_by_atom(ao_loc=ao_loc)[:,2:4]
+
+        if cuint_plan is None:
+            cuint_plan = self.cuint_plan
+
+        if cuint_plan is not None:
+            out = moleintor_cuint.getints(
+                intor_name,
+                self._atm,
+                self._bas,
+                self._env,
+                cuint_plan,
+                shls_slice=shls_slice,
+                comp=comp,
+                hermi=hermi,
+                aosym=aosym,
+                ao_loc=ao_loc,
+                trace_coords=self.trace_coords,
+                trace_basis=self.trace_basis,
+                aoslices=aoslices,
+            )
+        else:
+            out = moleintor_lite.getints(
+                intor_name,
+                self._atm,
+                self._bas,
+                self._env,
+                shls_slice=shls_slice,
+                comp=comp,
+                hermi=hermi,
+                aosym=aosym,
+                ao_loc=ao_loc,
+                trace_coords=self.trace_coords,
+                trace_basis=self.trace_basis,
+                aoslices=aoslices,
+            )
+        return out
+
+    def ao_loc_nr(self) -> numpy.ndarray:
+        if self.cart:
+            key = "cart"
+        else:
+            key = "sph"
+        return self.basis.make_loc(self.natm, key)
+
+    ao_loc = property(ao_loc_nr)
+    ao_loc_2c = NotImplemented
+
+    def aoslice_by_atom(self, ao_loc: ArrayLike | None = None) -> numpy.ndarray:
+        if ao_loc is None:
+            ao_loc = self.ao_loc
+        return self.basis.aoslice_by_atom(self.natm, ao_loc=ao_loc)
+
+    tot_electrons = tot_electrons
+    atom_pure_symbol = NotImplemented
+    from_pyscf = NotImplemented
+    to_pyscf = NotImplemented
+
+def make_atm_env(
+    coords: ArrayLike,
+    numbers: ArrayLike,
+    ptr: int = 0,
+    nuclear_model: int = NUC_POINT,
+    nucprop: dict | None = None,
+) -> tuple[Array, Array]:
+    natm = len(coords)
+    nuc_charge = numbers
+    if nuclear_model == NUC_POINT:
+        zeta = np.zeros((natm,1))
+    else:
+        raise NotImplementedError
+    _env = np.hstack((coords, zeta)).ravel()
+
+    _atm = np.zeros((natm, ATM_SLOTS), dtype=np.int32)
+    _atm = ops.index_update(_atm, ops.index[:,CHARGE_OF],
+                            np.asarray(nuc_charge, dtype=np.int32))
+    _atm = ops.index_update(_atm, ops.index[:,PTR_COORD],
+                            np.arange(ptr, ptr+4*natm, 4, dtype=np.int32))
+    _atm = ops.index_update(_atm, ops.index[:,NUC_MOD_OF],
+                            np.arange(nuclear_model, dtype=np.int32))
+    _atm = ops.index_update(_atm, ops.index[:,PTR_ZETA],
+                            _atm[:,PTR_COORD] + np.array(3, dtype=np.int32))
+    return _atm, _env
+
+def make_env(
+    mol: MolePad,
+    bas0: ArrayLike | None = None,
+    env0: ArrayLike | None = None,
+) -> tuple[Array, Array, Array]:
+    """Make ``_atm``, ``_bas``, and ``_env`` for
+    interfacing with libcint.
+    """
+    pre_env = np.zeros(PTR_ENV_START)
+    _env = [pre_env]
+    ptr_env = pre_env.size
+
+    # TODO other nuclear charge models
+    _atm, env1 = make_atm_env(mol.coords, mol.numbers, ptr_env)
+    _env.append(env1)
+    ptr_env += env1.size
+
+    if bas0 is None or env0 is None:
+        bas0, env0 = mol.basis.make_bas_env(ptr_env)
+    else:
+        bas0 = ops.index_add(bas0, ops.index[:,:,PTR_EXP],
+                             np.array(ptr_env, dtype=np.int32))
+        bas0 = ops.index_add(bas0, ops.index[:,:,PTR_COEFF],
+                             np.array(ptr_env, dtype=np.int32))
+
+    _bas = bas0[mol.numbers]
+    _bas = ops.index_update(_bas, ops.index[:,:,ATOM_OF],
+                            np.arange(len(_atm), dtype=np.int32)[:,None])
+    _bas = _bas.reshape(-1, BAS_SLOTS)
+    _env = np.hstack(_env)
+    _env = np.hstack([_env, env0])
+    return _atm, _bas, _env
+

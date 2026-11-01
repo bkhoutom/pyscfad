@@ -76,7 +76,10 @@ def int3c_cross_bwd(intor, comp, aosym, shls_slice, out,
     if shls_slice is None:
         shls_slice = (0, mol.nbas, 0, mol.nbas, mol.nbas,
                       mol.nbas + auxmol.nbas)
-    assert shls_slice[5] - shls_slice[4] == auxmol.nbas
+    aux_sh0 = shls_slice[4] - mol.nbas
+    aux_sh1 = shls_slice[5] - mol.nbas
+    if not 0 <= aux_sh0 <= aux_sh1 <= auxmol.nbas:
+        raise ValueError('Auxiliary shell slice is outside the auxiliary basis.')
 
     natm = mol.natm
     comp = 3
@@ -95,6 +98,13 @@ def int3c_cross_bwd(intor, comp, aosym, shls_slice, out,
     intor1 = ascint3(mol._add_suffix(intor1))
     ao_loc = make_loc(bas, intor1)
     ao_loc = numpy.asarray(ao_loc, order='C', dtype=numpy.int32)
+    i0, i1 = ao_loc[shls_slice[0]], ao_loc[shls_slice[1]]
+    npair = int(i1) * (int(i1) + 1) // 2 - int(i0) * (int(i0) + 1) // 2
+    naux_slice = ao_loc[shls_slice[5]] - ao_loc[shls_slice[4]]
+    if ybar.shape != (npair, naux_slice):
+        raise ValueError(
+            f'Integral cotangent has shape {ybar.shape}, '
+            f'expected {(npair, naux_slice)} for the shell slice.')
     cintopt = make_cintopt(atm, bas, env, intor1)
 
     drv = libcgto.GTOnr3c_ij_r0_vjp
@@ -104,17 +114,23 @@ def int3c_cross_bwd(intor, comp, aosym, shls_slice, out,
     # invariance gives the auxiliary derivative from the two AO derivatives.
     # Keep the public (pair, aux) layout and pass contiguous auxiliary slices
     # to the existing driver; it handles each slice's AO-pair row offset.
+    # Both the atom intersections and cotangent offsets must be relative to
+    # the requested auxiliary slice, which may start/end inside an atom.
     vjp_aux = numpy.zeros((auxmol.natm, comp))
-    for ia, (b0, b1, p0, p1) in enumerate(auxmol.aoslice_by_atom()):
-        if b0 == b1:
+    aux_loc = ao_loc[mol.nbas:] - ao_loc[mol.nbas]
+    aux_start = aux_loc[aux_sh0]
+    for ia, (b0, b1, _, _) in enumerate(auxmol.aoslice_by_atom()):
+        b0, b1 = max(b0, aux_sh0), min(b1, aux_sh1)
+        if b0 >= b1:
             continue
+        p0, p1 = aux_loc[b0] - aux_start, aux_loc[b1] - aux_start
         vjp_ia = numpy.zeros_like(vjp)
         ybar_ia = numpy.asarray(ybar[:, p0:p1], order='F')
         drv(getattr(libcgto, intor1), fill,
             vjp_ia.ctypes.data_as(ctypes.c_void_p),
             ybar_ia.ctypes.data_as(ctypes.c_void_p),
             ctypes.c_int(comp),
-            (ctypes.c_int*6)(*shls_slice[:4], shls_slice[4]+b0, shls_slice[4]+b1),
+            (ctypes.c_int*6)(*shls_slice[:4], mol.nbas+b0, mol.nbas+b1),
             ao_loc.ctypes.data_as(ctypes.c_void_p), cintopt,
             c_atm, ctypes.c_int(len(atm)), ctypes.c_int(natm),
             c_bas, ctypes.c_int(len(bas)), c_env)

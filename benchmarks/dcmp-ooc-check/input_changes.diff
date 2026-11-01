@@ -1,0 +1,291 @@
+--- before/reproduce_dcmp_ad.py
++++ after/reproduce_dcmp_ad.py
+@@ -1,4 +1,4 @@
+-"""dCMP gradient with separate DF, SCF and MP2 VJPs and phase-local SciPy threads."""
++"""dCMP energy/gradient with disk-backed AO DF and phase-local SciPy threads."""
+ import os
+ import sys
+ import time
+@@ -20,6 +20,7 @@
+ 
+ MAX_MEMORY = 60000  # MB, advisory budget
+ FROZEN = 24
++CDERI_PATH = os.path.join(os.environ['PYSCF_TMPDIR'], 'dcmp-cderi.h5')
+ DF_THREADS = int(os.environ.get(
+     'SCIPY_DF_THREADS', os.environ.get('SLURM_CPUS_PER_TASK', '1')))
+ if DF_THREADS < 1:
+@@ -96,13 +97,15 @@
+ 
+ def df_state(mol):
+     mf = scf.RHF(mol).density_fit(auxbasis='cc-pvtz-jkfit')
+-    mf.with_df.build()
++    mf.with_df.incore = False
++    # Attach inside the trace: SCF/MP2 custom VJPs retain AO and auxiliary response.
++    mf.with_df.attach_outcore_cderi(CDERI_PATH)
+     return mol, mf.with_df
+ 
+ 
+ def scf_state(df_inputs):
+     mol, with_df = df_inputs
+-    assert with_df._cderi is not None
++    assert with_df._has_outcore_cderi_placeholder()
+     mf = scf.RHF(mol).density_fit(with_df=with_df)
+     mf.conv_tol, mf.conv_tol_grad, mf.max_cycle = 1e-10, 1e-8, 250
+     mf.kernel()
+@@ -126,6 +129,15 @@
+ with scipy_pool.limit(limits=DF_THREADS):
+     record_threads('df_forward', DF_THREADS)
+     start = time.perf_counter()
++    # Build once for this geometry, outside JAX tracing. Keep the file for all VJPs.
++    builder = scf.RHF(mol).density_fit(auxbasis='cc-pvtz-jkfit').with_df
++    builder.incore = False
++    builder._cderi_to_save = CDERI_PATH
++    builder.build()
++    assert builder._has_outcore_cderi_placeholder()
++    print(f'Out-of-core AO DF: {CDERI_PATH}; '
++          f'{os.path.getsize(CDERI_PATH) / 2**30:.3f} GiB', flush=True)
++    del builder
+     df_inputs, df_pullback = jax.vjp(df_state, mol)
+     jax.block_until_ready((df_inputs, df_pullback))
+     phase_seconds['df_forward'] = time.perf_counter() - start
+@@ -174,12 +186,13 @@
+ with scipy_pool.limit(limits=DF_THREADS):
+     record_threads('df_pullback', DF_THREADS)
+     start = time.perf_counter()
+-    # Pass the full (mol, with_df) cotangent, including all shared geometry paths.
++    # Integral derivatives were evaluated in the SCF/MP2 pullbacks.
++    # This attachment pullback reconnects every molecular/auxiliary geometry path.
+     jac, = df_pullback(df_inputs_bar)
+     jax.block_until_ready(jac)
+     phase_seconds['df_pullback'] = time.perf_counter() - start
+ del df_pullback, df_inputs_bar
+-print(f"DF pullback: {phase_seconds['df_pullback']:.6f} s", flush=True)
++print(f"DF attachment pullback: {phase_seconds['df_pullback']:.6f} s", flush=True)
+ scf_reverse_seconds = phase_seconds['scf_pullback'] + phase_seconds['df_pullback']
+ print(f'SCF pullback (including DF pullback): {scf_reverse_seconds:.6f} s', flush=True)
+ 
+--- before/pyscf_scf.py
++++ after/pyscf_scf.py
+@@ -12,6 +12,7 @@
+ 
+ MAX_MEMORY = 60000  # MB, advisory budget
+ FROZEN = 24
++CDERI_PATH = os.path.join(os.environ['PYSCF_TMPDIR'], 'dcmp-cderi.h5')
+ SCIPY_DF_THREADS = int(os.environ.get('SCIPY_DF_THREADS', pyscf.lib.num_threads()))
+ if SCIPY_DF_THREADS < 1:
+     raise ValueError('SCIPY_DF_THREADS must be positive')
+@@ -70,12 +71,17 @@
+ def energy(mol):
+     start = time.perf_counter()
+     mf = scf.RHF(mol).density_fit(auxbasis='cc-pvtz-jkfit')
++    # A string destination forces PySCF to build and read AO DF factors on disk.
++    mf.with_df._cderi_to_save = CDERI_PATH
+     mf.conv_tol, mf.conv_tol_grad, mf.max_cycle = 1e-10, 1e-8, 250
+     # This large SciPy solve runs outside the native OpenMP kernels.
+     # Restore single-threaded BLAS before SCF and MP2. The timer includes DF.
+     df_start = time.perf_counter()
+     with scipy_blas.limit(limits=SCIPY_DF_THREADS):
+         mf.with_df.build()
++    assert isinstance(mf.with_df._cderi, str)
++    print(f'Out-of-core AO DF: {mf.with_df._cderi}; '
++          f'{os.path.getsize(CDERI_PATH) / 2**30:.3f} GiB', flush=True)
+     df_seconds = time.perf_counter() - df_start
+     print(f'DF forward: {df_seconds:.6f} s', flush=True)
+     mf.kernel()
+--- before/submit_pyscfad.sh
++++ after/submit_pyscfad.sh
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env bash
+-#SBATCH --job-name=xing-pyscfad
++#SBATCH --job-name=dcmp-ooc-ad
+ #SBATCH --partition=expansion
+ #SBATCH --account=sharmagroup
+ #SBATCH --qos=normal
+@@ -14,15 +14,17 @@
+ #SBATCH --error=reproduce_dcmp_ad.err.16.3.%j
+ 
+ set -euo pipefail
+-cd "${SLURM_SUBMIT_DIR:?Submit from dCMP}"
++cd "${SLURM_SUBMIT_DIR:?Submit from dCMP-ooc}"
+ PYTHON=${PYTHON_BIN:-/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/bin/python}
+ export PATH="${PYTHON%/*}:$PATH"
+ unset PYTHONPATH LD_LIBRARY_PATH OPENBLAS_CORETYPE
+ export PYTHONNOUSERSITE=1
+ 
+-SCRATCH_DIR="/resnick/scratch/$USER/xing/${SLURM_JOB_ID:?Run via sbatch}"
++# Caltech high-I/O scratch is all-NVMe VAST storage.
++SCRATCH_DIR="/resnick/scratch/$USER/dcmp-ooc/${SLURM_JOB_ID:?Run via sbatch}"
+ mkdir -p "$SCRATCH_DIR"
+ export TMPDIR="$SCRATCH_DIR" PYSCF_TMPDIR="$SCRATCH_DIR"
++echo "Out-of-core scratch: $SCRATCH_DIR"
+ export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-16}"
+ export OMP_THREAD_LIMIT="$OMP_NUM_THREADS" OMP_MAX_ACTIVE_LEVELS=1
+ export OMP_DYNAMIC=FALSE OMP_PROC_BIND=FALSE MKL_DYNAMIC=FALSE
+@@ -31,7 +33,7 @@
+ export OPENBLAS_NUM_THREADS=1
+ export MKL_NUM_THREADS=1
+ export BLIS_NUM_THREADS=1
+-# Only DF construction and its pullback use the larger SciPy BLAS pool.
++# The eager DF build uses SciPy16; derivative kernels retain BLAS1.
+ export SCIPY_DF_THREADS="$SLURM_CPUS_PER_TASK"
+ # Balance integral derivative work across OpenMP threads.
+ export PYSCFAD_INTEGRAL_VJP_SCHEDULE=dynamic
+--- before/submit_pyscf.sh
++++ after/submit_pyscf.sh
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env bash
+-#SBATCH --job-name=xing-pyscf
++#SBATCH --job-name=dcmp-ooc-pyscf
+ #SBATCH --partition=expansion
+ #SBATCH --account=sharmagroup
+ #SBATCH --qos=normal
+@@ -14,15 +14,17 @@
+ #SBATCH --error=pyscf_scf.err.16.%j
+ 
+ set -euo pipefail
+-cd "${SLURM_SUBMIT_DIR:?Submit from dCMP}"
++cd "${SLURM_SUBMIT_DIR:?Submit from dCMP-ooc}"
+ PYTHON=${PYTHON_BIN:-/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/bin/python}
+ export PATH="${PYTHON%/*}:$PATH"
+ unset PYTHONPATH LD_LIBRARY_PATH OPENBLAS_CORETYPE
+ export PYTHONNOUSERSITE=1
+ 
+-SCRATCH_DIR="/resnick/scratch/$USER/xing/${SLURM_JOB_ID:?Run via sbatch}"
++# Caltech high-I/O scratch is all-NVMe VAST storage.
++SCRATCH_DIR="/resnick/scratch/$USER/dcmp-ooc/${SLURM_JOB_ID:?Run via sbatch}"
+ mkdir -p "$SCRATCH_DIR"
+ export TMPDIR="$SCRATCH_DIR" PYSCF_TMPDIR="$SCRATCH_DIR"
++echo "Out-of-core scratch: $SCRATCH_DIR"
+ export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-16}"
+ export OMP_THREAD_LIMIT="$OMP_NUM_THREADS" OMP_MAX_ACTIVE_LEVELS=1
+ export OMP_DYNAMIC=FALSE OMP_PROC_BIND=FALSE MKL_DYNAMIC=FALSE
+--- before/README.md
++++ after/README.md
+@@ -1,52 +1,88 @@
+-# dCMP runtime benchmark: custom fork
++# dCMP with out-of-core AO density fitting
+ 
+ Submit from this directory:
+ 
+ ```bash
+-sbatch submit_pyscfad.sh
++sbatch submit_pyscfad.sh  # PySCFAD total energy and nuclear gradient
++sbatch submit_pyscf.sh    # plain PySCF total energy
+ ```
+ 
+-`reproduce_dcmp_ad.py` contains the input and computes the full energy and
+-coordinate gradient. `submit_pyscfad.sh` uses
+-`/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/bin/python`, one MPI task,
+-16 physical Intel cores, 128 GB RAM and a two-hour limit. No MPI module is
+-needed. Program output and SLURM errors remain in this directory; scratch uses
+-the explicit location in the script.
++Both scripts use the existing `pyscfad_env`, one Python process, 16 physical
++Ice Lake cores, 128 GB RAM, and a two-hour limit. The geometry, cc-pVTZ basis,
++cc-pVTZ-JKFIT auxiliary basis, 24 frozen occupied orbitals, SCF tolerances
++`1e-10` / `1e-8`, and 60000 MB advisory memory budget are unchanged.
++Expected HF energy is -1377.51494675713 Eh and MP2 total is -1381.31940656203 Eh.
+ 
+-The molecule has 34 atoms, cc-pVTZ / cc-pVTZ-JKFIT, 24 frozen occupied orbitals,
+-SCF tolerances `1e-10` / `1e-8`, and a 60000 MB advisory memory budget.
+-Expected HF energy is -1377.51494675713 Eh and MP2 total is -1381.31940656203 Eh.
+-The full gradient is computed; the driver prints its first ten rows.
++## What uses disk
+ 
+-PySCF 2.14.0 and BLAS-using PySCFAD native libraries use LP64 sequential
+-MKL 2024.2.2. Native OpenMP uses the 16 allocated cores. NumPy and SciPy retain
+-their separate OpenBLAS libraries: NumPy/native BLAS stay at one thread, while
+-the driver selects SciPy16 only for DF forward/reverse and SciPy1 elsewhere.
++The AO three-index DF factors (CDERI) are explicitly built into
++`$PYSCF_TMPDIR/dcmp-cderi.h5`. Both drivers print the actual filename and size.
+ 
+-Timing output separates DF, SCF and MP2 forward and reverse stages. SCF forward
+-with DF adds the two forward phases; SCF reverse with DF adds both pullbacks.
+-Compare MP2 forward plus pullback across branches: the fork's custom JVP
+-performs part of the derivative work during its forward stage. Forward timing
+-inside a VJP is not a standalone energy-only measurement. The final total
+-includes all six phases, with synchronization, but excludes initial imports
+-and molecule construction. JIT compilation during these stages is included.
++- `reproduce_dcmp_ad.py`: build with `incore=False` and a string
++  `_cderi_to_save` before JAX tracing. Inside the differentiated calculation,
++  `df_state` uses `attach_outcore_cderi` so SCF and MP2 stream the disk factors
++  and their custom pullbacks retain molecular and auxiliary-basis derivatives.
++- `pyscf_scf.py`: setting `_cderi_to_save` to a string explicitly forces
++  plain PySCF's disk build, regardless of available memory.
+ 
+-The driver explicitly enables `pyscfad_scf_df_precond`. The submission script
+-sets `PYSCFAD_INTEGRAL_VJP_SCHEDULE=dynamic` for load balancing. The package's
+-global preconditioner and static scheduling defaults remain unchanged; dynamic
+-scheduling permits insignificant summation-order roundoff.
++The file is rebuilt for the current geometry on each invocation and retained
++through every gradient stage. The AD driver keeps the complete `(mol, with_df)`
++cotangents; the disk file is not treated as a geometry-independent constant.
+ 
+-Paired timings, full-gradient checks and build details are recorded in
+-`/resnick/groups/sharmagroup/bkhou/src/pyscfad/benchmarks/main-parity/RESULTS.md`.
+-For the separate plain-PySCF energy comparison, use `submit_pyscf.sh`.
++This is out-of-core **AO DF**, not a fully out-of-core MP2 algorithm. PySCFAD's
++transformed occupied-virtual factors (`Lov`) and gradient intermediates still
++need RAM. Lowering `max_memory` does not make all MP2 intermediates disk-backed.
+ 
+-The plain-PySCF driver also prebuilds its density-fitting factors with the scoped
+-SciPy thread limit, then restores one BLAS thread before SCF/MP2. Its script
+-requests the same Ice Lake CPU generation as the AD script. `Threads 16` in the
+-PySCF banner reports OpenMP and does not by itself establish SciPy BLAS threads.
+-The plain total includes both SCF and MP2 energy; it is not an SCF-only timer.
++## Scratch storage
+ 
+-In this fork's AD output, the SCS-MP2 and same/opposite-spin diagnostic lines
+-are legacy placeholders because that path does not populate spin components.
+-Use the ordinary `E(MP2)` and total gradient for this benchmark, not those SCS
+-diagnostics. The plain PySCF driver does compute the spin components.
++Both submission scripts set:
++
++```bash
++SCRATCH_DIR="/resnick/scratch/$USER/dcmp-ooc/$SLURM_JOB_ID"
++export TMPDIR="$SCRATCH_DIR" PYSCF_TMPDIR="$SCRATCH_DIR"
++```
++
++[Caltech's storage documentation](https://www.hpc.caltech.edu/docs/documentation/storage.html)
++identifies `/resnick/scratch` as all-NVMe VAST storage, with no separate high-I/O
++tier. This is the documented high-performance scratch choice. The inspected
++Ice Lake node records do not advertise scheduler-guaranteed local scratch.
++No claim of benchmark-proven optimal I/O is made.
++
++Caltech documents a 20 TB default scratch quota and purging after 14 days
++without access. The scripts retain their scratch files for inspection; move
++anything needed long-term to project storage. SLURM output and program results
++remain in this calculation directory. No automatic cleanup or resubmission is
++added.
++
++## Threads and timings
++
++Native OpenMP uses 16 workers. BLAS pools remain at one thread except that the
++existing scoped SciPy pool uses 16 during DF setup and the final attachment
++pullback. The latter is now just geometry-cotangent routing: the actual DF
++integral derivative work is included in the SCF and MP2 pullback timings.
++Consequently, individual DF/reverse timings are not directly comparable to
++the old in-core phase breakdown. Total time includes disk DF construction.
++
++The plain PySCF run computes energy only, while the AD run also differentiates
++it. Their HDF5 layouts may differ. Do not interpret their total-time ratio as
++an isolated comparison of DF algorithms.
++
++## Validation
++
++The small water-dimer check is self-contained in
++`/resnick/groups/sharmagroup/bkhou/src/pyscfad/benchmarks/dcmp-ooc-check`.
++It compares the original in-core phase-split AD driver against the modified
++out-of-core AD driver and plain PySCF, using def2-SVP / weigend, two frozen
++orbitals, and all 18 coordinate-gradient components. Production dCMP inputs
++retain cc-pVTZ / cc-pVTZ-JKFIT and 24 frozen orbitals.
++
++Validation job **5818204** completed successfully on Ice Lake node
++`hpc-53-08` on 2026-10-31. Maximum differences were 3.41e-13 Eh for in-core
++versus out-of-core AD energy, 2.43e-14 Eh/bohr across the full gradient, and
++2.27e-13 Eh for plain PySCF versus AD energy. Evidence is in the validation
++folder's `verification.json`, `slurm-5818204.out`, and three calculation logs.
++No calculations ran on a login node. The full dCMP production jobs have not
++been submitted as part of this input edit.
++
++Original inputs and the complete edit diff are saved in that validation
++folder as `original_inputs/` and `input_changes.diff`.

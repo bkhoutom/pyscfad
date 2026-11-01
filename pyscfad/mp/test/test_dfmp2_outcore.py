@@ -146,7 +146,7 @@ def test_outcore_nr_e2_vjp_matches_dense_without_full_cderi_bar(
         atol=1e-9,
         rtol=1e-9,
     )
-    assert calls["forward_stream"] >= 2
+    assert calls["forward_stream"] == 1
     assert calls["mo_stream"] == 1
     assert calls["direct_int3c"] == 1
 

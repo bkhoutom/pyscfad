@@ -1,0 +1,394 @@
+{
+  "status": "ok",
+  "variant": "stock",
+  "repeat": "1",
+  "metadata": {
+    "python": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/bin/python",
+    "python_version": "3.11.16 | packaged by conda-forge | (main, Aug 21 2026, 22:44:51) [GCC 14.4.0]",
+    "pyscf_path": "/resnick/groups/sharmagroup/bkhou/src/pyscfad/benchmarks/pyscf_hpc/stock/pyscf/__init__.py",
+    "pyscf_version": "2.14.0",
+    "hostname": "hpc-90-30.cm.cluster",
+    "cpu_name": "Intel(R) Xeon(R) Gold 6130 CPU @ 2.10GHz",
+    "cpu_affinity": [
+      3,
+      9,
+      11,
+      15,
+      17,
+      21,
+      28,
+      30
+    ],
+    "environment": {
+      "OMP_NUM_THREADS": "8",
+      "OMP_DYNAMIC": "FALSE",
+      "OMP_PROC_BIND": null,
+      "OMP_PLACES": null,
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "BLIS_NUM_THREADS": "1",
+      "VECLIB_MAXIMUM_THREADS": null,
+      "NUMEXPR_NUM_THREADS": null,
+      "XLA_FLAGS": null,
+      "JAX_ENABLE_X64": "True",
+      "JAX_PLATFORMS": "cpu",
+      "PYTHONPATH": "/resnick/groups/sharmagroup/bkhou/src/pyscfad/benchmarks/pyscf_hpc/stock:/resnick/groups/sharmagroup/bkhou/src/pyscfad",
+      "LD_LIBRARY_PATH": "/resnick/groups/sharmagroup/bkhou/software/orca:/resnick/groups/sharmagroup/bkhou/software/openmpi-4.1.8-install/lib:/resnick/groups/sharmagroup/bkhou/software/orca:/resnick/groups/sharmagroup/bkhou/software/openmpi-4.1.8-install/lib:",
+      "SLURM_JOB_ID": "5736126",
+      "SLURM_JOB_NODELIST": "hpc-90-30",
+      "SLURM_CPUS_PER_TASK": "8",
+      "SLURM_NTASKS": "1",
+      "SLURM_CPU_BIND": "quiet,mask_cpu:0x50228A08",
+      "TMPDIR": "/resnick/groups/sharmagroup/bkhou/src/pyscfad/benchmarks/pyscf_hpc/scratch"
+    },
+    "threadpools": [
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 1,
+        "prefix": "libopenblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/src/pyscfad/benchmarks/pyscf_hpc/stock/pyscf/lib/libopenblas-r0-f650aae0.3.3.so",
+        "version": null,
+        "threading_layer": "disabled",
+        "architecture": "Haswell"
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 1,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/numpy.libs/libscipy_openblas64_-32a4b2a6.so",
+        "version": "0.3.31.188.0",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 8,
+        "prefix": "libopenblas",
+        "filepath": "/usr/lib64/libopenblaso-r0.3.26.so",
+        "version": "0.3.26",
+        "threading_layer": "openmp",
+        "architecture": "SkylakeX"
+      },
+      {
+        "user_api": "openmp",
+        "internal_api": "openmp",
+        "num_threads": 8,
+        "prefix": "libgomp",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/src/pyscfad/benchmarks/pyscf_hpc/stock/pyscf/lib/libgomp-a34b3233.so.1.0.0",
+        "version": null
+      },
+      {
+        "user_api": "openmp",
+        "internal_api": "openmp",
+        "num_threads": 8,
+        "prefix": "libgomp",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libgomp.so.1.0.0",
+        "version": null
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "flexiblas",
+        "num_threads": 8,
+        "prefix": "libflexiblas",
+        "filepath": "/usr/lib64/libflexiblas.so.3.0",
+        "version": "3.0.4",
+        "available_backends": [
+          "NETLIB",
+          "OPENBLAS-OPENMP"
+        ],
+        "loaded_backends": [
+          "OPENBLAS-OPENMP"
+        ],
+        "current_backend": "OPENBLAS-OPENMP"
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 1,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/scipy.libs/libscipy_openblas-6cdc3b4a.so",
+        "version": "0.3.30",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      }
+    ],
+    "jax_version": "0.10.2",
+    "jax_devices": [
+      "cpu:0"
+    ],
+    "pyscfad_path": "/resnick/groups/sharmagroup/bkhou/src/pyscfad/pyscfad"
+  },
+  "input": {
+    "description": "Fresh-process PySCF 2.14.0 build comparison; coordinates in Angstrom, gradients in Eh/bohr.",
+    "repeats": 3,
+    "conv_tol": 1e-11,
+    "conv_tol_grad": 1e-07,
+    "max_cycle": 100,
+    "energy_tolerance_eh": 1e-08,
+    "gradient_tolerance_eh_per_bohr": 2e-07,
+    "pyscf": {
+      "geometry_source": "First four waters in examples/lno/water_24.xyz, copied here for reproducibility.",
+      "basis": "def2-tzvp",
+      "atom": [
+        [
+          "O",
+          [
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        [
+          "H",
+          [
+            0.8584387283,
+            -0.0162191956,
+            0.4310567321
+          ]
+        ],
+        [
+          "H",
+          [
+            -0.1285702914,
+            -0.9228632802,
+            -0.2657898937
+          ]
+        ],
+        [
+          "O",
+          [
+            0.3869432269,
+            2.2707048536,
+            -1.1777831426
+          ]
+        ],
+        [
+          "H",
+          [
+            1.2908364862,
+            2.3199976721,
+            -1.4424881911
+          ]
+        ],
+        [
+          "H",
+          [
+            0.1336742975,
+            1.3938921086,
+            -0.8395850391
+          ]
+        ],
+        [
+          "O",
+          [
+            -0.6129904528,
+            -2.5003769391,
+            -0.8732913774
+          ]
+        ],
+        [
+          "H",
+          [
+            -1.4314851482,
+            -2.9122221727,
+            -0.4692437
+          ]
+        ],
+        [
+          "H",
+          [
+            0.1599679895,
+            -3.1027971753,
+            -0.6367108512
+          ]
+        ],
+        [
+          "O",
+          [
+            2.2082455475,
+            -0.0902041186,
+            1.7266977708
+          ]
+        ],
+        [
+          "H",
+          [
+            2.6143039482,
+            -1.00868162,
+            1.835385184
+          ]
+        ],
+        [
+          "H",
+          [
+            2.7801446443,
+            0.6036957195,
+            1.2517647786
+          ]
+        ]
+      ]
+    },
+    "pyscfad": {
+      "geometry_source": "First water in examples/lno/water_dimer.xyz, copied here for reproducibility.",
+      "basis": "def2-svp",
+      "atom": [
+        [
+          "O",
+          [
+            -1.485163346097,
+            -0.114724564047,
+            0.0
+          ]
+        ],
+        [
+          "H",
+          [
+            -1.868415346097,
+            0.762298435953,
+            0.0
+          ]
+        ],
+        [
+          "H",
+          [
+            -0.533833346097,
+            0.040507435953,
+            0.0
+          ]
+        ]
+      ]
+    }
+  },
+  "workloads": {
+    "direct_rhf": {
+      "seconds": 9.824119865894318,
+      "energy_eh": -304.22088290920874,
+      "converged": true,
+      "cycles": 14,
+      "nao": 172
+    },
+    "df_rhf": {
+      "seconds": 0.8025350160896778,
+      "energy_eh": -304.2208287875901,
+      "converged": true,
+      "cycles": 14,
+      "nao": 172
+    },
+    "df_rhf_gradient": {
+      "seconds": 0.9696982949972153,
+      "energy_eh": -304.2208287875901,
+      "auxbasis_response": true,
+      "gradient_eh_per_bohr": [
+        [
+          -0.017739622445526404,
+          0.03372239256293552,
+          -0.005129140816208855
+        ],
+        [
+          0.019302557680992427,
+          -0.004279538061176206,
+          -0.0016932034191460277
+        ],
+        [
+          0.007580241835427881,
+          -0.025810772384797565,
+          -0.0008782211109913396
+        ],
+        [
+          0.006641387352797068,
+          -0.002999568771778094,
+          -0.0007035685514988899
+        ],
+        [
+          0.005474815089408391,
+          0.008800248340331995,
+          -0.0023455399076925953
+        ],
+        [
+          -0.013257802890757953,
+          -0.018992606007425916,
+          0.010951070579885036
+        ],
+        [
+          -0.0031875246756938314,
+          0.06372425334810705,
+          -0.03412158693958878
+        ],
+        [
+          -0.04643293283700212,
+          -0.021499283052242246,
+          0.021700231070273523
+        ],
+        [
+          0.04986649100544871,
+          -0.031793286293009704,
+          0.0145891865437206
+        ],
+        [
+          -0.04491728205397272,
+          0.007588082006239227,
+          0.01864745241722421
+        ],
+        [
+          0.011483011232790608,
+          -0.06612377447843665,
+          0.013113669831028463
+        ],
+        [
+          0.025186660706149055,
+          0.05766385279124764,
+          -0.03413034969696671
+        ]
+      ]
+    },
+    "pyscfad_df_rhf_value_gradient_first": {
+      "seconds": 6.182113081216812,
+      "energy_eh": -75.96074018870874,
+      "converged": true,
+      "nao": 24,
+      "gradient_eh_per_bohr": [
+        [
+          -0.015484511027881676,
+          -0.01627557608712349,
+          -7.922949349939787e-18
+        ],
+        [
+          -0.004973090109541112,
+          0.012490265765859765,
+          3.3470874947198736e-17
+        ],
+        [
+          0.020457601137422565,
+          0.0037853103212737854,
+          -2.5547925597259763e-17
+        ]
+      ]
+    },
+    "pyscfad_df_rhf_value_gradient_warmed": {
+      "seconds": 1.2872035391628742,
+      "energy_eh": -75.96074018870878,
+      "converged": true,
+      "nao": 24,
+      "gradient_eh_per_bohr": [
+        [
+          -0.015484511027877235,
+          -0.016275576087128263,
+          7.063113999566333e-18
+        ],
+        [
+          -0.004973090109540834,
+          0.012490265765862818,
+          -2.9555169966452446e-17
+        ],
+        [
+          0.020457601137419568,
+          0.0037853103212745626,
+          2.2492055966886976e-17
+        ]
+      ]
+    }
+  }
+}

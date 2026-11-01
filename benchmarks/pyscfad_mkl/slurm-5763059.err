@@ -1,0 +1,15 @@
+Traceback (most recent call last):
+  File "/resnick/groups/sharmagroup/bkhou/src/pyscfad/benchmarks/pyscfad_mkl/driver.py", line 152, in <module>
+    result = run(sys.argv[1])
+             ^^^^^^^^^^^^^^^^
+  File "/resnick/groups/sharmagroup/bkhou/src/pyscfad/benchmarks/pyscfad_mkl/driver.py", line 33, in run
+    assert Path(pyscfadlib.__file__).resolve() == expected / 'pyscfadlib/__init__.py'
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError
+Traceback (most recent call last):
+  File "/resnick/groups/sharmagroup/bkhou/src/pyscfad/benchmarks/pyscfad_mkl/driver.py", line 159, in <module>
+    subprocess.run([sys.executable, '-u', str(ROOT / 'driver.py'), variant],
+  File "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/bin/python', '-u', '/resnick/groups/sharmagroup/bkhou/src/pyscfad/benchmarks/pyscfad_mkl/driver.py', 'baseline']' returned non-zero exit status 1.
+srun: error: hpc-83-16: task 0: Exited with exit code 1

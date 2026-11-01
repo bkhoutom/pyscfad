@@ -15,10 +15,12 @@
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import partial
+import ctypes
 import numpy
 import jax
-from jax import custom_vjp
+from jax import custom_jvp, custom_vjp
 from pyscf import __config__
+from pyscf import lib as pyscf_lib
 from pyscf.lib import direct_sum, current_memory
 #from pyscf.mp.mp2 import _ChemistsERIs
 from pyscfad import config
@@ -31,6 +33,17 @@ from pyscfad.df import addons as df_addons
 from pyscfad.df import _cderi_vjp
 from pyscfad.mp import mp2
 from pyscfad.tools import resource_profile
+
+try:
+    from pyscfadlib import libmp_vjp
+except (ImportError, OSError):
+    # Older native installations retain the differentiable scan fallback.
+    libmp_vjp = None
+try:
+    libmp = pyscf_lib.load_library('libmp')
+    libmp.MP2_contract_d
+except (OSError, AttributeError):
+    libmp = None
 
 WITH_T2 = getattr(__config__, 'mp_dfmp2_with_t2', True)
 
@@ -247,6 +260,94 @@ def _contract_scan_impl(Lov, mo_energy, nocc, nvir, with_t2=True):
     return emp2, t2
 
 
+def _native_energy_inputs(Lov, mo_energy, nocc, nvir):
+    # PySCF's pair kernel uses contiguous (occupied, virtual, auxiliary) rows.
+    iaL = pyscf_lib.transpose(numpy.asarray(Lov)).reshape(nocc, nvir, -1)
+    mo_energy = numpy.asarray(mo_energy, order='C')
+    e_occ, e_vir = mo_energy[:nocc], mo_energy[nocc:]
+    moeoo = numpy.asarray(e_occ[:, None] + e_occ, order='C')
+    moevv = numpy.asarray(e_vir[:, None] + e_vir, order='C')
+    ed, ex = numpy.zeros(1), numpy.zeros(1)
+    libmp.MP2_contract_d(
+        ed.ctypes.data_as(ctypes.c_void_p),
+        ex.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(1),
+        iaL.ctypes.data_as(ctypes.c_void_p),
+        iaL.ctypes.data_as(ctypes.c_void_p),
+        ctypes.c_int(0), ctypes.c_int(0),
+        ctypes.c_int(nocc), ctypes.c_int(nocc),
+        ctypes.c_int(nocc), ctypes.c_int(nvir), ctypes.c_int(iaL.shape[-1]),
+        moeoo.ctypes.data_as(ctypes.c_void_p),
+        moevv.ctypes.data_as(ctypes.c_void_p),
+        pyscf_lib.c_null_ptr(), ctypes.c_int(0),
+    )
+    return ed[0]*2 + ex[0], iaL, mo_energy
+
+
+def _native_input_gradients(iaL, mo_energy, nocc, nvir):
+    iaL_bar = numpy.zeros_like(iaL)
+    energy_bar = numpy.zeros_like(mo_energy)
+    libmp_vjp.MP2_contract_d_vjp(
+        iaL_bar.ctypes.data_as(ctypes.c_void_p),
+        energy_bar.ctypes.data_as(ctypes.c_void_p),
+        energy_bar[nocc:].ctypes.data_as(ctypes.c_void_p),
+        ctypes.c_double(2.), ctypes.c_double(1.),
+        iaL.ctypes.data_as(ctypes.c_void_p),
+        mo_energy.ctypes.data_as(ctypes.c_void_p),
+        mo_energy[nocc:].ctypes.data_as(ctypes.c_void_p),
+        ctypes.c_int(nocc), ctypes.c_int(nvir), ctypes.c_int(iaL.shape[-1]),
+    )
+    return (pyscf_lib.transpose(iaL_bar.reshape(nocc*nvir, -1)),
+            energy_bar)
+
+
+@partial(custom_jvp, nondiff_argnums=(2, 3))
+def _contract_native(Lov, mo_energy, nocc, nvir):
+    # Native host calls cannot consume staged arrays.  Keep the original JAX
+    # contraction under JIT/vmap and whenever another AD level is active.
+    if any(isinstance(x, jax.core.Tracer) for x in (Lov, mo_energy)):
+        return _contract_scan_impl(Lov, mo_energy, nocc, nvir, False)[0]
+    return _profile_call('dfmp2.energy_forward', _native_energy_inputs,
+                         Lov, mo_energy, nocc, nvir)[0]
+
+
+@_contract_native.defjvp
+def _contract_native_jvp(nocc, nvir, primals, tangents):
+    if any(isinstance(x, jax.core.Tracer) for x in primals):
+        fn = lambda x, e: _contract_scan_impl(x, e, nocc, nvir, False)[0]
+        return jax.jvp(fn, primals, tangents)
+    energy, iaL, mo_energy = _profile_call(
+        'dfmp2.energy_forward', _native_energy_inputs,
+        *primals, nocc, nvir,
+    )
+    # For this scalar energy, a JVP is a dot product with its two input
+    # gradients.  Reverse AD transposes these dots, preserving arbitrary
+    # cotangents while avoiding a custom-VJP boundary that rejects forward AD.
+    # The native gradients are evaluated during linearization, and traced
+    # higher derivatives use the scan above instead of treating them constant.
+    lov_bar, energy_bar = _profile_call(
+        'dfmp2.energy_cotangents', _native_input_gradients,
+        iaL, mo_energy, nocc, nvir,
+    )
+    tangent = np.sum(np.asarray(lov_bar)*tangents[0])
+    tangent += np.sum(np.asarray(energy_bar)*tangents[1])
+    return energy, tangent
+
+
+def _contract_energy(Lov, mo_energy, nocc, nvir, with_t2=True):
+    if not config.moleintor_opt:
+        return _contract(Lov, mo_energy, nocc, nvir, with_t2)
+    # The native energy/gradient kernels are real-double and energy-only.
+    # Frozen orbital selection is already applied to both inputs by ao2mo.
+    if (not with_t2 and libmp is not None and libmp_vjp is not None
+            and nocc > 0 and nvir > 0 and Lov.shape[0] > 0
+            and Lov.shape == (Lov.shape[0], nocc*nvir)
+            and mo_energy.shape == (nocc+nvir,)
+            and numpy.dtype(Lov.dtype) == numpy.dtype(numpy.float64)
+            and numpy.dtype(mo_energy.dtype) == numpy.dtype(numpy.float64)):
+        return _contract_native(Lov, mo_energy, nocc, nvir), None
+    return _contract_scan(Lov, mo_energy, nocc, nvir, with_t2)
+
+
 @partial(custom_vjp, nondiff_argnums=(3, 4, 5, 6))
 def _outcore_nr_e2(mol, auxmol, mo_coeff, cderi_source, max_memory,
                    ijslice, aosym):
@@ -274,7 +375,7 @@ def _outcore_nr_e2_fwd(mol, auxmol, mo_coeff, cderi_source, max_memory,
                        ijslice, aosym):
     out = _outcore_nr_e2(mol, auxmol, mo_coeff, cderi_source, max_memory,
                          ijslice, aosym)
-    return out, (mol, auxmol, mo_coeff)
+    return out, (mol, auxmol, mo_coeff, out)
 
 
 def _outcore_nr_e2_bwd(cderi_source, max_memory, ijslice, aosym, res, ybar):
@@ -285,7 +386,7 @@ def _outcore_nr_e2_bwd(cderi_source, max_memory, ijslice, aosym, res, ybar):
 
 
 def _outcore_nr_e2_bwd_impl(cderi_source, max_memory, ijslice, aosym, res, ybar):
-    mol, auxmol, mo_coeff = res
+    mol, auxmol, mo_coeff, out = res
     effective_memory = max(max_memory, 4096)
     use_direct_vjp = (
         numpy.dtype(mo_coeff.dtype) == numpy.dtype(numpy.float64)
@@ -324,6 +425,7 @@ def _outcore_nr_e2_bwd_impl(cderi_source, max_memory, ijslice, aosym, res, ybar)
                     int3c=mol._add_suffix('int3c2e'),
                     int2c=mol._add_suffix('int2c2e'),
                     aosym='s2ij',
+                    saved_output=out,
                 )
             )
             return mol_bar, auxmol_bar, mo_coeff_bar
@@ -403,12 +505,7 @@ def kernel(mp, mo_energy=None, mo_coeff=None, eris=None, with_t2=WITH_T2,
         'dfmp2.ao2mo', mp.loop_ao2mo, mo_coeff, nocc, with_t2,
     )
 
-    if config.moleintor_opt:
-        #emp2, t2 = _contract_opt(Lov, mo_energy, nocc, nvir, with_t2)
-        emp2, t2 = _contract_scan(Lov, mo_energy, nocc, nvir, with_t2)
-    else:
-        emp2, t2 = _contract(Lov, mo_energy, nocc, nvir, with_t2)
-    return emp2, t2
+    return _contract_energy(Lov, mo_energy, nocc, nvir, with_t2)
 
 class MP2(mp2.MP2):
     _dynamic_attr = _keys = {'with_df'}

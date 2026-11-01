@@ -1,0 +1,52 @@
+{
+  "job_id": "5767581",
+  "host": "hpc-53-24.cm.cluster",
+  "affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "phase_means_seconds": {
+    "main": {
+      "df_forward": 8.218759870389476,
+      "scf_forward": 51.34603127418086,
+      "mp2_forward": 6.096017211908475,
+      "mp2_pullback": 15.224715138785541,
+      "scf_pullback": 56.98752082651481,
+      "df_pullback": 14.436030643060803,
+      "total": 152.60084965708666,
+      "scf_forward_including_df": 59.564791144570336,
+      "mp2_forward_and_reverse": 21.320732350694016,
+      "scf_reverse_including_df": 71.42355146957561
+    },
+    "fork": {
+      "df_forward": 8.242615348892286,
+      "scf_forward": 52.67727372655645,
+      "mp2_forward": 18.271074818680063,
+      "mp2_pullback": 3.577601634664461,
+      "scf_pullback": 54.706491130404174,
+      "df_pullback": 18.60801631794311,
+      "total": 156.34558550151996,
+      "scf_forward_including_df": 60.91988907544874,
+      "mp2_forward_and_reverse": 21.848676453344524,
+      "scf_reverse_including_df": 73.31450744834729
+    }
+  },
+  "fork_over_main": 1.0245394167388202,
+  "max_paired_gradient_error": 6.197597990365011e-12,
+  "energy_spread": 1.5916157281026244e-12,
+  "fork_minus_main_seconds": 3.7447358444333076
+}

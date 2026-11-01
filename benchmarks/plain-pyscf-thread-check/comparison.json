@@ -1,0 +1,42 @@
+{
+  "job_id": "5786642",
+  "node": "hpc-19-30.cm.cluster",
+  "affinity": [
+    3,
+    4,
+    5,
+    6,
+    7,
+    16,
+    41,
+    42,
+    43,
+    44,
+    45,
+    46,
+    47,
+    52,
+    53,
+    54
+  ],
+  "original": {
+    "total_seconds": 90.02877886034548,
+    "phases": {
+      "SCF forward (including DF build)": 84.124551,
+      "MP2 forward (excluding SCF)": 5.890566
+    },
+    "df_seconds": 35.78919027373195
+  },
+  "optimized": {
+    "total_seconds": 63.30010122805834,
+    "phases": {
+      "SCF forward (including DF build)": 57.363395,
+      "MP2 forward (excluding SCF)": 5.899768
+    },
+    "df_seconds": 5.491428563371301
+  },
+  "energy_difference": 2.2737367544323206e-13,
+  "energy": -1381.319406562033,
+  "speedup": 1.422253315772573,
+  "control": "Same node, cores, Python, native MKL libraries and scientific input. One fresh-process run each; SciPy16 is scoped to DF construction in the updated driver. Legacy MPI-module environment was removed equally for both cases; its independent performance effect is not measured."
+}

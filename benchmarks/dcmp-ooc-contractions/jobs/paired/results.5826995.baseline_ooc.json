@@ -1,0 +1,745 @@
+{
+  "case": "baseline_ooc",
+  "mode": "outcore",
+  "job_id": "5826995",
+  "node": "hpc-20-35.cm.cluster",
+  "total_seconds": 710.0097918882966,
+  "phase_seconds": {
+    "df_forward": 25.151553697884083,
+    "scf_forward": 290.79536574706435,
+    "mp2_forward": 22.068759705871344,
+    "mp2_pullback": 38.981415044516325,
+    "scf_pullback": 332.6816013418138,
+    "df_pullback": 0.04064256697893143
+  },
+  "energy_hartree": -1381.3194065620316,
+  "gradient_hartree_per_bohr": [
+    [
+      0.0270922452749374,
+      0.17426531542789836,
+      -0.039551062145638055
+    ],
+    [
+      0.002425675031090931,
+      -0.0036853845088461908,
+      0.006620266696595382
+    ],
+    [
+      0.0034412908517282396,
+      -0.004808613662415653,
+      -0.009609857481331677
+    ],
+    [
+      -0.08547823957192174,
+      -0.07552063799911338,
+      -0.05116967228489421
+    ],
+    [
+      0.004439795216425995,
+      0.04412854792346761,
+      -0.009475356272861262
+    ],
+    [
+      -0.0935836688725664,
+      0.047463415557962005,
+      0.08599240802518149
+    ],
+    [
+      0.07309095453833142,
+      -0.1534564501088308,
+      -0.04869804611402816
+    ],
+    [
+      0.009023701036987759,
+      0.06627409876275522,
+      -0.006281647886886536
+    ],
+    [
+      -0.03855805545543933,
+      0.024540313696386096,
+      -0.008851997887085338
+    ],
+    [
+      0.005238569271956907,
+      -0.05487181581163307,
+      0.006685222187173145
+    ],
+    [
+      -0.009295017539945641,
+      -0.00869404144519187,
+      -0.001145477943623969
+    ],
+    [
+      0.005641122569672828,
+      0.0038789349638956947,
+      -0.003151708414962309
+    ],
+    [
+      0.00264891433223597,
+      -0.0032716892344641577,
+      -0.0009764504520220832
+    ],
+    [
+      0.005259685606781989,
+      -0.006923419392119035,
+      0.0002685654295802994
+    ],
+    [
+      0.007947484779522066,
+      0.04300922739385017,
+      -0.0015111240367240843
+    ],
+    [
+      0.029346109901881533,
+      -0.011613396987277681,
+      -0.06655112903388487
+    ],
+    [
+      0.033723031942699905,
+      -0.04087983474210672,
+      0.016201434069877146
+    ],
+    [
+      0.07756087180369378,
+      0.0032400265741671713,
+      0.013320022443926145
+    ],
+    [
+      0.014032498109095124,
+      0.04865637508362699,
+      -0.005933373159737011
+    ],
+    [
+      0.027346012290226547,
+      0.04824782058089136,
+      -0.0022245120118493007
+    ],
+    [
+      -0.0034000333307134274,
+      -0.0035908646730037365,
+      0.006817165054584973
+    ],
+    [
+      0.000939044046120904,
+      0.0015671347287405336,
+      -0.0034193048297909267
+    ],
+    [
+      -0.0007669621337300552,
+      0.002825442250663592,
+      0.005501006618531132
+    ],
+    [
+      -0.003073456129531099,
+      -0.0008492838070924927,
+      0.006199538261591678
+    ],
+    [
+      -0.001614144680008929,
+      -0.015565200265971562,
+      -0.0006800327894570194
+    ],
+    [
+      -0.000778047747910419,
+      -0.0016984319477273552,
+      -0.0013478577687477122
+    ],
+    [
+      -0.0008387550559809734,
+      -0.00018610860976652117,
+      -0.002081409675063908
+    ],
+    [
+      -0.00967535967989555,
+      0.005494254762414736,
+      0.013790311907926962
+    ],
+    [
+      -0.06081439905068691,
+      0.04470728684359619,
+      -0.01619354751019546
+    ],
+    [
+      -0.06617214238123298,
+      -0.03528945102967429,
+      -0.006062896590035203
+    ],
+    [
+      0.06997967448379935,
+      -0.031065901778715287,
+      0.01205255187897365
+    ],
+    [
+      -0.060767059031628864,
+      -0.04488178108405155,
+      0.0026719624968785257
+    ],
+    [
+      -0.030209563251475974,
+      -0.10052067413724652,
+      0.03602781714389237
+    ],
+    [
+      0.06584822282548633,
+      0.03907478667494837,
+      0.07276819207414947
+    ]
+  ],
+  "settings": {
+    "OMP_NUM_THREADS": "16",
+    "SCIPY_DF_THREADS": "16",
+    "PYSCFAD_DENSE_BLAS_THREADS": "16",
+    "PYSCFAD_FACTOR_PANEL_MEMORY_MB": "4096",
+    "PYSCFAD_SOLVE_MEMORY_MB": "64",
+    "PYSCFAD_PRECOND_CACHE_MEMORY_MB": "1024"
+  },
+  "peak_rss_kib": 5885248,
+  "max_memory_mb": 120000,
+  "cpu_affinity": [
+    16,
+    17,
+    19,
+    40,
+    41,
+    45,
+    46,
+    47,
+    56,
+    57,
+    58,
+    59,
+    60,
+    61,
+    62,
+    63
+  ],
+  "dense_pools": [
+    {
+      "user_api": "openmp",
+      "internal_api": "openmp",
+      "num_threads": 16,
+      "prefix": "libgomp",
+      "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libgomp.so.1.0.0",
+      "version": null
+    },
+    {
+      "user_api": "blas",
+      "internal_api": "openblas",
+      "num_threads": 16,
+      "prefix": "libscipy_openblas",
+      "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/scipy.libs/libscipy_openblas-6cdc3b4a.so",
+      "version": "0.3.30",
+      "threading_layer": "pthreads",
+      "architecture": "SkylakeX"
+    },
+    {
+      "user_api": "blas",
+      "internal_api": "openblas",
+      "num_threads": 16,
+      "prefix": "libscipy_openblas",
+      "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/numpy.libs/libscipy_openblas64_-32a4b2a6.so",
+      "version": "0.3.31.188.0",
+      "threading_layer": "pthreads",
+      "architecture": "SkylakeX"
+    }
+  ],
+  "source_sha256": {
+    "df/df.py": "9880754dbd8444c182232104cdb1eddba4ea3262534309c39923d1cb4bbb5adf",
+    "df/_df_jk_factorized.py": "1fac6ee57b68800427e4f526c4e2aa0cf1f375bbd294c3cf8622aa6f4351c6fe",
+    "df/_df_jk_opt.py": "7c440ab22ee78e5a2ac70a8d8c5623003bec3bf45e8700fbad683464d2dd07d1",
+    "df/_cderi_vjp.py": "d0cd0d6beaeafdbb3cd424c4cd58d8f5ceb1fa206a7486c4dfcd6180312d94e6",
+    "df/_int3c_cross_opt.py": "4ffc8836cf01f853a9a3047b776029eee69ca8625b472dae8371c57c78df0f65",
+    "mp/dfmp2.py": "71b7c0de872ec2bf2152b7bdd962359347148ea065106fee899f223b88610a60",
+    "scf/hf.py": "de680a3d40a2246577aa217aa4ed17e03bd3619e06127c90c1c9aba69aea7f84",
+    "_src/implicit_diff.py": "c13e477081ca87d917073854f7556ddaac87615a6b3616254ea365894be3a1c8",
+    "lib/_threading.py": "a214bed4385e1c24314ed9dbb6462bfc2bed449951e275a793ecc4895f3bafdb"
+  },
+  "driver_sha256": "fc846b6c835ae31d2cebdf9f9456afce1043a6566e3480fd543452490a8ab0f5",
+  "input_sha256": "2d1e23f52f7b036921e490180c00401085c55f5b74469e2165b5649b264e2564",
+  "cderi_bytes": 5234056448,
+  "scf_df_split": {
+    "definition": "DF-construction reverse measured inside SCF; MP2 events excluded. Conservative split assigns fused AO-adjoint assembly/packing to SCF.",
+    "scf_forward_without_df_seconds": 290.79536574706435,
+    "scf_reverse_including_embedded_df_seconds": 332.6816013418138,
+    "fused_df_construction_reverse_seconds": 131.70836400985718,
+    "scf_reverse_excluding_fused_df_seconds": 200.97323733195662,
+    "mixed_ao_adjoint_assembly_seconds": 63.25192204862833,
+    "scf_reverse_without_df_conservative_seconds": 264.22515938058496,
+    "df_reverse_excluding_ao_adjoint_assembly_seconds": 68.45644196122885,
+    "scf_exclusive_breakdown_seconds": {
+      "initial_factor_response_and_compressed_adjoint": 77.23365655168891,
+      "implicit_response_df_jk": 85.54416078701615,
+      "coulomb_preconditioner_setup": 9.085375349968672,
+      "coulomb_preconditioner_apply": 0.7985894344747066,
+      "other_scf": 28.311455208808184
+    },
+    "fused_df_breakdown_seconds": {
+      "metric_and_triangular_transforms": 33.1835484020412,
+      "density_setup": 0.09852395206689835,
+      "coordinate_total": 96.19850765541196,
+      "coordinate_density_assembly_and_packing": 63.15339809656143,
+      "coordinate_native_contraction": 32.8293751180172,
+      "coordinate_fallback_contraction": 0.0,
+      "metric_reverse": 2.227784000337124
+    },
+    "counts": {
+      "coordinate_df": 3,
+      "factorized_df": 3,
+      "preconditioner_setup": 1,
+      "preconditioner_apply": 12,
+      "implicit_matvec": 11
+    },
+    "checks": {
+      "three_factorized_geometry_calls": true,
+      "three_coordinate_helpers": true,
+      "no_generic_fallback": true,
+      "implicit_response_observed": true,
+      "one_preconditioner_setup": true,
+      "preconditioner_applied": true,
+      "positive_exclusive_times": true,
+      "df_substages_sum": true,
+      "exclusive_bins_fit": true
+    },
+    "passed": true
+  },
+  "timing_events": [
+    {
+      "kind": "coordinate_df",
+      "seconds": 28.3368660248816,
+      "density_seconds": 18.57492481917143,
+      "native_seconds": 9.706398133188486,
+      "fallback_seconds": 0.0,
+      "native_blocks": 114,
+      "fallback_blocks": 0,
+      "density_reader": false,
+      "phase": "mp2_pullback"
+    },
+    {
+      "kind": "coordinate_df",
+      "seconds": 33.50456369668245,
+      "density_seconds": 21.652800891548395,
+      "native_seconds": 11.766529466956854,
+      "fallback_seconds": 0.0,
+      "native_blocks": 131,
+      "fallback_blocks": 0,
+      "density_reader": true,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "factorized_df",
+      "df_seconds": 44.91503734886646,
+      "factor_response_prefix_seconds": 41.05632796138525,
+      "metric_transform_seconds": 10.667959198355675,
+      "density_setup_seconds": 0.023313667625188828,
+      "coordinate_seconds": 33.50469224527478,
+      "metric_reverse_seconds": 0.719072237610817,
+      "initial_read_seconds": 7.215986352413893,
+      "initial_unpack_seconds": 2.1550420075654984,
+      "initial_dense_seconds": 31.67201865836978,
+      "rank": 80,
+      "factor_response": true,
+      "with_j": true,
+      "with_k": true,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "coordinate_df",
+      "seconds": 31.416730519384146,
+      "density_seconds": 20.162815161049366,
+      "native_seconds": 11.153906267136335,
+      "fallback_seconds": 0.0,
+      "native_blocks": 131,
+      "fallback_blocks": 0,
+      "density_reader": true,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "factorized_df",
+      "df_seconds": 44.84999605640769,
+      "factor_response_prefix_seconds": 13.981079075485468,
+      "metric_transform_seconds": 12.63831602036953,
+      "density_setup_seconds": 0.03429378569126129,
+      "coordinate_seconds": 31.416829902678728,
+      "metric_reverse_seconds": 0.7605563476681709,
+      "initial_read_seconds": 4.128638159483671,
+      "initial_unpack_seconds": 2.467908550053835,
+      "initial_dense_seconds": 7.371550165116787,
+      "rank": 80,
+      "factor_response": false,
+      "with_j": true,
+      "with_k": true,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "preconditioner_setup",
+      "seconds": 9.085375349968672,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "preconditioner_apply",
+      "seconds": 0.12261024862527847,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "preconditioner_apply",
+      "seconds": 0.06735137477517128,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "implicit_matvec",
+      "seconds": 8.084907844662666,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "preconditioner_apply",
+      "seconds": 0.055973734706640244,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "implicit_matvec",
+      "seconds": 8.090177670121193,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "preconditioner_apply",
+      "seconds": 0.06362077593803406,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "implicit_matvec",
+      "seconds": 7.570812173187733,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "preconditioner_apply",
+      "seconds": 0.07693721354007721,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "implicit_matvec",
+      "seconds": 7.742589168250561,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "preconditioner_apply",
+      "seconds": 0.09924549609422684,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "implicit_matvec",
+      "seconds": 8.134267184883356,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "preconditioner_apply",
+      "seconds": 0.04863322526216507,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "implicit_matvec",
+      "seconds": 7.7672914154827595,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "preconditioner_apply",
+      "seconds": 0.04595937952399254,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "implicit_matvec",
+      "seconds": 7.725705422461033,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "preconditioner_apply",
+      "seconds": 0.04717034846544266,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "implicit_matvec",
+      "seconds": 8.502863708883524,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "preconditioner_apply",
+      "seconds": 0.060747597366571426,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "implicit_matvec",
+      "seconds": 8.300440941005945,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "preconditioner_apply",
+      "seconds": 0.05934186652302742,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "implicit_matvec",
+      "seconds": 7.122594710439444,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "preconditioner_apply",
+      "seconds": 0.05099817365407944,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "implicit_matvec",
+      "seconds": 6.5025105476379395,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "coordinate_df",
+      "seconds": 31.276879977434874,
+      "density_seconds": 21.33778204396367,
+      "native_seconds": 9.908939383924007,
+      "fallback_seconds": 0.0,
+      "native_blocks": 131,
+      "fallback_blocks": 0,
+      "density_reader": true,
+      "phase": "scf_pullback"
+    },
+    {
+      "kind": "factorized_df",
+      "df_seconds": 41.943330604583025,
+      "factor_response_prefix_seconds": 22.19624951481819,
+      "metric_transform_seconds": 9.877273183315992,
+      "density_setup_seconds": 0.04091649875044823,
+      "coordinate_seconds": 31.27698550745845,
+      "metric_reverse_seconds": 0.748155415058136,
+      "initial_read_seconds": 5.540663219988346,
+      "initial_unpack_seconds": 3.1294213868677616,
+      "initial_dense_seconds": 13.516277395188808,
+      "rank": 80,
+      "factor_response": false,
+      "with_j": true,
+      "with_k": true,
+      "phase": "scf_pullback"
+    }
+  ],
+  "validation": {
+    "reference_job": "5822463",
+    "energy_absolute_difference_hartree": 2.2737367544323206e-13,
+    "gradient_max_absolute_difference_hartree_per_bohr": 3.921177618715355e-12,
+    "gradient_components_compared": 102,
+    "input_matches": true,
+    "energy_tolerance_hartree": 1e-09,
+    "gradient_tolerance_hartree_per_bohr": 2e-07,
+    "passed": true
+  },
+  "phase_threadpools": {
+    "df_forward": [
+      {
+        "user_api": "openmp",
+        "internal_api": "openmp",
+        "num_threads": 16,
+        "prefix": "libgomp",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libgomp.so.1.0.0",
+        "version": null
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 16,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/scipy.libs/libscipy_openblas-6cdc3b4a.so",
+        "version": "0.3.30",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 1,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/numpy.libs/libscipy_openblas64_-32a4b2a6.so",
+        "version": "0.3.31.188.0",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      }
+    ],
+    "scf_forward": [
+      {
+        "user_api": "openmp",
+        "internal_api": "openmp",
+        "num_threads": 16,
+        "prefix": "libgomp",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libgomp.so.1.0.0",
+        "version": null
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 1,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/scipy.libs/libscipy_openblas-6cdc3b4a.so",
+        "version": "0.3.30",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 1,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/numpy.libs/libscipy_openblas64_-32a4b2a6.so",
+        "version": "0.3.31.188.0",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      }
+    ],
+    "mp2_forward": [
+      {
+        "user_api": "openmp",
+        "internal_api": "openmp",
+        "num_threads": 16,
+        "prefix": "libgomp",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libgomp.so.1.0.0",
+        "version": null
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 1,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/scipy.libs/libscipy_openblas-6cdc3b4a.so",
+        "version": "0.3.30",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 1,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/numpy.libs/libscipy_openblas64_-32a4b2a6.so",
+        "version": "0.3.31.188.0",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      }
+    ],
+    "mp2_pullback": [
+      {
+        "user_api": "openmp",
+        "internal_api": "openmp",
+        "num_threads": 16,
+        "prefix": "libgomp",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libgomp.so.1.0.0",
+        "version": null
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 1,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/scipy.libs/libscipy_openblas-6cdc3b4a.so",
+        "version": "0.3.30",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 1,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/numpy.libs/libscipy_openblas64_-32a4b2a6.so",
+        "version": "0.3.31.188.0",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      }
+    ],
+    "scf_pullback": [
+      {
+        "user_api": "openmp",
+        "internal_api": "openmp",
+        "num_threads": 16,
+        "prefix": "libgomp",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libgomp.so.1.0.0",
+        "version": null
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 1,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/scipy.libs/libscipy_openblas-6cdc3b4a.so",
+        "version": "0.3.30",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 1,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/numpy.libs/libscipy_openblas64_-32a4b2a6.so",
+        "version": "0.3.31.188.0",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      }
+    ],
+    "df_pullback": [
+      {
+        "user_api": "openmp",
+        "internal_api": "openmp",
+        "num_threads": 16,
+        "prefix": "libgomp",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libgomp.so.1.0.0",
+        "version": null
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 16,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/scipy.libs/libscipy_openblas-6cdc3b4a.so",
+        "version": "0.3.30",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 1,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/numpy.libs/libscipy_openblas64_-32a4b2a6.so",
+        "version": "0.3.31.188.0",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      }
+    ],
+    "after_run": [
+      {
+        "user_api": "openmp",
+        "internal_api": "openmp",
+        "num_threads": 16,
+        "prefix": "libgomp",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libgomp.so.1.0.0",
+        "version": null
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 1,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/scipy.libs/libscipy_openblas-6cdc3b4a.so",
+        "version": "0.3.30",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 1,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/numpy.libs/libscipy_openblas64_-32a4b2a6.so",
+        "version": "0.3.31.188.0",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      }
+    ]
+  },
+  "ledger_sha256": "2c6585282e87b47a388bac0e7ebdede65a741aa61199159fed8cf741ff6951b0"
+}

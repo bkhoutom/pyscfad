@@ -1,0 +1,342 @@
+diff --git a/pyscfad/df/_df_jk_opt.py b/pyscfad/df/_df_jk_opt.py
+index 4e17727..ac3bf0e 100644
+--- a/pyscfad/df/_df_jk_opt.py
++++ b/pyscfad/df/_df_jk_opt.py
+@@ -280,6 +280,46 @@ def _implicit_lowrank_df_k_tolerance():
+         return 1e-8
+ 
+ 
++def _density_exchange_factors(dm, vk_bar, hermi=1):
++    """Recover signed low-rank exchange seeds outside the implicit solve.
++
++    Adapted from upstream PySCFAD's range-recovery exchange transpose. Every
++    reconstructed seed is checked in full; high-rank, asymmetric, complex,
++    non-finite or unsupported densities retain the dense native transpose.
++    The return factors satisfy Kbar = X Y.T + Y X.T and may be indefinite.
++    """
++    from scipy.linalg import eigh, qr
++
++    seeds = numpy.asarray(vk_bar)
++    if (seeds.dtype != numpy.dtype(numpy.float64) or not numpy.isfinite(seeds).all()
++            or seeds.ndim != 3 or seeds.shape[1] != seeds.shape[2]):
++        return None
++    xs = _density_factors(dm, hermi)
++    if xs is None or len(xs) != len(seeds):
++        return None
++    nao = seeds.shape[-1]
++    tol = nao * numpy.finfo(seeds.dtype).eps
++    rng = numpy.random.default_rng(1)
++    parts = []
++    for seed, density_factor in zip(seeds, xs):
++        nvec = 2 * density_factor.shape[1] + 10
++        if nvec > nao // 2:
++            return None
++        scale = numpy.max(numpy.abs(seed))
++        if numpy.max(numpy.abs(seed - seed.T)) > 10 * tol * scale:
++            return None
++        q = qr(lib.dot(seed, rng.standard_normal((nao, nvec))), mode='economic')[0]
++        w, v = eigh(lib.dot(q.T, lib.dot(seed, q)))
++        selected = numpy.abs(w) > tol * numpy.max(numpy.abs(w))
++        z, w = lib.dot(q, v[:, selected]), w[selected]
++        if numpy.max(numpy.abs(seed - lib.dot(z * w, z.T))) > 10 * tol * scale:
++            return None
++        x = numpy.asarray(z * numpy.sqrt(numpy.abs(w)), order='F')
++        y = numpy.asarray(x * (.5 * numpy.sign(w)), order='F')
++        parts.append((x, y))
++    return tuple(parts)
++
++
+ def _implicit_lowrank_exchange_factors(dfobj, vj_bar, vk_bar, hermi,
+                                        with_j, with_k):
+     """Recover ``vk_bar = R Co.T + Co R.T`` for an RHF response matvec.
+@@ -649,8 +689,13 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
+                 numpy.asarray(vk_bar).reshape(-1, nao, nao))
+     response_factors = None
+     if solution_only and dm_active and vj_bar is not None and vk_array is not None:
+-        response_factors = _implicit_lowrank_exchange_factors(
++        implicit_factors = _implicit_lowrank_exchange_factors(
+             dfobj, vj_bar, vk_array, hermi, with_j, with_k)
++        if implicit_factors is not None:
++            response_factors = (implicit_factors,)
++    elif not solution_only and dm_active and vk_array is not None:
++        response_factors = _density_exchange_factors(
++            _tag_dm_for_fast_exchange(dfobj, dm), vk_array, hermi)
+     xs = (_density_factors(_tag_dm_for_fast_exchange(dfobj, dm), hermi)
+           if need_eri and vk_array is not None and _DF_VK_VJP_LOWRANK is not None
+           else None)
+@@ -670,8 +715,8 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
+                if dm_active or dense_k else None)
+     buf = numpy.empty((blksize, nao, nao)) if dense_k else None
+     if response_factors is not None:
+-        occ_coeff, response_coeff = response_factors
+-        buf_occ = numpy.empty((blksize * occ_coeff.shape[1], nao))
++        rank = max(pair[0].shape[1] for pair in response_factors)
++        buf_occ = numpy.empty((blksize * rank, nao))
+         buf_response = numpy.empty_like(buf_occ)
+     stream_eri_bar = geometry_active
+     eri_bar = numpy.zeros(eri_bar_shape) if return_cderi_bar else None
+@@ -702,8 +747,8 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
+                     for k in range(nset):
+                         dms_bar[k] += dense_dm_bar[k]
+                 if need_eri:
+-                    eri_blk += (dmtril @ eri1.T).T @ vj_bar_tril
+-                    eri_blk += rho_bar.T @ dmtril
++                    lib.dot((dmtril @ eri1.T).T, vj_bar_tril, c=eri_blk, beta=1)
++                    lib.dot(rho_bar.T, dmtril, c=eri_blk, beta=1)
+             if vk_array is not None:
+                 for k in range(nset):
+                     if dense_k:
+@@ -734,8 +779,10 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
+                                 ctypes.c_int(xs[k].shape[1]))
+                         if dm_active:
+                             if response_factors is not None:
+-                                _df_vk_dm_vjp_lowrank(dms_bar[k], eri1, occ_coeff,
+-                                                     response_coeff, buf_occ, buf_response)
++                                occ_coeff, response_coeff = response_factors[k]
++                                if occ_coeff.shape[1]:
++                                    _df_vk_dm_vjp_lowrank(dms_bar[k], eri1, occ_coeff,
++                                                         response_coeff, buf_occ, buf_response)
+                             else:
+                                 _DF_VK_DM_VJP(
+                                     dms_bar[k].ctypes.data_as(ctypes.c_void_p),
+diff --git a/pyscfad/mp/dfmp2.py b/pyscfad/mp/dfmp2.py
+index 7a23902..2d2870d 100644
+--- a/pyscfad/mp/dfmp2.py
++++ b/pyscfad/mp/dfmp2.py
+@@ -15,10 +15,12 @@
+ from contextlib import contextmanager
+ from contextvars import ContextVar
+ from functools import partial
++import ctypes
+ import numpy
+ import jax
+-from jax import custom_vjp
++from jax import custom_jvp, custom_vjp
+ from pyscf import __config__
++from pyscf import lib as pyscf_lib
+ from pyscf.lib import direct_sum, current_memory
+ #from pyscf.mp.mp2 import _ChemistsERIs
+ from pyscfad import config
+@@ -32,6 +34,17 @@ from pyscfad.df import _cderi_vjp
+ from pyscfad.mp import mp2
+ from pyscfad.tools import resource_profile
+ 
++try:
++    from pyscfadlib import libmp_vjp
++except (ImportError, OSError):
++    # Older native installations retain the differentiable scan fallback.
++    libmp_vjp = None
++try:
++    libmp = pyscf_lib.load_library('libmp')
++    libmp.MP2_contract_d
++except (OSError, AttributeError):
++    libmp = None
++
+ WITH_T2 = getattr(__config__, 'mp_dfmp2_with_t2', True)
+ 
+ def _contract(Lov, mo_energy, nocc, nvir, with_t2=True):
+@@ -247,6 +260,94 @@ def _contract_scan_impl(Lov, mo_energy, nocc, nvir, with_t2=True):
+     return emp2, t2
+ 
+ 
++def _native_energy_inputs(Lov, mo_energy, nocc, nvir):
++    # PySCF's pair kernel uses contiguous (occupied, virtual, auxiliary) rows.
++    iaL = pyscf_lib.transpose(numpy.asarray(Lov)).reshape(nocc, nvir, -1)
++    mo_energy = numpy.asarray(mo_energy, order='C')
++    e_occ, e_vir = mo_energy[:nocc], mo_energy[nocc:]
++    moeoo = numpy.asarray(e_occ[:, None] + e_occ, order='C')
++    moevv = numpy.asarray(e_vir[:, None] + e_vir, order='C')
++    ed, ex = numpy.zeros(1), numpy.zeros(1)
++    libmp.MP2_contract_d(
++        ed.ctypes.data_as(ctypes.c_void_p),
++        ex.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(1),
++        iaL.ctypes.data_as(ctypes.c_void_p),
++        iaL.ctypes.data_as(ctypes.c_void_p),
++        ctypes.c_int(0), ctypes.c_int(0),
++        ctypes.c_int(nocc), ctypes.c_int(nocc),
++        ctypes.c_int(nocc), ctypes.c_int(nvir), ctypes.c_int(iaL.shape[-1]),
++        moeoo.ctypes.data_as(ctypes.c_void_p),
++        moevv.ctypes.data_as(ctypes.c_void_p),
++        pyscf_lib.c_null_ptr(), ctypes.c_int(0),
++    )
++    return ed[0]*2 + ex[0], iaL, mo_energy
++
++
++def _native_input_gradients(iaL, mo_energy, nocc, nvir):
++    iaL_bar = numpy.zeros_like(iaL)
++    energy_bar = numpy.zeros_like(mo_energy)
++    libmp_vjp.MP2_contract_d_vjp(
++        iaL_bar.ctypes.data_as(ctypes.c_void_p),
++        energy_bar.ctypes.data_as(ctypes.c_void_p),
++        energy_bar[nocc:].ctypes.data_as(ctypes.c_void_p),
++        ctypes.c_double(2.), ctypes.c_double(1.),
++        iaL.ctypes.data_as(ctypes.c_void_p),
++        mo_energy.ctypes.data_as(ctypes.c_void_p),
++        mo_energy[nocc:].ctypes.data_as(ctypes.c_void_p),
++        ctypes.c_int(nocc), ctypes.c_int(nvir), ctypes.c_int(iaL.shape[-1]),
++    )
++    return (pyscf_lib.transpose(iaL_bar.reshape(nocc*nvir, -1)),
++            energy_bar)
++
++
++@partial(custom_jvp, nondiff_argnums=(2, 3))
++def _contract_native(Lov, mo_energy, nocc, nvir):
++    # Native host calls cannot consume staged arrays.  Keep the original JAX
++    # contraction under JIT/vmap and whenever another AD level is active.
++    if any(isinstance(x, jax.core.Tracer) for x in (Lov, mo_energy)):
++        return _contract_scan_impl(Lov, mo_energy, nocc, nvir, False)[0]
++    return _profile_call('dfmp2.energy_forward', _native_energy_inputs,
++                         Lov, mo_energy, nocc, nvir)[0]
++
++
++@_contract_native.defjvp
++def _contract_native_jvp(nocc, nvir, primals, tangents):
++    if any(isinstance(x, jax.core.Tracer) for x in primals):
++        fn = lambda x, e: _contract_scan_impl(x, e, nocc, nvir, False)[0]
++        return jax.jvp(fn, primals, tangents)
++    energy, iaL, mo_energy = _profile_call(
++        'dfmp2.energy_forward', _native_energy_inputs,
++        *primals, nocc, nvir,
++    )
++    # For this scalar energy, a JVP is a dot product with its two input
++    # gradients.  Reverse AD transposes these dots, preserving arbitrary
++    # cotangents while avoiding a custom-VJP boundary that rejects forward AD.
++    # The native gradients are evaluated during linearization, and traced
++    # higher derivatives use the scan above instead of treating them constant.
++    lov_bar, energy_bar = _profile_call(
++        'dfmp2.energy_cotangents', _native_input_gradients,
++        iaL, mo_energy, nocc, nvir,
++    )
++    tangent = np.sum(np.asarray(lov_bar)*tangents[0])
++    tangent += np.sum(np.asarray(energy_bar)*tangents[1])
++    return energy, tangent
++
++
++def _contract_energy(Lov, mo_energy, nocc, nvir, with_t2=True):
++    if not config.moleintor_opt:
++        return _contract(Lov, mo_energy, nocc, nvir, with_t2)
++    # The native energy/gradient kernels are real-double and energy-only.
++    # Frozen orbital selection is already applied to both inputs by ao2mo.
++    if (not with_t2 and libmp is not None and libmp_vjp is not None
++            and nocc > 0 and nvir > 0 and Lov.shape[0] > 0
++            and Lov.shape == (Lov.shape[0], nocc*nvir)
++            and mo_energy.shape == (nocc+nvir,)
++            and numpy.dtype(Lov.dtype) == numpy.dtype(numpy.float64)
++            and numpy.dtype(mo_energy.dtype) == numpy.dtype(numpy.float64)):
++        return _contract_native(Lov, mo_energy, nocc, nvir), None
++    return _contract_scan(Lov, mo_energy, nocc, nvir, with_t2)
++
++
+ @partial(custom_vjp, nondiff_argnums=(3, 4, 5, 6))
+ def _outcore_nr_e2(mol, auxmol, mo_coeff, cderi_source, max_memory,
+                    ijslice, aosym):
+@@ -403,12 +504,7 @@ def kernel(mp, mo_energy=None, mo_coeff=None, eris=None, with_t2=WITH_T2,
+         'dfmp2.ao2mo', mp.loop_ao2mo, mo_coeff, nocc, with_t2,
+     )
+ 
+-    if config.moleintor_opt:
+-        #emp2, t2 = _contract_opt(Lov, mo_energy, nocc, nvir, with_t2)
+-        emp2, t2 = _contract_scan(Lov, mo_energy, nocc, nvir, with_t2)
+-    else:
+-        emp2, t2 = _contract(Lov, mo_energy, nocc, nvir, with_t2)
+-    return emp2, t2
++    return _contract_energy(Lov, mo_energy, nocc, nvir, with_t2)
+ 
+ class MP2(mp2.MP2):
+     _dynamic_attr = _keys = {'with_df'}
+diff --git a/pyscfadlib/pyscfadlib/__init__.py b/pyscfadlib/pyscfadlib/__init__.py
+index 5c1d18c..3ceb3c0 100644
+--- a/pyscfadlib/pyscfadlib/__init__.py
++++ b/pyscfadlib/pyscfadlib/__init__.py
+@@ -6,5 +6,6 @@ from pyscfadlib.lib import (
+     libcc_vjp as libcc_vjp,
+     libcgto_vjp as libcgto_vjp,
+     libcvhf_vjp as libcvhf_vjp,
++    libmp_vjp as libmp_vjp,
+     libnp_helper_vjp as libnp_helper_vjp,
+ )
+diff --git a/pyscfadlib/pyscfadlib/lib.py b/pyscfadlib/pyscfadlib/lib.py
+index a09c8c0..2b97452 100644
+--- a/pyscfadlib/pyscfadlib/lib.py
++++ b/pyscfadlib/pyscfadlib/lib.py
+@@ -28,3 +28,8 @@ libcgto_ad = load_library('libcgto_ad')
+ libcgto_vjp = _FallbackCDLL(load_library('libcgto_vjp'), libcgto_ad)
+ libcvhf_vjp = load_library('libcvhf_vjp')
+ libnp_helper_vjp = load_library('libnp_helper_vjp')
++try:
++    libmp_vjp = load_library('libmp_vjp')
++except OSError:
++    # Optional for compatibility with native builds predating this kernel.
++    libmp_vjp = None
+diff --git a/pyscfadlib/pyscfadlib/vjp/CMakeLists.txt b/pyscfadlib/pyscfadlib/vjp/CMakeLists.txt
+index cdaee53..2637986 100644
+--- a/pyscfadlib/pyscfadlib/vjp/CMakeLists.txt
++++ b/pyscfadlib/pyscfadlib/vjp/CMakeLists.txt
+@@ -67,6 +67,12 @@ set_target_properties(cc_vjp PROPERTIES
+ )
+ target_link_libraries(cc_vjp PRIVATE vjp_util ${BLAS_LIBRARIES} ${OPENMP_C_PROPERTIES})
+ 
++# Canonical density-fitted MP2 energy derivatives.
++add_library(mp_vjp SHARED mp/mp2_vjp.c)
++set_target_properties(mp_vjp PROPERTIES
++  LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}
++)
++target_link_libraries(mp_vjp PRIVATE ${BLAS_LIBRARIES} ${OPENMP_C_PROPERTIES})
+ 
+ # Do not allow a wheel to be produced with unresolved helper symbols.  This
+ # would have caught a cgto_vjp build that called omp_dsum_reduce_inplace but
+@@ -78,6 +84,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+       np_helper_vjp
+       ao2mo_vjp
+       cvhf_vjp
++      mp_vjp
+       cc_vjp)
+     target_link_options(${_vjp_target} PRIVATE "LINKER:-z,defs")
+   endforeach()
+diff --git a/pyscfadlib/pyscfadlib/vjp/gto/fill_nr_3c_vjp.c b/pyscfadlib/pyscfadlib/vjp/gto/fill_nr_3c_vjp.c
+index 999cb73..7203c40 100644
+--- a/pyscfadlib/pyscfadlib/vjp/gto/fill_nr_3c_vjp.c
++++ b/pyscfadlib/pyscfadlib/vjp/gto/fill_nr_3c_vjp.c
+@@ -13,6 +13,7 @@
+    limitations under the License.
+ */
+ #include <stdlib.h>
++#include <string.h>
+ #include "config.h"
+ #include "cint.h"
+ #include "gto/gto.h"
+@@ -188,6 +189,11 @@ void GTOnr3c_ij_r0_vjp(int (*intor)(), void (*fill)(), double *vjp, double *ybar
+         const int cache_size = GTOmax_cache_size(intor, shls_slice, 3,
+                                                  atm, natm, bas, nbas, env);
+         const int njobs = (MAX(nish,njsh) / BLKSIZE + 1) * nksh;
++        // Retain reproducible static scheduling by default.  The opt-in
++        // dynamic schedule balances unequal shell costs without changing
++        // private buffers, worksharing barriers, or the ordered reduction.
++        const char *schedule = getenv("PYSCFAD_INTEGRAL_VJP_SCHEDULE");
++        const int dynamic_schedule = schedule != NULL && strcmp(schedule, "dynamic") == 0;
+ 
+         double **vjp_loc_bufs = calloc(omp_get_max_threads_safe(), sizeof(double *));
+ #pragma omp parallel
+@@ -203,10 +209,18 @@ void GTOnr3c_ij_r0_vjp(int (*intor)(), void (*fill)(), double *vjp, double *ybar
+         }
+         vjp_loc_bufs[thread_id] = vjp_loc;
+ 
+-        #pragma omp for schedule(static)
+-        for (jobid = 0; jobid < njobs; jobid++) {
+-                (*fill)(intor, vjp_loc, ybar, buf, comp, jobid, shls_slice, ao_loc,
+-                        cintopt, atm, natm, bas, nbas, env);
++        if (dynamic_schedule) {
++                #pragma omp for schedule(dynamic)
++                for (jobid = 0; jobid < njobs; jobid++) {
++                        (*fill)(intor, vjp_loc, ybar, buf, comp, jobid, shls_slice, ao_loc,
++                                cintopt, atm, natm, bas, nbas, env);
++                }
++        } else {
++                #pragma omp for schedule(static)
++                for (jobid = 0; jobid < njobs; jobid++) {
++                        (*fill)(intor, vjp_loc, ybar, buf, comp, jobid, shls_slice, ao_loc,
++                                cintopt, atm, natm, bas, nbas, env);
++                }
+         }
+         free(buf);
+ 

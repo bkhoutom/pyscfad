@@ -1,0 +1,17 @@
+FF
+=================================== FAILURES ===================================
+_____ test_pack_symmetric_keeps_diagonal_once_and_sums_off_diagonal[False] _____
+test_reverse_packed_density.py:45: in test_pack_symmetric_keeps_diagonal_once_and_sums_off_diagonal
+    result = _cderi_vjp._pack_tril_symmetric_sum(matrices, out=out)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: module 'pyscfad.df._cderi_vjp' has no attribute '_pack_tril_symmetric_sum'
+_____ test_pack_symmetric_keeps_diagonal_once_and_sums_off_diagonal[True] ______
+test_reverse_packed_density.py:45: in test_pack_symmetric_keeps_diagonal_once_and_sums_off_diagonal
+    result = _cderi_vjp._pack_tril_symmetric_sum(matrices, out=out)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: module 'pyscfad.df._cderi_vjp' has no attribute '_pack_tril_symmetric_sum'
+=========================== short test summary info ============================
+FAILED test_reverse_packed_density.py::test_pack_symmetric_keeps_diagonal_once_and_sums_off_diagonal[False]
+FAILED test_reverse_packed_density.py::test_pack_symmetric_keeps_diagonal_once_and_sums_off_diagonal[True]
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 2 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+2 failed, 16 deselected in 4.18s

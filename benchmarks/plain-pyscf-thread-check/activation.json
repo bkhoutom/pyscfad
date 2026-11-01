@@ -1,0 +1,10 @@
+{
+  "target_directory": "/home/bkhou/DLNO_CCSDT/test_pyscfad_stc_mp2/runtime_test/dCMP",
+  "files": {
+    "pyscf_scf.py": "b3914c1f99604d8bf73babebabbb21e4f0a4610dcc64ce6dfec96350f4e7cbf5",
+    "submit_pyscf.sh": "fb06fcdac467adfb755f9a0cae35779990e6f3dfb210e96f297de48929239dfb",
+    "README.md": "a42f3355dd2031accb4c25dcd7932e24b23fde6e56b77873f0a9cd784c039f63"
+  },
+  "backups": "/resnick/groups/sharmagroup/bkhou/src/pyscfad/benchmarks/plain-pyscf-thread-check/original",
+  "validated_job": "5786642"
+}

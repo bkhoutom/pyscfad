@@ -1,0 +1,39 @@
+{
+  "scope": "Throwaway schedule-only native int3c coordinate-transpose diagnostic; no public API or live installation changes",
+  "atom": "\nP   -0.7861   -2.9882   -3.3568\nO    0.3621   -0.4750   -0.0755\nO   -0.6006   -2.9501    2.3130\nO   -0.2284   -2.5042   -2.0976\nO   -1.4907    1.6935    0.6571\nO    0.1337   -2.7862   -4.4471\nO   -2.0169   -2.2960   -3.6547\nO   -1.0677   -4.4001   -3.2784\nN    0.7577    1.5581    1.0208\nN   -0.3824    3.5106    0.5641\nN    0.6130    5.4794    0.3914\nC   -0.6870   -1.7330    1.5756\nC    0.0339   -1.8383    0.2125\nC   -0.0291   -0.5231    2.2697\nC    0.8080    0.1401    1.1447\nC   -0.8302   -2.4810   -0.8985\nC    1.8821    2.2875    1.1077\nC   -0.3874    2.2126    0.7600\nC    1.8936    3.6200    0.8982\nC    0.6979    4.2198    0.6148\nH   -1.7498   -1.5163    1.4273\nH    0.9614   -2.4165    0.3100\nH    0.6059   -0.8358    3.1032\nH   -0.7921    0.1400    2.6852\nH    1.8361   -0.2234    1.2890\nH   -1.0695   -3.5012   -0.5805\nH   -1.7655   -1.9154   -0.9635\nH   -1.1504   -2.8067    3.1115\nH    2.7592    1.8678    1.3230\nH    2.7406    4.1403    0.9520\nH   -0.2224    5.8834    0.2712\nH    1.3879    6.0016    0.3430\nH    0.3417   -1.9730   -4.7110\nH   -2.5588   -2.5912   -4.2812\n",
+  "basis": "cc-pvtz",
+  "auxbasis": "cc-pvtz-jkfit",
+  "threads": 16,
+  "order": [
+    "static",
+    "dynamic",
+    "dynamic",
+    "static"
+  ],
+  "seed": 4133,
+  "synthetic_cotangent_scale": 0.001,
+  "native": "/resnick/groups/sharmagroup/bkhou/src/pyscfad-perf-mp2/benchmarks/native-mp2/candidate/pyscfadlib",
+  "pyscf_parent": "/resnick/groups/sharmagroup/bkhou/src/pyscfad/benchmarks/pyscfad_mkl/candidate",
+  "source_original": "/resnick/groups/sharmagroup/bkhou/src/pyscfad-perf-mp2/benchmarks/native-mp2/candidate/pyscfadlib/vjp/gto/fill_nr_3c_vjp.c",
+  "source_sha256": "a1b40fe402a440f70a77ee76b3ac655f27433efffa2fe1c97e7c7ff440a8d700",
+  "local_sources": {
+    "static.c": "a1b40fe402a440f70a77ee76b3ac655f27433efffa2fe1c97e7c7ff440a8d700",
+    "dynamic.c": "a081063a25a14fef70387592537ff95f26359f9dee3f86b5760d738c715f9db1"
+  },
+  "native_sha256": {
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-perf-mp2/benchmarks/native-mp2/candidate/pyscfadlib/libcgto_vjp.so": "b8553e0a0534becf649ef0dde7d533e7ac4ba840ee4449f26165768705273916",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-perf-mp2/benchmarks/native-mp2/candidate/pyscfadlib/libcgto_ad.so": "c007dbeb1e3c1231db98bdda710ab89800c80ccfe7109b1506d81b1bbd83c2ce",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-perf-mp2/benchmarks/native-mp2/candidate/pyscfadlib/libvjp_util.so": "0b5d41f552b7d6c5af3dd6ddb88f79df4ec3e6934193ca17382719f5f784dd16",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-perf-mp2/benchmarks/native-mp2/candidate/pyscfadlib/thirdparty/lib/libcintad.so": "282c2d83c13ef1117be972872670e2c08a70adc51892f876f1ce0b542c463d0c"
+  },
+  "flags": "GCC11 -O3 -DNDEBUG -march=x86-64-v3 -mtune=generic -msse3 -std=gnu99 -fPIC -fopenmp",
+  "baseline_int3c_wall_seconds": {
+    "candidate_precond": 22.91,
+    "main": 13.78
+  },
+  "baseline_int3c_cpu_seconds": {
+    "candidate_precond": 194.49,
+    "main": 179.57
+  },
+  "interpretation": "Same fork source, integral function pointers, input tensor and reduction; only static/dynamic work scheduling differs."
+}

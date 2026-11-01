@@ -41,6 +41,7 @@ from pyscfad.df import _int3c_cross_opt
 from pyscfad.df import addons as df_addons
 from pyscfad.tools import resource_profile
 from pyscfad.lib._threading import dense_blas_threads
+from pyscfadlib import libnp_helper_vjp
 try:
     from pyscfadlib import libao2mo_vjp
 except (ImportError, OSError):
@@ -53,6 +54,11 @@ _CDERI_BAR_PAIR_BLOCK_MB = 256.0
 _CDERI_BAR_AUX_BLOCK_MB = 256.0
 _CDERI_BAR_HDF_CHUNK_MB = 8.0
 _INT3C_MO_VJP_BLOCK_MB = 512.0
+_symmetric_pack = getattr(libnp_helper_vjp, 'NPdunpack_tril_2d_vjp', None)
+if _symmetric_pack is not None:
+    _symmetric_pack.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+                               ctypes.c_void_p, ctypes.c_int]
+    _symmetric_pack.restype = None
 _NR_E2_CDERI_BAR_NATIVE = (
     libao2mo_vjp is not None
     and hasattr(libao2mo_vjp, 'AO2MOnr_e2_cderi_bar_project_omp')
@@ -1521,8 +1527,8 @@ def _stream_nr_e2_from_cderi_source(cderi_source, mo_coeff, orbs_slice,
     return out
 
 
-def _int3c_ip1_mo_density_contractions(ints, mo_k, mo_l, z_blk):
-    """Contract one ``int3c_ip1`` block for both coordinate centres.
+def _int3c_mo_physical_density(mo_k, mo_l, z_blk):
+    """Form the density containing both AO derivative legs.
 
     For each auxiliary function, form
 
@@ -1546,18 +1552,29 @@ def _int3c_ip1_mo_density_contractions(ints, mo_k, mo_l, z_blk):
     """
     kc = int(mo_k.shape[1])
     lc = int(mo_l.shape[1])
-    if kc <= lc:
-        # Contract the large l space before forming the AO-square object, so
-        # the latter contraction is over k.
-        tmp = pyscf_lib.einsum('pkl,vl->pkv', z_blk, mo_l)
-        density = pyscf_lib.einsum('uk,pkv->puv', mo_k, tmp)
-    else:
-        # The transposed order makes the AO-square contraction run over l.
-        tmp = pyscf_lib.einsum('uk,pkl->pul', mo_k, z_blk)
-        density = pyscf_lib.einsum('pul,vl->puv', tmp, mo_l)
+    naux = int(z_blk.shape[0])
+    nao = int(mo_k.shape[0])
+    with dense_blas_threads():
+        if kc <= lc:
+            # Contract the large l space before forming the AO-square object.
+            # Flatten auxiliary panels so each contraction is one NumPy GEMM.
+            tmp = (z_blk.reshape(-1, lc) @ mo_l.T).reshape(naux, kc, nao)
+            density = (
+                tmp.transpose(0, 2, 1).reshape(-1, kc) @ mo_k.T
+            ).reshape(naux, nao, nao).swapaxes(1, 2)
+        else:
+            # Make the AO-square contraction run over the smaller l space.
+            tmp = (
+                z_blk.transpose(0, 2, 1).reshape(-1, kc) @ mo_k.T
+            ).reshape(naux, lc, nao).transpose(0, 2, 1)
+            density = (tmp.reshape(-1, lc) @ mo_l.T).reshape(naux, nao, nao)
     tmp = None
+    return density + density.swapaxes(1, 2)
 
-    density = density + density.swapaxes(1, 2)
+
+def _int3c_ip1_mo_density_contractions(ints, mo_k, mo_l, z_blk):
+    """Contract one explicit ``int3c_ip1`` block for both coordinate centres."""
+    density = _int3c_mo_physical_density(mo_k, mo_l, z_blk)
     per_aux_ao = numpy.einsum('puv,xuvp->pux', density, ints)
     return per_aux_ao.sum(axis=0), per_aux_ao.sum(axis=1)
 
@@ -1578,11 +1595,53 @@ def _iter_auxiliary_subranges(p0, p1, max_rows):
         yield read0, min(read0 + max_rows, int(p1))
 
 
+def _pack_tril_symmetric_sum(density, out=None):
+    """Pack A+A.T off diagonal and A on diagonal for native int3c bars.
+
+    Unlike a physical density containing both AO legs, native packed
+    diagonal pairs already count both legs. The unpack-triangle VJP has
+    exactly this normalization and writes directly into the final buffer.
+    Its OpenMP loop must run outside a dense BLAS thread scope.
+    """
+    density = numpy.asarray(density)
+    if density.dtype != numpy.float64:
+        raise TypeError('Symmetric packed density requires float64 input')
+    if density.ndim != 3 or density.shape[1] != density.shape[2]:
+        raise ValueError('Symmetric packed density requires square matrix batches')
+    count, nao = density.shape[:2]
+    shape = (count, nao * (nao + 1) // 2)
+    if out is None:
+        out = numpy.empty(shape)
+    elif not isinstance(out, numpy.ndarray) or out.dtype != numpy.float64:
+        raise TypeError('Symmetric packed output requires a float64 array')
+    if out.shape != shape or not out.flags.c_contiguous or not out.flags.writeable:
+        raise ValueError('Symmetric packed output must have the expected shape '
+                         'and be writable and C contiguous')
+    if _symmetric_pack is None:
+        raise NotImplementedError('Native symmetric packing is unavailable')
+    density = numpy.ascontiguousarray(density)
+    if numpy.shares_memory(density, out):
+        raise ValueError('Symmetric packed output must not overlap its input')
+    if density.size:
+        _symmetric_pack(count, nao, out.ctypes.data, density.ctypes.data, 3)
+    return out
+
+
 def _int3c_mo_deriv_coords_vjp_from_z_reader(
         mol, auxmol, mo_coeff, read_z_aux_block, orbs_slice,
         int3c='int3c2e', aosym='s2ij', block_memory_mb=None,
-        z_dtype=None, z_aux_block_max_rows=None, read_density_aux_block=None):
-    """Coordinate pullback with bounded z reads per auxiliary-shell block."""
+        z_dtype=None, z_aux_block_max_rows=None, read_density_aux_block=None,
+        fill_packed_density_aux_block=None):
+    """Coordinate pullback with bounded reads per auxiliary-shell block.
+
+    An optional ``fill_packed_density_aux_block(begin, end, out)`` writes
+    normalized real symmetric native bars into ``out``: the lower physical
+    density triangle with its diagonal halved. The producer guarantees this
+    representation; the companion dense reader remains the fallback for
+    coordinate inputs unsupported by the native driver.
+    """
+    if fill_packed_density_aux_block is not None and read_density_aux_block is None:
+        raise ValueError('Packed density filler requires a dense fallback reader')
     if aosym not in ('s2', 's2ij'):
         raise NotImplementedError(f'Only packed s2 CDERI is supported, got {aosym}.')
     if read_density_aux_block is None and mo_coeff.shape[0] != mol.nao:
@@ -1637,76 +1696,139 @@ def _int3c_mo_deriv_coords_vjp_from_z_reader(
     aux_loc = auxmol.ao_loc
     aux_ranges = balance_partition(aux_loc, blksize)
 
+    # The native packed driver differentiates both AO legs and contracts
+    # directly into atomic coordinates. Keep the explicit derivative route
+    # for inputs that cannot be represented by its real symmetric bars.
+    native_supported = (
+        int3c in ('int3c2e', mol._add_suffix('int3c2e'))
+        and all(obj.coords is not None
+                and obj.exp is None and obj.ctr_coeff is None and obj.r0 is None
+                for obj in (mol, auxmol))
+        and not any(isinstance(leaf, jax.core.Tracer)
+                    for leaf in tree_flatten((mol, auxmol))[0])
+        and (read_density_aux_block is not None
+             or (mo_k.dtype == numpy.float64 and mo_l.dtype == numpy.float64))
+        and (z_dtype is None or numpy.dtype(z_dtype) == numpy.float64)
+    )
     int3c_ip1 = int3c.replace('int3c2e', 'int3c2e_ip1')
     mol_ao_bar = None
     aux_ao_bar = None
-
-    def contract_aux_range(read0, read1, ints):
-        nonlocal mol_ao_bar, aux_ao_bar
-        if read_density_aux_block is None:
-            z_blk = numpy.asarray(read_z_aux_block(read0, read1))
-            expected_shape = (read1 - read0, kc * lc)
-            if z_blk.shape != expected_shape:
-                raise ValueError(
-                    'z auxiliary block has incompatible shape: '
-                    f'got {z_blk.shape}, expected {expected_shape}'
-                )
-            z_blk = z_blk.reshape(read1 - read0, kc, lc)
-            mol_contraction, aux_contraction = \
-                _int3c_ip1_mo_density_contractions(ints, mo_k, mo_l, z_blk)
-            dtype = z_blk.dtype
-        else:
-            density = numpy.asarray(read_density_aux_block(read0, read1))
-            expected_shape = (read1 - read0, nao, nao)
-            if density.shape != expected_shape:
-                raise ValueError(f'density block {density.shape}, expected {expected_shape}')
-            per_aux_ao = numpy.einsum('puv,xuvp->pux', density, ints)
-            mol_contraction = per_aux_ao.sum(axis=0)
-            aux_contraction = per_aux_ao.sum(axis=1)
-            dtype = density.dtype
-        if mol_ao_bar is None:
-            mol_ao_bar = numpy.zeros((nao, 3), dtype=dtype)
-            aux_ao_bar = numpy.zeros((naux, 3), dtype=dtype)
-        mol_ao_bar -= mol_contraction
-        # The libcint ``ip1`` convention carries the same leading minus sign
-        # as the former explicit ``ip2`` path.  Translational invariance
-        # reverses the auxiliary-centre contribution.
-        aux_ao_bar[read0:read1] += aux_contraction
+    mol_native_bar = numpy.zeros((mol.natm, 3))
+    aux_native_bar = numpy.zeros((auxmol.natm, 3))
+    npair = nao * (nao + 1) // 2
+    diagonal = numpy.arange(nao)
+    diagonal = diagonal * (diagonal + 3) // 2
+    profile = _profile_enabled()
+    density_seconds = native_seconds = fallback_seconds = 0.0
+    native_blocks = fallback_blocks = 0
 
     for shl0, shl1, _ in aux_ranges:
         p0, p1 = int(aux_loc[shl0]), int(aux_loc[shl1])
         shls_slice = (0, nbas, 0, nbas, nbas + shl0, nbas + shl1)
-        ints = _int3c_cross_opt.int3c_cross(
-            mol, auxmol, intor=int3c_ip1, comp=3, aosym='s1',
-            shls_slice=shls_slice,
-        )
-        ints = numpy.asarray(ints)
-        if z_aux_block_max_rows is None or p1 - p0 <= z_aux_block_max_rows:
-            contract_aux_range(p0, p1, ints)
-        else:
-            # Shell granularity can exceed the requested row cap.  The shell
-            # integral is still generated once, then sliced into disjoint
-            # logical blocks paired one-for-one with bounded z reads.
-            for read0, read1 in _iter_auxiliary_subranges(
-                    p0, p1, z_aux_block_max_rows):
-                int0 = read0 - p0
-                int1 = read1 - p0
-                contract_aux_range(
-                    read0, read1, ints[..., int0:int1]
-                )
+        packed = ints = None
+        max_rows = p1 - p0 if z_aux_block_max_rows is None else z_aux_block_max_rows
+        for read0, read1 in _iter_auxiliary_subranges(p0, p1, max_rows):
+            started = time.perf_counter() if profile else 0.0
+            if fill_packed_density_aux_block is not None and native_supported:
+                if packed is None:
+                    packed = numpy.empty((p1 - p0, npair))
+                fill_packed_density_aux_block(
+                    read0, read1, packed[read0 - p0:read1 - p0])
+                if profile:
+                    density_seconds += time.perf_counter() - started
+                continue
+            if read_density_aux_block is None:
+                z_blk = numpy.asarray(read_z_aux_block(read0, read1))
+                expected_shape = (read1 - read0, kc * lc)
+                if z_blk.shape != expected_shape:
+                    raise ValueError(
+                        'z auxiliary block has incompatible shape: '
+                        f'got {z_blk.shape}, expected {expected_shape}'
+                    )
+                dtype = z_blk.dtype
+                density = _int3c_mo_physical_density(
+                    mo_k, mo_l, z_blk.reshape(read1 - read0, kc, lc))
+                z_blk = None
+            else:
+                density = numpy.asarray(read_density_aux_block(read0, read1))
+                expected_shape = (read1 - read0, nao, nao)
+                if density.shape != expected_shape:
+                    raise ValueError(
+                        f'density block {density.shape}, expected {expected_shape}')
+                dtype = density.dtype
+            use_native = (
+                native_supported and dtype == numpy.float64
+                and density.dtype == numpy.float64
+                and (read_density_aux_block is None
+                     or numpy.array_equal(density, density.swapaxes(1, 2)))
+            )
+            int0, int1 = read0 - p0, read1 - p0
+            if use_native:
+                if packed is None:
+                    # The driver requires whole shells. Even when one shell
+                    # exceeds the reader cap, only its packed rows persist;
+                    # physical AO-square densities obey the reader row cap.
+                    packed = numpy.zeros((p1 - p0, npair))
+                packed[int0:int1] = pyscf_lib.pack_tril(density)
+                # Density already contains both legs; native diagonal pairs
+                # also count both legs, so their cotangent needs half weight.
+                packed[int0:int1, diagonal] *= 0.5
+                if profile:
+                    density_seconds += time.perf_counter() - started
+            else:
+                if profile:
+                    density_seconds += time.perf_counter() - started
+                    started = time.perf_counter()
+                if ints is None:
+                    ints = numpy.asarray(_int3c_cross_opt.int3c_cross(
+                        mol, auxmol, intor=int3c_ip1, comp=3, aosym='s1',
+                        shls_slice=shls_slice))
+                    fallback_blocks += 1
+                per_aux_ao = numpy.einsum(
+                    'puv,xuvp->pux', density, ints[..., int0:int1])
+                if mol_ao_bar is None:
+                    mol_ao_bar = numpy.zeros((nao, 3), dtype=dtype)
+                    aux_ao_bar = numpy.zeros((naux, 3), dtype=dtype)
+                mol_ao_bar -= per_aux_ao.sum(axis=0)
+                aux_ao_bar[read0:read1] += per_aux_ao.sum(axis=1)
+                per_aux_ao = None
+                if profile:
+                    fallback_seconds += time.perf_counter() - started
+            density = None
         ints = None
+        if packed is not None:
+            started = time.perf_counter() if profile else 0.0
+            mol_block, aux_block = _int3c_cross_opt.int3c_cross_bwd(
+                int3c, 1, 's2ij', shls_slice, None,
+                (mol, auxmol), packed.T)
+            mol_native_bar += numpy.asarray(mol_block.coords)
+            aux_native_bar += numpy.asarray(aux_block.coords)
+            native_blocks += 1
+            if profile:
+                native_seconds += time.perf_counter() - started
+        packed = None
 
-    if mol_ao_bar is None:
+    if mol_ao_bar is not None:
+        mol_coords = _ao_to_atom_coords_bar(mol, mol_ao_bar)
+        aux_coords = _ao_to_atom_coords_bar(auxmol, aux_ao_bar)
+        if native_blocks:
+            mol_coords = mol_coords + mol_native_bar
+            aux_coords = aux_coords + aux_native_bar
+    elif not native_blocks:
         if z_dtype is None:
             z_dtype = numpy.asarray(mo_coeff).dtype
-        mol_ao_bar = numpy.zeros((nao, 3), dtype=z_dtype)
-        aux_ao_bar = numpy.zeros((naux, 3), dtype=z_dtype)
-
-    mol_bar = _coords_tree_like(mol, _ao_to_atom_coords_bar(mol, mol_ao_bar))
-    auxmol_bar = _coords_tree_like(
-        auxmol, _ao_to_atom_coords_bar(auxmol, aux_ao_bar)
-    )
-    return mol_bar, auxmol_bar
+        mol_coords = numpy.zeros((mol.natm, 3), dtype=z_dtype)
+        aux_coords = numpy.zeros((auxmol.natm, 3), dtype=z_dtype)
+    else:
+        mol_coords, aux_coords = mol_native_bar, aux_native_bar
+    if profile:
+        _profile_msg(
+            'int3c coordinate reverse '
+            f'density_pack={density_seconds:.6f} s '
+            f'native_contract={native_seconds:.6f} s '
+            f'explicit_contract={fallback_seconds:.6f} s '
+            f'native_blocks={native_blocks} explicit_blocks={fallback_blocks}')
+    return _coords_tree_like(mol, mol_coords), _coords_tree_like(auxmol, aux_coords)
 
 
 def _int3c_mo_deriv_coords_vjp(mol, auxmol, mo_coeff, z,

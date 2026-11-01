@@ -1,0 +1,60 @@
+{
+  "job_id": "5822463",
+  "node": "hpc-34-23.cm.cluster",
+  "case_order": [
+    "baseline_ooc",
+    "optimized_ooc",
+    "optimized_incore"
+  ],
+  "differences_from_baseline": {
+    "baseline_ooc": {
+      "energy_hartree": 0.0,
+      "max_gradient_hartree_per_bohr": 0.0
+    },
+    "optimized_ooc": {
+      "energy_hartree": 0.0,
+      "max_gradient_hartree_per_bohr": 4.298179867578966e-12
+    },
+    "optimized_incore": {
+      "energy_hartree": 0.0,
+      "max_gradient_hartree_per_bohr": 1.5541434458810066e-11
+    }
+  },
+  "total_seconds": {
+    "baseline_ooc": 641.375541895628,
+    "optimized_ooc": 488.4510359726846,
+    "optimized_incore": 169.77691293880343
+  },
+  "phase_seconds": {
+    "baseline_ooc": {
+      "df_forward": 15.883518163114786,
+      "scf_forward": 164.49090600386262,
+      "mp2_forward": 22.60711869969964,
+      "mp2_pullback": 45.01945423334837,
+      "scf_pullback": 393.0931311920285,
+      "df_pullback": 0.043843869119882584
+    },
+    "optimized_ooc": {
+      "df_forward": 14.566739361733198,
+      "scf_forward": 167.57318400591612,
+      "mp2_forward": 24.065244559198618,
+      "mp2_pullback": 27.91417695209384,
+      "scf_pullback": 254.10439360886812,
+      "df_pullback": 0.044755227863788605
+    },
+    "optimized_incore": {
+      "df_forward": 7.922794498503208,
+      "scf_forward": 51.573514457792044,
+      "mp2_forward": 18.025876946747303,
+      "mp2_pullback": 3.958948574960232,
+      "scf_pullback": 63.05063149333,
+      "df_pullback": 24.814902290701866
+    }
+  },
+  "peak_rss_gib": {
+    "baseline_ooc": 6.001575469970703,
+    "optimized_ooc": 5.697914123535156,
+    "optimized_incore": 36.89429473876953
+  },
+  "all_checks_passed": true
+}

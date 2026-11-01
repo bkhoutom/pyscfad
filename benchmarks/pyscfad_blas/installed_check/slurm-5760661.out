@@ -1,0 +1,295 @@
+Python: /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/bin/python
+PySCFAD 0.3.1: /resnick/groups/sharmagroup/bkhou/src/pyscfad/pyscfad/__init__.py
+PySCFADlib 0.3.3+ompfix.ef9edb92: /resnick/groups/sharmagroup/bkhou/src/pyscfad/pyscfadlib/pyscfadlib/__init__.py
+PySCF 2.14.0: /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/__init__.py
+JAX 0.10.2; x64=True; OpenMP threads=2
+#INFO: **** input file is /resnick/groups/sharmagroup/bkhou/src/pyscfad/benchmarks/pyscfad_blas/installed_check/driver.py ****
+"""Exercise the benchmark drivers on frozen-core water and check the gradient."""
+import json
+import runpy
+from pathlib import Path
+
+import numpy as np
+
+ad = runpy.run_path('reproduce_dcmp_ad.py')
+ref = runpy.run_path('pyscf_scf.py')
+energy_error = abs(float(ad['e']) - float(ref['e']))
+gradient = np.asarray(ad['grad'])
+assert np.isfinite(gradient).all()
+assert energy_error < 1e-8, energy_error
+
+h = 1e-3  # bohr; PySCFAD coordinate gradients are in Hartree / bohr.
+coordinates = ref['mol'].atom_coords()
+displaced_energies = []
+for direction in (1, -1):
+    displaced = coordinates.copy()
+    displaced[1, 2] += direction * h
+    mol = ref['mol'].set_geom_(displaced, unit='Bohr', inplace=False)
+    mol.verbose = 0
+    displaced_energies.append(float(ref['energy'](mol)))
+finite_difference = (displaced_energies[0] - displaced_energies[1]) / (2 * h)
+gradient_error = abs(gradient[1, 2] - finite_difference)
+assert gradient_error < 2e-6, (gradient[1, 2], finite_difference, gradient_error)
+result = {
+    'energy_error_hartree': energy_error,
+    'gradient_ad_hartree_per_bohr': float(gradient[1, 2]),
+    'gradient_fd_hartree_per_bohr': finite_difference,
+    'gradient_error_hartree_per_bohr': float(gradient_error),
+}
+Path('results.json').write_text(json.dumps(result, indent=2) + '\n')
+print(json.dumps(result, indent=2))
+print('Both benchmark drivers and the frozen-core gradient check passed.')
+#INFO: ******************** input file end ********************
+
+
+System: uname_result(system='Linux', node='hpc-34-28.cm.cluster', release='5.14.0-427.13.1.el9_4.x86_64', version='#1 SMP PREEMPT_DYNAMIC Wed Apr 10 10:29:16 EDT 2024', machine='x86_64')  Threads 2
+Python 3.11.16 | packaged by conda-forge | (main, Aug 21 2026, 22:44:51) [GCC 14.4.0]
+numpy 2.4.6  scipy 1.17.1  h5py 3.16.0
+Date: Fri Oct 30 17:20:14 2026
+PySCF version 2.14.0
+PySCF path  /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf
+
+[ENV] PYSCF_TMPDIR /resnick/groups/sharmagroup/bkhou/src/pyscfad/benchmarks/pyscfad_blas/installed_check/scratch
+[CONFIG] conf_file None
+[INPUT] verbose = 4
+[INPUT] num. atoms = 3
+[INPUT] num. electrons = 10
+[INPUT] charge = 0
+[INPUT] spin (= nelec alpha-beta = 2S) = 0
+[INPUT] symmetry False subgroup None
+[INPUT] Mole.unit = angstrom
+[INPUT] Symbol           X                Y                Z      unit          X                Y                Z       unit  Magmom
+[INPUT]  1 O      0.000000000000   0.000000000000   0.000000000000 AA    0.000000000000   0.000000000000   0.000000000000 Bohr   0.0
+[INPUT]  2 H      0.000000000000  -0.757000000000   0.587000000000 AA    0.000000000000  -1.430522676296   1.109269235120 Bohr   0.0
+[INPUT]  3 H      0.000000000000   0.757000000000   0.587000000000 AA    0.000000000000   1.430522676296   1.109269235120 Bohr   0.0
+
+nuclear repulsion = 9.18825841774611
+number of shells = 11
+number of NR pGTOs = 40
+number of NR cGTOs = 24
+basis = cc-pvdz
+ecp = {}
+CPU time:         3.81
+
+
+******** <class 'pyscfad.df.df_jk._DFHF'> ********
+method = _DFHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscfad.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-10
+SCF conv_tol_grad = 1e-08
+SCF max_cycles = 250
+direct_scf = False
+chkfile to save SCF result = /resnick/groups/sharmagroup/bkhou/src/pyscfad/benchmarks/pyscfad_blas/installed_check/scratch/tmp47vq7hvy
+max_memory 1000 MB (current use 290 MB)
+Initial guess from minao.
+******** <class 'pyscfad.df.df.DF'> ********
+auxbasis = cc-pvdz-jkfit
+max_memory = 1000
+init E= -75.856472134853
+  HOMO = -0.476812931339846  LUMO = 0.100643077442609  gap/eV = 15.71338
+cycle= 1 E= -75.9877961137575  delta_E= -0.131  |g|= 0.448  |ddm|= 1.31
+  HOMO = -0.412633061003741  LUMO = 0.186498575249779  gap/eV = 16.30320
+cycle= 2 E= -76.0176948885323  delta_E= -0.0299  |g|= 0.228  |ddm|= 0.37
+  HOMO = -0.498194647900805  LUMO = 0.180838772728705  gap/eV = 18.47744
+cycle= 3 E= -76.0265614413955  delta_E= -0.00887  |g|= 0.0245  |ddm|= 0.13
+  HOMO = -0.491194548603711  LUMO = 0.185602132447854  gap/eV = 18.41658
+cycle= 4 E= -76.0267302783868  delta_E= -0.000169  |g|= 0.00588  |ddm|= 0.0181
+  HOMO = -0.49271894102876  LUMO = 0.18553183438729  gap/eV = 18.45614
+cycle= 5 E= -76.0267442443783  delta_E= -1.4e-05  |g|= 0.000976  |ddm|= 0.00646
+  HOMO = -0.493073793088462  LUMO = 0.185448801824893  gap/eV = 18.46354
+cycle= 6 E= -76.0267447249567  delta_E= -4.81e-07  |g|= 0.00015  |ddm|= 0.00138
+  HOMO = -0.493129149069873  LUMO = 0.185442380528898  gap/eV = 18.46487
+cycle= 7 E= -76.026744737192  delta_E= -1.22e-08  |g|= 1.64e-05  |ddm|= 0.000264
+  HOMO = -0.493127993406443  LUMO = 0.185441606247741  gap/eV = 18.46482
+cycle= 8 E= -76.0267447373459  delta_E= -1.54e-10  |g|= 3.88e-06  |ddm|= 2.65e-05
+  HOMO = -0.493126857491632  LUMO = 0.185441596936428  gap/eV = 18.46479
+cycle= 9 E= -76.026744737357  delta_E= -1.11e-11  |g|= 6.51e-07  |ddm|= 8.47e-06
+  HOMO = -0.493126742201316  LUMO = 0.18544154607325  gap/eV = 18.46478
+cycle= 10 E= -76.0267447373573  delta_E= -3.41e-13  |g|= 6.04e-08  |ddm|= 1.45e-06
+  HOMO = -0.493126741819174  LUMO = 0.185441539449007  gap/eV = 18.46478
+cycle= 11 E= -76.0267447373574  delta_E= -2.84e-14  |g|= 8.95e-09  |ddm|= 1.14e-07
+  HOMO = -0.493126744965287  LUMO = 0.185441538783753  gap/eV = 18.46478
+Extra cycle  E= -76.0267447373573  delta_E= 8.53e-14  |g|= 3.19e-09  |ddm|= 8.33e-09
+converged SCF energy = -76.0267447373573
+SCF forward (including DF build): 7.686083 s
+  HOMO = -0.493126744965287  LUMO = 0.185441538783753  gap/eV = 18.46478
+
+******** <class 'pyscfad.mp.dfmp2.MP2'> ********
+nocc = 4, nmo = 23
+frozen orbitals 1
+max_memory 1000 MB (current use 462 MB)
+E(MP2) = -76.2283846545511  E_corr = -0.201639917193849
+E(SCS-MP2) = -76.0267447373573  E_corr = 0
+E_corr(same-spin) = 0
+E_corr(oppo-spin) = 0
+MP2 forward (excluding SCF): 1.227917 s
+MP2 pullback: 1.659463 s
+  HOMO = -0.493126744965286  LUMO = 0.185441538783751  gap/eV = 18.46478
+  HOMO = -0.493126744965283  LUMO = 0.185441538783751  gap/eV = 18.46478
+SCF pullback (including DF pullback): 4.570252 s
+[[ 4.98277823e-17  1.49949497e-14  1.27305253e-02]
+ [-1.10865726e-17  2.38386429e-03 -6.36526267e-03]
+ [-3.87412097e-17 -2.38386429e-03 -6.36526267e-03]]
+Total energy + gradient wall time: 15.144977 s
+15.144976787269115
+Python: /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/bin/python
+PySCF 2.14.0: /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/__init__.py
+OpenMP threads=2
+#INFO: **** input file is /resnick/groups/sharmagroup/bkhou/src/pyscfad/benchmarks/pyscfad_blas/installed_check/driver.py ****
+"""Exercise the benchmark drivers on frozen-core water and check the gradient."""
+import json
+import runpy
+from pathlib import Path
+
+import numpy as np
+
+ad = runpy.run_path('reproduce_dcmp_ad.py')
+ref = runpy.run_path('pyscf_scf.py')
+energy_error = abs(float(ad['e']) - float(ref['e']))
+gradient = np.asarray(ad['grad'])
+assert np.isfinite(gradient).all()
+assert energy_error < 1e-8, energy_error
+
+h = 1e-3  # bohr; PySCFAD coordinate gradients are in Hartree / bohr.
+coordinates = ref['mol'].atom_coords()
+displaced_energies = []
+for direction in (1, -1):
+    displaced = coordinates.copy()
+    displaced[1, 2] += direction * h
+    mol = ref['mol'].set_geom_(displaced, unit='Bohr', inplace=False)
+    mol.verbose = 0
+    displaced_energies.append(float(ref['energy'](mol)))
+finite_difference = (displaced_energies[0] - displaced_energies[1]) / (2 * h)
+gradient_error = abs(gradient[1, 2] - finite_difference)
+assert gradient_error < 2e-6, (gradient[1, 2], finite_difference, gradient_error)
+result = {
+    'energy_error_hartree': energy_error,
+    'gradient_ad_hartree_per_bohr': float(gradient[1, 2]),
+    'gradient_fd_hartree_per_bohr': finite_difference,
+    'gradient_error_hartree_per_bohr': float(gradient_error),
+}
+Path('results.json').write_text(json.dumps(result, indent=2) + '\n')
+print(json.dumps(result, indent=2))
+print('Both benchmark drivers and the frozen-core gradient check passed.')
+#INFO: ******************** input file end ********************
+
+
+System: uname_result(system='Linux', node='hpc-34-28.cm.cluster', release='5.14.0-427.13.1.el9_4.x86_64', version='#1 SMP PREEMPT_DYNAMIC Wed Apr 10 10:29:16 EDT 2024', machine='x86_64')  Threads 2
+Python 3.11.16 | packaged by conda-forge | (main, Aug 21 2026, 22:44:51) [GCC 14.4.0]
+numpy 2.4.6  scipy 1.17.1  h5py 3.16.0
+Date: Fri Oct 30 17:20:31 2026
+PySCF version 2.14.0
+PySCF path  /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf
+
+[ENV] PYSCF_TMPDIR /resnick/groups/sharmagroup/bkhou/src/pyscfad/benchmarks/pyscfad_blas/installed_check/scratch
+[CONFIG] conf_file None
+[INPUT] verbose = 4
+[INPUT] num. atoms = 3
+[INPUT] num. electrons = 10
+[INPUT] charge = 0
+[INPUT] spin (= nelec alpha-beta = 2S) = 0
+[INPUT] symmetry False subgroup None
+[INPUT] Mole.unit = angstrom
+[INPUT] Symbol           X                Y                Z      unit          X                Y                Z       unit  Magmom
+[INPUT]  1 O      0.000000000000   0.000000000000   0.000000000000 AA    0.000000000000   0.000000000000   0.000000000000 Bohr   0.0
+[INPUT]  2 H      0.000000000000  -0.757000000000   0.587000000000 AA    0.000000000000  -1.430522676296   1.109269235120 Bohr   0.0
+[INPUT]  3 H      0.000000000000   0.757000000000   0.587000000000 AA    0.000000000000   1.430522676296   1.109269235120 Bohr   0.0
+
+nuclear repulsion = 9.18825841774611
+number of shells = 11
+number of NR pGTOs = 40
+number of NR cGTOs = 24
+basis = cc-pvdz
+ecp = {}
+CPU time:        19.33
+
+
+******** <class 'pyscf.df.df_jk.DFRHF'> ********
+method = DFRHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-10
+SCF conv_tol_grad = 1e-08
+SCF max_cycles = 250
+direct_scf = False
+chkfile to save SCF result = /resnick/groups/sharmagroup/bkhou/src/pyscfad/benchmarks/pyscfad_blas/installed_check/scratch/tmpc2ysnb75
+max_memory 1000 MB (current use 645 MB)
+Initial guess from minao.
+******** <class 'pyscf.df.df.DF'> ********
+auxbasis = cc-pvdz-jkfit
+max_memory = 1000
+init E= -75.8564721348531
+  HOMO = -0.476812931339855  LUMO = 0.100643077442605  gap/eV = 15.71338
+cycle= 1 E= -75.9877961137575  delta_E= -0.131  |g|= 0.448  |ddm|= 1.31
+  HOMO = -0.412633061003743  LUMO = 0.18649857524978  gap/eV = 16.30320
+cycle= 2 E= -76.0176948885324  delta_E= -0.0299  |g|= 0.228  |ddm|= 0.37
+  HOMO = -0.498194647900803  LUMO = 0.180838772728706  gap/eV = 18.47744
+cycle= 3 E= -76.0265614413954  delta_E= -0.00887  |g|= 0.0245  |ddm|= 0.13
+  HOMO = -0.491194548603707  LUMO = 0.18560213244786  gap/eV = 18.41658
+cycle= 4 E= -76.0267302783868  delta_E= -0.000169  |g|= 0.00588  |ddm|= 0.0181
+  HOMO = -0.492718941028762  LUMO = 0.185531834387289  gap/eV = 18.45614
+cycle= 5 E= -76.0267442443783  delta_E= -1.4e-05  |g|= 0.000976  |ddm|= 0.00646
+  HOMO = -0.493073793088461  LUMO = 0.185448801824893  gap/eV = 18.46354
+cycle= 6 E= -76.0267447249566  delta_E= -4.81e-07  |g|= 0.00015  |ddm|= 0.00138
+  HOMO = -0.493129149069867  LUMO = 0.185442380528912  gap/eV = 18.46487
+cycle= 7 E= -76.0267447371919  delta_E= -1.22e-08  |g|= 1.64e-05  |ddm|= 0.000264
+  HOMO = -0.493127993406456  LUMO = 0.185441606247752  gap/eV = 18.46482
+cycle= 8 E= -76.0267447373458  delta_E= -1.54e-10  |g|= 3.88e-06  |ddm|= 2.65e-05
+  HOMO = -0.493126857492024  LUMO = 0.185441596936403  gap/eV = 18.46479
+cycle= 9 E= -76.0267447373571  delta_E= -1.13e-11  |g|= 6.51e-07  |ddm|= 8.47e-06
+  HOMO = -0.493126742201317  LUMO = 0.185441546073257  gap/eV = 18.46478
+cycle= 10 E= -76.0267447373574  delta_E= -2.84e-13  |g|= 6.04e-08  |ddm|= 1.45e-06
+  HOMO = -0.493126741819167  LUMO = 0.185441539449014  gap/eV = 18.46478
+cycle= 11 E= -76.0267447373573  delta_E= 7.11e-14  |g|= 8.95e-09  |ddm|= 1.14e-07
+  HOMO = -0.493126744965288  LUMO = 0.185441538783752  gap/eV = 18.46478
+Extra cycle  E= -76.0267447373574  delta_E= -9.95e-14  |g|= 3.19e-09  |ddm|= 8.33e-09
+converged SCF energy = -76.0267447373574
+SCF forward (including DF build): 0.322181 s
+
+******** <class 'pyscf.mp.dfmp2.DFRMP2'> ********
+nocc = 4, nmo = 23
+frozen orbitals 1
+max_memory 1000 MB (current use 646 MB)
+E(DFRMP2) = -76.2283846545513  E_corr = -0.201639917193849
+E(SCS-DFRMP2) = -76.224705058925  E_corr = -0.197960321567518
+E_corr(same-spin) = -0.0507779758443475
+E_corr(oppo-spin) = -0.150861941349502
+MP2 forward (excluding SCF): 0.003378 s
+Total energy wall time: 0.328769 s
+0.32876910641789436
+
+WARN: Mole.unit (angstrom) is changed to Bohr
+
+New geometry
+   1 O      0.000000000000   0.000000000000   0.000000000000 AA    0.000000000000   0.000000000000   0.000000000000 Bohr
+   2 H      0.000000000000  -0.757000000000   0.587529177211 AA    0.000000000000  -1.430522676296   1.110269235120 Bohr
+   3 H      0.000000000000   0.757000000000   0.587000000000 AA    0.000000000000   1.430522676296   1.109269235120 Bohr
+SCF forward (including DF build): 0.412656 s
+MP2 forward (excluding SCF): 0.002044 s
+
+WARN: Mole.unit (angstrom) is changed to Bohr
+
+New geometry
+   1 O      0.000000000000   0.000000000000   0.000000000000 AA    0.000000000000   0.000000000000   0.000000000000 Bohr
+   2 H      0.000000000000  -0.757000000000   0.586470822789 AA    0.000000000000  -1.430522676296   1.108269235120 Bohr
+   3 H      0.000000000000   0.757000000000   0.587000000000 AA    0.000000000000   1.430522676296   1.109269235120 Bohr
+SCF forward (including DF build): 0.307046 s
+MP2 forward (excluding SCF): 0.002083 s
+{
+  "energy_error_hartree": 1.4210854715202004e-13,
+  "gradient_ad_hartree_per_bohr": -0.0063652626663409095,
+  "gradient_fd_hartree_per_bohr": -0.006365291206122947,
+  "gradient_error_hartree_per_bohr": 2.853978203765095e-08
+}
+Both benchmark drivers and the frozen-core gradient check passed.

@@ -1,0 +1,922 @@
+from pyscfad.lno import _df_outcore as lno_df_outcore
+import os
+
+import h5py
+import jax
+import numpy
+import pytest
+
+from pyscfad import config, gto
+from pyscfad import numpy as np
+from pyscfad.ao2mo import _ao2mo
+from pyscfad.df import _cderi_vjp, addons, incore
+
+
+def test_coordinate_pullback_avoids_unused_primal_integrals(monkeypatch):
+    """The geometry-only custom residual needs no ordinary int3c values."""
+    from pyscfad.df import _int3c_cross_opt
+
+    mol = gto.Mole(atom='O 0 0 0; H 0 0 1; H 0 1 0',
+                   basis='sto-3g', verbose=0)
+    mol.build(trace_exp=False, trace_ctr_coeff=False)
+    auxmol = addons.make_auxmol(mol, 'weigend')
+    slices = (0, mol.nbas, 0, mol.nbas,
+              mol.nbas, mol.nbas + auxmol.nbas)
+    naux = auxmol.nao
+    cotangent = numpy.random.default_rng(8201).normal(
+        size=(naux, mol.nao * (mol.nao + 1) // 2))
+
+    def primal(mol_, auxmol_):
+        return _int3c_cross_opt.int3c_cross(
+            mol_, auxmol_, shls_slice=slices).reshape(-1, naux).T
+
+    _, pullback = jax.vjp(primal, mol, auxmol)
+    expected = pullback(np.asarray(cotangent))
+    ordinary_calls = []
+    actual_cross = _int3c_cross_opt.int3c_cross
+
+    def counted_cross(*args, **kwargs):
+        if kwargs.get('comp', 1) == 1:
+            ordinary_calls.append(kwargs.get('intor', 'int3c2e'))
+        return actual_cross(*args, **kwargs)
+
+    monkeypatch.setattr(_int3c_cross_opt, 'int3c_cross', counted_cross)
+    actual = _cderi_vjp._int3c_coordinate_vjp_block(
+        mol, auxmol, cotangent, int3c=mol._add_suffix('int3c2e'),
+        shls_slice=slices, naoaux=naux)
+    for result, reference in zip(actual, expected):
+        numpy.testing.assert_allclose(result.coords, reference.coords,
+                                      atol=2e-11, rtol=2e-11)
+    assert ordinary_calls == []
+
+
+def test_zero_strict_upper_inplace_preserves_lower_triangle():
+    matrix = numpy.arange(25.0).reshape(5, 5)
+    lower = numpy.tril(matrix)
+    result = _cderi_vjp._zero_strict_upper_inplace(matrix)
+    assert result is matrix
+    numpy.testing.assert_array_equal(result, lower)
+
+
+def test_int3c_mo_vjp_block_mb_environment_priority(monkeypatch):
+    monkeypatch.delenv('PYSCFAD_DF_INT3C_MO_VJP_BLOCK_MB', raising=False)
+    assert (
+        _cderi_vjp._int3c_mo_vjp_block_mb()
+        == _cderi_vjp._INT3C_MO_VJP_BLOCK_MB
+    )
+
+    monkeypatch.setenv('PYSCFAD_DF_INT3C_MO_VJP_BLOCK_MB', '32')
+    assert _cderi_vjp._int3c_mo_vjp_block_mb() == 32.0
+
+    monkeypatch.setenv('PYSCFAD_DF_INT3C_MO_VJP_BLOCK_MB', '0.25')
+    assert _cderi_vjp._int3c_mo_vjp_block_mb() == 1.0
+
+    monkeypatch.setenv('PYSCFAD_DF_INT3C_MO_VJP_BLOCK_MB', 'invalid')
+    assert (
+        _cderi_vjp._int3c_mo_vjp_block_mb()
+        == _cderi_vjp._INT3C_MO_VJP_BLOCK_MB
+    )
+
+
+@pytest.mark.parametrize(('kc', 'lc'), ((2, 7), (7, 2), (4, 4)))
+@pytest.mark.parametrize('complex_data', (False, True))
+def test_int3c_ip1_mo_density_contraction_matches_einstein_reference(
+        kc, lc, complex_data):
+    rng = numpy.random.default_rng(1201)
+    naux = 5
+    nao = 6
+    ints = rng.normal(size=(3, nao, nao, naux))
+    mo_k = rng.normal(size=(nao, kc))
+    mo_l = rng.normal(size=(nao, lc))
+    z_blk = rng.normal(size=(naux, kc, lc))
+    if complex_data:
+        ints = ints + 1j * rng.normal(size=ints.shape)
+        mo_k = mo_k + 1j * rng.normal(size=mo_k.shape)
+        mo_l = mo_l + 1j * rng.normal(size=mo_l.shape)
+        z_blk = z_blk + 1j * rng.normal(size=z_blk.shape)
+
+    reference = numpy.einsum(
+        'pkl,uk,vl,xuvp->ux',
+        z_blk,
+        mo_k,
+        mo_l,
+        ints,
+        optimize=True,
+    )
+    reference += numpy.einsum(
+        'pkl,vk,ul,xuvp->ux',
+        z_blk,
+        mo_k,
+        mo_l,
+        ints,
+        optimize=True,
+    )
+    auxiliary_reference = numpy.einsum(
+        'pkl,uk,vl,xuvp->px',
+        z_blk,
+        mo_k,
+        mo_l,
+        ints,
+        optimize=True,
+    )
+    auxiliary_reference += numpy.einsum(
+        'pkl,vk,ul,xuvp->px',
+        z_blk,
+        mo_k,
+        mo_l,
+        ints,
+        optimize=True,
+    )
+
+    result, auxiliary_result = \
+        _cderi_vjp._int3c_ip1_mo_density_contractions(
+        ints, mo_k, mo_l, z_blk
+    )
+    numpy.testing.assert_allclose(result, reference, atol=2e-11, rtol=2e-11)
+    numpy.testing.assert_allclose(
+        auxiliary_result, auxiliary_reference, atol=2e-11, rtol=2e-11
+    )
+    numpy.testing.assert_allclose(
+        _cderi_vjp._int3c_ip1_mo_density_contraction(
+            ints, mo_k, mo_l, z_blk
+        ),
+        reference,
+        atol=2e-11,
+        rtol=2e-11,
+    )
+
+
+def test_nr_e2_cderi_bar_packed_blocks_match_full_vjp():
+    rng = numpy.random.default_rng(12)
+    naux = 4
+    nao = 5
+    nmo = 4
+    npair = nao * (nao + 1) // 2
+    orbs_slice = (0, 3, 1, 4)
+
+    cderi = rng.normal(size=(naux, npair))
+    mo_coeff = rng.normal(size=(nao, nmo))
+    ybar = rng.normal(size=(naux, (orbs_slice[1] - orbs_slice[0]) *
+                            (orbs_slice[3] - orbs_slice[2])))
+
+    def fn(cderi_):
+        return _ao2mo.nr_e2(cderi_, np.asarray(mo_coeff), orbs_slice, aosym='s2')
+
+    _, pullback = jax.vjp(fn, np.asarray(cderi))
+    cderi_bar_ref = numpy.asarray(pullback(np.asarray(ybar))[0])
+
+    blocks = []
+    for p0 in range(0, npair, 4):
+        p1 = min(p0 + 4, npair)
+        blocks.append(
+            _cderi_vjp.nr_e2_cderi_bar_packed_block(
+                np.asarray(mo_coeff),
+                np.asarray(ybar),
+                orbs_slice,
+                numpy.arange(p0, p1, dtype=numpy.int64),
+            )
+        )
+    cderi_bar = numpy.concatenate(blocks, axis=1)
+
+    assert numpy.allclose(cderi_bar, cderi_bar_ref, atol=1e-10, rtol=1e-10)
+
+
+def _assert_projection_close(actual, expected, tolerance=5e-12):
+    difference = numpy.asarray(actual) - numpy.asarray(expected)
+    scale = max(
+        1.0,
+        float(numpy.abs(actual).max(initial=0.0)),
+        float(numpy.abs(expected).max(initial=0.0)),
+    )
+    norm_scale = max(float(numpy.linalg.norm(expected)), 1.0)
+    assert float(numpy.abs(difference).max(initial=0.0)) / scale <= tolerance
+    assert float(numpy.linalg.norm(difference)) / norm_scale <= tolerance
+
+
+@pytest.mark.parametrize('backend', ('native', 'numpy'))
+@pytest.mark.parametrize(('kc', 'lc'), ((2, 7), (7, 2), (4, 4)))
+def test_nr_e2_cderi_bar_project_noncontiguous(
+        monkeypatch, backend, kc, lc):
+    if backend == 'native':
+        if not _cderi_vjp._NR_E2_CDERI_BAR_NATIVE:
+            pytest.skip('native AO projection kernel is unavailable')
+    else:
+        monkeypatch.setattr(_cderi_vjp, '_NR_E2_CDERI_BAR_NATIVE', False)
+
+    rng = numpy.random.default_rng(121)
+    naux = 5
+    npos = 11
+    ybar = rng.normal(size=(naux, kc, 2 * lc))[..., ::2]
+    mok_rows = rng.normal(size=(npos, 2 * kc))[:, ::2]
+    mol_cols = rng.normal(size=(npos, 2 * lc))[:, ::2]
+    assert not ybar.flags.c_contiguous
+    assert not mok_rows.flags.c_contiguous
+    assert not mol_cols.flags.c_contiguous
+
+    reference = numpy.einsum(
+        'Lij,pi,pj->Lp', ybar, mok_rows, mol_cols, optimize=True
+    )
+    result = _cderi_vjp._nr_e2_cderi_bar_project(
+        ybar, mok_rows, mol_cols
+    )
+    _assert_projection_close(result, reference)
+
+
+def test_nr_e2_cderi_bar_packed_block_unsorted_duplicate_positions():
+    rng = numpy.random.default_rng(122)
+    naux, nao, nmo = 6, 5, 8
+    orbs_slice = (0, 2, 2, 8)
+    mo_coeff = rng.normal(size=(nao, nmo))
+    ybar = rng.normal(size=(naux, 12))
+    positions = numpy.asarray([8, 0, 4, 8, 14, 2, 1], dtype=numpy.int64)
+
+    rows, cols = numpy.tril_indices(nao)
+    y3 = ybar.reshape(naux, 2, 6)
+    reference = numpy.einsum(
+        'Lij,pi,pj->Lp',
+        y3,
+        mo_coeff[rows[positions], :2],
+        mo_coeff[cols[positions], 2:8],
+        optimize=True,
+    )
+    offdiag = rows[positions] != cols[positions]
+    reference[:, offdiag] += numpy.einsum(
+        'Lij,pi,pj->Lp',
+        y3,
+        mo_coeff[cols[positions[offdiag]], :2],
+        mo_coeff[rows[positions[offdiag]], 2:8],
+        optimize=True,
+    )
+    result = _cderi_vjp.nr_e2_cderi_bar_packed_block(
+        np.asarray(mo_coeff), np.asarray(ybar), orbs_slice, positions
+    )
+    _assert_projection_close(result, reference)
+
+    empty = _cderi_vjp.nr_e2_cderi_bar_packed_block(
+        np.asarray(mo_coeff), np.asarray(ybar), orbs_slice,
+        numpy.empty(0, dtype=numpy.int64),
+    )
+    assert empty.shape == (naux, 0)
+
+
+@pytest.mark.parametrize('backend', ('native', 'numpy'))
+@pytest.mark.parametrize(('kc', 'lc'), ((2, 7), (7, 2), (4, 4)))
+def test_nr_e2_cderi_bar_packed_aux_block_matches_dense_reference(
+        monkeypatch, backend, kc, lc):
+    if backend == 'native':
+        if not _cderi_vjp._NR_E2_CDERI_BAR_AUX_NATIVE:
+            pytest.skip('native auxiliary-slab AO projection kernel is unavailable')
+    else:
+        monkeypatch.setattr(_cderi_vjp, '_NR_E2_CDERI_BAR_AUX_NATIVE', False)
+
+    rng = numpy.random.default_rng(123)
+    naux = 5
+    nao = 6
+    nmo = kc + lc
+    ybar = rng.normal(size=(naux, kc, 2 * lc))[..., ::2]
+    mo_coeff = rng.normal(size=(nao, 2 * nmo))[:, ::2]
+    assert not ybar.flags.c_contiguous
+    assert not mo_coeff.flags.c_contiguous
+    orbs_slice = (0, kc, kc, nmo)
+
+    dense = numpy.einsum(
+        'Pij,ui,vj->Puv',
+        ybar,
+        mo_coeff[:, :kc],
+        mo_coeff[:, kc:],
+        optimize=True,
+    )
+    rows, cols = numpy.tril_indices(nao)
+    reference = dense[:, rows, cols].copy()
+    offdiag = rows != cols
+    reference[:, offdiag] += dense[:, cols[offdiag], rows[offdiag]]
+
+    result = _cderi_vjp.nr_e2_cderi_bar_packed_aux_block(
+        np.asarray(mo_coeff), np.asarray(ybar), orbs_slice
+    )
+    _assert_projection_close(result, reference)
+
+
+def test_nr_e2_cderi_bar_packed_disk_aux_write_pair_read(tmp_path, monkeypatch):
+    monkeypatch.setattr(_cderi_vjp, '_NR_E2_CDERI_BAR_AUX_NATIVE', False)
+    rng = numpy.random.default_rng(124)
+    naux, nao, nocc, nvir = 5, 4, 2, 5
+    nmo = nocc + nvir
+    mo_coeff = rng.normal(size=(nao, nmo))
+    ybar = rng.normal(size=(naux, nocc * nvir))
+    orbs_slice = (0, nocc, nocc, nmo)
+    reference = _cderi_vjp.nr_e2_cderi_bar_packed_aux_block(
+        np.asarray(mo_coeff), np.asarray(ybar), orbs_slice
+    )
+
+    disk_path = None
+    with _cderi_vjp.nr_e2_cderi_bar_packed_disk(
+            np.asarray(mo_coeff), np.asarray(ybar), orbs_slice,
+            directory=str(tmp_path), aux_blksize=2) as dataset:
+        disk_path = dataset.file.filename
+        assert dataset.shape == (naux, nao * (nao + 1) // 2)
+        assert dataset.chunks[0] == 2
+        assert numpy.allclose(numpy.asarray(dataset[:, :]), reference)
+        # Exercise the intended second-phase access pattern explicitly.
+        pair_blocks = []
+        for q0 in range(0, dataset.shape[1], 3):
+            q1 = min(q0 + 3, dataset.shape[1])
+            pair_blocks.append(numpy.asarray(dataset[:, q0:q1]))
+        assert numpy.allclose(numpy.concatenate(pair_blocks, axis=1), reference)
+    assert disk_path is not None
+    assert not os.path.exists(disk_path)
+
+
+def test_nr_e2_cderi_bar_aux_blksize_accounts_for_all_slab_workspace(
+        monkeypatch):
+    monkeypatch.setenv('PYSCFAD_DF_CDERI_BAR_AUX_BLOCK_MB', '1')
+    monkeypatch.setattr(_cderi_vjp.pyscf_lib, 'num_threads', lambda: 8)
+
+    naux, nao, kc, lc = 100, 20, 80, 100
+    mo_coeff = numpy.empty((nao, kc + lc), dtype=numpy.float64)
+    ybar = numpy.empty((naux, kc * lc), dtype=numpy.float64)
+    block = _cderi_vjp._nr_e2_cderi_bar_aux_blksize(
+        mo_coeff, ybar, (0, kc, kc, kc + lc)
+    )
+
+    npair = nao * (nao + 1) // 2
+    bytes_per_aux = (npair + nao * kc + kc * lc) * 8
+    matrix_bytes = nao * nao * 8
+    target_bytes = 1024**2 - nao * (kc + lc) * 8
+    assert block * bytes_per_aux + min(block, 8) * matrix_bytes <= target_bytes
+    assert (
+        (block + 1) * bytes_per_aux
+        + min(block + 1, 8) * matrix_bytes
+        > target_bytes
+    )
+
+
+def test_nr_e2_cderi_bar_packed_disk_cleans_up_after_build_failure(
+        tmp_path, monkeypatch):
+    token = object()
+    finished = []
+    monkeypatch.setattr(_cderi_vjp.resource_profile, 'start', lambda: token)
+    monkeypatch.setattr(
+        _cderi_vjp.resource_profile,
+        'finish',
+        lambda phase, before, **details: finished.append((phase, before)),
+    )
+
+    def fail_projection(*args, **kwargs):
+        raise RuntimeError('projection failed')
+
+    monkeypatch.setattr(
+        _cderi_vjp, '_nr_e2_cderi_bar_packed_aux_block_prepared',
+        fail_projection,
+    )
+    mo_coeff = numpy.ones((3, 4))
+    ybar = numpy.ones((2, 4))
+    with pytest.raises(RuntimeError, match='projection failed'):
+        with _cderi_vjp.nr_e2_cderi_bar_packed_disk(
+                mo_coeff, ybar, (0, 2, 2, 4), directory=str(tmp_path)):
+            pass
+
+    assert finished == [('df_vjp.cderi_bar_disk_build_incomplete', token)]
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize('failing_call', ('start', 'finish'))
+def test_nr_e2_cderi_bar_packed_disk_cleans_up_after_profiler_failure(
+        tmp_path, monkeypatch, failing_call):
+    token = object()
+
+    def profile_start():
+        if failing_call == 'start':
+            raise RuntimeError('profile start failed')
+        return token
+
+    def profile_finish(*args, **kwargs):
+        raise RuntimeError('profile finish failed')
+
+    monkeypatch.setattr(_cderi_vjp.resource_profile, 'start', profile_start)
+    monkeypatch.setattr(_cderi_vjp.resource_profile, 'finish', profile_finish)
+    mo_coeff = numpy.ones((3, 4))
+    ybar = numpy.ones((2, 4))
+
+    with pytest.raises(RuntimeError, match=f'profile {failing_call} failed'):
+        with _cderi_vjp.nr_e2_cderi_bar_packed_disk(
+                mo_coeff, ybar, (0, 2, 2, 4), directory=str(tmp_path)):
+            pass
+
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ('kc', 'lc', 'expected_order'),
+    ((2, 7, 'transposed'), (7, 2, 'as_given'), (4, 4, 'as_given')),
+)
+def test_ao_projection_order_uses_smaller_trailing_dimension(
+        kc, lc, expected_order):
+    ybar = numpy.zeros((3, kc, lc))
+    mok_rows = numpy.zeros((5, kc))
+    mol_cols = numpy.zeros((5, lc))
+
+    selected = _cderi_vjp._select_ao_projection_order(
+        ybar, mok_rows, mol_cols
+    )
+    assert selected[3] == expected_order
+    assert selected[0].shape == (3, max(kc, lc), min(kc, lc))
+
+
+def test_ao_projection_order_validates_shapes():
+    with pytest.raises(ValueError, match='rank 3'):
+        _cderi_vjp._select_ao_projection_order(
+            numpy.zeros((2, 3)),
+            numpy.zeros((5, 3)),
+            numpy.zeros((5, 3)),
+        )
+    with pytest.raises(ValueError, match='mok_rows has shape'):
+        _cderi_vjp._select_ao_projection_order(
+            numpy.zeros((2, 3, 4)),
+            numpy.zeros((5, 2)),
+            numpy.zeros((5, 4)),
+        )
+    with pytest.raises(ValueError, match='second dimension'):
+        _cderi_vjp._select_ao_projection_order(
+            numpy.zeros((2, 3, 4)),
+            numpy.zeros((5, 3)),
+            numpy.zeros((5, 2)),
+        )
+
+
+def test_nr_e2_mo_coeff_vjp_from_cderi_source_is_blocked(tmp_path):
+    rng = numpy.random.default_rng(13)
+    naux = 5
+    nao = 4
+    nmo = 4
+    npair = nao * (nao + 1) // 2
+    orbs_slice = (0, 2, 1, 4)
+
+    cderi = rng.normal(size=(naux, npair))
+    mo_coeff = rng.normal(size=(nao, nmo))
+    ybar = rng.normal(size=(naux, (orbs_slice[1] - orbs_slice[0]) *
+                            (orbs_slice[3] - orbs_slice[2])))
+
+    cderi_file = tmp_path / 'cderi.h5'
+    with h5py.File(cderi_file, 'w') as h5f:
+        h5f.create_dataset('j3c', data=cderi)
+
+    def fn(mo_coeff_):
+        return _ao2mo.nr_e2(np.asarray(cderi), mo_coeff_, orbs_slice, aosym='s2')
+
+    _, pullback = jax.vjp(fn, np.asarray(mo_coeff))
+    mo_coeff_bar_ref = numpy.asarray(pullback(np.asarray(ybar))[0])
+
+    mo_coeff_bar = _cderi_vjp.nr_e2_mo_coeff_vjp_from_cderi_source(
+        str(cderi_file),
+        np.asarray(mo_coeff),
+        np.asarray(ybar),
+        orbs_slice,
+        aosym='s2',
+    )
+
+    assert numpy.allclose(mo_coeff_bar, mo_coeff_bar_ref, atol=1e-10, rtol=1e-10)
+
+
+def test_nr_e2_mo_coeff_vjp_from_local_cderi_source(tmp_path):
+    rng = numpy.random.default_rng(14)
+    naux = 5
+    nao = 5
+    local_nao = 3
+    nmo = 3
+    npair = nao * (nao + 1) // 2
+    orbs_slice = (0, 2, 1, 3)
+
+    cderi = rng.normal(size=(naux, npair))
+    mo_coeff = rng.normal(size=(local_nao, nmo))
+    ybar = rng.normal(size=(naux, (orbs_slice[1] - orbs_slice[0]) *
+                            (orbs_slice[3] - orbs_slice[2])))
+
+    ao_idx = numpy.asarray([0, 2, 4])
+    rows, cols = numpy.tril_indices(local_nao)
+    pair_idx = ao_idx[rows] * (ao_idx[rows] + 1) // 2 + ao_idx[cols]
+    local_cderi = cderi[:, pair_idx]
+
+    cderi_file = tmp_path / 'cderi.h5'
+    with h5py.File(cderi_file, 'w') as h5f:
+        h5f.create_dataset('j3c', data=cderi)
+
+    def fn(mo_coeff_):
+        return _ao2mo.nr_e2(
+            np.asarray(local_cderi), mo_coeff_, orbs_slice, aosym='s2'
+        )
+
+    _, pullback = jax.vjp(fn, np.asarray(mo_coeff))
+    mo_coeff_bar_ref = numpy.asarray(pullback(np.asarray(ybar))[0])
+
+    mo_coeff_bar = _cderi_vjp.nr_e2_mo_coeff_vjp_from_cderi_source(
+        str(cderi_file),
+        np.asarray(mo_coeff),
+        np.asarray(ybar),
+        orbs_slice,
+        aosym='s2',
+        pair_idx=tuple(pair_idx.tolist()),
+    )
+
+    assert numpy.allclose(mo_coeff_bar, mo_coeff_bar_ref, atol=1e-10, rtol=1e-10)
+
+
+def test_local_cderi_bar_disk_scatter_matches_pair_projection(tmp_path):
+
+    rng = numpy.random.default_rng(141)
+    naux, global_nao, local_nao = 5, 6, 3
+    nocc, nvir = 2, 4
+    nmo = nocc + nvir
+    mo_coeff = rng.normal(size=(local_nao, nmo))
+    ybar = rng.normal(size=(naux, nocc * nvir))
+    orbs_slice = (0, nocc, nocc, nmo)
+    ao_idx = numpy.asarray([0, 2, 5], dtype=numpy.int64)
+    rows, cols = numpy.tril_indices(local_nao)
+    pair_idx = (
+        ao_idx[rows] * (ao_idx[rows] + 1) // 2 + ao_idx[cols]
+    )
+
+    with _cderi_vjp.nr_e2_cderi_bar_packed_disk(
+            np.asarray(mo_coeff), np.asarray(ybar), orbs_slice,
+            directory=str(tmp_path), aux_blksize=2) as dataset:
+        global_pair_count = global_nao * (global_nao + 1) // 2
+        for p0 in range(0, global_pair_count, 4):
+            p1 = min(p0 + 4, global_pair_count)
+            reference = lno_df_outcore._nr_e2_local_cderi_bar_block(
+                np.asarray(mo_coeff), np.asarray(ybar), orbs_slice,
+                pair_idx, p0, p1,
+            )
+            result = lno_df_outcore._nr_e2_local_cderi_bar_disk_block(
+                dataset, pair_idx, p0, p1
+            )
+            assert numpy.allclose(result, reference, atol=1e-10, rtol=1e-10)
+
+
+def test_cholesky_eri_mo_deriv_vjp_matches_cderi_bar_path(
+        tmp_path):
+    rng = numpy.random.default_rng(15)
+    mol = gto.Mole(
+        atom='O 0 0 0; H 0 0 1; H 0 1 0',
+        basis='sto-3g',
+        verbose=0,
+    )
+    mol.build(trace_exp=False, trace_ctr_coeff=False)
+    auxmol = addons.make_auxmol(mol, 'weigend')
+    old_moleintor_opt = config.moleintor_opt
+    config.update('pyscfad_moleintor_opt', True)
+    try:
+        cderi = numpy.asarray(
+            incore.cholesky_eri(
+                mol,
+                auxmol=auxmol,
+                int3c=mol._add_suffix('int3c2e'),
+                int2c=mol._add_suffix('int2c2e'),
+                aosym='s2ij',
+                verbose=0,
+            )
+        )
+    finally:
+        config.update('pyscfad_moleintor_opt', old_moleintor_opt)
+    cderi_file = tmp_path / 'cderi.h5'
+    with h5py.File(cderi_file, 'w') as h5f:
+        h5f.create_dataset('j3c', data=cderi)
+
+    nao = mol.nao
+    nmo = 4
+    mo_coeff = rng.normal(size=(nao, nmo))
+    orbs_slice = (0, nmo, 0, nmo)
+    ybar = rng.normal(size=(auxmol.nao, nmo * nmo))
+    def cderi_bar_block(p0, p1):
+        return _cderi_vjp.nr_e2_cderi_bar_packed_block(
+            np.asarray(mo_coeff),
+            np.asarray(ybar),
+            orbs_slice,
+            numpy.arange(p0, p1, dtype=numpy.int64),
+        )
+
+    mol_ref, aux_ref = _cderi_vjp.cholesky_eri_vjp_from_cderi_block_fn(
+        mol,
+        auxmol,
+        str(cderi_file),
+        cderi_bar_block,
+        1024,
+        int3c=mol._add_suffix('int3c2e'),
+        int2c=mol._add_suffix('int2c2e'),
+        aosym='s2ij',
+    )
+    dispatched_blocks = []
+
+    def dispatched_int3c_vjp(block_index, shls_slice, ints_bar):
+        dispatched_blocks.append(block_index)
+        return _cderi_vjp._int3c_coordinate_vjp_block(
+            mol,
+            auxmol,
+            ints_bar,
+            int3c=mol._add_suffix('int3c2e'),
+            shls_slice=shls_slice,
+            naoaux=auxmol.nao,
+        )
+
+    mol_dispatched, aux_dispatched = (
+        _cderi_vjp.cholesky_eri_vjp_from_cderi_block_fn(
+            mol,
+            auxmol,
+            str(cderi_file),
+            cderi_bar_block,
+            1024,
+            int3c=mol._add_suffix('int3c2e'),
+            int2c=mol._add_suffix('int2c2e'),
+            aosym='s2ij',
+            int3c_block_vjp=dispatched_int3c_vjp,
+            max_pair_block=8,
+        )
+    )
+    mol_test, aux_test = _cderi_vjp.cholesky_eri_vjp_from_mo_coeff_ybar(
+        mol,
+        auxmol,
+        str(cderi_file),
+        np.asarray(mo_coeff),
+        np.asarray(ybar),
+        orbs_slice,
+        1024,
+        int3c=mol._add_suffix('int3c2e'),
+        int2c=mol._add_suffix('int2c2e'),
+        aosym='s2ij',
+    )
+
+    assert len(dispatched_blocks) > 1
+    assert dispatched_blocks == list(range(len(dispatched_blocks)))
+    numpy.testing.assert_allclose(
+        numpy.asarray(mol_dispatched.coords),
+        numpy.asarray(mol_ref.coords),
+        atol=2e-9,
+        rtol=2e-10,
+    )
+    numpy.testing.assert_allclose(
+        numpy.asarray(aux_dispatched.coords),
+        numpy.asarray(aux_ref.coords),
+        atol=2e-9,
+        rtol=2e-10,
+    )
+
+    assert numpy.allclose(
+        numpy.asarray(mol_test.coords),
+        numpy.asarray(mol_ref.coords),
+        atol=1e-8,
+        rtol=1e-8,
+    )
+    assert numpy.allclose(
+        numpy.asarray(aux_test.coords),
+        numpy.asarray(aux_ref.coords),
+        atol=1e-8,
+        rtol=1e-8,
+    )
+
+
+def test_int3c_mo_deriv_coords_vjp_accepts_one_read_per_aux_block(monkeypatch):
+    rng = numpy.random.default_rng(1501)
+    mol = gto.Mole(
+        atom='O 0 0 0; H 0 0 1; H 0 1 0',
+        basis='sto-3g',
+        verbose=0,
+    )
+    mol.build(trace_exp=False, trace_ctr_coeff=False)
+    auxmol = addons.make_auxmol(mol, 'weigend')
+    mo_coeff = rng.normal(size=(mol.nao, 5))
+    orbs_slice = (0, 2, 2, 5)
+    z = rng.normal(size=(auxmol.nao, 6))
+    ranges = [
+        (sh0, sh0 + 1, int(auxmol.ao_loc[sh0 + 1] - auxmol.ao_loc[sh0]))
+        for sh0 in range(auxmol.nbas)
+    ]
+    monkeypatch.setattr(
+        _cderi_vjp, 'balance_partition', lambda unused_loc, unused_size: ranges
+    )
+    reference = _cderi_vjp._int3c_mo_deriv_coords_vjp(
+        mol, auxmol, mo_coeff, z, orbs_slice
+    )
+    calls = []
+
+    def read_z_aux_block(p0, p1):
+        calls.append((int(p0), int(p1)))
+        return z[p0:p1, :]
+
+    result = _cderi_vjp._int3c_mo_deriv_coords_vjp(
+        mol, auxmol, mo_coeff, read_z_aux_block, orbs_slice
+    )
+
+    assert calls == [
+        (int(auxmol.ao_loc[sh0]), int(auxmol.ao_loc[sh1]))
+        for sh0, sh1, _ in ranges
+    ]
+    numpy.testing.assert_allclose(
+        numpy.asarray(result[0].coords), numpy.asarray(reference[0].coords),
+        atol=2e-11, rtol=2e-11,
+    )
+    numpy.testing.assert_allclose(
+        numpy.asarray(result[1].coords), numpy.asarray(reference[1].coords),
+        atol=2e-11, rtol=2e-11,
+    )
+
+
+def test_int3c_mo_deriv_coords_vjp_rejects_transposed_reader_block():
+    rng = numpy.random.default_rng(1502)
+    mol = gto.Mole(
+        atom='O 0 0 0; H 0 0 1; H 0 1 0',
+        basis='sto-3g',
+        verbose=0,
+    )
+    mol.build(trace_exp=False, trace_ctr_coeff=False)
+    auxmol = addons.make_auxmol(mol, 'weigend')
+    mo_coeff = rng.normal(size=(mol.nao, 5))
+    orbs_slice = (0, 2, 2, 5)
+    z = rng.normal(size=(auxmol.nao, 6))
+
+    def transposed_z_aux_block(p0, p1):
+        return z[p0:p1, :].T
+
+    with pytest.raises(ValueError, match='z auxiliary block.*shape'):
+        _cderi_vjp._int3c_mo_deriv_coords_vjp(
+            mol, auxmol, mo_coeff, transposed_z_aux_block, orbs_slice
+        )
+
+
+def test_int3c_mo_deriv_coords_vjp_oversized_shell_fallback_is_disjoint(
+    monkeypatch,
+):
+    rng = numpy.random.default_rng(1503)
+    mol = gto.Mole(
+        atom='O 0 0 0; H 0 0 1; H 0 1 0',
+        basis='sto-3g',
+        verbose=0,
+    )
+    mol.build(trace_exp=False, trace_ctr_coeff=False)
+    auxmol = addons.make_auxmol(mol, 'weigend')
+    mo_coeff = rng.normal(size=(mol.nao, 5))
+    orbs_slice = (0, 2, 2, 5)
+    z = rng.normal(size=(auxmol.nao, 6))
+    reference = _cderi_vjp._int3c_mo_deriv_coords_vjp(
+        mol, auxmol, mo_coeff, z, orbs_slice
+    )
+    real_int3c_bwd = _cderi_vjp._int3c_cross_opt.int3c_cross_bwd
+    integral_ranges = []
+
+    def tracked_int3c_bwd(*args, **kwargs):
+        shls_slice = args[3]
+        shl0 = shls_slice[4] - mol.nbas
+        shl1 = shls_slice[5] - mol.nbas
+        integral_ranges.append(
+            (int(auxmol.ao_loc[shl0]), int(auxmol.ao_loc[shl1]))
+        )
+        return real_int3c_bwd(*args, **kwargs)
+
+    monkeypatch.setattr(
+        _cderi_vjp._int3c_cross_opt, 'int3c_cross_bwd', tracked_int3c_bwd
+    )
+    read_ranges = []
+
+    def read_z_aux_block(p0, p1):
+        read_ranges.append((p0, p1))
+        return z[p0:p1, :]
+
+    result = _cderi_vjp._int3c_mo_deriv_coords_vjp(
+        mol,
+        auxmol,
+        mo_coeff,
+        read_z_aux_block,
+        orbs_slice,
+        z_aux_block_max_rows=1,
+    )
+
+    assert read_ranges == [(p0, p0 + 1) for p0 in range(auxmol.nao)]
+    assert all(
+        left[1] == right[0]
+        for left, right in zip(integral_ranges, integral_ranges[1:])
+    )
+    assert integral_ranges[0][0] == 0
+    assert integral_ranges[-1][1] == auxmol.nao
+    assert len(integral_ranges) < len(read_ranges)
+    numpy.testing.assert_allclose(
+        numpy.asarray(result[0].coords), numpy.asarray(reference[0].coords),
+        atol=2e-10, rtol=2e-10,
+    )
+    numpy.testing.assert_allclose(
+        numpy.asarray(result[1].coords), numpy.asarray(reference[1].coords),
+        atol=2e-10, rtol=2e-10,
+    )
+
+
+def test_local_disk_cderi_bar_cholesky_vjp_matches_pairwise_path(tmp_path, monkeypatch):
+
+    rng = numpy.random.default_rng(151)
+    mol = gto.Mole(
+        atom='H 0 0 0; H 0 0 1; H 0 1 0; H 1 0 0',
+        basis='sto-3g',
+        verbose=0,
+    )
+    mol.build(trace_exp=False, trace_ctr_coeff=False)
+    auxmol = addons.make_auxmol(mol, 'weigend')
+    old_moleintor_opt = config.moleintor_opt
+    config.update('pyscfad_moleintor_opt', True)
+    try:
+        cderi = numpy.asarray(
+            incore.cholesky_eri(
+                mol,
+                auxmol=auxmol,
+                int3c=mol._add_suffix('int3c2e'),
+                int2c=mol._add_suffix('int2c2e'),
+                aosym='s2ij',
+                verbose=0,
+            )
+        )
+    finally:
+        config.update('pyscfad_moleintor_opt', old_moleintor_opt)
+    cderi_file = tmp_path / 'local-cderi.h5'
+    with h5py.File(cderi_file, 'w') as h5f:
+        h5f.create_dataset('j3c', data=cderi)
+
+    ao_idx = numpy.asarray([0, 2, 3], dtype=numpy.int64)
+    local_nao = ao_idx.size
+    rows, cols = numpy.tril_indices(local_nao)
+    pair_idx = (
+        ao_idx[rows] * (ao_idx[rows] + 1) // 2 + ao_idx[cols]
+    )
+    nocc, nvir = 1, 2
+    mo_coeff = rng.normal(size=(local_nao, nocc + nvir))
+    orbs_slice = (0, nocc, nocc, nocc + nvir)
+    ybar = rng.normal(size=(auxmol.nao, nocc * nvir))
+
+    def pairwise_block(p0, p1):
+        return lno_df_outcore._nr_e2_local_cderi_bar_block(
+            np.asarray(mo_coeff), np.asarray(ybar), orbs_slice,
+            pair_idx, p0, p1,
+        )
+
+    mol_ref, aux_ref = _cderi_vjp.cholesky_eri_vjp_from_cderi_block_fn(
+        mol, auxmol, str(cderi_file), pairwise_block, 1024,
+        int3c=mol._add_suffix('int3c2e'),
+        int2c=mol._add_suffix('int2c2e'),
+        aosym='s2ij',
+    )
+
+    with _cderi_vjp.nr_e2_cderi_bar_packed_disk(
+            np.asarray(mo_coeff), np.asarray(ybar), orbs_slice,
+            directory=str(tmp_path), aux_blksize=3) as dataset:
+        mol_test, aux_test = _cderi_vjp.cholesky_eri_vjp_from_cderi_block_fn(
+            mol,
+            auxmol,
+            str(cderi_file),
+            lambda p0, p1: lno_df_outcore._nr_e2_local_cderi_bar_disk_block(
+                dataset, pair_idx, p0, p1
+            ),
+            1024,
+            int3c=mol._add_suffix('int3c2e'),
+            int2c=mol._add_suffix('int2c2e'),
+            aosym='s2ij',
+        )
+
+    assert numpy.allclose(
+        numpy.asarray(mol_test.coords),
+        numpy.asarray(mol_ref.coords),
+        atol=1e-8,
+        rtol=1e-8,
+    )
+    assert numpy.allclose(
+        numpy.asarray(aux_test.coords),
+        numpy.asarray(aux_ref.coords),
+        atol=1e-8,
+        rtol=1e-8,
+    )
+
+    coeff = np.asarray(mo_coeff)
+    cotangent = np.asarray(ybar)
+    _, coeff_pullback = jax.vjp(
+        lambda c: _ao2mo.nr_e2(np.asarray(cderi[:, pair_idx]), c,
+                               orbs_slice, aosym='s2'), coeff,
+    )
+    coeff_ref = coeff_pullback(cotangent)[0]
+
+    def reject_disk(*args, **kwargs):
+        raise AssertionError('Supported partial domains must not build an AO cotangent file')
+
+    monkeypatch.setattr(_cderi_vjp, 'nr_e2_cderi_bar_packed_disk', reject_disk)
+    y, pullback = jax.vjp(
+        lambda m, a, c: lno_df_outcore._outcore_local_nr_e2_from_global_cderi(
+            m, a, c, str(cderi_file), 1024, orbs_slice, 's2', tuple(pair_idx)),
+        mol, auxmol, coeff,
+    )
+    mol_direct, aux_direct, coeff_direct = pullback(cotangent)
+    y_ref = _ao2mo.nr_e2(np.asarray(cderi[:, pair_idx]), coeff, orbs_slice, aosym='s2')
+    for actual, expected in ((y, y_ref), (mol_direct.coords, mol_ref.coords),
+                             (aux_direct.coords, aux_ref.coords), (coeff_direct, coeff_ref)):
+        numpy.testing.assert_allclose(actual, expected, atol=1e-8, rtol=1e-8)
+
+
+    # An empty MO slice has identically zero pullbacks and needs no DF work.
+    _, empty_pullback = jax.vjp(
+        lambda m, a, c: lno_df_outcore._outcore_local_nr_e2_from_global_cderi(
+            m, a, c, str(cderi_file), 1024, (0, 0, 1, 3), 's2', tuple(pair_idx)),
+        mol, auxmol, coeff,
+    )
+    for bar in jax.tree_util.tree_leaves(empty_pullback(np.zeros((auxmol.nao, 0)))):
+        numpy.testing.assert_array_equal(bar, np.zeros_like(bar))

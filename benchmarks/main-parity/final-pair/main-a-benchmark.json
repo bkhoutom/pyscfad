@@ -1,0 +1,600 @@
+{
+  "integral_schedule": "dynamic",
+  "label": "main-a",
+  "variant": "main",
+  "cpu_topology": [
+    {
+      "cpu": 32,
+      "socket": 1,
+      "core": 0,
+      "numa_nodes": [
+        2
+      ]
+    },
+    {
+      "cpu": 33,
+      "socket": 1,
+      "core": 1,
+      "numa_nodes": [
+        2
+      ]
+    },
+    {
+      "cpu": 34,
+      "socket": 1,
+      "core": 2,
+      "numa_nodes": [
+        2
+      ]
+    },
+    {
+      "cpu": 35,
+      "socket": 1,
+      "core": 3,
+      "numa_nodes": [
+        2
+      ]
+    },
+    {
+      "cpu": 36,
+      "socket": 1,
+      "core": 4,
+      "numa_nodes": [
+        2
+      ]
+    },
+    {
+      "cpu": 37,
+      "socket": 1,
+      "core": 5,
+      "numa_nodes": [
+        2
+      ]
+    },
+    {
+      "cpu": 38,
+      "socket": 1,
+      "core": 6,
+      "numa_nodes": [
+        2
+      ]
+    },
+    {
+      "cpu": 39,
+      "socket": 1,
+      "core": 7,
+      "numa_nodes": [
+        2
+      ]
+    },
+    {
+      "cpu": 40,
+      "socket": 1,
+      "core": 8,
+      "numa_nodes": [
+        2
+      ]
+    },
+    {
+      "cpu": 41,
+      "socket": 1,
+      "core": 9,
+      "numa_nodes": [
+        2
+      ]
+    },
+    {
+      "cpu": 42,
+      "socket": 1,
+      "core": 10,
+      "numa_nodes": [
+        2
+      ]
+    },
+    {
+      "cpu": 43,
+      "socket": 1,
+      "core": 11,
+      "numa_nodes": [
+        2
+      ]
+    },
+    {
+      "cpu": 44,
+      "socket": 1,
+      "core": 12,
+      "numa_nodes": [
+        2
+      ]
+    },
+    {
+      "cpu": 45,
+      "socket": 1,
+      "core": 13,
+      "numa_nodes": [
+        2
+      ]
+    },
+    {
+      "cpu": 46,
+      "socket": 1,
+      "core": 14,
+      "numa_nodes": [
+        2
+      ]
+    },
+    {
+      "cpu": 47,
+      "socket": 1,
+      "core": 15,
+      "numa_nodes": [
+        2
+      ]
+    }
+  ],
+  "mode": "benchmark",
+  "job_id": "5766613",
+  "hostname": "hpc-21-31.cm.cluster",
+  "affinity": [
+    32,
+    33,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39,
+    40,
+    41,
+    42,
+    43,
+    44,
+    45,
+    46,
+    47
+  ],
+  "python": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/bin/python",
+  "versions": {
+    "jax": "0.10.2",
+    "jaxlib": "0.10.2",
+    "numpy": "2.4.6",
+    "scipy": "1.17.1",
+    "pyscf": "2.14.0",
+    "nanobind": "3.1.0"
+  },
+  "pyscf_path": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/python3.11/site-packages/pyscf/__init__.py",
+  "pyscfad_path": "/resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfad/__init__.py",
+  "pyscfadlib_path": "/resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/__init__.py",
+  "mkl": "Intel(R) oneAPI Math Kernel Library Version 2024.2.2-Product Build 20240823 for Intel(R) 64 architecture applications",
+  "preconditioner": "upstream automatic",
+  "dependencies": {
+    "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/python3.11/site-packages/pyscf/lib/libcvhf.so": "\tlinux-vdso.so.1 (0x00007ffde359c000)\n\tlibcgto.so => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/python3.11/site-packages/pyscf/lib/libcgto.so (0x00007f6f165f8000)\n\tlibnp_helper.so => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/python3.11/site-packages/pyscf/lib/libnp_helper.so (0x00007f6f165e8000)\n\tlibcint.so => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/python3.11/site-packages/pyscf/lib/deps/lib/libcint.so (0x00007f6f163ac000)\n\tlibmkl_intel_lp64.so.2 => /resnick/software9/spack/opt/spack/linux-rhel9-skylake_avx512/none-none/intel-oneapi-mkl-2024.2.2-vmnjeo2f64yeg54h3dt3bvwmd2pt7m54/mkl/2024.2/lib/libmkl_intel_lp64.so.2 (0x00007f6f154fb000)\n\tlibmkl_sequential.so.2 => /resnick/software9/spack/opt/spack/linux-rhel9-skylake_avx512/none-none/intel-oneapi-mkl-2024.2.2-vmnjeo2f64yeg54h3dt3bvwmd2pt7m54/mkl/2024.2/lib/libmkl_sequential.so.2 (0x00007f6f13fe2000)\n\tlibmkl_core.so.2 => /resnick/software9/spack/opt/spack/linux-rhel9-skylake_avx512/none-none/intel-oneapi-mkl-2024.2.2-vmnjeo2f64yeg54h3dt3bvwmd2pt7m54/mkl/2024.2/lib/libmkl_core.so.2 (0x00007f6f1006d000)\n\tlibm.so.6 => /lib64/libm.so.6 (0x00007f6f0ff7d000)\n\tlibgomp.so.1 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/libgomp.so.1 (0x00007f6f0ff22000)\n\tlibc.so.6 => /lib64/libc.so.6 (0x00007f6f0fc00000)\n\tlibquadmath-96973f99.so.0.0.0 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/python3.11/site-packages/pyscf/lib/deps/lib/../../libquadmath-96973f99.so.0.0.0 (0x00007f6f0f9c3000)\n\tlibdl.so.2 => /lib64/libdl.so.2 (0x00007f6f0ff1b000)\n\tlibpthread.so.0 => /lib64/libpthread.so.0 (0x00007f6f0ff16000)\n\t/lib64/ld-linux-x86-64.so.2 (0x00007f6f1670f000)\n",
+    "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/python3.11/site-packages/pyscf/lib/libmp.so": "\tlinux-vdso.so.1 (0x00007ffded28a000)\n\tlibnp_helper.so => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/python3.11/site-packages/pyscf/lib/libnp_helper.so (0x00007efecf086000)\n\tlibmkl_intel_lp64.so.2 => /resnick/software9/spack/opt/spack/linux-rhel9-skylake_avx512/none-none/intel-oneapi-mkl-2024.2.2-vmnjeo2f64yeg54h3dt3bvwmd2pt7m54/mkl/2024.2/lib/libmkl_intel_lp64.so.2 (0x00007efece1d7000)\n\tlibmkl_sequential.so.2 => /resnick/software9/spack/opt/spack/linux-rhel9-skylake_avx512/none-none/intel-oneapi-mkl-2024.2.2-vmnjeo2f64yeg54h3dt3bvwmd2pt7m54/mkl/2024.2/lib/libmkl_sequential.so.2 (0x00007efecccbe000)\n\tlibmkl_core.so.2 => /resnick/software9/spack/opt/spack/linux-rhel9-skylake_avx512/none-none/intel-oneapi-mkl-2024.2.2-vmnjeo2f64yeg54h3dt3bvwmd2pt7m54/mkl/2024.2/lib/libmkl_core.so.2 (0x00007efec8d47000)\n\tlibm.so.6 => /lib64/libm.so.6 (0x00007efec8c57000)\n\tlibgomp.so.1 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/libgomp.so.1 (0x00007efec8bfc000)\n\tlibc.so.6 => /lib64/libc.so.6 (0x00007efec8800000)\n\tlibdl.so.2 => /lib64/libdl.so.2 (0x00007efec8bf7000)\n\tlibpthread.so.0 => /lib64/libpthread.so.0 (0x00007efec8bf2000)\n\t/lib64/ld-linux-x86-64.so.2 (0x00007efecf09f000)\n",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/libao2mo_vjp.so": "\tlinux-vdso.so.1 (0x00007ffef29cc000)\n\tlibnp_helper_ad.so => /resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/libnp_helper_ad.so (0x00007ff95cb88000)\n\tlibvjp_util.so => /resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/libvjp_util.so (0x00007ff95cb83000)\n\tlibmkl_intel_lp64.so.2 => /resnick/software9/spack/opt/spack/linux-rhel9-skylake_avx512/none-none/intel-oneapi-mkl-2024.2.2-vmnjeo2f64yeg54h3dt3bvwmd2pt7m54/mkl/2024.2/lib/libmkl_intel_lp64.so.2 (0x00007ff95bcd4000)\n\tlibmkl_sequential.so.2 => /resnick/software9/spack/opt/spack/linux-rhel9-skylake_avx512/none-none/intel-oneapi-mkl-2024.2.2-vmnjeo2f64yeg54h3dt3bvwmd2pt7m54/mkl/2024.2/lib/libmkl_sequential.so.2 (0x00007ff95a7b9000)\n\tlibmkl_core.so.2 => /resnick/software9/spack/opt/spack/linux-rhel9-skylake_avx512/none-none/intel-oneapi-mkl-2024.2.2-vmnjeo2f64yeg54h3dt3bvwmd2pt7m54/mkl/2024.2/lib/libmkl_core.so.2 (0x00007ff956844000)\n\tlibm.so.6 => /lib64/libm.so.6 (0x00007ff956754000)\n\tlibgomp.so.1 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/libgomp.so.1 (0x00007ff9566f9000)\n\tlibc.so.6 => /lib64/libc.so.6 (0x00007ff956400000)\n\tlibdl.so.2 => /lib64/libdl.so.2 (0x00007ff9566f2000)\n\tlibpthread.so.0 => /lib64/libpthread.so.0 (0x00007ff9566ed000)\n\t/lib64/ld-linux-x86-64.so.2 (0x00007ff95cb94000)\n",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/libcc_vjp.so": "\tlinux-vdso.so.1 (0x00007ffc24330000)\n\tlibvjp_util.so => /resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/libvjp_util.so (0x00007f4c19486000)\n\tlibmkl_intel_lp64.so.2 => /resnick/software9/spack/opt/spack/linux-rhel9-skylake_avx512/none-none/intel-oneapi-mkl-2024.2.2-vmnjeo2f64yeg54h3dt3bvwmd2pt7m54/mkl/2024.2/lib/libmkl_intel_lp64.so.2 (0x00007f4c185d7000)\n\tlibmkl_sequential.so.2 => /resnick/software9/spack/opt/spack/linux-rhel9-skylake_avx512/none-none/intel-oneapi-mkl-2024.2.2-vmnjeo2f64yeg54h3dt3bvwmd2pt7m54/mkl/2024.2/lib/libmkl_sequential.so.2 (0x00007f4c170be000)\n\tlibmkl_core.so.2 => /resnick/software9/spack/opt/spack/linux-rhel9-skylake_avx512/none-none/intel-oneapi-mkl-2024.2.2-vmnjeo2f64yeg54h3dt3bvwmd2pt7m54/mkl/2024.2/lib/libmkl_core.so.2 (0x00007f4c13147000)\n\tlibm.so.6 => /lib64/libm.so.6 (0x00007f4c13057000)\n\tlibgomp.so.1 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/libgomp.so.1 (0x00007f4c12ffc000)\n\tlibc.so.6 => /lib64/libc.so.6 (0x00007f4c12c00000)\n\tlibdl.so.2 => /lib64/libdl.so.2 (0x00007f4c12ff7000)\n\tlibpthread.so.0 => /lib64/libpthread.so.0 (0x00007f4c12ff2000)\n\t/lib64/ld-linux-x86-64.so.2 (0x00007f4c1949e000)\n",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/libcgto_ad.so": "\tlinux-vdso.so.1 (0x00007ffe16b61000)\n\tlibcintad.so => /resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/thirdparty/lib/libcintad.so (0x00007f0ea75eb000)\n\tlibnp_helper_ad.so => /resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/libnp_helper_ad.so (0x00007f0ea75e6000)\n\tlibmkl_intel_lp64.so.2 => /resnick/software9/spack/opt/spack/linux-rhel9-skylake_avx512/none-none/intel-oneapi-mkl-2024.2.2-vmnjeo2f64yeg54h3dt3bvwmd2pt7m54/mkl/2024.2/lib/libmkl_intel_lp64.so.2 (0x00007f0ea6737000)\n\tlibmkl_sequential.so.2 => /resnick/software9/spack/opt/spack/linux-rhel9-skylake_avx512/none-none/intel-oneapi-mkl-2024.2.2-vmnjeo2f64yeg54h3dt3bvwmd2pt7m54/mkl/2024.2/lib/libmkl_sequential.so.2 (0x00007f0ea521c000)\n\tlibmkl_core.so.2 => /resnick/software9/spack/opt/spack/linux-rhel9-skylake_avx512/none-none/intel-oneapi-mkl-2024.2.2-vmnjeo2f64yeg54h3dt3bvwmd2pt7m54/mkl/2024.2/lib/libmkl_core.so.2 (0x00007f0ea12a7000)\n\tlibm.so.6 => /lib64/libm.so.6 (0x00007f0ea11b7000)\n\tlibgomp.so.1 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/libgomp.so.1 (0x00007f0ea115c000)\n\tlibc.so.6 => /lib64/libc.so.6 (0x00007f0ea0e00000)\n\tlibquadmath.so.0 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/libquadmath.so.0 (0x00007f0ea1111000)\n\tlibdl.so.2 => /lib64/libdl.so.2 (0x00007f0ea110c000)\n\tlibpthread.so.0 => /lib64/libpthread.so.0 (0x00007f0ea1107000)\n\t/lib64/ld-linux-x86-64.so.2 (0x00007f0ea7adc000)\n",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/libcgto_vjp.so": "\tlinux-vdso.so.1 (0x00007fffd25b0000)\n\tlibcgto_ad.so => /resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/libcgto_ad.so (0x00007f9413217000)\n\tlibvjp_util.so => /resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/libvjp_util.so (0x00007f9413212000)\n\tlibcintad.so => /resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/thirdparty/lib/libcintad.so (0x00007f9412dc0000)\n\tlibnp_helper_ad.so => /resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/libnp_helper_ad.so (0x00007f9412db9000)\n\tlibmkl_intel_lp64.so.2 => /resnick/software9/spack/opt/spack/linux-rhel9-skylake_avx512/none-none/intel-oneapi-mkl-2024.2.2-vmnjeo2f64yeg54h3dt3bvwmd2pt7m54/mkl/2024.2/lib/libmkl_intel_lp64.so.2 (0x00007f9411f0a000)\n\tlibmkl_sequential.so.2 => /resnick/software9/spack/opt/spack/linux-rhel9-skylake_avx512/none-none/intel-oneapi-mkl-2024.2.2-vmnjeo2f64yeg54h3dt3bvwmd2pt7m54/mkl/2024.2/lib/libmkl_sequential.so.2 (0x00007f94109f1000)\n\tlibmkl_core.so.2 => /resnick/software9/spack/opt/spack/linux-rhel9-skylake_avx512/none-none/intel-oneapi-mkl-2024.2.2-vmnjeo2f64yeg54h3dt3bvwmd2pt7m54/mkl/2024.2/lib/libmkl_core.so.2 (0x00007f940ca7c000)\n\tlibm.so.6 => /lib64/libm.so.6 (0x00007f940c98c000)\n\tlibgomp.so.1 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/libgomp.so.1 (0x00007f940c931000)\n\tlibc.so.6 => /lib64/libc.so.6 (0x00007f940c600000)\n\tlibquadmath.so.0 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/libquadmath.so.0 (0x00007f940c8e6000)\n\tlibdl.so.2 => /lib64/libdl.so.2 (0x00007f940c8e1000)\n\tlibpthread.so.0 => /lib64/libpthread.so.0 (0x00007f940c8dc000)\n\t/lib64/ld-linux-x86-64.so.2 (0x00007f94132c1000)\n",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/libcvhf_vjp.so": "\tlinux-vdso.so.1 (0x00007ffc23ddc000)\n\tlibnp_helper_ad.so => /resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/libnp_helper_ad.so (0x00007f0b981bb000)\n\tlibvjp_util.so => /resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/libvjp_util.so (0x00007f0b981b6000)\n\tlibmkl_intel_lp64.so.2 => /resnick/software9/spack/opt/spack/linux-rhel9-skylake_avx512/none-none/intel-oneapi-mkl-2024.2.2-vmnjeo2f64yeg54h3dt3bvwmd2pt7m54/mkl/2024.2/lib/libmkl_intel_lp64.so.2 (0x00007f0b97307000)\n\tlibmkl_sequential.so.2 => /resnick/software9/spack/opt/spack/linux-rhel9-skylake_avx512/none-none/intel-oneapi-mkl-2024.2.2-vmnjeo2f64yeg54h3dt3bvwmd2pt7m54/mkl/2024.2/lib/libmkl_sequential.so.2 (0x00007f0b95dec000)\n\tlibmkl_core.so.2 => /resnick/software9/spack/opt/spack/linux-rhel9-skylake_avx512/none-none/intel-oneapi-mkl-2024.2.2-vmnjeo2f64yeg54h3dt3bvwmd2pt7m54/mkl/2024.2/lib/libmkl_core.so.2 (0x00007f0b91e77000)\n\tlibm.so.6 => /lib64/libm.so.6 (0x00007f0b91d87000)\n\tlibgomp.so.1 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/libgomp.so.1 (0x00007f0b91d2c000)\n\tlibc.so.6 => /lib64/libc.so.6 (0x00007f0b91a00000)\n\tlibdl.so.2 => /lib64/libdl.so.2 (0x00007f0b91d25000)\n\tlibpthread.so.0 => /lib64/libpthread.so.0 (0x00007f0b91d20000)\n\t/lib64/ld-linux-x86-64.so.2 (0x00007f0b981c9000)\n",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/libmp_vjp.so": "\tlinux-vdso.so.1 (0x00007ffe8cb36000)\n\tlibmkl_intel_lp64.so.2 => /resnick/software9/spack/opt/spack/linux-rhel9-skylake_avx512/none-none/intel-oneapi-mkl-2024.2.2-vmnjeo2f64yeg54h3dt3bvwmd2pt7m54/mkl/2024.2/lib/libmkl_intel_lp64.so.2 (0x00007f79379be000)\n\tlibmkl_sequential.so.2 => /resnick/software9/spack/opt/spack/linux-rhel9-skylake_avx512/none-none/intel-oneapi-mkl-2024.2.2-vmnjeo2f64yeg54h3dt3bvwmd2pt7m54/mkl/2024.2/lib/libmkl_sequential.so.2 (0x00007f79364a5000)\n\tlibmkl_core.so.2 => /resnick/software9/spack/opt/spack/linux-rhel9-skylake_avx512/none-none/intel-oneapi-mkl-2024.2.2-vmnjeo2f64yeg54h3dt3bvwmd2pt7m54/mkl/2024.2/lib/libmkl_core.so.2 (0x00007f7932530000)\n\tlibm.so.6 => /lib64/libm.so.6 (0x00007f793243e000)\n\tlibgomp.so.1 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/libgomp.so.1 (0x00007f79323e3000)\n\tlibc.so.6 => /lib64/libc.so.6 (0x00007f7932000000)\n\tlibdl.so.2 => /lib64/libdl.so.2 (0x00007f79323de000)\n\tlibpthread.so.0 => /lib64/libpthread.so.0 (0x00007f79323d9000)\n\t/lib64/ld-linux-x86-64.so.2 (0x00007f7938875000)\n",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/libnp_helper_ad.so": "\tlinux-vdso.so.1 (0x00007f87c665f000)\n\tlibgomp.so.1 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/libgomp.so.1 (0x00007f87c65f9000)\n\tlibc.so.6 => /lib64/libc.so.6 (0x00007f87c6200000)\n\tlibdl.so.2 => /lib64/libdl.so.2 (0x00007f87c65df000)\n\tlibpthread.so.0 => /lib64/libpthread.so.0 (0x00007f87c65d8000)\n\t/lib64/ld-linux-x86-64.so.2 (0x00007f87c6661000)\n",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/libnp_helper_vjp.so": "\tlinux-vdso.so.1 (0x00007ffd62bfd000)\n\tlibgomp.so.1 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/libgomp.so.1 (0x00007fd51cbce000)\n\tlibc.so.6 => /lib64/libc.so.6 (0x00007fd51c800000)\n\tlibdl.so.2 => /lib64/libdl.so.2 (0x00007fd51cbb4000)\n\tlibpthread.so.0 => /lib64/libpthread.so.0 (0x00007fd51cbad000)\n\t/lib64/ld-linux-x86-64.so.2 (0x00007fd51cc30000)\n",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/libvjp_util.so": "\tlinux-vdso.so.1 (0x00007ffe2f741000)\n\tlibgomp.so.1 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/libgomp.so.1 (0x00007f2bb2f9a000)\n\tlibc.so.6 => /lib64/libc.so.6 (0x00007f2bb2c00000)\n\tlibdl.so.2 => /lib64/libdl.so.2 (0x00007f2bb2f80000)\n\tlibpthread.so.0 => /lib64/libpthread.so.0 (0x00007f2bb2f79000)\n\t/lib64/ld-linux-x86-64.so.2 (0x00007f2bb2ffc000)\n",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/pyscfad_lapack.cpython-311-x86_64-linux-gnu.so": "\tlinux-vdso.so.1 (0x00007ffe3eb2d000)\n\tlibmkl_intel_lp64.so.2 => /resnick/software9/spack/opt/spack/linux-rhel9-skylake_avx512/none-none/intel-oneapi-mkl-2024.2.2-vmnjeo2f64yeg54h3dt3bvwmd2pt7m54/mkl/2024.2/lib/libmkl_intel_lp64.so.2 (0x00007f7fb1f81000)\n\tlibmkl_sequential.so.2 => /resnick/software9/spack/opt/spack/linux-rhel9-skylake_avx512/none-none/intel-oneapi-mkl-2024.2.2-vmnjeo2f64yeg54h3dt3bvwmd2pt7m54/mkl/2024.2/lib/libmkl_sequential.so.2 (0x00007f7fb0a68000)\n\tlibmkl_core.so.2 => /resnick/software9/spack/opt/spack/linux-rhel9-skylake_avx512/none-none/intel-oneapi-mkl-2024.2.2-vmnjeo2f64yeg54h3dt3bvwmd2pt7m54/mkl/2024.2/lib/libmkl_core.so.2 (0x00007f7facaf3000)\n\tlibm.so.6 => /lib64/libm.so.6 (0x00007f7faca01000)\n\tlibstdc++.so.6 => /lib64/libstdc++.so.6 (0x00007f7fac600000)\n\tlibgcc_s.so.1 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/libgcc_s.so.1 (0x00007f7fac9d3000)\n\tlibc.so.6 => /lib64/libc.so.6 (0x00007f7fac200000)\n\t/lib64/ld-linux-x86-64.so.2 (0x00007f7fb2e59000)\n\tlibdl.so.2 => /lib64/libdl.so.2 (0x00007f7fac9ce000)\n\tlibpthread.so.0 => /lib64/libpthread.so.0 (0x00007f7fac9c9000)\n"
+  },
+  "native_hashes": {
+    "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/python3.11/site-packages/pyscf/lib/libcvhf.so": "2ebdceab95f8d7e4c03221eb0e5d8c4b4ef311ee391a0243cb60d4bd42d98ac4",
+    "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/python3.11/site-packages/pyscf/lib/libmp.so": "63ac4718a830e9a69b4d894b85b2e75b8aca6db38a0d0b861f8a83818a6b35f6",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/libao2mo_vjp.so": "ace47111734cbca23eae0bd9422f7a319bcf2063dfed389d06645322bed6e132",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/libcc_vjp.so": "2c13466f8f94ea509d2348fea2ba59388dc53bc8a9cc50cc908666b25306089f",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/libcgto_ad.so": "36f5ff1d8fbe4d3add8137fd89f4b82d33b7f936cf670a433b573898195961d2",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/libcgto_vjp.so": "aabe71c8d0613cf340339eefa780759b36ab874065b38f7eefc80bd5341669df",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/libcvhf_vjp.so": "4ac2ef607a338385a6b7cbc03a83f14eca8f7895a504fb866b5415fe4badd482",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/libmp_vjp.so": "329e0b9abfd61c7fabee38e4d69f59fe1f3151b9ec693e6e776de002766a8a79",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/libnp_helper_ad.so": "367e5e9da3ab19cab7fc91af09f7f53fd85be71eddd45fc41b9736d57e0683d6",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/libnp_helper_vjp.so": "4fa01fbd49cf7beeb05a899af3ed769bf089eeb7be0cb71aa2aeae96f6c9d1cb",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/libvjp_util.so": "d4bb94719612136be18cf644973a730b766045028aed56c935c4f5f5645362d4",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfadlib/pyscfadlib/pyscfad_lapack.cpython-311-x86_64-linux-gnu.so": "9c2ad18167e7a3a5ed33077afee3b54e9fa3e8e7665fbea381596273359b5c5c"
+  },
+  "source_hashes": {
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfad/mp/dfmp2.py": "e01aa6e7e4880482d9b1ac80ea99ce0e7f828f2f0b4ddf20621ac0b5b7db5bed",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfad/scf/hf.py": "c7861b8a933fe7e49f304cafa6e1160208c9938a2f8306e89beac8eae9a373fe",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfad/df/_df_jk_opt.py": "6a534600218c16c7a2e5566c9f67b8f9fb03f9487a63625f7882cc7e795feb03",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad-main/pyscfad/_src/_config.py": "b04979a0ce3e1ea935e4aeb92d77e76cb8f4dc602eb8df86d91064690d9c56db"
+  },
+  "energy": -1381.3194065620328,
+  "gradient": [
+    [
+      0.027092245283403704,
+      0.17426531543905366,
+      -0.03955106213362747
+    ],
+    [
+      0.002425675029694041,
+      -0.0036853845052351453,
+      0.00662026668132043
+    ],
+    [
+      0.0034412908512098106,
+      -0.0048086136626572795,
+      -0.009609857481100548
+    ],
+    [
+      -0.08547823958152456,
+      -0.07552063800938891,
+      -0.05116967227393676
+    ],
+    [
+      0.004439795216324427,
+      0.044128547923818706,
+      -0.009475356271608532
+    ],
+    [
+      -0.09358366887809488,
+      0.047463415554786614,
+      0.08599240801860475
+    ],
+    [
+      0.0730909545414562,
+      -0.15345645011125164,
+      -0.0486980461133637
+    ],
+    [
+      0.009023701034125864,
+      0.06627409876394097,
+      -0.006281647891666964
+    ],
+    [
+      -0.03855805544279267,
+      0.024540313698904415,
+      -0.008851997879625095
+    ],
+    [
+      0.005238569266909465,
+      -0.05487181581147382,
+      0.006685222187494233
+    ],
+    [
+      -0.00929501753886841,
+      -0.008694041446180023,
+      -0.0011454779432562567
+    ],
+    [
+      0.005641122573472046,
+      0.003878934961287328,
+      -0.0031517084200221035
+    ],
+    [
+      0.002648914329281382,
+      -0.003271689236618691,
+      -0.0009764504461824419
+    ],
+    [
+      0.005259685604383835,
+      -0.006923419388341415,
+      0.0002685654291454398
+    ],
+    [
+      0.007947484775584712,
+      0.04300922739962698,
+      -0.0015111240354377387
+    ],
+    [
+      0.029346109911290164,
+      -0.011613396988011893,
+      -0.06655112904096594
+    ],
+    [
+      0.03372303193965642,
+      -0.04087983475189794,
+      0.01620143407500496
+    ],
+    [
+      0.07756087180435411,
+      0.003240026572885135,
+      0.013320022443579771
+    ],
+    [
+      0.014032498105972735,
+      0.04865637508747067,
+      -0.00593337316420639
+    ],
+    [
+      0.027346012291754374,
+      0.04824782058196231,
+      -0.002224512011293839
+    ],
+    [
+      -0.0034000333306263286,
+      -0.003590864672851607,
+      0.006817165054389784
+    ],
+    [
+      0.0009390440457219817,
+      0.0015671347286214665,
+      -0.003419304830173331
+    ],
+    [
+      -0.0007669621337635935,
+      0.002825442249731358,
+      0.005501006617997017
+    ],
+    [
+      -0.0030734561299621266,
+      -0.0008492838073979048,
+      0.006199538261054016
+    ],
+    [
+      -0.001614144680170071,
+      -0.015565200265571177,
+      -0.0006800327898893732
+    ],
+    [
+      -0.0007780477469044866,
+      -0.0016984319461688102,
+      -0.001347857769003702
+    ],
+    [
+      -0.0008387550560802204,
+      -0.00018610860930240447,
+      -0.002081409674876189
+    ],
+    [
+      -0.009675359679821138,
+      0.005494254762277051,
+      0.013790311907689201
+    ],
+    [
+      -0.060814399050929335,
+      0.0447072868431001,
+      -0.016193547509639417
+    ],
+    [
+      -0.06617214238100666,
+      -0.03528945102995995,
+      -0.0060628965902617404
+    ],
+    [
+      0.06997967448373221,
+      -0.031065901778652316,
+      0.012052551878969031
+    ],
+    [
+      -0.060767059031596515,
+      -0.0448817810840898,
+      0.0026719624969059053
+    ],
+    [
+      -0.0302095632518673,
+      -0.10052067413745336,
+      0.03602781714396475
+    ],
+    [
+      0.06584822282574088,
+      0.03907478667507708,
+      0.07276819207406637
+    ]
+  ],
+  "energy_error": 1.1368683772161603e-12,
+  "gradient_max_error": 3.5571545708990016e-12,
+  "total_seconds": 158.91748328879476,
+  "phase_seconds": {
+    "df_forward": 8.106476031243801,
+    "scf_forward": 48.71969750896096,
+    "mp2_forward": 6.807295057922602,
+    "mp2_pullback": 14.598413728177547,
+    "scf_pullback": 60.611814610660076,
+    "df_pullback": 19.60276709124446
+  },
+  "phase_threadpools": {
+    "df_forward": [
+      {
+        "user_api": "openmp",
+        "internal_api": "openmp",
+        "num_threads": 16,
+        "prefix": "libgomp",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/libgomp.so.1.0.0",
+        "version": null
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 16,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/python3.11/site-packages/scipy.libs/libscipy_openblas-6cdc3b4a.so",
+        "version": "0.3.30",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 1,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/python3.11/site-packages/numpy.libs/libscipy_openblas64_-32a4b2a6.so",
+        "version": "0.3.31.188.0",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      }
+    ],
+    "scf_forward": [
+      {
+        "user_api": "openmp",
+        "internal_api": "openmp",
+        "num_threads": 16,
+        "prefix": "libgomp",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/libgomp.so.1.0.0",
+        "version": null
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 1,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/python3.11/site-packages/scipy.libs/libscipy_openblas-6cdc3b4a.so",
+        "version": "0.3.30",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 1,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/python3.11/site-packages/numpy.libs/libscipy_openblas64_-32a4b2a6.so",
+        "version": "0.3.31.188.0",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      }
+    ],
+    "mp2_forward": [
+      {
+        "user_api": "openmp",
+        "internal_api": "openmp",
+        "num_threads": 16,
+        "prefix": "libgomp",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/libgomp.so.1.0.0",
+        "version": null
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 1,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/python3.11/site-packages/scipy.libs/libscipy_openblas-6cdc3b4a.so",
+        "version": "0.3.30",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 1,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/python3.11/site-packages/numpy.libs/libscipy_openblas64_-32a4b2a6.so",
+        "version": "0.3.31.188.0",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      }
+    ],
+    "mp2_pullback": [
+      {
+        "user_api": "openmp",
+        "internal_api": "openmp",
+        "num_threads": 16,
+        "prefix": "libgomp",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/libgomp.so.1.0.0",
+        "version": null
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 1,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/python3.11/site-packages/scipy.libs/libscipy_openblas-6cdc3b4a.so",
+        "version": "0.3.30",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 1,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/python3.11/site-packages/numpy.libs/libscipy_openblas64_-32a4b2a6.so",
+        "version": "0.3.31.188.0",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      }
+    ],
+    "scf_pullback": [
+      {
+        "user_api": "openmp",
+        "internal_api": "openmp",
+        "num_threads": 16,
+        "prefix": "libgomp",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/libgomp.so.1.0.0",
+        "version": null
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 1,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/python3.11/site-packages/scipy.libs/libscipy_openblas-6cdc3b4a.so",
+        "version": "0.3.30",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 1,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/python3.11/site-packages/numpy.libs/libscipy_openblas64_-32a4b2a6.so",
+        "version": "0.3.31.188.0",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      }
+    ],
+    "df_pullback": [
+      {
+        "user_api": "openmp",
+        "internal_api": "openmp",
+        "num_threads": 16,
+        "prefix": "libgomp",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/libgomp.so.1.0.0",
+        "version": null
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 16,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/python3.11/site-packages/scipy.libs/libscipy_openblas-6cdc3b4a.so",
+        "version": "0.3.30",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      },
+      {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "num_threads": 1,
+        "prefix": "libscipy_openblas",
+        "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/python3.11/site-packages/numpy.libs/libscipy_openblas64_-32a4b2a6.so",
+        "version": "0.3.31.188.0",
+        "threading_layer": "pthreads",
+        "architecture": "SkylakeX"
+      }
+    ]
+  },
+  "threadpools_after": [
+    {
+      "user_api": "openmp",
+      "internal_api": "openmp",
+      "num_threads": 16,
+      "prefix": "libgomp",
+      "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/libgomp.so.1.0.0",
+      "version": null
+    },
+    {
+      "user_api": "blas",
+      "internal_api": "openblas",
+      "num_threads": 1,
+      "prefix": "libscipy_openblas",
+      "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/python3.11/site-packages/scipy.libs/libscipy_openblas-6cdc3b4a.so",
+      "version": "0.3.30",
+      "threading_layer": "pthreads",
+      "architecture": "SkylakeX"
+    },
+    {
+      "user_api": "blas",
+      "internal_api": "openblas",
+      "num_threads": 1,
+      "prefix": "libscipy_openblas",
+      "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_main_env/lib/python3.11/site-packages/numpy.libs/libscipy_openblas64_-32a4b2a6.so",
+      "version": "0.3.31.188.0",
+      "threading_layer": "pthreads",
+      "architecture": "SkylakeX"
+    }
+  ]
+}

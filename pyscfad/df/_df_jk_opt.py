@@ -280,6 +280,46 @@ def _implicit_lowrank_df_k_tolerance():
         return 1e-8
 
 
+def _density_exchange_factors(dm, vk_bar, hermi=1):
+    """Recover signed low-rank exchange seeds outside the implicit solve.
+
+    Adapted from upstream PySCFAD's range-recovery exchange transpose. Every
+    reconstructed seed is checked in full; high-rank, asymmetric, complex,
+    non-finite or unsupported densities retain the dense native transpose.
+    The return factors satisfy Kbar = X Y.T + Y X.T and may be indefinite.
+    """
+    from scipy.linalg import eigh, qr
+
+    seeds = numpy.asarray(vk_bar)
+    if (seeds.dtype != numpy.dtype(numpy.float64) or not numpy.isfinite(seeds).all()
+            or seeds.ndim != 3 or seeds.shape[1] != seeds.shape[2]):
+        return None
+    xs = _density_factors(dm, hermi)
+    if xs is None or len(xs) != len(seeds):
+        return None
+    nao = seeds.shape[-1]
+    tol = nao * numpy.finfo(seeds.dtype).eps
+    rng = numpy.random.default_rng(1)
+    parts = []
+    for seed, density_factor in zip(seeds, xs):
+        nvec = 2 * density_factor.shape[1] + 10
+        if nvec > nao // 2:
+            return None
+        scale = numpy.max(numpy.abs(seed))
+        if numpy.max(numpy.abs(seed - seed.T)) > 10 * tol * scale:
+            return None
+        q = qr(lib.dot(seed, rng.standard_normal((nao, nvec))), mode='economic')[0]
+        w, v = eigh(lib.dot(q.T, lib.dot(seed, q)))
+        selected = numpy.abs(w) > tol * numpy.max(numpy.abs(w))
+        z, w = lib.dot(q, v[:, selected]), w[selected]
+        if numpy.max(numpy.abs(seed - lib.dot(z * w, z.T))) > 10 * tol * scale:
+            return None
+        x = numpy.asarray(z * numpy.sqrt(numpy.abs(w)), order='F')
+        y = numpy.asarray(x * (.5 * numpy.sign(w)), order='F')
+        parts.append((x, y))
+    return tuple(parts)
+
+
 def _implicit_lowrank_exchange_factors(dfobj, vj_bar, vk_bar, hermi,
                                        with_j, with_k):
     """Recover ``vk_bar = R Co.T + Co R.T`` for an RHF response matvec.
@@ -575,6 +615,74 @@ def get_jk_fwd(dfobj, dm, hermi, with_j, with_k, direct_scf_tol):
     return (vj, vk), (dfobj, dm, activity)
 
 
+def _factorized_geometry_bwd(hermi, direct_scf_tol, dfobj, dm, activity,
+                             vj_bar, vk_bar):
+    """Use thin factors only for geometry; retain the full AO-density bar.
+
+    For fixed D=S S.T the coordinate derivative can hold S fixed, but its
+    factor cotangent cannot recover an independent density cotangent. Keep
+    the generic density-only transpose and avoid the AO-pair adjoint file
+    only when the geometry metric solves have fewer columns with S.
+    """
+    from . import df_jk, _df_jk_factorized
+
+    dm_active, _, mol_active, aux_active = activity
+    if (hermi != 1 or not (mol_active or aux_active)
+            or os.environ.get('PYSCFAD_DF_OCCUPIED_VJP', '1').lower()
+            in ('0', 'false', 'no', 'off')
+            or not df_jk._has_outcore_cderi(dfobj)
+            or df_jk._MPI_GET_JK_HOOK.get() is not None):
+        return None
+    density = numpy.asarray(dm)
+    if (density.ndim != 2 or density.shape[0] != density.shape[1]
+            or density.dtype != numpy.float64):
+        return None
+    for obj in (dfobj.mol, dfobj.auxmol):
+        if (getattr(obj, 'coords', None) is None
+                or len(tree_flatten(obj)[0]) != 1
+                or numpy.asarray(obj.coords).dtype != numpy.float64):
+            return None
+    for bar in (vj_bar, vk_bar):
+        if bar is not None:
+            array = numpy.asarray(bar)
+            if (array.shape != density.shape or array.dtype != numpy.float64
+                    or not numpy.isfinite(array).all()):
+                return None
+    factors = _density_factors(_tag_dm_for_fast_exchange(dfobj, dm), hermi)
+    if factors is None or len(factors) != 1:
+        return None
+    S = factors[0]
+    nao, rank = S.shape
+    if rank == 0 or nao * rank >= nao * (nao + 1) // 2:
+        return None
+
+    started = time.perf_counter()
+    with_j, with_k = vj_bar is not None, vk_bar is not None
+    zero = numpy.zeros_like(density)
+    seeds = (vj_bar if with_j else zero, vk_bar if with_k else zero)
+    dm_bar = None
+    if dm_active:
+        # Geometry activity is absent, so this call cannot re-enter here.
+        _, dm_bar = get_jk_bwd(
+            hermi, with_j, with_k, direct_scf_tol,
+            (dfobj, dm, (True, False, False, False)), seeds)
+    density_seconds = time.perf_counter() - started
+    geometry_started = time.perf_counter()
+    geometry_bar, _ = _df_jk_factorized._backward(
+        with_j, with_k, False, (dfobj, S), seeds)
+    df_bar = tree_map(lambda x: None, dfobj)
+    if mol_active:
+        df_bar.mol = geometry_bar.mol
+    if aux_active:
+        df_bar.auxmol = geometry_bar.auxmol
+    _profile_msg(
+        f'get_jk_bwd factorized geometry rank={rank} '
+        f'density={density_seconds:.2f} s '
+        f'geometry={time.perf_counter() - geometry_started:.2f} s '
+        f'done {time.perf_counter() - started:.2f} s')
+    return df_bar, dm_bar
+
+
 def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
                res, ybar, *, coordinate_vjp=None):
     t_bwd = time.perf_counter()
@@ -620,6 +728,12 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
             df_bar._cderi = bars[0]
         return df_bar, bars[-1] if dm_active else None
 
+    if coordinate_vjp is None and not solution_only:
+        factorized = _factorized_geometry_bwd(
+            hermi, direct_scf_tol, dfobj, dm, activity, vj_bar, vk_bar)
+        if factorized is not None:
+            return factorized
+
     log = logger.new_logger(dfobj)
     dms = numpy.asarray(dm)
     dm_shape = dms.shape
@@ -649,8 +763,13 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
                 numpy.asarray(vk_bar).reshape(-1, nao, nao))
     response_factors = None
     if solution_only and dm_active and vj_bar is not None and vk_array is not None:
-        response_factors = _implicit_lowrank_exchange_factors(
+        implicit_factors = _implicit_lowrank_exchange_factors(
             dfobj, vj_bar, vk_array, hermi, with_j, with_k)
+        if implicit_factors is not None:
+            response_factors = (implicit_factors,)
+    elif not solution_only and dm_active and vk_array is not None:
+        response_factors = _density_exchange_factors(
+            _tag_dm_for_fast_exchange(dfobj, dm), vk_array, hermi)
     xs = (_density_factors(_tag_dm_for_fast_exchange(dfobj, dm), hermi)
           if need_eri and vk_array is not None and _DF_VK_VJP_LOWRANK is not None
           else None)
@@ -670,8 +789,8 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
                if dm_active or dense_k else None)
     buf = numpy.empty((blksize, nao, nao)) if dense_k else None
     if response_factors is not None:
-        occ_coeff, response_coeff = response_factors
-        buf_occ = numpy.empty((blksize * occ_coeff.shape[1], nao))
+        rank = max(pair[0].shape[1] for pair in response_factors)
+        buf_occ = numpy.empty((blksize * rank, nao))
         buf_response = numpy.empty_like(buf_occ)
     stream_eri_bar = geometry_active
     eri_bar = numpy.zeros(eri_bar_shape) if return_cderi_bar else None
@@ -702,8 +821,8 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
                     for k in range(nset):
                         dms_bar[k] += dense_dm_bar[k]
                 if need_eri:
-                    eri_blk += (dmtril @ eri1.T).T @ vj_bar_tril
-                    eri_blk += rho_bar.T @ dmtril
+                    lib.dot((dmtril @ eri1.T).T, vj_bar_tril, c=eri_blk, beta=1)
+                    lib.dot(rho_bar.T, dmtril, c=eri_blk, beta=1)
             if vk_array is not None:
                 for k in range(nset):
                     if dense_k:
@@ -734,8 +853,10 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
                                 ctypes.c_int(xs[k].shape[1]))
                         if dm_active:
                             if response_factors is not None:
-                                _df_vk_dm_vjp_lowrank(dms_bar[k], eri1, occ_coeff,
-                                                     response_coeff, buf_occ, buf_response)
+                                occ_coeff, response_coeff = response_factors[k]
+                                if occ_coeff.shape[1]:
+                                    _df_vk_dm_vjp_lowrank(dms_bar[k], eri1, occ_coeff,
+                                                         response_coeff, buf_occ, buf_response)
                             else:
                                 _DF_VK_DM_VJP(
                                     dms_bar[k].ctypes.data_as(ctypes.c_void_p),
@@ -790,51 +911,84 @@ get_jk.defvjp(get_jk_fwd, get_jk_bwd, symbolic_zeros=True)
 
 
 def gen_coulomb_precond(dfobj, orbo, orbv, e_ai):
-    '''For the Coulomb part of the RHF orbital hessian, e + 4 B^T B with
-    B[L,ai] = (L|ai) and e[a,i] = e_a - e_i > 0, returns
-    coul(s) = B^T (1/4 + B e^-1 B^T)^-1 B e^-1 s, so that by the Woodbury
-    identity (e + 4 B^T B)^-1 s = (s - coul(s)) / e. B is not stored:
-    1/4 + B e^-1 B^T is accumulated over blocks of occupied orbitals, and
-    B and B^T are applied as the two halves of a J build, so only the
-    (naux, naux) Cholesky factor is kept.
-    '''
-    # Adapted from upstream PySCFAD (Xing Zhang / The PySCFAD Authors).
+    """Generate the Coulomb part of the RHF orbital Hessian inverse.
+
+    The result obeys ``(e + 4 B.T @ B)^-1 s = (s - coul(s)) / e``.
+    Scaled occupied-virtual factors are retained only when they fit the
+    PYSCFAD_PRECOND_CACHE_MEMORY_MB budget; otherwise applications stream DF.
+    """
     from scipy.linalg import cho_factor, cho_solve
     from pyscf.ao2mo import _ao2mo
+    from pyscfad.lib._threading import dense_blas_threads
 
+    t_setup = time.perf_counter()
     nao, nocc = orbo.shape
     nvir = orbv.shape[1]
     naux = dfobj.get_naoaux()
-    kmat = numpy.eye(naux) * .25
+    try:
+        budget_mb = float(os.environ.get('PYSCFAD_PRECOND_CACHE_MEMORY_MB', '1024'))
+        if not numpy.isfinite(budget_mb) or budget_mb < 0:
+            budget_mb = 1024.
+    except ValueError:
+        budget_mb = 1024.
     max_memory = dfobj.max_memory - lib.current_memory()[0]
+    cache_limit = min(budget_mb * 1024**2, .3 * max(max_memory, 0) * 1e6)
+    cache_bytes = naux * nvir * nocc * numpy.dtype(numpy.float64).itemsize
+    use_cache = cache_bytes > 0 and cache_bytes <= cache_limit
+    cached = numpy.empty((naux, nvir, nocc)) if use_cache else None
+    sqrt_e = numpy.sqrt(e_ai)
+    kmat = numpy.eye(naux) * .25
     blksize = max(4, min(nocc, int(max_memory*.3e6/8/(naux*nvir))))
     for i0, i1 in lib.prange(0, nocc, blksize):
         mo = numpy.asarray(numpy.hstack((orbv, orbo[:,i0:i1])), order='F')
         bov = numpy.empty((naux, nvir*(i1-i0)))
         p1 = 0
+        eri1 = None
         for eri1 in dfobj.loop():
             p0, p1 = p1, p1 + eri1.shape[0]
             _ao2mo.nr_e2(eri1, mo, (0,nvir,nvir,nvir+i1-i0), aosym='s2',
                          mosym='s1', out=bov[p0:p1])
-        bov /= numpy.sqrt(e_ai[:,i0:i1]).ravel()
-        lib.dot(bov, bov.T, c=kmat, beta=1)
-        bov = None
-    # NOTE the inverse, so that coul runs on lib.dot only (scipy's BLAS
-    # threads compete with those of lib.dot)
-    kmat = cho_solve(cho_factor(kmat), numpy.eye(naux))
+        bov /= sqrt_e[:,i0:i1].ravel()
+        if cached is not None:
+            cached[:,:,i0:i1] = bov.reshape(naux, nvir, i1-i0)
+        with dense_blas_threads():
+            kmat += bov @ bov.T
+        bov = mo = eri1 = None
+    with dense_blas_threads():
+        kmat = cho_solve(cho_factor(kmat), numpy.eye(naux))
+    if cached is not None:
+        cached = cached.reshape(naux, -1)
+    _profile_msg(f'coulomb preconditioner setup cache={use_cache} '
+                 f'cache_mib={cache_bytes / 1024**2:.2f} '
+                 f'budget_mib={budget_mb:.2f} limit_mib={cache_limit / 1024**2:.2f} '
+                 f'elapsed={time.perf_counter() - t_setup:.2f} s')
 
     idx = numpy.arange(nao)
+    count = 0
     def coul(s):
-        # B e^-1 s, with the density orbv (s/e) orbo^T as in a J build
-        x = lib.dot(lib.dot(orbv, s/e_ai), orbo.T)
-        xtril = lib.pack_tril(x + x.T)
-        xtril[idx*(idx+1)//2+idx] *= .5
-        rho = numpy.vstack([lib.dot(eri1, xtril[:,None]) for eri1 in dfobj.loop()])
-        rho = lib.dot(kmat, rho)
-        vtril = numpy.zeros((nao*(nao+1)//2,1))
-        p1 = 0
-        for eri1 in dfobj.loop():
-            p0, p1 = p1, p1 + eri1.shape[0]
-            lib.dot(eri1.T, rho[p0:p1], c=vtril, beta=1)
-        return lib.dot(orbv.T, lib.dot(lib.unpack_tril(vtril[:,0]), orbo))
+        nonlocal count
+        t_apply = time.perf_counter()
+        count += 1
+        if cached is not None:
+            with dense_blas_threads():
+                rho = cached @ (s / sqrt_e).ravel()
+                rho = kmat @ rho
+                result = (cached.T @ rho).reshape(nvir, nocc) * sqrt_e
+        else:
+            # B e^-1 s and B.T rho are the two halves of a streamed J build.
+            x = lib.dot(lib.dot(orbv, s/e_ai), orbo.T)
+            xtril = lib.pack_tril(x + x.T)
+            xtril[idx*(idx+1)//2+idx] *= .5
+            rho = numpy.vstack([lib.dot(eri1, xtril[:,None]) for eri1 in dfobj.loop()])
+            with dense_blas_threads():
+                rho = kmat @ rho
+            vtril = numpy.zeros((nao*(nao+1)//2,1))
+            p1 = 0
+            for eri1 in dfobj.loop():
+                p0, p1 = p1, p1 + eri1.shape[0]
+                lib.dot(eri1.T, rho[p0:p1], c=vtril, beta=1)
+            result = lib.dot(orbv.T, lib.dot(lib.unpack_tril(vtril[:,0]), orbo))
+        _profile_msg(f'coulomb preconditioner apply count={count} cache={use_cache} '
+                     f'elapsed={time.perf_counter() - t_apply:.2f} s')
+        return result
     return coul

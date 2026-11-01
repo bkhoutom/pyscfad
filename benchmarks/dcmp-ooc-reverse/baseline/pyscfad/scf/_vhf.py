@@ -1,0 +1,214 @@
+# Copyright 2021-2025 Xing Zhang
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from functools import lru_cache, partial
+import ctypes
+import jax
+import jax.numpy as jnp
+import numpy
+from jax import custom_vjp
+from jax.interpreters import ad as jax_ad
+from pyscf.scf import _vhf
+from pyscfadlib import libcvhf_vjp as libcvhf
+
+def incore(eri, dms, hermi=0, with_j=True, with_k=True):
+    vj = vk = None
+    if _has_jvp_tracer(eri, dms):
+        if with_j:
+            vj = _get_j_jax(eri, dms, hermi=hermi)
+        if with_k:
+            vk = _get_k_jax(eri, dms, hermi=hermi)
+        return vj, vk
+    if with_j:
+        vj = _get_j(eri, dms, hermi=hermi)
+    if with_k:
+        vk = _get_k(eri, dms, hermi=hermi)
+    return vj, vk
+
+
+@lru_cache(maxsize=None)
+def _s4_pair_index(nao):
+    pair = numpy.empty((nao, nao), dtype=numpy.int64)
+    ij = 0
+    for i in range(nao):
+        for j in range(i + 1):
+            pair[i, j] = ij
+            pair[j, i] = ij
+            ij += 1
+    return pair
+
+
+def _s4_to_s1_jax(eri, nao):
+    pair = jnp.asarray(_s4_pair_index(nao))
+    return eri[pair[:, :, None, None], pair[None, None, :, :]]
+
+
+def _get_j_jax(eri, dms, hermi=0):
+    del hermi
+    nao = dms.shape[-1]
+    eri = _s4_to_s1_jax(jnp.asarray(eri), nao)
+    return jnp.einsum('ijkl,...ji->...kl', eri, dms)
+
+
+def _get_k_jax(eri, dms, hermi=0):
+    del hermi
+    nao = dms.shape[-1]
+    eri = _s4_to_s1_jax(jnp.asarray(eri), nao)
+    return jnp.einsum('ijkl,...jk->...il', eri, dms)
+
+
+def _has_tracer(*xs):
+    return any(isinstance(x, jax.core.Tracer) for x in xs)
+
+
+def _has_jvp_tracer(*xs):
+    return any(_contains_jvp_tracer(x) for x in xs)
+
+
+def _contains_jvp_tracer(x):
+    if isinstance(x, jax_ad.JVPTracer):
+        return True
+    for attr in ('primal', 'val'):
+        if hasattr(x, attr):
+            try:
+                if _contains_jvp_tracer(getattr(x, attr)):
+                    return True
+            except AttributeError:
+                pass
+    return False
+
+
+def _jax_bwd(fun, hermi, eri, dms, vjk_bar):
+    _, vjp = jax.vjp(lambda eri_, dms_: fun(eri_, dms_, hermi), eri, dms)
+    return vjp(vjk_bar)
+
+
+@partial(custom_vjp, nondiff_argnums=(2,))
+def _get_j(eri, dms, hermi=0):
+    if _has_tracer(eri, dms):
+        return _get_j_jax(eri, dms, hermi=hermi)
+
+    nao = dms.shape[-1]
+    npair = nao*(nao+1)//2
+    if eri.ndim == 2 and eri.size == npair*npair:
+        vj, _ = _vhf.incore(eri, dms, hermi=hermi,
+                             with_j=True, with_k=False)
+    else:
+        raise NotImplementedError
+    return vj
+
+def _get_j_fwd(eri, dms, hermi):
+    return _get_j(eri, dms, hermi), (eri, dms)
+
+def _get_j_bwd(hermi, res, vjk_bar):
+    #t0 = (logger.process_clock(), logger.perf_counter())
+    eri, dms = res
+    if _has_tracer(eri, dms, vjk_bar):
+        return _jax_bwd(_get_j_jax, hermi, eri, dms, vjk_bar)
+
+    eri = numpy.asarray(eri, order='C', dtype=numpy.double)
+    dms = numpy.asarray(dms, order='C', dtype=numpy.double)
+
+    dms_shape = dms.shape
+    nao = dms_shape[-1]
+    dms = dms.reshape(-1,nao,nao)
+    ndm = dms.shape[0]
+
+    vjk_bar = numpy.asarray(vjk_bar, order='C', dtype=numpy.double)
+    vjk_bar = vjk_bar.reshape(dms.shape)
+
+    vjp_dms = numpy.zeros_like(dms, order='C', dtype=numpy.double)
+    fdrv = getattr(libcvhf, 'CVHFnrs4_incore_dms_vjp')
+    fvjk = getattr(libcvhf, 'CVHFics4_vj_dms_deriv')
+
+    fdrv(vjp_dms.ctypes.data_as(ctypes.c_void_p),
+         eri.ctypes.data_as(ctypes.c_void_p),
+         vjk_bar.ctypes.data_as(ctypes.c_void_p),
+         ctypes.c_int(ndm), ctypes.c_int(nao), fvjk)
+    vjp_dms = vjp_dms.reshape(dms_shape)
+
+    vjp_eri = numpy.zeros_like(eri, order='C', dtype=numpy.double)
+    fdrv = getattr(libcvhf, 'CVHFnrs4_incore_eri_vjp')
+    fvjk = getattr(libcvhf, 'CVHFics4_vj_eri_deriv')
+    fdrv(vjp_eri.ctypes.data_as(ctypes.c_void_p),
+         dms.ctypes.data_as(ctypes.c_void_p),
+         vjk_bar.ctypes.data_as(ctypes.c_void_p),
+         ctypes.c_int(ndm), ctypes.c_int(nao), fvjk)
+    #t1 = (logger.process_clock(), logger.perf_counter())
+    #print('    CPU time for %s %9.2f sec, wall time %9.2f sec'
+    #              % ('_get_j_bwd', t1[0]-t0[0], t1[1]-t0[1]))
+    return vjp_eri, vjp_dms
+
+_get_j.defvjp(_get_j_fwd, _get_j_bwd)
+
+
+@partial(custom_vjp, nondiff_argnums=(2,))
+def _get_k(eri, dms, hermi=0):
+    if _has_tracer(eri, dms):
+        return _get_k_jax(eri, dms, hermi=hermi)
+
+    nao = dms.shape[-1]
+    npair = nao*(nao+1)//2
+    if eri.ndim == 2 and eri.size == npair*npair:
+        _, vk = _vhf.incore(eri, dms, hermi=hermi,
+                             with_j=False, with_k=True)
+    else:
+        raise NotImplementedError
+    return vk
+
+def _get_k_fwd(eri, dms, hermi):
+    return _get_k(eri, dms, hermi), (eri, dms)
+
+def _get_k_bwd(hermi, res, vjk_bar):
+    #t0 = (logger.process_clock(), logger.perf_counter())
+    eri, dms = res
+    if _has_tracer(eri, dms, vjk_bar):
+        return _jax_bwd(_get_k_jax, hermi, eri, dms, vjk_bar)
+
+    eri = numpy.asarray(eri, order='C', dtype=numpy.double)
+    dms = numpy.asarray(dms, order='C', dtype=numpy.double)
+
+    dms_shape = dms.shape
+    nao = dms_shape[-1]
+    dms = dms.reshape(-1,nao,nao)
+    ndm = dms.shape[0]
+
+    vjk_bar = vjk_bar.reshape(dms.shape)
+    if hermi != 0:
+        tmp = .5 * (vjk_bar + vjk_bar.transpose(0,2,1))
+    vjk_bar = numpy.asarray(vjk_bar, order='C', dtype=numpy.double)
+
+    vjp_dms = numpy.zeros_like(dms, order='C', dtype=numpy.double)
+    fdrv = getattr(libcvhf, 'CVHFnrs4_incore_dms_vjp')
+    fvjk = getattr(libcvhf, 'CVHFics4_vk_dms_deriv')
+
+    fdrv(vjp_dms.ctypes.data_as(ctypes.c_void_p),
+         eri.ctypes.data_as(ctypes.c_void_p),
+         vjk_bar.ctypes.data_as(ctypes.c_void_p),
+         ctypes.c_int(ndm), ctypes.c_int(nao), fvjk)
+    vjp_dms = vjp_dms.reshape(dms_shape)
+
+    vjp_eri = numpy.zeros_like(eri, order='C', dtype=numpy.double)
+    fdrv = getattr(libcvhf, 'CVHFnrs4_incore_eri_vjp')
+    fvjk = getattr(libcvhf, 'CVHFics4_vk_eri_deriv')
+    fdrv(vjp_eri.ctypes.data_as(ctypes.c_void_p),
+         dms.ctypes.data_as(ctypes.c_void_p),
+         vjk_bar.ctypes.data_as(ctypes.c_void_p),
+         ctypes.c_int(ndm), ctypes.c_int(nao), fvjk)
+    #t1 = (logger.process_clock(), logger.perf_counter())
+    #print('    CPU time for %s %9.2f sec, wall time %9.2f sec'
+    #              % ('_get_k_bwd', t1[0]-t0[0], t1[1]-t0[1]))
+    return vjp_eri, vjp_dms
+
+_get_k.defvjp(_get_k_fwd, _get_k_bwd)

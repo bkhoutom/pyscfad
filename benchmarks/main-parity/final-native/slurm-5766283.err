@@ -1,0 +1,2 @@
+/resnick/groups/sharmagroup/bkhou/src/pyscfad/benchmarks/pyscfad_mkl/candidate/pyscf/gto/mole.py:1291: UserWarning: Function mol.dumps drops attribute coords because it is not JSON-serializable
+  warnings.warn(msg)

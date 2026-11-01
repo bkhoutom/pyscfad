@@ -1,0 +1,1183 @@
+--- a/pyscfad/df/_cderi_vjp.py
++++ b/pyscfad/df/_cderi_vjp.py
+@@ -1521,8 +1521,8 @@
+     return out
+ 
+ 
+-def _int3c_ip1_mo_density_contractions(ints, mo_k, mo_l, z_blk):
+-    """Contract one ``int3c_ip1`` block for both coordinate centres.
++def _int3c_mo_physical_density(mo_k, mo_l, z_blk):
++    """Form the density containing both AO derivative legs.
+ 
+     For each auxiliary function, form
+ 
+@@ -1546,18 +1546,29 @@
+     """
+     kc = int(mo_k.shape[1])
+     lc = int(mo_l.shape[1])
+-    if kc <= lc:
+-        # Contract the large l space before forming the AO-square object, so
+-        # the latter contraction is over k.
+-        tmp = pyscf_lib.einsum('pkl,vl->pkv', z_blk, mo_l)
+-        density = pyscf_lib.einsum('uk,pkv->puv', mo_k, tmp)
+-    else:
+-        # The transposed order makes the AO-square contraction run over l.
+-        tmp = pyscf_lib.einsum('uk,pkl->pul', mo_k, z_blk)
+-        density = pyscf_lib.einsum('pul,vl->puv', tmp, mo_l)
++    naux = int(z_blk.shape[0])
++    nao = int(mo_k.shape[0])
++    with dense_blas_threads():
++        if kc <= lc:
++            # Contract the large l space before forming the AO-square object.
++            # Flatten auxiliary panels so each contraction is one NumPy GEMM.
++            tmp = (z_blk.reshape(-1, lc) @ mo_l.T).reshape(naux, kc, nao)
++            density = (
++                tmp.transpose(0, 2, 1).reshape(-1, kc) @ mo_k.T
++            ).reshape(naux, nao, nao).swapaxes(1, 2)
++        else:
++            # Make the AO-square contraction run over the smaller l space.
++            tmp = (
++                z_blk.transpose(0, 2, 1).reshape(-1, kc) @ mo_k.T
++            ).reshape(naux, lc, nao).transpose(0, 2, 1)
++            density = (tmp.reshape(-1, lc) @ mo_l.T).reshape(naux, nao, nao)
+     tmp = None
+-
+-    density = density + density.swapaxes(1, 2)
++    return density + density.swapaxes(1, 2)
++
++
++def _int3c_ip1_mo_density_contractions(ints, mo_k, mo_l, z_blk):
++    """Contract one explicit ``int3c_ip1`` block for both coordinate centres."""
++    density = _int3c_mo_physical_density(mo_k, mo_l, z_blk)
+     per_aux_ao = numpy.einsum('puv,xuvp->pux', density, ints)
+     return per_aux_ao.sum(axis=0), per_aux_ao.sum(axis=1)
+ 
+@@ -1637,76 +1648,131 @@
+     aux_loc = auxmol.ao_loc
+     aux_ranges = balance_partition(aux_loc, blksize)
+ 
++    # The native packed driver differentiates both AO legs and contracts
++    # directly into atomic coordinates. Keep the explicit derivative route
++    # for inputs that cannot be represented by its real symmetric bars.
++    native_supported = (
++        int3c in ('int3c2e', mol._add_suffix('int3c2e'))
++        and all(obj.coords is not None
++                and obj.exp is None and obj.ctr_coeff is None and obj.r0 is None
++                for obj in (mol, auxmol))
++        and not any(isinstance(leaf, jax.core.Tracer)
++                    for leaf in tree_flatten((mol, auxmol))[0])
++        and (read_density_aux_block is not None
++             or (mo_k.dtype == numpy.float64 and mo_l.dtype == numpy.float64))
++        and (z_dtype is None or numpy.dtype(z_dtype) == numpy.float64)
++    )
+     int3c_ip1 = int3c.replace('int3c2e', 'int3c2e_ip1')
+     mol_ao_bar = None
+     aux_ao_bar = None
+-
+-    def contract_aux_range(read0, read1, ints):
+-        nonlocal mol_ao_bar, aux_ao_bar
+-        if read_density_aux_block is None:
+-            z_blk = numpy.asarray(read_z_aux_block(read0, read1))
+-            expected_shape = (read1 - read0, kc * lc)
+-            if z_blk.shape != expected_shape:
+-                raise ValueError(
+-                    'z auxiliary block has incompatible shape: '
+-                    f'got {z_blk.shape}, expected {expected_shape}'
+-                )
+-            z_blk = z_blk.reshape(read1 - read0, kc, lc)
+-            mol_contraction, aux_contraction = \
+-                _int3c_ip1_mo_density_contractions(ints, mo_k, mo_l, z_blk)
+-            dtype = z_blk.dtype
+-        else:
+-            density = numpy.asarray(read_density_aux_block(read0, read1))
+-            expected_shape = (read1 - read0, nao, nao)
+-            if density.shape != expected_shape:
+-                raise ValueError(f'density block {density.shape}, expected {expected_shape}')
+-            per_aux_ao = numpy.einsum('puv,xuvp->pux', density, ints)
+-            mol_contraction = per_aux_ao.sum(axis=0)
+-            aux_contraction = per_aux_ao.sum(axis=1)
+-            dtype = density.dtype
+-        if mol_ao_bar is None:
+-            mol_ao_bar = numpy.zeros((nao, 3), dtype=dtype)
+-            aux_ao_bar = numpy.zeros((naux, 3), dtype=dtype)
+-        mol_ao_bar -= mol_contraction
+-        # The libcint ``ip1`` convention carries the same leading minus sign
+-        # as the former explicit ``ip2`` path.  Translational invariance
+-        # reverses the auxiliary-centre contribution.
+-        aux_ao_bar[read0:read1] += aux_contraction
++    mol_native_bar = numpy.zeros((mol.natm, 3))
++    aux_native_bar = numpy.zeros((auxmol.natm, 3))
++    npair = nao * (nao + 1) // 2
++    diagonal = numpy.arange(nao)
++    diagonal = diagonal * (diagonal + 3) // 2
++    profile = _profile_enabled()
++    density_seconds = native_seconds = fallback_seconds = 0.0
++    native_blocks = fallback_blocks = 0
+ 
+     for shl0, shl1, _ in aux_ranges:
+         p0, p1 = int(aux_loc[shl0]), int(aux_loc[shl1])
+         shls_slice = (0, nbas, 0, nbas, nbas + shl0, nbas + shl1)
+-        ints = _int3c_cross_opt.int3c_cross(
+-            mol, auxmol, intor=int3c_ip1, comp=3, aosym='s1',
+-            shls_slice=shls_slice,
+-        )
+-        ints = numpy.asarray(ints)
+-        if z_aux_block_max_rows is None or p1 - p0 <= z_aux_block_max_rows:
+-            contract_aux_range(p0, p1, ints)
+-        else:
+-            # Shell granularity can exceed the requested row cap.  The shell
+-            # integral is still generated once, then sliced into disjoint
+-            # logical blocks paired one-for-one with bounded z reads.
+-            for read0, read1 in _iter_auxiliary_subranges(
+-                    p0, p1, z_aux_block_max_rows):
+-                int0 = read0 - p0
+-                int1 = read1 - p0
+-                contract_aux_range(
+-                    read0, read1, ints[..., int0:int1]
+-                )
++        packed = ints = None
++        max_rows = p1 - p0 if z_aux_block_max_rows is None else z_aux_block_max_rows
++        for read0, read1 in _iter_auxiliary_subranges(p0, p1, max_rows):
++            started = time.perf_counter() if profile else 0.0
++            if read_density_aux_block is None:
++                z_blk = numpy.asarray(read_z_aux_block(read0, read1))
++                expected_shape = (read1 - read0, kc * lc)
++                if z_blk.shape != expected_shape:
++                    raise ValueError(
++                        'z auxiliary block has incompatible shape: '
++                        f'got {z_blk.shape}, expected {expected_shape}'
++                    )
++                dtype = z_blk.dtype
++                density = _int3c_mo_physical_density(
++                    mo_k, mo_l, z_blk.reshape(read1 - read0, kc, lc))
++                z_blk = None
++            else:
++                density = numpy.asarray(read_density_aux_block(read0, read1))
++                expected_shape = (read1 - read0, nao, nao)
++                if density.shape != expected_shape:
++                    raise ValueError(
++                        f'density block {density.shape}, expected {expected_shape}')
++                dtype = density.dtype
++            use_native = (
++                native_supported and dtype == numpy.float64
++                and density.dtype == numpy.float64
++                and (read_density_aux_block is None
++                     or numpy.array_equal(density, density.swapaxes(1, 2)))
++            )
++            int0, int1 = read0 - p0, read1 - p0
++            if use_native:
++                if packed is None:
++                    # The driver requires whole shells. Even when one shell
++                    # exceeds the reader cap, only its packed rows persist;
++                    # physical AO-square densities obey the reader row cap.
++                    packed = numpy.zeros((p1 - p0, npair))
++                packed[int0:int1] = pyscf_lib.pack_tril(density)
++                # Density already contains both legs; native diagonal pairs
++                # also count both legs, so their cotangent needs half weight.
++                packed[int0:int1, diagonal] *= 0.5
++                if profile:
++                    density_seconds += time.perf_counter() - started
++            else:
++                if profile:
++                    density_seconds += time.perf_counter() - started
++                    started = time.perf_counter()
++                if ints is None:
++                    ints = numpy.asarray(_int3c_cross_opt.int3c_cross(
++                        mol, auxmol, intor=int3c_ip1, comp=3, aosym='s1',
++                        shls_slice=shls_slice))
++                    fallback_blocks += 1
++                per_aux_ao = numpy.einsum(
++                    'puv,xuvp->pux', density, ints[..., int0:int1])
++                if mol_ao_bar is None:
++                    mol_ao_bar = numpy.zeros((nao, 3), dtype=dtype)
++                    aux_ao_bar = numpy.zeros((naux, 3), dtype=dtype)
++                mol_ao_bar -= per_aux_ao.sum(axis=0)
++                aux_ao_bar[read0:read1] += per_aux_ao.sum(axis=1)
++                per_aux_ao = None
++                if profile:
++                    fallback_seconds += time.perf_counter() - started
++            density = None
+         ints = None
+-
+-    if mol_ao_bar is None:
++        if packed is not None:
++            started = time.perf_counter() if profile else 0.0
++            mol_block, aux_block = _int3c_cross_opt.int3c_cross_bwd(
++                int3c, 1, 's2ij', shls_slice, None,
++                (mol, auxmol), packed.T)
++            mol_native_bar += numpy.asarray(mol_block.coords)
++            aux_native_bar += numpy.asarray(aux_block.coords)
++            native_blocks += 1
++            if profile:
++                native_seconds += time.perf_counter() - started
++        packed = None
++
++    if mol_ao_bar is not None:
++        mol_coords = _ao_to_atom_coords_bar(mol, mol_ao_bar)
++        aux_coords = _ao_to_atom_coords_bar(auxmol, aux_ao_bar)
++        if native_blocks:
++            mol_coords = mol_coords + mol_native_bar
++            aux_coords = aux_coords + aux_native_bar
++    elif not native_blocks:
+         if z_dtype is None:
+             z_dtype = numpy.asarray(mo_coeff).dtype
+-        mol_ao_bar = numpy.zeros((nao, 3), dtype=z_dtype)
+-        aux_ao_bar = numpy.zeros((naux, 3), dtype=z_dtype)
+-
+-    mol_bar = _coords_tree_like(mol, _ao_to_atom_coords_bar(mol, mol_ao_bar))
+-    auxmol_bar = _coords_tree_like(
+-        auxmol, _ao_to_atom_coords_bar(auxmol, aux_ao_bar)
+-    )
+-    return mol_bar, auxmol_bar
++        mol_coords = numpy.zeros((mol.natm, 3), dtype=z_dtype)
++        aux_coords = numpy.zeros((auxmol.natm, 3), dtype=z_dtype)
++    else:
++        mol_coords, aux_coords = mol_native_bar, aux_native_bar
++    if profile:
++        _profile_msg(
++            'int3c coordinate reverse '
++            f'density_pack={density_seconds:.6f} s '
++            f'native_contract={native_seconds:.6f} s '
++            f'explicit_contract={fallback_seconds:.6f} s '
++            f'native_blocks={native_blocks} explicit_blocks={fallback_blocks}')
++    return _coords_tree_like(mol, mol_coords), _coords_tree_like(auxmol, aux_coords)
+ 
+ 
+ def _int3c_mo_deriv_coords_vjp(mol, auxmol, mo_coeff, z,
+--- a/pyscfad/df/_df_jk_factorized.py
++++ b/pyscfad/df/_df_jk_factorized.py
+@@ -154,13 +154,42 @@
+     with dense_blas_threads():
+         D = S @ S.T
+ 
++    # For real symmetric J inputs, form 2 K + J and symmetrize once at the
++    # end. This avoids repeated full-density copies and broadcast products.
++    # Keep the original arithmetic for other dtypes or nonexact symmetry;
++    # hermi_sum must not introduce conjugation into those cases.
++    fused_density = (
++        all(x.dtype == numpy.float64 for x in (S, G, H, D))
++        and (not with_j or (numpy.array_equal(G, G.T)
++                            and numpy.array_equal(D, D.T))))
++    doubled_st = (numpy.ascontiguousarray(2 * S.T)
++                  if fused_density and with_k else None)
++    jd_columns = (numpy.asfortranarray(numpy.stack((G.ravel(), D.ravel()), axis=1))
++                  if fused_density and with_j else None)
++
+     def read_density(begin, end):
+         # The coordinate integral contracts both AO legs. Supply 2 Z, where
+         # Z=L^-T A is the symmetric raw-integral adjoint.
++        if fused_density:
++            with dense_blas_threads():
++                if with_k:
++                    panel = numpy.asarray(Rtilde[begin:end]).reshape(-1, rank)
++                    density = (panel @ doubled_st).reshape(end - begin, nao, nao)
++                else:
++                    density = numpy.zeros((end - begin, nao, nao))
++                if with_j:
++                    coefficients = numpy.array((a[begin:end], b[begin:end]), order='F')
++                    updated = scipy.linalg.blas.dgemm(
++                        1., jd_columns, coefficients, beta=1.,
++                        c=density.reshape(end - begin, -1).T, overwrite_c=1)
++                    # BLAS may copy its output argument; always use its return.
++                    density = updated.T.reshape(end - begin, nao, nao)
++            return lib.hermi_sum(density, axes=(0, 2, 1), inplace=True)
+         with dense_blas_threads():
+             if with_k:
+                 panel = numpy.asarray(Rtilde[begin:end]).reshape(end - begin, nao, rank)
+-                density = panel @ S.T
++                density = (panel.reshape(-1, rank) @ S.T).reshape(
++                    end - begin, nao, nao)
+                 density += density.swapaxes(1, 2).copy()
+             else:
+                 density = numpy.zeros((end - begin, nao, nao))
+--- a/pyscfad/df/_df_jk_opt.py
++++ b/pyscfad/df/_df_jk_opt.py
+@@ -613,6 +613,74 @@
+     dfobj, dm, activity = _unwrap_jk_primals(dfobj, dm)
+     vj, vk = get_jk(dfobj, dm, hermi, with_j, with_k, direct_scf_tol)
+     return (vj, vk), (dfobj, dm, activity)
++
++
++def _factorized_geometry_bwd(hermi, direct_scf_tol, dfobj, dm, activity,
++                             vj_bar, vk_bar):
++    """Use thin factors only for geometry; retain the full AO-density bar.
++
++    For fixed D=S S.T the coordinate derivative can hold S fixed, but its
++    factor cotangent cannot recover an independent density cotangent. Keep
++    the generic density-only transpose and avoid the AO-pair adjoint file
++    only when the geometry metric solves have fewer columns with S.
++    """
++    from . import df_jk, _df_jk_factorized
++
++    dm_active, _, mol_active, aux_active = activity
++    if (hermi != 1 or not (mol_active or aux_active)
++            or os.environ.get('PYSCFAD_DF_OCCUPIED_VJP', '1').lower()
++            in ('0', 'false', 'no', 'off')
++            or not df_jk._has_outcore_cderi(dfobj)
++            or df_jk._MPI_GET_JK_HOOK.get() is not None):
++        return None
++    density = numpy.asarray(dm)
++    if (density.ndim != 2 or density.shape[0] != density.shape[1]
++            or density.dtype != numpy.float64):
++        return None
++    for obj in (dfobj.mol, dfobj.auxmol):
++        if (getattr(obj, 'coords', None) is None
++                or len(tree_flatten(obj)[0]) != 1
++                or numpy.asarray(obj.coords).dtype != numpy.float64):
++            return None
++    for bar in (vj_bar, vk_bar):
++        if bar is not None:
++            array = numpy.asarray(bar)
++            if (array.shape != density.shape or array.dtype != numpy.float64
++                    or not numpy.isfinite(array).all()):
++                return None
++    factors = _density_factors(_tag_dm_for_fast_exchange(dfobj, dm), hermi)
++    if factors is None or len(factors) != 1:
++        return None
++    S = factors[0]
++    nao, rank = S.shape
++    if rank == 0 or nao * rank >= nao * (nao + 1) // 2:
++        return None
++
++    started = time.perf_counter()
++    with_j, with_k = vj_bar is not None, vk_bar is not None
++    zero = numpy.zeros_like(density)
++    seeds = (vj_bar if with_j else zero, vk_bar if with_k else zero)
++    dm_bar = None
++    if dm_active:
++        # Geometry activity is absent, so this call cannot re-enter here.
++        _, dm_bar = get_jk_bwd(
++            hermi, with_j, with_k, direct_scf_tol,
++            (dfobj, dm, (True, False, False, False)), seeds)
++    density_seconds = time.perf_counter() - started
++    geometry_started = time.perf_counter()
++    geometry_bar, _ = _df_jk_factorized._backward(
++        with_j, with_k, False, (dfobj, S), seeds)
++    df_bar = tree_map(lambda x: None, dfobj)
++    if mol_active:
++        df_bar.mol = geometry_bar.mol
++    if aux_active:
++        df_bar.auxmol = geometry_bar.auxmol
++    _profile_msg(
++        f'get_jk_bwd factorized geometry rank={rank} '
++        f'density={density_seconds:.2f} s '
++        f'geometry={time.perf_counter() - geometry_started:.2f} s '
++        f'done {time.perf_counter() - started:.2f} s')
++    return df_bar, dm_bar
+ 
+ 
+ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
+@@ -659,6 +727,12 @@
+             df_bar = tree_map(lambda x: None, dfobj)
+             df_bar._cderi = bars[0]
+         return df_bar, bars[-1] if dm_active else None
++
++    if coordinate_vjp is None and not solution_only:
++        factorized = _factorized_geometry_bwd(
++            hermi, direct_scf_tol, dfobj, dm, activity, vj_bar, vk_bar)
++        if factorized is not None:
++            return factorized
+ 
+     log = logger.new_logger(dfobj)
+     dms = numpy.asarray(dm)
+@@ -837,51 +911,84 @@
+ 
+ 
+ def gen_coulomb_precond(dfobj, orbo, orbv, e_ai):
+-    '''For the Coulomb part of the RHF orbital hessian, e + 4 B^T B with
+-    B[L,ai] = (L|ai) and e[a,i] = e_a - e_i > 0, returns
+-    coul(s) = B^T (1/4 + B e^-1 B^T)^-1 B e^-1 s, so that by the Woodbury
+-    identity (e + 4 B^T B)^-1 s = (s - coul(s)) / e. B is not stored:
+-    1/4 + B e^-1 B^T is accumulated over blocks of occupied orbitals, and
+-    B and B^T are applied as the two halves of a J build, so only the
+-    (naux, naux) Cholesky factor is kept.
+-    '''
+-    # Adapted from upstream PySCFAD (Xing Zhang / The PySCFAD Authors).
++    """Generate the Coulomb part of the RHF orbital Hessian inverse.
++
++    The result obeys ``(e + 4 B.T @ B)^-1 s = (s - coul(s)) / e``.
++    Scaled occupied-virtual factors are retained only when they fit the
++    PYSCFAD_PRECOND_CACHE_MEMORY_MB budget; otherwise applications stream DF.
++    """
+     from scipy.linalg import cho_factor, cho_solve
+     from pyscf.ao2mo import _ao2mo
+-
++    from pyscfad.lib._threading import dense_blas_threads
++
++    t_setup = time.perf_counter()
+     nao, nocc = orbo.shape
+     nvir = orbv.shape[1]
+     naux = dfobj.get_naoaux()
++    try:
++        budget_mb = float(os.environ.get('PYSCFAD_PRECOND_CACHE_MEMORY_MB', '1024'))
++        if not numpy.isfinite(budget_mb) or budget_mb < 0:
++            budget_mb = 1024.
++    except ValueError:
++        budget_mb = 1024.
++    max_memory = dfobj.max_memory - lib.current_memory()[0]
++    cache_limit = min(budget_mb * 1024**2, .3 * max(max_memory, 0) * 1e6)
++    cache_bytes = naux * nvir * nocc * numpy.dtype(numpy.float64).itemsize
++    use_cache = cache_bytes > 0 and cache_bytes <= cache_limit
++    cached = numpy.empty((naux, nvir, nocc)) if use_cache else None
++    sqrt_e = numpy.sqrt(e_ai)
+     kmat = numpy.eye(naux) * .25
+-    max_memory = dfobj.max_memory - lib.current_memory()[0]
+     blksize = max(4, min(nocc, int(max_memory*.3e6/8/(naux*nvir))))
+     for i0, i1 in lib.prange(0, nocc, blksize):
+         mo = numpy.asarray(numpy.hstack((orbv, orbo[:,i0:i1])), order='F')
+         bov = numpy.empty((naux, nvir*(i1-i0)))
+         p1 = 0
++        eri1 = None
+         for eri1 in dfobj.loop():
+             p0, p1 = p1, p1 + eri1.shape[0]
+             _ao2mo.nr_e2(eri1, mo, (0,nvir,nvir,nvir+i1-i0), aosym='s2',
+                          mosym='s1', out=bov[p0:p1])
+-        bov /= numpy.sqrt(e_ai[:,i0:i1]).ravel()
+-        lib.dot(bov, bov.T, c=kmat, beta=1)
+-        bov = None
+-    # NOTE the inverse, so that coul runs on lib.dot only (scipy's BLAS
+-    # threads compete with those of lib.dot)
+-    kmat = cho_solve(cho_factor(kmat), numpy.eye(naux))
++        bov /= sqrt_e[:,i0:i1].ravel()
++        if cached is not None:
++            cached[:,:,i0:i1] = bov.reshape(naux, nvir, i1-i0)
++        with dense_blas_threads():
++            kmat += bov @ bov.T
++        bov = mo = eri1 = None
++    with dense_blas_threads():
++        kmat = cho_solve(cho_factor(kmat), numpy.eye(naux))
++    if cached is not None:
++        cached = cached.reshape(naux, -1)
++    _profile_msg(f'coulomb preconditioner setup cache={use_cache} '
++                 f'cache_mib={cache_bytes / 1024**2:.2f} '
++                 f'budget_mib={budget_mb:.2f} limit_mib={cache_limit / 1024**2:.2f} '
++                 f'elapsed={time.perf_counter() - t_setup:.2f} s')
+ 
+     idx = numpy.arange(nao)
++    count = 0
+     def coul(s):
+-        # B e^-1 s, with the density orbv (s/e) orbo^T as in a J build
+-        x = lib.dot(lib.dot(orbv, s/e_ai), orbo.T)
+-        xtril = lib.pack_tril(x + x.T)
+-        xtril[idx*(idx+1)//2+idx] *= .5
+-        rho = numpy.vstack([lib.dot(eri1, xtril[:,None]) for eri1 in dfobj.loop()])
+-        rho = lib.dot(kmat, rho)
+-        vtril = numpy.zeros((nao*(nao+1)//2,1))
+-        p1 = 0
+-        for eri1 in dfobj.loop():
+-            p0, p1 = p1, p1 + eri1.shape[0]
+-            lib.dot(eri1.T, rho[p0:p1], c=vtril, beta=1)
+-        return lib.dot(orbv.T, lib.dot(lib.unpack_tril(vtril[:,0]), orbo))
++        nonlocal count
++        t_apply = time.perf_counter()
++        count += 1
++        if cached is not None:
++            with dense_blas_threads():
++                rho = cached @ (s / sqrt_e).ravel()
++                rho = kmat @ rho
++                result = (cached.T @ rho).reshape(nvir, nocc) * sqrt_e
++        else:
++            # B e^-1 s and B.T rho are the two halves of a streamed J build.
++            x = lib.dot(lib.dot(orbv, s/e_ai), orbo.T)
++            xtril = lib.pack_tril(x + x.T)
++            xtril[idx*(idx+1)//2+idx] *= .5
++            rho = numpy.vstack([lib.dot(eri1, xtril[:,None]) for eri1 in dfobj.loop()])
++            with dense_blas_threads():
++                rho = kmat @ rho
++            vtril = numpy.zeros((nao*(nao+1)//2,1))
++            p1 = 0
++            for eri1 in dfobj.loop():
++                p0, p1 = p1, p1 + eri1.shape[0]
++                lib.dot(eri1.T, rho[p0:p1], c=vtril, beta=1)
++            result = lib.dot(orbv.T, lib.dot(lib.unpack_tril(vtril[:,0]), orbo))
++        _profile_msg(f'coulomb preconditioner apply count={count} cache={use_cache} '
++                     f'elapsed={time.perf_counter() - t_apply:.2f} s')
++        return result
+     return coul
+--- a/pyscfad/df/_int3c_cross_opt.py
++++ b/pyscfad/df/_int3c_cross_opt.py
+@@ -76,7 +76,10 @@
+     if shls_slice is None:
+         shls_slice = (0, mol.nbas, 0, mol.nbas, mol.nbas,
+                       mol.nbas + auxmol.nbas)
+-    assert shls_slice[5] - shls_slice[4] == auxmol.nbas
++    aux_sh0 = shls_slice[4] - mol.nbas
++    aux_sh1 = shls_slice[5] - mol.nbas
++    if not 0 <= aux_sh0 <= aux_sh1 <= auxmol.nbas:
++        raise ValueError('Auxiliary shell slice is outside the auxiliary basis.')
+ 
+     natm = mol.natm
+     comp = 3
+@@ -95,6 +98,13 @@
+     intor1 = ascint3(mol._add_suffix(intor1))
+     ao_loc = make_loc(bas, intor1)
+     ao_loc = numpy.asarray(ao_loc, order='C', dtype=numpy.int32)
++    i0, i1 = ao_loc[shls_slice[0]], ao_loc[shls_slice[1]]
++    npair = int(i1) * (int(i1) + 1) // 2 - int(i0) * (int(i0) + 1) // 2
++    naux_slice = ao_loc[shls_slice[5]] - ao_loc[shls_slice[4]]
++    if ybar.shape != (npair, naux_slice):
++        raise ValueError(
++            f'Integral cotangent has shape {ybar.shape}, '
++            f'expected {(npair, naux_slice)} for the shell slice.')
+     cintopt = make_cintopt(atm, bas, env, intor1)
+ 
+     drv = libcgto.GTOnr3c_ij_r0_vjp
+@@ -104,17 +114,23 @@
+     # invariance gives the auxiliary derivative from the two AO derivatives.
+     # Keep the public (pair, aux) layout and pass contiguous auxiliary slices
+     # to the existing driver; it handles each slice's AO-pair row offset.
++    # Both the atom intersections and cotangent offsets must be relative to
++    # the requested auxiliary slice, which may start/end inside an atom.
+     vjp_aux = numpy.zeros((auxmol.natm, comp))
+-    for ia, (b0, b1, p0, p1) in enumerate(auxmol.aoslice_by_atom()):
+-        if b0 == b1:
++    aux_loc = ao_loc[mol.nbas:] - ao_loc[mol.nbas]
++    aux_start = aux_loc[aux_sh0]
++    for ia, (b0, b1, _, _) in enumerate(auxmol.aoslice_by_atom()):
++        b0, b1 = max(b0, aux_sh0), min(b1, aux_sh1)
++        if b0 >= b1:
+             continue
++        p0, p1 = aux_loc[b0] - aux_start, aux_loc[b1] - aux_start
+         vjp_ia = numpy.zeros_like(vjp)
+         ybar_ia = numpy.asarray(ybar[:, p0:p1], order='F')
+         drv(getattr(libcgto, intor1), fill,
+             vjp_ia.ctypes.data_as(ctypes.c_void_p),
+             ybar_ia.ctypes.data_as(ctypes.c_void_p),
+             ctypes.c_int(comp),
+-            (ctypes.c_int*6)(*shls_slice[:4], shls_slice[4]+b0, shls_slice[4]+b1),
++            (ctypes.c_int*6)(*shls_slice[:4], mol.nbas+b0, mol.nbas+b1),
+             ao_loc.ctypes.data_as(ctypes.c_void_p), cintopt,
+             c_atm, ctypes.c_int(len(atm)), ctypes.c_int(natm),
+             c_bas, ctypes.c_int(len(bas)), c_env)
+--- a/pyscfad/df/test/test_cderi_vjp.py
++++ b/pyscfad/df/test/test_cderi_vjp.py
+@@ -758,20 +758,20 @@
+     reference = _cderi_vjp._int3c_mo_deriv_coords_vjp(
+         mol, auxmol, mo_coeff, z, orbs_slice
+     )
+-    real_int3c_cross = _cderi_vjp._int3c_cross_opt.int3c_cross
++    real_int3c_bwd = _cderi_vjp._int3c_cross_opt.int3c_cross_bwd
+     integral_ranges = []
+ 
+-    def tracked_int3c_cross(*args, **kwargs):
+-        shls_slice = kwargs['shls_slice']
++    def tracked_int3c_bwd(*args, **kwargs):
++        shls_slice = args[3]
+         shl0 = shls_slice[4] - mol.nbas
+         shl1 = shls_slice[5] - mol.nbas
+         integral_ranges.append(
+             (int(auxmol.ao_loc[shl0]), int(auxmol.ao_loc[shl1]))
+         )
+-        return real_int3c_cross(*args, **kwargs)
++        return real_int3c_bwd(*args, **kwargs)
+ 
+     monkeypatch.setattr(
+-        _cderi_vjp._int3c_cross_opt, 'int3c_cross', tracked_int3c_cross
++        _cderi_vjp._int3c_cross_opt, 'int3c_cross_bwd', tracked_int3c_bwd
+     )
+     read_ranges = []
+ 
+--- /dev/null
++++ b/pyscfad/df/test/test_reverse_dense_density.py
+@@ -0,0 +1,34 @@
++"""The physical density must use the scoped NumPy BLAS backend."""
++
++import numpy
++import pytest
++
++from pyscfad.df import _cderi_vjp
++
++
++@pytest.mark.parametrize("kc,lc", [(2, 4), (4, 2)])
++@pytest.mark.parametrize("dtype", [numpy.float64, numpy.complex128])
++def test_physical_density_uses_numpy_blas(kc, lc, dtype, monkeypatch):
++    rng = numpy.random.default_rng(79)
++
++    def values(shape):
++        out = rng.normal(size=shape)
++        if numpy.issubdtype(dtype, numpy.complexfloating):
++            out = out + 1j * rng.normal(size=shape)
++        return numpy.asarray(out, dtype=dtype)
++
++    mo_k = values((5, kc))
++    mo_l = values((5, lc))
++    z = values((3, kc, lc))[:, ::-1, :]
++    # Independent three-factor contraction also catches conjugation errors.
++    expected = numpy.einsum("uk,pkl,vl->puv", mo_k, z, mo_l)
++    expected = expected + expected.swapaxes(1, 2)
++
++    def forbidden_sequential_backend(*args, **kwargs):
++        raise AssertionError("physical density used PySCF's sequential BLAS")
++
++    monkeypatch.setattr(
++        _cderi_vjp.pyscf_lib, "einsum", forbidden_sequential_backend
++    )
++    actual = _cderi_vjp._int3c_mo_physical_density(mo_k, mo_l, z)
++    numpy.testing.assert_allclose(actual, expected, atol=1e-12, rtol=1e-12)
+--- /dev/null
++++ b/pyscfad/df/test/test_reverse_generic_geometry.py
+@@ -0,0 +1,148 @@
++"""Thin geometry work must preserve the independent AO-density transpose."""
++import jax
++import jax.numpy as jnp
++import numpy as np
++import pytest
++from pyscf import lib
++
++from pyscfad import config_update, df, gto
++from pyscfad.df import _df_jk_opt, _df_jk_factorized, incore
++
++
++@pytest.fixture
++def problem(tmp_path, monkeypatch):
++    monkeypatch.setenv('PYSCFAD_DF_OCCUPIED_VJP', '1')
++    monkeypatch.setenv('PYSCFAD_FACTOR_PANEL_MEMORY_MB', '4')
++    mol = gto.Mole(atom='O 0 0 0; H 0 -.757 .587; H 0 .757 .587',
++                   basis='sto-3g', verbose=0, max_memory=1000)
++    mol.build(trace_exp=False, trace_ctr_coeff=False)
++    obj = df.DF(mol, auxbasis='weigend')
++    obj.incore = False
++    obj._cderi_to_save = str(tmp_path / 'factors.h5')
++    with config_update('pyscfad_moleintor_opt', True):
++        obj.build()
++    rng = np.random.default_rng(9401)
++    factors = rng.normal(size=(mol.nao, 2)) * .2
++    density = factors @ factors.T
++    seeds = [tuple(rng.normal(size=density.shape) for _ in range(2))
++             for _ in range(2)]
++    return obj, density, factors, seeds
++
++
++def _dense_values(mol, auxmol, density):
++    packed = incore.cholesky_eri(mol, auxmol=auxmol)
++    if packed.shape[1] == mol.nao ** 2:
++        b = packed.reshape(-1, mol.nao, mol.nao)
++    else:
++        i, j = np.tril_indices(mol.nao)
++        b = jnp.zeros((packed.shape[0], mol.nao, mol.nao))
++        b = b.at[:, i, j].set(packed).at[:, j, i].set(packed)
++    return (jnp.einsum('Lij,ij,Lpq->pq', b, density, b),
++            jnp.einsum('Lpi,ij,Ljq->pq', b, density, b))
++
++
++def _spill_observer(monkeypatch):
++    paths = []
++    original = _df_jk_opt.tempfile.mkstemp
++    def observe(*args, **kwargs):
++        result = original(*args, **kwargs)
++        if kwargs.get('prefix', '').startswith('pyscfad_dfjk_eri_bar_'):
++            paths.append(result[1])
++        return result
++    monkeypatch.setattr(_df_jk_opt.tempfile, 'mkstemp', observe)
++    return paths
++
++
++@pytest.mark.parametrize(('with_j', 'with_k'), [(True, True), (True, False), (False, True)])
++def test_repeated_geometry_and_full_density_bars_without_ao_spill(
++        problem, monkeypatch, with_j, with_k):
++    obj, density, factors, seeds = problem
++    with config_update('pyscfad_moleintor_opt', True):
++        _, reference = jax.vjp(_dense_values, obj.mol, obj.auxmol, jnp.asarray(density))
++    paths = _spill_observer(monkeypatch)
++    expected_first = None
++    for bars in (seeds[0], seeds[1], seeds[0]):
++        bars = tuple(bar if active else np.zeros_like(bar)
++                     for bar, active in zip(bars, (with_j, with_k)))
++        with config_update('pyscfad_moleintor_opt', True):
++            expected = reference(bars)
++        actual_obj, actual_dm = _df_jk_opt.get_jk_bwd(
++            1, with_j, with_k, 1e-13,
++            (obj, density, (True, False, True, True)), bars)
++        for actual, wanted in zip((actual_obj.mol.coords, actual_obj.auxmol.coords,
++                                   actual_dm), (expected[0].coords, expected[1].coords,
++                                                expected[2])):
++            np.testing.assert_allclose(actual, wanted, atol=2e-9, rtol=2e-10)
++        assert actual_obj._cderi is None
++        if expected_first is None:
++            expected_first = np.asarray(actual_dm).copy()
++    np.testing.assert_allclose(actual_dm, expected_first, atol=2e-12, rtol=2e-12)
++    # Sbar alone cannot reconstruct this nonzero virtual-virtual block.
++    q, _ = np.linalg.qr(factors, mode='complete')
++    outside = q[:, factors.shape[1]:]
++    assert np.linalg.norm(outside.T @ actual_dm @ outside) > 1e-6
++    assert paths == [], 'eligible geometry wrote full AO-factor adjoints'
++
++
++@pytest.mark.parametrize(('mol_active', 'aux_active'), [(True, False), (False, True), (True, True)])
++def test_geometry_only_preserves_inactive_bars(problem, monkeypatch, mol_active, aux_active):
++    obj, density, _, seeds = problem
++    with config_update('pyscfad_moleintor_opt', True):
++        _, reference = jax.vjp(_dense_values, obj.mol, obj.auxmol, jnp.asarray(density))
++        expected = reference(seeds[0])
++    paths = _spill_observer(monkeypatch)
++    actual, dm_bar = _df_jk_opt.get_jk_bwd(
++        1, True, True, 1e-13,
++        (obj, density, (False, False, mol_active, aux_active)), seeds[0])
++    assert dm_bar is None and actual._cderi is None
++    for bar, wanted, active in zip((actual.mol.coords, actual.auxmol.coords),
++                                   (expected[0].coords, expected[1].coords),
++                                   (mol_active, aux_active)):
++        if active:
++            np.testing.assert_allclose(bar, wanted, atol=2e-9, rtol=2e-10)
++        else:
++            assert bar is None
++    assert paths == []
++
++
++@pytest.mark.parametrize('mode', ['disabled', 'asymmetric', 'indefinite', 'callback'])
++def test_ineligible_geometry_keeps_generic_route(problem, monkeypatch, mode):
++    obj, density, _, seeds = problem
++    if mode == 'disabled':
++        monkeypatch.setenv('PYSCFAD_DF_OCCUPIED_VJP', '0')
++    elif mode == 'asymmetric':
++        density = density.copy()
++        density[0, 1] += .1
++    elif mode == 'indefinite':
++        density = density - np.eye(density.shape[0])
++    def forbidden(*args, **kwargs):
++        raise AssertionError('ineligible generic geometry entered factorized reverse')
++    monkeypatch.setattr(_df_jk_factorized, '_backward', forbidden)
++    with config_update('pyscfad_moleintor_opt', True):
++        _, reference = jax.vjp(_dense_values, obj.mol, obj.auxmol, jnp.asarray(density))
++        expected = reference(seeds[0])
++    callbacks = []
++    def coordinate_callback(*args, **kwargs):
++        callbacks.append(1)
++        return _df_jk_opt._cderi_mol_aux_vjp_from_block_fn(*args, **kwargs)
++    actual, dm_bar = _df_jk_opt.get_jk_bwd(
++        1, True, True, 1e-13, (obj, density, (True, False, True, True)), seeds[0],
++        coordinate_vjp=coordinate_callback if mode == 'callback' else None)
++    for bar, wanted in zip((actual.mol.coords, actual.auxmol.coords, dm_bar),
++                           (expected[0].coords, expected[1].coords, expected[2])):
++        np.testing.assert_allclose(bar, wanted, atol=2e-9, rtol=2e-10)
++    assert bool(callbacks) == (mode == 'callback')
++
++
++def test_stale_tags_cannot_change_geometry(problem, monkeypatch):
++    obj, density, factors, seeds = problem
++    # Invalid tags may be discarded and correct factors recovered from D.
++    tagged = lib.tag_array(density, mo_coeff=factors * 3, mo_occ=np.ones(2))
++    with config_update('pyscfad_moleintor_opt', True):
++        _, reference = jax.vjp(_dense_values, obj.mol, obj.auxmol, jnp.asarray(density))
++        expected = reference(seeds[0])
++    actual, dm_bar = _df_jk_opt.get_jk_bwd(
++        1, True, True, 1e-13, (obj, tagged, (True, False, True, True)), seeds[0])
++    for bar, wanted in zip((actual.mol.coords, actual.auxmol.coords, dm_bar),
++                           (expected[0].coords, expected[1].coords, expected[2])):
++        np.testing.assert_allclose(bar, wanted, atol=2e-9, rtol=2e-10)
+--- /dev/null
++++ b/pyscfad/df/test/test_reverse_native_slices.py
+@@ -0,0 +1,154 @@
++"""Independent checks for bounded native coordinate contractions."""
++
++import numpy
++import pytest
++
++from pyscfad import gto
++from pyscfad.df import _cderi_vjp, _int3c_cross_opt
++
++
++def _molecules():
++    mol = gto.Mole(atom='O 0 0 0; H 0 -.757 .587; H 0 .757 .587',
++                   basis='sto-3g', verbose=0)
++    mol.build(trace_exp=False, trace_ctr_coeff=False)
++    # Independent centres and unequal atom counts expose auxiliary mapping bugs.
++    auxmol = gto.Mole(atom='H .1 .2 .3; H -.2 .1 1.1',
++                      basis='weigend', verbose=0)
++    auxmol.build(trace_exp=False, trace_ctr_coeff=False)
++    return mol, auxmol
++
++
++def _explicit_ip1_reference(mol, auxmol, physical_density):
++    """Contract an independently formed density with all explicit ip1 values."""
++    ints = numpy.asarray(_int3c_cross_opt.int3c_cross(
++        mol, auxmol, intor='int3c2e_ip1', comp=3, aosym='s1'))
++    per_aux_ao = numpy.einsum('puv,xuvp->pux', physical_density, ints)
++    mol_coords = numpy.zeros((mol.natm, 3), dtype=physical_density.dtype)
++    aux_coords = numpy.zeros((auxmol.natm, 3), dtype=physical_density.dtype)
++    for atom, (_, _, p0, p1) in enumerate(mol.aoslice_by_atom()):
++        mol_coords[atom] = -per_aux_ao[:, p0:p1].sum(axis=(0, 1))
++    for atom, (_, _, p0, p1) in enumerate(auxmol.aoslice_by_atom()):
++        aux_coords[atom] = per_aux_ao[p0:p1].sum(axis=(0, 1))
++    return mol_coords, aux_coords
++
++
++def _assert_coords(actual, expected):
++    for result, reference in zip(actual, expected):
++        numpy.testing.assert_allclose(result.coords, reference,
++                                      atol=3e-10, rtol=3e-11)
++    numpy.testing.assert_allclose(
++        actual[0].coords.sum(axis=0) + actual[1].coords.sum(axis=0),
++        0, atol=3e-10)
++
++
++@pytest.mark.parametrize('i0', [0, 1])
++@pytest.mark.parametrize('slice_kind', ['within_atom', 'across_atoms', 'last_atom'])
++def test_native_auxiliary_slice_preserves_pair_and_atom_offsets(i0, slice_kind):
++    """Wrong global/local aux offsets or shifted packed rows change gradients."""
++    mol, auxmol = _molecules()
++    boundary = int(auxmol.aoslice_by_atom()[1, 0])
++    a0, a1 = {
++        'within_atom': (1, boundary - 1),
++        'across_atoms': (boundary - 1, boundary + 1),
++        'last_atom': (boundary + 1, auxmol.nbas),
++    }[slice_kind]
++    p0, p1 = map(int, auxmol.ao_loc[[a0, a1]])
++    i1 = mol.nbas - 1
++    ao0, ao1 = map(int, mol.ao_loc[[i0, i1]])
++    pair0, pair1 = ao0 * (ao0 + 1) // 2, ao1 * (ao1 + 1) // 2
++    seed = numpy.random.default_rng(913).normal(size=(pair1 - pair0, p1 - p0))
++    full = numpy.zeros((mol.nao * (mol.nao + 1) // 2, auxmol.nao))
++    full[pair0:pair1, p0:p1] = seed
++    rows, cols = numpy.tril_indices(mol.nao)
++    physical = numpy.zeros((auxmol.nao, mol.nao, mol.nao))
++    physical[:, rows, cols] = full.T
++    physical[:, cols, rows] += full.T
++    expected = _explicit_ip1_reference(mol, auxmol, physical)
++    full_bars = _int3c_cross_opt.int3c_cross_bwd(
++        'int3c2e', 1, 's2ij', None, None, (mol, auxmol), full)
++    _assert_coords(full_bars, expected)
++    slices = (i0, i1, 0, mol.nbas, mol.nbas + a0, mol.nbas + a1)
++    actual = _int3c_cross_opt.int3c_cross_bwd(
++        'int3c2e', 1, 's2ij', slices, None, (mol, auxmol), seed)
++    _assert_coords(actual, expected)
++
++
++@pytest.mark.parametrize('use_density_reader', [False, True])
++@pytest.mark.parametrize('kc,lc', [(2, 5), (5, 2)])
++def test_mo_coordinate_reverse_avoids_derivative_tensor(
++        monkeypatch, use_density_reader, kc, lc):
++    """The native path must retain both AO legs, diagonal weights, and row caps."""
++    mol, auxmol = _molecules()
++    rng = numpy.random.default_rng(914)
++    coeff = rng.normal(size=(mol.nao, kc + lc))
++    z = rng.normal(size=(auxmol.nao, kc * lc))
++    density = numpy.einsum('uk,pkl,vl->puv', coeff[:, :kc],
++                           z.reshape(auxmol.nao, kc, lc), coeff[:, kc:])
++    physical = density + density.swapaxes(1, 2)
++    expected = _explicit_ip1_reference(mol, auxmol, physical)
++    original = _int3c_cross_opt.int3c_cross
++
++    def no_derivative_tensor(*args, **kwargs):
++        assert kwargs.get('comp', 1) == 1, 'full derivative tensor materialized'
++        return original(*args, **kwargs)
++
++    monkeypatch.setattr(_int3c_cross_opt, 'int3c_cross', no_derivative_tensor)
++    native_bwd = _int3c_cross_opt.int3c_cross_bwd
++    packed_bytes = []
++
++    def bounded_native(*args, **kwargs):
++        packed_bytes.append(args[-1].nbytes)
++        return native_bwd(*args, **kwargs)
++
++    monkeypatch.setattr(_int3c_cross_opt, 'int3c_cross_bwd', bounded_native)
++    reads = []
++
++    def read_z(p0, p1):
++        assert not use_density_reader
++        reads.append((p0, p1))
++        return z[p0:p1]
++
++    def read_density(p0, p1):
++        reads.append((p0, p1))
++        # This density already contains BOTH AO derivative legs.
++        return physical[p0:p1]
++
++    actual = _cderi_vjp._int3c_mo_deriv_coords_vjp_from_z_reader(
++        mol, auxmol, coeff, read_z, (0, kc, kc, kc + lc),
++        z_dtype=numpy.float64, block_memory_mb=1,
++        z_aux_block_max_rows=1,
++        read_density_aux_block=read_density if use_density_reader else None)
++    _assert_coords(actual, expected)
++    assert reads == [(p, p + 1) for p in range(auxmol.nao)]
++    # A one-row reader cap permits one indivisible auxiliary shell in the
++    # native cotangent, never an unbounded full-auxiliary packed allocation.
++    shell_rows = int(numpy.diff(auxmol.ao_loc).max())
++    npair = mol.nao * (mol.nao + 1) // 2
++    assert max(packed_bytes) <= 8 * npair * shell_rows
++
++
++@pytest.mark.parametrize('unsupported', ['complex', 'asymmetric_density'])
++def test_coordinate_reverse_preserves_explicit_fallback(monkeypatch, unsupported):
++    """Native real symmetric packed bars cannot represent these contractions."""
++    mol, auxmol = _molecules()
++    rng = numpy.random.default_rng(915)
++    coeff = rng.normal(size=(mol.nao, 5))
++    z = rng.normal(size=(auxmol.nao, 6))
++    if unsupported == 'complex':
++        z = z + 1j * rng.normal(size=z.shape)
++    density = numpy.einsum('uk,pkl,vl->puv', coeff[:, :2],
++                           z.reshape(auxmol.nao, 2, 3), coeff[:, 2:])
++    if unsupported == 'complex':
++        density = density + density.swapaxes(1, 2)
++    expected = _explicit_ip1_reference(mol, auxmol, density)
++
++    def forbidden_native(*args, **kwargs):
++        raise AssertionError('unsupported contraction sent to real packed VJP')
++
++    monkeypatch.setattr(_int3c_cross_opt, 'int3c_cross_bwd', forbidden_native)
++    actual = _cderi_vjp._int3c_mo_deriv_coords_vjp_from_z_reader(
++        mol, auxmol, coeff, lambda p0, p1: z[p0:p1], (0, 2, 2, 5),
++        z_dtype=z.dtype, z_aux_block_max_rows=1,
++        read_density_aux_block=(lambda p0, p1: density[p0:p1])
++        if unsupported == 'asymmetric_density' else None)
++    _assert_coords(actual, expected)
+--- /dev/null
++++ b/pyscfad/df/test/test_reverse_precond_cache.py
+@@ -0,0 +1,93 @@
++"""The Coulomb response preconditioner retains bounded fixed DF factors."""
++import h5py
++import numpy as np
++import pytest
++from pyscf import lib
++
++from pyscfad import gto, scf
++from pyscfad.df import _df_jk_opt
++
++
++@pytest.fixture
++def problem(tmp_path, monkeypatch):
++    rng = np.random.default_rng(31415)
++    mol = gto.Mole(atom='O 0 0 0; H 0 -.757 .587; H 0 .757 .587',
++                   basis='sto-3g', verbose=0, max_memory=1000)
++    mol.build(trace_exp=False, trace_ctr_coeff=False)
++    dfobj = scf.RHF(mol).density_fit().with_df
++    nao = mol.nao
++    raw = rng.normal(size=(9, nao, nao))
++    factors = (raw + raw.transpose(0, 2, 1)) * .15
++    path = tmp_path / 'packed.h5'
++    with h5py.File(path, 'w') as handle:
++        handle['j3c'] = lib.pack_tril(factors)
++    dfobj.attach_outcore_cderi(str(path))
++    dfobj.blockdim = 3
++    orbitals, _ = np.linalg.qr(rng.normal(size=(nao, nao)))
++    # All three occupied orbitals must contribute, including a hypothetical
++    # frozen occupied orbital in a subsequent correlated calculation.
++    occupied, virtual = orbitals[:, :3], orbitals[:, 3:]
++    gaps = 1 + rng.random((virtual.shape[1], occupied.shape[1]))
++    bov = np.einsum('Lpq,pa,qi->Lai', factors, virtual, occupied).reshape(9, -1)
++    hessian = np.diag(gaps.ravel()) + 4 * bov.T @ bov
++    rhs = [rng.normal(size=gaps.shape) for _ in range(2)]
++    reads = []
++    loop = dfobj.loop
++
++    def counted_loop(*args, **kwargs):
++        for block in loop(*args, **kwargs):
++            reads.append(block.shape[0])
++            yield block
++
++    monkeypatch.setattr(dfobj, 'loop', counted_loop)
++    return dfobj, occupied, virtual, gaps, hessian, rhs, reads
++
++
++def _assert_hessian_result(coulomb, gaps, hessian, rhs):
++    expected = rhs - gaps * np.linalg.solve(hessian, rhs.ravel()).reshape(gaps.shape)
++    np.testing.assert_allclose(coulomb(rhs), expected, atol=2e-12, rtol=2e-12)
++
++
++def test_cached_applications_match_hessian_without_further_disk_reads(problem, monkeypatch):
++    monkeypatch.setenv('PYSCFAD_PRECOND_CACHE_MEMORY_MB', '1')
++    dfobj, occupied, virtual, gaps, hessian, vectors, reads = problem
++    coulomb = _df_jk_opt.gen_coulomb_precond(dfobj, occupied, virtual, gaps)
++    assert reads
++    setup_reads = len(reads)
++    for rhs in vectors:
++        _assert_hessian_result(coulomb, gaps, hessian, rhs)
++    assert len(reads) == setup_reads
++
++
++@pytest.mark.parametrize('budget', ['0', '0.000001'])
++def test_insufficient_budget_streams_each_application(problem, monkeypatch, budget):
++    monkeypatch.setenv('PYSCFAD_PRECOND_CACHE_MEMORY_MB', budget)
++    dfobj, occupied, virtual, gaps, hessian, vectors, reads = problem
++    coulomb = _df_jk_opt.gen_coulomb_precond(dfobj, occupied, virtual, gaps)
++    previous_reads = len(reads)
++    for rhs in vectors:
++        _assert_hessian_result(coulomb, gaps, hessian, rhs)
++        assert len(reads) > previous_reads
++        previous_reads = len(reads)
++
++
++@pytest.mark.parametrize('budget', ['', 'invalid', '-1', 'nan', 'inf'])
++def test_invalid_budget_uses_safe_default(problem, monkeypatch, budget):
++    monkeypatch.setenv('PYSCFAD_PRECOND_CACHE_MEMORY_MB', budget)
++    dfobj, occupied, virtual, gaps, hessian, vectors, reads = problem
++    coulomb = _df_jk_opt.gen_coulomb_precond(dfobj, occupied, virtual, gaps)
++    setup_reads = len(reads)
++    _assert_hessian_result(coulomb, gaps, hessian, vectors[0])
++    assert len(reads) == setup_reads
++
++
++def test_no_available_df_memory_streams_despite_positive_cache_budget(problem, monkeypatch):
++    monkeypatch.setenv('PYSCFAD_PRECOND_CACHE_MEMORY_MB', '1')
++    dfobj, occupied, virtual, gaps, hessian, vectors, reads = problem
++    dfobj.max_memory = 0
++    coulomb = _df_jk_opt.gen_coulomb_precond(dfobj, occupied, virtual, gaps)
++    previous_reads = len(reads)
++    for rhs in vectors:
++        _assert_hessian_result(coulomb, gaps, hessian, rhs)
++        assert len(reads) > previous_reads
++        previous_reads = len(reads)
+--- a/pyscfad/mp/dfmp2.py
++++ b/pyscfad/mp/dfmp2.py
+@@ -375,7 +375,7 @@
+                        ijslice, aosym):
+     out = _outcore_nr_e2(mol, auxmol, mo_coeff, cderi_source, max_memory,
+                          ijslice, aosym)
+-    return out, (mol, auxmol, mo_coeff)
++    return out, (mol, auxmol, mo_coeff, out)
+ 
+ 
+ def _outcore_nr_e2_bwd(cderi_source, max_memory, ijslice, aosym, res, ybar):
+@@ -386,7 +386,7 @@
+ 
+ 
+ def _outcore_nr_e2_bwd_impl(cderi_source, max_memory, ijslice, aosym, res, ybar):
+-    mol, auxmol, mo_coeff = res
++    mol, auxmol, mo_coeff, out = res
+     effective_memory = max(max_memory, 4096)
+     use_direct_vjp = (
+         numpy.dtype(mo_coeff.dtype) == numpy.dtype(numpy.float64)
+@@ -425,6 +425,7 @@
+                     int3c=mol._add_suffix('int3c2e'),
+                     int2c=mol._add_suffix('int2c2e'),
+                     aosym='s2ij',
++                    saved_output=out,
+                 )
+             )
+             return mol_bar, auxmol_bar, mo_coeff_bar
+--- a/pyscfad/mp/test/test_dfmp2_outcore.py
++++ b/pyscfad/mp/test/test_dfmp2_outcore.py
+@@ -146,7 +146,7 @@
+         atol=1e-9,
+         rtol=1e-9,
+     )
+-    assert calls["forward_stream"] >= 2
++    assert calls["forward_stream"] == 1
+     assert calls["mo_stream"] == 1
+     assert calls["direct_int3c"] == 1
+ 
+--- /dev/null
++++ b/pyscfad/mp/test/test_reverse_saved_lov.py
+@@ -0,0 +1,121 @@
++"""Regressions for retaining canonical MP2's forward MO factors."""
++
++import h5py
++import jax
++import numpy
++import pytest
++
++from pyscfad import config_update, gto
++from pyscfad import numpy as np
++from pyscfad.ao2mo import _ao2mo
++from pyscfad.df import _cderi_vjp, addons, incore
++from pyscfad.mp import dfmp2
++
++
++@pytest.fixture
++def transform_case(tmp_path):
++    mol = gto.Mole(
++        atom="O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587",
++        basis="sto-3g", verbose=0, max_memory=1000,
++    )
++    mol.build(trace_exp=False, trace_ctr_coeff=False)
++    auxmol = addons.make_auxmol(mol, "weigend")
++    source = tmp_path / "cderi.h5"
++    with config_update("pyscfad_moleintor_opt", True):
++        cderi = incore.cholesky_eri(
++            mol, auxmol=auxmol,
++            int3c=mol._add_suffix("int3c2e"),
++            int2c=mol._add_suffix("int2c2e"),
++            aosym="s2ij", verbose=0,
++        )
++    with h5py.File(source, "w") as handle:
++        handle.create_dataset("j3c", data=numpy.asarray(cderi))
++    rng = numpy.random.default_rng(63)
++    coeff = np.asarray(rng.normal(size=(mol.nao, 5)))
++    # An unused MO column also checks the full coefficient cotangent.
++    orbs_slice = (1, 3, 3, 5)
++    ybars = tuple(np.asarray(rng.normal(size=(auxmol.nao, 4)))
++                  for _ in range(2))
++    return mol, auxmol, coeff, str(source), orbs_slice, ybars
++
++
++def _dense_transform(mol, auxmol, coeff, orbs_slice):
++    cderi = incore.cholesky_eri(
++        mol, auxmol=auxmol,
++        int3c=mol._add_suffix("int3c2e"),
++        int2c=mol._add_suffix("int2c2e"),
++        aosym="s2ij", verbose=0,
++    )
++    return _ao2mo.nr_e2(cderi, coeff, orbs_slice, aosym="s2")
++
++
++def _assert_bars_close(actual, expected):
++    for index in (0, 1):
++        numpy.testing.assert_allclose(
++            actual[index].coords, expected[index].coords,
++            atol=2e-8, rtol=2e-8,
++        )
++    numpy.testing.assert_allclose(
++        actual[2], expected[2], atol=1e-9, rtol=1e-9,
++    )
++
++
++def test_saved_lov_repeated_pullbacks_match_dense(transform_case):
++    """Saving Lov must preserve arbitrary cotangents and repeated pullbacks."""
++    mol, auxmol, coeff, source, orbs_slice, ybars = transform_case
++    with config_update("pyscfad_moleintor_opt", True):
++        expected, reference_pullback = jax.vjp(
++            lambda m, a, c: _dense_transform(m, a, c, orbs_slice),
++            mol, auxmol, coeff,
++        )
++        actual, pullback = jax.vjp(
++            lambda m, a, c: dfmp2._outcore_nr_e2(
++                m, a, c, source, 1000, orbs_slice, "s2"
++            ),
++            mol, auxmol, coeff,
++        )
++        original_output = numpy.array(actual, copy=True)
++        numpy.testing.assert_allclose(actual, expected, atol=1e-10, rtol=1e-10)
++        # Reuse the same residual with different cotangents, then repeat the
++        # first. A stale cotangent or destructive update of Lov changes bars.
++        for ybar in (ybars[0], ybars[1], ybars[0]):
++            _assert_bars_close(pullback(ybar), reference_pullback(ybar))
++            numpy.testing.assert_array_equal(actual, original_output)
++
++
++def test_backward_reuses_lov_without_streamed_ao2mo(
++        transform_case, monkeypatch):
++    """The MO adjoint still reads CDERI, but no reverse AO2MO is needed."""
++    mol, auxmol, coeff, source, orbs_slice, ybars = transform_case
++    calls = {"ao2mo": 0, "mo_adjoint": 0}
++    original_transform = _cderi_vjp._stream_nr_e2_from_cderi_source
++    original_mo_adjoint = _cderi_vjp.nr_e2_mo_coeff_vjp_from_cderi_source
++
++    def count_transform(*args, **kwargs):
++        calls["ao2mo"] += 1
++        return original_transform(*args, **kwargs)
++
++    def count_mo_adjoint(*args, **kwargs):
++        calls["mo_adjoint"] += 1
++        return original_mo_adjoint(*args, **kwargs)
++
++    monkeypatch.setattr(
++        _cderi_vjp, "_stream_nr_e2_from_cderi_source", count_transform
++    )
++    monkeypatch.setattr(
++        _cderi_vjp, "nr_e2_mo_coeff_vjp_from_cderi_source", count_mo_adjoint
++    )
++    with config_update("pyscfad_moleintor_opt", True):
++        _, pullback = jax.vjp(
++            lambda m, a, c: dfmp2._outcore_nr_e2(
++                m, a, c, source, 1000, orbs_slice, "s2"
++            ),
++            mol, auxmol, coeff,
++        )
++        assert calls["ao2mo"] == 1
++        for index, ybar in enumerate(ybars, start=1):
++            pullback(ybar)
++            assert calls["mo_adjoint"] == index
++            assert calls["ao2mo"] == 1, (
++                "backward reconstructed forward Lov from disk-backed CDERI"
++            )

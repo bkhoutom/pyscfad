@@ -1,0 +1,16 @@
+ M pyscfad/df/_df_jk_opt.py
+ M pyscfad/mp/dfmp2.py
+ M pyscfadlib/pyscfadlib/__init__.py
+ M pyscfadlib/pyscfadlib/lib.py
+ M pyscfadlib/pyscfadlib/vjp/CMakeLists.txt
+ M pyscfadlib/pyscfadlib/vjp/gto/fill_nr_3c_vjp.c
+?? INSTALL_LOCAL.md
+?? NATIVE_BUILD.json
+?? benchmarks/
+?? native-linkage.json
+?? pyscfad/df/test/test_df_jk_lowrank.py
+?? pyscfad/mp/test/test_dfmp2_native.py
+?? pyscfadlib/pyscfadlib/vjp/mp/
+?? requirement_workstation.txt
+?? submit.sh
+?? verify_native.py

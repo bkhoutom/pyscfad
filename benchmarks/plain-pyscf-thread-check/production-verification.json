@@ -1,0 +1,14 @@
+{
+  "job_id": "5786841",
+  "state": "COMPLETED 0:0",
+  "output": "/home/bkhou/DLNO_CCSDT/test_pyscfad_stc_mp2/runtime_test/dCMP/pyscf_scf.out.16.5786841",
+  "node": "hpc-35-15.cm.cluster",
+  "energy": -1381.31940656203,
+  "phases": {
+    "DF forward": 5.425751,
+    "SCF forward (excluding DF build)": 44.559426,
+    "SCF forward (including DF build)": 49.985178,
+    "MP2 forward (excluding SCF)": 4.773052,
+    "Total energy wall time": 54.787901
+  }
+}

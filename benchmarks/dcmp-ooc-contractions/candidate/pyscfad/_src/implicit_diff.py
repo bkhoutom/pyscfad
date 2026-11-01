@@ -1,0 +1,322 @@
+# Copyright 2021-2025 Xing Zhang
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import inspect
+import operator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import partial
+import jax
+from jax.tree_util import tree_map
+from jax.scipy.sparse.linalg import gmres
+from pyscfad.backend import get_backend
+
+_Sub = partial(tree_map, operator.sub)
+
+
+# A reverse-mode root solve has two qualitatively different VJPs.  Krylov
+# matvecs differentiate the optimality condition with respect to the root
+# variable only, whereas the VJP after the solve differentiates with respect
+# to the external arguments.  Custom VJPs normally cannot tell that a primal
+# argument was closed over by ``fun_sol``: their backward rule is still asked
+# to return every input cotangent, even though JAX will discard the closed-
+# over ones.  Expensive primitives can consult this marker to omit those
+# provably unused argument cotangents during a Krylov matvec.
+_IMPLICIT_DIFF_SOLVE_MATVEC = ContextVar(
+    'pyscfad_implicit_diff_solve_matvec', default=False
+)
+_IMPLICIT_DIFF_EXTERNAL_VJP = ContextVar(
+    'pyscfad_implicit_diff_external_vjp', default=False
+)
+
+
+def is_implicit_diff_external_vjp():
+    """Whether the root is fixed while differentiating external arguments.
+
+    This is a phase marker, not permission to discard arbitrary nested
+    derivatives. The SCF callback uses it only for its explicit fixed root.
+    """
+    return bool(_IMPLICIT_DIFF_EXTERNAL_VJP.get())
+
+
+@contextmanager
+def _implicit_diff_external_vjp(active=True):
+    token = _IMPLICIT_DIFF_EXTERNAL_VJP.set(active)
+    try:
+        yield
+    finally:
+        _IMPLICIT_DIFF_EXTERNAL_VJP.reset(token)
+
+
+def is_implicit_diff_solve_matvec():
+    """Whether only the implicit root-variable cotangent is being used."""
+    return bool(_IMPLICIT_DIFF_SOLVE_MATVEC.get())
+
+
+@contextmanager
+def _implicit_diff_solve_matvec(active=True):
+    token = _IMPLICIT_DIFF_SOLVE_MATVEC.set(active)
+    try:
+        yield
+    finally:
+        _IMPLICIT_DIFF_SOLVE_MATVEC.reset(token)
+
+def _Scalar_mul(scal, tree_x):
+    return tree_map(lambda x: scal * x, tree_x)
+
+def _map_back(diff_items, items, keys):
+    new_items = list(items)
+    for k, i in enumerate(keys):
+        new_items[i] = diff_items[k]
+    return tuple(new_items)
+
+def root_vjp(optimality_fun, sol, args, cotangent,
+             solve=gmres, nondiff_argnums=(),
+             optfn_has_aux=False, solver_kwargs=None,
+             gen_precond=None,
+             custom_vjp_from_optcond=False, gen_precond_host_only=False):
+    if solver_kwargs is None:
+        solver_kwargs = {}
+
+    def fun_sol(sol):
+        return optimality_fun(sol, *args)
+
+    # A nested root can be entered from another root's external pullback.
+    # Its own Jacobian and linear solve still need the full root response.
+    # Restore the parent's phase on both success and failure.
+    with _implicit_diff_external_vjp(False):
+        # FIXME M may not work for solvers other than scipy
+        M = None
+        if optfn_has_aux:
+            if custom_vjp_from_optcond:
+                _, (vjp_fun_sol, optfn_aux) = fun_sol(sol)
+            else:
+                _, vjp_fun_sol, optfn_aux = jax.vjp(fun_sol, sol, has_aux=True)
+            if gen_precond is not None:
+                if gen_precond_host_only:
+                    # A captured host solver may fall back to JAX under tracing.
+                    # Only host callbacks are suppressed; native JAX callbacks
+                    # must retain their behavior in traced iterative solves.
+                    traced = any(isinstance(x, jax.core.Tracer) for x in
+                                 jax.tree_util.tree_leaves((sol, args, cotangent)))
+                    if not traced:
+                        M = gen_precond(optfn_aux, *args, solver=solve)
+                else:
+                    M = gen_precond(optfn_aux, *args)
+        else:
+            _, vjp_fun_sol = jax.vjp(fun_sol, sol)
+
+        def matvec(u):
+            with _implicit_diff_solve_matvec():
+                return vjp_fun_sol(u)[0]
+
+        v = _Scalar_mul(-1, cotangent)
+        u = solve(matvec, v, M=M, **solver_kwargs)[0]
+
+    diff_args_dict = {i: arg for i, arg in enumerate(args) if i+1 not in nondiff_argnums}
+    keys = diff_args_dict.keys()
+    diff_args = tuple(diff_args_dict.values())
+    def fun_args(*diff_args):
+        new_args = _map_back(diff_args, args, keys)
+        return optimality_fun(sol, *new_args)
+
+    # A nested root's external bars are needed even inside a parent matvec.
+    with _implicit_diff_solve_matvec(False), _implicit_diff_external_vjp():
+        _, vjp_fun_args = jax.vjp(fun_args, *diff_args, has_aux=optfn_has_aux)[:2]
+        diff_vjps = vjp_fun_args(u)
+
+    vjps = [None,] * len(args)
+    vjps = _map_back(diff_vjps, vjps, keys)
+    return vjps
+
+def _custom_root(solver_fun, optimality_fun, solve,
+                 has_aux=False, nondiff_argnums=(), use_converged_args=None,
+                 optfn_has_aux=False, solver_kwargs=None,
+                 gen_precond=None,
+                 custom_vjp_from_optcond=False, gen_precond_host_only=False):
+    solver_fun_sig = inspect.signature(solver_fun)
+    optimality_fun_sig = inspect.signature(optimality_fun)
+
+    def make_custom_vjp_solver_fun(solver_fun, kwargs):
+        @jax.custom_vjp
+        def solver_fun_close_kwargs(*args):
+            return solver_fun(*args, **kwargs)
+
+        def solver_fun_fwd(*args):
+            res = solver_fun_close_kwargs(*args)
+            return res, (res, args)
+
+        def solver_fun_rev(tup, cotangent):
+            res, args = tup
+            if has_aux:
+                cotangent = cotangent[0]
+                sol = res[0]
+            else:
+                sol = res
+
+            args = list(args)
+            if use_converged_args:
+                for key, val in use_converged_args.items():
+                    args[key] = res[val]
+
+            try:
+                _ = optimality_fun_sig.bind(*args)
+            except TypeError as err:
+                msg = ("The optimality function has arguments that "
+                       "are not compatible with the solver function.")
+                raise TypeError(msg) from err
+
+            vjps = root_vjp(optimality_fun, sol,
+                            args[1:], cotangent, solve=solve,
+                            nondiff_argnums=nondiff_argnums,
+                            optfn_has_aux=optfn_has_aux,
+                            solver_kwargs=solver_kwargs,
+                            gen_precond=gen_precond,
+                            custom_vjp_from_optcond=custom_vjp_from_optcond,
+                            gen_precond_host_only=gen_precond_host_only)
+            vjps = (None,) + vjps
+            return vjps
+
+        solver_fun_close_kwargs.defvjp(solver_fun_fwd, solver_fun_rev)
+        return solver_fun_close_kwargs
+
+    def wrapped_solver_fun(*args, **kwargs):
+        ba = solver_fun_sig.bind(*args, **kwargs)
+        ba.apply_defaults()
+        return make_custom_vjp_solver_fun(solver_fun, ba.kwargs)(*ba.args)
+
+    return wrapped_solver_fun
+
+def custom_root(optimality_fun, solve=None, has_aux=False,
+                nondiff_argnums=(), use_converged_args=None,
+                optfn_has_aux=False, solver_kwargs=None,
+                gen_precond=None,
+                custom_vjp_from_optcond=False, gen_precond_host_only=False):
+    if solve is None:
+        solve = gmres
+
+    def wrapper(solver_fun):
+        return _custom_root(solver_fun, optimality_fun, solve,
+                            has_aux=has_aux, nondiff_argnums=nondiff_argnums,
+                            use_converged_args=use_converged_args,
+                            optfn_has_aux=optfn_has_aux,
+                            solver_kwargs=solver_kwargs,
+                            gen_precond=gen_precond,
+                            custom_vjp_from_optcond=custom_vjp_from_optcond,
+                            gen_precond_host_only=gen_precond_host_only)
+
+    return wrapper
+
+def custom_fixed_point(fixed_point_fun, solve=None, has_aux=False,
+                       nondiff_argnums=(), use_converged_args=None,
+                       optfn_has_aux=False, solver_kwargs=None,
+                       gen_precond=None,
+                       custom_vjp_from_optcond=False, gen_precond_host_only=False):
+
+    def optimality_fun(x0, *args):
+        result = fixed_point_fun(x0, *args)
+        if optfn_has_aux:
+            value, aux = result
+            return _Sub(value, x0), aux
+        return _Sub(result, x0)
+
+    optimality_fun.__wrapped__ = fixed_point_fun
+
+    return custom_root(optimality_fun, solve=solve,
+                       has_aux=has_aux, nondiff_argnums=nondiff_argnums,
+                       use_converged_args=use_converged_args,
+                       optfn_has_aux=optfn_has_aux,
+                       solver_kwargs=solver_kwargs,
+                       gen_precond=gen_precond,
+                       custom_vjp_from_optcond=custom_vjp_from_optcond,
+                       gen_precond_host_only=gen_precond_host_only)
+
+def make_implicit_diff(fn, implicit_diff=False, fixed_point=True,
+                       optimality_cond=None, solver=None, has_aux=False,
+                       nondiff_argnums=(), use_converged_args=None,
+                       optimality_fun_has_aux=False,
+                       solver_kwargs=None, gen_precond=None,
+                       custom_vjp_from_optcond=False, gen_precond_host_only=False):
+    """Wrap a function for implicit differentiation.
+
+    Parameters
+    ----------
+    fn : object
+        The function to be wrapped.
+    implicit_diff : bool, optional
+        If False, return `fn` without modification.
+        Otherwise, wrap `fn` to make it implicitly differentiable.
+        Default is ``False``.
+    fixed_point : bool, optional
+        If True, the optimality condition is defined by a fixed point
+        problem. Otherwise, the optimality condition should return 0.
+        Default is ``True``.
+    optimality_cond : object, optional
+        The funtion defining the optimality condition problem.
+    solver : object, optional
+        The function solves the linear equations.
+    has_aux : bool, optional
+        Whether `fn` returns auxiliary data. Default is ``False``.
+    nondiff_argnums : tuple of ints, optional
+        Specify which arguments are not differentiated with respect to,
+        by their indices in the argument list. Default is empty tuple.
+    use_converged_args : dict, optional
+        Specify in the backward propagation, which arguments should use
+        their converged values produced by `fn` in the forward pass.
+        The dict has the form ``{argnum: value}``, where ``argnum``
+        is the index of this argument in the argument list. Default is ``None``.
+    optimality_fun_has_aux : bool, optional
+        Whether the optimality function returns auxiliary data.
+        Default is False.
+    solver_kwargs : dict, optional
+        The keyword arguments passed to the linear solver function.
+        Default is empty dict.
+    gen_precond : object, optional
+        A function which generates the preconditioner
+        for the linear solver. `gen_precond` should
+        take the auxiliary data returned by the optimality function followed
+        by its arguments other than the solution, and return the preconditioner
+        recognized by the linear solver, usually a function or an array.
+
+    gen_precond_host_only : bool, optional
+        If True, skip the callback for traced solves and pass the actual captured
+        linear solver as its keyword argument ``solver``. Default is False, so
+        JAX-native preconditioner callbacks remain available under tracing.
+
+    Returns
+    -------
+    wrapped_fn : object
+        The wrapped function.
+    """
+    if implicit_diff and get_backend().__name__ == "jax.numpy":
+        if fixed_point:
+            method = custom_fixed_point
+        else:
+            method = custom_root
+
+        if not callable(optimality_cond):
+            raise KeyError(f"optimality_cond must be a function, "
+                           f"but got {optimality_cond}.")
+        if solver is None:
+            solver = gmres
+        return method(optimality_cond, solve=solver, has_aux=has_aux,
+                      nondiff_argnums=nondiff_argnums,
+                      use_converged_args=use_converged_args,
+                      optfn_has_aux=optimality_fun_has_aux,
+                      solver_kwargs=solver_kwargs,
+                      gen_precond=gen_precond,
+                      custom_vjp_from_optcond=custom_vjp_from_optcond,
+                      gen_precond_host_only=gen_precond_host_only)(fn)
+    else:
+        return fn

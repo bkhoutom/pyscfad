@@ -1,0 +1,114 @@
+{
+  "source": "/home/bkhou/DLNO_CCSDT/test_pyscfad_stc_mp2/runtime_test/dCMP-ooc/test_reverse/paired/slurm-5821996.out",
+  "job_id": 5821996,
+  "timings_seconds": {
+    "baseline": {
+      "scf_pullback_excluding_df_attachment": 504.96326,
+      "factorized_call_totals": [
+        92.84,
+        83.04
+      ],
+      "factorized_call_sum": 175.88,
+      "factorized_coordinate_density_pack_and_native_contract_nested": null,
+      "generic_jk_total": 94.87,
+      "generic_jk_df_block_loop_nested": 24.4,
+      "generic_jk_geometry_nested": 69.51,
+      "geometry_nested_breakdown": {
+        "outer_block_total": 68.10390007123351,
+        "cderi_read": 8.956697452813387,
+        "triangular_solve": 7.765569236129522,
+        "low_bar_gemm": 14.84408687800169,
+        "int3c_pullback": 31.401537898927927,
+        "ao_projection_total": 4.23330369964242
+      },
+      "matvec_totals": [
+        7.34,
+        7.68,
+        7.56,
+        7.49,
+        7.69,
+        7.57,
+        7.24,
+        7.19,
+        7.25,
+        7.11,
+        7.33
+      ],
+      "matvec_sum": 81.45,
+      "matvec_df_block_sum_nested": 76.34,
+      "preconditioner_setup": null,
+      "preconditioner_applications": null,
+      "preconditioner_applications_sum": null,
+      "unassigned": 152.76326
+    },
+    "first_candidate": {
+      "scf_pullback_excluding_df_attachment": 345.88924,
+      "factorized_call_totals": [
+        78.04,
+        79.05
+      ],
+      "factorized_call_sum": 157.09,
+      "factorized_coordinate_density_pack_and_native_contract_nested": [
+        [
+          35.769276,
+          11.318296
+        ],
+        [
+          35.150475,
+          12.128287
+        ]
+      ],
+      "generic_jk_total": 78.37,
+      "generic_jk_df_block_loop_nested": 21.66,
+      "generic_jk_geometry_nested": 55.64,
+      "geometry_nested_breakdown": {
+        "outer_block_total": 54.148776803165674,
+        "cderi_read": 9.41468781977892,
+        "triangular_solve": 7.8741319961845875,
+        "low_bar_gemm": 13.733155071735382,
+        "int3c_pullback": 17.483990732580423,
+        "ao_projection_total": 4.684367194771767
+      },
+      "matvec_totals": [
+        7.27,
+        7.24,
+        7.21,
+        7.29,
+        7.21,
+        7.47,
+        8.19,
+        7.63,
+        7.08,
+        7.03,
+        7.31
+      ],
+      "matvec_sum": 80.93,
+      "matvec_df_block_sum_nested": 75.4,
+      "preconditioner_setup": 6.61,
+      "preconditioner_applications": [
+        0.08,
+        0.11,
+        0.08,
+        0.04,
+        0.05,
+        0.06,
+        0.07,
+        0.06,
+        0.07,
+        0.06,
+        0.11,
+        0.1
+      ],
+      "preconditioner_applications_sum": 0.89,
+      "unassigned": 21.99924
+    }
+  },
+  "scope_notes": [
+    "SCF pullback excludes separately timed DF attachment.",
+    "Factorized coordinate density pack and native contraction are nested within factorized call totals.",
+    "Generic JK DF block and geometry are nested within generic JK total; geometry int3c loop and detailed timings are nested within geometry.",
+    "Matvec DF block timings are nested within each matvec total.",
+    "Unassigned is SCF total minus nonoverlapping instrumented top-level totals, subject to log rounding. Baseline preconditioner is not separately instrumented and remains in baseline unassigned.",
+    "First candidate only, not the subsequently modified final candidate. Single run; no attribution of all timing differences to individual changes."
+  ]
+}

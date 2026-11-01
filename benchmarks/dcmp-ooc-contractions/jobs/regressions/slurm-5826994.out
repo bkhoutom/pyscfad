@@ -1,0 +1,15 @@
+Package under test: /resnick/home/bkhou/DLNO_CCSDT/test_pyscfad_stc_mp2/runtime_test/dCMP-ooc/test_reverse/contractions/regressions/code/pyscfad/__init__.py
+........................................................................ [ 32%]
+........................................................................ [ 64%]
+........................................................................ [ 96%]
+........                                                                 [100%]
+=============================== warnings summary ===============================
+code/pyscfad/df/test/test_scf_precond.py: 21 warnings
+code/pyscfad/df/test/test_df_jk_implicit.py: 4 warnings
+code/pyscfad/mp/test/test_dfmp2_outcore.py: 2 warnings
+code/pyscfad/mp/test/test_dfmp2_native.py: 3 warnings
+  /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/gto/mole.py:1291: UserWarning: Function mol.dumps drops attribute coords because it is not JSON-serializable
+    warnings.warn(msg)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+224 passed, 30 warnings in 183.34s (0:03:03)

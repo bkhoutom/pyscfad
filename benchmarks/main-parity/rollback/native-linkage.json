@@ -1,0 +1,68 @@
+{
+  "python": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/bin/python",
+  "pyscf_path": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/__init__.py",
+  "pyscfad_path": "/resnick/groups/sharmagroup/bkhou/src/pyscfad/pyscfad/__init__.py",
+  "pyscfadlib_path": "/resnick/groups/sharmagroup/bkhou/src/pyscfad/pyscfadlib/pyscfadlib/__init__.py",
+  "blas_config": "OpenBLAS 0.3.34 DYNAMIC_ARCH NO_AFFINITY SkylakeX MAX_THREADS=128",
+  "dependencies": {
+    "libao2mo_vjp.so": "\tlinux-vdso.so.1 (0x00007ffd68376000)\n\tlibnp_helper_ad.so => /resnick/groups/sharmagroup/bkhou/src/pyscfad/pyscfadlib/pyscfadlib/libnp_helper_ad.so (0x00007fa77d47f000)\n\tlibvjp_util.so => /resnick/groups/sharmagroup/bkhou/src/pyscfad/pyscfadlib/pyscfadlib/libvjp_util.so (0x00007fa77d47a000)\n\tlibopenblas.so.0 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libopenblas.so.0 (0x00007fa77adc9000)\n\tlibgomp.so.1 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libgomp.so.1 (0x00007fa77ad6e000)\n\tlibc.so.6 => /lib64/libc.so.6 (0x00007fa77aa00000)\n\tlibm.so.6 => /lib64/libm.so.6 (0x00007fa77ac78000)\n\tlibpthread.so.0 => /lib64/libpthread.so.0 (0x00007fa77ac73000)\n\tlibgfortran.so.5 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/./libgfortran.so.5 (0x00007fa77a69e000)\n\t/lib64/ld-linux-x86-64.so.2 (0x00007fa77d48c000)\n\tlibdl.so.2 => /lib64/libdl.so.2 (0x00007fa77ac6e000)\n\tlibquadmath.so.0 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/././libquadmath.so.0 (0x00007fa77ac23000)\n\tlibgcc_s.so.1 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/././libgcc_s.so.1 (0x00007fa77a670000)\n",
+    "libcc_vjp.so": "\tlinux-vdso.so.1 (0x00007ffc88646000)\n\tlibvjp_util.so => /resnick/groups/sharmagroup/bkhou/src/pyscfad/pyscfadlib/pyscfadlib/libvjp_util.so (0x00007fb2ee94c000)\n\tlibopenblas.so.0 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libopenblas.so.0 (0x00007fb2ec29b000)\n\tlibgomp.so.1 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libgomp.so.1 (0x00007fb2ec240000)\n\tlibc.so.6 => /lib64/libc.so.6 (0x00007fb2ec000000)\n\tlibm.so.6 => /lib64/libm.so.6 (0x00007fb2ebf25000)\n\tlibpthread.so.0 => /lib64/libpthread.so.0 (0x00007fb2ec220000)\n\tlibgfortran.so.5 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/./libgfortran.so.5 (0x00007fb2ebbc3000)\n\t/lib64/ld-linux-x86-64.so.2 (0x00007fb2ee967000)\n\tlibdl.so.2 => /lib64/libdl.so.2 (0x00007fb2ec21b000)\n\tlibquadmath.so.0 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/././libquadmath.so.0 (0x00007fb2ebb7a000)\n\tlibgcc_s.so.1 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/././libgcc_s.so.1 (0x00007fb2ebb4c000)\n",
+    "libcgto_ad.so": "\tlinux-vdso.so.1 (0x00007ffe241cf000)\n\tlibcintad.so => /resnick/groups/sharmagroup/bkhou/src/pyscfad/pyscfadlib/pyscfadlib/thirdparty/lib/libcintad.so (0x00007fc681958000)\n\tlibnp_helper_ad.so => /resnick/groups/sharmagroup/bkhou/src/pyscfad/pyscfadlib/pyscfadlib/libnp_helper_ad.so (0x00007fc681953000)\n\tlibopenblas.so.0 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libopenblas.so.0 (0x00007fc67f2a2000)\n\tlibgomp.so.1 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libgomp.so.1 (0x00007fc67f247000)\n\tlibc.so.6 => /lib64/libc.so.6 (0x00007fc67f000000)\n\tlibquadmath.so.0 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libquadmath.so.0 (0x00007fc67efb7000)\n\tlibm.so.6 => /lib64/libm.so.6 (0x00007fc67eedc000)\n\tlibpthread.so.0 => /lib64/libpthread.so.0 (0x00007fc67f227000)\n\tlibgfortran.so.5 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/./libgfortran.so.5 (0x00007fc67eb7a000)\n\t/lib64/ld-linux-x86-64.so.2 (0x00007fc681e49000)\n\tlibdl.so.2 => /lib64/libdl.so.2 (0x00007fc67f220000)\n\tlibgcc_s.so.1 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/././libgcc_s.so.1 (0x00007fc67eb4c000)\n",
+    "libcgto_vjp.so": "\tlinux-vdso.so.1 (0x00007fff0ab57000)\n\tlibcgto_ad.so => /resnick/groups/sharmagroup/bkhou/src/pyscfad/pyscfadlib/pyscfadlib/libcgto_ad.so (0x00007fd05e1c2000)\n\tlibvjp_util.so => /resnick/groups/sharmagroup/bkhou/src/pyscfad/pyscfadlib/pyscfadlib/libvjp_util.so (0x00007fd05e1bd000)\n\tlibm.so.6 => /lib64/libm.so.6 (0x00007fd05e0c9000)\n\tlibcintad.so => /resnick/groups/sharmagroup/bkhou/src/pyscfad/pyscfadlib/pyscfadlib/thirdparty/lib/libcintad.so (0x00007fd05dc77000)\n\tlibnp_helper_ad.so => /resnick/groups/sharmagroup/bkhou/src/pyscfad/pyscfadlib/pyscfadlib/libnp_helper_ad.so (0x00007fd05dc70000)\n\tlibgomp.so.1 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libgomp.so.1 (0x00007fd05dc15000)\n\tlibopenblas.so.0 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libopenblas.so.0 (0x00007fd05b564000)\n\tlibc.so.6 => /lib64/libc.so.6 (0x00007fd05b200000)\n\t/lib64/ld-linux-x86-64.so.2 (0x00007fd05e26c000)\n\tlibquadmath.so.0 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libquadmath.so.0 (0x00007fd05b51b000)\n\tlibdl.so.2 => /lib64/libdl.so.2 (0x00007fd05b514000)\n\tlibpthread.so.0 => /lib64/libpthread.so.0 (0x00007fd05b50f000)\n\tlibgfortran.so.5 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/./libgfortran.so.5 (0x00007fd05ae9e000)\n\tlibgcc_s.so.1 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/././libgcc_s.so.1 (0x00007fd05b4e1000)\n",
+    "libcvhf_vjp.so": "\tlinux-vdso.so.1 (0x00007ffe7e884000)\n\tlibnp_helper_ad.so => /resnick/groups/sharmagroup/bkhou/src/pyscfad/pyscfadlib/pyscfadlib/libnp_helper_ad.so (0x00007f3f07a22000)\n\tlibvjp_util.so => /resnick/groups/sharmagroup/bkhou/src/pyscfad/pyscfadlib/pyscfadlib/libvjp_util.so (0x00007f3f07a1d000)\n\tlibm.so.6 => /lib64/libm.so.6 (0x00007f3f07929000)\n\tlibopenblas.so.0 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libopenblas.so.0 (0x00007f3f05278000)\n\tlibgomp.so.1 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libgomp.so.1 (0x00007f3f0521b000)\n\tlibc.so.6 => /lib64/libc.so.6 (0x00007f3f05000000)\n\t/lib64/ld-linux-x86-64.so.2 (0x00007f3f07a30000)\n\tlibpthread.so.0 => /lib64/libpthread.so.0 (0x00007f3f05216000)\n\tlibgfortran.so.5 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/./libgfortran.so.5 (0x00007f3f04c9e000)\n\tlibdl.so.2 => /lib64/libdl.so.2 (0x00007f3f05211000)\n\tlibquadmath.so.0 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/././libquadmath.so.0 (0x00007f3f04c55000)\n\tlibgcc_s.so.1 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/././libgcc_s.so.1 (0x00007f3f04c27000)\n",
+    "libnp_helper_ad.so": "\tlinux-vdso.so.1 (0x00007fff8895c000)\n\tlibgomp.so.1 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libgomp.so.1 (0x00007f16db0d8000)\n\tlibc.so.6 => /lib64/libc.so.6 (0x00007f16dae00000)\n\tlibdl.so.2 => /lib64/libdl.so.2 (0x00007f16db0ba000)\n\tlibpthread.so.0 => /lib64/libpthread.so.0 (0x00007f16db0b5000)\n\t/lib64/ld-linux-x86-64.so.2 (0x00007f16db13a000)\n",
+    "libnp_helper_vjp.so": "\tlinux-vdso.so.1 (0x00007fff34db3000)\n\tlibgomp.so.1 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libgomp.so.1 (0x00007fa7c5904000)\n\tlibc.so.6 => /lib64/libc.so.6 (0x00007fa7c5600000)\n\tlibdl.so.2 => /lib64/libdl.so.2 (0x00007fa7c58e6000)\n\tlibpthread.so.0 => /lib64/libpthread.so.0 (0x00007fa7c58e1000)\n\t/lib64/ld-linux-x86-64.so.2 (0x00007fa7c5966000)\n",
+    "libvjp_util.so": "\tlinux-vdso.so.1 (0x00007ffe09bd8000)\n\tlibgomp.so.1 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libgomp.so.1 (0x00007f5b032d1000)\n\tlibc.so.6 => /lib64/libc.so.6 (0x00007f5b03000000)\n\tlibdl.so.2 => /lib64/libdl.so.2 (0x00007f5b032b3000)\n\tlibpthread.so.0 => /lib64/libpthread.so.0 (0x00007f5b032ae000)\n\t/lib64/ld-linux-x86-64.so.2 (0x00007f5b03333000)\n",
+    "pyscfad_lapack.cpython-311-x86_64-linux-gnu.so": "\tlinux-vdso.so.1 (0x00007ffd4e3c5000)\n\tlibopenblas.so.0 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libopenblas.so.0 (0x00007f6840285000)\n\tlibstdc++.so.6 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libstdc++.so.6 (0x00007f683ffd0000)\n\tlibm.so.6 => /lib64/libm.so.6 (0x00007f683fedc000)\n\tlibgcc_s.so.1 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libgcc_s.so.1 (0x00007f683feae000)\n\tlibc.so.6 => /lib64/libc.so.6 (0x00007f683fc00000)\n\t/lib64/ld-linux-x86-64.so.2 (0x00007f684295f000)\n\tlibpthread.so.0 => /lib64/libpthread.so.0 (0x00007f683fea7000)\n\tlibgfortran.so.5 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/./libgfortran.so.5 (0x00007f683f89e000)\n\tlibdl.so.2 => /lib64/libdl.so.2 (0x00007f683fea2000)\n\tlibquadmath.so.0 => /resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/././libquadmath.so.0 (0x00007f683fe59000)\n"
+  },
+  "versions": {
+    "pyscf": "2.14.0",
+    "pyscfad": "0.3.1",
+    "pyscfadlib": "0.3.3+ompfix.ef9edb92",
+    "jax": "0.10.2",
+    "jaxlib": "0.10.2",
+    "numpy": "2.4.6",
+    "scipy": "1.17.1",
+    "nanobind": "3.0.1"
+  },
+  "threadpools": [
+    {
+      "user_api": "blas",
+      "internal_api": "openblas",
+      "num_threads": 1,
+      "prefix": "libopenblas",
+      "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libopenblasp-r0.3.34.so",
+      "version": "0.3.34",
+      "threading_layer": "pthreads",
+      "architecture": "SkylakeX"
+    },
+    {
+      "user_api": "openmp",
+      "internal_api": "openmp",
+      "num_threads": 1,
+      "prefix": "libgomp",
+      "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libgomp.so.1.0.0",
+      "version": null
+    },
+    {
+      "user_api": "blas",
+      "internal_api": "openblas",
+      "num_threads": 1,
+      "prefix": "libscipy_openblas",
+      "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/scipy.libs/libscipy_openblas-6cdc3b4a.so",
+      "version": "0.3.30",
+      "threading_layer": "pthreads",
+      "architecture": "SkylakeX"
+    },
+    {
+      "user_api": "blas",
+      "internal_api": "openblas",
+      "num_threads": 1,
+      "prefix": "libscipy_openblas",
+      "filepath": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/numpy.libs/libscipy_openblas64_-32a4b2a6.so",
+      "version": "0.3.31.188.0",
+      "threading_layer": "pthreads",
+      "architecture": "SkylakeX"
+    }
+  ]
+}

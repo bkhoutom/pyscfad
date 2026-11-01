@@ -1,0 +1,3 @@
+[2026-10-30T19:28:00.257] error: *** STEP 5766258.1 ON hpc-19-15 CANCELLED AT 2026-10-30T19:28:00 DUE to SIGNAL Terminated ***
+[2026-10-30T19:28:00.258] error: *** JOB 5766258 ON hpc-19-15 CANCELLED AT 2026-10-30T19:28:00 DUE to SIGNAL Terminated ***
+srun: Job step aborted: Waiting up to 32 seconds for job step to finish.

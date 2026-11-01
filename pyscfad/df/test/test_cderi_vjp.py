@@ -758,20 +758,20 @@ def test_int3c_mo_deriv_coords_vjp_oversized_shell_fallback_is_disjoint(
     reference = _cderi_vjp._int3c_mo_deriv_coords_vjp(
         mol, auxmol, mo_coeff, z, orbs_slice
     )
-    real_int3c_cross = _cderi_vjp._int3c_cross_opt.int3c_cross
+    real_int3c_bwd = _cderi_vjp._int3c_cross_opt.int3c_cross_bwd
     integral_ranges = []
 
-    def tracked_int3c_cross(*args, **kwargs):
-        shls_slice = kwargs['shls_slice']
+    def tracked_int3c_bwd(*args, **kwargs):
+        shls_slice = args[3]
         shl0 = shls_slice[4] - mol.nbas
         shl1 = shls_slice[5] - mol.nbas
         integral_ranges.append(
             (int(auxmol.ao_loc[shl0]), int(auxmol.ao_loc[shl1]))
         )
-        return real_int3c_cross(*args, **kwargs)
+        return real_int3c_bwd(*args, **kwargs)
 
     monkeypatch.setattr(
-        _cderi_vjp._int3c_cross_opt, 'int3c_cross', tracked_int3c_cross
+        _cderi_vjp._int3c_cross_opt, 'int3c_cross_bwd', tracked_int3c_bwd
     )
     read_ranges = []
 

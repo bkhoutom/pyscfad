@@ -13,6 +13,7 @@
    limitations under the License.
 */
 #include <stdlib.h>
+#include <string.h>
 #include "config.h"
 #include "cint.h"
 #include "gto/gto.h"
@@ -188,6 +189,11 @@ void GTOnr3c_ij_r0_vjp(int (*intor)(), void (*fill)(), double *vjp, double *ybar
         const int cache_size = GTOmax_cache_size(intor, shls_slice, 3,
                                                  atm, natm, bas, nbas, env);
         const int njobs = (MAX(nish,njsh) / BLKSIZE + 1) * nksh;
+        // Retain reproducible static scheduling by default.  The opt-in
+        // dynamic schedule balances unequal shell costs without changing
+        // private buffers, worksharing barriers, or the ordered reduction.
+        const char *schedule = getenv("PYSCFAD_INTEGRAL_VJP_SCHEDULE");
+        const int dynamic_schedule = schedule != NULL && strcmp(schedule, "dynamic") == 0;
 
         double **vjp_loc_bufs = calloc(omp_get_max_threads_safe(), sizeof(double *));
 #pragma omp parallel
@@ -203,10 +209,18 @@ void GTOnr3c_ij_r0_vjp(int (*intor)(), void (*fill)(), double *vjp, double *ybar
         }
         vjp_loc_bufs[thread_id] = vjp_loc;
 
-        #pragma omp for schedule(static)
-        for (jobid = 0; jobid < njobs; jobid++) {
-                (*fill)(intor, vjp_loc, ybar, buf, comp, jobid, shls_slice, ao_loc,
-                        cintopt, atm, natm, bas, nbas, env);
+        if (dynamic_schedule) {
+                #pragma omp for schedule(dynamic)
+                for (jobid = 0; jobid < njobs; jobid++) {
+                        (*fill)(intor, vjp_loc, ybar, buf, comp, jobid, shls_slice, ao_loc,
+                                cintopt, atm, natm, bas, nbas, env);
+                }
+        } else {
+                #pragma omp for schedule(static)
+                for (jobid = 0; jobid < njobs; jobid++) {
+                        (*fill)(intor, vjp_loc, ybar, buf, comp, jobid, shls_slice, ao_loc,
+                                cintopt, atm, natm, bas, nbas, env);
+                }
         }
         free(buf);
 

@@ -1,0 +1,57 @@
+{
+  "source_driver": "/home/bkhou/DLNO_CCSDT/test_pyscfad_stc_mp2/runtime_test/water_tests/water_tests/compare_mp2_LT.py",
+  "source_driver_sha256": "ea322c82b253313944ae6184dfdd30a6204241754bbb66e3e84693632254f752",
+  "validation_job": 5788235,
+  "conditions": [
+    {
+      "condition": "water_2",
+      "atoms": 6,
+      "destination": "/home/bkhou/DLNO_CCSDT/test_pyscfad_stc_mp2/runtime_test/water_tests/water_2",
+      "sha256": {
+        "compare_mp2_LT.py": "f23c73d2f3de60b5932047660969d2f0e82796b439daf1421fbced0f610e541b",
+        "submit.sh": "fc44345191831a42b90133a7950a15ef767e5983e2075d5731952c0966057741",
+        "water_2.xyz": "7825c5959ba0f1bb11ca2293e3634f1f275413fb2f174c8370a1715a9b06fcba"
+      }
+    },
+    {
+      "condition": "water_4",
+      "atoms": 12,
+      "destination": "/home/bkhou/DLNO_CCSDT/test_pyscfad_stc_mp2/runtime_test/water_tests/water_4",
+      "sha256": {
+        "compare_mp2_LT.py": "176a4c1e55720c6ba3338531d6cbce05dbe392b642772aa1d054a1692d9024f5",
+        "submit.sh": "7798ad67682e550b955d08413db74dd15b9d75582fc182753f74431f6a2cb55a",
+        "water_4.xyz": "26d7b08cdae0b075f5d1a6da6ce885a1b87cb0cd384301dd52805ff4623cf82d"
+      }
+    },
+    {
+      "condition": "water_8",
+      "atoms": 24,
+      "destination": "/home/bkhou/DLNO_CCSDT/test_pyscfad_stc_mp2/runtime_test/water_tests/water_8",
+      "sha256": {
+        "compare_mp2_LT.py": "510ad1cb48802cb72125657a3ddd89cd321c521499c22b8b30cc206027ad115e",
+        "submit.sh": "f4faa10c90faa7251f1b169fee3667b13228250274929429e340fccd851262cd",
+        "water_8.xyz": "79daa8992bb5bbe24dd78c8ee503fb66e47920ddc9d2e7832679e6c37ae702d7"
+      }
+    },
+    {
+      "condition": "water_12",
+      "atoms": 36,
+      "destination": "/home/bkhou/DLNO_CCSDT/test_pyscfad_stc_mp2/runtime_test/water_tests/water_12",
+      "sha256": {
+        "compare_mp2_LT.py": "8e1f25a2c01c6a450ee740e56a9de2513fe2f5790440ead5291f4b0a08a98971",
+        "submit.sh": "c600fc252e7e09ba137f529be8bf76d5db7389e0635019d35cb186b4d472c123",
+        "water_12.xyz": "69dc6d43fdd84f64f4889706dfc00e55152efeff82b97b5875aa7f3d1c335315"
+      }
+    },
+    {
+      "condition": "water_16",
+      "atoms": 48,
+      "destination": "/home/bkhou/DLNO_CCSDT/test_pyscfad_stc_mp2/runtime_test/water_tests/water_16",
+      "sha256": {
+        "compare_mp2_LT.py": "b72df41b34ef37094dff60ad7bd775ba87cb144bf3956e934eba14fa0a601955",
+        "submit.sh": "ff351cf60612057d438db0cf122bb91a3aa60af5b10c67c94c97efecfef79b3f",
+        "water_16.xyz": "6696d451e230da0b4cdeed720ab0944a7ec2081011886420291f3bb989e3926f"
+      }
+    }
+  ]
+}

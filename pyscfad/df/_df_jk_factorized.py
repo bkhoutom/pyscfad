@@ -23,6 +23,7 @@ from jax import scipy as jax_scipy
 from jax.tree_util import tree_flatten, tree_unflatten
 import numpy
 import scipy.linalg
+from threadpoolctl import threadpool_limits
 from pyscf import lib
 from pyscf.df import df_jk as pyscf_df_jk
 
@@ -154,13 +155,74 @@ def _reverse(with_j, with_k, factor_response, residual, cotangents, T, Rtilde):
     with dense_blas_threads():
         D = S @ S.T
 
+    # For real symmetric J inputs, form 2 K + J and symmetrize once at the
+    # end. This avoids repeated full-density copies and broadcast products.
+    # Keep the original arithmetic for other dtypes or nonexact symmetry;
+    # hermi_sum must not introduce conjugation into those cases.
+    fused_density = (
+        all(x.dtype == numpy.float64 for x in (S, G, H, D))
+        and (not with_j or (numpy.array_equal(G, G.T)
+                            and numpy.array_equal(D, D.T))))
+    doubled_st = (numpy.ascontiguousarray(2 * S.T)
+                  if fused_density and with_k else None)
+    packed_density = fused_density and _cderi_vjp._symmetric_pack is not None
+    # Packing symmetric G,D once gives twice their off-diagonal entries and
+    # their unchanged diagonals, precisely the native coordinate weighting.
+    packed_jd_columns = (
+        _cderi_vjp._pack_tril_symmetric_sum(numpy.stack((G, D))).T
+        if packed_density and with_j else None)
+    jd_columns = None
+
+    def fill_packed_density(begin, end, out):
+        # X=2 R S.T contributes X+X.T off diagonal and X on diagonal.
+        # Contract J directly in packed space, avoiding its AO-square block.
+        if with_k:
+            with dense_blas_threads():
+                panel = numpy.asarray(Rtilde[begin:end]).reshape(-1, rank)
+                density = (panel @ doubled_st).reshape(end - begin, nao, nao)
+            _cderi_vjp._pack_tril_symmetric_sum(density, out=out)
+            del density, panel
+        if with_j:
+            coefficients = numpy.array((a[begin:end], b[begin:end]), order='F')
+            # This rank-two update is memory bound. A large BLAS team costs
+            # more here and competes with the following OpenMP contraction.
+            with threadpool_limits(limits=1, user_api='blas'):
+                updated = scipy.linalg.blas.dgemm(
+                    1., packed_jd_columns, coefficients, beta=float(with_k),
+                    c=out.T, overwrite_c=1)
+            # BLAS wrappers may copy their output; preserve the fill contract.
+            if not numpy.shares_memory(updated, out):
+                out[:] = updated.T
+        elif not with_k:
+            out.fill(0.)
+
     def read_density(begin, end):
+        nonlocal jd_columns
         # The coordinate integral contracts both AO legs. Supply 2 Z, where
         # Z=L^-T A is the symmetric raw-integral adjoint.
+        if fused_density:
+            with dense_blas_threads():
+                if with_k:
+                    panel = numpy.asarray(Rtilde[begin:end]).reshape(-1, rank)
+                    density = (panel @ doubled_st).reshape(end - begin, nao, nao)
+                else:
+                    density = numpy.zeros((end - begin, nao, nao))
+                if with_j:
+                    if jd_columns is None:
+                        jd_columns = numpy.asfortranarray(
+                            numpy.stack((G.ravel(), D.ravel()), axis=1))
+                    coefficients = numpy.array((a[begin:end], b[begin:end]), order='F')
+                    updated = scipy.linalg.blas.dgemm(
+                        1., jd_columns, coefficients, beta=1.,
+                        c=density.reshape(end - begin, -1).T, overwrite_c=1)
+                    # BLAS may copy its output argument; always use its return.
+                    density = updated.T.reshape(end - begin, nao, nao)
+            return lib.hermi_sum(density, axes=(0, 2, 1), inplace=True)
         with dense_blas_threads():
             if with_k:
                 panel = numpy.asarray(Rtilde[begin:end]).reshape(end - begin, nao, rank)
-                density = panel @ S.T
+                density = (panel.reshape(-1, rank) @ S.T).reshape(
+                    end - begin, nao, nao)
                 density += density.swapaxes(1, 2).copy()
             else:
                 density = numpy.zeros((end - begin, nao, nao))
@@ -174,6 +236,7 @@ def _reverse(with_j, with_k, factor_response, residual, cotangents, T, Rtilde):
         dfobj.mol, auxmol, None, None, (0, nao, 0, nao),
         int3c=dfobj.mol._add_suffix('int3c2e'),
         read_density_aux_block=read_density,
+        fill_packed_density_aux_block=fill_packed_density if packed_density else None,
     )
 
     def metric_cholesky(aux):

@@ -138,6 +138,7 @@ dmypy.json
 /.local/
 
 # Repository-local generated output and scratch
+/benchmarks/
 /output/
 /tmp/
 

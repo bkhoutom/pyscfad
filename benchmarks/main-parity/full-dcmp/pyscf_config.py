@@ -1,1 +1,0 @@
-TIMER_LEVEL = 4

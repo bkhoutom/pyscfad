@@ -1,9 +1,0 @@
-hpc-53-08.cm.cluster
-TARGET           SOURCE                              FSTYPE
-/resnick/scratch fs.vast.cm.cluster:/resnick/scratch nfs
-{
-  "outcore_vs_incore_energy_hartree": 3.410605131648481e-13,
-  "max_gradient_error_hartree_per_bohr": 2.4270516152391508e-14,
-  "plain_vs_ad_energy_hartree": 2.2737367544323206e-13
-}
-PASS: disk-backed and in-core energies/full gradients agree.

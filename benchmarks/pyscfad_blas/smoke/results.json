@@ -1,6 +1,0 @@
-{
-  "energy_error_hartree": 1.4210854715202004e-13,
-  "gradient_ad_hartree_per_bohr": -0.0063652626663409095,
-  "gradient_fd_hartree_per_bohr": -0.006365291206122947,
-  "gradient_error_hartree_per_bohr": 2.853978203765095e-08
-}

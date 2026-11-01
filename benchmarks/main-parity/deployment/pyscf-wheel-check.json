@@ -1,8 +1,0 @@
-{
-  "wheel": "/resnick/groups/sharmagroup/bkhou/src/pyscfad/benchmarks/pyscfad_mkl/wheels/pyscf-2.14.0-2caltechmklseq-py3-none-linux_x86_64.whl",
-  "wheel_sha256": "52ad6a68ffdcb49177c63bb66cc0e0bcefa4249cc432c1c62aa61aa1482c4a59",
-  "runtime_files_match_candidate": true,
-  "metadata_difference": "HPC_BUILD.json in wheel records the MKL build; the copied candidate still has historical OpenBLAS build metadata. All Python code and binary files are byte-identical.",
-  "files": 1221,
-  "native": 25
-}

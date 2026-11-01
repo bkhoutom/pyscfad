@@ -1,8 +1,0 @@
-/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/gto/mole.py:1291: UserWarning: Function mol.dumps drops attribute coords because it is not JSON-serializable
-  warnings.warn(msg)
-/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/gto/mole.py:1291: UserWarning: Function mol.dumps drops attribute _enuc because it is not JSON-serializable
-  warnings.warn(msg)
-/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/gto/mole.py:1291: UserWarning: Function mol.dumps drops attribute coords because it is not JSON-serializable
-  warnings.warn(msg)
-/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/gto/mole.py:1291: UserWarning: Function mol.dumps drops attribute _enuc because it is not JSON-serializable
-  warnings.warn(msg)

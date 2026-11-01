@@ -515,6 +515,8 @@ def _run_system(initializer, controls, comm, *, with_grad, include_hf=False):
     rank = 0 if comm is None else comm.Get_rank()
     with resource_profile.section('stc.system.scf'):
         state = _root_call(comm, rank, initializer, "initial system preparation")
+        if rank == 0 and resource_profile.enabled():
+            jax.block_until_ready((state["mf"], state["scf_pullback"]))
     has_work = bool(len(state["occupied"]) and len(state["virtual"])) if rank == 0 else None
     if comm is not None:
         has_work = comm.bcast(has_work, root=0)

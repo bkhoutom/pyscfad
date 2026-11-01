@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ctypes
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import partial
-import ctypes
 import numpy
 import jax
 from jax import custom_jvp, custom_vjp
+from jax.custom_derivatives import SymbolicZero
 from pyscf import __config__
 from pyscf import lib as pyscf_lib
 from pyscf.lib import direct_sum, current_memory
@@ -37,12 +38,12 @@ from pyscfad.tools import resource_profile
 try:
     from pyscfadlib import libmp_vjp
 except (ImportError, OSError):
-    # Older native installations retain the differentiable scan fallback.
     libmp_vjp = None
+
 try:
     libmp = pyscf_lib.load_library('libmp')
-    libmp.MP2_contract_d
-except (OSError, AttributeError):
+except OSError:
+    # Older supported PySCF releases have no native MP2 library.
     libmp = None
 
 WITH_T2 = getattr(__config__, 'mp_dfmp2_with_t2', True)
@@ -260,54 +261,235 @@ def _contract_scan_impl(Lov, mo_energy, nocc, nvir, with_t2=True):
     return emp2, t2
 
 
-def _native_energy_inputs(Lov, mo_energy, nocc, nvir):
-    # PySCF's pair kernel uses contiguous (occupied, virtual, auxiliary) rows.
-    iaL = pyscf_lib.transpose(numpy.asarray(Lov)).reshape(nocc, nvir, -1)
-    mo_energy = numpy.asarray(mo_energy, order='C')
-    e_occ, e_vir = mo_energy[:nocc], mo_energy[nocc:]
-    moeoo = numpy.asarray(e_occ[:, None] + e_occ, order='C')
-    moevv = numpy.asarray(e_vir[:, None] + e_vir, order='C')
-    ed, ex = numpy.zeros(1), numpy.zeros(1)
+def _to_iaL(Lov, nocc, nvir):
+    # (nocc, nvir, naux), the layout of MP2_contract_d
+    return pyscf_lib.transpose(numpy.asarray(Lov)).reshape(nocc, nvir, -1)
+
+def _ed_ex(iaL, mo_energy, nocc, nvir, t2=None):
+    '''(ed, ex) of MP2_contract_d, and the amplitudes written to t2,
+    (nocc, nocc, nvir, nvir) in C order, if given.'''
+    naux = iaL.shape[-1]
+    e_occ = mo_energy[:nocc]
+    e_vir = mo_energy[nocc:]
+    moeoo = numpy.asarray(e_occ[:,None] + e_occ, order='C')
+    moevv = numpy.asarray(e_vir[:,None] + e_vir, order='C')
+    ed = numpy.zeros(1)
+    ex = numpy.zeros(1)
     libmp.MP2_contract_d(
         ed.ctypes.data_as(ctypes.c_void_p),
-        ex.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(1),
+        ex.ctypes.data_as(ctypes.c_void_p),
+        ctypes.c_int(1),
         iaL.ctypes.data_as(ctypes.c_void_p),
         iaL.ctypes.data_as(ctypes.c_void_p),
         ctypes.c_int(0), ctypes.c_int(0),
         ctypes.c_int(nocc), ctypes.c_int(nocc),
-        ctypes.c_int(nocc), ctypes.c_int(nvir), ctypes.c_int(iaL.shape[-1]),
+        ctypes.c_int(nocc), ctypes.c_int(nvir), ctypes.c_int(naux),
         moeoo.ctypes.data_as(ctypes.c_void_p),
         moevv.ctypes.data_as(ctypes.c_void_p),
-        pyscf_lib.c_null_ptr(), ctypes.c_int(0),
+        _c_ptr(t2), ctypes.c_int(0),
     )
-    return ed[0]*2 + ex[0], iaL, mo_energy
+    return ed[0], ex[0]
 
+def _c_ptr(a):
+    if a is None:
+        return pyscf_lib.c_null_ptr()
+    return a.ctypes.data_as(ctypes.c_void_p)
 
-def _native_input_gradients(iaL, mo_energy, nocc, nvir):
-    iaL_bar = numpy.zeros_like(iaL)
-    energy_bar = numpy.zeros_like(mo_energy)
-    libmp_vjp.MP2_contract_d_vjp(
+def _contract_d_vjp(iaL, mo_energy, nocc, nvir, ed_bar, ex_bar,
+                    iaL_bar=None, e_bar=None, with_energy=False,
+                    t2=None, t2_bar=None):
+    '''VJP of (ed, ex) of MP2_contract_d for the cotangents (ed_bar, ex_bar),
+    and of the amplitudes for t2_bar if given, added to iaL_bar and e_bar if
+    given. If with_energy, also returns ed and ex, and writes the amplitudes
+    to t2 if given, computed in the same pass (MP2_contract_d_energy_vjp).
+    '''
+    naux = iaL.shape[-1]
+    if iaL_bar is None:
+        iaL_bar = numpy.zeros_like(iaL)
+    if e_bar is None:
+        e_bar = numpy.zeros_like(mo_energy)
+    e_vir_bar = e_bar[nocc:]
+    args = (
         iaL_bar.ctypes.data_as(ctypes.c_void_p),
-        energy_bar.ctypes.data_as(ctypes.c_void_p),
-        energy_bar[nocc:].ctypes.data_as(ctypes.c_void_p),
-        ctypes.c_double(2.), ctypes.c_double(1.),
+        e_bar.ctypes.data_as(ctypes.c_void_p),
+        e_vir_bar.ctypes.data_as(ctypes.c_void_p),
+        ctypes.c_double(ed_bar),
+        ctypes.c_double(ex_bar),
         iaL.ctypes.data_as(ctypes.c_void_p),
         mo_energy.ctypes.data_as(ctypes.c_void_p),
         mo_energy[nocc:].ctypes.data_as(ctypes.c_void_p),
-        ctypes.c_int(nocc), ctypes.c_int(nvir), ctypes.c_int(iaL.shape[-1]),
+        ctypes.c_int(nocc), ctypes.c_int(nvir), ctypes.c_int(naux),
     )
-    return (pyscf_lib.transpose(iaL_bar.reshape(nocc*nvir, -1)),
-            energy_bar)
+    if with_energy or t2 is not None or t2_bar is not None:
+        e = numpy.zeros(2)
+        if t2_bar is not None:
+            t2_bar = numpy.asarray(t2_bar, dtype=numpy.float64, order='C')
+            assert t2_bar.shape == (nocc, nocc, nvir, nvir)
+        libmp_vjp.MP2_contract_d_energy_vjp(_c_ptr(e), _c_ptr(t2), _c_ptr(t2_bar),
+                                            *args)
+        if with_energy:
+            return e[0], e[1], iaL_bar, e_bar
+    else:
+        libmp_vjp.MP2_contract_d_vjp(*args)
+    return iaL_bar, e_bar
+
+
+_NATIVE_REVERSE_MODE = ContextVar('dfmp2_native_reverse_mode', default=False)
+
+
+@contextmanager
+def _native_reverse_mode():
+    """Enable native fusion in an audited eager first-order reverse call.
+
+    Only use around grad, value_and_grad, or vjp, never around linearize.
+    Linearize uses the same tracer as reverse AD and cannot be distinguished
+    reliably. Outside this private opt-in, traced amplitude-returning calls
+    keep generic AD; energy-only calls may use the forward-compatible JVP.
+    """
+    token = _NATIVE_REVERSE_MODE.set(True)
+    try:
+        yield
+    finally:
+        _NATIVE_REVERSE_MODE.reset(token)
+
+
+def _native_lov_eligible(Lov, mo_energy, nocc, nvir):
+    if (libmp is None or not hasattr(libmp, 'MP2_contract_d')
+            or libmp_vjp is None
+            or not hasattr(libmp_vjp, 'MP2_contract_d_vjp')
+            or not hasattr(libmp_vjp, 'MP2_contract_d_energy_vjp')
+            or nocc <= 0 or nvir <= 0):
+        return False
+    for value in (Lov, mo_energy):
+        if getattr(value, 'dtype', None) != numpy.dtype(numpy.float64):
+            return False
+        if isinstance(value, jax.core.Tracer):
+            if not (_NATIVE_REVERSE_MODE.get()
+                    and type(value).__name__ == 'LinearizeTracer'):
+                return False
+            if isinstance(value.primal, jax.core.Tracer):
+                return False
+    return (Lov.ndim == 2 and Lov.shape[0] > 0
+            and Lov.shape[1] == nocc*nvir
+            and mo_energy.shape == (nocc+nvir,))
+
+
+
+def _native_lov_memory_fits(mp, Lov, mo_energy, nocc, nvir, with_t2):
+    """Check native additions after the existing transform has produced Lov.
+
+    Keep the transform's own memory guard. Native contraction adds a layout
+    copy and OpenMP workspace; reverse mode also retains cached derivatives
+    and may need writable seed corrections plus the outgoing Lov cotangent.
+    Falling back leaves the original scan and its memory policy available.
+    """
+    if getattr(getattr(mp, 'mol', None), 'incore_anyway', False):
+        return True
+    max_memory = getattr(mp, 'max_memory', float('inf'))
+    reverse = any(isinstance(x, jax.core.Tracer) for x in (Lov, mo_energy))
+    values = tuple(x.primal if isinstance(x, jax.core.Tracer) else x
+                   for x in (Lov, mo_energy))
+    # Native execution must wait for these primals anyway. Account resident
+    # transform outputs before inspecting RSS, including async JAX outputs.
+    jax.block_until_ready(values)
+    nthreads = max(1, int(pyscf_lib.num_threads()))
+    nmo = nocc + nvir
+    factor_copies = 4 if reverse else 1
+    extra_doubles = factor_copies * Lov.size
+    extra_doubles += 3*nvir*nvir*nthreads  # private v/t/g per native worker
+    extra_doubles += nocc*nocc + nvir*nvir  # primal energy denominators
+    extra_doubles += nmo*(nthreads + 3)  # energy buffers/reductions
+    if with_t2:
+        # Output plus reverse seed/layout allowance; no T2-sized cache is kept.
+        extra_doubles += (3 if reverse else 1)*(nocc*nvir)**2
+    extra_bytes = 8*extra_doubles
+    extra_bytes += 4*nocc*(nocc + 1) + 64*nocc  # pair indices/lock allowance
+    return current_memory()[0] + extra_bytes/1e6 < max_memory
+
+
+@partial(custom_vjp, nondiff_argnums=(2, 3, 4))
+def _contract_d_lov(Lov, mo_energy, nocc, nvir, with_t2=False):
+    """Native (ed, ex[, t2]) after the existing AO-to-MO transform.
+
+    The forward reverse-AD rule also computes the total-energy seed (2, 1)
+    in the same pair pass. The backward rule scales it and adds any remaining
+    energy/T2 seed. Retain only the iaL layout, not both iaL and Lov.
+    """
+    iaL = _to_iaL(Lov, nocc, nvir)
+    mo_energy = numpy.asarray(mo_energy, order='C')
+    if iaL.dtype != numpy.float64 or mo_energy.dtype != numpy.float64:
+        raise TypeError('native MP2 requires float64 factors and energies')
+    t2 = numpy.empty((nocc, nocc, nvir, nvir)) if with_t2 else None
+    ed, ex = _profile_call(
+        'dfmp2.energy_forward', _ed_ex, iaL, mo_energy, nocc, nvir, t2)
+    return (ed, ex, t2) if with_t2 else (ed, ex)
+
+
+def _contract_d_lov_fwd(Lov, mo_energy, nocc, nvir, with_t2):
+    iaL = _to_iaL(Lov.value, nocc, nvir)
+    mo_energy = numpy.asarray(mo_energy.value, order='C')
+    if iaL.dtype != numpy.float64 or mo_energy.dtype != numpy.float64:
+        raise TypeError('native MP2 requires float64 factors and energies')
+    t2 = numpy.empty((nocc, nocc, nvir, nvir)) if with_t2 else None
+    compute = partial(_contract_d_vjp, with_energy=True, t2=t2)
+    ed, ex, iaL_bar, e_bar = _profile_call(
+        'dfmp2.energy_vjp_fused', compute,
+        iaL, mo_energy, nocc, nvir, 2., 1.)
+    out = (ed, ex, t2) if with_t2 else (ed, ex)
+    return out, (iaL, mo_energy, iaL_bar, e_bar)
+
+
+def _contract_d_lov_bwd(nocc, nvir, with_t2, res, ybar):
+    iaL, mo_energy, total_iaL_bar, total_e_bar = res
+    ed_bar, ex_bar = (0. if isinstance(y, SymbolicZero) else float(y)
+                      for y in ybar[:2])
+    t2_bar = None
+    if with_t2 and not isinstance(ybar[2], SymbolicZero):
+        t2_bar = ybar[2]
+    if ed_bar == 0 and ex_bar == 0 and t2_bar is None:
+        return None, None
+
+    # (ed_bar, ex_bar) = ex_bar*(2, 1) + (ed_bar-2*ex_bar, 0).
+    correction = ed_bar - 2*ex_bar
+    if correction != 0 or t2_bar is not None:
+        # Native kernels add to their output: never mutate residuals, since
+        # the same pullback may be reused with different seeds.
+        iaL_bar = total_iaL_bar * ex_bar
+        e_bar = total_e_bar * ex_bar
+        compute = partial(_contract_d_vjp, t2_bar=t2_bar)
+        iaL_bar, e_bar = _profile_call(
+            'dfmp2.energy_cotangents', compute, iaL, mo_energy, nocc, nvir,
+            correction, 0., iaL_bar, e_bar)
+        scale = 1.
+    else:
+        iaL_bar, e_bar = total_iaL_bar, total_e_bar
+        scale = ex_bar
+    naux = iaL_bar.shape[-1]
+    Lov_bar = pyscf_lib.transpose(iaL_bar.reshape(nocc*nvir, naux))
+    if scale != 1:
+        Lov_bar *= scale
+        e_bar = e_bar * scale
+    return Lov_bar, e_bar
+
+
+_contract_d_lov.defvjp(
+    _contract_d_lov_fwd, _contract_d_lov_bwd, symbolic_zeros=True)
 
 
 @partial(custom_jvp, nondiff_argnums=(2, 3))
 def _contract_native(Lov, mo_energy, nocc, nvir):
-    # Native host calls cannot consume staged arrays.  Keep the original JAX
-    # contraction under JIT/vmap and whenever another AD level is active.
+    """Energy-only native contraction with a forward-AD-compatible rule.
+
+    Staged and higher derivatives retain the scan. First-order eager AD
+    evaluates energy and its two input gradients in one native pair pass.
+    """
     if any(isinstance(x, jax.core.Tracer) for x in (Lov, mo_energy)):
         return _contract_scan_impl(Lov, mo_energy, nocc, nvir, False)[0]
-    return _profile_call('dfmp2.energy_forward', _native_energy_inputs,
-                         Lov, mo_energy, nocc, nvir)[0]
+    iaL = _to_iaL(Lov, nocc, nvir)
+    energies = numpy.asarray(mo_energy, order='C')
+    ed, ex = _profile_call(
+        'dfmp2.energy_forward', _ed_ex, iaL, energies, nocc, nvir)
+    return 2 * ed + ex
 
 
 @_contract_native.defjvp
@@ -315,35 +497,45 @@ def _contract_native_jvp(nocc, nvir, primals, tangents):
     if any(isinstance(x, jax.core.Tracer) for x in primals):
         fn = lambda x, e: _contract_scan_impl(x, e, nocc, nvir, False)[0]
         return jax.jvp(fn, primals, tangents)
-    energy, iaL, mo_energy = _profile_call(
-        'dfmp2.energy_forward', _native_energy_inputs,
-        *primals, nocc, nvir,
-    )
-    # For this scalar energy, a JVP is a dot product with its two input
-    # gradients.  Reverse AD transposes these dots, preserving arbitrary
-    # cotangents while avoiding a custom-VJP boundary that rejects forward AD.
-    # The native gradients are evaluated during linearization, and traced
-    # higher derivatives use the scan above instead of treating them constant.
-    lov_bar, energy_bar = _profile_call(
-        'dfmp2.energy_cotangents', _native_input_gradients,
-        iaL, mo_energy, nocc, nvir,
-    )
-    tangent = np.sum(np.asarray(lov_bar)*tangents[0])
-    tangent += np.sum(np.asarray(energy_bar)*tangents[1])
-    return energy, tangent
+    Lov, mo_energy = primals
+    iaL = _to_iaL(Lov, nocc, nvir)
+    energies = numpy.asarray(mo_energy, order='C')
+    ed, ex, iaL_bar, energy_bar = _profile_call(
+        'dfmp2.energy_vjp_fused', partial(_contract_d_vjp, with_energy=True),
+        iaL, energies, nocc, nvir, 2., 1.)
+    lov_bar = pyscf_lib.transpose(iaL_bar.reshape(nocc * nvir, -1))
+    # Transposing these linear dots preserves arbitrary/reused energy seeds.
+    tangent = np.sum(np.asarray(lov_bar) * tangents[0])
+    tangent += np.sum(np.asarray(energy_bar) * tangents[1])
+    return 2 * ed + ex, tangent
 
 
-def _contract_energy(Lov, mo_energy, nocc, nvir, with_t2=True):
+def _native_energy_eligible(Lov, mo_energy, nocc, nvir):
+    """Check host primals without excluding eager JVP or linearize."""
+    primals = []
+    for value in (Lov, mo_energy):
+        if isinstance(value, jax.core.Tracer):
+            if type(value).__name__ not in ('LinearizeTracer', 'JVPTracer'):
+                return False
+            value = value.primal
+            if isinstance(value, jax.core.Tracer):
+                return False
+        primals.append(value)
+    return _native_lov_eligible(*primals, nocc, nvir)
+
+
+def _contract_energy(Lov, mo_energy, nocc, nvir, with_t2=True, *, mp=None):
+    """Dispatch after AO-to-MO transformation, preserving both native APIs."""
     if not config.moleintor_opt:
         return _contract(Lov, mo_energy, nocc, nvir, with_t2)
-    # The native energy/gradient kernels are real-double and energy-only.
-    # Frozen orbital selection is already applied to both inputs by ao2mo.
-    if (not with_t2 and libmp is not None and libmp_vjp is not None
-            and nocc > 0 and nvir > 0 and Lov.shape[0] > 0
-            and Lov.shape == (Lov.shape[0], nocc*nvir)
-            and mo_energy.shape == (nocc+nvir,)
-            and numpy.dtype(Lov.dtype) == numpy.dtype(numpy.float64)
-            and numpy.dtype(mo_energy.dtype) == numpy.dtype(numpy.float64)):
+    native_vjp = _native_lov_eligible(Lov, mo_energy, nocc, nvir)
+    native_jvp = not with_t2 and _native_energy_eligible(
+        Lov, mo_energy, nocc, nvir)
+    if ((native_vjp or native_jvp)
+            and _native_lov_memory_fits(mp, Lov, mo_energy, nocc, nvir, with_t2)):
+        if native_vjp:
+            out = _contract_d_lov(Lov, mo_energy, nocc, nvir, with_t2)
+            return 2 * out[0] + out[1], out[2] if with_t2 else None
         return _contract_native(Lov, mo_energy, nocc, nvir), None
     return _contract_scan(Lov, mo_energy, nocc, nvir, with_t2)
 
@@ -505,7 +697,7 @@ def kernel(mp, mo_energy=None, mo_coeff=None, eris=None, with_t2=WITH_T2,
         'dfmp2.ao2mo', mp.loop_ao2mo, mo_coeff, nocc, with_t2,
     )
 
-    return _contract_energy(Lov, mo_energy, nocc, nvir, with_t2)
+    return _contract_energy(Lov, mo_energy, nocc, nvir, with_t2, mp=mp)
 
 class MP2(mp2.MP2):
     _dynamic_attr = _keys = {'with_df'}

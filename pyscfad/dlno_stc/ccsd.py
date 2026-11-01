@@ -24,7 +24,7 @@ from .domain import build_boys_ed_frame
 from .protocol import validate_full_result, validate_input_cotangents
 
 
-CC_SELECTIONS_SCHEMA_VERSION = 4
+CC_SELECTIONS_SCHEMA_VERSION = 6
 
 
 @dataclass(frozen=True)
@@ -131,7 +131,7 @@ def _validate_run(static, baseline_controls, matrix_controls, matrix_kind):
     if not isinstance(static, CCSDSelections):
         raise TypeError('static must be CCSDSelections from build_static_selections')
     if vars(static).get('schema_version') != CC_SELECTIONS_SCHEMA_VERSION:
-        raise ValueError('incompatible CC selections; rebuild selections for fragment energy budgets')
+        raise ValueError('incompatible CC selections; rebuild selections for full-Fock smooth frames')
     kind = static.matrix_kind if matrix_kind is None else matrix_kind
     if kind != static.matrix_kind:
         raise ValueError('matrix_kind differs from the saved LIS selection')
@@ -211,7 +211,7 @@ def _bar_norm(*trees):
 def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_vir,
                             baseline_controls, matrix_controls,
                             internal_rank_threshold=1e-6, merge_identical=True, fragment_indices=None,
-                            smooth_gap=None, smooth_laplace_points=10):
+                            smooth=True, smooth_laplace_points=10):
     """Select physical-fragment LIS ranks from explicit D or W cutoffs and controls.
 
     ``mp2_static`` is a concrete Boys ``DomainSelections``. D and W use
@@ -219,16 +219,16 @@ def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_v
     ``fragment_indices`` selects only those LIS ranks; unselected entries
     remain absent while all domain metadata is retained.
 
-    ``smooth_gap`` (Eh) opts each retained LIS into anchored Fock clusters
-    and full-Fock Laplace triples. D/W subspace response is retained. Cluster
-    labels, ranks, anchors and per-fragment quadratures are fixed here.
-    ``smooth_laplace_points`` defaults to ten fitted points per LIS; None
-    retains the older adaptive Gaussian grid. MP2 fragment energy proxies
-    from D/W selection are saved for subsequent triples variance allocation.
+    Smooth anchored frames with full occupied and virtual Fock matrices are
+    the default. Set ``smooth=False`` only for a deterministic semicanonical reference.
+    D/W subspace and AO overlap response are retained; there are no internal
+    Fock cluster projectors. Ranks, anchors and quadratures are fixed here.
+    ``smooth_laplace_points`` defaults to ten fitted points per LIS.
+    MP2 fragment proxies from D/W selection allocate triples variance budgets.
     """
     from .lis import LISSelections, build_fragment_lis_selection, build_fragment_lis
-    if smooth_gap is not None and (not numpy.isfinite(smooth_gap) or smooth_gap <= 0):
-        raise ValueError('smooth_gap must be finite and positive (Eh)')
+    if not isinstance(smooth, (bool, numpy.bool_)):
+        raise TypeError('smooth must be a boolean')
     baseline, matrix = _normalize_controls(baseline_controls, matrix_controls, matrix_kind)
     state = driver._initialize(mf, mp2_static, baseline, with_grad=False)
     indices = _fragment_indices(mp2_static, fragment_indices, selecting=True)
@@ -262,7 +262,7 @@ def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_v
                 frame_fragment_index=group.representative_index,
                 thresh_occ=thresh_occ, thresh_vir=thresh_vir,
                 internal_rank_threshold=internal_rank_threshold)
-            if smooth_gap is not None:
+            if smooth:
                 from .smooth import select_frame
                 from .smooth_triples import make_grid
                 partial_lis = LISSelections(mp2_static, matrix_kind, thresh_occ, thresh_vir,
@@ -272,7 +272,7 @@ def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_v
                     frame=frame, frame_fragment_index=group.representative_index)
                 coefficients = (selected.active_occupied_coeff, selected.active_virtual_coeff)
                 if all(coeff.shape[1] for coeff in coefficients):
-                    frames[index] = tuple(select_frame(coeff, state['common'].fock, smooth_gap)
+                    frames[index] = tuple(select_frame(coeff, state['common'].fock)
                                           for coeff in coefficients)
                     spectra = [numpy.linalg.eigvalsh(item.anchor.T @
                         numpy.asarray(state['common'].fock) @ item.anchor) for item in frames[index]]
@@ -285,8 +285,8 @@ def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_v
                         thresh_occ=thresh_occ, thresh_vir=thresh_vir,
                         internal_rank_threshold=internal_rank_threshold,
                         fragments=tuple(selections),
-                        smooth_frames=tuple(frames) if smooth_gap is not None else None,
-                        smooth_grid=tuple(grids) if smooth_gap is not None else None)
+                        smooth_frames=tuple(frames) if smooth else None,
+                        smooth_grid=tuple(grids) if smooth else None)
     static = CCSDSelections(lis, _scientific_identity(baseline, matrix),
                             mp2_fragment_energies=tuple(mp2_energies))
     for index in indices:
@@ -298,22 +298,12 @@ def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_v
 def _allocate_triples_controls(controls, nfragments, *, static=None, indices=None):
     """Allocate a total triples SE budget over globally requested physical fragments."""
     smooth = getattr(getattr(static, 'lis_static', None), 'smooth_frames', None) is not None
-    if controls is not None:
-        if smooth:
-            controls = dict(controls)
-            controls.setdefault('dressing', 'asymmetric')
-            controls.setdefault('dressing_backend', 'native')
-        elif 'dressing' in controls or 'dressing_backend' in controls:
-            raise ValueError('dressing requires the smooth Laplace triples path')
     if controls is not None and controls.get('mode') == 'stochastic':
-        if smooth:
-            # Resolve the default before checkpoint/MPI identity is recorded.
-            # Changing this default must not silently reuse older production.
-            controls = dict(controls)
-            controls.setdefault('trace_exponent', DEFAULT_TRIPLES_TRACE_EXPONENT)
-            controls.setdefault('adaptive', True)
-        elif 'trace_exponent' in controls or 'adaptive' in controls:
-            raise ValueError('trace_exponent/adaptive requires the smooth Laplace triples path')
+        if not smooth:
+            raise ValueError('stochastic triples requires full-LIS smooth frames; '
+                             'canonical triples sampling has been removed')
+        controls = dict(controls)
+        controls.setdefault('trace_exponent', DEFAULT_TRIPLES_TRACE_EXPONENT)
     if controls is None or 'energy_tolerance' not in controls:
         return controls
     energies = controls.get('fragment_energies', getattr(static, 'mp2_fragment_energies', None))
@@ -359,7 +349,8 @@ def _triples_fragment_seed(global_seed, fragment_index):
 
 
 def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
-                    verbose_imp, ccsd_t, triples_controls=None, with_grad=False):
+                    verbose_imp, ccsd_t, triples_controls=None, with_grad=False,
+                    vvvv_direct=False):
     """Return MP2-LIS, CCSD and triples; stochastic calls also return diagnostics."""
     from .lis import build_fragment_lis
     representative = group.representative_index
@@ -385,23 +376,20 @@ def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
             local_controls['global_seed'] = _triples_fragment_seed(
                 local_controls.get('global_seed', 71), fragment_index)
             options['triples_solver'] = make_solver(local_controls,
-                static.lis_static.smooth_frames[fragment_index],
                 static.lis_static.smooth_grid[fragment_index],
                 with_grad=with_grad)
     elif stochastic:
-        from .triples import make_solver
-        local_controls = dict(triples_controls, global_seed=_triples_fragment_seed(
-            triples_controls['global_seed'], fragment_index))
-        options['triples_solver'] = make_solver(local_controls, with_grad=with_grad)
+        raise ValueError('canonical triples sampling has been removed; rebuild smooth selections')
     return _impurity_solve_core(
         mf, lis.mo_coeff, lis.fragment_iao_coeff, common.fock, common.s1e,
         frozen=lis.frozen, frag_prescreen=metadata, verbose_imp=verbose_imp,
-        ccsd_t=ccsd_t, dcsd=False, profile_info=None, **options)
+        ccsd_t=ccsd_t, dcsd=False, profile_info=None,
+        vvvv_direct=vvvv_direct, **options)
 
 
 def _run_group(state, static, group, baseline_controls, matrix_controls, *,
                with_grad, verbose_imp, ccsd_t, triples_controls=None,
-               include_baseline=True, fragment_indices=None):
+               include_baseline=True, fragment_indices=None, vvvv_direct=False):
     """Complete one owned group's preparation, baseline and physical-fragment responses.
 
     All process-local VJPs and matrix replay records are consumed here. Only
@@ -438,7 +426,8 @@ def _run_group(state, static, group, baseline_controls, matrix_controls, *,
         def correction(mf, common, blocks):
             values = _solve_fragment(mf, common, static, index, blocks, group,
                                      verbose_imp=verbose_imp, ccsd_t=ccsd_t,
-                                     triples_controls=local_triples, with_grad=with_grad)
+                                     triples_controls=local_triples, with_grad=with_grad,
+                                     vvvv_direct=vvvv_direct)
             if ccsd_t and (getattr(getattr(static, 'lis_static', None), 'smooth_frames', None) is not None or
                           triples_controls is not None and triples_controls['mode'] == 'stochastic'):
                 values, diagnostics = values
@@ -527,12 +516,12 @@ def _run_weak(state, static, *, with_grad, pairs=None):
 def _run_serial(state, static, baseline, matrix, *, with_grad, include_hf,
                 merge_identical, verbose_imp, ccsd_t, return_components,
                 triples_controls=None, fragment_indices=None, include_baseline=True,
-                checkpoint_dir=None, resume=False):
+                checkpoint_dir=None, resume=False, vvvv_direct=False):
     from ._ccsd_checkpoint import open_checkpoint, restore_progress, save_progress
     groups = build_domain_groups(static.mp2_static, merge_identical=merge_identical)
     allocated = allocate_domain_controls(baseline, len(groups))
     options = dict(with_grad=with_grad, include_hf=include_hf, ccsd_t=ccsd_t,
-                   triples_controls=triples_controls,
+                   triples_controls=triples_controls, vvvv_direct=vvvv_direct,
                    include_baseline=include_baseline, fragment_indices=fragment_indices,
                    merge_identical=merge_identical)
     checkpoint = open_checkpoint(state, static, groups, checkpoint_dir=checkpoint_dir,
@@ -549,7 +538,7 @@ def _run_serial(state, static, baseline, matrix, *, with_grad, include_hf,
                 records.extend(_run_group(
                     state, static, group, allocated, matrix, with_grad=with_grad,
                     verbose_imp=verbose_imp, ccsd_t=ccsd_t,
-                    triples_controls=triples_controls,
+                    triples_controls=triples_controls, vvvv_direct=vvvv_direct,
                     include_baseline=include_baseline, fragment_indices=fragment_indices))
             save_progress(checkpoint, state, records, position + 1, False, with_grad=with_grad)
             gc.collect()
@@ -589,6 +578,8 @@ def _run(initializer, worker_initializer, comm, *, checkpoint_dir, resume,
         return _run_mpi(initializer, worker_initializer, comm,
                         parallel_scf_jk=parallel_scf_jk,
                         scf_worker_initializer=scf_worker_initializer, **options)
+    if not isinstance(options.get('vvvv_direct', False), bool):
+        raise TypeError('vvvv_direct must be a bool')
     state, static, baseline, matrix = initializer()
     options['fragment_indices'] = state.pop('cc_fragment_indices')
     options['triples_controls'] = state.pop('cc_triples_controls')
@@ -601,7 +592,7 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
            ccsd_t=False, triples_controls=None, verbose_imp=0, include_hf=False,
            return_components=False,
            merge_identical=True, comm=None, fragment_indices=None, include_baseline=True,
-           checkpoint_dir=None, resume=False, parallel_scf_jk=True):
+           checkpoint_dir=None, resume=False, parallel_scf_jk=True, vvvv_direct=False):
     """Return correlation energy, or total energy with ``include_hf=True``.
 
     ``return_components=True`` returns ``(energy, CCSDComponents)``. The MP2
@@ -618,6 +609,8 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
     ``fragment_indices`` restricts corrections (default: all saved LIS ranks).
     The complete baseline remains included unless ``include_baseline=False``;
     that option returns only selected CC-minus-MP2-LIS corrections and forbids HF.
+    ``vvvv_direct=False`` caches the DF virtual ladder integrals when
+    memory permits; ``True`` uses the improved uncached contraction.
     Multi-rank calls distribute common-preparation DF J/K work by default.
     Each rank must supply a matching MF skeleton; preceding SCF is caller-owned.
     ``parallel_scf_jk=False`` retains root-only shared work. Serial and
@@ -648,6 +641,7 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
     return _run(initialize, initialize_worker, comm, with_grad=False, include_hf=include_hf,
                 merge_identical=merge_identical, verbose_imp=verbose_imp,
                 ccsd_t=ccsd_t, return_components=return_components,
+                vvvv_direct=vvvv_direct,
                 fragment_indices=fragment_indices, include_baseline=include_baseline,
                 checkpoint_dir=checkpoint_dir, resume=resume,
                 parallel_scf_jk=parallel_scf_jk, scf_worker_initializer=lambda: mf)
@@ -659,7 +653,7 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
                    verbose_imp=0, include_hf=False,
                    return_components=False, merge_identical=True, comm=None, build_static=None,
                    fragment_indices=None, include_baseline=True, checkpoint_dir=None, resume=False,
-                   parallel_scf_jk=True):
+                   parallel_scf_jk=True, vvvv_direct=False):
     """Return ``(energy, mol_bar)``; ``mol_bar.coords`` is a nuclear gradient.
 
     Include HF once with ``include_hf=True``. Append ``CCSDComponents`` with
@@ -669,6 +663,7 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
     correction-only subset closes common-data and implicit SCF response once.
     ``triples_controls`` has the same independent sampling semantics as in
     :func:`kernel`; the reported triples SE estimates energy uncertainty only.
+    ``vvvv_direct`` has the memory/performance semantics of :func:`kernel`.
     Multi-rank calls distribute DF J/K work in SCF, common preparation and
     their coordinate pullbacks by default. Worker ``build_mf`` must accept
     ``mo_coeff_init``, ``mo_energy_init``, ``mo_occ_init`` and ``e_tot_init``,
@@ -720,6 +715,7 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
     return _run(initialize, initialize_worker, comm, with_grad=True, include_hf=include_hf,
                 merge_identical=merge_identical, verbose_imp=verbose_imp,
                 ccsd_t=ccsd_t, return_components=return_components,
+                vvvv_direct=vvvv_direct,
                 fragment_indices=fragment_indices, include_baseline=include_baseline,
                 checkpoint_dir=checkpoint_dir, resume=resume,
                 parallel_scf_jk=parallel_scf_jk,

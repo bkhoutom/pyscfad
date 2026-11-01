@@ -11,15 +11,17 @@ import pytest
 from pyscfad.dlno_stc.test.test_domain_mpi import SOURCE_ROOT
 
 
-def launch(tmp_path, mode='enabled', ranks=2):
+def launch(tmp_path, mode='enabled', ranks=2, *, vvvv_direct=False):
     pytest.importorskip('mpi4py')
     pytest.importorskip('pyscfad.dlno_stc._stc_mp2')
     launcher = shutil.which('mpiexec')
     if launcher is None:
         pytest.skip('mpiexec is unavailable')
-    output = tmp_path / f'cc-scf-{mode}-{ranks}.json'
+    output = tmp_path / f'cc-scf-{mode}-{ranks}-{int(vvvv_direct)}.json'
     command = [sys.executable, '-m', 'pyscfad.dlno_stc.test.ccsd_mpi_scf_smoke',
                '--mode', mode, '--output', str(output)]
+    if vvvv_direct:
+        command.append('--vvvv-direct')
     if mode != 'serial':
         command = [launcher, '-n', str(ranks), *command]
     env = dict(os.environ, OMP_NUM_THREADS='1', OMP_THREAD_LIMIT='1',
@@ -45,8 +47,9 @@ def launch(tmp_path, mode='enabled', ranks=2):
 
 def test_cc_parallel_scf_matches_serial_and_opt_out(tmp_path):
     reference = launch(tmp_path, 'serial', 1)
-    for mode, ranks in (('enabled', 1), ('disabled', 2), ('enabled', 2)):
-        result = launch(tmp_path, mode, ranks)
+    for mode, ranks, direct in (('enabled', 1, False), ('disabled', 2, False),
+                                ('enabled', 2, False), ('enabled', 2, True)):
+        result = launch(tmp_path, mode, ranks, vvvv_direct=direct)
         np.testing.assert_allclose(result['energy'], reference['energy'], atol=2e-10, rtol=0)
         np.testing.assert_allclose(result['gradient'], reference['gradient'], atol=2e-8, rtol=0)
 

@@ -13,7 +13,8 @@ import os
 from pathlib import Path
 import time
 
-from benchmark_affinity import configure_cpu_workload, check_worker_affinity
+from benchmark_affinity import (configure_cpu_workload, check_worker_affinity,
+                                ensure_worker_stack)
 
 os.environ["PYSCFAD_DLNO_RESOURCE_PROFILE"] = "1"
 faulthandler.enable()
@@ -37,8 +38,7 @@ def main():
     parser.add_argument("--cc-conv-tol", type=float, default=1e-7)
     parser.add_argument("--cc-conv-tol-normt", type=float, default=1e-5)
     parser.add_argument("--triples-method", choices=("conventional", "smooth"),
-                        default="conventional")
-    parser.add_argument("--smooth-gap", type=float, default=.01)
+                        default="smooth")
     parser.add_argument("--smooth-laplace-points", type=int, default=10)
     parser.add_argument("--smooth-trace-exponent", type=float, default=5.)
     parser.add_argument("--selection-only", action="store_true")
@@ -56,6 +56,9 @@ def main():
         parser.error("CCSD convergence tolerances must be finite and positive")
     if args.deterministic_only and args.reference:
         parser.error("--deterministic-only computes a new reference; omit --reference")
+    if args.triples_method == "conventional" and not args.deterministic_only:
+        parser.error("conventional is a deterministic reference only; use smooth for sampling")
+    frame_mode = "full" if args.triples_method == "smooth" else None
     if any(x <= 0 for x in args.targets_meh) or len(set(args.targets_meh)) != len(args.targets_meh):
         parser.error("targets must be positive and distinct")
     if any(x < 0 for x in args.seeds) or len(set(args.seeds)) != len(args.seeds):
@@ -68,11 +71,16 @@ def main():
 
     import jax
     import numpy as np
+    import pyscfad
     from pyscf import gto as pgto, scf as pscf
     from pyscfad import gto, scf, dlno_stc
     from pyscfad.dlno_stc import ccsd
     from pyscfad.dlno_stc.laplace import make_laplace_grid
     from pyscfad.lno.ccsd import RCCSD
+
+    snapshot_root = os.environ.get("LNO_BENCHMARK_SOURCE_ROOT")
+    if snapshot_root and not Path(pyscfad.__file__).resolve().is_relative_to(Path(snapshot_root).resolve()):
+        raise RuntimeError("benchmark did not import its pinned source snapshot")
 
     RCCSD.conv_tol = args.cc_conv_tol
     RCCSD.conv_tol_normt = args.cc_conv_tol_normt
@@ -85,6 +93,12 @@ def main():
                          cc_conv_tol_normt=args.cc_conv_tol_normt,
                          triples_mode=args.triples_method,
                          cpu_affinity=benchmark_cpus, threads=args.threads)
+        if previous.get("smooth_frame_mode", "clustered") != frame_mode:
+            raise ValueError("smooth frame mode differs from existing results; use a new output directory")
+        cache_enabled = os.environ.get("JAX_ENABLE_COMPILATION_CACHE", "true").lower() != "false"
+        if ("jax_persistent_cache_enabled" in previous
+                and previous["jax_persistent_cache_enabled"] != cache_enabled):
+            raise ValueError("compilation-cache policy differs from existing results")
         for key, value in requested.items():
             if previous.get(key) != value:
                 raise ValueError(f"{key} differs from existing results; use a new output directory")
@@ -155,19 +169,22 @@ def main():
                   memory_limit_mb=args.max_memory_mb, **grid)
     selection_start = time.perf_counter()
     report("Starting W-LIS selection")
-    faulthandler.dump_traceback_later(120, repeat=True)
     selection_options = dict(matrix_kind="W", thresh_occ=1e-4, thresh_vir=1e-5,
                              baseline_controls=baseline, matrix_controls=matrix,
                              merge_identical=True)
-    if args.triples_method == "smooth":
-        selected = ccsd.build_static_selections(
-            mf, domains, smooth_gap=args.smooth_gap,
-            smooth_laplace_points=args.smooth_laplace_points, **selection_options)
-    else:
-        selected = ccsd.build_static_selections(mf, domains, **selection_options)
+    selected = ccsd.build_static_selections(
+        mf, domains, smooth=args.triples_method == "smooth",
+        smooth_laplace_points=args.smooth_laplace_points, **selection_options)
     selection_seconds = time.perf_counter() - selection_start
-    faulthandler.cancel_dump_traceback_later()
     dimensions = [ccsd._fragment_dimensions(selected, i) for i in range(expected_groups)]
+    frame_blocks = []
+    if args.triples_method == "smooth":
+        for dims, frames in zip(dimensions, selected.lis_static.smooth_frames):
+            blocks = dict(occupied=[frames[0].anchor.shape[1]],
+                          virtual=[frames[1].anchor.shape[1]])
+            if blocks != dict(occupied=[dims[0]], virtual=[dims[1]]):
+                raise RuntimeError(f"full-Fock frame dimensions disagree: {blocks}")
+            frame_blocks.append(blocks)
     affinity = check_worker_affinity(benchmark_cpus)
     settings = dict(geometry=str(xyz), elements=elements, basis=args.basis,
                     auxbasis=auxbasis or "auto", frozen=args.frozen, boys_grouping=args.boys_grouping,
@@ -179,7 +196,12 @@ def main():
                     cc_conv_tol_normt=args.cc_conv_tol_normt, cc_max_cycle=200,
                     targets_meh=args.targets_meh, seeds=args.seeds,
                     pilot_samples=args.pilot_samples, triples_mode=args.triples_method,
-                    smooth_gap_eh=args.smooth_gap if args.triples_method == "smooth" else None,
+                    smooth_frame_mode=frame_mode,
+                    smooth_frame_blocks=frame_blocks,
+                    jax_persistent_cache_enabled=bool(jax.config.jax_enable_compilation_cache),
+                    jax_compilation_cache_dir=jax.config.jax_compilation_cache_dir,
+                    code_snapshot_sha256=os.environ.get("LNO_BENCHMARK_SNAPSHOT_SHA256"),
+                    source_package_path=str(Path(pyscfad.__file__).resolve()),
                     smooth_laplace_points=(args.smooth_laplace_points
                                            if args.triples_method == "smooth" else None),
                     smooth_trace_exponent=(args.smooth_trace_exponent
@@ -194,6 +216,8 @@ def main():
     save(output / "settings.json", settings)
     report(f"CPU affinity {benchmark_cpus}; all {affinity['runtime_threads']} runtime threads verified")
     report(f"Selected {expected_groups} W-LIS fragments; dimensions {dimensions}")
+    report(f"Smooth frame blocks {frame_blocks}; persistent JAX cache enabled: "
+           f"{bool(jax.config.jax_enable_compilation_cache)}")
     if args.selection_only:
         return
     options = dict(baseline_controls=baseline, matrix_controls=matrix,
@@ -201,8 +225,6 @@ def main():
                    return_components=True, merge_identical=True)
 
     deterministic_controls = dict(mode="deterministic")
-    if args.triples_method == "smooth":
-        deterministic_controls.update(dressing="asymmetric", dressing_backend="native")
     jobs = []
     if args.reference:
         reference = json.loads(args.reference.read_text())
@@ -228,9 +250,7 @@ def main():
                             pilot_samples=args.pilot_samples,
                             global_seed=seed, energy_tolerance=target / 1000)
             if args.triples_method == "smooth":
-                controls.update(trace_exponent=args.smooth_trace_exponent,
-                                adaptive=True, dressing="asymmetric",
-                                dressing_backend="native")
+                controls.update(trace_exponent=args.smooth_trace_exponent)
             jobs.append((label, controls))
     for label, controls in jobs:
         destination = output / f"{label}.json"
@@ -256,6 +276,10 @@ def main():
                       cc_conv_tol_normt=args.cc_conv_tol_normt,
                       threads=args.threads,
                       triples_mode=args.triples_method,
+                      smooth_frame_mode=frame_mode,
+                      smooth_frame_blocks=frame_blocks,
+                      jax_persistent_cache_enabled=bool(jax.config.jax_enable_compilation_cache),
+                      code_snapshot_sha256=os.environ.get("LNO_BENCHMARK_SNAPSHOT_SHA256"),
                       selection_seconds=selection_seconds,
                       preselection_setup_seconds=selection_start-started,
                       lno_thresh_occ=1e-4, lno_thresh_vir=1e-5,
@@ -271,4 +295,5 @@ def main():
 
 
 if __name__ == "__main__":
+    ensure_worker_stack()
     main()

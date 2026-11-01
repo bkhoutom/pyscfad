@@ -305,7 +305,9 @@ def kernel(mycc, eris, t1=None, t2=None, verbose=logger.NOTE):
             leaves[keys.index(k)] = val
 
         for i, leaf in enumerate(leaves):
-            if leaf is None:
+            # The runtime ladder cache is unrelated to (T); None is the
+            # custom_vjp zero, avoiding a quartic host-side zero allocation.
+            if leaf is None and keys[i] != '_vvvv_pair':
                 leaves[i] = numpy.zeros(shapes[i])
 
         eris_bar = tree_unflatten(treedef, leaves)

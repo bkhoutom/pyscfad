@@ -28,8 +28,9 @@ libcgto_ad = load_library('libcgto_ad')
 libcgto_vjp = _FallbackCDLL(load_library('libcgto_vjp'), libcgto_ad)
 libcvhf_vjp = load_library('libcvhf_vjp')
 libnp_helper_vjp = load_library('libnp_helper_vjp')
+
+# MP2 fusion is optional so existing native installations remain importable.
 try:
     libmp_vjp = load_library('libmp_vjp')
 except OSError:
-    # Optional for compatibility with native builds predating this kernel.
     libmp_vjp = None

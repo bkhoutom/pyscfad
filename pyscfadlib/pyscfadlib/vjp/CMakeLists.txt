@@ -54,6 +54,15 @@ set_target_properties(cvhf_vjp PROPERTIES
 )
 target_link_libraries(cvhf_vjp PRIVATE np_helper_ad vjp_util ${VJP_MATH_LIBRARY} ${BLAS_LIBRARIES} ${OPENMP_C_PROPERTIES})
 
+#mp
+add_library(mp_vjp SHARED
+  mp/mp2_vjp.c
+)
+set_target_properties(mp_vjp PROPERTIES
+  LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}
+)
+target_link_libraries(mp_vjp PRIVATE ${BLAS_LIBRARIES} ${OPENMP_C_PROPERTIES})
+
 #cc
 add_library(cc_vjp SHARED
   cc/ccsd_t.c
@@ -67,12 +76,6 @@ set_target_properties(cc_vjp PROPERTIES
 )
 target_link_libraries(cc_vjp PRIVATE vjp_util ${BLAS_LIBRARIES} ${OPENMP_C_PROPERTIES})
 
-# Canonical density-fitted MP2 energy derivatives.
-add_library(mp_vjp SHARED mp/mp2_vjp.c)
-set_target_properties(mp_vjp PROPERTIES
-  LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}
-)
-target_link_libraries(mp_vjp PRIVATE ${BLAS_LIBRARIES} ${OPENMP_C_PROPERTIES})
 
 # Do not allow a wheel to be produced with unresolved helper symbols.  This
 # would have caught a cgto_vjp build that called omp_dsum_reduce_inplace but
@@ -84,8 +87,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
       np_helper_vjp
       ao2mo_vjp
       cvhf_vjp
-      mp_vjp
-      cc_vjp)
+      cc_vjp
+      mp_vjp)
     target_link_options(${_vjp_target} PRIVATE "LINKER:-z,defs")
   endforeach()
 endif()

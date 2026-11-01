@@ -62,12 +62,13 @@ def water4_fixture(directory, threads):
     return mol, build_mf, static, baseline, matrix
 
 
-def run(mode, output, *, fixture='small', fixture_dir=None, threads=1):
+def run(mode, output, *, fixture='small', fixture_dir=None, threads=1, vvvv_direct=False):
     import jax
     import numpy as np
     from mpi4py import MPI
     import pyscfad
     from pyscfad import config_update
+    from pyscfad.lno.ccsd import RCCSD
     from pyscfad.df import mpi_df_jk
     from pyscfad.dlno_stc import ccsd, driver, _mpi_ccsd, _mpi_scf
     from pyscfad.dlno_stc.test import _boys_acceptance as accept
@@ -101,7 +102,7 @@ def run(mode, output, *, fixture='small', fixture_dir=None, threads=1):
         def build_static(mf):
             state['selecting'] = True
             try:
-                return ccsd.build_static_selections(mf, accept.selection(mf), matrix_kind='W',
+                return ccsd.build_static_selections(mf, accept.selection(mf), smooth=False, matrix_kind='W',
                     thresh_occ=1e-5, thresh_vir=1e-5,
                     baseline_controls=baseline, matrix_controls=matrix)
             finally:
@@ -215,6 +216,14 @@ def run(mode, output, *, fixture='small', fixture_dir=None, threads=1):
         state['correlation_df'] = mf.with_df
         return mf
 
+    ladder_caches = []
+    build_eris = RCCSD.ao2mo
+    def observed_eris(solver, *args, **kwargs):
+        eris = build_eris(solver, *args, **kwargs)
+        ladder_caches.append(dict(direct=solver.vvvv_direct,
+                                  cached=eris._vvvv_pair is not None))
+        return eris
+
     run_group = ccsd._run_group
     def group(*args, **kwargs):
         assert mpi_df_jk.get_active_executor() is None, 'SCF hook active during CC group'
@@ -242,6 +251,7 @@ def run(mode, output, *, fixture='small', fixture_dir=None, threads=1):
     failed = False
     options = dict(baseline_controls=baseline, matrix_controls=matrix, ccsd_t=True,
                    include_hf=True, parallel_scf_jk=mode != 'disabled',
+                   vvvv_direct=vvvv_direct,
                    comm=None if mode == 'serial' else comm)
     if mode == 'invalid-option':
         options['parallel_scf_jk'] = 'invalid' if rank == 0 else False
@@ -261,7 +271,8 @@ def run(mode, output, *, fixture='small', fixture_dir=None, threads=1):
             (_mpi_scf, '_source_fingerprint', fingerprinted),
             (driver, '_initialize', initialized), (driver, '_finish_response', response),
             (_mpi_ccsd, '_build_cc_worker', worker), (ccsd, '_run_group', group),
-            (ccsd, '_run', cc_run), (ccsd, '_finish', finishing)):
+            (ccsd, '_run', cc_run), (ccsd, '_finish', finishing),
+            (RCCSD, 'ao2mo', observed_eris)):
             stack.enter_context(patch.object(obj, name, replacement))
         # Fixture preparation and its checks precede the production interval.
         # Every rank starts together; the receipt includes service setup/close.
@@ -292,7 +303,7 @@ def run(mode, output, *, fixture='small', fixture_dir=None, threads=1):
         source_fingerprint=state['source_fingerprint'],
         source_path=state['source_path'] or state['declared_source_path'],
         failed=failed, timings=times, affinity=sorted(os.sched_getaffinity(0)),
-        registry_clean=True, active_executor_clean=True))
+        registry_clean=True, active_executor_clean=True, ladder_caches=ladder_caches))
     maxima = {key: max(row['timings'][key] for row in observations) for key in times}
     from pyscfad.dlno_stc import _stc_mp2
     fixture_hashes = {}
@@ -336,6 +347,11 @@ def run(mode, output, *, fixture='small', fixture_dir=None, threads=1):
             assert all(not any(row['counts'].values()) and row['serves'] == 0 for row in observations), observations
         if fixture == 'water4':
             assert all(row['source_path'] == str(fixture_dir / 'scf_cderi.h5') for row in observations), observations
+        observed_caches = [cache for row in observations for cache in row['ladder_caches']]
+        # Cached mode may legitimately fall back as JAX compilation raises RSS.
+        assert observed_caches and all(cache['direct'] is vvvv_direct
+                                       and (not vvvv_direct or not cache['cached'])
+                                       for cache in observed_caches), observations
         if rank == 0:
             energy, bar = result if with_grad else (result, None)
             assert np.isfinite(float(energy))
@@ -359,8 +375,10 @@ def main():
     parser.add_argument('--fixture-dir', type=Path)
     parser.add_argument('--threads', type=int, default=1)
     parser.add_argument('--output', type=Path)
+    parser.add_argument('--vvvv-direct', action='store_true')
     args = parser.parse_args()
-    run(args.mode, args.output, fixture=args.fixture, fixture_dir=args.fixture_dir, threads=args.threads)
+    run(args.mode, args.output, fixture=args.fixture, fixture_dir=args.fixture_dir,
+        threads=args.threads, vvvv_direct=args.vvvv_direct)
 
 
 if __name__ == '__main__':

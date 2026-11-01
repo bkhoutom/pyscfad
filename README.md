@@ -10,7 +10,21 @@ PySCF with Auto-differentiation
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.6960749.svg)](https://doi.org/10.5281/zenodo.6960749)
 
 * [Documentation](https://fishjojo.github.io/pyscfad/index.html)
-* [Smooth-basis CCSD(T): theory and options](README_SMOOTH_CCSD_T.md)
+* [Smooth DLNO-CCSD(T): modes, defaults, theory, and force examples](README_SMOOTH_CCSD_T.md)
+
+DLNO-STC branch
+--------------
+
+This checkout includes D/W-selected LIS CCSD(T) with deterministic reference
+forces and native asymmetric stochastic triples. Multiple physical fragments
+and truncated LISs use anchored occupied/virtual frames with full Fock response.
+See the [branch README](README_SMOOTH_CCSD_T.md) for supported modes and defaults,
+32-thread examples, the 0.05 mEh triples SE target, and force-error reporting.
+Library defaults and run-script overrides are listed separately.
+
+For this implementation, install the current checkout (`pip install -e .`) and
+follow the [native STC build instructions](pyscfad/dlno_stc/README.md#build-and-checks).
+The release and upstream installation commands below install upstream PySCFAD.
 
 Installation
 ------------

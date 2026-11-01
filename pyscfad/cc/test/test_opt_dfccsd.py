@@ -218,3 +218,33 @@ def test_dfccsd_factor_lambda_matches_dense(get_opt_mol, monkeypatch):
         numpy.asarray(factor_l2) - numpy.asarray(dense_l2)
     )) < 1e-11
     assert eris.ovvv is None
+
+
+def test_triples_pullback_does_not_allocate_zero_ladder_cache(get_opt_mol,
+                                                            monkeypatch):
+    """The unrelated quartic ladder cache must remain a symbolic zero in (T)."""
+    mf = scf.RHF(get_opt_mol).density_fit()
+    mf.kernel()
+    mycc = dfccsd.RCCSD(mf)
+    eris = mycc.ao2mo()
+    mycc.kernel(eris=eris)
+    assert eris._vvvv_pair is not None
+    cache_shape = eris._vvvv_pair.shape
+    original_zeros = numpy.zeros
+
+    def guarded_zeros(shape, *args, **kwargs):
+        if numpy.shape(shape) == (3,) and tuple(shape) == cache_shape:
+            raise AssertionError('triples allocated a quartic zero ladder cache')
+        return original_zeros(shape, *args, **kwargs)
+
+    # Keep the actual triples forward and pullback, guarding only the unwanted
+    # allocation in the existing host-side cotangent construction.
+    monkeypatch.setattr(ccsd_t.numpy, 'zeros', guarded_zeros)
+    _, pull = jax.vjp(lambda e, t1, t2: mycc.ccsd_t(t1=t1, t2=t2, eris=e),
+                      eris, mycc.t1, mycc.t2)
+    eris_bar, t1_bar, t2_bar = pull(1.)
+    assert numpy.linalg.norm(eris_bar.Lov) > 0
+    assert numpy.linalg.norm(eris_bar.Lvv) > 0
+    assert numpy.linalg.norm(t1_bar) > 0
+    assert numpy.linalg.norm(t2_bar) > 0
+    assert eris.ovvv is None

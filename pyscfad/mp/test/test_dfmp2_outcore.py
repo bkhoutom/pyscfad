@@ -297,8 +297,7 @@ def test_dfmp2_energy_gradient_uses_streamed_outcore_transform(
               for line in capsys.readouterr().out.splitlines()
               if "phase=dfmp2." in line]
     assert phases == ([
-        "dfmp2.ao2mo", "dfmp2.energy_forward",
-        "dfmp2.energy_cotangents", "dfmp2.input_pullback",
+        "dfmp2.ao2mo", "dfmp2.energy_vjp_fused", "dfmp2.input_pullback",
     ] if profiling else [])
     assert float(streamed_energy) == pytest.approx(
         float(dense_energy), abs=2e-10, rel=2e-10

@@ -5,7 +5,7 @@ from numbers import Real
 import numpy
 
 DEFAULT_ENERGY_TOLERANCE = 3e-4  # Hartree (0.3 mHa)
-DEFAULT_TRIPLES_TRACE_EXPONENT = 2.1
+DEFAULT_TRIPLES_TRACE_EXPONENT = 5.0
 
 
 def default_laplace_grid():
@@ -57,12 +57,10 @@ def _finite_control(name, value, *, positive=True):
 def normalize_triples_controls(controls, *, ccsd_t):
     """Validate triples independently of baseline and D/W selection settings.
 
-    Omitted controls preserve the existing deterministic correction.
-    A positive total energy tolerance enables variance allocation; otherwise
-    nsamples is a fixed production budget. Smooth triples uses pilot_samples
-    (default 10000) per point, and defaults to adaptive production extension
-    when a positive tolerance is supplied. Conventional triples uses pilot_samples when
-    supplied, otherwise nsamples, as its pilot count in tolerance mode.
+    Omitted controls select deterministic evaluation. Sampling uses the
+    asymmetric Laplace numerator and physical selected-space restriction.
+    A positive energy tolerance enables independent pilots and adaptive
+    production; otherwise nsamples sets a fixed production budget.
     """
     if not ccsd_t:
         if controls is not None:
@@ -74,20 +72,15 @@ def normalize_triples_controls(controls, *, ccsd_t):
         raise TypeError('triples_controls must be a dictionary')
     settings = controls.copy()
     unknown = set(settings) - {'mode', 'nsamples', 'global_seed', 'energy_tolerance',
-                               'pilot_samples', 'fragment_energies', 'trace_exponent', 'adaptive',
-                               'dressing', 'dressing_backend'}
+                               'pilot_samples', 'fragment_energies', 'trace_exponent'}
     if unknown:
         raise ValueError('unsupported triples controls: '
                          + ', '.join(sorted(map(str, unknown))))
     mode = settings.setdefault('mode', 'deterministic')
     if mode not in ('deterministic', 'stochastic'):
         raise ValueError('triples mode must be deterministic or stochastic')
-    if 'dressing_backend' in settings and settings['dressing_backend'] not in ('native', 'jax'):
-        raise ValueError('triples dressing_backend must be native or jax')
-    if 'dressing' in settings and settings['dressing'] not in ('equal', 'asymmetric'):
-        raise ValueError('triples dressing must be equal or asymmetric')
     if mode == 'deterministic':
-        if set(settings) - {'mode', 'dressing', 'dressing_backend'}:
+        if set(settings) - {'mode'}:
             raise ValueError('deterministic triples do not accept sampling controls')
         return settings
     if 'nsamples' not in settings:
@@ -101,10 +94,6 @@ def normalize_triples_controls(controls, *, ccsd_t):
             'pilot_samples', settings['pilot_samples'], minimum=2)
     if 'trace_exponent' in settings:
         settings['trace_exponent'] = _finite_control('trace_exponent', settings['trace_exponent'])
-    if 'adaptive' in settings:
-        if not isinstance(settings['adaptive'], (bool, numpy.bool_)):
-            raise ValueError('adaptive must be a boolean')
-        settings['adaptive'] = bool(settings['adaptive'])
     if 'fragment_energies' in settings:
         raw = settings['fragment_energies']
         if numpy.iscomplexobj(raw):

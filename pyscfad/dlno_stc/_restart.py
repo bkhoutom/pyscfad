@@ -143,10 +143,10 @@ def _static_registry():
     )
     from .lis import FragmentLISSelection, LISSelections
     from .ccsd import CCSDSelections
-    from .smooth import BlockFrame
+    from .smooth import AnchoredFrame
     classes = (BoysDomainThresholds, FixedPAOSubspaceSelection,
                FragmentDomainSelection, DomainSelections, DomainGroup,
-               FragmentLISSelection, LISSelections, CCSDSelections, BlockFrame)
+               FragmentLISSelection, LISSelections, CCSDSelections, AnchoredFrame)
     return {_class_tag(cls): cls for cls in classes}
 
 

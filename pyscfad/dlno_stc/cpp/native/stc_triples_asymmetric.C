@@ -610,7 +610,6 @@ stc_triples::triples_result stc_triples::asymmetric_triples(
         arma::mat ggbar(bank[GG].bar.memptr(),no*nv,no*nv,false,true);
         vjp->Bvv=Bvo*gvbar.t(); vjp->Boo=Bvo*gobar.t();
         vjp->Bvo=Bvv*gvbar+Boo*gobar+Bvo*(ggbar+ggbar.t());
-        vjp->eocc.zeros(no); vjp->evir.zeros(nv);
         result.vjp_finalize_seconds=omp_get_wtime()-start;
         result.vjp_reverse_seconds+=result.vjp_finalize_seconds;
     }

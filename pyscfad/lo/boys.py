@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+from functools import partial
 import numpy
 import jax
 from pyscf.lib import logger
@@ -22,7 +24,7 @@ from pyscfad.soscf.ciah import (
     extract_rotation,
     pack_uniq_var,
 )
-from pyscfad.tools.linear_solver import gen_gmres
+from pyscfad.tools.linear_solver import gen_gmres, precond_by_hdiag
 from pyscfad.scipy.linalg import logm
 
 # modified from pyscf v2.6
@@ -138,6 +140,68 @@ def _opt_cond(x, mol, mo_coeff):
     g = jax.grad(cost_function, 0)(x, mol, mo_coeff)
     return g
 
+
+def _projected_rotated_dipoles(x, dipoles):
+    """Rotate three occupied-space dipoles in the original exp(x) chart."""
+    u = extract_rotation(x)
+    return np.einsum('pi,apq,qj->aij', u.conj(), dipoles, u)
+
+
+def _projected_cost(x, dipoles):
+    dip = _projected_rotated_dipoles(x, dipoles)
+    # Tr(U.T @ C.T @ r2 @ C @ U) is invariant under orthogonal U. Its
+    # x-gradient and the external derivatives of that gradient are zero.
+    return -np.einsum('aii,aii->', dip, dip)
+
+
+# Arrays are explicit arguments, so both the gradient and its compiled VJPs
+# can be reused for different geometries/seeds with the same occupied size.
+# Host integrals remain outside this compiled, purely numerical boundary.
+_projected_gradient = jax.jit(jax.grad(_projected_cost, 0))
+
+
+def _projected_opt_cond(x, mol, mo_coeff):
+    return _projected_gradient(x, dipole_integral(mol, mo_coeff))
+
+
+def _projected_opt_cond_aux(x, mol, mo_coeff):
+    dipoles = dipole_integral(mol, mo_coeff)
+    return _projected_gradient(x, dipoles), (x, dipoles)
+
+
+@jax.jit
+def _projected_tangent_diagonal(x, dipoles):
+    dip = _projected_rotated_dipoles(x, dipoles)
+    centers = np.diagonal(dip, axis1=-2, axis2=-1)
+    differences = centers[:, :, None] - centers[:, None, :]
+    diagonal = 4 * np.sum(differences ** 2, axis=0) - 16 * np.sum(dip ** 2, axis=0)
+    return pack_uniq_var(diagonal)
+
+
+def _projected_preconditioner(aux, mol, mo_coeff, *, solver=None):
+    """Positive regularized tangent diagonal, only an approximate inverse.
+
+    The true action still uses the exact original exponential coordinates.
+    In particular, this diagonal never shifts or replaces the response Hessian.
+    """
+    from pyscfad.tools import linear_solver
+
+    del mol, mo_coeff
+    if solver is None:
+        solver = linear_solver.gen_gmres()
+    # Concrete eager inputs can still select a JAX solver. Its preconditioner
+    # must be a JAX-compatible callable, not a scipy LinearOperator. Preserve
+    # this distinction through both partials and profiling decorators.
+    while isinstance(solver, partial) or hasattr(solver, '__wrapped__'):
+        solver = solver.func if isinstance(solver, partial) else solver.__wrapped__
+    if solver not in (linear_solver.pyscfad_gmres, linear_solver.gmres_safe):
+        return None
+    diagonal = numpy.asarray(_projected_tangent_diagonal(*aux), dtype=float)
+    magnitude = numpy.abs(diagonal)
+    floor = max(1e-10, float(numpy.max(magnitude, initial=0.0)) * 1e-8)
+    return precond_by_hdiag(numpy.maximum(magnitude, floor))
+
+
 def _extract_x0(loc, u):
     if numpy.linalg.det(u) < 0:
         u[:,0] *= -1
@@ -203,20 +267,49 @@ def boys(mol, mo_coeff, *,
             the derivatives. Default valule is `False`.
         gmres_options : dict
             Options of the GMRES solver for computing the derivatives.
-            See `pyscfad.tools.linear_solver.gen_gmres` for more information.
+            The default projected, preconditioned response uses ``tol=1e-10``;
+            explicit caller options take precedence. See
+            `pyscfad.tools.linear_solver.gen_gmres` for other options.
+
+    Notes:
+        The response uses occupied-space dipoles and a compiled rotation
+        gradient. A diagonal preconditioner is applied to compatible host
+        solvers; traced and JAX solves retain the exact projected response
+        without a host preconditioner. The forward localization is unchanged.
+
+        Set ``BOYS_RESPONSE_VARIANT=baseline`` to recover the original response
+        and solver defaults, or ``projected`` for the unpreconditioned projected
+        response. The default is ``projected_precond``.
     '''
     if mo_coeff.shape[-1] == 1:
         return mo_coeff
-    if gmres_options is None:
-        gmres_options = {}
+    gmres_options = {} if gmres_options is None else dict(gmres_options)
 
+    # Retain the original response as an explicit diagnostic fallback.
+    variant = os.environ.get('BOYS_RESPONSE_VARIANT', 'projected_precond')
+    response_options = {}
+    if variant == 'baseline':
+        optimality_cond = _opt_cond
+    elif variant == 'projected':
+        optimality_cond = _projected_opt_cond
+    elif variant == 'projected_precond':
+        # The tighter default keeps adjoints insensitive to the different
+        # preconditioned stopping history. Never override caller tolerances.
+        gmres_options.setdefault('tol', 1e-10)
+        optimality_cond = _projected_opt_cond_aux
+        response_options = dict(optimality_fun_has_aux=True,
+                                gen_precond=_projected_preconditioner,
+                                gen_precond_host_only=True)
+    else:
+        raise ValueError(f'Unknown BOYS_RESPONSE_VARIANT: {variant!r}')
     solver = gen_gmres(safe=symmetry, **gmres_options)
     _boys_iter = make_implicit_diff(_boys,
                                     implicit_diff=True,
                                     fixed_point=False,
-                                    optimality_cond=_opt_cond,
+                                    optimality_cond=optimality_cond,
                                     solver=solver,
-                                    has_aux=True)
+                                    has_aux=True,
+                                    **response_options)
 
     x, sorted_idx = _boys_iter(None, mol, mo_coeff,
                                init_guess=init_guess,

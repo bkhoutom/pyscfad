@@ -12,24 +12,25 @@ Zero forces disk panels or single-column solve slabs, respectively.
 """
 
 from functools import partial
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 import math
 import os
 import time
 
 import jax
 from jax import custom_vjp
+from jax.custom_derivatives import CustomVJPPrimal, SymbolicZero
 from jax import scipy as jax_scipy
-from jax.tree_util import tree_flatten, tree_unflatten
+from jax.tree_util import tree_flatten, tree_unflatten, tree_map
 import numpy
 import scipy.linalg
-from threadpoolctl import threadpool_limits
 from pyscf import lib
 from pyscf.df import df_jk as pyscf_df_jk
+from pyscf.gto.mole import AS_RINV_ORIG_ATOM
 
 from pyscfad import numpy as np
 from pyscfad.df import _cderi_vjp
-from pyscfad.lib._threading import dense_blas_threads
+from pyscfad.lib._threading import dense_blas_threads, blas_threads
 
 _FACTOR_PANEL_MEMORY_MB = 256.0
 _SOLVE_MEMORY_MB = 64.0
@@ -45,14 +46,14 @@ def _memory_mb(name, default):
 
 
 @contextmanager
-def _factor_panels(naux, nao, rank, with_k):
+def _factor_panels(naux, nao, rank, with_k, *, force_disk=False):
     """Keep small thin panels in RAM; spill large ones to owned scratch."""
     if not with_k:
         yield None, None
         return
     shape = (naux, nao * rank)
     panel_memory = _memory_mb('PYSCFAD_FACTOR_PANEL_MEMORY_MB', _FACTOR_PANEL_MEMORY_MB)
-    if 2 * numpy.prod(shape) * 8 <= panel_memory * 1024**2:
+    if not force_disk and 2 * numpy.prod(shape) * 8 <= panel_memory * 1024**2:
         yield numpy.empty(shape), numpy.empty(shape)
     else:
         # Every later read/solve is a bounded slab. The file is closed and
@@ -75,18 +76,144 @@ def get_jk_from_occ(dfobj, factors, with_j=True, with_k=True, factor_response=Tr
 
 
 def _forward(dfobj, factors, with_j, with_k, factor_response):
-    return get_jk_from_occ(dfobj, factors, with_j, with_k, factor_response), (dfobj, factors)
+    def active(value):
+        return any(isinstance(x, CustomVJPPrimal) and x.perturbed
+                   for x in tree_flatten(value)[0])
+    activity = (active(factors), active(dfobj.mol), active(dfobj.auxmol))
+    unwrap = lambda x: x.value if isinstance(x, CustomVJPPrimal) else x
+    dfobj, factors = tree_map(unwrap, dfobj), unwrap(factors)
+    value = get_jk_from_occ(dfobj, factors, with_j, with_k, factor_response)
+    return value, (dfobj, factors, activity)
 
 
-def _backward(with_j, with_k, factor_response, residual, cotangents):
-    dfobj, factors = residual
+def _backward(with_j, with_k, factor_response, residual, cotangents, *,
+              geometry_activity=(True, True)):
+    started = time.perf_counter()
+    dfobj, factors = residual[:2]
+    if len(residual) == 3:
+        factor_active, mol_active, aux_active = residual[2]
+        factor_response = factor_response and factor_active
+        geometry_activity = (geometry_activity[0] and mol_active,
+                             geometry_activity[1] and aux_active)
+    with_j = with_j and not isinstance(cotangents[0], SymbolicZero)
+    with_k = with_k and not isinstance(cotangents[1], SymbolicZero)
+    if not (with_j or with_k):
+        return None, None
+    zero = numpy.zeros((factors.shape[0], factors.shape[0]))
+    cotangents = (cotangents[0] if with_j else zero,
+                  cotangents[1] if with_k else zero)
+    if not any(geometry_activity):
+        return None, (factor_pullback(dfobj, factors, *cotangents,
+                                     with_j=with_j, with_k=with_k)
+                      if factor_response else None)
+
+    from . import _ooc_cotangent
+    deferred = _ooc_cotangent.defer_backward(
+        with_j, with_k, factor_response, (dfobj, factors), cotangents,
+        geometry_activity=geometry_activity)
+    if deferred is not None:
+        return deferred
+    contribution, sbar = _prepare_backward(
+        with_j, with_k, factor_response, (dfobj, factors), cotangents)
+    try:
+        geometry = contribution.contract()
+        if not geometry_activity[0]:
+            geometry.mol = tree_map(lambda _: None, dfobj.mol)
+        if not geometry_activity[1]:
+            geometry.auxmol = tree_map(lambda _: None, dfobj.auxmol)
+        _cderi_vjp._profile_msg(
+            f'occupied-factor DF J/K reverse rank={factors.shape[1]} '
+            f'done {time.perf_counter() - started:.2f} s')
+        return geometry, sbar
+    finally:
+        contribution.close()
+
+
+class _GeometryContribution:
+    """Owned, reusable thin-panel seed for a later coordinate contraction."""
+
+    def __init__(self, dfobj, rank, lowbar, read_density, fill_packed_density,
+                 disk_panels):
+        self.dfobj = dfobj
+        self.nao = dfobj.mol.nao
+        self.naux = dfobj.get_naoaux()
+        self.rank = rank
+        self.lowbar = lowbar
+        self.read_density_aux_block = read_density
+        self.fill_packed_density_aux_block = fill_packed_density
+        self.disk_panels = disk_panels
+        self._resources = None
+        self.closed = False
+
+    def contract(self):
+        """Evaluate this seed without consuming it or closing its scratch."""
+        return contract_geometry((self,))
+
+    def close(self):
+        """Release scratch and retained arrays, including on failed contraction."""
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            if self._resources is not None:
+                self._resources.close()
+        finally:
+            self._resources = None
+            self.lowbar = None
+            self.read_density_aux_block = None
+            self.fill_packed_density_aux_block = None
+
+
+def _prepare_backward(with_j, with_k, factor_response, residual, cotangents, *,
+                      force_disk=False):
+    """Return a geometry seed and immediate factor bar; caller closes the seed."""
+    dfobj, factors = residual[:2]
     nao, rank = factors.shape
-    with _factor_panels(dfobj.get_naoaux(), nao, rank, with_k) as panels:
-        return _reverse(with_j, with_k, factor_response, residual, cotangents, *panels)
+    resources = ExitStack()
+    try:
+        panels = resources.enter_context(_factor_panels(
+            dfobj.get_naoaux(), nao, rank, with_k, force_disk=force_disk))
+        contribution, sbar = _prepare_reverse(
+            with_j, with_k, factor_response, (dfobj, factors), cotangents, *panels)
+        contribution._resources = resources
+        return contribution, sbar
+    except BaseException:
+        resources.close()
+        raise
+
+
+def factor_pullback(dfobj, S, G, H, with_j=True, with_k=True):
+    """Return the occupied-factor bar without any metric or geometry response."""
+    S, G, H = map(numpy.asarray, (S, G, H))
+    G, H = (G + G.T) * .5, (H + H.T) * .5
+    sbar = numpy.zeros_like(S)
+    if not (with_j or with_k):
+        return sbar
+    nao = S.shape[0]
+    rows = max(1, min(dfobj.blockdim, int(128 * 1024**2 / (8 * nao * nao))))
+    for packed in dfobj.loop(rows):
+        b = lib.unpack_tril(packed)
+        with dense_blas_threads():
+            t = b @ S
+            if with_j:
+                g = numpy.einsum('ab,pab->p', G, b)
+                sbar += 2 * numpy.einsum('p,par->ar', g, t)
+            if with_k:
+                sbar += 2 * numpy.sum(b @ (H @ t), axis=0)
+    return sbar
 
 
 def _reverse(with_j, with_k, factor_response, residual, cotangents, T, Rtilde):
-    started = time.perf_counter()
+    """Compatibility entry for callers that own their panel lifetime."""
+    contribution, sbar = _prepare_reverse(
+        with_j, with_k, factor_response, residual, cotangents, T, Rtilde)
+    try:
+        return contribution.contract(), sbar
+    finally:
+        contribution.close()
+
+
+def _prepare_reverse(with_j, with_k, factor_response, residual, cotangents, T, Rtilde):
     dfobj, factors = residual
     S = numpy.asarray(factors)
     G, H = (numpy.asarray(bar) for bar in cotangents)
@@ -186,7 +313,7 @@ def _reverse(with_j, with_k, factor_response, residual, cotangents, T, Rtilde):
             coefficients = numpy.array((a[begin:end], b[begin:end]), order='F')
             # This rank-two update is memory bound. A large BLAS team costs
             # more here and competes with the following OpenMP contraction.
-            with threadpool_limits(limits=1, user_api='blas'):
+            with blas_threads(1):
                 updated = scipy.linalg.blas.dgemm(
                     1., packed_jd_columns, coefficients, beta=float(with_k),
                     c=out.T, overwrite_c=1)
@@ -232,12 +359,69 @@ def _reverse(with_j, with_k, factor_response, residual, cotangents, T, Rtilde):
             density *= 2
         return density
 
+    return _GeometryContribution(
+        dfobj, rank, lowbar, read_density,
+        fill_packed_density if packed_density else None,
+        Rtilde is not None and not isinstance(Rtilde, numpy.ndarray)), Sbar
+
+
+def contract_geometry(contributions):
+    """Contract summed seeds for one shared DF source in a single block pass.
+
+    The caller groups compatible integral sources and retains ownership of
+    the contributions. No contribution or underlying cotangent is consumed.
+    """
+    contributions = tuple(contributions)
+    if not contributions:
+        raise ValueError('At least one geometry contribution is required')
+    for contribution in contributions:
+        if contribution.closed:
+            raise RuntimeError('Cannot contract a closed geometry contribution')
+    first = contributions[0]
+    dfobj, nao, naux = first.dfobj, first.nao, first.naux
+    auxmol = dfobj.auxmol
+    for contribution in contributions[1:]:
+        if contribution.nao != nao or contribution.naux != naux:
+            raise ValueError('Geometry contributions have incompatible DF dimensions')
+        for left, right in ((dfobj.mol, contribution.dfobj.mol),
+                            (auxmol, contribution.dfobj.auxmol)):
+            if (left.cart != right.cart
+                    or not numpy.array_equal(left.coords, right.coords)
+                    or not numpy.array_equal(left._atm, right._atm)
+                    or not numpy.array_equal(left._bas, right._bas)
+                    or not numpy.array_equal(left._env[:AS_RINV_ORIG_ATOM],
+                                             right._env[:AS_RINV_ORIG_ATOM])
+                    or not numpy.array_equal(left._env[AS_RINV_ORIG_ATOM+1:],
+                                             right._env[AS_RINV_ORIG_ATOM+1:])):
+                raise ValueError('Geometry contributions have incompatible integral sources')
+
+    def read_density(begin, end):
+        out = first.read_density_aux_block(begin, end)
+        for contribution in contributions[1:]:
+            out += contribution.read_density_aux_block(begin, end)
+        return out
+
+    def fill_packed_density(begin, end, out):
+        first.fill_packed_density_aux_block(begin, end, out)
+        if len(contributions) > 1:
+            scratch = numpy.empty_like(out)
+            for contribution in contributions[1:]:
+                contribution.fill_packed_density_aux_block(begin, end, scratch)
+                out += scratch
+
+    packed_density = all(c.fill_packed_density_aux_block is not None
+                         for c in contributions)
     molbar, auxbar = _cderi_vjp._int3c_mo_deriv_coords_vjp_from_z_reader(
         dfobj.mol, auxmol, None, None, (0, nao, 0, nao),
         int3c=dfobj.mol._add_suffix('int3c2e'),
         read_density_aux_block=read_density,
         fill_packed_density_aux_block=fill_packed_density if packed_density else None,
     )
+
+    lowbar = first.lowbar.copy()
+    for contribution in contributions[1:]:
+        lowbar += contribution.lowbar
+    int2c = dfobj.mol._add_suffix('int2c2e')
 
     def metric_cholesky(aux):
         return jax_scipy.linalg.cholesky(aux.intor(int2c, hermi=1), lower=True)
@@ -249,10 +433,7 @@ def _reverse(with_j, with_k, factor_response, residual, cotangents, T, Rtilde):
     bars = [numpy.zeros_like(leaf) for leaf in leaves]
     bars[0] = molbar.coords
     bars[1] = auxbar.coords
-    _cderi_vjp._profile_msg(
-        f'occupied-factor DF J/K reverse rank={rank} '
-        f'done {time.perf_counter() - started:.2f} s')
-    return tree_unflatten(tree, bars), Sbar
+    return tree_unflatten(tree, bars)
 
 
-get_jk_from_occ.defvjp(_forward, _backward)
+get_jk_from_occ.defvjp(_forward, _backward, symbolic_zeros=True)

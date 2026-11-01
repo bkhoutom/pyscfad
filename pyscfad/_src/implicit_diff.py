@@ -21,6 +21,11 @@ import jax
 from jax.tree_util import tree_map
 from jax.scipy.sparse.linalg import gmres
 from pyscfad.backend import get_backend
+try:
+    from jax._src.interpreters.ad import ValAccum as _ValAccum, Zero as _Zero
+except ImportError:
+    _ValAccum = None
+
 
 _Sub = partial(tree_map, operator.sub)
 
@@ -81,6 +86,31 @@ def _map_back(diff_items, items, keys):
         new_items[i] = diff_items[k]
     return tuple(new_items)
 
+# Upstream PR #180's guarded adapter avoids instantiating full factor zeros
+# after an implicit VJP whose resident factor contributions went to the scope.
+_NO_COTANGENT = object()
+
+if _ValAccum is not None:
+    class _ValAccumNoZero(_ValAccum):
+        def freeze(self):
+            return _NO_COTANGENT if isinstance(self.val, _Zero) else self.val
+
+
+def _call_vjp(vjp_fun, primals, ct):
+    """Keep absent registered bars symbolic, preserving all explicit bars."""
+    from pyscfad.lib import _cotangent_buffer
+    if (_ValAccum is None or getattr(jax, 'ad', None) is None
+            or not hasattr(vjp_fun, 'with_refs')):
+        return vjp_fun(ct)
+    leaves, tree = jax.tree_util.tree_flatten(primals)
+    skip = [_cotangent_buffer.registered(x) for x in leaves]
+    if not any(skip):
+        return vjp_fun(ct)
+    refs = [_ValAccumNoZero(jax.typeof(x).to_ct_aval()) if active
+            else jax.ad.GradValue() for x, active in zip(leaves, skip)]
+    cts = vjp_fun.with_refs(*jax.tree_util.tree_unflatten(tree, refs))(ct)
+    return tree_map(lambda x: None if x is _NO_COTANGENT else x, cts)
+
 def root_vjp(optimality_fun, sol, args, cotangent,
              solve=gmres, nondiff_argnums=(),
              optfn_has_aux=False, solver_kwargs=None,
@@ -95,7 +125,11 @@ def root_vjp(optimality_fun, sol, args, cotangent,
     # A nested root can be entered from another root's external pullback.
     # Its own Jacobian and linear solve still need the full root response.
     # Restore the parent's phase on both success and failure.
-    with _implicit_diff_external_vjp(False):
+    from pyscfad.lib import _cotangent_buffer, _scf_response_cache
+    traced = any(isinstance(x, jax.core.Tracer) for x in
+                 jax.tree_util.tree_leaves((sol, args, cotangent)))
+    with (_implicit_diff_external_vjp(False), _cotangent_buffer.suspend(),
+          _scf_response_cache.root_scope(enabled=not traced)):
         # FIXME M may not work for solvers other than scipy
         M = None
         if optfn_has_aux:
@@ -108,8 +142,6 @@ def root_vjp(optimality_fun, sol, args, cotangent,
                     # A captured host solver may fall back to JAX under tracing.
                     # Only host callbacks are suppressed; native JAX callbacks
                     # must retain their behavior in traced iterative solves.
-                    traced = any(isinstance(x, jax.core.Tracer) for x in
-                                 jax.tree_util.tree_leaves((sol, args, cotangent)))
                     if not traced:
                         M = gen_precond(optfn_aux, *args, solver=solve)
                 else:
@@ -122,7 +154,12 @@ def root_vjp(optimality_fun, sol, args, cotangent,
                 return vjp_fun_sol(u)[0]
 
         v = _Scalar_mul(-1, cotangent)
-        u = solve(matvec, v, M=M, **solver_kwargs)[0]
+        try:
+            u = solve(matvec, v, M=M, **solver_kwargs)[0]
+        finally:
+            # Release optional preconditioner factors before returning their
+            # reservation, including failures and nested root solves.
+            M = None
 
     diff_args_dict = {i: arg for i, arg in enumerate(args) if i+1 not in nondiff_argnums}
     keys = diff_args_dict.keys()
@@ -134,7 +171,7 @@ def root_vjp(optimality_fun, sol, args, cotangent,
     # A nested root's external bars are needed even inside a parent matvec.
     with _implicit_diff_solve_matvec(False), _implicit_diff_external_vjp():
         _, vjp_fun_args = jax.vjp(fun_args, *diff_args, has_aux=optfn_has_aux)[:2]
-        diff_vjps = vjp_fun_args(u)
+        diff_vjps = _call_vjp(vjp_fun_args, diff_args, u)
 
     vjps = [None,] * len(args)
     vjps = _map_back(diff_vjps, vjps, keys)

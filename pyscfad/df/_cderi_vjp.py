@@ -14,7 +14,7 @@
 
 """Memory-conscious VJP helpers for out-of-core molecular DF CDERI."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from functools import lru_cache
 import contextvars
 import ctypes
@@ -40,7 +40,7 @@ from pyscfad.ao2mo import _ao2mo
 from pyscfad.df import _int3c_cross_opt
 from pyscfad.df import addons as df_addons
 from pyscfad.tools import resource_profile
-from pyscfad.lib._threading import dense_blas_threads
+from pyscfad.lib._threading import dense_blas_threads, blas_threads
 from pyscfadlib import libnp_helper_vjp
 try:
     from pyscfadlib import libao2mo_vjp
@@ -1972,3 +1972,110 @@ def cholesky_eri_vjp_from_mo_coeff_ybar(mol, auxmol, cderi_source,
         f'{time.perf_counter() - t_total:.2f} s'
     )
     return mol_bar, auxmol_bar
+
+
+@contextmanager
+def _outcore_mo_geometry_panel(naux, columns, *, force_disk=False):
+    """Own one transformed MO-space seed, with bounded disk access if needed."""
+    from . import _df_jk_factorized as factorized
+    shape = (naux, columns)
+    budget = factorized._memory_mb(
+        'PYSCFAD_FACTOR_PANEL_MEMORY_MB', factorized._FACTOR_PANEL_MEMORY_MB)
+    if columns == 0 or (not force_disk and naux * columns * 8 <= budget * 1024**2):
+        yield numpy.empty(shape)
+    else:
+        with pyscf_lib.H5TmpFile() as scratch:
+            yield scratch.create_dataset(
+                'Z', shape, dtype='f8', chunks=(min(naux, 16), min(columns, 1024)))
+
+
+def _prepare_outcore_mo_geometry(dfobj, mo_coeff, ybar, orbs_slice,
+                                 saved_output, *, force_disk=False):
+    """Prepare an owned MO-space geometry seed without derivative integrals.
+
+    Raw Lov/ybar arrays or datasets are read by full-auxiliary column slabs.
+    The returned contribution retains only its own transformed Z panel and
+    coefficient blocks; the caller may release both raw inputs immediately.
+    This first-order path does not mutate seeds or the reusable forward Lov.
+    """
+    from . import _df_jk_factorized as factorized
+    mol, auxmol = dfobj.mol, dfobj.auxmol
+    if any(isinstance(x, jax.core.Tracer) for x in
+           jax.tree_util.tree_leaves((dfobj, mo_coeff, ybar, saved_output))):
+        raise NotImplementedError('Deferred MO geometry requires concrete first-order inputs')
+    mo = numpy.asarray(jax.device_get(mo_coeff))
+    if mo.ndim != 2 or mo.shape[0] != mol.nao or mo.dtype != numpy.float64:
+        raise NotImplementedError('Deferred MO geometry requires real float64 global AO coefficients')
+    if auxmol is None or any(obj.coords is None or len(tree_flatten(obj)[0]) != 1
+                             for obj in (mol, auxmol)):
+        raise NotImplementedError('Deferred MO geometry supports coordinate derivatives only')
+    k0, k1, l0, l1 = map(int, orbs_slice)
+    if not (0 <= k0 <= k1 <= mo.shape[1] and 0 <= l0 <= l1 <= mo.shape[1]):
+        raise ValueError('MO orbital slice is outside the coefficient matrix')
+    kc, lc = k1 - k0, l1 - l0
+    naux, columns = auxmol.nao, kc * lc
+    if naux <= 0 or dfobj.get_naoaux() != naux:
+        raise ValueError('MO geometry auxiliary dimension does not match the DF source')
+    for value in (ybar, saved_output):
+        if getattr(value, 'shape', None) != (naux, columns):
+            raise ValueError('MO geometry seed/forward output has an incompatible shape')
+        if numpy.dtype(value.dtype) != numpy.float64:
+            raise NotImplementedError('Deferred MO geometry requires float64 seed and forward output')
+
+    mo_k = numpy.array(mo[:, k0:k1], order='C', copy=True)
+    mo_l = numpy.array(mo[:, l0:l1], order='C', copy=True)
+    packed_k, packed_l = (mo_l, mo_k) if lc > kc else (mo_k, mo_l)
+    resources = ExitStack()
+    try:
+        z_panel = resources.enter_context(_outcore_mo_geometry_panel(
+            naux, columns, force_disk=force_disk))
+        metric = numpy.asarray(auxmol.intor(mol._add_suffix('int2c2e'), hermi=1))
+        with dense_blas_threads():
+            low = scipy.linalg.cholesky(metric, lower=True, check_finite=False)
+        del metric
+        lowbar = numpy.zeros((naux, naux), order='F')
+        solve_budget = factorized._memory_mb(
+            'PYSCFAD_SOLVE_MEMORY_MB', factorized._SOLVE_MEMORY_MB)
+        width = max(1, int(solve_budget * 1024**2 / (3 * 8 * naux)))
+        for begin in range(0, columns, width):
+            end = min(begin + width, columns)
+            # Do not coerce a whole HDF5 dataset to NumPy here.
+            with dense_blas_threads():
+                z = scipy.linalg.solve_triangular(
+                    low.T, numpy.asarray(ybar[:, begin:end]), lower=False,
+                    check_finite=False)
+                lowbar = scipy.linalg.blas.dgemm(
+                    -1., z, numpy.asarray(saved_output[:, begin:end]).T,
+                    beta=1., c=lowbar, overwrite_c=1)
+            z_panel[:, begin:end] = z
+            del z
+        del low
+
+        def read_density(begin, end):
+            if columns == 0:
+                return numpy.zeros((end - begin, mol.nao, mol.nao))
+            block = numpy.asarray(z_panel[begin:end]).reshape(end - begin, kc, lc)
+            return _int3c_mo_physical_density(mo_k, mo_l, block)
+
+        def fill_packed_density(begin, end, out):
+            block = numpy.asarray(z_panel[begin:end]).reshape(end - begin, kc, lc)
+            if lc > kc:
+                block = block.transpose(0, 2, 1)
+            # Off diagonal D+D.T, diagonal D: native coordinate weights.
+            # The native projection calls GEMM inside its OpenMP row loop.
+            # Keep those GEMMs serial; the NumPy fallback uses isolated GEMMs.
+            context = (blas_threads(1) if _use_native_cderi_bar_aux_block(block, packed_k, packed_l)
+                       else dense_blas_threads())
+            with context:
+                out[:] = _nr_e2_cderi_bar_packed_aux_block_prepared(block, packed_k, packed_l)
+
+        disk = not isinstance(z_panel, numpy.ndarray)
+        contribution = factorized._GeometryContribution(
+            dfobj, min(kc, lc), lowbar, read_density, fill_packed_density, disk)
+        contribution._resources = resources
+        contribution.mo_panel_columns = columns
+        contribution.retained_panel_bytes = 0 if disk else naux * columns * 8
+        return contribution
+    except BaseException:
+        resources.close()
+        raise

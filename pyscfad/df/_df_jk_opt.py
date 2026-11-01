@@ -33,6 +33,7 @@ from pyscf.df import df_jk as pyscf_df_jk
 from pyscfadlib import libcvhf_vjp as libvhf
 from pyscfad.df import incore as df_incore
 from pyscfad.df import _cderi_vjp
+from pyscfad.lib import _cotangent_buffer, _scf_response_cache
 from pyscfad._src.implicit_diff import is_implicit_diff_solve_matvec
 
 libao2mo = lib.load_library('libao2mo')
@@ -451,7 +452,7 @@ def _implicit_lowrank_exchange_factors(dfobj, vj_bar, vk_bar, hermi,
 
 
 def _df_vk_dm_vjp_lowrank(dm_bar, eri1, occ_coeff, response_coeff,
-                          buf_occ, buf_response):
+                          buf_occ, buf_response, *, cached_occ=None):
     """Apply the DF exchange transpose from thin occupied/response factors."""
     naux, _ = eri1.shape
     nao, nocc = occ_coeff.shape
@@ -466,15 +467,16 @@ def _df_vk_dm_vjp_lowrank(dm_bar, eri1, occ_coeff, response_coeff,
         ctypes.c_int(0),
     )
 
-    occ_block = buf_occ[:naux * nocc]
+    occ_block = buf_occ[:naux * nocc] if cached_occ is None else cached_occ
     response_block = buf_response[:naux * nocc]
-    fdrv(
-        ftrans, fmmm,
-        occ_block.ctypes.data_as(ctypes.c_void_p),
-        eri1.ctypes.data_as(ctypes.c_void_p),
-        occ_coeff.ctypes.data_as(ctypes.c_void_p),
-        ctypes.c_int(naux), *rargs,
-    )
+    if cached_occ is None:
+        fdrv(
+            ftrans, fmmm,
+            occ_block.ctypes.data_as(ctypes.c_void_p),
+            eri1.ctypes.data_as(ctypes.c_void_p),
+            occ_coeff.ctypes.data_as(ctypes.c_void_p),
+            ctypes.c_int(naux), *rargs,
+        )
     fdrv(
         ftrans, fmmm,
         response_block.ctypes.data_as(ctypes.c_void_p),
@@ -482,6 +484,7 @@ def _df_vk_dm_vjp_lowrank(dm_bar, eri1, occ_coeff, response_coeff,
         response_coeff.ctypes.data_as(ctypes.c_void_p),
         ctypes.c_int(naux), *rargs,
     )
+    _scf_response_cache.record_transforms(occupied=cached_occ is None)
     cross = lib.dot(occ_block.T, response_block)
     dm_bar += cross
     dm_bar += cross.T
@@ -602,21 +605,64 @@ def _jk_residual(res):
     if len(res) == 2:
         # Compatibility for direct callers predating symbolic activity.
         return res[0], res[1], (True, True, True, True)
-    return res
+    return res[:3]
 
 
 def _active_output_bar(bar, enabled):
     return bar if enabled and not isinstance(bar, SymbolicZero) else None
 
 
+def _capture_geometry_factors(dfobj, dm, hermi, activity):
+    """Retain the exact forward orbital frame for an eligible OOC geometry VJP.
+
+    The SCF extra cycle can replace the orbital cache before the backward
+    pass. Recovering factors there gives a different (valid) Cholesky gauge,
+    preventing exact coalescing with the implicit root's geometry seed.
+    This small residual is independent of the full AO-density cotangent.
+    """
+    if (os.environ.get('PYSCFAD_DF_OOC_CAPTURE_FACTORS', '0').lower()
+            not in ('1', 'true', 'yes', 'on') or hermi != 1
+            or not (activity[2] or activity[3])
+            or _has_tracer(dfobj, dm)):
+        return None
+    from . import df_jk
+    if (os.environ.get('PYSCFAD_DF_OCCUPIED_VJP', '1').lower()
+            in ('0', 'false', 'no', 'off')
+            or not df_jk._has_outcore_cderi(dfobj)
+            or df_jk._MPI_GET_JK_HOOK.get() is not None):
+        return None
+    density = numpy.asarray(dm)
+    if (density.ndim != 2 or density.shape[0] != density.shape[1]
+            or density.dtype != numpy.float64):
+        return None
+    for obj in (dfobj.mol, dfobj.auxmol):
+        if (getattr(obj, 'coords', None) is None
+                or len(tree_flatten(obj)[0]) != 1
+                or numpy.asarray(obj.coords).dtype != numpy.float64):
+            return None
+    factors = _density_factors(_tag_dm_for_fast_exchange(dfobj, dm), hermi)
+    if factors is None or len(factors) != 1:
+        return None
+    factor = factors[0]
+    nao, rank = factor.shape
+    if rank == 0 or nao * rank >= nao * (nao + 1) // 2:
+        return None
+    # Own the residual even if a caller later changes its orbital cache.
+    return numpy.array(factor, dtype=numpy.float64, order='F', copy=True)
+
+
 def get_jk_fwd(dfobj, dm, hermi, with_j, with_k, direct_scf_tol):
     dfobj, dm, activity = _unwrap_jk_primals(dfobj, dm)
+    factors = _capture_geometry_factors(dfobj, dm, hermi, activity)
     vj, vk = get_jk(dfobj, dm, hermi, with_j, with_k, direct_scf_tol)
-    return (vj, vk), (dfobj, dm, activity)
+    residual = (dfobj, dm, activity)
+    if factors is not None:
+        residual += (factors,)
+    return (vj, vk), residual
 
 
 def _factorized_geometry_bwd(hermi, direct_scf_tol, dfobj, dm, activity,
-                             vj_bar, vk_bar):
+                             vj_bar, vk_bar, *, fixed_factors=None):
     """Use thin factors only for geometry; retain the full AO-density bar.
 
     For fixed D=S S.T the coordinate derivative can hold S fixed, but its
@@ -648,7 +694,8 @@ def _factorized_geometry_bwd(hermi, direct_scf_tol, dfobj, dm, activity,
             if (array.shape != density.shape or array.dtype != numpy.float64
                     or not numpy.isfinite(array).all()):
                 return None
-    factors = _density_factors(_tag_dm_for_fast_exchange(dfobj, dm), hermi)
+    factors = ((fixed_factors,) if fixed_factors is not None else
+               _density_factors(_tag_dm_for_fast_exchange(dfobj, dm), hermi))
     if factors is None or len(factors) != 1:
         return None
     S = factors[0]
@@ -669,7 +716,8 @@ def _factorized_geometry_bwd(hermi, direct_scf_tol, dfobj, dm, activity,
     density_seconds = time.perf_counter() - started
     geometry_started = time.perf_counter()
     geometry_bar, _ = _df_jk_factorized._backward(
-        with_j, with_k, False, (dfobj, S), seeds)
+        with_j, with_k, False, (dfobj, S), seeds,
+        geometry_activity=(mol_active, aux_active))
     df_bar = tree_map(lambda x: None, dfobj)
     if mol_active:
         df_bar.mol = geometry_bar.mol
@@ -688,6 +736,7 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
     t_bwd = time.perf_counter()
     _profile_msg(f'get_jk_bwd start hermi={hermi} with_j={with_j} with_k={with_k}')
     dfobj, dm, activity = _jk_residual(res)
+    fixed_factors = res[3] if len(res) == 4 else None
     dm_active, eri_active, mol_active, aux_active = activity
     vj_bar = _active_output_bar(ybar[0], with_j)
     vk_bar = _active_output_bar(ybar[1], with_k)
@@ -730,7 +779,8 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
 
     if coordinate_vjp is None and not solution_only:
         factorized = _factorized_geometry_bwd(
-            hermi, direct_scf_tol, dfobj, dm, activity, vj_bar, vk_bar)
+            hermi, direct_scf_tol, dfobj, dm, activity, vj_bar, vk_bar,
+            fixed_factors=fixed_factors)
         if factorized is not None:
             return factorized
 
@@ -792,8 +842,14 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
         rank = max(pair[0].shape[1] for pair in response_factors)
         buf_occ = numpy.empty((blksize * rank, nao))
         buf_response = numpy.empty_like(buf_occ)
+    occupied_panel = (_scf_response_cache.get_panel(dfobj, response_factors[0][0])
+                      if solution_only and response_factors is not None
+                      and len(response_factors) == 1 else None)
     stream_eri_bar = geometry_active
-    eri_bar = numpy.zeros(eri_bar_shape) if return_cderi_bar else None
+    eri_bar_buf = (_cotangent_buffer.get(dfobj._cderi)
+                   if return_cderi_bar else None)
+    eri_bar = (eri_bar_buf if eri_bar_buf is not None else
+               numpy.zeros(eri_bar_shape) if return_cderi_bar else None)
     eri_bar_file = eri_bar_path = eri_bar_h5 = None
     p1 = 0
     try:
@@ -855,8 +911,18 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
                             if response_factors is not None:
                                 occ_coeff, response_coeff = response_factors[k]
                                 if occ_coeff.shape[1]:
-                                    _df_vk_dm_vjp_lowrank(dms_bar[k], eri1, occ_coeff,
-                                                         response_coeff, buf_occ, buf_response)
+                                    cached_occ = (occupied_panel.lookup_block(p0, p1)
+                                                  if occupied_panel is not None else None)
+                                    if cached_occ is None:
+                                        _df_vk_dm_vjp_lowrank(dms_bar[k], eri1, occ_coeff,
+                                                             response_coeff, buf_occ, buf_response)
+                                        if occupied_panel is not None:
+                                            occupied_panel.store_block(
+                                                p0, p1, buf_occ[:naux * occ_coeff.shape[1]])
+                                    else:
+                                        _df_vk_dm_vjp_lowrank(dms_bar[k], eri1, occ_coeff,
+                                                             response_coeff, buf_occ, buf_response,
+                                                             cached_occ=cached_occ)
                             else:
                                 _DF_VK_DM_VJP(
                                     dms_bar[k].ctypes.data_as(ctypes.c_void_p),
@@ -875,7 +941,7 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
                              f'{time.perf_counter() - t_bwd:.2f} s')
             return None, dm_bar
         df_bar = tree_map(lambda x: None, dfobj)
-        if return_cderi_bar:
+        if return_cderi_bar and eri_bar_buf is None:
             df_bar._cderi = eri_bar
         if geometry_active:
             t_cderi = time.perf_counter()
@@ -937,6 +1003,8 @@ def gen_coulomb_precond(dfobj, orbo, orbv, e_ai):
     cache_limit = min(budget_mb * 1024**2, .5 * max(max_memory, 0) * 1e6)
     cache_bytes = naux * nvir * nocc * numpy.dtype(numpy.float64).itemsize
     use_cache = cache_bytes > 0 and cache_bytes <= cache_limit
+    if use_cache:
+        use_cache = _scf_response_cache.reserve_preconditioner(cache_bytes)
     cached = numpy.empty((naux, nvir, nocc)) if use_cache else None
     sqrt_e = numpy.sqrt(e_ai)
     kmat = numpy.eye(naux) * .25

@@ -10,6 +10,10 @@ from pyscfad.df import _df_jk_opt
 
 @pytest.fixture
 def problem(tmp_path, monkeypatch):
+    # Test the advisory-memory policy independently of JAX allocator pages
+    # retained by earlier tests in the same process. Low-memory cases below
+    # still select their intended limits explicitly.
+    monkeypatch.setattr(_df_jk_opt.lib, 'current_memory', lambda: (0., 0.))
     rng = np.random.default_rng(31415)
     mol = gto.Mole(atom='O 0 0 0; H 0 -.757 .587; H 0 .757 .587',
                    basis='sto-3g', verbose=0, max_memory=1000)

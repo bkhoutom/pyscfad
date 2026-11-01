@@ -19,7 +19,7 @@ from functools import partial
 import numpy
 import jax
 from jax import custom_jvp, custom_vjp
-from jax.custom_derivatives import SymbolicZero
+from jax.custom_derivatives import CustomVJPPrimal, SymbolicZero
 from pyscf import __config__
 from pyscf import lib as pyscf_lib
 from pyscf.lib import direct_sum, current_memory
@@ -540,10 +540,10 @@ def _contract_energy(Lov, mo_energy, nocc, nvir, with_t2=True, *, mp=None):
     return _contract_scan(Lov, mo_energy, nocc, nvir, with_t2)
 
 
-@partial(custom_vjp, nondiff_argnums=(3, 4, 5, 6))
+@partial(custom_vjp, nondiff_argnums=(3, 4, 5, 6, 7))
 def _outcore_nr_e2(mol, auxmol, mo_coeff, cderi_source, max_memory,
-                   ijslice, aosym):
-    del mol, auxmol
+                   ijslice, aosym, source_token=None):
+    del mol, auxmol, source_token
     if numpy.dtype(mo_coeff.dtype) != numpy.dtype(numpy.float64):
         # Preserve the generic backend (including its non-float64 support).
         # The streamed PySCF C transform below is intentionally float64-only.
@@ -564,21 +564,37 @@ def _outcore_nr_e2(mol, auxmol, mo_coeff, cderi_source, max_memory,
 
 
 def _outcore_nr_e2_fwd(mol, auxmol, mo_coeff, cderi_source, max_memory,
-                       ijslice, aosym):
+                       ijslice, aosym, source_token=None):
+    def active(value):
+        return any(isinstance(x, CustomVJPPrimal) and x.perturbed
+                   for x in jax.tree_util.tree_leaves(value))
+    activity = (active(mol), active(auxmol), active(mo_coeff))
+    unwrap = lambda x: x.value if isinstance(x, CustomVJPPrimal) else x
+    mol, auxmol, mo_coeff = jax.tree_util.tree_map(unwrap, (mol, auxmol, mo_coeff))
     out = _outcore_nr_e2(mol, auxmol, mo_coeff, cderi_source, max_memory,
-                         ijslice, aosym)
-    return out, (mol, auxmol, mo_coeff, out)
+                         ijslice, aosym, source_token)
+    return out, (mol, auxmol, mo_coeff, out, activity)
 
 
-def _outcore_nr_e2_bwd(cderi_source, max_memory, ijslice, aosym, res, ybar):
+def _outcore_nr_e2_bwd(cderi_source, max_memory, ijslice, aosym, source_token, res, ybar):
     return _profile_call(
-        'dfmp2.input_pullback', _outcore_nr_e2_bwd_impl,
+        'dfmp2.input_pullback', partial(_outcore_nr_e2_bwd_impl, source_token=source_token),
         cderi_source, max_memory, ijslice, aosym, res, ybar,
     )
 
 
-def _outcore_nr_e2_bwd_impl(cderi_source, max_memory, ijslice, aosym, res, ybar):
-    mol, auxmol, mo_coeff, out = res
+def _outcore_nr_e2_bwd_impl(cderi_source, max_memory, ijslice, aosym, res, ybar, *,
+                           source_token=None):
+    mol, auxmol, mo_coeff, out = res[:4]
+    mol_active, aux_active, mo_active = res[4] if len(res) == 5 else (True, True, True)
+    if isinstance(ybar, SymbolicZero) or not (mol_active or aux_active or mo_active):
+        return None, None, None
+
+    def active_bars(mol_bar, auxmol_bar, mo_coeff_bar):
+        return (mol_bar if mol_active else None,
+                auxmol_bar if aux_active else None,
+                mo_coeff_bar if mo_active else None)
+
     effective_memory = max(max_memory, 4096)
     use_direct_vjp = (
         numpy.dtype(mo_coeff.dtype) == numpy.dtype(numpy.float64)
@@ -603,8 +619,15 @@ def _outcore_nr_e2_bwd_impl(cderi_source, max_memory, ijslice, aosym, res, ybar)
                     ijslice,
                     aosym=aosym,
                     max_memory=effective_memory,
-                )
+                ) if mo_active else None
             )
+            if not (mol_active or aux_active):
+                return None, None, mo_coeff_bar
+            from pyscfad.df import _ooc_cotangent
+            if _ooc_cotangent.defer_mo_geometry(
+                    source_token, cderi_source, mol, auxmol, mo_coeff, ijslice,
+                    out, ybar, geometry_activity=(mol_active, aux_active)):
+                return None, None, mo_coeff_bar
             mol_bar, auxmol_bar = (
                 _cderi_vjp.cholesky_eri_vjp_from_mo_coeff_ybar(
                     mol,
@@ -620,7 +643,7 @@ def _outcore_nr_e2_bwd_impl(cderi_source, max_memory, ijslice, aosym, res, ybar)
                     saved_output=out,
                 )
             )
-            return mol_bar, auxmol_bar, mo_coeff_bar
+            return active_bars(mol_bar, auxmol_bar, mo_coeff_bar)
         except NotImplementedError:
             pass
 
@@ -649,13 +672,15 @@ def _outcore_nr_e2_bwd_impl(cderi_source, max_memory, ijslice, aosym, res, ybar)
                 generic_transform, cderi, mo_coeff
             )
             cderi_bar, mo_coeff_bar = generic_pullback(ybar)
+        if not (mol_active or aux_active):
+            return None, None, mo_coeff_bar if mo_active else None
         mol_bar, auxmol_bar = _cderi_vjp.cholesky_eri_vjp_from_cderi_source(
             mol, auxmol, cderi_source, cderi_bar, effective_memory,
             int3c=mol._add_suffix('int3c2e'),
             int2c=mol._add_suffix('int2c2e'),
             aosym='s2ij',
         )
-        return mol_bar, auxmol_bar, mo_coeff_bar
+        return active_bars(mol_bar, auxmol_bar, mo_coeff_bar)
     except NotImplementedError:
         pass
 
@@ -671,10 +696,10 @@ def _outcore_nr_e2_bwd_impl(cderi_source, max_memory, ijslice, aosym, res, ybar)
         return _ao2mo.nr_e2(cderi, mo_coeff_, ijslice, aosym=aosym)
 
     _, pullback = jax.vjp(fn, mol, auxmol, mo_coeff)
-    return pullback(ybar)
+    return active_bars(*pullback(ybar))
 
 
-_outcore_nr_e2.defvjp(_outcore_nr_e2_fwd, _outcore_nr_e2_bwd)
+_outcore_nr_e2.defvjp(_outcore_nr_e2_fwd, _outcore_nr_e2_bwd, symbolic_zeros=True)
 
 
 def kernel(mp, mo_energy=None, mo_coeff=None, eris=None, with_t2=WITH_T2,
@@ -740,7 +765,8 @@ class MP2(mp2.MP2):
                     )
                 return _outcore_nr_e2(
                     with_df.mol, with_df.auxmol, mo_coeff, cderi,
-                    with_df.max_memory, ijslice, 's2'
+                    with_df.max_memory, ijslice, 's2',
+                    source_token=with_df._fast_exchange_cache_token,
                 )
             with df_addons.load(cderi, 'j3c') as eri1:
                 if not is_array(eri1):

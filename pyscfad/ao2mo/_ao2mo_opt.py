@@ -16,6 +16,8 @@ from functools import partial
 import ctypes
 import numpy
 from jax import custom_vjp
+from jax.custom_derivatives import SymbolicZero
+from pyscfad.lib import _cotangent_buffer
 from pyscf.ao2mo import _ao2mo
 from pyscfadlib import libao2mo_vjp as libao2mo
 
@@ -32,14 +34,30 @@ def nr_e2(eri, mo_coeff, orbs_slice, aosym='s1', mosym='s1', out=None,
                         out=out, ao_loc=ao_loc)
 
 def nr_e2_fwd(eri, mo_coeff, orbs_slice, aosym, mosym, out, ao_loc):
+    perturbed = (eri.perturbed, mo_coeff.perturbed)
+    eri, mo_coeff = eri.value, mo_coeff.value
     out = nr_e2(eri, mo_coeff, orbs_slice, aosym=aosym, mosym=mosym,
                 out=out, ao_loc=ao_loc)
-    return out, (eri, mo_coeff)
+    return out, (eri, mo_coeff, perturbed)
 
 
 def nr_e2_bwd(orbs_slice, aosym, mosym, out, ao_loc,
               res, ybar):
-    eri, mo_coeff = res
+    eri, mo_coeff, (eri_perturbed, mo_perturbed) = res
+    if isinstance(ybar, SymbolicZero):
+        return None, None
+    eri_bar_buf = _cotangent_buffer.get(eri) if eri_perturbed else None
+    eri_bar, mo_coeff_bar = nr_e2_vjp(
+        eri, mo_coeff, orbs_slice, ybar, aosym=aosym, mosym=mosym,
+        ao_loc=ao_loc, eri_bar=eri_bar_buf)
+    if eri_bar_buf is not None or not eri_perturbed:
+        eri_bar = None
+    return eri_bar, mo_coeff_bar if mo_perturbed else None
+
+
+def nr_e2_vjp(eri, mo_coeff, orbs_slice, ybar, aosym='s1', mosym='s1',
+              ao_loc=None, eri_bar=None):
+    """Return bars, adding the factor contribution to ``eri_bar`` if given."""
     nrow, nao_pair = eri.shape
     nao, nmo = mo_coeff.shape
     assert nrow == ybar.shape[0]
@@ -74,7 +92,12 @@ def nr_e2_bwd(orbs_slice, aosym, mosym, out, ao_loc,
     ybar = numpy.asarray(ybar, order='C')
 
     #TODO save eri_bar on disk
-    eri_bar = numpy.zeros_like(eri, order='C')
+    if eri_bar is None:
+        eri_bar = numpy.zeros_like(eri, order='C')
+    elif (not isinstance(eri_bar, numpy.ndarray) or eri_bar.shape != eri.shape
+          or eri_bar.dtype != numpy.float64 or not eri_bar.flags.c_contiguous
+          or not eri_bar.flags.writeable or numpy.shares_memory(eri_bar, eri)):
+        raise ValueError('eri_bar must be a separate writable C-order float64 buffer')
 
     fdrv = getattr(libao2mo, 'AO2MOnr_e2_vjp_drv')
     fdrv(ftrans, fmmm,
@@ -87,7 +110,7 @@ def nr_e2_bwd(orbs_slice, aosym, mosym, out, ao_loc,
          (ctypes.c_int*4)(*orbs_slice))
     return (eri_bar, mo_coeff_bar)
 
-nr_e2.defvjp(nr_e2_fwd, nr_e2_bwd)
+nr_e2.defvjp(nr_e2_fwd, nr_e2_bwd, symbolic_zeros=True)
 
 
 def nr_e2_mo_coeff_vjp(eri, mo_coeff, ybar, orbs_slice, aosym='s1',

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pyscfad.lib import _cotangent_buffer
 from functools import partial
 import ctypes
 import numpy
@@ -210,8 +211,8 @@ def int3c2e_cholesky(mol, auxmol, low, intor, shranges):
 
     Fuses int3c_cross and the triangular solve so that the tensor, and its
     cotangent in the backward pass, are each built in place in one array.
-    The backward rule returns ordinary explicit cotangents, preserving
-    consumer ownership without a process-global accumulation registry.
+    Ordinary VJPs return explicit cotangents. An experimental reverse scope
+    can share one resident cotangent with the optimized JK/AO2MO consumers.
     '''
     return _int3c2e_cholesky(mol, auxmol, low, intor, shranges)
 
@@ -219,17 +220,22 @@ def int3c2e_cholesky_fwd(mol, auxmol, low, intor, shranges):
     mol, auxmol, low = tree_map(lambda x: x.value, (mol, auxmol, low),
                                 is_leaf=lambda x: isinstance(x, CustomVJPPrimal))
     cderi = _int3c2e_cholesky(mol, auxmol, low, intor, shranges)
+    _cotangent_buffer.register(cderi)
     return cderi, (mol, auxmol, low, cderi)
 
 def int3c2e_cholesky_bwd(intor, shranges, res, cderi_bar):
     mol, auxmol, low, cderi = res
     log = logger.new_logger(mol)
     t0 = (log._t0, log._w0)
-    if isinstance(cderi_bar, SymbolicZero):
+    ints_bar = _cotangent_buffer.pop(cderi)
+    if not isinstance(cderi_bar, SymbolicZero):
+        if ints_bar is None:
+            # Never mutate an explicit caller-owned seed or reusable residual.
+            ints_bar = numpy.array(cderi_bar, dtype=numpy.float64, order='C', copy=True)
+        else:
+            ints_bar += numpy.asarray(cderi_bar)
+    if ints_bar is None:
         return (None, None, None)
-    # Explicit cotangents preserve arbitrary consumer/AD ownership. This
-    # private writable copy is consumed by the in-place triangular solve.
-    ints_bar = numpy.array(cderi_bar, dtype=numpy.float64, order='C', copy=True)
 
     # cderi = low^-1 ints, so that ints_bar = low^-T cderi_bar
     # and low_bar = -tril(low^-T cderi_bar cderi^T)

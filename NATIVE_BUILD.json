@@ -1,6 +1,4 @@
 {
-  "status": "installed and validated",
-  "fork_commit": "b0e6a36848e11206600967f022a017751b5477b5",
   "source_directory": "/resnick/groups/sharmagroup/bkhou/src/pyscfad",
   "environment": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env",
   "blas": "Intel oneMKL",
@@ -23,6 +21,17 @@
   "compiler": "gcc (GCC) 11.5.0 20240719 (Red Hat 11.5.0-2)",
   "build_type": "Release",
   "compiler_flags": "-march=x86-64-v3 -mtune=generic",
+  "pyscf_wheel": {
+    "wheel": "/resnick/groups/sharmagroup/bkhou/src/pyscfad/benchmarks/pyscfad_mkl/wheels/pyscf-2.14.0-2caltechmklseq-py3-none-linux_x86_64.whl",
+    "wheel_sha256": "52ad6a68ffdcb49177c63bb66cc0e0bcefa4249cc432c1c62aa61aa1482c4a59",
+    "runtime_files_match_candidate": true,
+    "metadata_difference": "HPC_BUILD.json in wheel records the MKL build; the copied candidate still has historical OpenBLAS build metadata. All Python code and binary files are byte-identical.",
+    "files": 1221,
+    "native": 25
+  },
+  "status": "installed and validated",
+  "fork_commit": "2e8f747be4bffd5f95966ff299eb8a34c0f985c0",
+  "verified_utc": "2026-11-01T06:01:37.071467+00:00",
   "package_versions": {
     "pyscf": "2.14.0",
     "pyscfad": "0.3.1",
@@ -34,15 +43,20 @@
     "nanobind": "3.0.1"
   },
   "source_sha256": {
-    "pyscfad/mp/dfmp2.py": "2d8ad10c80d05fec2ba1a05dd59a27d2a3b8e6bf2adfc41a1c95e1705fc45cb7",
+    "pyscfad/mp/dfmp2.py": "50e6dd55eb7d39991d18ee2312f09bcbb708eac822578d5039fdf2a64045c885",
     "pyscfad/mp/test/test_dfmp2_native.py": "135b92fa86077b18b82bcb7ea9a5cfa1a9fa64809742f56816b6b727b9261b65",
-    "pyscfadlib/pyscfadlib/__init__.py": "1bddd2c408166f782d88368fa2b5690fa3dafdae53164652219396d9768e3449",
-    "pyscfadlib/pyscfadlib/lib.py": "ac839427be967496c7a78f8b111b774d83d191ab03f1b51cf4233b2db80f5402",
-    "pyscfadlib/pyscfadlib/vjp/CMakeLists.txt": "9c97a3f68f685ef0a53f8126a8583f2b00482bab1195758eeeaf3e6519e50582",
-    "pyscfadlib/pyscfadlib/vjp/mp/mp2_vjp.c": "b543b5b33cde4f0819468b6ec79224cdf37ecf8c472d22688caad669c8dbd8f3",
-    "pyscfad/df/_df_jk_opt.py": "026d84f3bae17b8435602ba879b312317efbe229f3f05a39e8c7b9993b1e8189",
+    "pyscfadlib/pyscfadlib/__init__.py": "1ba42508e4a1cf108d3e155da9a0b4f59369bc8dfb3b5e8f5c8f1594c8fdf6fa",
+    "pyscfadlib/pyscfadlib/lib.py": "143e6b77b9b2d39660365488c87499cf8430cb6e713c4dbf235db80976d7f4e5",
+    "pyscfadlib/pyscfadlib/vjp/CMakeLists.txt": "93cd974dc7de511bcef66e1a13808d57c5df0f34355c4a00f82240468b0f6a3e",
+    "pyscfadlib/pyscfadlib/vjp/mp/mp2_vjp.c": "9b9716909b458bc05b7cd47f3d99d6fa7ebcea0211bd885b0dbfcf3ad025cc42",
+    "pyscfad/df/_df_jk_opt.py": "91dfcb7c7dec7264329f5caf2c7d7f3a9308d0dd5840b207efd30e4ff7c2ff4d",
     "pyscfad/df/test/test_df_jk_lowrank.py": "6300a5fe88d3be2f2c26af9aa57af8631021bc8b75cd486b56c41cae249e7de3",
     "pyscfadlib/pyscfadlib/vjp/gto/fill_nr_3c_vjp.c": "1fe42f75e21191478fad5a1f8dee54d226246d92e86a1a02a413f98dacc13e02"
+  },
+  "source_provenance": {
+    "all_578_source_hashes": "build/rebuild-2e8f747/before.json",
+    "archive": "build/rebuild-2e8f747/source-2e8f747.tar",
+    "scientific_source_changed_by_rebuild": false
   },
   "native_sha256": {
     "libao2mo_vjp.so": "e46dcf3a9135bd6720bf076b455cc669fe0b02b6a6b4a6f4cf51b1e6f98a66c0",
@@ -50,117 +64,74 @@
     "libcgto_ad.so": "c007dbeb1e3c1231db98bdda710ab89800c80ccfe7109b1506d81b1bbd83c2ce",
     "libcgto_vjp.so": "eb8f638ee14fd292f2ed89e57ea84870bedb1ae0fffe9443ee485b9f4486ec27",
     "libcvhf_vjp.so": "19dcbab49bbaccc6c75f9b015cf123cb2681db117941b60f2c21ef872dbe4f11",
-    "libmp_vjp.so": "f242762ad86cd1d07edf9f02e00c8434b42038694c57998c277917aa6083cddc",
+    "libmp_vjp.so": "931db376b4d45aaa8e1b5004cb7d705d17357b52317eee493ac4f9bc5632f618",
     "libnp_helper_ad.so": "9c9c5be8d9df680f98243fe05a4911bee6c046c70ddcdedc6ac596c864fae160",
     "libnp_helper_vjp.so": "bb7d224a2103313c8cc1c4ce7cd70f9c53eb6ba605977a85d62f60664611a8e5",
     "libvjp_util.so": "0b5d41f552b7d6c5af3dd6ddb88f79df4ec3e6934193ca17382719f5f784dd16",
-    "pyscfad_lapack.cpython-311-x86_64-linux-gnu.so": "76c5d80980b7182f24901f74685a1830afa4f8c9cd508ec1bb8009630bf79600",
-    "thirdparty/lib/libcintad.so": "282c2d83c13ef1117be972872670e2c08a70adc51892f876f1ce0b542c463d0c",
-    "thirdparty/lib/libcintad.so.6": "282c2d83c13ef1117be972872670e2c08a70adc51892f876f1ce0b542c463d0c",
-    "thirdparty/lib/libcintad.so.6.1.1": "282c2d83c13ef1117be972872670e2c08a70adc51892f876f1ce0b542c463d0c"
+    "pyscfad_lapack.cpython-311-x86_64-linux-gnu.so": "76c5d80980b7182f24901f74685a1830afa4f8c9cd508ec1bb8009630bf79600"
   },
   "native_library_count": 10,
-  "retained_components_sha256": {
-    "/resnick/groups/sharmagroup/bkhou/src/pyscfad/pyscfad/dlno_stc/_stc_mp2.cpython-311-x86_64-linux-gnu.so": "d763736043de99554f2541eec6053cc1f2cabeaeedba8267cc8ec89c2419a28c",
-    "/resnick/groups/sharmagroup/bkhou/src/pyscfad/pyscfadlib/pyscfadlib/thirdparty/lib/libcintad.so": "282c2d83c13ef1117be972872670e2c08a70adc51892f876f1ce0b542c463d0c"
-  },
-  "pyscf_wheel": {
-    "wheel": "/resnick/groups/sharmagroup/bkhou/src/pyscfad/benchmarks/pyscfad_mkl/wheels/pyscf-2.14.0-2caltechmklseq-py3-none-linux_x86_64.whl",
-    "wheel_sha256": "52ad6a68ffdcb49177c63bb66cc0e0bcefa4249cc432c1c62aa61aa1482c4a59",
-    "runtime_files_match_candidate": true,
-    "metadata_difference": "HPC_BUILD.json in wheel records the MKL build; the copied candidate still has historical OpenBLAS build metadata. All Python code and binary files are byte-identical.",
-    "files": 1221,
-    "native": 25
-  },
-  "tested_native_artifact": "/resnick/groups/sharmagroup/bkhou/src/pyscfad/benchmarks/main-parity/final-native/pyscfadlib",
-  "source_changes": [
-    "native eager float64 energy-only DF-MP2 with AD fallbacks",
-    "validated generic low-rank exchange transpose",
-    "in-place Coulomb factor-cotangent accumulation",
-    "optional dynamic three-centre integral VJP schedule; static default retained"
+  "native_mp2_symbols": [
+    "MP2_contract_d_vjp",
+    "MP2_contract_d_energy_vjp"
   ],
-  "benchmark_settings": {
-    "openmp_threads": 16,
-    "mkl_threads": 1,
-    "numpy_blas_threads": 1,
-    "scipy_blas_threads_df": 16,
-    "scipy_blas_threads_other": 1,
-    "scf_df_preconditioner": true,
-    "integral_vjp_schedule": "dynamic",
-    "global_defaults_changed": false
+  "stc": {
+    "path": "/resnick/groups/sharmagroup/bkhou/src/pyscfad/pyscfad/dlno_stc/_stc_mp2.cpython-311-x86_64-linux-gnu.so",
+    "sha256": "3a2c7de8010a9b1383f446d523881894cb44cc03dcc29a13acb0775a1e91d53f",
+    "compiler": "environment GCC/G++ 15.3.0",
+    "build_type": "Release",
+    "compiler_flags": "-march=x86-64-v3 -mtune=generic -O3 -DNDEBUG",
+    "blas": "OpenBLAS 0.3.34",
+    "blas_abi": "LP64",
+    "blas_path": "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/libopenblasp-r0.3.34.so",
+    "triples_version": "stc_triples:asymmetric-only:sha256:header=962b3da2176b7a267fad82179681cde04a0495310f9ec58eae1027aef38c4adb:asymmetric=73b292face29e1c712a06cee5901e48ac3618a03cfb021962d38bfea7f9532b1:sampler=3cb84a2fd873ab706d3b67b9f0f9f3119981d22a9ca291535075dd78072f7a96:dressing=ed94a891ccc42d53224305ad48fa298036af5e155753d10f697fc5755318455a:mp2_gradient=496fea31c8e455f6d6e6d84238d6aff9915607cde3649c3434fbe21f0efcc573:binding-10"
+  },
+  "retained_components_sha256": {
+    "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/lib/libagf2.so": "f57a838ee5b4c79e41c8f55d1e591470206f8cb340df44a19828b2b527737ab4",
+    "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/lib/libao2mo.so": "1f6ea45ee8d33a3215c5611701b1077b30324995e8d3cdaff436d7bb93730eee",
+    "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/lib/libcc.so": "4accf767a95b593f1587c1b018169b5518ac8fe55df0bb3ab15670121460dd91",
+    "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/lib/libccsdt.so": "e671654586ea4387212b692614b1f93da63ec830830379d45e6ce0191b934e06",
+    "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/lib/libcgto.so": "f734fc27583614fc4144d15090f6bbd8ab3df0a2aa4401b83e0b15ba845e2d16",
+    "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/lib/libcvhf.so": "436c9788ea4d99b5ee1b726c95967fe99e09daa873a76b99f72f0a713c583103",
+    "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/lib/libdft.so": "955e6a4e796cc9fff3e12e253c082b27547b524b4b79e98462179d78688262bd",
+    "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/lib/libfci.so": "942801fccc6b74c6627d819b09be0749fab02fbe887b771629eb022e05169fab",
+    "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/lib/libmcscf.so": "bfb1db10bdaf4c5fb4c6717d8d90b2894e51f5c12266e1e9f8a4f850e006ca2b",
+    "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/lib/libmp.so": "8b8a50d2b7be0fd5a62453ba70e6449f45228386cc4aef1290ebd5103d291cd9",
+    "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/lib/libnp_helper.so": "69a505a7139d5e6d6921e0914deaa1035f1b5172ec5eeda54b32ae8c924397df",
+    "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/lib/libopenblas-r0-f650aae0.3.3.so": "79ec02b53f573cd7116a89f04c397473018e7fda05720b354d43505c19d47958",
+    "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/lib/libpbc.so": "8435f3c0de621b8dab76a664b74c46b7cf40b40bdd57799d27cabd6c8866eba0",
+    "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/lib/libpdft.so": "03defa1206392515519f595e3e8568c49b603218efcd814f2756d868f7ad5fcf",
+    "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/lib/libri.so": "3360a83a29e959363173abff19b65a61d6409e283a03d4d6b32dab7c47b28e33",
+    "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/lib/libsolvent.so": "6b5ac2a3e60e71c71f905c9506ddac773ae3ffa2582d0ee7c6915520d2f53bdf",
+    "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/lib/libxc_itrf.so": "f3f5183b167802a32360a863b84e8562834d026721c9d77e64a873261947a978",
+    "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/lib/libxcfun_itrf.so": "a14f306b078e4d9af9c34d5f0861db1f33c496f98caf638bae9d98b8d8f29ea6",
+    "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/lib/deps/lib/libcint.so": "950bb0a297507369dce95b9013ef2c5b64b0fa36a0018c303c98e95efce7db7e",
+    "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/lib/deps/lib/libxc.so": "d120371b37f4729dfc21f3b0575e563ef9b0254839926c41c0c02f5082143548",
+    "/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env/lib/python3.11/site-packages/pyscf/lib/deps/lib64/libxcfun.so": "69a381159a6dc1646a963d23f3376f2770f8d2cb2148cce015c2b9184ec55c5e",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad/pyscfadlib/pyscfadlib/thirdparty/lib/libcintad.so": "282c2d83c13ef1117be972872670e2c08a70adc51892f876f1ce0b542c463d0c",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad/pyscfadlib/pyscfadlib/thirdparty/lib/libcintad.so.6": "282c2d83c13ef1117be972872670e2c08a70adc51892f876f1ce0b542c463d0c",
+    "/resnick/groups/sharmagroup/bkhou/src/pyscfad/pyscfadlib/pyscfadlib/thirdparty/lib/libcintad.so.6.1.1": "282c2d83c13ef1117be972872670e2c08a70adc51892f876f1ce0b542c463d0c"
   },
   "validation": {
-    "native_and_finite_differences_job": "5766283",
-    "coulomb_scf_regressions_job": "5767257",
-    "coulomb_scf_tests_passed": 177,
-    "final_benchmark_and_regressions_job": "5767581",
-    "installed_check": "passed",
-    "final_targeted_tests_passed": 128,
-    "isolated_dlno_tests_passed": 2,
-    "final_job_status": "COMPLETED 0:0",
-    "installed_check_job": "5770098",
-    "installed_check_result": "benchmarks/main-parity/installed-check/results.json",
-    "water_fd_error": 1.3820689037657985e-10,
-    "pip_check": "No broken requirements found."
-  },
-  "known_baseline_failures": [
-    "pyscfad/mp/test/test_mp2.py::test_nuc_grad",
-    "pyscfad/mp/test/test_mp2.py::test_nuc_grad_n2"
-  ],
-  "timing_summary": {
-    "job_id": "5767581",
-    "host": "hpc-53-24.cm.cluster",
-    "affinity": [
-      0,
+    "build_and_serial_tests_job": "5837507",
+    "build_and_linkage": "passed",
+    "native_scf_dfmp2_tests_passed": 67,
+    "stc_tests_passed": 49,
+    "threaded_tests_job": "5837590",
+    "threaded_tests_job_status": "COMPLETED 0:0",
+    "threaded_tests_passed": 18,
+    "openmp_test_threads": [
       1,
-      2,
-      3,
-      4,
-      5,
-      6,
-      7,
-      8,
-      9,
-      10,
-      11,
-      12,
-      13,
-      14,
-      15
+      16
     ],
-    "phase_means_seconds": {
-      "main": {
-        "df_forward": 8.218759870389476,
-        "scf_forward": 51.34603127418086,
-        "mp2_forward": 6.096017211908475,
-        "mp2_pullback": 15.224715138785541,
-        "scf_pullback": 56.98752082651481,
-        "df_pullback": 14.436030643060803,
-        "total": 152.60084965708666,
-        "scf_forward_including_df": 59.564791144570336,
-        "mp2_forward_and_reverse": 21.320732350694016,
-        "scf_reverse_including_df": 71.42355146957561
-      },
-      "fork": {
-        "df_forward": 8.242615348892286,
-        "scf_forward": 52.67727372655645,
-        "mp2_forward": 18.271074818680063,
-        "mp2_pullback": 3.577601634664461,
-        "scf_pullback": 54.706491130404174,
-        "df_pullback": 18.60801631794311,
-        "total": 156.34558550151996,
-        "scf_forward_including_df": 60.91988907544874,
-        "mp2_forward_and_reverse": 21.848676453344524,
-        "scf_reverse_including_df": 73.31450744834729
-      }
-    },
-    "fork_over_main": 1.0245394167388202,
-    "max_paired_gradient_error": 6.197597990365011e-12,
-    "energy_spread": 1.5916157281026244e-12,
-    "fork_minus_main_seconds": 3.7447358444333076
+    "host": "hpc-35-25",
+    "pip_check": "No broken requirements found.",
+    "package_versions_unchanged": true,
+    "initial_batch_status": "FAILED 2:0 only at final pytest collection; both builds, linkage, 67 native/SCF/MP2 and 49 STC tests passed before this.",
+    "collection_fix": "Standalone mixed native/DF pytest invocation now uses --import-mode=append; reproduced collection error at one thread, then reran all 18 remaining checks successfully on 16 cores.",
+    "logs": "build/rebuild-2e8f747"
   },
-  "rollback_directory": "/resnick/groups/sharmagroup/bkhou/src/pyscfad/benchmarks/main-parity/rollback",
-  "pyscf_rollback_wheel": "/resnick/groups/sharmagroup/bkhou/src/pyscfad/benchmarks/pyscfad_mkl/rollback/pyscf-2.14.0-1rollbackmkl-py3-none-linux_x86_64.whl",
-  "activated_utc": "2026-10-31T03:14:54.174908+00:00",
-  "verified_utc": "2026-10-31T03:16:38.144743+00:00"
+  "previous_build_record": "build/rebuild-2e8f747/rollback/NATIVE_BUILD.json",
+  "rollback_directory": "/resnick/groups/sharmagroup/bkhou/src/pyscfad/build/rebuild-2e8f747/rollback",
+  "performance": "No new dCMP/water runtime benchmark was run for this revision. Historical timing data are in the previous build record and benchmarks/main-parity/RESULTS.md."
 }

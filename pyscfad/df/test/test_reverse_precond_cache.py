@@ -91,3 +91,25 @@ def test_no_available_df_memory_streams_despite_positive_cache_budget(problem, m
         _assert_hessian_result(coulomb, gaps, hessian, rhs)
         assert len(reads) > previous_reads
         previous_reads = len(reads)
+
+
+@pytest.mark.parametrize('remaining_mb, expect_cached', [
+    (0.00216, True),   # 864-byte factors occupy 40% of remaining memory.
+    (0.00144, False),  # The same factors occupy 60% and must stream.
+])
+def test_cache_uses_at_most_half_remaining_memory(problem, monkeypatch,
+                                                 remaining_mb, expect_cached):
+    monkeypatch.setenv('PYSCFAD_PRECOND_CACHE_MEMORY_MB', '1')
+    dfobj, occupied, virtual, gaps, hessian, vectors, reads = problem
+    # Control the process-memory measurement, while exercising the real DF
+    # transform, cache/streaming paths and independent Hessian reference.
+    monkeypatch.setattr(_df_jk_opt.lib, 'current_memory', lambda: (0., 0.))
+    dfobj.max_memory = remaining_mb
+    coulomb = _df_jk_opt.gen_coulomb_precond(dfobj, occupied, virtual, gaps)
+    setup_reads = len(reads)
+    for rhs in vectors:
+        _assert_hessian_result(coulomb, gaps, hessian, rhs)
+    if expect_cached:
+        assert len(reads) == setup_reads
+    else:
+        assert len(reads) > setup_reads

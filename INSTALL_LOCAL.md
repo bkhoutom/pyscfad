@@ -3,15 +3,26 @@
 Source: `/resnick/groups/sharmagroup/bkhou/src/pyscfad`, branch `dlno-stc`.
 Environment: `/resnick/groups/sharmagroup/bkhou/envs/pyscfad_env`.
 
+The `benchmarks/` and `build/` directories are local artifacts ignored by Git.
+Paths to wheels, results, logs and rollback copies below refer to this
+installation; those files are not included in a fresh clone.
+
+Latest validated rebuild: `dlno-stc` revision `2e8f747`, 2026-10-31.
+Passed 67 native/SCF/DF-MP2 tests, 49 STC tests, and 18 checks at 16 OpenMP
+threads. See the [rebuild record](build/rebuild-2e8f747/RESULTS.md) for logs,
+the resolved pytest collection issue, binary hashes and rollback copies.
+No new runtime benchmark was performed for this revision.
+
 PySCF 2.14.0 and the ten PySCFAD support libraries use Intel oneMKL 2024.2.2,
 LP64, sequential BLAS/LAPACK, with GNU OpenMP in the surrounding native loops.
 The build uses GCC 11.5, Release, `-march=x86-64-v3 -mtune=generic` and embedded
 runtime paths. Do not load another MKL/OpenMP module or override `LD_LIBRARY_PATH`.
 
-NumPy and SciPy retain their separate bundled OpenBLAS libraries. JAX CPU LAPACK
-uses SciPy bindings. Native MKL linkage does not replace those libraries.
-The custom STC/Armadillo extension retains its existing OpenBLAS 0.3.34 linkage;
-the patched libcintad 6.1.1 and custom STC/DLNO functionality are preserved.
+NumPy and SciPy retain their separate bundled OpenBLAS libraries. Ordinary JAX
+CPU LAPACK uses SciPy bindings; the custom generalized SCF eigensolver uses
+native MKL. Native MKL linkage does not replace the NumPy/SciPy libraries.
+The custom STC/Armadillo extension is built separately using the environment's
+GCC 15.3 and LP64 OpenBLAS 0.3.34. The patched libcintad 6.1.1 is retained.
 
 ## Rebuild and verify
 
@@ -22,17 +33,28 @@ cd /resnick/groups/sharmagroup/bkhou/src/pyscfad
 sbatch submit.sh
 ```
 
-The short script uses `build/pyscfadlib-mkl`, retains libcintad with
-`BUILD_LIBCINT=OFF`, rebuilds ten support libraries, checks normal editable
-imports and MKL linkage, then runs native and SCF-gradient tests. It does not
-reinstall PySCF or change Python dependencies. Old OpenBLAS/FlexiBLAS build
-caches are historical and do not describe the installed libraries.
+The script uses `build/pyscfadlib-mkl`, retains libcintad with
+`BUILD_LIBCINT=OFF`, and rebuilds ten support libraries. It also rebuilds the
+STC extension in `build/dlno-stc-openblas` with explicit environment Armadillo
+and runtime paths. It checks normal editable imports, native symbols and
+linkage, then runs SCF/DF-MP2 gradients, STC tests, and selected native tests
+at 16 OpenMP threads. It does not reinstall PySCF or change Python dependencies.
+The older `build/pyscfadlib` and `build/dlno_stc` caches are historical.
+
+After a pull, Python changes are immediately visible through the editable
+installation, but changed C/C++ sources and CMake targets require rebuilding.
+For example, revision `2e8f747` requires `MP2_contract_d_energy_vjp` and the
+STC asymmetric-only triples interface. Old libraries can import successfully
+while disabling the native MP2 path or exposing an obsolete STC interface.
+Use fresh generated caches when changing compilers, BLAS, Python/JAX headers,
+or link flags. Record revisions and hashes outside the submission script.
 
 The validated PySCF MKL wheel for this exact environment is
 `benchmarks/pyscfad_mkl/wheels/pyscf-2.14.0-2caltechmklseq-py3-none-linux_x86_64.whl`.
 Its rebuild inputs and metadata are in `benchmarks/pyscfad_mkl/`.
 `verify_native.py` checks actual imported paths, ten support libraries, core
-PySCF libraries, LP64 MKL 2024.2.2, one MKL thread, and retained libcintad hash.
+PySCF libraries, LP64 MKL 2024.2.2, one MKL thread, retained libcintad hash,
+both native MP2 symbols, and STC's current interface and LP64 OpenBLAS linkage.
 
 ## Calculation settings
 

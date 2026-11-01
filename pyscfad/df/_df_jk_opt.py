@@ -914,8 +914,10 @@ def gen_coulomb_precond(dfobj, orbo, orbv, e_ai):
     """Generate the Coulomb part of the RHF orbital Hessian inverse.
 
     The result obeys ``(e + 4 B.T @ B)^-1 s = (s - coul(s)) / e``.
-    Scaled occupied-virtual factors are retained only when they fit the
-    PYSCFAD_PRECOND_CACHE_MEMORY_MB budget; otherwise applications stream DF.
+    Scaled occupied-virtual factors are retained only when they fit both the
+    PYSCFAD_PRECOND_CACHE_MEMORY_MB budget and half the remaining DF memory
+    budget; otherwise applications stream DF. Only the actual tensor is
+    allocated, not the full allowance.
     """
     from scipy.linalg import cho_factor, cho_solve
     from pyscf.ao2mo import _ao2mo
@@ -932,7 +934,7 @@ def gen_coulomb_precond(dfobj, orbo, orbv, e_ai):
     except ValueError:
         budget_mb = 1024.
     max_memory = dfobj.max_memory - lib.current_memory()[0]
-    cache_limit = min(budget_mb * 1024**2, .3 * max(max_memory, 0) * 1e6)
+    cache_limit = min(budget_mb * 1024**2, .5 * max(max_memory, 0) * 1e6)
     cache_bytes = naux * nvir * nocc * numpy.dtype(numpy.float64).itemsize
     use_cache = cache_bytes > 0 and cache_bytes <= cache_limit
     cached = numpy.empty((naux, nvir, nocc)) if use_cache else None

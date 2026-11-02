@@ -496,3 +496,158 @@ their gradients; production energy and derivative estimates share samples.
 CC selections use schema 6; rebuild saved selections/checkpoints after changing
 from earlier implementations. Native energy/VJP entry points are
 `triples_asymmetric_energy` and `triples_asymmetric_energy_vjp`.
+
+## Optional STC CCSD amplitudes
+
+`ccsd.kernel` and `ccsd.value_and_grad` accept `cc_solver="stc"` and
+`stc_cc_controls`. Their default remains `cc_solver="deterministic"`; importing
+or running that default does not require the external STC CCSD packages.
+Install the separate `stc_cc` package from its source repository and
+`stc-cc-jax[cc]` into the same environment as PySCFAD. For editable checkouts:
+
+```bash
+python -m pip install -e /path/to/stc_qc_paper
+python -m pip install -e '/path/to/stc-cc-jax[cc]'
+```
+
+The latter builds its optional CPU native sampler during installation; the
+external package also supports its JAX fallback. See the external packages'
+installation instructions for their compiler/runtime requirements. Nothing is
+compiled or installed when a DLNO calculation imports the adapter.
+
+With an existing CC selection `cc_static` and converged density-fitted `mf`:
+
+```python
+from pyscfad.dlno_stc import ccsd
+
+energy, components = ccsd.kernel(
+    mf, cc_static, cc_solver="stc", return_components=True,
+    baseline_controls={"mode": "deterministic"},
+    matrix_controls={"mode": "deterministic"},
+    stc_cc_controls={
+        "energy_tolerance_mEh": 0.1,  # final molecular sampling standard error
+        "target_error_mEh": 0.4,      # optional local update-noise setting
+        "max_cycle": 50,
+        "average": 10,
+        "seed": 7,
+        "localize": True,
+        "grad_max_cycle": 50,
+        "grad_average": 10,
+    },
+)
+```
+
+The same solver arguments apply to `ccsd.value_and_grad`. Reuse the exact
+baseline/matrix controls used for the saved selection, including any fitted
+Laplace grid. With the molecular precision controller, these stages and any
+triples contractions must be deterministic; unsupported stochastic combinations
+are rejected. Without it, the existing independent stage controls remain
+available.
+
+The primary precision input is **`energy_tolerance_mEh`**, a requested sampling
+standard error for the final sum of projected corrections. For example, `0.1`
+means 0.1 mEh, not 0.1 Eh. `components.stc_standard_error` and
+`components.stc_target_standard_error` report Eh; multiply by 1000 for mEh.
+`components.stc_target_met` states whether the observed combined SE meets its
+target. This is an empirical SE, not an upper bound on the energy error.
+
+| Input | Units | Meaning |
+|---|---|---|
+| `energy_tolerance_mEh` | mEh | Final molecular sampling SE, with allocation across selected LIS |
+| `target_error_mEh` | mEh | Advanced local per-update noise target |
+| `error_tol_mEh` | mEh | Optional upstream local mean-energy stopping SE |
+| `grad_target_error_mEh` | mEh | Adjoint sampling allocation proxy; not a force tolerance |
+
+Legacy `target_error`, `error_tol`, and `grad_target_error` retain **Eh** units;
+explicit `*_mEh` inputs are converted once. Supplying both forms of a setting
+is an error. Normalized controls store Eh internally, including
+`energy_tolerance`. The default fixed-budget, single-solve STC path is preserved
+when no molecular tolerance is supplied.
+
+For N selected physical LIS fragments, the controller assigns each a variance
+budget `tau_f**2 = tau_total**2 / N`. It evaluates independent complete-solve
+pilot replicas of the actual projected correction `E_CCSD + E_T - E_MP2_LIS`.
+The pilot sample variance determines a fixed independent production count
+`ceil(pilot_variance / tau_f**2)`, subject to the configured minimum and maximum.
+Pilots are excluded from the returned estimate. The production correction is
+the **mean of replica energies**, each evaluated at that replica's averaged
+CC amplitudes; it is not the energy of amplitudes averaged across replicas.
+The production sample variance divided by its count estimates each LIS mean
+variance. Independent fragment streams permit summing these variances, then
+taking the square root for the molecular SE. When only a subset is selected,
+the target covers that selected correction sum.
+
+Controls `precision_pilot_replicas=4`, `precision_min_replicas=4`, and
+`precision_max_replicas=32` bound the work. This initial empirical controller
+therefore costs at least eight solves per LIS. It consumes production VJPs
+sequentially and averages cotangents, preserving the existing physical
+projector/domain/SCF pullback. Discrete pilot allocation is held fixed in
+response. Pilot and production streams are independent; MPI ownership does
+not change their fragment seeds. A preflight checks every eligible replica's
+actual 32-bit forward and adjoint seed within each stream family. If it finds a
+collision, choose a different root seed or reduce the replica cap as indicated
+by the error; colliding streams are not silently included in the variance sum.
+
+Per-fragment `ccsd_diagnostics["precision"]` retains pilot and production
+energies, seeds, budgets, counts, the full component covariance, observed SE,
+and cap/target status. CCSD/triples covariance is included because deterministic
+triples still depend on stochastic amplitudes. A cap or missed empirical
+target issues a warning; no successful accuracy claim is made silently.
+Finite pilot uncertainty and finite-iteration/nonlinear/domain/quadrature bias
+are outside this sampling SE. A molecular energy target does not control force
+variance.
+
+The adapter uses the already prepared retained LIS factors and Fock matrix.
+`localize=True` chooses a private PySCF Boys frame within its occupied and
+virtual spans; `False` keeps their supplied frame. This private gauge is fixed
+in reverse mode. Tensor transformations, physical domain/LIS preparation,
+projector response and SCF response remain differentiable. Semicanonical
+Fock denominators are constructed in the private frame. The external adjoint
+acts on differentiable **averaged amplitudes**, which are backrotated before
+the ordinary projected fragment energy and triples are evaluated. The
+external total-energy-only orbital cotangent filter is not applied. Stable
+physical fragment IDs receive distinct reproducible sampling streams;
+changing MPI ownership does not change the intended fragment seed.
+
+Supported local controls include `target_error` (or `target_error_mEh`), optional `error_tol` (or `error_tol_mEh`), `max_cycle`,
+`average`, `seed`, `localize`; `diis_space` (`None` disables it, otherwise at
+least two), `diis_shift`, `init_damp`; `gamma`, `batch_size`, `tail_batch_size`,
+`nrun`, `init_nsamples`, `std_tol`, `max_nsamples_var`, `min_nsamples`;
+`sampled_terms`, `share_tables`, `iid_root`, `unroll`, `flat`, `sampler`,
+`block_size`, `block_min_entries`, `block_store_P`; and `grad_max_cycle`,
+`grad_average`, `grad_target_error`, `grad_seed`, `vjp_nsamples`. Unknown or
+invalid controls fail before solving. Variance pilots require `nrun >= 2` and
+`init_nsamples >= 2`. `average=0` selects the last iterate.
+
+`target_error`, `error_tol` and `grad_target_error` use Hartree. With
+`error_tol=None`, the solver completes a fixed iteration budget; its upstream
+`converged=True` means that budget completed and **does not certify CC residual
+convergence**. With `error_tol`, the upstream flag means its total-local
+mean-energy standard-error stopping rule was satisfied. The returned
+`termination_mode` and `convergence_note` make this distinction explicit.
+Neither setting guarantees the accuracy of a projected fragment or a force.
+
+In the single-solve mode, each fragment's `ccsd_diagnostics` records controls,
+effective seeds and projected iterate energies. Molecular precision mode
+records its independent-replica estimator and nested precision diagnostics. `nsamples_forward_production` counts only forward
+production draws; it excludes variance pilots and adjoint draws and is not a
+total-cost metric. `projected_mean_iterate_energy` is the
+mean of observed projected energies in the external solver's averaging
+window; `projected_energy_at_mean_amplitudes` is the physical projected energy
+at the returned mean amplitudes. Their difference reflects nonlinear
+averaging. `projected_mean_iterate_stderr_iid` is only an observed IID-iterate
+estimate: it ignores autocorrelation and burn-in bias. The external
+`local_mean_iterate_stderr` refers to the total active-space functional,
+not the projected fragment. Use independent seeds and deterministic
+references to assess finite-iteration/sampling error; these diagnostics are
+not force-error bounds. The upstream external adjoint currently fails for an
+exactly zero amplitude cotangent (its residual normalization divides by zero);
+objectives whose amplitude response is identically zero should avoid calling
+that external backward path until it is fixed upstream.
+
+Serial checkpoints include the backend and normalized controls. STC
+checkpoints additionally fingerprint installed external package versions,
+Python sources and native binaries, including editable source changes and
+the native extension selected at runtime. Changed implementation identity
+rejects resume. Existing deterministic checkpoint payloads are unchanged;
+serial progress checkpoints remain unavailable for multi-rank execution.

@@ -12,7 +12,7 @@ from pyscfad.tools import resource_profile
 from pyscfad import numpy as np
 from pyscfad.lno.ccsd import _impurity_solve_core
 
-from . import backend, driver
+from . import backend, driver, _stc_precision
 from ._memory import memory_calculation
 from ._selection import (DomainSelections, _physical_groups, _strong_preparation_key,
                          build_domain_groups)
@@ -65,6 +65,8 @@ class FragmentComponents:
     triples_samples: int = 0
     triples_timings: dict | None = None
     triples_diagnostics: dict | None = None
+    ccsd_method: str = 'deterministic'
+    ccsd_diagnostics: dict | None = None
 
     @property
     def e_ccsd_t(self):
@@ -104,6 +106,41 @@ class CCSDComponents:
     def triples_standard_error(self):
         """Energy SE for independently sampled LIS triples, excluding D error."""
         return sum(f.triples_standard_error**2 for f in self.fragments)**.5
+
+
+    @property
+    def stc_standard_error(self):
+        """Empirical SE of independent final projected replica means, or None."""
+        statistics = [(f.ccsd_diagnostics or {}).get('precision') for f in self.fragments]
+        if not statistics or any(item is None for item in statistics):
+            return None
+        return sum(item['standard_error']**2 for item in statistics)**.5
+
+    @property
+    def stc_target_standard_error(self):
+        """Requested SE over selected physical fragments, in Hartree, or None."""
+        statistics = [(f.ccsd_diagnostics or {}).get('precision') for f in self.fragments]
+        if not statistics or any(item is None for item in statistics):
+            return None
+        return sum(item['fragment_target_standard_error']**2 for item in statistics)**.5
+
+    @property
+    def stc_target_met(self):
+        """Whether the empirical global SE meets its target; no bias guarantee."""
+        error, target = self.stc_standard_error, self.stc_target_standard_error
+        return None if error is None else error <= target
+
+
+def _cc_solver_options(cc_solver, stc_cc_controls):
+    """Validate the optional backend without importing external STC packages."""
+    if cc_solver not in ('deterministic', 'stc'):
+        raise ValueError("cc_solver must be 'deterministic' or 'stc'")
+    if cc_solver == 'deterministic':
+        if stc_cc_controls is not None:
+            raise ValueError("stc_cc_controls requires cc_solver='stc'")
+        return {}
+    from .stc_ccsd import normalize_controls
+    return dict(cc_solver='stc', stc_cc_controls=normalize_controls(stc_cc_controls))
 
 
 def _normalize_controls(baseline_controls, matrix_controls, matrix_kind):
@@ -350,7 +387,7 @@ def _triples_fragment_seed(global_seed, fragment_index):
 
 def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
                     verbose_imp, ccsd_t, triples_controls=None, with_grad=False,
-                    vvvv_direct=False):
+                    vvvv_direct=False, cc_solver='deterministic', stc_cc_controls=None):
     """Return MP2-LIS, CCSD and triples; stochastic calls also return diagnostics."""
     from .lis import build_fragment_lis
     representative = group.representative_index
@@ -362,11 +399,15 @@ def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
     if not lis.active_occupied_coeff.shape[1] or not lis.active_virtual_coeff.shape[1]:
         zero = np.zeros((), dtype=common.s1e.dtype)
         values = (zero, zero, zero)
-        return (values, {}) if stochastic or (ccsd_t and static.lis_static.smooth_frames is not None) else values
+        return ((values, {}) if cc_solver == 'stc' or stochastic or
+                (ccsd_t and static.lis_static.smooth_frames is not None) else values)
     metadata = {'fragment_index': int(fragment_index),
                 'extended_primary_domain': numpy.asarray(
                     static.mp2_static.fragments[representative].extended_atoms, dtype=numpy.int32)}
     options = {}
+    if cc_solver == 'stc':
+        from .stc_ccsd import make_solver
+        options['amplitude_solver'] = make_solver(stc_cc_controls, fragment_index=fragment_index)
     if static.lis_static.smooth_frames is not None:
         from .smooth import noncanonical_mp2
         from .smooth_triples import make_solver
@@ -389,7 +430,8 @@ def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
 
 def _run_group(state, static, group, baseline_controls, matrix_controls, *,
                with_grad, verbose_imp, ccsd_t, triples_controls=None,
-               include_baseline=True, fragment_indices=None, vvvv_direct=False):
+               include_baseline=True, fragment_indices=None, vvvv_direct=False,
+               cc_solver='deterministic', stc_cc_controls=None):
     """Complete one owned group's preparation, baseline and physical-fragment responses.
 
     All process-local VJPs and matrix replay records are consumed here. Only
@@ -423,26 +465,54 @@ def _run_group(state, static, group, baseline_controls, matrix_controls, *,
                 matrix_controls, matrix_kind=static.matrix_kind)
         matrices = {name: np.asarray(forward[name]) for name in ('occupied', 'virtual')}
         local_triples = _fragment_triples_controls(triples_controls, index)
-        def correction(mf, common, blocks):
-            values = _solve_fragment(mf, common, static, index, blocks, group,
-                                     verbose_imp=verbose_imp, ccsd_t=ccsd_t,
-                                     triples_controls=local_triples, with_grad=with_grad,
-                                     vvvv_direct=vvvv_direct)
-            if ccsd_t and (getattr(getattr(static, 'lis_static', None), 'smooth_frames', None) is not None or
-                          triples_controls is not None and triples_controls['mode'] == 'stochastic'):
-                values, diagnostics = values
-            else:
-                diagnostics = {}
-            emp2, ecc, et = values
-            return ecc + et - emp2, (values, diagnostics)
-        if with_grad:
+        pilot_mf = None
+        def evaluate(configuration, need_grad):
+            nonlocal pilot_mf
+            solver_options = (dict(cc_solver=cc_solver, stc_cc_controls=configuration)
+                              if cc_solver == 'stc' else {})
+            def correction(mf, common, blocks):
+                values = _solve_fragment(mf, common, static, index, blocks, group,
+                                         verbose_imp=verbose_imp, ccsd_t=ccsd_t,
+                                         triples_controls=local_triples, with_grad=need_grad,
+                                         vvvv_direct=vvvv_direct, **solver_options)
+                if cc_solver == 'stc' or (ccsd_t and (
+                        getattr(getattr(static, 'lis_static', None), 'smooth_frames', None) is not None or
+                        triples_controls is not None and triples_controls['mode'] == 'stochastic')):
+                    values, diagnostics = values
+                else:
+                    diagnostics = {}
+                emp2, ecc, et = values
+                return ecc + et - emp2, (values, diagnostics)
+            if not need_grad:
+                reference = state['mf']
+                if with_grad:
+                    # Plain forward pilots populate local-DF caches. Keep those
+                    # mutations off the live MF whose response trees are saved.
+                    if pilot_mf is None:
+                        pilot_mf = jax.tree.map(lambda value: value, reference)
+                        df = getattr(pilot_mf, 'with_df', None)
+                        cache = getattr(df, '_lno_local_df_cache', None)
+                        if cache is not None:
+                            df._lno_local_df_cache = dict(cache)
+                    reference = pilot_mf
+                energy, auxiliary = correction(reference, state['common'], matrices)
+                return energy, auxiliary, None
             with resource_profile.section('stc.cc.correction_forward', frag=index+1):
-                energy, correction_pullback, auxiliary = jax.vjp(
+                energy, pullback, auxiliary = jax.vjp(
                     correction, state['mf'], state['common'], matrices, has_aux=True)
                 jax.block_until_ready((energy, auxiliary))
             with resource_profile.section('stc.cc.correction_pullback', frag=index+1):
-                mf_bar, common_bar, matrix_bars = correction_pullback(np.ones_like(energy))
-                jax.block_until_ready((mf_bar, common_bar, matrix_bars))
+                bars = pullback(np.ones_like(energy))
+                jax.block_until_ready(bars)
+            return energy, auxiliary, bars
+        if cc_solver == 'stc' and _stc_precision.enabled(stc_cc_controls):
+            nfragments = len(_fragment_indices(static, fragment_indices))
+            energy, auxiliary, correction_bars = _stc_precision.run_replicas(
+                evaluate, stc_cc_controls, index, nfragments, with_grad=with_grad)
+        else:
+            energy, auxiliary, correction_bars = evaluate(stc_cc_controls, with_grad)
+        if with_grad:
+            mf_bar, common_bar, matrix_bars = correction_bars
             direct_norm = _bar_norm(mf_bar, common_bar)
             driver._add_bars(state, mf_bar, common_bar)
             with resource_profile.section('stc.cc.matrix_pullback', frag=index+1):
@@ -456,15 +526,15 @@ def _run_group(state, static, group, baseline_controls, matrix_controls, *,
             else:
                 for name in inputs:
                     input_bars[name] += bars[name]
-            del correction_pullback, mf_bar, common_bar, matrix_bars, bars
+            del correction_bars, mf_bar, common_bar, matrix_bars, bars
         else:
             direct_norm = None
-            energy, auxiliary = correction(state['mf'], state['common'], matrices)
         values, diagnostics = auxiliary
         def diagnostic_value(value):
             value = numpy.asarray(value)
             return value.item() if value.ndim == 0 else value.tolist()
         diagnostics = jax.tree_util.tree_map(diagnostic_value, diagnostics)
+        cc_diagnostics = diagnostics.pop('ccsd', None)
         if local_triples is not None:
             diagnostics.update({key: local_triples[key] for key in (
                 'target_standard_error', 'fragment_variance_fraction',
@@ -485,8 +555,10 @@ def _run_group(state, static, group, baseline_controls, matrix_controls, *,
                                            triples_samples=int(diagnostics.get('samples', 0)),
                                            triples_timings={key: value for key, value in diagnostics.items()
                                                             if key.endswith('_seconds')} or None,
-                                           triples_diagnostics=diagnostics or None))
-        del forward, matrices, correction, energy, values, auxiliary, diagnostics
+                                           triples_diagnostics=diagnostics or None,
+                                           ccsd_method=cc_solver,
+                                           ccsd_diagnostics=cc_diagnostics))
+        del forward, matrices, evaluate, pilot_mf, energy, values, auxiliary, diagnostics
         gc.collect()
     if input_bars is not None:
         with resource_profile.section('stc.cc.input_pullback'):
@@ -516,7 +588,8 @@ def _run_weak(state, static, *, with_grad, pairs=None):
 def _run_serial(state, static, baseline, matrix, *, with_grad, include_hf,
                 merge_identical, verbose_imp, ccsd_t, return_components,
                 triples_controls=None, fragment_indices=None, include_baseline=True,
-                checkpoint_dir=None, resume=False, vvvv_direct=False):
+                checkpoint_dir=None, resume=False, vvvv_direct=False,
+                cc_solver='deterministic', stc_cc_controls=None):
     from ._ccsd_checkpoint import open_checkpoint, restore_progress, save_progress
     groups = build_domain_groups(static.mp2_static, merge_identical=merge_identical)
     allocated = allocate_domain_controls(baseline, len(groups))
@@ -524,6 +597,9 @@ def _run_serial(state, static, baseline, matrix, *, with_grad, include_hf,
                    triples_controls=triples_controls, vvvv_direct=vvvv_direct,
                    include_baseline=include_baseline, fragment_indices=fragment_indices,
                    merge_identical=merge_identical)
+    solver_options = (dict(cc_solver=cc_solver, stc_cc_controls=stc_cc_controls)
+                      if cc_solver == 'stc' else {})
+    options.update(solver_options)
     checkpoint = open_checkpoint(state, static, groups, checkpoint_dir=checkpoint_dir,
                                   resume=resume, options=options)
     try:
@@ -539,7 +615,8 @@ def _run_serial(state, static, baseline, matrix, *, with_grad, include_hf,
                     state, static, group, allocated, matrix, with_grad=with_grad,
                     verbose_imp=verbose_imp, ccsd_t=ccsd_t,
                     triples_controls=triples_controls, vvvv_direct=vvvv_direct,
-                    include_baseline=include_baseline, fragment_indices=fragment_indices))
+                    include_baseline=include_baseline, fragment_indices=fragment_indices,
+                    **solver_options))
             save_progress(checkpoint, state, records, position + 1, False, with_grad=with_grad)
             gc.collect()
         if not weak_done:
@@ -557,6 +634,11 @@ def _finish(state, static, records, *, with_grad, include_hf, return_components)
     components = CCSDComponents(state.get('baseline_energy', 0.), state.get('weak_energy', 0.),
                                 tuple(sorted(records, key=lambda item: item.fragment_index)),
                                 static.matrix_kind, state['variance'] ** .5)
+    if components.stc_standard_error is not None:
+        driver.lib.logger.info(state['mf'],
+            'STC final selected-correction empirical SE %.6g mEh; target %.6g mEh; met %s',
+            components.stc_standard_error * 1000., components.stc_target_standard_error * 1000.,
+            components.stc_target_met)
     result = driver._finish(
         state, with_grad=with_grad, include_hf=include_hf,
         uncertainty_label='MP2 baseline standard error')
@@ -583,6 +665,7 @@ def _run(initializer, worker_initializer, comm, *, checkpoint_dir, resume,
     state, static, baseline, matrix = initializer()
     options['fragment_indices'] = state.pop('cc_fragment_indices')
     options['triples_controls'] = state.pop('cc_triples_controls')
+    options.update(state.pop('cc_solver_options', {}))
     return _run_serial(state, static, baseline, matrix,
                        checkpoint_dir=checkpoint_dir, resume=resume, **options)
 
@@ -592,7 +675,8 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
            ccsd_t=False, triples_controls=None, verbose_imp=0, include_hf=False,
            return_components=False,
            merge_identical=True, comm=None, fragment_indices=None, include_baseline=True,
-           checkpoint_dir=None, resume=False, parallel_scf_jk=True, vvvv_direct=False):
+           checkpoint_dir=None, resume=False, parallel_scf_jk=True, vvvv_direct=False,
+           cc_solver='deterministic', stc_cc_controls=None):
     """Return correlation energy, or total energy with ``include_hf=True``.
 
     ``return_components=True`` returns ``(energy, CCSDComponents)``. The MP2
@@ -615,19 +699,38 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
     Each rank must supply a matching MF skeleton; preceding SCF is caller-owned.
     ``parallel_scf_jk=False`` retains root-only shared work. Serial and
     single-rank calls keep their existing behavior.
+
+    ``cc_solver='stc'`` selects the experimental external ``stc_cc_jax``
+    amplitude solver; ``stc_cc_controls`` contains its sampling/localization
+    settings (unsuffixed energy fields: Hartree; explicit ``*_mEh`` aliases:
+    millihartree). All other stages retain their independent controls. The adapter returns differentiable averaged amplitudes in the
+    original LIS basis. Fragment CC diagnostics are separate from triples and
+    baseline uncertainty. The default does not import the optional dependency.
+    ``stc_cc_controls['energy_tolerance_mEh']`` enables independent complete-solve
+    replicas, allocating equal variance across the globally selected physical LIS.
+    Independent pilots choose a fixed production count per LIS. Returned energies
+    and response cotangents are production means; ``components.stc_standard_error``
+    is their empirical combined SE. Baseline, matrices and triples contractions
+    must be deterministic. This SE excludes iteration/approximation bias and does
+    not bound forces; cap/unmet-target diagnostics remain explicit.
     """
     def initialize():
+        solver_options = _cc_solver_options(cc_solver, stc_cc_controls)
         triples = normalize_triples_controls(triples_controls, ccsd_t=ccsd_t)
         if include_hf and not include_baseline:
             raise ValueError('include_hf requires include_baseline=True')
         baseline, matrix = _validate_run(static, baseline_controls, matrix_controls, matrix_kind)
         indices = _fragment_indices(static, fragment_indices)
+        _stc_precision.validate_stages(solver_options.get('stc_cc_controls'), baseline, matrix, triples)
+        _stc_precision.validate_seed_independence(solver_options.get('stc_cc_controls'), indices)
         triples = _allocate_triples_controls(triples, len(indices), static=static, indices=indices)
         if any(isinstance(x, jax.core.Tracer) for x in jax.tree_util.tree_leaves(mf)):
             raise TypeError('STC CC kernel is forward-only; use value_and_grad')
         state = driver._initialize(mf, static.mp2_static, baseline, with_grad=False)
         state['cc_fragment_indices'] = indices
         state['cc_triples_controls'] = triples
+        if solver_options:
+            state['cc_solver_options'] = solver_options
         return state, static, baseline, matrix
 
     def initialize_worker(canonical):
@@ -653,7 +756,8 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
                    verbose_imp=0, include_hf=False,
                    return_components=False, merge_identical=True, comm=None, build_static=None,
                    fragment_indices=None, include_baseline=True, checkpoint_dir=None, resume=False,
-                   parallel_scf_jk=True, vvvv_direct=False):
+                   parallel_scf_jk=True, vvvv_direct=False,
+                   cc_solver='deterministic', stc_cc_controls=None):
     """Return ``(energy, mol_bar)``; ``mol_bar.coords`` is a nuclear gradient.
 
     Include HF once with ``include_hf=True``. Append ``CCSDComponents`` with
@@ -673,19 +777,30 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
     opt-in resident DF buffer and BLAS-controller scopes as the MP2 driver;
     the complete SCF pullback must reach its DF producer. See
     README_SERIAL_DF_SCF.md for activation and prebuilt-factor ownership.
+
+    ``cc_solver`` and ``stc_cc_controls`` match :func:`kernel`. STC response
+    uses its stochastic Lambda solve at the averaged amplitudes; energy-error
+    controls do not bound nuclear-gradient errors. Physical domain/LIS response
+    remains active, including the original fragment projector.
     """
     def initialize():
+        solver_options = _cc_solver_options(cc_solver, stc_cc_controls)
         triples = normalize_triples_controls(triples_controls, ccsd_t=ccsd_t)
         driver._coordinate_only(mol)
         if include_hf and not include_baseline:
             raise ValueError('include_hf requires include_baseline=True')
+        prechecked_indices = None
         if build_static is not None:
             if static is not None:
                 raise ValueError('supply either static or build_static, not both')
             if not callable(build_static):
                 raise TypeError('build_static must be callable')
         else:
-            _validate_run(static, baseline_controls, matrix_controls, matrix_kind)
+            early_baseline, early_matrix = _validate_run(static, baseline_controls, matrix_controls, matrix_kind)
+            _stc_precision.validate_stages(solver_options.get('stc_cc_controls'), early_baseline, early_matrix, triples)
+            if _stc_precision.enabled(solver_options.get('stc_cc_controls')):
+                prechecked_indices = _fragment_indices(static, fragment_indices)
+                _stc_precision.validate_seed_independence(solver_options['stc_cc_controls'], prechecked_indices)
         mf, scf_pullback = driver._initialize_scf(mol, build_mf)
         if comm is None:
             scf_pullback = driver._serial_scf_pullback(scf_pullback)
@@ -694,13 +809,19 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
         if build_static is not None:
             selected, scf_data, scf_data_pullback = driver._select_domain_reference(mf, build_static)
         baseline, matrix = _validate_run(selected, baseline_controls, matrix_controls, matrix_kind)
-        indices = _fragment_indices(selected, fragment_indices)
+        indices = (_fragment_indices(selected, fragment_indices)
+                   if prechecked_indices is None else prechecked_indices)
+        _stc_precision.validate_stages(solver_options.get('stc_cc_controls'), baseline, matrix, triples)
+        if build_static is not None:
+            _stc_precision.validate_seed_independence(solver_options.get('stc_cc_controls'), indices)
         triples = _allocate_triples_controls(triples, len(indices), static=selected, indices=indices)
         state = driver._initialize(mf, selected.mp2_static, baseline, with_grad=True,
                                    scf_pullback=scf_pullback, scf_data=scf_data,
                                    scf_data_pullback=scf_data_pullback)
         state['cc_fragment_indices'] = indices
         state['cc_triples_controls'] = triples
+        if solver_options:
+            state['cc_solver_options'] = solver_options
         return state, selected, baseline, matrix
 
     def initialize_worker(canonical):

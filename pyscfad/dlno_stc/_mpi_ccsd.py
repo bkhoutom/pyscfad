@@ -96,6 +96,7 @@ def _run_jobs(initializer, worker_initializer, comm, *, with_grad,
                        triples_controls=state['cc_triples_controls'], vvvv_direct=vvvv_direct,
                        return_components=return_components, include_baseline=include_baseline,
                        fragment_indices=indices)
+        options.update(state.get('cc_solver_options', {}))
         return (static, baseline, matrix, groups, state['weak_pairs'], options,
                 _reference_signature(state['mf']))
 
@@ -139,7 +140,9 @@ def _run_jobs(initializer, worker_initializer, comm, *, with_grad,
                 triples_controls=options['triples_controls'],
                 vvvv_direct=options['vvvv_direct'],
                 include_baseline=options['include_baseline'],
-                fragment_indices=options['fragment_indices']))
+                fragment_indices=options['fragment_indices'],
+                **({key: options[key] for key in ('cc_solver', 'stc_cc_controls')}
+                   if options.get('cc_solver') == 'stc' else {})))
             gc.collect()
     except Exception as exc:
         error = _error(exc, f'CC group {group_id}')

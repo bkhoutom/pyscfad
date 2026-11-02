@@ -26,6 +26,9 @@ def open_checkpoint(state, static, groups, *, checkpoint_dir, resume, options):
                    cc_selection_schema=static.schema_version,
                    boys_grouping=static.mp2_static.boys_grouping,
                    physical_groups=static.mp2_static.physical_groups)
+    if options.get('cc_solver') == 'stc':
+        from .stc_ccsd import external_implementation_identity
+        payload['external_stc_implementation'] = external_implementation_identity()
     triples = options.get('triples_controls')
     if triples is not None and (triples['mode'] == 'stochastic'
                                or static.lis_static.smooth_frames is not None):

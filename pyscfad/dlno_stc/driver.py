@@ -401,6 +401,27 @@ def _initialize_scf(mol, build_mf, *, fix_phases=True):
         return jax.vjp(build, mol)
 
 
+def _serial_scf_pullback(pullback):
+    """Use existing DF buffers/thread scopes for one complete serial reverse.
+
+    Producer registration remains opt-in before tracing. An enclosing caller
+    scope owns its finalization; otherwise this pullback must include the DF
+    producer. Standalone/partial VJPs and MPI calls keep their existing paths.
+    """
+    from pyscfad.lib import _cotangent_buffer
+    from pyscfad.lib._threading import dense_blas_scope
+
+    def apply(cotangent):
+        shared = (nullcontext() if _cotangent_buffer.is_active()
+                  else _cotangent_buffer.reverse_scope())
+        with shared, dense_blas_scope():
+            result = pullback(cotangent)
+            jax.block_until_ready(result)
+        return result
+
+    return apply
+
+
 def _initialize_system(mf, frozen, controls, *, with_grad, scf_pullback=None,
                        lo_kwargs=None, fock_from_scf=False):
     _validate_controls(controls)
@@ -638,6 +659,11 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
     An attached out-of-core CDERI source must be available on every rank.
     ``parallel_scf_jk=False`` retains root-only SCF and common response.
     System, serial and single-rank calls never activate this executor.
+    Serial calls (comm=None) scope the complete SCF pullback for resident DF
+    buffer sharing and dense-BLAS controller reuse. Enable
+    PYSCFAD_DF_SHARED_COTANGENT before tracing build_mf to use shared buffers;
+    build_mf must include their DF producer. A caller-owned complete reverse
+    scope is reused. See README_SERIAL_DF_SCF.md for staged/prebuilt DF cases.
     """
     scope = _shared_scope(static, scope, frozen, comm, lo_kwargs)
     rank = 0 if comm is None else comm.Get_rank()
@@ -657,6 +683,8 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
             _validate_static(static)
         with (resource_profile.section('stc.domain.scf') if scope == 'domain' else nullcontext()):
             mf, scf_pullback = _initialize_scf(mol, build_mf)
+        if comm is None:
+            scf_pullback = _serial_scf_pullback(scf_pullback)
         if scope == "system":
             return _initialize_system(mf, frozen, controls, with_grad=True,
                                       scf_pullback=scf_pullback, lo_kwargs=lo_kwargs,

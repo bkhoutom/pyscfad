@@ -669,8 +669,10 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
     ``mo_coeff_init``, ``mo_energy_init``, ``mo_occ_init`` and ``e_tot_init``,
     adopt these values and skip SCF. An attached out-of-core CDERI source
     must be available on every rank. ``parallel_scf_jk=False`` retains
-    root-only SCF and shared response. Serial and single-rank calls keep
-    their existing behavior.
+    root-only SCF and shared response. Serial calls (comm=None) use the same
+    opt-in resident DF buffer and BLAS-controller scopes as the MP2 driver;
+    the complete SCF pullback must reach its DF producer. See
+    README_SERIAL_DF_SCF.md for activation and prebuilt-factor ownership.
     """
     def initialize():
         triples = normalize_triples_controls(triples_controls, ccsd_t=ccsd_t)
@@ -685,6 +687,8 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
         else:
             _validate_run(static, baseline_controls, matrix_controls, matrix_kind)
         mf, scf_pullback = driver._initialize_scf(mol, build_mf)
+        if comm is None:
+            scf_pullback = driver._serial_scf_pullback(scf_pullback)
         selected = static
         scf_data = scf_data_pullback = None
         if build_static is not None:

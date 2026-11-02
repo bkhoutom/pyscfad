@@ -1,5 +1,8 @@
 # STC selected-target MP2
 
+See the [serial DF/SCF optimization guide](../../README_SERIAL_DF_SCF.md) for
+shared-buffer activation, preconditioning, thread settings and staged OOC use.
+
 STC owns Boys selection, exact-frame grouping, weak-pair correction, restart
 serialization, three-tensor preparation and molecular response. Production
 modules and examples do not import native DLNO. Saved orbital records and

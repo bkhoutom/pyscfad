@@ -64,6 +64,11 @@ class ReverseScope:
         self._buffers = {}
 
 
+def is_active():
+    """Whether a caller already owns this invocation's reverse transaction."""
+    return _scope.get() is not None
+
+
 @contextmanager
 def reverse_scope():
     """Own one complete reverse chain; reject nested or unfinished chains."""

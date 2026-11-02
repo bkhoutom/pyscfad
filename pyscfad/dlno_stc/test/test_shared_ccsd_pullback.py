@@ -16,9 +16,8 @@ def group_case(monkeypatch):
     native()
     x = full_fixture()
     controls = ccsd.driver._driver_controls({'mode': 'deterministic', 'threads': 1})
-    group = SimpleNamespace(representative_index=0, fragment_indices=(0, 1), target_indices=(0, 1))
-    static = SimpleNamespace(mp2_static=SimpleNamespace(), matrix_kind='D')
     preparations, packets, replays = [], [], []
+    baseline_targets, replay_energy_bars = [], []
 
     def prepare(mf, common):
         return {key: jnp.asarray(value) * (1 + .07 * mf + .03 * common)
@@ -49,36 +48,48 @@ def group_case(monkeypatch):
 
     solve, reverse = ccsd.backend.solve, ccsd.backend.pullback_matrices
     def baseline(*args, **kwargs):
+        baseline_targets.append(tuple(args[1]['target_indices']))
         result = solve(*args, **kwargs)
         if kwargs['with_grad']:
             retain(result['cotangents'])
         return result
 
     def replay(*args, **kwargs):
-        assert kwargs['energy_bar'] == 0.
         replays.append(args[1]['metadata']['fragment_id'])
+        replay_energy_bars.append(kwargs['energy_bar'])
         bars = reverse(*args, **kwargs)
         retain(bars)
         return bars
 
     monkeypatch.setattr(ccsd.driver, '_prepare', prepared)
-    monkeypatch.setattr(ccsd, '_group_cc_fragments', lambda static, group: ((0, (0,)), (1, (1,))))
+    monkeypatch.setattr(ccsd, '_group_cc_fragments', lambda static, group: static.test_fragments)
     monkeypatch.setattr(ccsd, '_solve_fragment', fragment)
     monkeypatch.setattr(ccsd.backend, 'solve', baseline)
     monkeypatch.setattr(ccsd.backend, 'pullback_matrices', replay)
 
     def run(include_baseline=True, indices=(0, 1), with_grad=True, mf=.2, common=-.1,
-            vvvv_direct=False):
+            vvvv_direct=False, *, matrix_kind='D', baseline_controls=None,
+            matrix_controls=None, group_targets=(0, 1),
+            fragments=((0, (0,)), (1, (1,)))):
+        group = SimpleNamespace(representative_index=0, fragment_indices=(0, 1),
+                                target_indices=group_targets)
+        static = SimpleNamespace(mp2_static=SimpleNamespace(), matrix_kind=matrix_kind,
+                                 test_fragments=fragments)
         state = dict(mf=jnp.asarray(mf), common=jnp.asarray(common), energy=jnp.zeros(()),
                      variance=0., mf_bar=jnp.asarray(.17), common_bar=jnp.asarray(-.23))
-        rows = ccsd._run_group(state, static, group, controls, controls,
+        rows = ccsd._run_group(state, static, group,
+            controls if baseline_controls is None else baseline_controls,
+            controls if matrix_controls is None else matrix_controls,
             with_grad=with_grad, verbose_imp=0, ccsd_t=True,
             include_baseline=include_baseline, fragment_indices=indices,
             vvvv_direct=vvvv_direct)
         return state, rows
 
     return SimpleNamespace(run=run, preparations=preparations, packets=packets,
-                           replays=replays, prepare=prepare, fragment=fragment)
+                           replays=replays, prepare=prepare, fragment=fragment,
+                           baseline_targets=baseline_targets,
+                           replay_energy_bars=replay_energy_bars,
+                           controls=controls, solve=solve)
 
 
 @pytest.mark.parametrize('include_baseline,indices,with_grad', [
@@ -92,6 +103,7 @@ def test_one_saved_preparation_pullback_per_contributing_group(group_case, inclu
     assert len(case.preparations) == 1
     assert len(case.preparations[0]) == int(with_grad and contributes)
     assert case.replays == (list(indices) if with_grad else [])
+    assert case.replay_energy_bars == ([0.] * len(indices) if with_grad else [])
     assert [row.fragment_index for row in rows] == list(indices)
     assert all(row.native_host_bar_norm is None for row in rows)
     assert all((row.direct_host_bar_norm > 0.) if with_grad else

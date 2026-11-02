@@ -261,6 +261,17 @@ an energy-only W seed is equivalent to half-identity seeds on both matrices,
 using the same saved production plan. Deterministic W has both traces equal
 to its energy within numerical tolerance.
 
+The CCSD driver reuses deterministic W energies for the MP2 baseline when
+both stages are deterministic and their Laplace roots and weights match.
+Each executed W result must cover only baseline targets still owned by its
+preparation group. Those energies are counted once, and their baseline response
+is included in the existing W pullback. Uncovered targets, including omitted
+CC fragments, retain a separate baseline solve. Stochastic stages and different
+quadratures retain their independent baseline calculations. The MP2 subtraction
+inside the truncated LIS and the weak-pair completion are unchanged.
+Baseline controls with native-only sampling options also retain the separate
+solve so its option validation remains in effect.
+
 ```python
 import jax
 import numpy as np

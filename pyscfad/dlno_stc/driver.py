@@ -213,7 +213,14 @@ def _initialize(mf, static, controls, *, with_grad, scf_pullback=None,
             "weak_pairs": tuple(weak_pair_indices(static))}
 
 
-def _prepare(state, static, group, controls, with_grad):
+def _prepare(state, static, group, controls, with_grad, *, return_frame=False):
+    """Prepare a domain, optionally exposing its frame and combined VJP.
+
+    The optional fourth return value is the frame. Its occupied/virtual
+    coefficients are also outputs of the saved VJP, whose seed then has shape
+    ``(input_bars, (occupied_bar, virtual_bar))``. Static frame metadata never
+    enters the differentiable output tree.
+    """
     memory_controls = ({"mode": "deterministic",
                         "target_batch_size": controls.get("target_batch_size", 1),
                         "threads": controls.get("threads")}
@@ -222,15 +229,28 @@ def _prepare(state, static, group, controls, with_grad):
                         with_grad=with_grad,
                         virtual_block_size=controls.get("virtual_block_size", 16),
                         **memory_controls)
-    prepare = lambda mf_, common_: prepare_boys_group_inputs(mf_, common_, static, group)
+    if return_frame:
+        prepare = lambda mf_, common_: prepare_boys_group_inputs(
+            mf_, common_, static, group, return_frame=True)
+    else:
+        prepare = lambda mf_, common_: prepare_boys_group_inputs(mf_, common_, static, group)
     with warnings.catch_warnings():
         warnings.filterwarnings("error", message="integral-direct local Lov is unavailable.*",
                                 category=RuntimeWarning)
-        if with_grad:
+        if return_frame:
+            if with_grad:
+                (inputs, _), pullback, frame = jax.vjp(
+                    prepare, state["mf"], state["common"], has_aux=True)
+            else:
+                (inputs, _), frame = prepare(state["mf"], state["common"])
+                pullback = None
+        elif with_grad:
             inputs, pullback = jax.vjp(prepare, state["mf"], state["common"])
         else:
             inputs, pullback = prepare(state["mf"], state["common"]), None
     jax.block_until_ready(inputs)
+    if return_frame:
+        return inputs, backend.host_inputs(inputs), pullback, frame
     return inputs, backend.host_inputs(inputs), pullback
 
 

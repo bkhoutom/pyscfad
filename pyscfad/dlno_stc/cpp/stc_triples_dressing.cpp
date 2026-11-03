@@ -148,7 +148,7 @@ class Dressing {
         return result;
     }
 public:
-    Dressing(py::tuple inputs) {
+    Dressing(py::tuple inputs,bool integral_inputs) {
         if(inputs.size()!=9) throw py::value_error("smooth triples dressing: expected nine inputs including physical target U");
         for(auto input:inputs) {
             auto array=Array::ensure(input);
@@ -157,15 +157,29 @@ public:
                 if(!std::isfinite(array.data()[i])) throw py::value_error("smooth triples dressing: nonfinite input");
             inputs_.push_back(std::move(array));
         }
-        if(inputs_[0].ndim()!=2 || inputs_[2].ndim()!=3) throw py::value_error("smooth triples dressing: invalid input rank");
-        const auto no=inputs_[0].shape(0),nv=inputs_[0].shape(1),np=inputs_[2].shape(0);
-        if(no<=0 || nv<=0 || np<=0) throw py::value_error("smooth triples dressing: empty orbital space");
-        check_shape(inputs_[1],{no,no,nv,nv}); check_shape(inputs_[2],{np,no,nv});
-        check_shape(inputs_[3],{np,no,no}); check_shape(inputs_[4],{np,nv,nv});
+        if(inputs_[0].ndim()!=2 || inputs_[2].ndim()!=(integral_inputs ? 4 : 3))
+            throw py::value_error("smooth triples dressing: invalid input rank");
+        const auto no=inputs_[0].shape(0),nv=inputs_[0].shape(1);
+        if(no<=0 || nv<=0) throw py::value_error("smooth triples dressing: empty orbital space");
+        check_shape(inputs_[1],{no,no,nv,nv});
+        if(integral_inputs) {
+            check_shape(inputs_[2],{no,nv,nv,nv});
+            check_shape(inputs_[3],{no,nv,no,no}); check_shape(inputs_[4],{no,nv,no,nv});
+        } else {
+            const auto np=inputs_[2].shape(0);
+            if(np<=0) throw py::value_error("smooth triples dressing: empty auxiliary space");
+            check_shape(inputs_[2],{np,no,nv});
+            check_shape(inputs_[3],{np,no,no}); check_shape(inputs_[4],{np,nv,nv});
+        }
         check_shape(inputs_[5],{no,nv}); check_shape(inputs_[6],{no,no}); check_shape(inputs_[7],{nv,nv});
         occupied_=spectrum(inputs_[6]); virtual_=spectrum(inputs_[7]);
         axes_={{{0,0},{1,1}},{{0,0},{1,0},{2,1},{3,1}},{{1,0},{2,1}},
                {{1,0},{2,2}},{{1,1},{2,3}},{{0,0},{1,1}}};
+        if(integral_inputs) {
+            axes_[2]={{0,0},{1,1},{2,1},{3,3}}; // (ia|bc): O,V,V,V^-1
+            axes_[3]={{0,0},{1,1},{2,0},{3,2}}; // (ia|jk): O,V,O,O^-1
+            axes_[4]={{0,0},{1,1},{2,0},{3,1}}; // (ia|jb): O,V,O,V
+        }
         sources_={0,1,2,3,4,5};
         if(inputs_[8].ndim()!=2 || inputs_[8].shape(0)!=no ||
            inputs_[8].shape(1)<=0 || inputs_[8].shape(1)>no)
@@ -236,7 +250,8 @@ public:
 } // namespace
 void bind_triples_dressing(py::module_& module) {
     py::class_<Dressing>(module,"TriplesDressing")
-        .def(py::init<py::tuple>(), py::arg("inputs"))
+        .def(py::init<py::tuple,bool>(), py::arg("inputs"),
+             py::kw_only(),py::arg("integral_inputs")=false)
         .def("prepare",&Dressing::prepare)
         .def("pullback",&Dressing::pullback);
 }

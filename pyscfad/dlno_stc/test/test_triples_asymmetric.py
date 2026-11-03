@@ -99,7 +99,8 @@ def test_asymmetric_invalid_right_projection_rejected(value):
 def test_only_asymmetric_native_entry_points_remain():
     native = triples_native()
     assert {name for name in dir(native) if name.startswith('triples_')} == {
-        'triples_asymmetric_energy', 'triples_asymmetric_energy_vjp'}
+        'triples_asymmetric_energy', 'triples_asymmetric_energy_vjp',
+        'triples_asymmetric_integrals_energy', 'triples_asymmetric_integrals_energy_vjp'}
     assert 'asymmetric-only' in native.TRIPLES_VERSION
 
 

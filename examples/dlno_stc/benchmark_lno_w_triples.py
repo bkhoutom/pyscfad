@@ -50,6 +50,8 @@ def main():
                         help="virtual W-eigenvalue cutoff for LIS selection")
     parser.add_argument("--triples-method", choices=("conventional", "smooth"),
                         default="smooth")
+    parser.add_argument("--triples-integral-transform", choices=("df", "rotate"),
+                        default="df", help="dress DF factors or rotate cached CCSD integrals")
     parser.add_argument("--smooth-laplace-points", type=int, default=10)
     parser.add_argument("--smooth-trace-exponent", type=float, default=5.)
     parser.add_argument("--selection-only", action="store_true")
@@ -72,6 +74,8 @@ def main():
         parser.error("--deterministic-only computes a new reference; omit --reference")
     if args.triples_method == "conventional" and not args.deterministic_only:
         parser.error("conventional is a deterministic reference only; use smooth for sampling")
+    if args.triples_method != "smooth" and args.triples_integral_transform == "rotate":
+        parser.error("--triples-integral-transform rotate requires --triples-method smooth")
     frame_mode = "full" if args.triples_method == "smooth" else None
     if not math.isfinite(args.df_memory_mb) or args.df_memory_mb <= 0:
         parser.error("DF memory budget must be finite and positive")
@@ -119,6 +123,8 @@ def main():
         previous = json.loads((output / "settings.json").read_text())
         if previous.get('scf_df_precond', False) != args.scf_df_precond:
             raise ValueError('SCF preconditioning differs; use a new output directory')
+        if previous.get('triples_integral_transform', 'df') != args.triples_integral_transform:
+            raise ValueError('triples integral transform differs; use a new output directory')
         requested = dict(cc_conv_tol=args.cc_conv_tol,
                          cc_conv_tol_normt=args.cc_conv_tol_normt,
                          lno_thresh_occ=args.lno_thresh_occ,
@@ -309,6 +315,7 @@ def main():
                     cc_conv_tol_normt=args.cc_conv_tol_normt, cc_max_cycle=200,
                     targets_meh=args.targets_meh, seeds=args.seeds,
                     pilot_samples=args.pilot_samples, triples_mode=args.triples_method,
+                    triples_integral_transform=args.triples_integral_transform,
                     smooth_frame_mode=frame_mode,
                     smooth_frame_blocks=frame_blocks,
                     jax_persistent_cache_enabled=bool(jax.config.jax_enable_compilation_cache),
@@ -338,6 +345,8 @@ def main():
                    return_components=True, merge_identical=True)
 
     deterministic_controls = dict(mode="deterministic")
+    if args.triples_integral_transform == "rotate":
+        deterministic_controls['integral_transform'] = 'rotate'
     jobs = []
     if args.reference:
         reference = json.loads(args.reference.read_text())
@@ -368,6 +377,8 @@ def main():
                             global_seed=seed, energy_tolerance=target / 1000)
             if args.triples_method == "smooth":
                 controls.update(trace_exponent=args.smooth_trace_exponent)
+            if args.triples_integral_transform == "rotate":
+                controls['integral_transform'] = 'rotate'
             jobs.append((label, controls))
     for label, controls in jobs:
         destination = output / f"{label}.json"
@@ -399,6 +410,7 @@ def main():
                       mp2_domains=mp2_domains,
                       mp2_energy_source="w_matrix_trace", mp2_response="joint_energy_w_pullback",
                       triples_mode=args.triples_method,
+                      triples_integral_transform=args.triples_integral_transform,
                       smooth_frame_mode=frame_mode,
                       smooth_frame_blocks=frame_blocks,
                       jax_persistent_cache_enabled=bool(jax.config.jax_enable_compilation_cache),

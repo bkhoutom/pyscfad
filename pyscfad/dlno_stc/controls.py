@@ -54,6 +54,13 @@ def _finite_control(name, value, *, positive=True):
     return value
 
 
+def _triples_integral_transform(controls):
+    value = controls.get('integral_transform', 'df')
+    if not isinstance(value, str) or value not in ('df', 'rotate'):
+        raise ValueError('integral_transform must be df or rotate')
+    return value
+
+
 def normalize_triples_controls(controls, *, ccsd_t):
     """Validate triples independently of baseline and D/W selection settings.
 
@@ -72,15 +79,19 @@ def normalize_triples_controls(controls, *, ccsd_t):
         raise TypeError('triples_controls must be a dictionary')
     settings = controls.copy()
     unknown = set(settings) - {'mode', 'nsamples', 'global_seed', 'energy_tolerance',
-                               'pilot_samples', 'fragment_energies', 'trace_exponent'}
+                               'pilot_samples', 'fragment_energies', 'trace_exponent',
+                               'integral_transform'}
     if unknown:
         raise ValueError('unsupported triples controls: '
                          + ', '.join(sorted(map(str, unknown))))
     mode = settings.setdefault('mode', 'deterministic')
     if mode not in ('deterministic', 'stochastic'):
         raise ValueError('triples mode must be deterministic or stochastic')
+    if _triples_integral_transform(settings) == 'df':
+        # Explicit default and omission share a checkpoint identity.
+        settings.pop('integral_transform', None)
     if mode == 'deterministic':
-        if set(settings) - {'mode'}:
+        if set(settings) - {'mode', 'integral_transform'}:
             raise ValueError('deterministic triples do not accept sampling controls')
         return settings
     if 'nsamples' not in settings:

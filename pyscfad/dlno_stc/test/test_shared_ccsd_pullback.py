@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from pyscfad.dlno_stc import ccsd
+from pyscfad.dlno_stc.domain import BoysEDFrame
 from pyscfad.dlno_stc.test.test_backend import native
 from pyscfad.dlno_stc.test.test_full_kernel import full_fixture
 
@@ -19,25 +20,37 @@ def group_case(monkeypatch):
     preparations, packets, replays, baseline_calls, events = [], [], [], [], []
     baseline_targets, replay_energy_bars = [], []
 
+    def frame_coeff(mf, common):
+        return (jnp.atleast_2d(1 + .11 * mf + .13 * common),
+                jnp.atleast_2d(.7 - .17 * mf + .19 * common))
+
     def prepare(mf, common):
-        return {key: jnp.asarray(value) * (1 + .07 * mf + .03 * common)
+        co, cv = frame_coeff(mf, common)
+        factor = 1 + .07 * mf + .03 * common + .05 * jnp.sum(co * cv)
+        return {key: jnp.asarray(value) * factor
                 for key, value in x.items()}
 
-    def prepared(state, *args):
-        inputs, pullback = jax.vjp(prepare, state['mf'], state['common'])
+    def prepared(state, *args, return_frame=False):
+        assert return_frame
+        (inputs, coeff), pullback = jax.vjp(
+            lambda m, c: (prepare(m, c), frame_coeff(m, c)), state['mf'], state['common'])
         calls = []
         preparations.append(calls)
         def counted(bars):
-            calls.append({key: np.array(value) for key, value in bars.items()})
+            calls.append({key: np.array(value) for key, value in bars[0].items()})
             return pullback(bars)
-        return inputs, ccsd.backend.host_inputs(inputs), counted
+        frame = BoysEDFrame(*coeff, np.array([0]), np.array([0]), 0, (0,))
+        return inputs, ccsd.backend.host_inputs(inputs), counted, frame
 
     def fragment(mf, common, static, index, matrices, group, **options):
         events.append(('correction', index))
         d, v = matrices['occupied'], matrices['virtual']
+        frame = options['frame']
+        co, cv = frame.occupied_coeff, frame.virtual_coeff
         return (.013 * (index + 1) * jnp.sum(d*d) + .02 * mf,
-                (.7 + mf) * jnp.sum(v*v) + common * jnp.sum(d),
-                .011 * (index + 1) * common)
+                (.7 + mf + .09 * jnp.sum(cv)) * jnp.sum(v*v)
+                + common * jnp.sum(d) + .04 * jnp.sum(co * cv),
+                .011 * (index + 1) * common * jnp.sum(co**2))
 
     def retain(bars):
         # Incoming packets are owned by their producer. Read-only arrays catch
@@ -80,7 +93,7 @@ def group_case(monkeypatch):
         group = SimpleNamespace(representative_index=0, fragment_indices=(0, 1),
                                 target_indices=group_targets)
         static = SimpleNamespace(mp2_static=SimpleNamespace(), matrix_kind=matrix_kind,
-                                 test_fragments=fragments)
+                                 test_fragments=fragments, fragments=(True, True))
         state = dict(mf=jnp.asarray(mf), common=jnp.asarray(common), energy=jnp.zeros(()),
                      variance=0., mf_bar=jnp.asarray(.17), common_bar=jnp.asarray(-.23))
         rows = ccsd._run_group(state, static, group, baseline, matrix,
@@ -211,7 +224,9 @@ def test_group_forwards_ladder_mode_to_each_fragment(group_case, monkeypatch, di
 
 
 @pytest.mark.parametrize('with_grad', [False, True])
-def test_stc_cc_interface_preserves_shared_w_energy_and_response(group_case, monkeypatch, with_grad):
+@pytest.mark.parametrize('precision', [False, True])
+def test_stc_cc_interface_preserves_shared_w_energy_and_response(group_case, monkeypatch,
+                                                                with_grad, precision):
     case = group_case
     reference, _ = case.run(matrix_kind='W', with_grad=with_grad)
     options_seen = []
@@ -221,13 +236,21 @@ def test_stc_cc_interface_preserves_shared_w_energy_and_response(group_case, mon
         values = original(*args, **options)
         return values, {'ccsd': {'seed': options['stc_cc_controls']['seed']}}
     monkeypatch.setattr(ccsd, '_solve_fragment', stc_fragment)
+    controls = {'seed': 71}
+    if precision:
+        controls.update(energy_tolerance=1e3, precision_pilot_replicas=2,
+                        precision_min_replicas=2, precision_max_replicas=2)
     state, rows = case.run(matrix_kind='W', with_grad=with_grad,
-                           cc_solver='stc', stc_cc_controls={'seed': 71})
-    assert len(options_seen) == 2
-    assert all(option['cc_solver'] == 'stc' and option['with_grad'] == with_grad
-               for option in options_seen)
-    assert all(row.ccsd_method == 'stc' and row.ccsd_diagnostics['seed'] == 71
-               for row in rows)
+                           cc_solver='stc', stc_cc_controls=controls)
+    assert len(options_seen) == (8 if precision else 2)
+    assert all(option['cc_solver'] == 'stc' for option in options_seen)
+    assert sum(option['with_grad'] for option in options_seen) == (
+        (4 if precision else 2) if with_grad else 0)
+    assert all(row.ccsd_method == 'stc' for row in rows)
+    if precision:
+        assert all(row.ccsd_diagnostics['precision']['production_replicas'] == 2 for row in rows)
+    else:
+        assert all(row.ccsd_diagnostics['seed'] == 71 for row in rows)
     for key in ('energy', 'baseline_energy', 'variance', 'mf_bar', 'common_bar'):
         np.testing.assert_allclose(state[key], reference[key], rtol=2e-12, atol=2e-13)
     assert case.baseline_calls == []

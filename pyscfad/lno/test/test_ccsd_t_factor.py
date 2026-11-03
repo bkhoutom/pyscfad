@@ -370,7 +370,7 @@ def test_public_and_lazy_factor_paths_never_materialize_ovvv(monkeypatch):
 
 def test_factor_direct_outcore_water_dlno_gradient_high_cost(
         tmp_path, monkeypatch):
-    """A complete one-fragment DLNO gradient keeps ovvv lazy.
+    """A complete one-fragment DLNO gradient retains packed ovvv.
 
     The outcore CDERI activates the same backward-replay boundary used by
     production fragment calculations.  Zero thresholds and full domains make
@@ -402,13 +402,18 @@ def test_factor_direct_outcore_water_dlno_gradient_high_cost(
         cc.kernel()
         return cc.e_tot + cc.ccsd_t()
 
-    def forbid_global_ovvv(_eris):
-        raise AssertionError('LNO triples materialized global packed ovvv')
+    builds = []
+    original = lno_ccsd._ChemistsERIs.get_ovvv_packed
+
+    def record_build(eris):
+        if eris.ovvv is None:
+            builds.append(True)
+        return original(eris)
 
     monkeypatch.setattr(
         lno_ccsd._ChemistsERIs,
         'get_ovvv_packed',
-        forbid_global_ovvv,
+        record_build,
     )
     monkeypatch.setattr(
         ccsd_t,
@@ -443,6 +448,7 @@ def test_factor_direct_outcore_water_dlno_gradient_high_cost(
         canonical_value, canonical_bar = jax.value_and_grad(
             canonical_energy)(mol)
 
+    assert builds
     numpy.testing.assert_allclose(
         local_energy, canonical_value, atol=3e-7, rtol=0.0)
     numpy.testing.assert_allclose(

@@ -288,8 +288,8 @@ def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_v
         corrections = _group_cc_fragments(mp2_static, group)
         if not any(index in indices for index, _ in corrections):
             continue
-        inputs, host, _ = driver._prepare(state, mp2_static, group, baseline, False)
-        frame = build_boys_ed_frame(state['common'], mp2_static, group.representative_index)
+        inputs, host, _, frame = driver._prepare(
+            state, mp2_static, group, baseline, False, return_frame=True)
         for index, targets in corrections:
             if index not in indices:
                 continue
@@ -339,6 +339,8 @@ def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_v
 def _allocate_triples_controls(controls, nfragments, *, static=None, indices=None):
     """Allocate a total triples SE budget over globally requested physical fragments."""
     smooth = getattr(getattr(static, 'lis_static', None), 'smooth_frames', None) is not None
+    if controls is not None and controls.get('integral_transform') == 'rotate' and not smooth:
+        raise ValueError('integral_transform=rotate requires smooth triples selections')
     if controls is not None and controls.get('mode') == 'stochastic':
         if not smooth:
             raise ValueError('stochastic triples requires full-LIS smooth frames; '
@@ -391,11 +393,13 @@ def _triples_fragment_seed(global_seed, fragment_index):
 
 def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
                     verbose_imp, ccsd_t, triples_controls=None, with_grad=False,
-                    vvvv_direct=False, cc_solver='deterministic', stc_cc_controls=None):
+                    vvvv_direct=False, cc_solver='deterministic', stc_cc_controls=None,
+                    frame=None):
     """Return MP2-LIS, CCSD and triples; stochastic calls also return diagnostics."""
     from .lis import build_fragment_lis
     representative = group.representative_index
-    frame = build_boys_ed_frame(common, static.mp2_static, representative)
+    if frame is None:
+        frame = build_boys_ed_frame(common, static.mp2_static, representative)
     lis = build_fragment_lis(mf, common, static.lis_static, fragment_index,
                              matrices=matrices, frame=frame,
                              frame_fragment_index=representative)
@@ -470,11 +474,16 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
 
     All process-local VJPs and matrix replay records are consumed here. Only
     scalar component records and the accumulated numerical host bars survive.
-    One preparation pullback consumes the sum of its input cotangents.
+    One preparation pullback consumes the sum of its input cotangents and
+    direct LIS frame cotangents. The domain frame and its reverse are shared
+    by domain MP2/W and every physical-fragment correction in this group.
     """
     with resource_profile.section('stc.cc.prepare'):
-        inputs, host, prepare_pullback = driver._prepare(
-            state, static.mp2_static, group, baseline_controls, with_grad)
+        inputs, host, prepare_pullback, frame = driver._prepare(
+            state, static.mp2_static, group, baseline_controls, with_grad,
+            return_frame=True)
+    frame_coeff = (frame.occupied_coeff, frame.virtual_coeff)
+    frame_bars = tuple(np.zeros_like(coeff) for coeff in frame_coeff) if with_grad else None
     metadata = {'fragment_id': group.representative_index,
                 'target_indices': tuple(group.target_indices)}
     input_bars = None
@@ -531,11 +540,12 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
             nonlocal pilot_mf
             solver_options = (dict(cc_solver=cc_solver, stc_cc_controls=configuration)
                               if cc_solver == 'stc' else {})
-            def correction(mf, common, blocks):
+            def correction(mf, common, blocks, coeff):
+                current_frame = frame._replace(occupied_coeff=coeff[0], virtual_coeff=coeff[1])
                 values = _solve_fragment(mf, common, static, index, blocks, group,
                                          verbose_imp=verbose_imp, ccsd_t=ccsd_t,
                                          triples_controls=local_triples, with_grad=need_grad,
-                                         vvvv_direct=vvvv_direct, **solver_options)
+                                         vvvv_direct=vvvv_direct, frame=current_frame, **solver_options)
                 if cc_solver == 'stc' or (ccsd_t and (
                         getattr(getattr(static, 'lis_static', None), 'smooth_frames', None) is not None or
                         triples_controls is not None and triples_controls['mode'] == 'stochastic')):
@@ -556,11 +566,11 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
                         if cache is not None:
                             df._lno_local_df_cache = dict(cache)
                     reference = pilot_mf
-                energy, auxiliary = correction(reference, state['common'], matrices)
+                energy, auxiliary = correction(reference, state['common'], matrices, frame_coeff)
                 return energy, auxiliary, None
             with resource_profile.section('stc.cc.correction_forward', frag=index+1):
                 energy, pullback, auxiliary = jax.vjp(
-                    correction, state['mf'], state['common'], matrices, has_aux=True)
+                    correction, state['mf'], state['common'], matrices, frame_coeff, has_aux=True)
                 jax.block_until_ready((energy, auxiliary))
             with resource_profile.section('stc.cc.correction_pullback', frag=index+1):
                 bars = pullback(np.ones_like(energy))
@@ -573,7 +583,11 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
         else:
             energy, auxiliary, correction_bars = evaluate(stc_cc_controls, with_grad)
         if with_grad:
-            mf_bar, common_bar, matrix_bars = correction_bars
+            mf_bar, common_bar, matrix_bars, coeff_bars = correction_bars
+            frame_bars = tuple(left + right for left, right in zip(frame_bars, coeff_bars))
+            jax.block_until_ready((mf_bar, common_bar, matrix_bars, frame_bars))
+            # The direct host response holds the shared frame fixed; apply its
+            # accumulated frame contribution once through preparation below.
             direct_norm = _bar_norm(mf_bar, common_bar)
             driver._add_bars(state, mf_bar, common_bar)
             with resource_profile.section('stc.cc.matrix_pullback', frag=index+1):
@@ -587,7 +601,7 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
             else:
                 for name in inputs:
                     input_bars[name] += bars[name]
-            del correction_bars, mf_bar, common_bar, matrix_bars, bars
+            del correction_bars, mf_bar, common_bar, matrix_bars, coeff_bars, bars
         else:
             direct_norm = None
         values, diagnostics = auxiliary
@@ -623,7 +637,10 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
         gc.collect()
     if input_bars is not None:
         with resource_profile.section('stc.cc.input_pullback'):
-            driver._add_bars(state, *apply_input_pullback(prepare_pullback, inputs, input_bars))
+            # AD adds the coefficient bars from DF/Fock construction to the
+            # explicit LIS bars before traversing the frame producer once.
+            combined_pullback = lambda bars: prepare_pullback((bars, frame_bars))
+            driver._add_bars(state, *apply_input_pullback(combined_pullback, inputs, input_bars))
             del input_bars
             jax.block_until_ready((state['mf_bar'], state['common_bar']))
     return records

@@ -8,6 +8,7 @@ import argparse
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import json
+import math
 import os
 from pathlib import Path
 import resource
@@ -22,8 +23,15 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--threads', type=int, default=32)
     parser.add_argument('--max-memory-mb', type=float, required=True)
-    parser.add_argument('--df-memory-mb', type=float, required=True)
+    parser.add_argument('--df-memory-mb', type=float,
+                        help='Optional tighter DF memory ceiling; defaults to the user total budget')
     args = parser.parse_args()
+    if args.df_memory_mb is None:
+        args.df_memory_mb = args.max_memory_mb
+    if not all(math.isfinite(v) and v > 0 for v in
+               (args.max_memory_mb, args.df_memory_mb)):
+        parser.error('Memory budgets must be finite and positive')
+    args.df_memory_mb = min(args.df_memory_mb, args.max_memory_mb)
     cpus = configure_cpu_workload(args.threads)
     os.environ['PYSCFAD_PROFILE_BACKWARD_PHASES'] = '1'
     os.environ['PYSCFAD_PRECOND_CACHE_MEMORY_MB'] = str(args.max_memory_mb * 1e6 / 1024**2)
@@ -35,7 +43,8 @@ def main():
     import pyscfad
     from pyscfad import config, gto, scf
     from pyscfad.df import _df_jk_opt
-    from pyscfad.scf import hf
+    from pyscfad.df.df import DF
+    from pyscf import lib as pyscf_lib
     from pyscfad._src.scipy.sparse import linalg as solver_impl
     from pyscfad.lib import _cotangent_buffer
     from pyscfad.lib._threading import dense_blas_scope
@@ -48,7 +57,7 @@ def main():
     output.mkdir(exist_ok=True)
     started = time.perf_counter()
     timings = {}
-    statistics = dict(preconditioner_setups=[], gmres_solves=[])
+    statistics = dict(preconditioner_setups=[], gmres_solves=[], df_blocks={})
 
     def save(name, value):
         path = output/name
@@ -57,12 +66,38 @@ def main():
         tmp.replace(path)
 
     def report(message):
-        print(f'[BENCHMARK {time.perf_counter()-started:.1f}s] {message}', flush=True)
+        print(f'[BENCHMARK] elapsed={time.perf_counter()-started:.1f}s {message}', flush=True)
 
     config.update('pyscfad_scf_implicit_diff', True)
     config.update('pyscfad_scf_first_order_custom', False)
     config.update('pyscfad_moleintor_opt', False)
     config.update('pyscfad_scf_df_precond', True)
+
+    # DF.max_memory is a process ceiling: PySCF subtracts the current RSS
+    # before sizing J/K panels. A fixed scratch allowance here would force
+    # minimum-sized panels once total RSS exceeded that allowance.
+    save('memory_policy.json', dict(total_memory_mb=args.max_memory_mb,
+        df_memory_ceiling_mb=args.df_memory_mb,
+        df_memory_semantics='Process ceiling; J/K subtracts current RSS before sizing panels',
+        rss_guard_fraction=.95, preconditioner_enabled=True))
+    original_loop = DF.loop
+
+    def traced_loop(obj, blksize=None, to_numpy=True):
+        first = True
+        for block in original_loop(obj, blksize=blksize, to_numpy=to_numpy):
+            if first:
+                first = False
+                key = str(block.shape[0])
+                if key not in statistics['df_blocks']:
+                    statistics['df_blocks'][key] = dict(
+                        first_seen_seconds=time.perf_counter()-started,
+                        df_memory_ceiling_mb=obj.max_memory,
+                        process_rss_mb=pyscf_lib.current_memory()[0], calls=0)
+                    report(f'DF panel rows={key}, ceiling={obj.max_memory:g} MB')
+                statistics['df_blocks'][key]['calls'] += 1
+            yield block
+
+    DF.loop = traced_loop
 
     # Instrument existing implementations without changing their equations,
     # tolerances, thread settings, or the number of requested reverse passes.

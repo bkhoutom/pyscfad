@@ -41,12 +41,18 @@ public:
         std::uint64_t seed;
         double allocation_target;
     };
+    // Matrices use the tensor bank layout: the last two orbital indices are
+    // rows, and the leading (i,a) pair indexes columns.
+    struct triples_integrals {
+        arma::mat ovvv, ovoo, ovov;
+    };
     struct triples_vjp {
         arma::field<arma::vec> t1;
         arma::field<arma::mat> t2;
         arma::mat fov;
         arma::mat occupied_left, occupied_right;
         arma::mat Bvo, Boo, Bvv;
+        triples_integrals integrals;
     };
 
     // Denominator-free Laplace numerator, contracted directly over a small
@@ -59,7 +65,8 @@ public:
         const arma::mat& left, const arma::mat& right,
         size_t nsamples, std::uint64_t seed, double target_standard_error,
         triples_vjp* vjp, double cotangent, const arma::mat* fov = nullptr,
-        const pilot_controls* pilot = nullptr);
+        const pilot_controls* pilot = nullptr,
+        const triples_integrals* integrals = nullptr);
 
 };
 

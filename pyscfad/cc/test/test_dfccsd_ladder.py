@@ -145,18 +145,19 @@ def test_jitted_ladder_uses_each_runtime_cache(monkeypatch, optimized):
         assert fn._cache_size() == 2
 
 
-def test_canonical_builder_defaults_to_cached_ladder_and_keeps_factors(get_opt_mol):
-    """Canonical ao2mo must enable the fast default without forcing global ovvv."""
+def test_canonical_builder_caches_integrals_and_keeps_factors(get_opt_mol):
+    """Canonical ao2mo retains packed ovvv independently of ladder mode."""
     mf = scf.RHF(get_opt_mol).density_fit()
     mf.kernel()
     mycc = dfccsd.RCCSD(mf)
     eris = mycc.ao2mo()
     assert eris._vvvv_pair is not None
     assert eris.Loo is not None and eris.Lov is not None and eris.Lvv is not None
-    assert eris.ovvv is None
+    assert eris.ovvv is not None
     mycc.vvvv_direct = True
     direct = mycc.ao2mo()
     assert direct._vvvv_pair is None
+    numpy.testing.assert_allclose(eris.ovvv, direct.ovvv, atol=1e-12)
     nvir = mycc.nmo - mycc.nocc
     tau = jnp.arange(2 * nvir**2, dtype=float).reshape(2, nvir, nvir)
     numpy.testing.assert_allclose(eris._contract_vvvv_t2(mycc, tau),
@@ -178,6 +179,7 @@ def test_cached_and_direct_molecular_response_gradients(optimized, custom_respon
     def inspect_gradient(*args):
         bar = original_gradient(*args)
         assert bar._vvvv_pair is None
+        assert bar.ovvv is None
         response_calls.append(True)
         return bar
 
@@ -191,7 +193,11 @@ def test_cached_and_direct_molecular_response_gradients(optimized, custom_respon
         mycc.vvvv_direct = direct
         mycc.conv_tol = 1e-10
         mycc.conv_tol_normt = 1e-8
-        mycc.kernel()
+        eris = mycc.ao2mo()
+        if direct:
+            # Compare with the original factor-only update and response.
+            eris.ovvv = None
+        mycc.kernel(eris=eris)
         # Nonzero amplitude cotangents exercise the full custom response solve.
         return mycc.e_tot + .001 * jnp.sum(mycc.t1) + .002 * jnp.sum(mycc.t2)
 

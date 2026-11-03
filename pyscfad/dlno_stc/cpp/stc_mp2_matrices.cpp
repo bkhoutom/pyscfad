@@ -638,20 +638,22 @@ Result solve_deterministic_energy(const Inputs& inputs,
     ThreadScope team(controls.threads > 0 ? controls.threads : omp_get_max_threads());
     NativeKernel kernel(inputs.foo, inputs.fvv, inputs.B, offsets_array(inputs));
     const arma::vec roots(controls.roots), weights(controls.weights);
-    for (size_t first = 0; first < targets.size(); first += controls.target_batch_size) {
-        const auto last = std::min(first + controls.target_batch_size, targets.size());
-        std::vector<size_t> group(targets.begin() + first, targets.begin() + last);
-        auto result = with_grad ? source::selected_deterministic_energy_vjp(
-            kernel, roots, weights, group, omp_get_max_threads())
-            : source::selected_deterministic_energy(
-            kernel, roots, weights, group, omp_get_max_threads());
-        output.energy += result.energy;
-        if (with_grad) {
-            output.foo += result.bar_occ;
-            output.fvv += result.bar_virt;
-            output.B += result.bar_b;
-        }
+    const std::vector<size_t> group(targets.begin(),targets.end());
+    auto result=source::evaluate_deterministic_energy(
+        kernel,roots,weights,group,omp_get_max_threads(),with_grad,controls.target_batch_size);
+    output.energy=result.energy;
+    if (with_grad) {
+        output.foo=std::move(result.bar_occ);
+        output.fvv=std::move(result.bar_virt);
+        output.B=std::move(result.bar_b);
     }
+    output.propagation_calls=result.propagation_calls;
+    output.backprop_calls=result.backprop_calls;
+    output.cached_targets=result.cached_targets;
+    output.bare_integrals_seconds=result.bare_integrals_seconds;
+    output.propagation_seconds=result.propagation_seconds;
+    output.contraction_seconds=result.contraction_seconds;
+    output.backprop_seconds=result.backprop_seconds;
     if (with_grad && controls.canonical_fock) {
         output.foo = arma::diagmat(output.foo.diag());
         output.fvv = arma::diagmat(output.fvv.diag());

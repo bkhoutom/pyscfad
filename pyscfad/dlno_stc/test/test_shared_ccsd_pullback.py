@@ -18,7 +18,8 @@ def group_case(monkeypatch):
     controls = ccsd.driver._driver_controls({'mode': 'deterministic', 'threads': 1})
     group = SimpleNamespace(representative_index=0, fragment_indices=(0, 1), target_indices=(0, 1))
     static = SimpleNamespace(mp2_static=SimpleNamespace(), matrix_kind='D')
-    preparations, packets, replays = [], [], []
+    preparations, packets, replays, baseline_calls, events = [], [], [], [], []
+    expected_energy_bar = [0.]
 
     def prepare(mf, common):
         return {key: jnp.asarray(value) * (1 + .07 * mf + .03 * common)
@@ -34,6 +35,7 @@ def group_case(monkeypatch):
         return inputs, ccsd.backend.host_inputs(inputs), counted
 
     def fragment(mf, common, static, index, matrices, group, **options):
+        events.append(('correction', index))
         d, v = matrices['occupied'], matrices['virtual']
         return (.013 * (index + 1) * jnp.sum(d*d) + .02 * mf,
                 (.7 + mf) * jnp.sum(v*v) + common * jnp.sum(d),
@@ -49,14 +51,16 @@ def group_case(monkeypatch):
 
     solve, reverse = ccsd.backend.solve, ccsd.backend.pullback_matrices
     def baseline(*args, **kwargs):
+        baseline_calls.append(kwargs['with_grad'])
         result = solve(*args, **kwargs)
         if kwargs['with_grad']:
             retain(result['cotangents'])
         return result
 
     def replay(*args, **kwargs):
-        assert kwargs['energy_bar'] == 0.
+        assert kwargs['energy_bar'] == expected_energy_bar[0]
         replays.append(args[1]['metadata']['fragment_id'])
+        events.append(('pullback', args[1]['metadata']['fragment_id']))
         bars = reverse(*args, **kwargs)
         retain(bars)
         return bars
@@ -68,17 +72,55 @@ def group_case(monkeypatch):
     monkeypatch.setattr(ccsd.backend, 'pullback_matrices', replay)
 
     def run(include_baseline=True, indices=(0, 1), with_grad=True, mf=.2, common=-.1,
-            vvvv_direct=False):
+            matrix_kind='D', matrix_controls=None, vvvv_direct=False):
+        matrix = controls if matrix_controls is None else matrix_controls
+        static.matrix_kind = matrix_kind
+        expected_energy_bar[0] = float(include_baseline and matrix_kind == 'W')
         state = dict(mf=jnp.asarray(mf), common=jnp.asarray(common), energy=jnp.zeros(()),
                      variance=0., mf_bar=jnp.asarray(.17), common_bar=jnp.asarray(-.23))
-        rows = ccsd._run_group(state, static, group, controls, controls,
+        rows = ccsd._run_group(state, static, group, controls, matrix,
             with_grad=with_grad, verbose_imp=0, ccsd_t=True,
             include_baseline=include_baseline, fragment_indices=indices,
             vvvv_direct=vvvv_direct)
         return state, rows
 
     return SimpleNamespace(run=run, preparations=preparations, packets=packets,
-                           replays=replays, prepare=prepare, fragment=fragment)
+                           replays=replays, prepare=prepare, fragment=fragment,
+                           baseline_calls=baseline_calls, events=events)
+
+
+@pytest.mark.parametrize('include_baseline', [False, True])
+@pytest.mark.parametrize('indices', [(0, 1), (1,), ()])
+@pytest.mark.parametrize('mode', ['deterministic', 'stochastic'])
+def test_w_energy_is_reversed_with_downstream_lis_bars(group_case, include_baseline, indices, mode):
+    case = group_case
+    # Exact cores keep the finite-difference oracle independent of changing
+    # stochastic allocations; the sampled replay itself is tested separately.
+    matrix = dict(mode=mode, threads=1)
+    if mode == 'stochastic':
+        matrix.update(domain_tau=1e-100, virtual_domain_tau=1e-100,
+            pair_pilot_samples=16, min_samples=16, matrix_tolerance=.03)
+    options = dict(matrix_kind='W', matrix_controls=matrix,
+        include_baseline=include_baseline, indices=indices)
+    state, rows = case.run(**options)
+    assert case.baseline_calls == []
+    assert case.replays == ([0, 1] if include_baseline else list(indices))
+    assert [row.fragment_index for row in rows] == list(indices)
+    for index in indices:
+        assert case.events.index(('correction', index)) < case.events.index(('pullback', index))
+    assert len(case.preparations[0]) == int(include_baseline or bool(indices))
+    if include_baseline:
+        x = {k: np.asarray(v) for k, v in case.prepare(.2, -.1).items()}
+        oracle = ccsd.backend.solve(x, dict(target_indices=(0, 1)),
+            ccsd.driver._driver_controls({'mode': 'deterministic'}), with_grad=False)
+        np.testing.assert_allclose(state['baseline_energy'], oracle['energy'], atol=2e-12)
+        assert state['variance'] == 0.
+    step = 1e-5
+    for name, dm, dc, initial in [('mf_bar', step, 0., .17), ('common_bar', 0., step, -.23)]:
+        plus, _ = case.run(**options, with_grad=False, mf=.2+dm, common=-.1+dc)
+        minus, _ = case.run(**options, with_grad=False, mf=.2-dm, common=-.1-dc)
+        np.testing.assert_allclose(state[name] - initial,
+            (plus['energy']-minus['energy'])/(2*step), atol=2e-9, rtol=2e-7)
 
 
 @pytest.mark.parametrize('include_baseline,indices,with_grad', [

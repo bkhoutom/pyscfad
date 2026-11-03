@@ -1,4 +1,4 @@
-"""Physical Boys-fragment CCSD(T) corrections to the separately controlled STC baseline.
+"""Physical Boys-fragment CCSD(T) corrections with shared W energy.
 
 Discrete domains and LIS ranks are fixed. Native D/W chooses each LIS in its
 STC frame; the shared Python solver retains the original Boys energy target.
@@ -24,7 +24,7 @@ from .domain import build_boys_ed_frame
 from .protocol import validate_full_result, validate_input_cotangents
 
 
-CC_SELECTIONS_SCHEMA_VERSION = 6
+CC_SELECTIONS_SCHEMA_VERSION = 7
 
 
 @dataclass(frozen=True)
@@ -73,7 +73,7 @@ class FragmentComponents:
 
 @dataclass(frozen=True)
 class CCSDComponents:
-    """Forward correlation accounting; matrix energies are diagnostics only."""
+    """Correlation accounting; W supplies its own strong-domain MP2 energy."""
     e_mp2_base: float
     e_mp2_weak: float
     fragments: tuple
@@ -110,7 +110,11 @@ def _normalize_controls(baseline_controls, matrix_controls, matrix_kind):
     baseline = driver._driver_controls(baseline_controls, scope='domain')
     baseline.setdefault('mode', 'deterministic')
     baseline.setdefault('global_seed', 0)
-    return baseline, normalize_matrix_controls(matrix_controls, matrix_kind)
+    matrix = normalize_matrix_controls(matrix_controls, matrix_kind)
+    if matrix_kind == 'W' and any(not numpy.array_equal(baseline[key], matrix[key])
+                                 for key in ('laplace_roots', 'laplace_weights')):
+        raise ValueError('W supplies the MP2 energy; baseline and matrix Laplace grids must match')
+    return baseline, matrix
 
 
 def _scientific_identity(baseline, matrix):
@@ -390,6 +394,30 @@ def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
 def _run_group(state, static, group, baseline_controls, matrix_controls, *,
                with_grad, verbose_imp, ccsd_t, triples_controls=None,
                include_baseline=True, fragment_indices=None, vvvv_direct=False):
+    """Optionally join all local DF producer responses for this domain."""
+    from pyscfad.lno import _df_shared
+    options = dict(with_grad=with_grad, verbose_imp=verbose_imp, ccsd_t=ccsd_t,
+                   triples_controls=triples_controls, include_baseline=include_baseline,
+                   fragment_indices=fragment_indices, vvvv_direct=vvvv_direct)
+    if not (with_grad and _df_shared.enabled() and hasattr(state['mf'], 'mol')):
+        return _run_group_responses(state, static, group, baseline_controls,
+                                    matrix_controls, **options)
+    atoms = static.mp2_static.fragments[group.representative_index].extended_atoms
+    with _df_shared.reverse_scope(state['mf'], atoms) as shared:
+        records = _run_group_responses(state, static, group, baseline_controls,
+                                       matrix_controls, **options)
+        with resource_profile.section('stc.cc.shared_df_integral_pullback',
+                                      frag=group.representative_index+1):
+            coords = shared.finish()
+            state['mf_bar'].mol.coords = state['mf_bar'].mol.coords + np.asarray(coords)
+            jax.block_until_ready(state['mf_bar'].mol.coords)
+        driver.lib.logger.info(state['mf'], 'Shared local DF reverse: %s', shared.receipt)
+    return records
+
+
+def _run_group_responses(state, static, group, baseline_controls, matrix_controls, *,
+                        with_grad, verbose_imp, ccsd_t, triples_controls=None,
+                        include_baseline=True, fragment_indices=None, vvvv_direct=False):
     """Complete one owned group's preparation, baseline and physical-fragment responses.
 
     All process-local VJPs and matrix replay records are consumed here. Only
@@ -402,7 +430,8 @@ def _run_group(state, static, group, baseline_controls, matrix_controls, *,
     metadata = {'fragment_id': group.representative_index,
                 'target_indices': group.target_indices}
     input_bars = None
-    if include_baseline:
+    baseline_from_w = include_baseline and static.matrix_kind == 'W'
+    if include_baseline and not baseline_from_w:
         with resource_profile.section('stc.cc.baseline'):
             baseline = backend.solve(host, metadata, baseline_controls, with_grad=with_grad)
         state['energy'] = state['energy'] + baseline['energy']
@@ -415,12 +444,38 @@ def _run_group(state, static, group, baseline_controls, matrix_controls, *,
         del baseline
     records = []
     for index, targets in _group_cc_fragments(static, group):
-        if fragment_indices is not None and index not in fragment_indices:
+        correct_fragment = fragment_indices is None or index in fragment_indices
+        if not correct_fragment and not baseline_from_w:
             continue
         with resource_profile.section('stc.cc.matrix_forward', frag=index+1):
             forward = backend.solve_matrices(
                 host, {'fragment_id': index, 'target_indices': targets},
                 matrix_controls, matrix_kind=static.matrix_kind)
+        if baseline_from_w:
+            # W already supplies the deterministic or sampled MP2 energy.
+            # Seed its derivative only after downstream LIS bars are known.
+            state['energy'] = state['energy'] + forward['energy']
+            state['baseline_energy'] = state.get('baseline_energy', 0.) + float(forward['energy'])
+            state['variance'] += float(forward['diagnostics']['energy_standard_error']) ** 2
+        if not correct_fragment:
+            # Restricting CC corrections must still retain the complete MP2
+            # baseline, including physical fragments without a selected LIS.
+            if with_grad:
+                with resource_profile.section('stc.cc.matrix_pullback', frag=index+1):
+                    bars = backend.pullback_matrices(
+                        host, forward, energy_bar=1.,
+                        occupied_bar=numpy.zeros_like(host['foo']),
+                        virtual_bar=numpy.zeros_like(host['fvv']))
+                validate_input_cotangents(bars, inputs)
+                if input_bars is None:
+                    input_bars = {name: numpy.array(value, dtype=numpy.float64, copy=True)
+                                  for name, value in bars.items()}
+                else:
+                    for name in inputs:
+                        input_bars[name] += bars[name]
+                del bars
+            del forward
+            continue
         matrices = {name: np.asarray(forward[name]) for name in ('occupied', 'virtual')}
         local_triples = _fragment_triples_controls(triples_controls, index)
         def correction(mf, common, blocks):
@@ -447,7 +502,7 @@ def _run_group(state, static, group, baseline_controls, matrix_controls, *,
             driver._add_bars(state, mf_bar, common_bar)
             with resource_profile.section('stc.cc.matrix_pullback', frag=index+1):
                 bars = backend.pullback_matrices(
-                    host, forward, energy_bar=0., occupied_bar=matrix_bars['occupied'],
+                    host, forward, energy_bar=float(baseline_from_w), occupied_bar=matrix_bars['occupied'],
                     virtual_bar=matrix_bars['virtual'])
             validate_input_cotangents(bars, inputs)
             if input_bars is None:

@@ -27,6 +27,7 @@ from pyscfad import numpy as np
 from pyscfad.ao2mo import _ao2mo
 from pyscfad.df import _cderi_vjp
 from pyscfad.df import _int3c_cross_opt
+from ._profile import _vjp_progress_section
 
 
 def _env_flag(name, default=False):
@@ -92,6 +93,14 @@ def _local_direct_nr_e2_impl(mol, auxmol, mo_coeff, max_memory, orbs_slice):
     coeff_k = numpy.asarray(jax.device_get(mo_coeff[:, k0:k1]), order='F')
     coeff_l = numpy.asarray(jax.device_get(mo_coeff[:, l0:l1]), order='F')
     nkl = int(coeff_k.shape[1] * coeff_l.shape[1])
+    # PySCF's MP2 helper reuses an AO-pair buffer for its MO output.  An
+    # all-pair CC transform can be wider, especially after AO projection.
+    # Stream those transforms into their own result instead of overflowing
+    # that buffer.  The usual occupied-virtual path remains unchanged.
+    if nkl > mol.nao * (mol.nao + 1) // 2:
+        return _local_direct_wide_nr_e2(
+            mol, auxmol, mo_coeff, max_memory, orbs_slice,
+        )
     effective_memory = _local_direct_effective_max_memory(
         max_memory, auxmol.nao, nkl
     )
@@ -104,6 +113,35 @@ def _local_direct_nr_e2_impl(mol, auxmol, mo_coeff, max_memory, orbs_slice):
         log=pyscf_lib.logger.new_logger(mol),
     )
     return np.asarray(numpy.asarray(ovl.T))
+
+
+def _local_direct_wide_nr_e2(mol, auxmol, mo_coeff, max_memory, orbs_slice):
+    """Shell-blocked transform when MO pairs outnumber packed AO pairs."""
+    from pyscf.ao2mo import _ao2mo as pyscf_ao2mo
+
+    k0, k1, l0, l1 = map(int, orbs_slice)
+    nkl = (k1 - k0) * (l1 - l0)
+    npair = mol.nao * (mol.nao + 1) // 2
+    coeff = numpy.asarray(jax.device_get(mo_coeff), order='F')
+    metric = numpy.asarray(jax.device_get(auxmol.intor('int2c2e', hermi=1)))
+    low = scipy_linalg.cholesky(metric, lower=True, check_finite=False)
+    del metric
+    result = numpy.empty((auxmol.nao, nkl), order='F')
+    available_bytes = max(0., (float(max_memory)
+        - pyscf_lib.current_memory()[0]) * 1e6 - result.nbytes)
+    block_bytes = min(_local_direct_int3c_block_mb() * 1024**2,
+                      .7 * available_bytes)
+    rows = max(1, int(block_bytes // (8 * (npair + nkl))))
+    for p0, p1, raw in _local_direct_raw_int3c_blocks(
+            mol, auxmol, z_aux_block_max_rows=rows):
+        result[p0:p1] = pyscf_ao2mo.nr_e2(
+            numpy.ascontiguousarray(raw), coeff, orbs_slice,
+            aosym='s2', mosym='s1',
+        )
+    del raw
+    return np.asarray(scipy_linalg.solve_triangular(
+        low, result, lower=True, overwrite_b=True, check_finite=False,
+    ))
 
 
 def _local_direct_raw_int3c_blocks(
@@ -274,22 +312,35 @@ def _local_direct_nr_e2_bwd(max_memory, orbs_slice, res, fitted_mo_bar):
     # Consume the metric tape before streaming the three-center integrals.
     # Its pullback uses only the lower triangle of the factor cotangent.
     _cderi_vjp._zero_strict_upper_inplace(low_bar)
+    from ._df_shared import defer_geometry
+    if defer_geometry(mol, auxmol, mo_coeff, z, low_bar, orbs_slice):
+        # Coefficient bars must remain immediate: LIS orbital derivatives
+        # determine the W cotangent that later joins this domain's response.
+        del metric_pullback, low_bar
+        with _vjp_progress_section('local DF MO-coeff backward'):
+            mo_coeff_bar = _local_direct_mo_coeff_vjp(
+                mol, auxmol, mo_coeff, z, orbs_slice)
+        return (_cderi_vjp._coords_tree_like(mol, numpy.zeros((mol.natm, 3))),
+                _cderi_vjp._coords_tree_like(auxmol, numpy.zeros((auxmol.natm, 3))),
+                mo_coeff_bar)
     aux_metric_bar = metric_pullback(np.asarray(low_bar))[0]
     del metric_pullback, low_bar
 
-    mo_coeff_bar = _local_direct_mo_coeff_vjp(
-        mol, auxmol, mo_coeff, z, orbs_slice
-    )
-    mol_bar, auxmol_bar = _cderi_vjp._int3c_mo_deriv_coords_vjp(
-        mol,
-        auxmol,
-        mo_coeff,
-        z,
-        orbs_slice,
-        int3c=mol._add_suffix('int3c2e'),
-        aosym='s2ij',
-        block_memory_mb=_local_direct_int3c_block_mb(),
-    )
+    with _vjp_progress_section('local DF MO-coeff backward'):
+        mo_coeff_bar = _local_direct_mo_coeff_vjp(
+            mol, auxmol, mo_coeff, z, orbs_slice
+        )
+    with _vjp_progress_section('local DF integral derivative backward'):
+        mol_bar, auxmol_bar = _cderi_vjp._int3c_mo_deriv_coords_vjp(
+            mol,
+            auxmol,
+            mo_coeff,
+            z,
+            orbs_slice,
+            int3c=mol._add_suffix('int3c2e'),
+            aosym='s2ij',
+            block_memory_mb=_local_direct_int3c_block_mb(),
+        )
     del z
 
     auxmol_bar = _tree_add(auxmol_bar, aux_metric_bar)

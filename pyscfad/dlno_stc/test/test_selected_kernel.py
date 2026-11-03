@@ -71,6 +71,40 @@ def test_group_additivity_all_targets_system_and_directional_reverse():
         np.testing.assert_allclose(np.sum(rows[1]['cotangents'][key]*direction), finite, rtol=2e-7, atol=2e-10)
 
 
+@pytest.mark.parametrize('cache_targets', [1, 2, 4])
+@pytest.mark.parametrize('with_grad', [False, True])
+def test_shared_point_transforms_and_reverse_independent_of_gram_cache(cache_targets, with_grad):
+    """Multiple selected targets require one propagation/reverse per point."""
+    from pyscfad.dlno_stc.controls import default_laplace_grid
+    rng = np.random.default_rng(714)
+    foo = rng.normal(size=(4, 4)) * .015
+    fvv = rng.normal(size=(5, 5)) * .015
+    x = dict(foo=(foo + foo.T) / 2 - np.eye(4),
+             fvv=(fvv + fvv.T) / 2 + .5 * np.eye(5),
+             B=rng.normal(size=(7, 4, 5)) * .1)
+    roots, weights = default_laplace_grid()
+    controls = dict(mode='deterministic', laplace_roots=roots, laplace_weights=weights,
+                    target_batch_size=cache_targets, threads=2)
+    targets = (3, 0, 2)
+    result = solve(x, targets, controls, with_grad=with_grad)
+    expected, bars = jax.value_and_grad(reference)(x, controls, targets)
+    np.testing.assert_allclose(result['energy'], expected, rtol=2e-11, atol=2e-13)
+    profile = result['diagnostics']
+    assert profile['propagation_calls'] == len(roots)
+    assert profile['backprop_calls'] == (len(roots) if with_grad else 0)
+    assert profile['cached_targets'] == min(len(targets), cache_targets)
+    assert all(value >= 0 for value in profile['timings_seconds'].values())
+    if with_grad:
+        for key in KEYS:
+            expected_bar = np.asarray(bars[key])
+            if key != 'B':
+                expected_bar = (expected_bar + expected_bar.T) / 2
+            np.testing.assert_allclose(result['cotangents'][key], expected_bar,
+                                       rtol=2e-10, atol=2e-12)
+    else:
+        assert 'cotangents' not in result
+
+
 @pytest.mark.parametrize('targets', [(), (0, 0), (-1,), (2,), (True,), (np.bool_(True),), (10**100,), (1.,), [0], None])
 def test_invalid_target_labels(targets):
     with pytest.raises((ValueError, TypeError)):

@@ -191,3 +191,55 @@ def test_nonstationary_scf_response_preconditioned_gradient_agrees(monkeypatch):
     assert counts['setup'] == 1 and counts['apply'] > 0
     np.testing.assert_allclose(value_on, value_off, atol=1e-12, rtol=0)
     np.testing.assert_allclose(grad_on.coords, grad_off.coords, atol=2e-8, rtol=2e-8)
+
+
+def test_ooc_benchmark_response_preserves_budgets_and_gradient(tmp_path, monkeypatch):
+    """Exercise the actual eager/OOC path with opt=False and RSS > workspace."""
+    import h5py
+    reference, _, _ = _packed_reference()
+    path = tmp_path / 'reference.h5'
+    with h5py.File(path, 'w') as handle:
+        handle['j3c'] = np.asarray(reference.with_df._cderi)
+    dm0 = np.asarray(reference.make_rdm1())
+    mol = reference.mol
+    weights = jax.numpy.asarray(np.random.default_rng(892).normal(size=(mol.nao, mol.nao)) * .02)
+    monkeypatch.setattr(_df_jk_opt.lib, 'current_memory', lambda: (20., 0.))
+    monkeypatch.setenv('PYSCFAD_PRECOND_CACHE_MEMORY_MB', str(100e6 / 1024**2))
+    original = _df_jk_opt.gen_coulomb_precond
+    setups = []
+
+    def counted(obj, *args):
+        # DF attributes must survive implicit differentiation's pytree copies.
+        assert obj.max_memory == obj.precond_workspace_memory == 1
+        assert obj.precond_total_memory == 100
+        result = original(obj, *args)
+        assert result is not None
+        setups.append(True)
+        return result
+
+    monkeypatch.setattr(_df_jk_opt, 'gen_coulomb_precond', counted)
+
+    def objective(m):
+        mf = scf.RHF(m).density_fit(auxbasis='weigend')
+        mf.with_df.incore = False
+        mf.with_df.max_memory = 1
+        mf.with_df.precond_total_memory = 100
+        mf.with_df.precond_workspace_memory = 1
+        mf.with_df.attach_outcore_cderi(str(path))
+        mf.conv_tol, mf.conv_tol_grad = 1e-12, 1e-8
+        with eager_gmres():
+            mf.kernel(dm0=dm0)
+        projections = jax.numpy.sum(weights * mf.mo_coeff, axis=0)
+        return mf.e_tot + jax.numpy.vdot(projections, projections).real
+
+    with (config_update('pyscfad_moleintor_opt', False),
+          config_update('pyscfad_scf_implicit_diff', True),
+          config_update('pyscfad_scf_first_order_custom', False)):
+        with config_update('pyscfad_scf_df_precond', False):
+            off_value, off_grad = jax.value_and_grad(objective)(mol)
+        assert not setups
+        with config_update('pyscfad_scf_df_precond', True):
+            on_value, on_grad = jax.value_and_grad(objective)(mol)
+    assert len(setups) == 1
+    np.testing.assert_allclose(on_value, off_value, atol=1e-12, rtol=0)
+    np.testing.assert_allclose(on_grad.coords, off_grad.coords, atol=2e-8, rtol=2e-8)

@@ -10,6 +10,12 @@ from pyscfad import gto
 from pyscfad.df import incore
 
 
+@pytest.fixture(params=[False, True])
+def integral_blocking(request, monkeypatch):
+    if request.param:
+        monkeypatch.setattr(incore.moleintor, '_INT3C_MAX_COMPONENT_SIZE', 600)
+
+
 def _molecules(cart):
     atom = 'O 0.1 0.0 0.0; H 0.0 -0.8 0.6; H 0.0 0.7 0.5'
     mol = gto.Mole(atom=atom, unit='Bohr', cart=cart, verbose=0,
@@ -26,7 +32,8 @@ def _molecules(cart):
 @pytest.mark.parametrize('cart', [False, True])
 @pytest.mark.parametrize('intor,comp', [('int3c2e', 1),
                                        ('int3c2e_ip1', 3), ('int3c2e_ip2', 3)])
-def test_coordinate_response_matches_finite_difference_and_adjoint(cart, intor, comp):
+def test_coordinate_response_matches_finite_difference_and_adjoint(cart, intor, comp,
+                                                                  integral_blocking):
     mol, aux = _molecules(cart)
     rng = numpy.random.default_rng(910)
     coordinates = (mol.coords, aux.coords)
@@ -60,7 +67,7 @@ def test_coordinate_response_matches_finite_difference_and_adjoint(cart, intor, 
     numpy.testing.assert_allclose(translated, 0., atol=2e-11)
 
 
-def test_coordinate_hessian_vector_matches_gradient_difference():
+def test_coordinate_hessian_vector_matches_gradient_difference(integral_blocking):
     mol, aux = _molecules(False)
     rng = numpy.random.default_rng(911)
     seed = jnp.asarray(rng.normal(size=(mol.nao, mol.nao, aux.nao)))

@@ -419,6 +419,17 @@ py::dict solve_selected(py::handle foo, py::handle fvv, py::handle B,
     result["energy"]=out.energy; result["energy_standard_error"]=out.energy_standard_error;
     diagnostics["mode"]=mode; diagnostics["global_seed"]=settings.global_seed;
     diagnostics["energy_identity"]="boys_target_laplace_mp2_v1";
+    if (!settings.stochastic) {
+        diagnostics["propagation_calls"]=out.propagation_calls;
+        diagnostics["backprop_calls"]=out.backprop_calls;
+        diagnostics["cached_targets"]=out.cached_targets;
+        py::dict timings;
+        timings["bare_integrals"]=out.bare_integrals_seconds;
+        timings["propagation"]=out.propagation_seconds;
+        timings["contraction"]=out.contraction_seconds;
+        timings["backpropagation"]=out.backprop_seconds;
+        diagnostics["timings_seconds"]=timings;
+    }
     diagnostics["target_indices"]=targets;
     diagnostics["seed_explicit"]=selected_controls.has_global_seed;
     diagnostics["sampling_proposal"]="source_separate_bare_dressed_support_floors";

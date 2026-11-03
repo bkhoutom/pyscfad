@@ -134,6 +134,21 @@ energy = ccsd.kernel(mf, selected, baseline_controls=baseline_controls,
                      matrix_controls=matrix_controls)
 ```
 
+For `matrix_kind="W"`, the CCSD driver uses the energy returned by W
+construction for the strong-domain MP2 term. It does not run a separate MP2
+energy/gradient solver. With the current normalization,
+`E = (trace(Wo) + trace(Wv))/2`; deterministically both traces equal E.
+Stochastic E and W use the same production samples, with covariance included
+in the reported MP2 energy SE. After the LIS CCSD(T) response, one matrix
+pullback combines `energy_bar=1` with the occupied/virtual W cotangents. Direct
+Fock and orbital cotangents from the LIS response are accumulated through their
+own preparation paths. No energy derivative is computed during W sampling.
+Weak-pair MP2 terms are still added separately, once. `include_baseline=False`
+sets the W energy seed to zero and returns only the selected CC corrections.
+For W, `matrix_controls` determines strong-domain energy precision;
+`baseline_controls` remains part of preparation configuration, and the two
+Laplace grids must match. D calculations retain their independent MP2 solver.
+
 The fit uses 600 single-gap points and three positive least-squares starts.
 Diagnostics include fitting seconds, exact molecular denominator bounds,
 histogram-weighted energy RMS, Delta-scaled derivative RMS (without lambda),
@@ -300,7 +315,7 @@ Matrix controls are separate from the established stochastic energy controls:
 | --- | --- |
 | `mode`, `laplace_roots`, `laplace_weights` | Deterministic or stochastic; the existing six-point grid is the default. Stochastic D/W requires strictly positive weights. |
 | `global_seed`, `threads` | Explicit seed and native thread count; matrix default threads is 1. Seeds are derived per fragment and batch. |
-| `target_batch_size` | Explicit target batch, default 1; full orbital spaces are retained. |
+| `target_batch_size` | Default `None` shares one native call across all targets in the physical fragment. An explicit positive integer caps the batch for memory constraints; full orbital spaces are retained. |
 | `memory_limit_mb` | Optional advisory budget in decimal MB for current RSS plus estimated additional matrix workspace. Exceedance warns and continues. Checks run before both forward and reverse host/native allocations; diagnostics include the breakdown and estimated process peak (unknown when RSS is unavailable). |
 | `auxiliary_group_size` | Default 32 rows per group when `aux_offsets` is omitted; an explicit partition takes precedence and is included in memory/replay accounting. |
 | `matrix_tolerance` | Stochastic D/W Frobenius SE target for each summed matrix, default `1e-4`. Inspect measured SEs and `target_met`; allocation is not an attainment guarantee. |
@@ -315,6 +330,11 @@ unknown settings. Those existing controls continue to work on the separate
 stochastic energy solver. New deterministic energy calls accept
 `target_batch_size` and optional `threads`; stochastic energy uses the existing
 OpenMP settings and rejects these new deterministic-only controls.
+For standalone deterministic selected energy, `target_batch_size` bounds the
+bare-integral target cache (default 1). All targets share each point's forward
+transformation and accumulated reverse regardless of that cache size. Uncached
+bare pair integrals are rebuilt in worker-local scratch. Diagnostics expose
+transformation/reverse counts and the kernel timing sections.
 
 The STC packet, finite-domain, system and D/W matrix memory guards treat
 `max_memory` and `memory_limit_mb` as advisory. They warn when a conservative

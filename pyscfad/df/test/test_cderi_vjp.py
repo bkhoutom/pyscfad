@@ -521,6 +521,60 @@ def test_nr_e2_mo_coeff_vjp_from_local_cderi_source(tmp_path):
     assert numpy.allclose(mo_coeff_bar, mo_coeff_bar_ref, atol=1e-10, rtol=1e-10)
 
 
+@pytest.mark.parametrize('native', [False, True])
+def test_local_mo_reverse_respects_total_and_workspace_budgets(tmp_path, monkeypatch, native):
+    from contextlib import contextmanager
+    from pyscfad import config_update
+    rng = numpy.random.default_rng(830)
+    naux, nao, local_nao, nmo = 37, 5, 3, 4
+    coeff = rng.normal(size=(local_nao, nmo))
+    orbs = (0, 2, 1, 4)
+    cderi = rng.normal(size=(naux, nao*(nao+1)//2))
+    seed = rng.normal(size=(naux, 6))
+    ao_idx = numpy.array([0, 2, 4])
+    rows, cols = numpy.tril_indices(local_nao)
+    pairs = ao_idx[rows]*(ao_idx[rows]+1)//2 + ao_idx[cols]
+    _, pullback = jax.vjp(
+        lambda c: _ao2mo.nr_e2(np.asarray(cderi[:, pairs]), c, orbs, aosym='s2'),
+        np.asarray(coeff))
+    expected = numpy.asarray(pullback(np.asarray(seed))[0])
+    path = tmp_path/'slabs.h5'
+    with h5py.File(path, 'w') as f:
+        f.create_dataset('j3c', data=cderi)
+    reads = []
+    load = _cderi_vjp.df_addons.load
+
+    @contextmanager
+    def slice_only_source(*args, **kwargs):
+        with load(*args, **kwargs) as dataset:
+            class Source:
+                shape = dataset.shape
+                def __getitem__(self, key):
+                    assert all(isinstance(x, slice) for x in key)
+                    block = dataset[key]
+                    reads.append(block.shape[0])
+                    return block
+            yield Source()
+
+    monkeypatch.setattr(_cderi_vjp.df_addons, 'load', slice_only_source)
+    monkeypatch.setattr(_cderi_vjp.pyscf_lib, 'current_memory', lambda: (40000., 40000.))
+    for total_budget, tight in ((50000., False), (40000.001, True)):
+        reads.clear()
+        with config_update('pyscfad_moleintor_opt', native):
+            actual = _cderi_vjp.nr_e2_mo_coeff_vjp_from_cderi_source(
+                str(path), coeff, seed, orbs, pair_idx=tuple(pairs),
+                max_memory=total_budget, workspace_memory_mb=.002)
+        numpy.testing.assert_allclose(actual, expected, atol=1e-10, rtol=1e-10)
+        assert sum(reads) == naux
+        # Account for contiguous source, gathered local pairs and seed rows.
+        assert max(reads)*8*(15+6+6) <= 2000
+        if tight:
+            assert max(reads) < 4
+        else:
+            # Resident CC memory must not collapse the separate workspace cap.
+            assert max(reads) > 4
+
+
 def test_local_cderi_bar_disk_scatter_matches_pair_projection(tmp_path):
 
     rng = numpy.random.default_rng(141)

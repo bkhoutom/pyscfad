@@ -9,6 +9,7 @@ from dataclasses import asdict
 import faulthandler
 import gc
 import json
+import math
 import os
 from pathlib import Path
 import time
@@ -22,6 +23,8 @@ faulthandler.enable()
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--scf-df-precond", action="store_true",
+                        help="Enable host SCF response preconditioning with separate total/workspace budgets")
     parser.add_argument("--threads", type=int, required=True,
                         help="CPU affinity budget and numerical worker count")
     parser.add_argument("--xyz-file", type=Path, required=True)
@@ -35,8 +38,16 @@ def main():
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--pilot-samples", type=int, default=20000)
     parser.add_argument("--max-memory-mb", type=float, default=800000)
+    parser.add_argument("--df-storage", choices=("incore", "outcore"), default="incore",
+                        help="store DF factors in RAM or stream them and their response from disk")
+    parser.add_argument("--df-memory-mb", type=float, default=4000,
+                        help="working-memory budget for streamed DF operations")
     parser.add_argument("--cc-conv-tol", type=float, default=1e-7)
     parser.add_argument("--cc-conv-tol-normt", type=float, default=1e-5)
+    parser.add_argument("--lno-thresh-occ", type=float, default=1e-4,
+                        help="occupied W-eigenvalue cutoff for LIS selection")
+    parser.add_argument("--lno-thresh-vir", type=float, default=1e-5,
+                        help="virtual W-eigenvalue cutoff for LIS selection")
     parser.add_argument("--triples-method", choices=("conventional", "smooth"),
                         default="smooth")
     parser.add_argument("--smooth-laplace-points", type=int, default=10)
@@ -54,11 +65,16 @@ def main():
     if not (0 < args.cc_conv_tol < float("inf")
             and 0 < args.cc_conv_tol_normt < float("inf")):
         parser.error("CCSD convergence tolerances must be finite and positive")
+    if not all(math.isfinite(x) and x >= 0
+               for x in (args.lno_thresh_occ, args.lno_thresh_vir)):
+        parser.error("LIS cutoffs must be finite and nonnegative")
     if args.deterministic_only and args.reference:
         parser.error("--deterministic-only computes a new reference; omit --reference")
     if args.triples_method == "conventional" and not args.deterministic_only:
         parser.error("conventional is a deterministic reference only; use smooth for sampling")
     frame_mode = "full" if args.triples_method == "smooth" else None
+    if not math.isfinite(args.df_memory_mb) or args.df_memory_mb <= 0:
+        parser.error("DF memory budget must be finite and positive")
     if any(x <= 0 for x in args.targets_meh) or len(set(args.targets_meh)) != len(args.targets_meh):
         parser.error("targets must be positive and distinct")
     if any(x < 0 for x in args.seeds) or len(set(args.seeds)) != len(args.seeds):
@@ -77,7 +93,19 @@ def main():
     from pyscfad.dlno_stc import ccsd
     from pyscfad.dlno_stc.laplace import make_laplace_grid
     from pyscfad.lno.ccsd import RCCSD
+    from pyscfad.tools.linear_solver import eager_gmres
 
+    pyscfad.config.update('pyscfad_scf_df_precond', args.scf_df_precond)
+    if args.scf_df_precond:
+        # Public CLI totals are decimal MB; this legacy cache cap uses MiB.
+        # The preconditioner further limits storage to half actual headroom.
+        os.environ.setdefault('PYSCFAD_PRECOND_CACHE_MEMORY_MB',
+                              str(args.max_memory_mb * 1e6 / 1024**2))
+
+    # Molecule grouping intentionally defines a single full molecular domain
+    # (C5H6). Atom-grouped alkanes use the physical domain/pair cutoffs.
+    force_full_domains = args.boys_grouping == "molecule"
+    domain_thresholds = dlno_stc.BoysDomainThresholds()
     snapshot_root = os.environ.get("LNO_BENCHMARK_SOURCE_ROOT")
     if snapshot_root and not Path(pyscfad.__file__).resolve().is_relative_to(Path(snapshot_root).resolve()):
         raise RuntimeError("benchmark did not import its pinned source snapshot")
@@ -89,9 +117,14 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     if (output / "settings.json").exists():
         previous = json.loads((output / "settings.json").read_text())
+        if previous.get('scf_df_precond', False) != args.scf_df_precond:
+            raise ValueError('SCF preconditioning differs; use a new output directory')
         requested = dict(cc_conv_tol=args.cc_conv_tol,
                          cc_conv_tol_normt=args.cc_conv_tol_normt,
+                         lno_thresh_occ=args.lno_thresh_occ,
+                         lno_thresh_vir=args.lno_thresh_vir,
                          triples_mode=args.triples_method,
+                         force_full_domains=force_full_domains,
                          cpu_affinity=benchmark_cpus, threads=args.threads)
         if previous.get("smooth_frame_mode", "clustered") != frame_mode:
             raise ValueError("smooth frame mode differs from existing results; use a new output directory")
@@ -102,6 +135,10 @@ def main():
         for key, value in requested.items():
             if previous.get(key) != value:
                 raise ValueError(f"{key} differs from existing results; use a new output directory")
+        if (previous.get("df_storage", "incore") != args.df_storage or
+                (args.df_storage == "outcore" and
+                 previous.get("df_memory_mb") != args.df_memory_mb)):
+            raise ValueError("DF storage settings differ; use a new output directory")
     xyz = args.xyz_file.resolve()
     started = time.perf_counter()
 
@@ -129,36 +166,97 @@ def main():
     if args.boys_grouping == "molecule":
         assert elements == ["C"] * 5 + ["H"] * 6
     else:
-        assert elements.count("C") == 20 and elements.count("H") == 42
+        carbons = elements.count("C")
+        hydrogens = elements.count("H")
+        if carbons < 2 or hydrogens != 2 * carbons + 2 or carbons + hydrogens != len(elements):
+            raise ValueError("atom-grouped alkane benchmark requires C_n H_(2n+2)")
     refmol = pgto.M(atom=str(xyz), basis=basis, unit="Angstrom",
                      max_memory=args.max_memory_mb, verbose=0)
     ref = pscf.RHF(refmol).density_fit(auxbasis=auxbasis)
+    cderi_path = output / "scf_cderi.h5" if args.df_storage == "outcore" else None
+    df_setup_seconds = None
+    if cderi_path is not None:
+        # The response primitives require a single packed j3c dataset.
+        # Build it once at this geometry and attach it to each traced SCF;
+        # their custom VJPs still differentiate the integrals and metric.
+        ref.with_df._compatible_format = True
+        ref.with_df._cderi_to_save = str(cderi_path)
+        ref.with_df.max_memory = args.df_memory_mb
+        report(f"Building disk-backed DF factors; working-memory budget {args.df_memory_mb:g} MB")
+        stage_start = time.perf_counter()
+        ref.with_df.build()
+        df_setup_seconds = time.perf_counter() - stage_start
+        report(f"DF factors ready in {df_setup_seconds:.1f} s")
     ref.conv_tol, ref.conv_tol_grad = 1e-9, 1e-6
+    stage_start = time.perf_counter()
     ref.kernel()
+    reference_scf_seconds = time.perf_counter() - stage_start
     if not ref.converged:
         raise RuntimeError("reference DF-RHF failed")
     dm0 = np.asarray(ref.make_rdm1())
+    report(f"Reference SCF complete in {reference_scf_seconds:.1f} s")
 
     def build_mf(current):
         mf = scf.RHF(current).density_fit(auxbasis=auxbasis)
+        if args.scf_df_precond:
+            mf.with_df.precond_total_memory = args.max_memory_mb
+            mf.with_df.precond_workspace_memory = args.df_memory_mb
+        if cderi_path is not None:
+            mf.with_df.incore = False
+            mf.with_df.max_memory = args.df_memory_mb
+            mf.with_df.attach_outcore_cderi(str(cderi_path))
         mf.conv_tol, mf.conv_tol_grad, mf.chkfile = 1e-9, 1e-6, None
-        mf.kernel(dm0=dm0)
+        if cderi_path is not None:
+            # The SCF response operator reads disk blocks. Construct its
+            # GMRES solver outside JIT, preserving the existing tolerances.
+            with eager_gmres():
+                mf.kernel(dm0=dm0)
+        else:
+            mf.kernel(dm0=dm0)
         if not mf.converged:
             raise RuntimeError("differentiable DF-RHF failed")
         return mf
 
+    stage_start = time.perf_counter()
     mf = build_mf(mol)
     jax.block_until_ready(mf)
+    initial_ad_scf_seconds = time.perf_counter() - stage_start
+    report(f"Initial differentiable SCF complete in {initial_ad_scf_seconds:.1f} s")
     if abs(float(ref.e_tot) - float(mf.e_tot)) > 1e-7:
         raise RuntimeError("reference and differentiable SCF disagree")
+    stage_start = time.perf_counter()
     domains = dlno_stc.build_domain_selections(
-        mf, frozen=args.frozen, force_full_domains=True,
+        mf, frozen=args.frozen, force_full_domains=force_full_domains,
+        thresholds=domain_thresholds,
         boys_grouping=args.boys_grouping,
         lo_kwargs=dict(init_guess="atomic", conv_tol=1e-10,
                        gmres_options=dict(restart=120, maxiter=100)))
-    expected_groups = 1 if args.boys_grouping == "molecule" else 20
+    domain_selection_seconds = time.perf_counter() - stage_start
+    report(f"Domain selection complete in {domain_selection_seconds:.1f} s")
+    expected_groups = 1 if args.boys_grouping == "molecule" else carbons
     if len(domains.physical_groups) != expected_groups:
         raise RuntimeError(f"expected {expected_groups} physical fragments")
+    mp2_domains = []
+    for index, members in enumerate(domains.physical_groups):
+        fragment = domains.fragments[members[0]]
+        mp2_domains.append(dict(fragment=index, target_orbitals=list(members),
+            primary_atoms=fragment.primary_atoms.tolist(),
+            extended_atoms=fragment.extended_atoms.tolist(),
+            nao=len(fragment.extended_ao_indices),
+            nocc=len(fragment.strong_occ_metric_keep),
+            nvir=len(fragment.virtual_anchor_columns)))
+    domain_report = dict(force_full_domains=force_full_domains,
+        thresholds=asdict(domains.thresholds), pair_energy_model=domains.pair_energy_model,
+        physical_fragments=expected_groups, molecular_nao=mol.nao,
+        total_active_occ=len(domains.active_occ_indices),
+        total_active_vir=len(domains.active_vir_indices),
+        full_ao_domains=sum(d['nao'] == mol.nao for d in mp2_domains),
+        weak_orbital_pairs=int(np.count_nonzero(np.triu(~domains.strong_mask, 1))),
+        fragments=mp2_domains)
+    save(output / "domain_selection.json", domain_report)
+    report(f"MP2 domain selection: force_full_domains={force_full_domains}; "
+           f"{domain_report['full_ao_domains']}/{expected_groups} domains span all AOs; "
+           f"(AO, occ, vir)={[(d['nao'], d['nocc'], d['nvir']) for d in mp2_domains]}")
     energies = np.asarray(mf.mo_energy)
     roots, weights, diagnostics = make_laplace_grid(
         energies[domains.active_occ_indices], energies[domains.active_vir_indices],
@@ -168,8 +266,10 @@ def main():
     matrix = dict(mode="deterministic", threads=args.threads,
                   memory_limit_mb=args.max_memory_mb, **grid)
     selection_start = time.perf_counter()
-    report("Starting W-LIS selection")
-    selection_options = dict(matrix_kind="W", thresh_occ=1e-4, thresh_vir=1e-5,
+    report(f"Starting W-LIS selection: occupied cutoff={args.lno_thresh_occ:g}, "
+           f"virtual cutoff={args.lno_thresh_vir:g}")
+    selection_options = dict(matrix_kind="W", thresh_occ=args.lno_thresh_occ,
+                             thresh_vir=args.lno_thresh_vir,
                              baseline_controls=baseline, matrix_controls=matrix,
                              merge_identical=True)
     selected = ccsd.build_static_selections(
@@ -188,11 +288,24 @@ def main():
     affinity = check_worker_affinity(benchmark_cpus)
     settings = dict(geometry=str(xyz), elements=elements, basis=args.basis,
                     auxbasis=auxbasis or "auto", frozen=args.frozen, boys_grouping=args.boys_grouping,
-                    force_full_domains=True, physical_fragments=expected_groups,
-                    lno_thresh_occ=1e-4, lno_thresh_vir=1e-5,
+                    force_full_domains=force_full_domains, physical_fragments=expected_groups,
+                    domain_thresholds=asdict(domains.thresholds), mp2_domains=mp2_domains,
+                    mp2_energy_source="w_matrix_trace", mp2_response="joint_energy_w_pullback",
+                    pair_energy_model=domains.pair_energy_model,
+                    lno_thresh_occ=args.lno_thresh_occ, lno_thresh_vir=args.lno_thresh_vir,
                     nao=mol.nao, lis_dimensions=dimensions, threads=args.threads,
                     cpu_affinity=benchmark_cpus, affinity_check=affinity,
                     max_memory_mb=args.max_memory_mb, cc_conv_tol=args.cc_conv_tol,
+                    df_storage=args.df_storage, df_memory_mb=args.df_memory_mb,
+                    scf_response_solver="eager_gmres" if cderi_path is not None else "default",
+                    scf_df_precond=args.scf_df_precond,
+                    scf_precond_total_memory_mb=args.max_memory_mb if args.scf_df_precond else None,
+                    scf_precond_workspace_memory_mb=args.df_memory_mb if args.scf_df_precond else None,
+                    scf_precond_cache_cap_mib=os.environ.get('PYSCFAD_PRECOND_CACHE_MEMORY_MB'),
+                    df_setup_seconds=df_setup_seconds,
+                    reference_scf_seconds=reference_scf_seconds,
+                    initial_ad_scf_seconds=initial_ad_scf_seconds,
+                    domain_selection_seconds=domain_selection_seconds,
                     cc_conv_tol_normt=args.cc_conv_tol_normt, cc_max_cycle=200,
                     targets_meh=args.targets_meh, seeds=args.seeds,
                     pilot_samples=args.pilot_samples, triples_mode=args.triples_method,
@@ -229,6 +342,10 @@ def main():
     if args.reference:
         reference = json.loads(args.reference.read_text())
         if (reference["basis"] != args.basis or reference["frozen"] != args.frozen
+                or reference.get("lno_thresh_occ") != args.lno_thresh_occ
+                or reference.get("lno_thresh_vir") != args.lno_thresh_vir
+                or reference.get("force_full_domains", True) != force_full_domains
+                or (not force_full_domains and reference.get("mp2_domains") != mp2_domains)
                 or abs(reference["hf_energy"] - float(mf.e_tot)) > 1e-8
                 or np.asarray(reference["force_eh_per_bohr"]).shape != (mol.natm, 3)
                 or [(f["nocc_lis"], f["nvir_lis"])
@@ -275,6 +392,12 @@ def main():
                       cc_conv_tol=args.cc_conv_tol,
                       cc_conv_tol_normt=args.cc_conv_tol_normt,
                       threads=args.threads,
+                      scf_df_precond=args.scf_df_precond,
+                      df_storage=args.df_storage, df_memory_mb=args.df_memory_mb,
+                      force_full_domains=force_full_domains,
+                      domain_thresholds=asdict(domains.thresholds),
+                      mp2_domains=mp2_domains,
+                      mp2_energy_source="w_matrix_trace", mp2_response="joint_energy_w_pullback",
                       triples_mode=args.triples_method,
                       smooth_frame_mode=frame_mode,
                       smooth_frame_blocks=frame_blocks,
@@ -282,7 +405,7 @@ def main():
                       code_snapshot_sha256=os.environ.get("LNO_BENCHMARK_SNAPSHOT_SHA256"),
                       selection_seconds=selection_seconds,
                       preselection_setup_seconds=selection_start-started,
-                      lno_thresh_occ=1e-4, lno_thresh_vir=1e-5,
+                      lno_thresh_occ=args.lno_thresh_occ, lno_thresh_vir=args.lno_thresh_vir,
                       elapsed_seconds=time.perf_counter()-phase,
                       completed_at_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         result.update(check_worker_affinity(benchmark_cpus))
@@ -291,6 +414,9 @@ def main():
                f"{result['elapsed_seconds']:.1f} s")
         del energy, molecule_bar, components, force, fragments
         gc.collect()
+    if cderi_path is not None:
+        cderi_path.unlink()
+        report("Removed completed run's temporary DF factors")
     report("All requested calculations complete")
 
 

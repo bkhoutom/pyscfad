@@ -271,7 +271,7 @@ def solve_matrices(inputs, metadata, controls, *, matrix_kind="D", aux_offsets=N
     arrays = host_inputs(inputs)
     saved_metadata = deepcopy(metadata)
     saved_metadata["target_indices"] = targets
-    size = settings["target_batch_size"]
+    size = settings["target_batch_size"] or len(targets)
     target_batches = [targets[first:first+size] for first in range(0, len(targets), size)]
     if not naux or not nvir:
         target_batches = []

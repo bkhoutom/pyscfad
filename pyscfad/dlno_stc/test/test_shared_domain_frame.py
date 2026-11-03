@@ -27,7 +27,7 @@ def molecular_group():
     controls = dict(accept.controls(), threads=1)
     static = ccsd.build_static_selections(
         mf, domains, matrix_kind='W', thresh_occ=1e-4, thresh_vir=3e-5,
-        baseline_controls=controls, matrix_controls=controls)
+        baseline_controls=controls, matrix_controls=controls, single_pass=False)
     group = ccsd.build_domain_groups(domains)[0]
     indices = tuple(i for i, _ in ccsd._group_cc_fragments(static, group))[:2]
     assert len(indices) == 2
@@ -139,7 +139,7 @@ def test_selection_reuses_prepared_frame(molecular_group, monkeypatch):
     selected = ccsd.build_static_selections(
         case.mf, case.static.mp2_static, matrix_kind='W', thresh_occ=1e-4, thresh_vir=3e-5,
         baseline_controls=case.controls, matrix_controls=case.controls,
-        fragment_indices=case.indices)
+        fragment_indices=case.indices, single_pass=False)
     assert counts == dict(forward=1, reverse=0)
     for index in case.indices:
         assert ccsd._fragment_dimensions(selected, index) == ccsd._fragment_dimensions(case.static, index)

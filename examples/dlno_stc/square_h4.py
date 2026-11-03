@@ -99,7 +99,7 @@ def main():
         mf, static, matrix_kind="W", thresh_occ=1e-4, thresh_vir=1e-5,
         baseline_controls=baseline, matrix_controls=matrix, merge_identical=True,
     )
-    report("W matrix and LNO spaces selected")
+    report("Single-pass W/LIS selection plan ready")
     options = dict(baseline_controls=baseline, matrix_controls=matrix,
                    matrix_kind="W", ccsd_t=True, triples_controls=triples,
                    include_hf=True, return_components=True, merge_identical=True)

@@ -123,7 +123,7 @@ def test_invalid_variance_allocations_rejected(settings):
         ccsd.normalize_triples_controls(dict(mode='stochastic', nsamples=16, **settings), ccsd_t=True)
 
 
-def test_molecular_single_pass_matches_two_pass_energy_and_full_gradient(molecular_group, monkeypatch):
+def test_default_single_pass_matches_two_pass_energy_and_full_gradient(molecular_group, monkeypatch):
     case = molecular_group
     monkeypatch.setenv('PYSCFAD_LNO_SHARED_LOCAL_DF_REVERSE', '1')
     counts = counted_frames(monkeypatch)
@@ -143,7 +143,7 @@ def test_molecular_single_pass_matches_two_pass_energy_and_full_gradient(molecul
     plan = ccsd.build_static_selections(
         case.mf, case.static.mp2_static, matrix_kind='W', thresh_occ=1e-4, thresh_vir=3e-5,
         baseline_controls=case.controls, matrix_controls=case.controls,
-        fragment_indices=case.indices, single_pass=True)
+        fragment_indices=case.indices)
     assert counts == dict(forward=0, reverse=0)
     assert forwards == reverses == []
     assert plan.mp2_fragment_energies is None
@@ -190,7 +190,7 @@ def test_public_gradient_factory_with_occupied_count_budget(molecular_group, mon
         plan = ccsd.build_static_selections(mf, case.static.mp2_static,
             matrix_kind='W', thresh_occ=1e-4, thresh_vir=3e-5,
             baseline_controls=case.controls, matrix_controls=case.controls,
-            fragment_indices=case.indices, single_pass=True)
+            fragment_indices=case.indices)
         plans.append(plan)
         return plan
 

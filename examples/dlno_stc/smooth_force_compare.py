@@ -136,7 +136,7 @@ def main():
     baseline = dict(mode='deterministic', threads=args.threads, global_seed=666, **grid)
     matrix = dict(mode='deterministic', threads=args.threads, memory_limit_mb=800000, **grid)
     selection_options = dict(matrix_kind='W', thresh_occ=args.lno_thresh_occ, thresh_vir=args.lno_thresh_vir,
-        baseline_controls=baseline, matrix_controls=matrix, merge_identical=True)
+        baseline_controls=baseline, matrix_controls=matrix, merge_identical=True, single_pass=False)
     phase = time.perf_counter()
     ordinary = ccsd.build_static_selections(mf, domains, smooth=False, **selection_options)
     setup_timings['conventional_lis_selection_seconds'] = time.perf_counter()-phase

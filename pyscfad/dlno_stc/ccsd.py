@@ -1,4 +1,4 @@
-"""Physical Boys-fragment CCSD(T) corrections to the separately controlled STC baseline.
+"""Physical Boys-fragment CCSD(T) corrections with shared W energy.
 
 Discrete domains and LIS ranks are fixed. Native D/W chooses each LIS in its
 STC frame; the shared Python solver retains the original Boys energy target.
@@ -24,7 +24,7 @@ from .domain import build_boys_ed_frame
 from .protocol import validate_full_result, validate_input_cotangents
 
 
-CC_SELECTIONS_SCHEMA_VERSION = 6
+CC_SELECTIONS_SCHEMA_VERSION = 8
 
 
 @dataclass(frozen=True)
@@ -75,7 +75,7 @@ class FragmentComponents:
 
 @dataclass(frozen=True)
 class CCSDComponents:
-    """Forward correlation accounting, including any baseline reused from W."""
+    """Correlation accounting; W supplies its own strong-domain MP2 energy."""
     e_mp2_base: float
     e_mp2_weak: float
     fragments: tuple
@@ -147,7 +147,11 @@ def _normalize_controls(baseline_controls, matrix_controls, matrix_kind):
     baseline = driver._driver_controls(baseline_controls, scope='domain')
     baseline.setdefault('mode', 'deterministic')
     baseline.setdefault('global_seed', 0)
-    return baseline, normalize_matrix_controls(matrix_controls, matrix_kind)
+    matrix = normalize_matrix_controls(matrix_controls, matrix_kind)
+    if matrix_kind == 'W' and any(not numpy.array_equal(baseline[key], matrix[key])
+                                 for key in ('laplace_roots', 'laplace_weights')):
+        raise ValueError('W supplies the MP2 energy; baseline and matrix Laplace grids must match')
+    return baseline, matrix
 
 
 def _scientific_identity(baseline, matrix):
@@ -428,74 +432,54 @@ def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
         vvvv_direct=vvvv_direct, **options)
 
 
-def _can_reuse_w_baseline(baseline, matrix):
-    """Match the numerical problem without bypassing native option validation."""
-    if (baseline.get('mode', 'deterministic') != 'deterministic'
-            or matrix.get('mode', 'deterministic') != 'deterministic'):
-        return False
-    # Native-only sampling options and unknown keys still go through the
-    # baseline solver, which owns their validation even in deterministic mode.
-    ordinary = {'mode', 'laplace_roots', 'laplace_weights', 'canonical_fock',
-                'global_seed', 'threads', 'target_batch_size', 'virtual_block_size',
-                'auxiliary_group_size', 'energy_tolerance'}
-    if baseline.keys() - ordinary or baseline.get('canonical_fock', False) is not False:
-        return False
-    for name in ('global_seed', 'threads', 'target_batch_size', 'virtual_block_size',
-                 'auxiliary_group_size'):
-        if name not in baseline:
-            continue
-        value = baseline[name]
-        if (isinstance(value, (bool, numpy.bool_))
-                or not isinstance(value, (int, numpy.integer))
-                or value < (0 if name == 'global_seed' else 1)):
-            return False
-        if name == 'threads' and value > numpy.iinfo(numpy.int32).max:
-            return False
-        if (name in ('target_batch_size', 'virtual_block_size')
-                and value > numpy.iinfo(numpy.int64).max):
-            return False
-    if 'energy_tolerance' in baseline:
-        tolerance = baseline['energy_tolerance']
-        if (not isinstance(tolerance, (int, float, numpy.integer, numpy.floating))
-                or not numpy.isfinite(tolerance) or tolerance <= 0
-                or numpy.any(numpy.asarray(baseline['laplace_weights']) <= 0)):
-            return False
-    return all(numpy.array_equal(baseline[key], matrix[key])
-               for key in ('laplace_roots', 'laplace_weights'))
-
-
 def _run_group(state, static, group, baseline_controls, matrix_controls, *,
                with_grad, verbose_imp, ccsd_t, triples_controls=None,
                include_baseline=True, fragment_indices=None, vvvv_direct=False,
                cc_solver='deterministic', stc_cc_controls=None):
+    """Optionally join all local DF producer responses for this domain."""
+    from pyscfad.lno import _df_shared
+    options = dict(with_grad=with_grad, verbose_imp=verbose_imp, ccsd_t=ccsd_t,
+                   triples_controls=triples_controls, include_baseline=include_baseline,
+                   fragment_indices=fragment_indices, vvvv_direct=vvvv_direct,
+                   cc_solver=cc_solver, stc_cc_controls=stc_cc_controls)
+    # Replica averaging scales returned VJP trees. Deferred integral bars in an
+    # outer shared scope would escape that scaling, so use ordinary responses.
+    replica_precision = cc_solver == 'stc' and _stc_precision.enabled(stc_cc_controls)
+    if not (with_grad and _df_shared.enabled() and hasattr(state['mf'], 'mol')
+            and not replica_precision):
+        return _run_group_responses(state, static, group, baseline_controls,
+                                    matrix_controls, **options)
+    atoms = static.mp2_static.fragments[group.representative_index].extended_atoms
+    with _df_shared.reverse_scope(state['mf'], atoms) as shared:
+        records = _run_group_responses(state, static, group, baseline_controls,
+                                       matrix_controls, **options)
+        with resource_profile.section('stc.cc.shared_df_integral_pullback',
+                                      frag=group.representative_index+1):
+            coords = shared.finish()
+            state['mf_bar'].mol.coords = state['mf_bar'].mol.coords + np.asarray(coords)
+            jax.block_until_ready(state['mf_bar'].mol.coords)
+        driver.lib.logger.info(state['mf'], 'Shared local DF reverse: %s', shared.receipt)
+    return records
+
+
+def _run_group_responses(state, static, group, baseline_controls, matrix_controls, *,
+                        with_grad, verbose_imp, ccsd_t, triples_controls=None,
+                        include_baseline=True, fragment_indices=None, vvvv_direct=False,
+                        cc_solver='deterministic', stc_cc_controls=None):
     """Complete one owned group's preparation, baseline and physical-fragment responses.
 
     All process-local VJPs and matrix replay records are consumed here. Only
     scalar component records and the accumulated numerical host bars survive.
     One preparation pullback consumes the sum of its input cotangents.
     """
-    corrections = tuple((index, targets) for index, targets in _group_cc_fragments(static, group)
-                        if fragment_indices is None or index in fragment_indices)
-    baseline_targets = tuple(group.target_indices) if include_baseline else ()
-    reuse_baseline = set()
-    if (include_baseline and static.matrix_kind == 'W'
-            and _can_reuse_w_baseline(baseline_controls, matrix_controls)):
-        # E = Tr(W_oo) on the same grid and prepared frame. Assign only whole
-        # fragment results: unmerged groups may own fewer baseline targets
-        # than a physical fragment's W. Unselected targets still need MP2.
-        remaining = set(baseline_targets)
-        for index, targets in corrections:
-            if set(targets).issubset(remaining):
-                reuse_baseline.add(index)
-                remaining.difference_update(targets)
-        baseline_targets = tuple(target for target in baseline_targets if target in remaining)
     with resource_profile.section('stc.cc.prepare'):
         inputs, host, prepare_pullback = driver._prepare(
             state, static.mp2_static, group, baseline_controls, with_grad)
     metadata = {'fragment_id': group.representative_index,
-                'target_indices': baseline_targets}
+                'target_indices': tuple(group.target_indices)}
     input_bars = None
-    if baseline_targets:
+    baseline_from_w = include_baseline and static.matrix_kind == 'W'
+    if include_baseline and not baseline_from_w:
         with resource_profile.section('stc.cc.baseline'):
             baseline = backend.solve(host, metadata, baseline_controls, with_grad=with_grad)
         state['energy'] = state['energy'] + baseline['energy']
@@ -507,14 +491,39 @@ def _run_group(state, static, group, baseline_controls, matrix_controls, *,
                           for name, value in baseline['cotangents'].items()}
         del baseline
     records = []
-    for index, targets in corrections:
+    for index, targets in _group_cc_fragments(static, group):
+        correct_fragment = fragment_indices is None or index in fragment_indices
+        if not correct_fragment and not baseline_from_w:
+            continue
         with resource_profile.section('stc.cc.matrix_forward', frag=index+1):
             forward = backend.solve_matrices(
                 host, {'fragment_id': index, 'target_indices': targets},
                 matrix_controls, matrix_kind=static.matrix_kind)
-        if index in reuse_baseline:
+        if baseline_from_w:
+            # W already supplies the deterministic or sampled MP2 energy.
+            # Seed its derivative only after downstream LIS bars are known.
             state['energy'] = state['energy'] + forward['energy']
             state['baseline_energy'] = state.get('baseline_energy', 0.) + float(forward['energy'])
+            state['variance'] += float(forward['diagnostics']['energy_standard_error']) ** 2
+        if not correct_fragment:
+            # Restricting CC corrections must still retain the complete MP2
+            # baseline, including physical fragments without a selected LIS.
+            if with_grad:
+                with resource_profile.section('stc.cc.matrix_pullback', frag=index+1):
+                    bars = backend.pullback_matrices(
+                        host, forward, energy_bar=1.,
+                        occupied_bar=numpy.zeros_like(host['foo']),
+                        virtual_bar=numpy.zeros_like(host['fvv']))
+                validate_input_cotangents(bars, inputs)
+                if input_bars is None:
+                    input_bars = {name: numpy.array(value, dtype=numpy.float64, copy=True)
+                                  for name, value in bars.items()}
+                else:
+                    for name in inputs:
+                        input_bars[name] += bars[name]
+                del bars
+            del forward
+            continue
         matrices = {name: np.asarray(forward[name]) for name in ('occupied', 'virtual')}
         local_triples = _fragment_triples_controls(triples_controls, index)
         pilot_mf = None
@@ -569,8 +578,7 @@ def _run_group(state, static, group, baseline_controls, matrix_controls, *,
             driver._add_bars(state, mf_bar, common_bar)
             with resource_profile.section('stc.cc.matrix_pullback', frag=index+1):
                 bars = backend.pullback_matrices(
-                    host, forward, energy_bar=1. if index in reuse_baseline else 0.,
-                    occupied_bar=matrix_bars['occupied'],
+                    host, forward, energy_bar=float(baseline_from_w), occupied_bar=matrix_bars['occupied'],
                     virtual_bar=matrix_bars['virtual'])
             validate_input_cotangents(bars, inputs)
             if input_bars is None:
@@ -732,11 +740,12 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
            cc_solver='deterministic', stc_cc_controls=None):
     """Return correlation energy, or total energy with ``include_hf=True``.
 
-    ``return_components=True`` returns ``(energy, CCSDComponents)``. The MP2
-    baseline includes weak completion and is independent of matrix precision.
-    Deterministic W with matching quadrature supplies covered baseline targets
-    through its trace and existing matrix pullback; remaining targets are solved
-    separately. Stochastic baseline and matrix controls remain independent.
+    ``return_components=True`` returns ``(energy, CCSDComponents)``. With W,
+    strong-domain MP2 energy is read directly from its traces, in deterministic
+    and stochastic modes, including fragments without a CC correction. Matrix
+    controls set its precision; there is no separate strong-domain MP2 solve.
+    Baseline and matrix Laplace grids must match. D retains a separate MP2
+    solver. The MP2 baseline includes weak completion in either case.
     With ``ccsd_t=True``, omitted ``triples_controls`` preserves deterministic
     triples; stochastic mode requires integer ``nsamples >= 2``. A positive
     ``energy_tolerance`` targets the total triples energy SE in Hartree and

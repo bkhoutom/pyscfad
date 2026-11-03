@@ -223,12 +223,80 @@ make_cintopt = replace_source_code(molint.make_cintopt, locals(),
                                    'libcgto', 'libcgto_vjp')
 getints2c = replace_source_code(molint.getints2c, locals(),
                                 'libcgto', 'libcgto_vjp')
-getints3c = replace_source_code(molint.getints3c, locals(),
-                                'libcgto', 'libcgto_vjp')
+_getints3c = replace_source_code(molint.getints3c, locals(),
+                                 'libcgto', 'libcgto_vjp')
 getints4c = replace_source_code(molint.getints4c, locals(),
                                 'libcgto', 'libcgto_vjp')
 getints_by_shell = replace_source_code(molint.getints_by_shell, locals(),
                                        'libcgto', 'libcgto_vjp')
+
+# libcint uses a signed 32-bit product of the output dimensions as the
+# component stride. Large DF derivative tensors can overflow it even when
+# enough memory is available. Bound each native call, retaining the public
+# layout and the caller's output buffer.
+_INT3C_MAX_COMPONENT_SIZE = numpy.iinfo(numpy.int32).max
+_INT3C_BLOCK_BYTES = 256 * 1024**2
+
+
+@wraps(molint.getints3c)
+def getints3c(intor_name, atm, bas, env, shls_slice=None, comp=1,
+             aosym='s1', ao_loc=None, cintopt=None, out=None):
+    atm = numpy.asarray(atm, dtype=numpy.int32, order='C')
+    bas = numpy.asarray(bas, dtype=numpy.int32, order='C')
+    env = numpy.asarray(env, dtype=numpy.double, order='C')
+    nbas = len(bas)
+    if shls_slice is None:
+        shls_slice = (0, nbas, 0, nbas, 0, nbas)
+        if 'ssc' in intor_name or 'spinor' in intor_name:
+            bas = numpy.asarray(numpy.vstack((bas, bas)), dtype=numpy.int32)
+            shls_slice = (0, nbas, 0, nbas, nbas, nbas*2)
+    i0, i1, j0, j1, k0, k1 = shls_slice[:6]
+    if ao_loc is None:
+        ao_loc = make_loc(bas, intor_name)
+        if 'ssc' in intor_name:
+            ao_loc[k0:] = ao_loc[k0] + make_loc(bas[k0:], 'cart')
+        elif 'spinor' in intor_name:
+            ao_loc[k0:] = ao_loc[k0] + make_loc(bas[k0:], 'sph')
+    ni, nj, nk = (int(ao_loc[b])-int(ao_loc[a])
+                  for a, b in ((i0, i1), (j0, j1), (k0, k1)))
+    if aosym == 's1':
+        leading_shape = (ni, nj)
+        plane = ni * nj
+    else:
+        ai0, ai1 = int(ao_loc[i0]), int(ao_loc[i1])
+        plane = ai1*(ai1+1)//2 - ai0*(ai0+1)//2
+        leading_shape = (plane,)
+    if plane * nk <= _INT3C_MAX_COMPONENT_SIZE:
+        return _getints3c(intor_name, atm, bas, env, shls_slice, comp,
+                         aosym, ao_loc, cintopt, out)
+
+    dtype = numpy.complex128 if 'spinor' in intor_name else numpy.double
+    max_aux = min(_INT3C_MAX_COMPONENT_SIZE // plane,
+                  max(1, _INT3C_BLOCK_BYTES // (plane*comp*numpy.dtype(dtype).itemsize)))
+    # A shell cannot be split in this driver. Check before allocating the
+    # full output so a truly oversized shell fails without a native crash.
+    if int(max(numpy.diff(ao_loc[k0:k1+1]))) * plane > _INT3C_MAX_COMPONENT_SIZE:
+        raise OverflowError('A three-center integral shell exceeds the native indexing limit')
+    if cintopt is None:
+        opt_bas = bas[:max(i1, j1)] if '3c2e' in intor_name else bas
+        cintopt = make_cintopt(atm, opt_bas, env, intor_name)
+    mat = numpy.ndarray((*leading_shape, nk, comp), dtype, out, order='F')
+    result = numpy.rollaxis(mat, -1, 0)
+    if comp == 1:
+        result = result[0]
+    start = k0
+    while start < k1:
+        stop = int(numpy.searchsorted(ao_loc, int(ao_loc[start])+max_aux, side='right'))-1
+        stop = min(k1, max(start+1, stop))
+        block = _getints3c(intor_name, atm, bas, env,
+                          (i0, i1, j0, j1, start, stop), comp,
+                          aosym, ao_loc, cintopt)
+        begin, end = int(ao_loc[start]-ao_loc[k0]), int(ao_loc[stop]-ao_loc[k0])
+        result[..., begin:end] = block
+        del block
+        start = stop
+    return result
+
 
 @wraps(molint.getints)
 def getints(intor_name, atm, bas, env, shls_slice=None, comp=None, hermi=0,

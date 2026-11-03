@@ -188,7 +188,7 @@ See the [domain and MP2 guide](../../../pyscfad/dlno_stc/README.md) for their de
 | --- | --- | --- |
 | `matrix_kind` | Required | `"D"` or `"W"`; no automatic conversion between their thresholds. |
 | `thresh_occ`, `thresh_vir` | Required | Nonnegative absolute-eigenvalue thresholds for retained external occupied/virtual directions. Zero retains the full corresponding space. |
-| `baseline_controls`, `matrix_controls` | Required dictionaries | Independent MP2 baseline and D/W precision choices; `{}` selects their deterministic defaults. |
+| `baseline_controls`, `matrix_controls` | Required dictionaries | MP2 preparation and D/W settings. W construction also supplies the strong-domain MP2 energy; D retains a separate energy solver. `{}` selects deterministic defaults. |
 | `internal_rank_threshold` | `1e-6` | Numerical rank threshold for constructing discarded complements when completing the full MO layout; all original S orbitals are retained. |
 | `merge_identical` | `True` | Reuse identical-domain preparation while retaining physical S identities. |
 | `fragment_indices` | `None` | Select all physical fragments; otherwise select only the listed zero-based S indices. |
@@ -198,10 +198,22 @@ See the [domain and MP2 guide](../../../pyscfad/dlno_stc/README.md) for their de
 The baseline and matrix dictionaries must match the scientific settings used to
 build selections. D/W matrices can independently use `mode="deterministic"`
 (default) or `"stochastic"`. Matrix defaults include `global_seed=0`, `threads=1`,
-`target_batch_size=1`, `auxiliary_group_size=32`, and no `memory_limit_mb`.
+`target_batch_size=None` (all targets in the physical fragment),
+`auxiliary_group_size=32`, and no `memory_limit_mb`.
 Stochastic matrix defaults and separate MP2 energy controls are listed in the
 [matrix control table](../../../pyscfad/dlno_stc/README.md#native-dw-matrices-and-delayed-reverse).
 Those controls are not accepted in `triples_controls`.
+
+Both deterministic and stochastic W supply
+`E_MP2 = (trace(Wo) + trace(Wv))/2`; deterministically each trace equals this
+energy. The CC driver reuses it instead of evaluating a separate strong-domain
+MP2 energy or gradient. The delayed W pullback receives `energy_bar=1` together
+with the W cotangents from LIS CCSD(T). In stochastic mode it replays the same
+saved samples. Direct Fock/orbital cotangents follow their own preparation
+paths and are accumulated with the W response. Weak-pair terms remain separate.
+The baseline and W Laplace grids must agree; W sampling precision is controlled
+by `matrix_controls`. The reported MP2 SE describes the sampled W energy, not
+the total CCSD(T) uncertainty induced by stochastic LIS selection.
 
 ### Energy and gradient driver options
 
@@ -386,16 +398,20 @@ comparison runner above for other molecules.
 | `--stochastic-only` | Off | Run only requested stochastic jobs. Mutually exclusive with `--deterministic-only`. |
 | `--reference` | None | Reuse a compatible deterministic JSON; invalid with `--deterministic-only`. |
 
-This runner fixes `force_full_domains=True`, `matrix_kind="W"`,
-`thresh_occ=1e-4`, and `thresh_vir=1e-5`. `conventional` requires
+This runner uses cutoff-selected MP2 domains for `boys_grouping="atom"`,
+with `force_full_domains=False` and the `BoysDomainThresholds` defaults.
+Molecule grouping retains one full molecular domain. Actual selected MP2
+domain sizes and all cutoffs are written to `domain_selection.json`.
+The runner fixes `matrix_kind="W"`, `thresh_occ=1e-4`, and
+`thresh_vir=1e-5`. `conventional` requires
 `--deterministic-only`; `smooth` deterministic enumeration is principally a
 small-system check. Required target/seed arguments are still parsed for
 selection-only and deterministic-only invocations.
 
 ### Settings shared by the runners
 
-Both use deterministic MP2 baseline and W matrices, a six-point fitted MP2 grid
-with `lambda_gradient=0.1`, baseline seed 666, and automatic auxiliary-basis
+Both obtain deterministic MP2 energy from their W matrices, using a six-point fitted MP2 grid
+with `lambda_gradient=0.1` and automatic auxiliary-basis
 selection. For H/C `def2-SV(P)`, the scripts explicitly use def2-SVP on carbon,
 only its s shells on hydrogen, and `def2-svp-jkfit` as the auxiliary basis.
 Both use DF-RHF thresholds `conv_tol=1e-9` and `conv_tol_grad=1e-6`, atomic Boys

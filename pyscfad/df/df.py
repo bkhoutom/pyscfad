@@ -31,11 +31,17 @@ _FAST_EXCHANGE_CACHE_TOKENS = itertools.count()
 @util.pytree_node(['mol', 'auxmol', '_cderi'], num_args=1)
 class DF(pyscf_df.DF):
     # pylint: disable=redefined-outer-name
-    _keys = pyscf_df.DF._keys.union({'incore'})
+    _keys = pyscf_df.DF._keys.union({
+        'incore', 'precond_total_memory', 'precond_workspace_memory'})
 
     def __init__(self, mol, auxbasis=None, incore=True, **kwargs):
         pyscf_df.DF.__init__(self, mol, auxbasis=auxbasis)
         self.incore = incore
+        # Optional SCF response budgets in decimal MB. Keep the total process
+        # budget distinct from a driver's DF working-memory/block limit.
+        # None retains the existing max_memory policy for ordinary callers.
+        self.precond_total_memory = None
+        self.precond_workspace_memory = None
         # Unlike Python identity, this token survives JAX pytree
         # flatten/unflatten.  It lets custom-VJP residual DF objects find the
         # orbital data cached by their originating SCF calculation without

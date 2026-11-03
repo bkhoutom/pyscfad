@@ -39,6 +39,9 @@ struct Result {
     std::vector<ResidualDiagnostic> residuals;
     std::vector<double> point_variance_targets;
     arma::mat foo, fvv, B;
+    std::size_t propagation_calls = 0, backprop_calls = 0, cached_targets = 0;
+    double bare_integrals_seconds = 0, propagation_seconds = 0;
+    double contraction_seconds = 0, backprop_seconds = 0;
 };
 struct Spectrum { arma::vec values; arma::mat vectors; };
 using KeepSets = std::vector<std::vector<arma::uword>>;

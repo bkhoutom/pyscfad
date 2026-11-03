@@ -131,12 +131,16 @@ def test_embed_local_coefficients_preserves_rows_and_rejects_invalid_pair_maps()
             lno_df_outcore._embed_local_mo_coeff_from_pair_idx(coeff, bad, 6)
 
 
-def test_partial_global_df_preserves_overlap_projection_response(tmp_path, monkeypatch):
+@pytest.mark.parametrize('reuse_forward', [False, True])
+def test_partial_global_df_preserves_overlap_projection_response(tmp_path, monkeypatch,
+                                                                reuse_forward):
     import h5py
     from pyscfad.df import addons, incore
     from pyscfad.ao2mo import _ao2mo
 
     mol = _water_mol()
+    from pyscf import lib
+    mol.max_memory = lib.current_memory()[0]+1000 if reuse_forward else 1.
     auxmol = addons.make_auxmol(mol, 'weigend')
     ao_idx = numpy.asarray([0, 1, 2, 3, 4, 6])  # O and the second H.
     pairs = tuple(lno_df_outcore._global_pair_indices_for_local_ao(ao_idx, mol.nao))
@@ -156,10 +160,12 @@ def test_partial_global_df_preserves_overlap_projection_response(tmp_path, monke
     orbs_slice = (0, 1, 1, 3)
 
     def actual(m, a, c):
-        holder = SimpleNamespace(mol=m, auxmol=a, max_memory=200,
-            _get_cderi_source=lambda: source, _has_outcore_cderi_placeholder=lambda: True)
-        mf = SimpleNamespace(mol=m, with_df=holder, get_ovlp=lambda: m.intor('int1e_ovlp'))
-        y = lno_df.transform_df_to_mo(mf, c, orbs_slice, atmlst=[0, 2])
+        overlap = m.intor('int1e_ovlp')
+        local = lno_tools.project_mo(c, overlap[ao_idx], overlap[np.ix_(ao_idx, ao_idx)])
+        # Explicit low-level global-metric utility. The fragment transform
+        # now intentionally uses a local auxiliary metric instead.
+        y = lno_df_outcore._outcore_local_nr_e2_from_global_cderi(
+            m, a, local, source, 200, orbs_slice, 's2', pairs)
         return np.sum(y * cotangent)
 
     def reference(m, a, c):
@@ -176,7 +182,15 @@ def test_partial_global_df_preserves_overlap_projection_response(tmp_path, monke
         raise AssertionError('Projected partial domain should use the direct VJP')
 
     monkeypatch.setattr(lno_df_direct._cderi_vjp, 'nr_e2_cderi_bar_packed_disk', reject_disk)
+    rebuild = lno_df_outcore._cderi_vjp._stream_nr_e2_from_cderi_source
+    rebuilt = []
+    def observe_rebuild(*args, **kwargs):
+        rebuilt.append(True)
+        return rebuild(*args, **kwargs)
+    monkeypatch.setattr(lno_df_outcore._cderi_vjp, '_stream_nr_e2_from_cderi_source',
+                        observe_rebuild)
     value, grad = jax.value_and_grad(actual, argnums=(0, 1, 2))(mol, auxmol, coeff)
+    assert len(rebuilt) == (0 if reuse_forward else 1)
     numpy.testing.assert_allclose(value, expected, atol=1e-8, rtol=1e-8)
     for result, ref in zip(jax.tree_util.tree_leaves(grad), jax.tree_util.tree_leaves(expected_grad)):
         numpy.testing.assert_allclose(result, ref, atol=1e-8, rtol=1e-8)

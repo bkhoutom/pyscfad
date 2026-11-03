@@ -117,3 +117,60 @@ def test_cache_uses_at_most_half_remaining_memory(problem, monkeypatch,
         assert len(reads) == setup_reads
     else:
         assert len(reads) > setup_reads
+
+
+def test_explicit_total_budget_is_independent_of_df_workspace(problem, monkeypatch):
+    monkeypatch.setenv('PYSCFAD_PRECOND_CACHE_MEMORY_MB', '1')
+    monkeypatch.setattr(_df_jk_opt.lib, 'current_memory', lambda: (20., 0.))
+    dfobj, occupied, virtual, gaps, hessian, vectors, reads = problem
+    # RSS exceeds DF workspace, while the user total still has headroom.
+    dfobj.max_memory = 1
+    dfobj.precond_workspace_memory = 1
+    dfobj.precond_total_memory = 100
+    coulomb = _df_jk_opt.gen_coulomb_precond(dfobj, occupied, virtual, gaps)
+    setup_reads = len(reads)
+    for rhs in vectors:
+        _assert_hessian_result(coulomb, gaps, hessian, rhs)
+    assert len(reads) == setup_reads
+
+
+def test_explicit_exhausted_total_skips_before_reading_factors(problem, monkeypatch):
+    dfobj, occupied, virtual, gaps, _, _, reads = problem
+    dfobj.precond_total_memory = 10
+    dfobj.precond_workspace_memory = 4
+    monkeypatch.setattr(_df_jk_opt.lib, 'current_memory', lambda: (10., 0.))
+    assert _df_jk_opt.gen_coulomb_precond(dfobj, occupied, virtual, gaps) is None
+    assert not reads
+
+
+def test_c20_sized_cache_plan_uses_user_budget_without_allocating(monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setenv('PYSCFAD_PRECOND_CACHE_MEMORY_MB', str(100000e6 / 1024**2))
+    monkeypatch.setattr(_df_jk_opt.lib, 'current_memory', lambda: (45000., 0.))
+    obj = SimpleNamespace(max_memory=4000, precond_total_memory=100000,
+                          precond_workspace_memory=4000)
+    plan = _df_jk_opt._precond_memory_plan(obj, 1188, 2840, 81, 1107)
+    assert plan['use_cache'] and plan['setup_allowed']
+    assert plan['cache_bytes'] == 2037234240
+    assert plan['cache_bytes'] <= .5 * (100000 - 45000) * 1e6
+    assert plan['block_bytes'] + plan['fixed_bytes'] <= 4000e6
+    obj.precond_total_memory = 46000
+    plan = _df_jk_opt._precond_memory_plan(obj, 1188, 2840, 81, 1107)
+    assert not plan['use_cache'] and plan['setup_allowed']
+    # The total has ample room, but fixed metric scratch does not fit this
+    # explicitly smaller workspace. No large arrays need to be allocated.
+    obj.precond_total_memory = 100000
+    obj.precond_workspace_memory = 1
+    assert not _df_jk_opt._precond_memory_plan(obj, 1188, 2840, 81, 1107)['setup_allowed']
+
+
+@pytest.mark.parametrize('name,value', [
+    ('precond_total_memory', 0), ('precond_total_memory', float('nan')),
+    ('precond_workspace_memory', -1), ('precond_workspace_memory', float('inf')),
+])
+def test_invalid_explicit_budget_is_rejected(problem, name, value):
+    dfobj, occupied, virtual, gaps, _, _, reads = problem
+    setattr(dfobj, name, value)
+    with pytest.raises(ValueError, match=name):
+        _df_jk_opt.gen_coulomb_precond(dfobj, occupied, virtual, gaps)
+    assert not reads

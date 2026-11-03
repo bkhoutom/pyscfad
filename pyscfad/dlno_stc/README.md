@@ -134,6 +134,23 @@ energy = ccsd.kernel(mf, selected, baseline_controls=baseline_controls,
                      matrix_controls=matrix_controls)
 ```
 
+For `matrix_kind="W"`, the CCSD driver uses the energy returned by W
+construction for the strong-domain MP2 term. It does not run a separate MP2
+energy/gradient solver. With the current normalization,
+`E = (trace(Wo) + trace(Wv))/2`; deterministically both traces equal E.
+Stochastic E and W use the same production samples, with covariance included
+in the reported MP2 energy SE. After the LIS CCSD(T) response, one matrix
+pullback combines `energy_bar=1` with the occupied/virtual W cotangents. Direct
+Fock and orbital cotangents from the LIS response are accumulated through their
+own preparation paths. No energy derivative is computed during W sampling.
+Weak-pair MP2 terms are still added separately, once. `include_baseline=False`
+sets the W energy seed to zero and returns only the selected CC corrections.
+For W, `matrix_controls` determines strong-domain energy precision;
+`baseline_controls` remains part of preparation configuration, and the two
+Laplace grids must match. D calculations retain their independent MP2 solver.
+Rebuild saved CC selections and start a new checkpoint after this merge;
+selection schema 8 prevents resuming results from the earlier baseline policy.
+
 The fit uses 600 single-gap points and three positive least-squares starts.
 Diagnostics include fitting seconds, exact molecular denominator bounds,
 histogram-weighted energy RMS, Delta-scaled derivative RMS (without lambda),
@@ -261,16 +278,13 @@ an energy-only W seed is equivalent to half-identity seeds on both matrices,
 using the same saved production plan. Deterministic W has both traces equal
 to its energy within numerical tolerance.
 
-The CCSD driver reuses deterministic W energies for the MP2 baseline when
-both stages are deterministic and their Laplace roots and weights match.
-Each executed W result must cover only baseline targets still owned by its
-preparation group. Those energies are counted once, and their baseline response
-is included in the existing W pullback. Uncovered targets, including omitted
-CC fragments, retain a separate baseline solve. Stochastic stages and different
-quadratures retain their independent baseline calculations. The MP2 subtraction
+The CCSD driver reads the strong-domain MP2 energy directly from W in both
+deterministic and stochastic runs. Every physical fragment contributes its W
+energy once, including fragments omitted from the CC correction selection;
+there is no separate strong-domain MP2 solve for W. The energy response is
+included in the same W pullback as the LIS response. Baseline and matrix
+Laplace grids must match; mismatched grids are rejected. The MP2 subtraction
 inside the truncated LIS and the weak-pair completion are unchanged.
-Baseline controls with native-only sampling options also retain the separate
-solve so its option validation remains in effect.
 
 ```python
 import jax
@@ -311,7 +325,7 @@ Matrix controls are separate from the established stochastic energy controls:
 | --- | --- |
 | `mode`, `laplace_roots`, `laplace_weights` | Deterministic or stochastic; the existing six-point grid is the default. Stochastic D/W requires strictly positive weights. |
 | `global_seed`, `threads` | Explicit seed and native thread count; matrix default threads is 1. Seeds are derived per fragment and batch. |
-| `target_batch_size` | Explicit target batch, default 1; full orbital spaces are retained. |
+| `target_batch_size` | Default `None` shares one native call across all targets in the physical fragment. An explicit positive integer caps the batch for memory constraints; full orbital spaces are retained. |
 | `memory_limit_mb` | Optional advisory budget in decimal MB for current RSS plus estimated additional matrix workspace. Exceedance warns and continues. Checks run before both forward and reverse host/native allocations; diagnostics include the breakdown and estimated process peak (unknown when RSS is unavailable). |
 | `auxiliary_group_size` | Default 32 rows per group when `aux_offsets` is omitted; an explicit partition takes precedence and is included in memory/replay accounting. |
 | `matrix_tolerance` | Stochastic D/W Frobenius SE target for each summed matrix, default `1e-4`. Inspect measured SEs and `target_met`; allocation is not an attainment guarantee. |
@@ -326,6 +340,11 @@ unknown settings. Those existing controls continue to work on the separate
 stochastic energy solver. New deterministic energy calls accept
 `target_batch_size` and optional `threads`; stochastic energy uses the existing
 OpenMP settings and rejects these new deterministic-only controls.
+For standalone deterministic selected energy, `target_batch_size` bounds the
+bare-integral target cache (default 1). All targets share each point's forward
+transformation and accumulated reverse regardless of that cache size. Uncached
+bare pair integrals are rebuilt in worker-local scratch. Diagnostics expose
+transformation/reverse counts and the kernel timing sections.
 
 The STC packet, finite-domain, system and D/W matrix memory guards treat
 `max_memory` and `memory_limit_mb` as advisory. They warn when a conservative
@@ -504,7 +523,7 @@ force-comparison examples. Library triples defaults are deterministic mode,
 point and trace exponent 5.0. The MP2 trace model uses exponent 1.4. The production
 examples request total triples SE `5e-5` Eh (0.05 mEh). These controls affect energies and
 their gradients; production energy and derivative estimates share samples.
-CC selections use schema 6; rebuild saved selections/checkpoints after changing
+CC selections use schema 8; rebuild saved selections/checkpoints after changing
 from earlier implementations. Native energy/VJP entry points are
 `triples_asymmetric_energy` and `triples_asymmetric_energy_vjp`.
 
@@ -593,7 +612,9 @@ Controls `precision_pilot_replicas=4`, `precision_min_replicas=4`, and
 therefore costs at least eight solves per LIS. It consumes production VJPs
 sequentially and averages cotangents, preserving the existing physical
 projector/domain/SCF pullback. Discrete pilot allocation is held fixed in
-response. Pilot and production streams are independent; MPI ownership does
+response. Replica precision uses ordinary local DF responses even when
+`PYSCFAD_LNO_SHARED_LOCAL_DF_REVERSE` is enabled, so integral derivatives are
+averaged with the other cotangents. Pilot and production streams are independent; MPI ownership does
 not change their fragment seeds. A preflight checks every eligible replica's
 actual 32-bit forward and adjoint seed within each stream family. If it finds a
 collision, choose a different root seed or reduce the replica cap as indicated
@@ -660,5 +681,5 @@ Serial checkpoints include the backend and normalized controls. STC
 checkpoints additionally fingerprint installed external package versions,
 Python sources and native binaries, including editable source changes and
 the native extension selected at runtime. Changed implementation identity
-rejects resume. Existing deterministic checkpoint payloads are unchanged;
+rejects resume. Checkpoints must use the current CC selection schema;
 serial progress checkpoints remain unavailable for multi-rank execution.

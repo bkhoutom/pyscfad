@@ -1,5 +1,11 @@
 # W baseline reuse implementation plan
 
+> Superseded by the `dlno-stc-fix` merge: W supplies the domain MP2 energy
+> directly from its traces in deterministic and stochastic modes, including
+> fragments without CC corrections. No separate W baseline solve remains;
+> mismatched Laplace grids are rejected. The plan below records the earlier
+> implementation.
+
 > Execute the accepted optimization with regression tests and an independent review.
 
 **Goal:** Avoid a separate deterministic MP2 baseline calculation when an existing

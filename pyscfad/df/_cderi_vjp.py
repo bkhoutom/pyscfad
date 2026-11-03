@@ -865,19 +865,18 @@ def nr_e2_cderi_bar_packed_disk(mo_coeff, ybar, orbs_slice,
                     pass
 
 
-def _df_jk_style_blockdim(max_memory, row_width):
-    blockdim = getattr(__config__, 'df_df_DF_blockdim', 240)
-    if max_memory is None:
-        return int(blockdim)
-    max_memory = max(float(max_memory) - pyscf_lib.current_memory()[0], 1.0)
-    return max(4, int(min(blockdim, max_memory*.3e6/8/max(row_width, 1))))
-
-
 def nr_e2_mo_coeff_vjp_from_cderi_source(cderi_source, mo_coeff, ybar,
                                          orbs_slice, aosym='s2',
                                          mosym='s1', pair_idx=None,
-                                         max_memory=None):
-    """Return only the MO-coefficient cotangent, streaming CDERI rows."""
+                                         max_memory=None,
+                                         workspace_memory_mb=None):
+    """Return the MO-coefficient cotangent with bounded CDERI row reads.
+
+    ``max_memory`` is the total process budget in decimal MB. The optional
+    ``workspace_memory_mb`` independently caps temporary slabs. A DF working
+    budget must not be mistaken for the total process budget when CC tensors
+    are already resident.
+    """
     if cderi_source is None:
         raise NotImplementedError('Missing CDERI source for nr_e2 VJP.')
     if aosym not in ('s2', 's2ij'):
@@ -907,24 +906,61 @@ def nr_e2_mo_coeff_vjp_from_cderi_source(cderi_source, mo_coeff, ybar,
             else:
                 npair = int(pair_idx.size)
 
-        blksize = max(
-            1,
-            min(naux, _df_jk_style_blockdim(max_memory, npair + ybar.shape[1])),
-        )
+        # HDF5 point selections over hundreds of thousands of local AO pairs
+        # are expensive. Read contiguous spans and gather in NumPy instead;
+        # count both the source slab and its selected copy in the budget.
+        first_pair = 0 if pair_idx is None or not pair_idx.size else int(pair_idx[0])
+        last_pair = int(eri1.shape[1]) if pair_idx is None else (
+            int(pair_idx[-1]) + 1 if pair_idx.size else 0)
+        if pair_idx is not None and (numpy.any(numpy.diff(pair_idx) <= 0)
+                or first_pair < 0 or last_pair > int(eri1.shape[1])):
+            raise ValueError('Local AO pair indices must be sorted, unique and in bounds')
+        source_width = last_pair - first_pair
+        row_bytes = 8 * max(1, source_width + npair + ybar.shape[1])
+        slab_bytes = _nr_e2_vjp_block_mb() * 1024**2
+        if workspace_memory_mb is not None:
+            if not numpy.isfinite(workspace_memory_mb) or workspace_memory_mb <= 0:
+                raise ValueError('workspace_memory_mb must be finite and positive')
+            slab_bytes = min(slab_bytes, workspace_memory_mb * 1e6)
+        # The native OpenMP kernel owns scratch and a coefficient reduction
+        # per thread, even when there are fewer rows than threads.
+        nao, nmo = mo_coeff.shape
+        k0, k1, l0, l1 = orbs_slice
+        scratch_per_thread = 8 * (2*nao*nao + nao*min(k1-k0, l1-l0)
+                                   + nao*(nao+1)//2 + nao*nmo)
+        threads = max(1, min(pyscf_lib.num_threads(), max(1, naux)))
+        if max_memory is not None:
+            if not numpy.isfinite(max_memory) or max_memory <= 0:
+                raise ValueError('max_memory must be finite and positive')
+            headroom = max(0., max_memory - pyscf_lib.current_memory()[0]) * 1e6
+            available = .8 * headroom
+            threads = max(1, min(threads, int(max(0., available-row_bytes)
+                                             // max(1, scratch_per_thread))))
+            slab_bytes = min(slab_bytes, max(0., available-threads*scratch_per_thread))
+        contiguous_read = row_bytes <= slab_bytes or pair_idx is None
+        if not contiguous_read:
+            # A widely separated local domain may span a huge global row.
+            # Keep the original selection as a low-memory fallback instead
+            # of allocating that whole span just to read one auxiliary row.
+            row_bytes = 8 * max(1, npair + ybar.shape[1])
+        blksize = max(1, min(naux, int(slab_bytes // row_bytes)))
+        local_pairs = None if pair_idx is None else pair_idx - first_pair
 
-        for p0 in range(0, naux, blksize):
-            p1 = min(p0 + blksize, naux)
-            if pair_idx is None:
-                cderi = numpy.asarray(eri1[p0:p1])
-            else:
-                cderi = numpy.asarray(eri1[p0:p1, pair_idx])
-
-            mo_coeff_bar_blk = _ao2mo.nr_e2_mo_coeff_vjp(
-                cderi, mo_coeff, ybar[p0:p1], orbs_slice,
-                aosym=aosym, mosym=mosym,
-            )
-            mo_coeff_bar = _tree_add(mo_coeff_bar, mo_coeff_bar_blk)
-            cderi = mo_coeff_bar_blk = None
+        with pyscf_lib.with_omp_threads(threads), blas_threads(1):
+            for p0 in range(0, naux, blksize):
+                p1 = min(p0 + blksize, naux)
+                if contiguous_read:
+                    cderi = numpy.asarray(eri1[p0:p1, first_pair:last_pair])
+                    if local_pairs is not None:
+                        cderi = numpy.take(cderi, local_pairs, axis=1)
+                else:
+                    cderi = numpy.asarray(eri1[p0:p1, pair_idx])
+                mo_coeff_bar_blk = _ao2mo.nr_e2_mo_coeff_vjp(
+                    cderi, mo_coeff, ybar[p0:p1], orbs_slice,
+                    aosym=aosym, mosym=mosym,
+                )
+                mo_coeff_bar = _tree_add(mo_coeff_bar, mo_coeff_bar_blk)
+                cderi = mo_coeff_bar_blk = None
     resource_profile.finish(
         'df_vjp.mo_coeff_stream',
         resource_start,
@@ -934,6 +970,11 @@ def nr_e2_mo_coeff_vjp_from_cderi_source(cderi_source, mo_coeff, ybar,
         blocks=(naux + blksize - 1) // blksize,
         ybar_mib=resource_profile.estimated_array_mib(ybar),
         configured_memory_mib=max_memory,
+        workspace_memory_mb=workspace_memory_mb,
+        read_slab_mib=blksize*row_bytes/1024**2,
+        native_scratch_mib=threads*scratch_per_thread/1024**2,
+        kernel_threads=threads,
+        contiguous_read=contiguous_read,
         pyscf_current_memory_mib=pyscf_lib.current_memory()[0],
     )
     return mo_coeff_bar

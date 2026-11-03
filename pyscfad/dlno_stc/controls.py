@@ -184,9 +184,15 @@ def normalize_matrix_controls(controls, matrix_kind):
     if mode == 'stochastic' and numpy.any(weights <= 0):
         raise ValueError('stochastic matrix Laplace weights must be strictly positive')
     for name, default in (('global_seed', 0), ('threads', 1),
-                          ('target_batch_size', 1), ('auxiliary_group_size', 32)):
+                          ('auxiliary_group_size', 32)):
         settings[name] = _integer_control(name, settings.get(name, default),
                                          minimum=0 if name == 'global_seed' else 1)
+    # Share the domain's Laplace factors across the physical fragment by
+    # default. An explicit batch cap remains available for memory constraints.
+    settings.setdefault('target_batch_size', None)
+    if settings['target_batch_size'] is not None:
+        settings['target_batch_size'] = _integer_control(
+            'target_batch_size', settings['target_batch_size'])
     if settings.get('memory_limit_mb') is not None:
         settings['memory_limit_mb'] = _finite_control('memory_limit_mb', settings['memory_limit_mb'])
     if mode == 'stochastic':
@@ -214,7 +220,8 @@ def estimate_matrix_memory(naux, nocc, nvir, ntarget, controls, *, matrix_kind,
     exclude existing inputs, SCF/preparation tapes, allocator/BLAS overhead and
     the rest of the process. Add current process residency when enforcing a
     process budget. No allocation proportional to all targets is assumed for
-    deterministic calls: their native target batch is bounded explicitly.
+    deterministic calls beyond the requested target batch. The default batch
+    contains all targets in the physical fragment and is counted in full.
     """
     settings = normalize_matrix_controls(controls, matrix_kind)
     dims = [_integer_control(name, value, minimum=0 if name in ('naux', 'nvir') else 1)
@@ -226,7 +233,7 @@ def estimate_matrix_memory(naux, nocc, nvir, ntarget, controls, *, matrix_kind,
     factor = 8 * naux * nocc * nvir
     matrices = 8 * (nocc * nocc + nvir * nvir)
     threads = settings['threads']
-    batch = min(ntarget, settings['target_batch_size'])
+    batch = ntarget if settings['target_batch_size'] is None else min(ntarget, settings['target_batch_size'])
     single_amplitude = 8 * nocc * nvir * nvir
     breakdown = {
         'input_copies': 2 * (factor + matrices),

@@ -976,14 +976,68 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
 get_jk.defvjp(get_jk_fwd, get_jk_bwd, symbolic_zeros=True)
 
 
+def _precond_memory_plan(dfobj, nao, naux, nocc, nvir):
+    """Plan optional response storage without treating workspace as total RSS.
+
+    Explicit budgets are decimal MB. The legacy environment cache cap is
+    MiB. Leave half of remaining process memory outside the optional cache;
+    setup scratch is bounded separately. The process RSS guard remains the
+    final protection against allocations made elsewhere in the calculation.
+    """
+    total = getattr(dfobj, 'precond_total_memory', None)
+    workspace = getattr(dfobj, 'precond_workspace_memory', None)
+    explicit = total is not None
+    for name, value in (('precond_total_memory', total),
+                        ('precond_workspace_memory', workspace)):
+        if value is not None and (not numpy.isfinite(value) or value <= 0):
+            raise ValueError(f'{name} must be finite and positive (decimal MB)')
+    total = float(dfobj.max_memory if total is None else total)
+    rss = lib.current_memory()[0]
+    remaining = max(total - rss, 0.) * 1e6
+    try:
+        cap = float(os.environ.get('PYSCFAD_PRECOND_CACHE_MEMORY_MB', '1024'))
+        if not numpy.isfinite(cap) or cap < 0:
+            cap = 1024.
+    except ValueError:
+        cap = 1024.
+    cache_bytes = naux * nvir * nocc * 8
+    cache_limit = min(cap * 1024**2, .5 * remaining)
+    # Conservative metric/factorization reserve plus small MO/gap arrays.
+    # AO DF panels still stream under dfobj.max_memory and blockdim.
+    fixed_bytes = 4 * naux * naux * 8 + 8 * (nao * (nocc + nvir) + nocc * nvir)
+    per_occ_bytes = 8 * (naux * nvir + nao)
+    use_cache = 0 < cache_bytes <= cache_limit
+    scratch = .3 * remaining
+    if workspace is not None:
+        scratch = min(scratch, max(0., workspace * 1e6 - fixed_bytes))
+    if explicit:
+        scratch = min(scratch, max(0., .8 * remaining - fixed_bytes
+                                  - (cache_bytes if use_cache else 0)))
+        # Prefer a streamed preconditioner if cache would prevent setup.
+        if scratch < per_occ_bytes and use_cache:
+            use_cache = False
+            scratch = min(.3 * remaining, max(0., .8 * remaining - fixed_bytes))
+            if workspace is not None:
+                scratch = min(scratch, max(0., workspace * 1e6 - fixed_bytes))
+    block = max(1 if explicit else 4,
+                min(nocc, int(scratch // max(1, per_occ_bytes))))
+    return dict(total_memory_mb=total, rss_mb=rss, remaining_mb=remaining / 1e6,
+                workspace_memory_mb=workspace, cache_mib=cache_bytes / 1024**2,
+                budget_mib=cap, limit_mib=cache_limit / 1024**2,
+                cache_bytes=cache_bytes, fixed_bytes=fixed_bytes,
+                block_bytes=block * per_occ_bytes, use_cache=use_cache, block=block,
+                setup_allowed=(not explicit and workspace is None) or scratch >= per_occ_bytes)
+
+
 def gen_coulomb_precond(dfobj, orbo, orbv, e_ai):
     """Generate the Coulomb part of the RHF orbital Hessian inverse.
 
     The result obeys ``(e + 4 B.T @ B)^-1 s = (s - coul(s)) / e``.
     Scaled occupied-virtual factors are retained only when they fit both the
-    PYSCFAD_PRECOND_CACHE_MEMORY_MB budget and half the remaining DF memory
-    budget; otherwise applications stream DF. Only the actual tensor is
-    allocated, not the full allowance.
+    PYSCFAD_PRECOND_CACHE_MEMORY_MB cap and half the remaining total memory
+    budget. DF.precond_total_memory and DF.precond_workspace_memory separate
+    process headroom from setup scratch; unset values retain the legacy DF
+    policy. Return None if explicit headroom cannot accommodate setup.
     """
     from scipy.linalg import cho_factor, cho_solve
     from pyscf.ao2mo import _ao2mo
@@ -993,22 +1047,18 @@ def gen_coulomb_precond(dfobj, orbo, orbv, e_ai):
     nao, nocc = orbo.shape
     nvir = orbv.shape[1]
     naux = dfobj.get_naoaux()
-    try:
-        budget_mb = float(os.environ.get('PYSCFAD_PRECOND_CACHE_MEMORY_MB', '1024'))
-        if not numpy.isfinite(budget_mb) or budget_mb < 0:
-            budget_mb = 1024.
-    except ValueError:
-        budget_mb = 1024.
-    max_memory = dfobj.max_memory - lib.current_memory()[0]
-    cache_limit = min(budget_mb * 1024**2, .5 * max(max_memory, 0) * 1e6)
-    cache_bytes = naux * nvir * nocc * numpy.dtype(numpy.float64).itemsize
-    use_cache = cache_bytes > 0 and cache_bytes <= cache_limit
+    plan = _precond_memory_plan(dfobj, nao, naux, nocc, nvir)
+    if not plan['setup_allowed']:
+        _profile_msg(f'coulomb preconditioner skipped insufficient memory {plan}')
+        return None
+    cache_bytes = plan['cache_bytes']
+    use_cache = plan['use_cache']
     if use_cache:
         use_cache = _scf_response_cache.reserve_preconditioner(cache_bytes)
     cached = numpy.empty((naux, nvir, nocc)) if use_cache else None
     sqrt_e = numpy.sqrt(e_ai)
     kmat = numpy.eye(naux) * .25
-    blksize = max(4, min(nocc, int(max_memory*.3e6/8/(naux*nvir))))
+    blksize = plan['block']
     for i0, i1 in lib.prange(0, nocc, blksize):
         mo = numpy.asarray(numpy.hstack((orbv, orbo[:,i0:i1])), order='F')
         bov = numpy.empty((naux, nvir*(i1-i0)))
@@ -1030,7 +1080,10 @@ def gen_coulomb_precond(dfobj, orbo, orbv, e_ai):
         cached = cached.reshape(naux, -1)
     _profile_msg(f'coulomb preconditioner setup cache={use_cache} '
                  f'cache_mib={cache_bytes / 1024**2:.2f} '
-                 f'budget_mib={budget_mb:.2f} limit_mib={cache_limit / 1024**2:.2f} '
+                 f'budget_mib={plan["budget_mib"]:.2f} limit_mib={plan["limit_mib"]:.2f} '
+                 f'total_memory_mb={plan["total_memory_mb"]:.3f} '
+                 f'workspace_memory_mb={plan["workspace_memory_mb"]} '
+                 f'rss_mb={plan["rss_mb"]:.3f} occupied_block={blksize} '
                  f'elapsed={time.perf_counter() - t_setup:.2f} s')
 
     idx = numpy.arange(nao)

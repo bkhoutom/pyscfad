@@ -176,6 +176,9 @@ def _gen_precond(aux, mf, s1e, h1e, root_factors=None, *, solver=None):
 
     log = logger.new_logger(mf)
     coul = gen_coulomb_precond(mf.with_df, orbo, orbv, e_ai)
+    if coul is None:
+        log.info('SCF DF preconditioner skipped: insufficient user memory headroom')
+        return None
     sorbo = dot(s1e, orbo)
     sorbv = dot(s1e, orbv)
 

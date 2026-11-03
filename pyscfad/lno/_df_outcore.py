@@ -80,6 +80,14 @@ def _outcore_nr_e2_block_mb():
         return 256.0
 
 
+def _save_forward_for_reverse(out, mol, workspace_memory_mb):
+    """Keep one fragment's existing factors only within user memory headroom."""
+    from pyscf import lib
+    headroom = max(0., float(mol.max_memory)-lib.current_memory()[0]) * 1e6
+    budget = min(float(workspace_memory_mb)*1e6, .25*headroom)
+    return out if out.nbytes <= budget else None
+
+
 def _outcore_nr_e2_from_source_blocked(cderi_source, mo_coeff, orbs_slice,
                                        aosym='s2', mosym='s1', pair_idx=None):
     """Transform out-of-core CDERI without materializing the full CDERI block."""
@@ -223,13 +231,14 @@ def _outcore_local_nr_e2_from_global_cderi_fwd(mol, auxmol, mo_coeff,
         mol, auxmol, mo_coeff, cderi_source, max_memory, orbs_slice, aosym,
         pair_idx,
     )
-    return out, (mol, auxmol, mo_coeff)
+    return out, (mol, auxmol, mo_coeff,
+                 _save_forward_for_reverse(out, mol, max_memory))
 
 
 def _outcore_local_nr_e2_from_global_cderi_bwd(cderi_source, max_memory,
                                                orbs_slice, aosym, pair_idx,
                                                res, ybar):
-    mol, auxmol, mo_coeff = res
+    mol, auxmol, mo_coeff, saved_output = res
     pair_idx = numpy.asarray(pair_idx, dtype=numpy.int64)
     full_pair_idx = _is_full_global_pair_idx(pair_idx, mol.nao)
     coeff_full = None if full_pair_idx else _embed_local_mo_coeff_from_pair_idx(
@@ -241,7 +250,8 @@ def _outcore_local_nr_e2_from_global_cderi_bwd(cderi_source, max_memory,
         with _vjp_progress_section('fragment DF AO2MO MO-coeff backward'):
             mo_coeff_bar = _cderi_vjp.nr_e2_mo_coeff_vjp_from_cderi_source(
                 cderi_source, mo_coeff, ybar, orbs_slice, aosym='s2',
-                pair_idx=pair_idx, max_memory=max_memory,
+                pair_idx=pair_idx, max_memory=mol.max_memory,
+                workspace_memory_mb=max_memory,
             )
 
         ybar_np = numpy.asarray(jax.device_get(ybar))
@@ -259,6 +269,7 @@ def _outcore_local_nr_e2_from_global_cderi_bwd(cderi_source, max_memory,
                         int3c=mol._add_suffix('int3c2e'),
                         int2c=mol._add_suffix('int2c2e'),
                         aosym='s2ij',
+                        saved_output=saved_output,
                     )
             except NotImplementedError:
                 mol_bar = auxmol_bar = None
@@ -298,6 +309,7 @@ def _outcore_local_nr_e2_from_global_cderi_bwd(cderi_source, max_memory,
                         mol, auxmol, cderi_source, coeff_full, ybar_np, orbs_slice,
                         max(max_memory, 4096), int3c=mol._add_suffix('int3c2e'),
                         int2c=mol._add_suffix('int2c2e'), aosym='s2ij',
+                        saved_output=saved_output,
                     )
             except NotImplementedError as err:
                 _cderi_vjp._profile_msg(f'partial-domain strategy=disk fallback: {err}')
@@ -360,7 +372,8 @@ def _outcore_nr_e2_fwd(mol, auxmol, mo_coeff, cderi_source, max_memory,
                        orbs_slice, aosym):
     out = _outcore_nr_e2(mol, auxmol, mo_coeff, cderi_source, max_memory,
                          orbs_slice, aosym)
-    return out, (mol, auxmol, mo_coeff, out)
+    return out, (mol, auxmol, mo_coeff,
+                 _save_forward_for_reverse(out, mol, max_memory))
 
 
 def _outcore_nr_e2_bwd(cderi_source, max_memory, orbs_slice, aosym, res, ybar):
@@ -369,7 +382,7 @@ def _outcore_nr_e2_bwd(cderi_source, max_memory, orbs_slice, aosym, res, ybar):
         with _vjp_progress_section('global DF AO2MO MO-coeff backward'):
             mo_coeff_bar = _cderi_vjp.nr_e2_mo_coeff_vjp_from_cderi_source(
                 cderi_source, mo_coeff, ybar, orbs_slice, aosym=aosym,
-                max_memory=max_memory,
+                max_memory=mol.max_memory, workspace_memory_mb=max_memory,
             )
 
         ybar_np = numpy.asarray(jax.device_get(ybar))

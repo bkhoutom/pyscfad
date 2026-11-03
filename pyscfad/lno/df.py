@@ -18,6 +18,7 @@ import warnings
 import os
 import numpy
 import jax
+from pyscf import lib as pyscf_lib
 from pyscfad import numpy as np
 from pyscfad.ops import is_array
 from pyscfad import df as df_mod
@@ -33,8 +34,6 @@ from ._df_h5 import (
     _build_local_Lov_h5_impl,
 )
 from ._df_outcore import (
-    _global_pair_indices_for_local_ao,
-    _outcore_local_nr_e2_from_global_cderi,
     _outcore_nr_e2,
 )
 
@@ -127,6 +126,12 @@ def build_local_Lov_h5(
 
 
 def transform_df_to_mo(mf, mo_coeff, orbs_slice, aosym='s2', mosym='s1', atmlst=None):
+    """Transform with the domain's AO and auxiliary bases when atoms are given.
+
+    The fitting space is independent of the parent's DF storage policy.
+    Fragment CCSD and its LIS MP2 subtraction must use the same local metric
+    as the extended-domain W/MP2 construction.
+    """
     atmlst = _local_domain_atmlst(mf, atmlst)
     if atmlst is not None:
         ao_idx = lno_tools.ao_index_by_atom(mf.mol, atmlst)
@@ -134,23 +139,21 @@ def transform_df_to_mo(mf, mo_coeff, orbs_slice, aosym='s2', mosym='s1', atmlst=
         s21 = s1e[ao_idx]
         s22 = s1e[np.ix_(ao_idx, ao_idx)]
         mo_coeff = lno_tools.project_mo(mo_coeff, s21, s22)
-        get_cderi = getattr(mf.with_df, '_get_cderi_source', None)
-        cderi = get_cderi() if get_cderi is not None else mf.with_df._cderi
-        has_outcore_cderi = (
-            hasattr(mf.with_df, '_has_outcore_cderi_placeholder')
-            and mf.with_df._has_outcore_cderi_placeholder()
-        )
-        if has_outcore_cderi:
-            if mf.with_df.auxmol is None:
-                mf.with_df.auxmol = df_mod.addons.make_auxmol(
-                    mf.with_df.mol, mf.with_df.auxbasis
+        if aosym == 's2' and mosym == 's1':
+            local_mol = make_local_mol(mf.mol, atmlst)
+            auxmol = df_addons.make_auxmol(local_mol, mf.with_df.auxbasis)
+            # Direct MO transformation avoids caching an AO-pair CDERI for
+            # every fragment. Respect both total memory and the DF workspace.
+            max_memory = min(
+                mf.mol.max_memory,
+                pyscf_lib.current_memory()[0] + mf.with_df.max_memory,
             )
-            pair_idx = tuple(
-                _global_pair_indices_for_local_ao(ao_idx, mf.mol.nao).tolist()
+            pyscf_lib.logger.info(
+                mf.mol, 'Local fragment DF: atoms=%d nao=%d naux=%d orbs_slice=%s',
+                len(atmlst), local_mol.nao, auxmol.nao, orbs_slice,
             )
-            return _outcore_local_nr_e2_from_global_cderi(
-                mf.with_df.mol, mf.with_df.auxmol, mo_coeff, cderi,
-                mf.with_df.max_memory, orbs_slice, aosym, pair_idx
+            return _local_direct_nr_e2(
+                local_mol, auxmol, mo_coeff, max_memory, orbs_slice,
             )
 
         fake_mol, local_df, _ = get_local_df(mf, atmlst)

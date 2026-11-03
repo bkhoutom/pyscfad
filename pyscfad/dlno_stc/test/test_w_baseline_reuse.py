@@ -1,4 +1,4 @@
-"""Deterministic W forwards also supply exactly their owned baseline energy."""
+"""W traces supply the complete domain MP2 energy without a separate solve."""
 import jax
 import numpy as np
 import pytest
@@ -7,7 +7,7 @@ from pyscfad.dlno_stc.test.test_full_kernel import reference
 from pyscfad.dlno_stc.test.test_shared_ccsd_pullback import group_case
 
 
-def assert_matches_separate_baseline(case, state, options):
+def assert_matches_native_reference(case, state, options):
     """Compare against a full selected native solve and correction-only VJP."""
     correction, _ = case.run(**dict(options, include_baseline=False))
     if not options.get('include_baseline', True):
@@ -79,72 +79,66 @@ def test_matching_w_forwards_replace_full_baseline_without_changing_response(gro
                                    rtol=2e-7, atol=2e-9)
 
 
-@pytest.mark.parametrize('options,baseline_targets,energy_seeds', [
-    pytest.param({'indices': (1,)}, [(0,)], [1.], id='partial-selection'),
-    pytest.param({'indices': (0,), 'with_grad': False}, [(1,)], [], id='partial-forward'),
-    pytest.param({'indices': ()}, [(0, 1)], [], id='empty-selection'),
-    pytest.param({'include_baseline': False}, [], [0., 0.], id='baseline-disabled'),
-    pytest.param({'include_baseline': False, 'indices': ()}, [], [], id='empty-no-baseline'),
-    pytest.param({'indices': None, 'fragments': ((0, (1, 0)),)}, [], [1.],
+@pytest.mark.parametrize('options,energy_seeds', [
+    pytest.param({'indices': (1,)}, [1., 1.], id='partial-selection'),
+    pytest.param({'indices': (0,), 'with_grad': False}, [], id='partial-forward'),
+    pytest.param({'indices': ()}, [1., 1.], id='empty-selection'),
+    pytest.param({'include_baseline': False}, [0., 0.], id='baseline-disabled'),
+    pytest.param({'include_baseline': False, 'indices': ()}, [], id='empty-no-baseline'),
+    pytest.param({'indices': None, 'fragments': ((0, (1, 0)),)}, [1.],
                  id='whole-multitarget-fragment'),
-    pytest.param({'group_targets': (0,), 'indices': (0,), 'fragments': ((0, (0, 1)),)},
-                 [(0,)], [0.], id='fragment-extends-beyond-baseline'),
-    pytest.param({'fragments': ((0, (0,)), (1, (0, 1)))}, [(1,)], [1., 0.],
-                 id='overlapping-fragment-keeps-residual'),
-    pytest.param({'fragments': ((0, (0, 1)), (1, (1,)))}, [], [1., 0.],
-                 id='covered-target-never-counted-twice'),
 ])
-def test_only_whole_executed_w_targets_replace_baseline(group_case, options,
-                                                      baseline_targets, energy_seeds):
+def test_all_owned_w_targets_supply_mp2_with_partial_cc_selection(group_case, options,
+                                                                 energy_seeds):
     case = group_case
     options = dict(options, matrix_kind='W')
     state, _ = case.run(**options)
-    assert case.baseline_targets == baseline_targets
+    assert case.baseline_targets == []
     assert case.replay_energy_bars == energy_seeds
     contributes = options.get('include_baseline', True) or bool(options.get('indices', (0, 1)))
     assert len(case.preparations[0]) == int(options.get('with_grad', True) and contributes)
     for bars, snapshot in case.packets:
         for name in bars:
             np.testing.assert_array_equal(bars[name], snapshot[name])
-    assert_matches_separate_baseline(case, state, options)
+    assert_matches_native_reference(case, state, options)
 
 
-@pytest.mark.parametrize('fallback', ['D', 'roots', 'weights', 'baseline-stochastic',
-                                    'matrix-stochastic', 'native-sampling-option'])
-def test_ineligible_controls_keep_independent_baseline(group_case, fallback):
+@pytest.mark.parametrize('indices', [(0, 1), (1,), ()])
+@pytest.mark.parametrize('with_grad', [False, True])
+def test_sampled_domain_mp2_is_read_from_w_traces(group_case, monkeypatch, indices, with_grad):
+    from pyscfad.dlno_stc import ccsd
     case = group_case
-    baseline = dict(case.controls)
-    matrix = dict(case.controls)
-    if fallback in ('roots', 'weights'):
-        name = 'laplace_' + fallback
-        matrix[name] = np.array(matrix[name], copy=True)
-        matrix[name][0] += .1
-    elif fallback == 'baseline-stochastic':
-        baseline.pop('threads')
-        baseline.update(mode='stochastic', production_samples=4, min_production_samples=2,
-                        pilot_samples=2, system_workload_cutoff=2.)
-    elif fallback == 'matrix-stochastic':
-        matrix.update(mode='stochastic', matrix_tolerance=1., pair_pilot_samples=4,
-                      min_samples=2, domain_tau=0., virtual_domain_tau=0.)
-    elif fallback == 'native-sampling-option':
-        baseline['pilot_samples'] = 2
-    options = dict(matrix_kind='D' if fallback == 'D' else 'W',
-                   baseline_controls=baseline, matrix_controls=matrix)
+    forwards = []
+    solve_matrices = ccsd.backend.solve_matrices
+    def observed(*args, **kwargs):
+        result = solve_matrices(*args, **kwargs)
+        forwards.append(result)
+        return result
+    def unexpected_baseline(*args, **kwargs):
+        pytest.fail('W must not launch a separate MP2 baseline solver')
+    monkeypatch.setattr(ccsd.backend, 'solve_matrices', observed)
+    monkeypatch.setattr(ccsd.backend, 'solve', unexpected_baseline)
+    matrix = dict(case.controls, mode='stochastic', global_seed=71,
+                  matrix_tolerance=.03, pair_pilot_samples=32, min_samples=32,
+                  domain_tau=10., virtual_domain_tau=10.)
+    state, rows = case.run(matrix_kind='W', matrix_controls=matrix,
+                           indices=indices, with_grad=with_grad)
+    assert len(forwards) == 2
+    assert all(f['diagnostics']['production_draws'] > 0 for f in forwards)
+    trace_energy = sum(.5 * (np.trace(f['occupied']) + np.trace(f['virtual']))
+                       for f in forwards)
+    np.testing.assert_allclose(state['baseline_energy'], trace_energy, atol=2e-13)
+    correction = sum(row.e_ccsd + row.e_triples - row.e_mp2_lis for row in rows)
+    np.testing.assert_allclose(state['energy'], trace_energy + correction, atol=2e-13)
+    np.testing.assert_allclose(state['variance'],
+        sum(f['diagnostics']['energy_standard_error']**2 for f in forwards), atol=1e-16)
+    assert case.replay_energy_bars == ([1., 1.] if with_grad else [])
+
+
+def test_d_keeps_its_independent_mp2_solver(group_case):
+    case = group_case
+    options = dict(matrix_kind='D')
     state, _ = case.run(**options)
     assert case.baseline_targets == [(0, 1)]
     assert case.replay_energy_bars == [0., 0.]
-    assert len(case.preparations[0]) == 1
-    assert_matches_separate_baseline(case, state, options)
-
-
-@pytest.mark.parametrize('invalid', [
-    {'unknown_baseline_control': 1}, {'threads': 0}, {'target_batch_size': 0},
-    {'pilot_samples': 1}, {'virtual_keep_fraction': 0.},
-    {'target_batch_size': 2**63}, {'virtual_block_size': 2**63},
-], ids=['unknown', 'threads', 'target-batch', 'pilot-samples', 'keep-fraction',
-        'target-batch-overflow', 'virtual-block-overflow'])
-def test_w_reuse_preserves_native_baseline_control_validation(group_case, invalid):
-    case = group_case
-    with pytest.raises((ValueError, RuntimeError)):
-        case.run(matrix_kind='W', baseline_controls=dict(case.controls, **invalid),
-                 matrix_controls=dict(case.controls))
+    assert_matches_native_reference(case, state, options)

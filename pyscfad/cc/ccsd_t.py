@@ -38,8 +38,7 @@ def _can_use_df_factor_triples(mycc, eris, t1, t2):
     pyscfad triples pullback itself is a real-double C kernel, so reverse mode
     rejects other dtypes explicitly instead of reinterpreting their buffers.
     """
-    if (eris.ovvv is not None
-            or getattr(eris, 'Lov', None) is None
+    if (getattr(eris, 'Lov', None) is None
             or getattr(eris, 'Lvv', None) is None
             or mycc.mol.symmetry):
         return False
@@ -244,7 +243,8 @@ def kernel(mycc, eris, t1=None, t2=None, verbose=logger.NOTE):
     # Keep the established dense forward/symmetry path.  It still requires an
     # ovvv pytree leaf so that the custom pullback has somewhere to attach its
     # cotangent.  Reverse mode rejects symmetry above until its sorting
-    # pullback is implemented.  The common real, C1 DF path leaves ovvv lazy.
+    # pullback is implemented. The real, C1 DF path keeps using factors even
+    # when CCSD has already populated its packed ovvv cache.
     if (not use_df_factors and eris.ovvv is None
             and hasattr(eris, 'get_ovvv_packed')):
         eris.get_ovvv_packed()
@@ -305,9 +305,11 @@ def kernel(mycc, eris, t1=None, t2=None, verbose=logger.NOTE):
             leaves[keys.index(k)] = val
 
         for i, leaf in enumerate(leaves):
-            # The runtime ladder cache is unrelated to (T); None is the
-            # custom_vjp zero, avoiding a quartic host-side zero allocation.
-            if leaf is None and keys[i] != '_vvvv_pair':
+            # None is the custom_vjp zero. The factor path bypasses packed
+            # ovvv, and neither path uses the runtime ladder cache.
+            cached_zero = (keys[i] == '_vvvv_pair'
+                           or (use_df_factors and keys[i] == 'ovvv'))
+            if leaf is None and not cached_zero:
                 leaves[i] = numpy.zeros(shapes[i])
 
         eris_bar = tree_unflatten(treedef, leaves)

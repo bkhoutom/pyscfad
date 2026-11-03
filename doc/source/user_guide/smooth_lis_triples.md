@@ -250,6 +250,7 @@ on workers. The comparison runners below use one process.
 | Key | Default | Meaning / allowed values |
 | --- | --- | --- |
 | `mode` | `"deterministic"` | `deterministic` or `stochastic`. With smooth selections, deterministic means exact numerator enumeration on the fitted Laplace grid, not exact integration of the denominator. |
+| `integral_transform` | `"df"` | `df` dresses DF factors and rebuilds the three numerator integral blocks at each point; `rotate` rotates cached CCSD `ovvv`, `ovoo`, and `ovov` blocks directly. Rotation requires smooth selections and supports both modes. |
 | `nsamples` | Required in stochastic mode | Integer ≥ 2. Nominal production samples per S in fixed-count mode. Still required with a positive tolerance; it does not cap adaptive production. |
 | `global_seed` | `71` | Nonnegative integer smaller than `2**64`. |
 | `energy_tolerance` | Omitted; `0` is equivalent | Total requested triples SE in Eh. Positive values enable adaptive production. |
@@ -260,6 +261,21 @@ on workers. The comparison runners below use one process.
 The last six keys are sampling controls and are rejected with deterministic
 mode. High-level stochastic `nsamples=0` is invalid: use deterministic mode for
 enumeration. The `nsamples=0` convention belongs only to the native entry points.
+
+For example, `triples_controls={"mode": "deterministic", "integral_transform": "rotate"}`
+selects cached-integral rotation. Add `"integral_transform": "rotate"` to a
+stochastic dictionary to use the same option with sampling. The default remains
+`"df"`; the transform choice is included in checkpoint compatibility checks.
+
+Rotation unpacks the CCSD `ovvv` cache once per fragment evaluation and applies
+the occupied/virtual matrix exponentials to each integral index at each Laplace
+point. Reciprocal exponentials on internal contracted indices preserve the
+existing numerator exactly. This route does not prepare transformed B factors
+or rebuild the integral blocks from them. Its pullback reverses the rotations,
+accumulates integral and Fock-block cotangents across points, and differentiates
+the original cached-integral construction once. The outer JAX backward uses
+those accumulated cotangents. Four-index rotation has its own memory and work
+cost, so a speed advantage depends on fragment dimensions and auxiliary rank.
 
 ### Variance allocation and sample accounting
 
@@ -391,6 +407,7 @@ comparison runner above for other molecules.
 | `--cc-conv-tol` | `1e-7` | Forward CCSD energy-change threshold in Eh. |
 | `--cc-conv-tol-normt` | `1e-5` | Forward amplitude and backward response update-norm threshold. |
 | `--triples-method` | `smooth` | `smooth` or deterministic-only `conventional`. |
+| `--triples-integral-transform` | `df` | `df` or `rotate`; `rotate` requires `--triples-method smooth`. |
 | `--smooth-laplace-points` | `10` | Fitted triples points per LIS. |
 | `--smooth-trace-exponent` | `5.0` | Trace-model exponent. |
 | `--selection-only` | Off | Stop after selections and settings output. |

@@ -45,7 +45,7 @@ def _project_inputs(mf, fock, occupied_coeff, virtual_coeff, atoms, *, group=Non
     }
 
 
-def prepare_inputs(mf, common, static, fragment_index):
+def prepare_inputs(mf, common, static, fragment_index, *, return_frame=False):
     """Prepare exactly three tensors in one fixed, labelled finite Boys frame.
 
     ``common`` is rebuilt by the independent Boys ``rebuild_domain_data``.
@@ -53,22 +53,32 @@ def prepare_inputs(mf, common, static, fragment_index):
     and concrete PAO anchors. That discrete metadata stays outside the
     differentiable tensor packet. Local AO and
     auxiliary supports remain finite through ``get_local_Lov``.
+
+    With ``return_frame=True``, return ``((inputs, (co, cv)), frame)``.
+    The coefficient pair is a differentiable output; the full frame is VJP
+    auxiliary data carrying the discrete supports and labels. A caller can
+    seed both outputs to join downstream frame response with DF/Fock response
+    in one preparation pullback.
     """
     frame = build_boys_ed_frame(common, static, fragment_index)
     ao = numpy.asarray(frame.extended_ao_indices)
-    return _project_inputs(
+    inputs = _project_inputs(
         mf, common.fock[numpy.ix_(ao, ao)], frame.occupied_coeff,
         frame.virtual_coeff, frame.extended_atoms, group=fragment_index,
     )
+    if return_frame:
+        return (inputs, (frame.occupied_coeff, frame.virtual_coeff)), frame
+    return inputs
 
 
-def prepare_boys_group_inputs(mf, common, static, group):
+def prepare_boys_group_inputs(mf, common, static, group, *, return_frame=False):
     """Prepare three tensors once in the group's saved representative frame.
 
     The full occupied partner space is retained. Group membership and target
     slots stay outside the differentiable tensor dictionary.
     """
-    return prepare_inputs(mf, common, static, group.representative_index)
+    return prepare_inputs(mf, common, static, group.representative_index,
+                          return_frame=return_frame)
 
 
 def prepare_system_inputs(

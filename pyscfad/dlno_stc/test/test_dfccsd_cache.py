@@ -1,10 +1,82 @@
 """DF ladder cache integration through the physical LNO solver and CC APIs."""
+import copy
+import jax
+import jax.numpy as jnp
 import numpy
 import pytest
 
 from pyscfad import config_update, gto, lib, scf
+from pyscfad.cc import dfccsd
 from pyscfad.dlno_stc import ccsd
 from pyscfad.lno import ccsd as lno_ccsd
+
+
+def test_ccsd_reads_cached_ovvv_for_updates_and_amplitude_response():
+    """Once cached, changing Lov cannot change an amplitude contraction."""
+    with config_update('pyscfad_moleintor_opt', True):
+        mol = gto.Mole(atom='O 0 0 0; H 0 -.757 .587; H 0 .757 .587',
+                       basis='sto-3g', verbose=0, max_memory=4000)
+        mol.build(trace_exp=False, trace_ctr_coeff=False)
+        mf = scf.RHF(mol).density_fit().run()
+        solver = lno_ccsd.RCCSD(mf)
+        eris = solver.ao2mo()
+        t1, t2 = solver.init_amps(eris=eris)[1:]
+        poisoned = copy.copy(eris)
+        poisoned.Lov = jnp.full_like(eris.Lov, jnp.nan)
+        expected, pull_expected = jax.vjp(
+            lambda a, b: solver.update_amps(a, b, eris), t1, t2)
+        actual, pull_actual = jax.vjp(
+            lambda a, b: solver.update_amps(a, b, poisoned), t1, t2)
+        seeds = tuple(jnp.ones_like(x) for x in expected)
+        for got, want in zip((*actual, *pull_actual(seeds)),
+                             (*expected, *pull_expected(seeds))):
+            numpy.testing.assert_allclose(got, want, atol=1e-12, rtol=1e-12)
+
+
+def test_smooth_triples_fragment_response_with_cached_ovvv(monkeypatch):
+    """The LNO ERI VJP composes with CCSD and the native smooth (T) VJP."""
+    from pyscfad.dlno_stc.smooth_triples import make_solver
+
+    cached_mode = [True]
+    original = lno_ccsd._make_df_eris_incore
+
+    def build(*args, **kwargs):
+        eris = original(*args, **kwargs)
+        assert eris.ovvv is not None
+        if not cached_mode[0]:
+            eris.ovvv = None
+        return eris
+
+    monkeypatch.setattr(lno_ccsd, '_make_df_eris_incore', build)
+    with config_update('pyscfad_moleintor_opt', True), \
+         config_update('pyscfad_ccsd_implicit_diff', True):
+        mol = gto.Mole(atom='H 0 0 0; H 0 0 1.4; H 0 0 3.4; H 0 0 4.8',
+                       basis='sto-3g', unit='Bohr', verbose=0)
+        mol.build(trace_exp=False, trace_ctr_coeff=False)
+        mf = scf.RHF(mol).density_fit().run()
+        fock, overlap = mf.get_fock(), mf.get_ovlp()
+        fragment = mf.mo_coeff[:, :1]
+        triples = make_solver({'mode': 'deterministic'},
+            (numpy.array([.3]), numpy.array([1.]), {}), with_grad=True)
+
+        def objective(coeff):
+            (emp2, ecc, et), _ = lno_ccsd._impurity_solve_core(
+                mf, coeff, fragment, fock, overlap,
+                ccsd_t=True, triples_solver=triples)
+            return ecc + et - emp2
+
+        value, bar = jax.value_and_grad(objective)(mf.mo_coeff)
+        triples = make_solver({'mode': 'deterministic', 'integral_transform': 'rotate'},
+            (numpy.array([.3]), numpy.array([1.]), {}), with_grad=True)
+        rotated, rotated_bar = jax.value_and_grad(objective)(mf.mo_coeff)
+        numpy.testing.assert_allclose(rotated, value, atol=1e-11, rtol=0)
+        numpy.testing.assert_allclose(rotated_bar, bar, atol=2e-9, rtol=0)
+        triples = make_solver({'mode': 'deterministic'},
+            (numpy.array([.3]), numpy.array([1.]), {}), with_grad=True)
+        cached_mode[0] = False
+        reference, refbar = jax.value_and_grad(objective)(mf.mo_coeff)
+        numpy.testing.assert_allclose(value, reference, atol=1e-11, rtol=0)
+        numpy.testing.assert_allclose(bar, refbar, atol=2e-9, rtol=0)
 
 
 @pytest.mark.parametrize('direct', [False, True])
@@ -26,8 +98,10 @@ def test_public_cc_api_forwards_ladder_mode(monkeypatch, direct, entry):
 
 
 @pytest.mark.parametrize('direct', [False, True])
-def test_lno_integral_builder_obeys_ladder_mode(direct):
+def test_lno_integral_builder_obeys_ladder_mode(direct, monkeypatch):
     """LNO overrides ao2mo; it must populate the cache just like canonical CC."""
+    # Independent of JAX executables retained by preceding gradient tests.
+    monkeypatch.setattr(dfccsd, 'current_memory', lambda: (0, 0))
     with config_update('pyscfad_moleintor_opt', True):
         mol = gto.Mole(atom='O 0 0 0; H 0 -.757 .587; H 0 .757 .587',
                        basis='sto-3g', verbose=0, max_memory=4000)
@@ -40,7 +114,9 @@ def test_lno_integral_builder_obeys_ladder_mode(direct):
         cached = getattr(eris, '_vvvv_pair', None)
         assert (cached is None) is direct
         assert eris.Lov is not None and eris.Lvv is not None
-        assert eris.ovvv is None
+        assert eris.ovvv is not None
+        expected_ovvv = numpy.einsum('Pia,Pq->iaq', eris.Lov, eris.Lvv)
+        numpy.testing.assert_allclose(eris.ovvv, expected_ovvv, atol=1e-12)
         tau = numpy.random.default_rng(10).normal(size=(3, 2, 2))
         L = numpy.asarray(lib.unpack_tril(eris.Lvv))
         expected = numpy.einsum('pcd,Pac,Pbd->pab', tau, L, L)
@@ -50,6 +126,7 @@ def test_lno_integral_builder_obeys_ladder_mode(direct):
 
 def test_impurity_solver_sets_ladder_mode_before_integral_build(monkeypatch):
     """Inner fragment RCCSD must obey the option before ao2mo creates its cache."""
+    monkeypatch.setattr(dfccsd, 'current_memory', lambda: (0, 0))
     with config_update('pyscfad_moleintor_opt', True):
         mol = gto.Mole(atom='H 0 0 0; H 0 0 1.4', basis='sto-3g', unit='Bohr', verbose=0)
         mol.build(trace_exp=False, trace_ctr_coeff=False)

@@ -283,12 +283,10 @@ class _ChemistsERIs(ccsd._ChemistsERIs):
     def get_ovvv_packed(self):
         """Return the packed ``(ov|vv)`` block of shape (nocc, nvir, nvir_pair).
 
-        Builds lazily from ``Lov`` and ``Lvv`` on first access and caches on
-        ``self.ovvv``.  Forward DF-CCSD's ``update_amps`` no longer needs this
-        tensor (it builds tiles from ``Lov`` directly).  The real, C1 (T)
-        path also builds its C-kernel caches from ``Lov/Lvv``.  The packed
-        form remains available for dense/symmetry fallbacks and callers that
-        explicitly request it.
+        DF ERI builders populate ``self.ovvv`` once. CCSD and its response
+        read tiles from this cache without repeating the auxiliary contraction
+        or unpacking the full tensor. Manually supplied factor-only ERIs can
+        still populate the cache on first access.
         """
         if self.ovvv is not None:
             return self.ovvv
@@ -376,11 +374,7 @@ def _make_df_eris_incore(cc, mo_coeff=None):
 
     oovv = np.dot(np.transpose(Loo), Lvv)
     eris.oovv = lib.unpack_tril(oovv).reshape(nocc,nocc,nvir,nvir)
-    # eris.ovvv is built lazily via eris.get_ovvv_packed() on first access so
-    # the forward DF-CCSD and real C1 (T) paths (which build tiles/caches from
-    # Lov/Lvv directly) do not pay the persistent nocc*nvir*nvir_pair
-    # allocation.  Dense/symmetry fallbacks and explicit get_ovvv callers
-    # trigger the build the first time they read eris.ovvv.
+    eris.get_ovvv_packed()
     return eris
 
 
@@ -697,8 +691,11 @@ def _dfccsd_update_amps_eris_cotangent(mycc, eris, t1, t2,
     for p0 in range(0, nvir, blksize):
         p1 = min(p0 + blksize, nvir)
         bw = p1 - p0
-        Lov_tile = eris.Lov[:, :, p0:p1]
-        vovv_packed = np.einsum('xia,xb->aib', Lov_tile, eris.Lvv)
+        if eris.ovvv is not None:
+            vovv_packed = eris.ovvv[:, p0:p1].transpose(1, 0, 2)
+        else:
+            Lov_tile = eris.Lov[:, :, p0:p1]
+            vovv_packed = np.einsum('xia,xb->aib', Lov_tile, eris.Lvv)
         wooVV_flat = wooVV_flat - np.dot(
             t1[:, p0:p1],
             vovv_packed.reshape(bw, nocc * nvir_pair),
@@ -945,7 +942,10 @@ def _dfccsd_update_amps_eris_cotangent(mycc, eris, t1, t2,
             p1 = min(p0 + blksize, nvir)
             bw = p1 - p0
             Lov_tile = eris.Lov[:, :, p0:p1]
-            vovv_packed = np.einsum('xia,xb->aib', Lov_tile, eris.Lvv)
+            if eris.ovvv is not None:
+                vovv_packed = eris.ovvv[:, p0:p1].transpose(1, 0, 2)
+            else:
+                vovv_packed = np.einsum('xia,xb->aib', Lov_tile, eris.Lvv)
             vovv_tile = lib.unpack_tril(
                 vovv_packed.reshape(bw * nocc, nvir_pair)
             ).reshape(bw, nocc, nvir, nvir)
@@ -1065,11 +1065,13 @@ def lagrangian_grad(mycc, eris, t1, t2, bar_e_val, lambda_vec):
         eris, t1, t2, bar_e_val
     )
 
-    # None denotes a zero cotangent to custom_vjp. Remove the runtime cache
-    # before zero-mapping so no quartic-sized zero cache is allocated here.
+    # None denotes a zero cotangent to custom_vjp. The analytical ovvv
+    # response already enters through Lov/Lvv, so its cache must not add a
+    # second gradient path or allocate a cache-sized zero here.
     import copy
     eris_without_cache = copy.copy(eris)
     eris_without_cache._vvvv_pair = None
+    eris_without_cache.ovvv = None
     eris_bar = jax.tree_util.tree_map(_zero_like_leaf, eris_without_cache)
     eris_bar.fock = _add_bar(update_bars['fock'], e_fock_bar)
     eris_bar.mo_energy = update_bars['mo_energy']

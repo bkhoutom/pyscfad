@@ -111,12 +111,28 @@ py::array_t<double> df_array(const arma::mat& input, py::ssize_t n1, py::ssize_t
     return result;
 }
 
+arma::mat integral_matrix(const InputArray& input) {
+    const auto n0=input.size(0), n1=input.size(1), n2=input.size(2), n3=input.size(3);
+    arma::mat result(n2*n3,n0*n1);
+    for(py::ssize_t i=0;i<n0;++i) for(py::ssize_t a=0;a<n1;++a)
+        for(py::ssize_t b=0;b<n2;++b) for(py::ssize_t c=0;c<n3;++c)
+            result(b*n3+c,i*n1+a)=input.get({i,a,b,c});
+    return result;
+}
+py::array_t<double> integral_array(const arma::mat& input,
+        py::ssize_t n0,py::ssize_t n1,py::ssize_t n2,py::ssize_t n3) {
+    py::array_t<double> result({n0,n1,n2,n3});
+    // Column-major matrix storage is the C-order (i,a,b,c) tensor layout.
+    std::memcpy(result.mutable_data(),input.memptr(),input.n_elem*sizeof(double));
+    return result;
+}
+
 py::dict asymmetric(py::handle t1_value, py::handle t2_value,
                     py::handle bvo_value, py::handle boo_value, py::handle bvv_value,
                     py::handle left_value, py::handle right_value,
                     py::handle sample_value, py::handle seed_value,
                     py::handle target_value, py::handle fov_value, bool with_vjp,
-                    py::object pilot_value) {
+                    py::object pilot_value, bool integral_inputs=false) {
     const auto samples=unsigned_integer(sample_value,"nsamples");
     const auto seed=unsigned_integer(seed_value,"seed");
     const auto target=standard_error_target(target_value);
@@ -145,13 +161,25 @@ py::dict asymmetric(py::handle t1_value, py::handle t2_value,
         pilot_ptr=&pilot;
     }
     InputArray t1(t1_value,"t1",2), t2(t2_value,"t2",4);
-    InputArray bvo(bvo_value,"Bvo",3), boo(boo_value,"Boo",3), bvv(bvv_value,"Bvv",3);
     InputArray left(left_value,"L",2), right(right_value,"R",2);
-    const auto no=t1.size(0), nv=t1.size(1), naux=bvo.size(0);
-    if (no<=0 || nv<=0 || naux<=0)
-        throw py::value_error("triples requires nonempty occupied, virtual, and auxiliary dimensions");
-    t2.shape({no,no,nv,nv}); bvo.shape({naux,no,nv});
-    boo.shape({naux,no,no}); bvv.shape({naux,nv,nv});
+    const auto no=t1.size(0), nv=t1.size(1);
+    if (no<=0 || nv<=0)
+        throw py::value_error("triples requires nonempty occupied and virtual dimensions");
+    t2.shape({no,no,nv,nv});
+    arma::mat Bvo,Boo,Bvv;
+    Triples::triples_integrals integrals;
+    if(integral_inputs) {
+        InputArray ovvv(bvo_value,"ovvv",4), ovoo(boo_value,"ovoo",4), ovov(bvv_value,"ovov",4);
+        ovvv.shape({no,nv,nv,nv}); ovoo.shape({no,nv,no,no}); ovov.shape({no,nv,no,nv});
+        integrals.ovvv=integral_matrix(ovvv);
+        integrals.ovoo=integral_matrix(ovoo); integrals.ovov=integral_matrix(ovov);
+    } else {
+        InputArray bvo(bvo_value,"Bvo",3), boo(boo_value,"Boo",3), bvv(bvv_value,"Bvv",3);
+        const auto naux=bvo.size(0);
+        if(naux<=0) throw py::value_error("triples requires nonempty auxiliary dimensions");
+        bvo.shape({naux,no,nv}); boo.shape({naux,no,no}); bvv.shape({naux,nv,nv});
+        Bvo=df_matrix(bvo); Boo=df_matrix(boo); Bvv=df_matrix(bvv);
+    }
     arma::mat fov;
     const arma::mat* fov_ptr=nullptr;
     if (!fov_value.is_none()) {
@@ -175,14 +203,14 @@ py::dict asymmetric(py::handle t1_value, py::handle t2_value,
                 for (py::ssize_t b=0; b<nv; ++b) doubles(i,j)(a,b)=t2.get({i,j,a,b});
         }
     }
-    const auto Bvo=df_matrix(bvo), Boo=df_matrix(boo), Bvv=df_matrix(bvv);
     Triples::triples_result result;
     Triples::triples_vjp bars;
     {
         py::gil_scoped_release release;
         result=Triples::asymmetric_triples(singles,doubles,Bvo,Boo,Bvv,
             L,R,size_t(samples),seed,target,
-            with_vjp ? &bars : nullptr,1.0,fov_ptr,pilot_ptr);
+            with_vjp ? &bars : nullptr,1.0,fov_ptr,pilot_ptr,
+            integral_inputs ? &integrals : nullptr);
     }
     py::dict out;
     out["energy"]=result.energy; out["standard_error"]=result.standard_error;
@@ -227,9 +255,15 @@ py::dict asymmetric(py::handle t1_value, py::handle t2_value,
                     for (py::ssize_t b=0; b<nv; ++b) d(i,j,a,b)=bars.t2(i,j)(a,b);
         }
         cotangents["t1"]=t1bar; cotangents["t2"]=t2bar;
-        cotangents["Bvo"]=df_array(bars.Bvo,no,nv);
-        cotangents["Boo"]=df_array(bars.Boo,no,no);
-        cotangents["Bvv"]=df_array(bars.Bvv,nv,nv);
+        if(integral_inputs) {
+            cotangents["ovvv"]=integral_array(bars.integrals.ovvv,no,nv,nv,nv);
+            cotangents["ovoo"]=integral_array(bars.integrals.ovoo,no,nv,no,no);
+            cotangents["ovov"]=integral_array(bars.integrals.ovov,no,nv,no,nv);
+        } else {
+            cotangents["Bvo"]=df_array(bars.Bvo,no,nv);
+            cotangents["Boo"]=df_array(bars.Boo,no,no);
+            cotangents["Bvv"]=df_array(bars.Bvv,nv,nv);
+        }
         cotangents["L"]=array(bars.occupied_left);
         cotangents["R"]=array(bars.occupied_right);
         cotangents["fov"]=array(bars.fov);
@@ -245,7 +279,7 @@ void bind_triples(py::module_& module) {
     bind_triples_dressing(module);
     // Immutable identity covers the extended native numerical sources and binding.
     module.attr("TRIPLES_VERSION")=
-        "stc_triples:asymmetric-only:sha256:header=962b3da2176b7a267fad82179681cde04a0495310f9ec58eae1027aef38c4adb:asymmetric=73b292face29e1c712a06cee5901e48ac3618a03cfb021962d38bfea7f9532b1:sampler=3cb84a2fd873ab706d3b67b9f0f9f3119981d22a9ca291535075dd78072f7a96:dressing=ed94a891ccc42d53224305ad48fa298036af5e155753d10f697fc5755318455a:mp2_gradient=496fea31c8e455f6d6e6d84238d6aff9915607cde3649c3434fbe21f0efcc573:binding-10";
+        "stc_triples:asymmetric-only:sha256:header=805276502cd09fa0d8e4c51db58a97c0ae01abf9ad158ebccc02d49bf699b078:asymmetric=2c8ad2a0c8616a765b49beaec99ce2542eec87c6f3f443a0a98690bb7ca2eb47:sampler=3cb84a2fd873ab706d3b67b9f0f9f3119981d22a9ca291535075dd78072f7a96:dressing=fa84104230baf6b00af9cac1a22249ac1001410df60b8ffbf4f23984f3e7f92a:mp2_gradient=1414da61595bc0674be42479f354881f2f6e1ad0e84e3e3d6a1dac9170923bbd:binding-11-integrals";
     for (bool vjp : {false,true}) {
         module.def(vjp ? "triples_asymmetric_energy_vjp" : "triples_asymmetric_energy",
             [vjp](py::handle t1,py::handle t2,py::handle Bvo,py::handle Boo,
@@ -259,6 +293,17 @@ void bind_triples(py::module_& module) {
               py::arg("pilot")=py::none(),
               "Laplace numerator with direct S contraction and M=L R^T; denominator is -1. "
               "nsamples=0 enumerates an exact small-system reference.");
+        module.def(vjp ? "triples_asymmetric_integrals_energy_vjp" : "triples_asymmetric_integrals_energy",
+            [vjp](py::handle t1,py::handle t2,py::handle ovvv,py::handle ovoo,
+                  py::handle ovov,py::handle L,py::object R,py::handle nsamples,
+                  py::handle seed,py::handle target_standard_error,py::handle fov,py::object pilot) {
+                return asymmetric(t1,t2,ovvv,ovoo,ovov,L,R,nsamples,seed,
+                    target_standard_error,fov,vjp,pilot,true);
+            },py::arg("t1"),py::arg("t2"),py::arg("ovvv"),py::arg("ovoo"),py::arg("ovov"),
+              py::arg("L"),py::arg("R"),py::arg("nsamples"),py::arg("seed")=71,
+              py::arg("target_standard_error")=0.,py::kw_only(),py::arg("fov")=py::none(),
+              py::arg("pilot")=py::none(),
+              "Laplace numerator from dressed four-index integrals; no auxiliary factors required.");
     }
 }
 }} // namespace pyscfad::dlno_stc

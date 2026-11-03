@@ -4,6 +4,8 @@ Each quadrature node dresses all six external numerator legs by half an
 exponential. Reciprocal factors on contracted internal legs cancel exactly.
 The existing native kernel then evaluates the dressed numerator with D=-1.
 Full Fock-block response enters through stable matrix-function derivatives.
+By default, each node dresses DF factors and contracts integral blocks. The
+optional integral_transform='rotate' dresses cached CCSD blocks directly.
 
 For a partial occupied target M=U U.T, the numerator weight is O^-1 M O.
 The numerator factors this as L R.T, L=O^-1 U, R=O U, and contracts
@@ -17,9 +19,11 @@ import jax.numpy as jnp
 import numpy as np
 
 from pyscfad import lib
-from .controls import DEFAULT_TRIPLES_TRACE_EXPONENT, _finite_control
+from .controls import (DEFAULT_TRIPLES_TRACE_EXPONENT, _finite_control,
+                       _triples_integral_transform)
 
 NAMES = ('t1', 't2', 'Bvo', 'Boo', 'Bvv', 'fov')
+INTEGRAL_NAMES = ('t1', 't2', 'ovvv', 'ovoo', 'ovov', 'fov')
 
 
 def make_grid(eocc, evir, *, points=10):
@@ -72,19 +76,21 @@ def point_variance_fractions(foo, fvv, nodes, weights, *, exponent=DEFAULT_TRIPL
     return fractions / fractions.sum()
 
 
-def _native(inputs, samples, seed, target=0., with_grad=True, *, pilot=None):
+def _native(inputs, samples, seed, target=0., with_grad=True, *, pilot=None,
+            integral_inputs=False):
     native = importlib.import_module('pyscfad.dlno_stc._stc_mp2')
     values = [np.asarray(x, dtype=np.float64) for x in inputs]
     options = {} if pilot is None else {'pilot': pilot}
-    function = (native.triples_asymmetric_energy_vjp if with_grad
-                else native.triples_asymmetric_energy)
+    name = 'triples_asymmetric_' + ('integrals_' if integral_inputs else '') + 'energy'
+    function = getattr(native, name + ('_vjp' if with_grad else ''))
     return function(*values[:5], *values[6:], nsamples=int(samples), seed=int(seed),
                     target_standard_error=float(target), fov=values[5], **options)
 
 
-def _make_dresser(inputs):
+def _make_dresser(inputs, *, integral_inputs=False):
     native = importlib.import_module('pyscfad.dlno_stc._stc_mp2')
-    return native.TriplesDressing(tuple(np.asarray(x, dtype=np.float64) for x in inputs))
+    return native.TriplesDressing(tuple(np.asarray(x, dtype=np.float64) for x in inputs),
+                                  integral_inputs=integral_inputs)
 
 
 def make_solver(controls, grid, *, with_grad):
@@ -93,6 +99,9 @@ def make_solver(controls, grid, *, with_grad):
     if removed:
         raise ValueError('removed triples options: ' + ', '.join(sorted(removed)))
     stochastic = controls['mode'] == 'stochastic'
+    rotate = _triples_integral_transform(controls) == 'rotate'
+    names = INTEGRAL_NAMES if rotate else NAMES
+    native_options = {'integral_inputs': True} if rotate else {}
     trace_exponent = _finite_control('trace_exponent',
         controls.get('trace_exponent', DEFAULT_TRIPLES_TRACE_EXPONENT))
     seed = controls.get('global_seed', 71)
@@ -112,7 +121,7 @@ def make_solver(controls, grid, *, with_grad):
         pilot_counts = np.zeros(count, dtype=np.int64)
         allocation = np.zeros(count, dtype=np.int64)
         phase = time.perf_counter()
-        dresser = _make_dresser(inputs)
+        dresser = _make_dresser(inputs, integral_inputs=rotate)
         prepare = dresser.prepare
         prepare_seconds, pilot_seconds = time.perf_counter() - phase, 0.
         prepared = None
@@ -125,7 +134,8 @@ def make_solver(controls, grid, *, with_grad):
             jax.block_until_ready(prepared)
             prepare_seconds += time.perf_counter() - phase
             phase = time.perf_counter()
-            pilots = [_native(values, pilot_count, seeds[i], with_grad=with_grad)
+            pilots = [_native(values, pilot_count, seeds[i], with_grad=with_grad,
+                              **native_options)
                       for i, values in enumerate(prepared)]
             pilot_se = np.array([r['standard_error'] for r in pilots])
             pilot_counts[:] = pilot_count
@@ -169,7 +179,7 @@ def make_solver(controls, grid, *, with_grad):
             phase = time.perf_counter()
             options = {} if pilot is None else {'pilot': pilot}
             result = _native(values, number, seeds[count + i], target=native_target,
-                             with_grad=with_grad, **options)
+                             with_grad=with_grad, **native_options, **options)
             native_wall = time.perf_counter() - phase
             if native_target and (not np.isfinite(result['standard_error']) or
                                   result['standard_error'] > native_target):
@@ -182,7 +192,7 @@ def make_solver(controls, grid, *, with_grad):
                 pilot_seconds += pilot_time
             else:
                 pilot_time = 0.
-            # Shared preparation and DF pullback belong to the native call;
+            # Shared preparation and numerator pullback belong to the native call;
             # pilot_seconds contains only its discarded-pilot sampling phase.
             production_seconds += native_wall - pilot_time
             energy += weight * result['energy']
@@ -202,7 +212,7 @@ def make_solver(controls, grid, *, with_grad):
             if with_grad:
                 phase = time.perf_counter()
                 transformed_bars = tuple(np.asarray(result['cotangents'][name]) * weight
-                                         for name in (*NAMES, 'L', 'R'))
+                                         for name in (*names, 'L', 'R'))
                 contribution = dresser.pullback(float(node), transformed_bars)
                 for a, b in zip(bars, contribution):
                     np.add(a, b, out=a)
@@ -228,6 +238,7 @@ def make_solver(controls, grid, *, with_grad):
             point_preparation_reused=bool(stochastic and target),
             asymmetric_dressing=True,
             native_dressing=True,
+            rotated_integrals=rotate,
             target_met=bool(not target or np.sqrt(variance) <= target),
             laplace_nodes=np.asarray(nodes), laplace_weights=np.asarray(weights),
             point_variance_fractions=fractions, point_variance_targets=point_targets,
@@ -260,7 +271,15 @@ def make_solver(controls, grid, *, with_grad):
         # The identity frame projector and the physical fragment target are
         # different objects. A partial S retains U and its full response.
         u = jnp.eye(no, dtype=t1.dtype) if prjlo.shape == (no, no) else prjlo.T
-        inputs = (t1, t2, eris.Lov, eris.Loo, lib.unpack_tril(eris.Lvv),
+        if rotate:
+            if any(getattr(eris, name, None) is None for name in ('ovvv', 'ovoo', 'ovov')):
+                raise ValueError('integral_transform=rotate requires cached ovvv, ovoo and ovov')
+            nv = t1.shape[1]
+            ovvv = lib.unpack_tril(eris.ovvv.reshape(no * nv, -1)).reshape(no, nv, nv, nv)
+            tensors = (ovvv, eris.ovoo, eris.ovov)
+        else:
+            tensors = (eris.Lov, eris.Loo, lib.unpack_tril(eris.Lvv))
+        inputs = (t1, t2, *tensors,
                   eris.fock[:no, no:], eris.fock[:no, :no], eris.fock[no:, no:], u)
         energy, diagnostics = evaluate(*inputs) if with_grad else run(inputs)[0]
         return energy, diagnostics

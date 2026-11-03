@@ -61,8 +61,7 @@ def _profile_done(label, t0):
 
 def _can_use_df_factor_triples(eris, t1, t2):
     """Whether the LNO triples caches can be generated from DF factors."""
-    if (eris.ovvv is not None
-            or getattr(eris, 'Lov', None) is None
+    if (getattr(eris, 'Lov', None) is None
             or getattr(eris, 'Lvv', None) is None):
         return False
     arrays = (t1, t2, eris.fock, eris.mo_energy, eris.ovoo, eris.ovov,

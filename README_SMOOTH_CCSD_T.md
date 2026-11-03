@@ -39,6 +39,7 @@ These are library defaults, not the overrides in the run scripts below.
 | `smooth` / `smooth_laplace_points` | `True` / `10` | Anchored frames and a positive fitted triples grid per LIS. |
 | `ccsd_t` / `triples_controls` | `False` / `None` | Enable triples explicitly; omitted controls then mean deterministic. |
 | `triples_controls.mode` | `"deterministic"` | `"stochastic"` enables sampling. |
+| `integral_transform` | `"df"` | `"rotate"` directly rotates cached CCSD `ovvv`, `ovoo`, and `ovov` at each Laplace point; available for either smooth triples mode. |
 | `nsamples` | Required for stochastic mode, integer ≥ 2 | Nominal production budget **per S** in fixed-count mode; still required but does not cap tolerance-driven sampling. |
 | `energy_tolerance` | Omitted (equivalent to `0`) | Positive value is the total requested `(T)` energy SE in **Eh**; `5e-5` Eh = **0.05 mEh**. |
 | `pilot_samples` | `10000` | Independent discarded pilot draws **per Laplace point per S**. |
@@ -53,6 +54,15 @@ Sampling-only controls are invalid with `mode="deterministic"`. The triples
 dictionary has no thread, batch, dressing, or separate backward-sampling option.
 MP2 baseline and D/W matrix controls are independent dictionaries; changing their
 mode does not change the triples mode.
+
+To reuse CCSD integrals, add `"integral_transform": "rotate"` to
+`triples_controls`, for example
+`{"mode": "deterministic", "integral_transform": "rotate"}`. This option avoids
+transformed B factors and integral reconstruction in smooth triples. Its native
+pullback accumulates responses to the cached integrals and full Fock blocks
+across Laplace points. The default `"df"` route remains available; which is faster
+depends on fragment dimensions and auxiliary rank. The benchmark runner exposes
+the choice as `--triples-integral-transform rotate`.
 
 ## Are these only forward options?
 

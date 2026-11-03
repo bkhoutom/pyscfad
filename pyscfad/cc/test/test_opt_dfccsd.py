@@ -25,15 +25,20 @@ from pyscfad.cc import ccsd_lambda
 
 
 def test_dfccsdt_nuc_grad(get_opt_mol, monkeypatch):
-    """Differentiate factor-native (T) while keeping ``ovvv`` lazy."""
+    """CCSD(T) retains one packed ovvv construction through its full response."""
 
-    def forbid_global_ovvv(_eris):
-        raise AssertionError('global packed ovvv was materialized')
+    builds = []
+    original = dfccsd._ChemistsERIs.get_ovvv_packed
+
+    def record_build(eris):
+        if eris.ovvv is None:
+            builds.append(True)
+        return original(eris)
 
     # This covers the complete CCSD(T) reverse pass, including the production
     # solve_response_lambda path, rather than only checking the triples call.
     monkeypatch.setattr(
-        dfccsd._ChemistsERIs, 'get_ovvv_packed', forbid_global_ovvv
+        dfccsd._ChemistsERIs, 'get_ovvv_packed', record_build
     )
 
     mol = get_opt_mol
@@ -43,15 +48,16 @@ def test_dfccsdt_nuc_grad(get_opt_mol, monkeypatch):
 
         mycc = dfccsd.RCCSD(mf)
         eris = mycc.ao2mo()
+        cached = eris.ovvv
+        assert cached is not None
         mycc.kernel(eris=eris)
-        # The triples caches and their cotangents are built directly from the
-        # DF factors, so global packed (ov|vv) is never needed.
-        assert eris.ovvv is None
+        assert eris.ovvv is cached
         et = mycc.ccsd_t(eris=eris)
-        assert eris.ovvv is None
+        assert eris.ovvv is cached
         return mycc.e_tot + et
 
     e, jac = jax.value_and_grad(energy)(mol)
+    assert len(builds) == 1
 
     e0 = -100.10156178822595
     assert abs(e - e0) < 1e-6
@@ -69,6 +75,8 @@ def test_dfccsdt_factor_cache_energy_and_vjp(get_opt_mol):
     mycc = dfccsd.RCCSD(mf)
     eris = mycc.ao2mo()
     mycc.kernel(eris=eris)
+    # The standalone triples factor path must also support uncached ERIs.
+    eris.ovvv = None
     assert eris.ovvv is None
     assert ccsd_t._can_use_df_factor_triples(
         mycc, eris, mycc.t1, mycc.t2
@@ -159,8 +167,9 @@ def test_dfccsdt_factor_cache_energy_and_vjp(get_opt_mol):
     assert abs(directional_ad - directional_fd) < 2e-11
 
 
-def test_dfccsd_factor_lambda_matches_dense(get_opt_mol, monkeypatch):
-    """Tiled DF lambda update/solve agrees with the dense ovvv equations."""
+@pytest.mark.parametrize('cached', [False, True])
+def test_dfccsd_factor_lambda_matches_dense(get_opt_mol, monkeypatch, cached):
+    """Cached and factor-only tiles agree with the dense lambda equations."""
     mol = get_opt_mol
     mf = scf.RHF(mol).density_fit()
     mf.kernel()
@@ -174,7 +183,9 @@ def test_dfccsd_factor_lambda_matches_dense(get_opt_mol, monkeypatch):
     monkeypatch.setattr(ccsd_lambda, '_DF_WVVOV_B_BLKSIZE', 2)
 
     dense_eris = copy.copy(eris)
-    dense_eris.get_ovvv_packed()
+    dense_eris.Lov = None  # Select the independent dense lambda equations.
+    if not cached:
+        eris.ovvv = None
     factor_imds = ccsd_lambda.make_intermediates(
         mycc, mycc.t1, mycc.t2, eris
     )
@@ -182,7 +193,7 @@ def test_dfccsd_factor_lambda_matches_dense(get_opt_mol, monkeypatch):
         mycc, mycc.t1, mycc.t2, dense_eris
     )
     assert factor_imds.wvvov is None
-    assert eris.ovvv is None
+    assert (eris.ovvv is not None) == cached
 
     rng = numpy.random.default_rng(5)
     l1 = numpy.asarray(mycc.t1) + rng.normal(
@@ -217,24 +228,24 @@ def test_dfccsd_factor_lambda_matches_dense(get_opt_mol, monkeypatch):
     assert numpy.max(numpy.abs(
         numpy.asarray(factor_l2) - numpy.asarray(dense_l2)
     )) < 1e-11
-    assert eris.ovvv is None
+    assert (eris.ovvv is not None) == cached
 
 
-def test_triples_pullback_does_not_allocate_zero_ladder_cache(get_opt_mol,
-                                                            monkeypatch):
-    """The unrelated quartic ladder cache must remain a symbolic zero in (T)."""
+def test_triples_pullback_does_not_allocate_zero_integral_caches(get_opt_mol,
+                                                              monkeypatch):
+    """Factor (T) must not allocate zero cotangents for the CCSD caches."""
     mf = scf.RHF(get_opt_mol).density_fit()
     mf.kernel()
     mycc = dfccsd.RCCSD(mf)
     eris = mycc.ao2mo()
     mycc.kernel(eris=eris)
     assert eris._vvvv_pair is not None
-    cache_shape = eris._vvvv_pair.shape
+    cache_shapes = {eris._vvvv_pair.shape, eris.ovvv.shape}
     original_zeros = numpy.zeros
 
     def guarded_zeros(shape, *args, **kwargs):
-        if numpy.shape(shape) == (3,) and tuple(shape) == cache_shape:
-            raise AssertionError('triples allocated a quartic zero ladder cache')
+        if numpy.shape(shape) == (3,) and tuple(shape) in cache_shapes:
+            raise AssertionError('triples allocated a zero integral cache')
         return original_zeros(shape, *args, **kwargs)
 
     # Keep the actual triples forward and pullback, guarding only the unwanted
@@ -247,4 +258,4 @@ def test_triples_pullback_does_not_allocate_zero_ladder_cache(get_opt_mol,
     assert numpy.linalg.norm(eris_bar.Lvv) > 0
     assert numpy.linalg.norm(t1_bar) > 0
     assert numpy.linalg.norm(t2_bar) > 0
-    assert eris.ovvv is None
+    assert eris.ovvv is not None

@@ -182,14 +182,24 @@ stc_triples::triples_result stc_triples::asymmetric_triples(
     const arma::mat& Bvo,const arma::mat& Boo,const arma::mat& Bvv,
     const arma::mat& left,const arma::mat& right,
     size_t nsamples,std::uint64_t seed,double target,
-    triples_vjp* vjp,double cotangent,const arma::mat* fov,const pilot_controls* pilot) {
+    triples_vjp* vjp,double cotangent,const arma::mat* fov,const pilot_controls* pilot,
+    const triples_integrals* integrals) {
     const size_t no=t1.n_elem,nv=no ? t1(0).n_elem : 0,ns=left.n_cols;
     if(!no || !nv || !ns || ns>no || left.n_rows!=no || right.n_rows!=no || right.n_cols!=ns ||
-       !left.is_finite() || !right.is_finite() || Bvo.n_cols!=no*nv || Boo.n_cols!=no*no ||
-       Bvv.n_cols!=nv*nv || Bvo.n_rows!=Boo.n_rows || Bvo.n_rows!=Bvv.n_rows ||
-       !Bvo.is_finite() || !Boo.is_finite() || !Bvv.is_finite() ||
+       !left.is_finite() || !right.is_finite() ||
        t2.n_rows!=no || t2.n_cols!=no || (fov && (fov->n_rows!=no || fov->n_cols!=nv || !fov->is_finite())))
         throw std::invalid_argument("asymmetric (T): inconsistent dimensions or nonfinite inputs");
+    if(integrals) {
+        const auto& g=*integrals;
+        if(g.ovvv.n_rows!=nv*nv || g.ovoo.n_rows!=no*no || g.ovov.n_rows!=no*nv ||
+           g.ovvv.n_cols!=no*nv || g.ovoo.n_cols!=no*nv || g.ovov.n_cols!=no*nv ||
+           !g.ovvv.is_finite() || !g.ovoo.is_finite() || !g.ovov.is_finite())
+            throw std::invalid_argument("asymmetric (T): invalid integral tensors");
+    } else if(!Bvo.n_rows || Bvo.n_cols!=no*nv || Boo.n_cols!=no*no ||
+              Bvv.n_cols!=nv*nv || Bvo.n_rows!=Boo.n_rows || Bvo.n_rows!=Bvv.n_rows ||
+              !Bvo.is_finite() || !Boo.is_finite() || !Bvv.is_finite()) {
+        throw std::invalid_argument("asymmetric (T): invalid DF factors");
+    }
     if(nsamples==1 || !std::isfinite(target) || target<0 || (target>0 && !nsamples) || !std::isfinite(cotangent))
         throw std::invalid_argument("asymmetric (T): invalid sample count, target or cotangent");
     if(pilot && (pilot->samples<2 || nsamples<2 || pilot->seed==seed ||
@@ -231,7 +241,11 @@ stc_triples::triples_result stc_triples::asymmetric_triples(
         arma::mat gv(bank[GV].value.memptr(),nv*nv,no*nv,false,true);
         arma::mat go(bank[GO].value.memptr(),no*no,no*nv,false,true);
         arma::mat gg(bank[GG].value.memptr(),no*nv,no*nv,false,true);
-        gv=Bvv.t()*Bvo; go=Boo.t()*Bvo; gg=Bvo.t()*Bvo;
+        if(integrals) {
+            gv=integrals->ovvv; go=integrals->ovoo; gg=integrals->ovov;
+        } else {
+            gv=Bvv.t()*Bvo; go=Boo.t()*Bvo; gg=Bvo.t()*Bvo;
+        }
     }
     result.amplitude_packing_seconds=omp_get_wtime()-packing_start;
     const double projection_start=omp_get_wtime();
@@ -608,8 +622,12 @@ stc_triples::triples_result stc_triples::asymmetric_triples(
         arma::mat gvbar(bank[GV].bar.memptr(),nv*nv,no*nv,false,true);
         arma::mat gobar(bank[GO].bar.memptr(),no*no,no*nv,false,true);
         arma::mat ggbar(bank[GG].bar.memptr(),no*nv,no*nv,false,true);
-        vjp->Bvv=Bvo*gvbar.t(); vjp->Boo=Bvo*gobar.t();
-        vjp->Bvo=Bvv*gvbar+Boo*gobar+Bvo*(ggbar+ggbar.t());
+        if(integrals) {
+            vjp->integrals.ovvv=gvbar; vjp->integrals.ovoo=gobar; vjp->integrals.ovov=ggbar;
+        } else {
+            vjp->Bvv=Bvo*gvbar.t(); vjp->Boo=Bvo*gobar.t();
+            vjp->Bvo=Bvv*gvbar+Boo*gobar+Bvo*(ggbar+ggbar.t());
+        }
         result.vjp_finalize_seconds=omp_get_wtime()-start;
         result.vjp_reverse_seconds+=result.vjp_finalize_seconds;
     }

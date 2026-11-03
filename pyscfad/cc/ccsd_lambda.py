@@ -67,8 +67,7 @@ def _get_ovvv_full(eris):
 
 
 def _has_df_ovvv_factors(eris):
-    return (eris.ovvv is None
-            and getattr(eris, 'Lov', None) is not None
+    return (getattr(eris, 'Lov', None) is not None
             and getattr(eris, 'Lvv', None) is not None)
 
 
@@ -90,7 +89,7 @@ def _tril_pair_indices(first, second):
 
 
 def _df_ovvv_tiles(eris, p0, p1):
-    """Return complementary ovvv tiles from packed DF factors.
+    """Return complementary ovvv tiles from the cache, or DF factors.
 
     ``ovvv_a[j,a,b,c]`` slices the first (MO-pair) virtual index ``a``;
     ``ovvv_b[j,c,a,b]`` slices the first virtual index of the packed-vv
@@ -101,6 +100,15 @@ def _df_ovvv_tiles(eris, p0, p1):
     Lvv = eris.Lvv
     naux, nocc, nvir = Lov.shape
     bw = p1 - p0
+    pair = _tril_pair_indices(numpy.arange(p0, p1), numpy.arange(nvir))
+
+    if eris.ovvv is not None:
+        ovvv_a = lib.unpack_tril(
+            eris.ovvv[:, p0:p1].reshape(nocc * bw, -1)
+        ).reshape(nocc, bw, nvir, nvir)
+        ovvv_b = np.take(eris.ovvv, pair.ravel(), axis=2).reshape(
+            nocc, nvir, bw, nvir)
+        return ovvv_a, ovvv_b, ovvv_b.transpose(2, 3, 0, 1)
 
     Lov_tile = Lov[:, :, p0:p1]
     ovvv_packed = np.einsum('xja,xq->ajq', Lov_tile, Lvv)
@@ -108,7 +116,6 @@ def _df_ovvv_tiles(eris, p0, p1):
         ovvv_packed.reshape(bw * nocc, -1)
     ).reshape(bw, nocc, nvir, nvir).transpose(1, 0, 2, 3)
 
-    pair = _tril_pair_indices(numpy.arange(p0, p1), numpy.arange(nvir))
     L_ab = np.take(Lvv, pair.ravel(), axis=1).reshape(naux, bw, nvir)
     ovvv_b = np.einsum('xjc,xab->jcab', Lov, L_ab)
     # eris_vvov = eris_ovvv.transpose(2, 3, 0, 1)
@@ -152,7 +159,7 @@ def _contains_tracer(x):
 
 
 def _make_intermediates_df(mycc, t1, t2, eris):
-    """DF lambda intermediates without global ``ovvv`` or ``wvvov``."""
+    """DF lambda intermediates without full unpacked ``ovvv`` or ``wvvov``."""
     nocc, nvir = t1.shape
     foo = eris.fock[:nocc, :nocc]
     fov = eris.fock[:nocc, nocc:]

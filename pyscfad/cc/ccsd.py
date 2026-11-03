@@ -257,9 +257,8 @@ def update_amps(mycc, t1, t2, eris):
             raise NotImplementedError(
                 'DF tiled ovvv update does not support direct AO mode')
 
-        # DF-direct path: build the ovvv block (nvir, nocc, nvir, nvir) on the
-        # fly per tile from Lov, Lvv -- avoids the 1.9 GB persistent
-        # `eris.ovvv` and the ~6 GB transient full unpack of `eris_vovv`.
+        # Read the packed ovvv cache one virtual column at a time, avoiding
+        # a full unpack. Factor-only ERIs retain the on-demand fallback.
         # ``eris.Lov`` is stored with shape (naux, nocc, nvir);
         # ``eris.Lvv`` is the tril-packed (naux, nvir*(nvir+1)/2).
         Lov_full = eris.Lov
@@ -280,12 +279,16 @@ def update_amps(mycc, t1, t2, eris):
         theta_scan = jnp.asarray(theta)
         Lov_scan = jnp.asarray(Lov_full)
         Lvv_scan = jnp.asarray(Lvv_full)
+        ovvv_scan = None if eris.ovvv is None else jnp.asarray(eris.ovvv)
         tau_scan = jnp.asarray(tau_for_vvvo)
 
         def ovvv_body(carry, aidx):
             fvv, wooVV_flat, wVOov, t1new, tmp_acc = carry
-            Lov_col = Lov_scan[:, :, aidx]
-            vovv_packed = np.einsum('xi,xb->ib', Lov_col, Lvv_scan)
+            if ovvv_scan is not None:
+                vovv_packed = ovvv_scan[:, aidx, :]
+            else:
+                Lov_col = Lov_scan[:, :, aidx]
+                vovv_packed = np.einsum('xi,xb->ib', Lov_col, Lvv_scan)
             wooVV_flat = wooVV_flat - (
                 t1_scan[:, aidx][:, None]
                 * vovv_packed.reshape(1, nocc * nvir_pair)

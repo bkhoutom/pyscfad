@@ -142,7 +142,18 @@ Stochastic E and W use the same production samples, with covariance included
 in the reported MP2 energy SE. After the LIS CCSD(T) response, one matrix
 pullback combines `energy_bar=1` with the occupied/virtual W cotangents. Direct
 Fock and orbital cotangents from the LIS response are accumulated through their
-own preparation paths. No energy derivative is computed during W sampling.
+own preparation paths. The extended-domain occupied/virtual frame is built
+once per preparation group and shared by the domain DF/Fock and LIS branches.
+Preparation exposes both its three input tensors and the frame coefficients
+as differentiable outputs. Direct LIS frame cotangents are summed over the
+group's physical fragments and seeded alongside the accumulated DF/Fock bars;
+one preparation VJP combines them before reversing the frame once. Only the
+current group's frame, derivative intermediates and coefficient bars are kept.
+Selection also reuses the frame returned by domain preparation, while its
+discrete selection pass remains separate from the differentiable evaluation.
+The per-fragment `direct_host_bar_norm` reports direct host bars with this
+shared frame held fixed; shared frame response is included later in the total
+gradient. No energy derivative is computed during W sampling.
 Weak-pair MP2 terms are still added separately, once. `include_baseline=False`
 sets the W energy seed to zero and returns only the selected CC corrections.
 For W, `matrix_controls` determines strong-domain energy precision;
@@ -488,13 +499,23 @@ remaining `max_memory`; otherwise the solver warns and uses the improved
 uncached contraction. Set `vvvv_direct=True` on `ccsd.kernel` or
 `ccsd.value_and_grad` to force the lower-memory mode. Canonical and LNO
 `RCCSD` objects expose the same attribute, set before `ao2mo`/`kernel`.
-Both modes retain the factor-based `ovvv`, lambda and triples paths.
-The float64 cache uses `16 * [nvir * (nvir + 1) / 2]**2` bytes per active
+Both modes always cache packed `(ov|vv)`, along with the existing `oooo`,
+`ovoo`, `ovov`/`ovvo`, and `oovv` blocks. CCSD updates, lambda contractions,
+and the analytical response replay read tiles from the packed cache; they
+do not rebuild `(ov|vv)` from DF factors. Its float64 storage is
+`8 * nocc * nvir * [nvir * (nvir + 1) / 2]` bytes per active fragment.
+Smooth triples defaults to its existing factor-based construction. Set
+`triples_controls={"mode": "deterministic", "integral_transform": "rotate"}`
+to rotate cached `ovvv`, `ovoo`, and `ovov` blocks at each Laplace point instead.
+The same `integral_transform` option is available in stochastic mode. This path
+needs no transformed B factors and accumulates the cached-integral response
+across points before propagating it to the original DF factors.
+The float64 `vvvv` cache uses `16 * [nvir * (nvir + 1) / 2]**2` bytes per active
 fragment; concurrent MPI ranks each need their own cache allocation.
 The selected mode is included in serial CC checkpoint identity.
-The default analytical CCSD response keeps the cache cotangent symbolic.
+The default analytical CCSD response keeps both cache cotangents symbolic.
 If `pyscfad_dfccsd_custom_response=False` selects generic implicit response,
-JAX can additionally materialize one cache-sized zero cotangent; use
+JAX can additionally materialize one `vvvv`-cache-sized zero cotangent; use
 `vvvv_direct=True` when that extra memory is undesirable.
 
 The retained stochastic implementation uses full occupied/virtual LIS frames,

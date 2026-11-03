@@ -214,6 +214,7 @@ def test_checkpoint_rejects_changed_triples_controls_and_native_version(tmp_path
     manager.close()
     for changed in ({**options, 'triples_controls': {**options['triples_controls'], 'nsamples':3}},
                     {**options, 'triples_controls': {**options['triples_controls'], 'global_seed':72}},
+                    {**options, 'triples_controls': {**options['triples_controls'], 'integral_transform':'rotate'}},
                     {**options, 'triples_controls': {'mode':'deterministic'}}):
         with pytest.raises(RestartMismatchError):
             open_checkpoint(state, static, groups, checkpoint_dir=tmp_path, resume=True, options=changed)
@@ -237,9 +238,14 @@ def test_group_carries_triples_diagnostics_through_response(monkeypatch, with_gr
     settings = {'mode': 'stochastic', 'nsamples': 2, 'global_seed': 71}
     def prepare(mf, common):
         return {k: jnp.asarray(v) * (1 + .07 * mf + .03 * common) for k, v in x.items()}
-    def prepared(state, *args):
-        inputs, pullback = jax.vjp(prepare, state['mf'], state['common'])
-        return inputs, ccsd.backend.host_inputs(inputs), pullback
+    def prepared(state, *args, return_frame=False):
+        from pyscfad.dlno_stc.domain import BoysEDFrame
+        assert return_frame
+        coeff = (jnp.ones((1, 1)), jnp.ones((1, 1)))
+        (inputs, _), pullback = jax.vjp(
+            lambda m, c: (prepare(m, c), coeff), state['mf'], state['common'])
+        frame = BoysEDFrame(*coeff, np.array([0]), np.array([0]), 0, (0,))
+        return inputs, ccsd.backend.host_inputs(inputs), pullback, frame
     def fragment(mf, common, static, index, matrices, group, **options):
         assert options['triples_controls'] == settings
         assert options['with_grad'] == with_grad

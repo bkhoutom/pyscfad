@@ -160,7 +160,7 @@ For W, `matrix_controls` determines strong-domain energy precision;
 `baseline_controls` remains part of preparation configuration, and the two
 Laplace grids must match. D calculations retain their independent MP2 solver.
 Rebuild saved CC selections and start a new checkpoint after this merge;
-selection schema 8 prevents resuming results from the earlier baseline policy.
+selection schema 9 requires rebuilding earlier LIS selections and checkpoints.
 
 The fit uses 600 single-gap points and three positive least-squares starts.
 Diagnostics include fitting seconds, exact molecular denominator bounds,
@@ -502,6 +502,34 @@ remain 1.
 `value_and_grad`. Each physical Boys fragment has its own retained LIS and
 CCSD(T) correction; identical extended domains may share preparation.
 
+Occupied and virtual LNO eigenproblems always use extended-domain coordinates;
+there is no global-space selection option. The occupied calculation projects
+out the original fragment targets, selects an independent basis of the
+remaining domain span, and diagonalizes the density there. Every original
+target is retained exactly. Projection metrics, target projectors and domain
+maps all carry their pullbacks, preserving the global-space subspace definition.
+A zero cutoff retains the full corresponding molecular active space directly,
+without a density eigenproblem.
+
+For serial W calculations, `build_static_selections(..., single_pass=True)`
+returns a plan without a W prepass. Production
+prepares one domain group, selects each fragment's LIS from its W result, and
+retains the same input/frame pullback through its CCSD(T)-MP2 correction and
+joint W/MP2 reverse. The library retains two-pass selection as its default;
+`benchmark_lno_w_triples.py` defaults to single-pass. Both use only domain
+eigensystems. The former `virtual_eigenspace` Python argument and
+`--lis-virtual-eigenspace` CLI switch have been removed.
+
+Single-pass adaptive triples uses `variance_allocation="occupied_count"`:
+`w_f = n_occ_fragment / n_active_occ_total` and
+`target_SE_f = total_SE * sqrt(w_f)`. These counts refer to original physical
+occupied targets, not extended-domain dimensions. Subset calculations keep
+the whole-molecule denominator. This replaces the legacy `mp2_energy` proxy
+allocation and may change sample counts and finite-sample triples results.
+Neither allocation is differentiated. The common-domain pullback remains:
+summed fragment adjoints must still pass through Boys/PAO construction,
+overlap and Fock data, followed by the separate SCF orbital response.
+
 DF-CCSD uses the improved virtual ladder contractions from upstream PySCFAD.
 The default `vvvv_direct=False` caches the symmetry-packed virtual integrals
 for repeated CCSD and response iterations when the cache fits within 60% of
@@ -544,7 +572,7 @@ force-comparison examples. Library triples defaults are deterministic mode,
 point and trace exponent 5.0. The MP2 trace model uses exponent 1.4. The production
 examples request total triples SE `5e-5` Eh (0.05 mEh). These controls affect energies and
 their gradients; production energy and derivative estimates share samples.
-CC selections use schema 8; rebuild saved selections/checkpoints after changing
+CC selections use schema 9; rebuild saved selections/checkpoints after changing
 from earlier implementations. Native energy/VJP entry points are
 `triples_asymmetric_energy` and `triples_asymmetric_energy_vjp`.
 

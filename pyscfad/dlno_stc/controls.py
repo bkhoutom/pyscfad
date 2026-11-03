@@ -80,7 +80,7 @@ def normalize_triples_controls(controls, *, ccsd_t):
     settings = controls.copy()
     unknown = set(settings) - {'mode', 'nsamples', 'global_seed', 'energy_tolerance',
                                'pilot_samples', 'fragment_energies', 'trace_exponent',
-                               'integral_transform'}
+                               'integral_transform', 'variance_allocation'}
     if unknown:
         raise ValueError('unsupported triples controls: '
                          + ', '.join(sorted(map(str, unknown))))
@@ -94,6 +94,11 @@ def normalize_triples_controls(controls, *, ccsd_t):
         if set(settings) - {'mode', 'integral_transform'}:
             raise ValueError('deterministic triples do not accept sampling controls')
         return settings
+    allocation = settings.get('variance_allocation', 'mp2_energy')
+    if allocation not in ('mp2_energy', 'occupied_count'):
+        raise ValueError('variance_allocation must be mp2_energy or occupied_count')
+    if allocation == 'occupied_count' and 'fragment_energies' in settings:
+        raise ValueError('occupied_count allocation does not use fragment_energies')
     if 'nsamples' not in settings:
         raise ValueError('stochastic triples require integer nsamples >= 2')
     settings['nsamples'] = _integer_control('nsamples', settings['nsamples'], minimum=2)

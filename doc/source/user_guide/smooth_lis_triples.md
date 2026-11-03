@@ -20,8 +20,17 @@ frames and the older adaptive Gaussian triples grid have been removed.
 
 ## Frames and physical selection
 
+LNO eigenproblems use only extended-domain occupied and virtual coordinates.
+Original occupied fragment targets are retained exactly; the occupied density
+is projected outside their span before its compact eigenproblem. The domain
+projection metrics, map response and target-projector response are retained.
+No global-space diagonalization option is exposed. Zero cutoffs keep the full
+corresponding molecular active space directly, without diagonalizing D/W.
+
 `build_static_selections` chooses LIS ranks, AO anchors and Laplace grids once,
-outside differentiation. `select_frame` saves semicanonical reference anchors;
+outside differentiation. With `single_pass=True` it returns a plan, and those
+choices are made from each fragment's production W while its preparation
+pullback remains live. `select_frame` saves semicanonical reference anchors;
 `rebuild_frame` transports those anchors with the current LIS and AO overlap.
 Its input contains no Fock matrix, so the Fock-frame cotangent is zero.
 

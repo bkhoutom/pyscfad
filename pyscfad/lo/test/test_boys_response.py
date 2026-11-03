@@ -1,5 +1,6 @@
 """Numerical regression checks for the projected Boys localization response."""
 import importlib
+from contextlib import nullcontext
 from functools import partial, wraps
 
 import jax
@@ -64,15 +65,17 @@ def test_complete_localization_pullback_matches_baseline(case, monkeypatch, vari
     def localize(m, c):
         return boys.boys(m, c, **options)
     monkeypatch.setenv('BOYS_RESPONSE_VARIANT', 'baseline')
-    expected, baseline = jax.vjp(localize, mol, coeff)
-    expected_bars = baseline(seed)
+    with monkeypatch.context() as uncached:
+        uncached.setattr(boys.Boys, '_cache_dipoles', lambda *args, **kwargs: nullcontext())
+        expected, baseline = jax.vjp(localize, mol, coeff)
+        expected_bars = baseline(seed)
     if variant is None:
         monkeypatch.delenv('BOYS_RESPONSE_VARIANT', raising=False)
     else:
         monkeypatch.setenv('BOYS_RESPONSE_VARIANT', variant)
     actual, projected = jax.vjp(localize, mol, coeff)
     actual_bars = projected(seed)
-    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_allclose(actual, expected, rtol=1e-9, atol=1e-10)
     for a, b in zip(jax.tree_util.tree_leaves(actual_bars),
                     jax.tree_util.tree_leaves(expected_bars)):
         np.testing.assert_allclose(a, b, rtol=1e-7, atol=1e-9)

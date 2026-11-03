@@ -187,16 +187,18 @@ def test_partial_target_laplace_all_responses():
 
 
 def test_truncated_anchored_frame_w_response_and_internal_degeneracy():
-    from pyscfad.dlno_stc.lis import _smooth_density_space
+    from pyscfad.dlno_stc.lis import _mapped_density_space
     rng = np.random.default_rng(83)
     q = jnp.asarray(np.linalg.qr(rng.normal(size=(6, 6)))[0])
     matrix = q @ jnp.diag(jnp.array([0., .01, .01, .3, .3, .8])) @ q.T
     internal = q[:, :1]
+    external = q[:, 1:]
     identity = jnp.eye(6)
     frame = AnchoredFrame(np.asarray(q[:, [0, 3, 4, 5]]))
     d = rng.normal(size=(6, 6)); d = jnp.asarray((d+d.T)/2)
     def project(w):
-        c = _smooth_density_space(w, internal, (3, 4, 5), False, identity, identity, frame)
+        c = _mapped_density_space(external.T @ w @ external, external, internal,
+                                  (2, 3, 4), identity, identity, frame)
         return c @ c.T
     _, tangent = jax.jvp(project, (matrix,), (d,))
     step = 1e-5
@@ -246,5 +248,5 @@ def test_retained_frame_checkpoint_roundtrip_and_old_selection_rejection(tmp_pat
     finally:
         manager.close()
     previous = ccsd.CCSDSelections(None, (), schema_version=5)
-    with pytest.raises(ValueError, match='incompatible CC selections'):
+    with pytest.raises(ValueError, match='incompatible CC selection schema'):
         ccsd._validate_run(previous, {}, {}, None)

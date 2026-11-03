@@ -55,12 +55,20 @@ def main():
     parser.add_argument("--smooth-laplace-points", type=int, default=10)
     parser.add_argument("--smooth-trace-exponent", type=float, default=5.)
     parser.add_argument("--selection-only", action="store_true")
+    parser.add_argument("--single-pass-w", action=argparse.BooleanOptionalAction, default=True,
+                        help="select each LIS from its production W, preserving the same pullback")
+    parser.add_argument("--triples-variance-allocation", choices=("occupied_count", "mp2_energy"),
+                        default="occupied_count")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--deterministic-only", action="store_true")
     mode.add_argument("--stochastic-only", action="store_true")
     parser.add_argument("--reference", type=Path,
                         help="reuse a validated deterministic energy/force result")
     args = parser.parse_args()
+    if args.single_pass_w and (args.selection_only or args.reference):
+        parser.error('selection-only/reference reuse requires --no-single-pass-w')
+    if args.single_pass_w and args.triples_variance_allocation != 'occupied_count':
+        parser.error('single-pass W requires occupied_count variance allocation')
     if args.threads < 1:
         parser.error("--threads must be positive")
     benchmark_cpus = configure_cpu_workload(args.threads)
@@ -121,6 +129,12 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     if (output / "settings.json").exists():
         previous = json.loads((output / "settings.json").read_text())
+        for key, value, old_default in (
+                ('single_pass_w', args.single_pass_w, False),
+                ('lis_eigenspace', 'domain', 'global'),
+                ('triples_variance_allocation', args.triples_variance_allocation, 'mp2_energy')):
+            if previous.get(key, old_default) != value:
+                raise ValueError(f'{key} differs; use a new output directory')
         if previous.get('scf_df_precond', False) != args.scf_df_precond:
             raise ValueError('SCF preconditioning differs; use a new output directory')
         if previous.get('triples_integral_transform', 'df') != args.triples_integral_transform:
@@ -272,7 +286,7 @@ def main():
     matrix = dict(mode="deterministic", threads=args.threads,
                   memory_limit_mb=args.max_memory_mb, **grid)
     selection_start = time.perf_counter()
-    report(f"Starting W-LIS selection: occupied cutoff={args.lno_thresh_occ:g}, "
+    report(f"Configuring W-LIS selection: occupied cutoff={args.lno_thresh_occ:g}, "
            f"virtual cutoff={args.lno_thresh_vir:g}")
     selection_options = dict(matrix_kind="W", thresh_occ=args.lno_thresh_occ,
                              thresh_vir=args.lno_thresh_vir,
@@ -280,11 +294,13 @@ def main():
                              merge_identical=True)
     selected = ccsd.build_static_selections(
         mf, domains, smooth=args.triples_method == "smooth",
-        smooth_laplace_points=args.smooth_laplace_points, **selection_options)
+        smooth_laplace_points=args.smooth_laplace_points,
+        single_pass=args.single_pass_w,
+        **selection_options)
     selection_seconds = time.perf_counter() - selection_start
     dimensions = [ccsd._fragment_dimensions(selected, i) for i in range(expected_groups)]
     frame_blocks = []
-    if args.triples_method == "smooth":
+    if args.triples_method == "smooth" and not args.single_pass_w:
         for dims, frames in zip(dimensions, selected.lis_static.smooth_frames):
             blocks = dict(occupied=[frames[0].anchor.shape[1]],
                           virtual=[frames[1].anchor.shape[1]])
@@ -299,6 +315,12 @@ def main():
                     mp2_energy_source="w_matrix_trace", mp2_response="joint_energy_w_pullback",
                     pair_energy_model=domains.pair_energy_model,
                     lno_thresh_occ=args.lno_thresh_occ, lno_thresh_vir=args.lno_thresh_vir,
+                    single_pass_w=args.single_pass_w,
+                    lis_eigenspace='domain',
+                    triples_variance_allocation=args.triples_variance_allocation,
+                    selection_timer_scope='plan_only' if args.single_pass_w else 'complete_prepass',
+                    fragment_occupied_counts=[len(members) for members in domains.physical_groups],
+                    total_active_occupied=len(domains.active_occ_indices),
                     nao=mol.nao, lis_dimensions=dimensions, threads=args.threads,
                     cpu_affinity=benchmark_cpus, affinity_check=affinity,
                     max_memory_mb=args.max_memory_mb, cc_conv_tol=args.cc_conv_tol,
@@ -335,7 +357,11 @@ def main():
                     setup_seconds=time.perf_counter()-started)
     save(output / "settings.json", settings)
     report(f"CPU affinity {benchmark_cpus}; all {affinity['runtime_threads']} runtime threads verified")
-    report(f"Selected {expected_groups} W-LIS fragments; dimensions {dimensions}")
+    if args.single_pass_w:
+        report(f"Planned {expected_groups} fragments: one W build and shared input pullback; "
+               "LIS ranks/anchors will be selected within each production fragment")
+    else:
+        report(f"Selected {expected_groups} W-LIS fragments; dimensions {dimensions}")
     report(f"Smooth frame blocks {frame_blocks}; persistent JAX cache enabled: "
            f"{bool(jax.config.jax_enable_compilation_cache)}")
     if args.selection_only:
@@ -374,7 +400,8 @@ def main():
             label = f"stochastic_t{target:g}_seed{seed}"
             controls = dict(mode="stochastic", nsamples=args.pilot_samples,
                             pilot_samples=args.pilot_samples,
-                            global_seed=seed, energy_tolerance=target / 1000)
+                            global_seed=seed, energy_tolerance=target / 1000,
+                            variance_allocation=args.triples_variance_allocation)
             if args.triples_method == "smooth":
                 controls.update(trace_exponent=args.smooth_trace_exponent)
             if args.triples_integral_transform == "rotate":
@@ -396,6 +423,12 @@ def main():
         fragments = asdict(components)["fragments"]
         if len(fragments) != expected_groups:
             raise RuntimeError(f"{label} returned {len(fragments)} fragments")
+        if args.single_pass_w:
+            dimensions = [(f['nocc_lis'], f['nvir_lis']) for f in fragments]
+            frame_blocks = ([dict(occupied=[no], virtual=[nv]) for no, nv in dimensions]
+                            if args.triples_method == 'smooth' else [])
+            settings.update(lis_dimensions=dimensions, smooth_frame_blocks=frame_blocks)
+            save(output / 'settings.json', settings)
         result = dict(label=label, controls=controls, total_energy_eh=float(energy),
                       force_eh_per_bohr=force.tolist(), components=asdict(components),
                       geometry=str(xyz), basis=args.basis, frozen=args.frozen,
@@ -411,6 +444,9 @@ def main():
                       mp2_energy_source="w_matrix_trace", mp2_response="joint_energy_w_pullback",
                       triples_mode=args.triples_method,
                       triples_integral_transform=args.triples_integral_transform,
+                      single_pass_w=args.single_pass_w,
+                      lis_eigenspace='domain',
+                      triples_variance_allocation=args.triples_variance_allocation,
                       smooth_frame_mode=frame_mode,
                       smooth_frame_blocks=frame_blocks,
                       jax_persistent_cache_enabled=bool(jax.config.jax_enable_compilation_cache),

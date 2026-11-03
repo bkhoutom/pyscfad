@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from contextlib import contextmanager
 from functools import partial
 import numpy
 import jax
@@ -34,6 +35,9 @@ def kernel(localizer, mo_coeff=None, callback=None, verbose=None,
     from pyscf.soscf import ciah
     if mo_coeff is not None:
         localizer.mo_coeff = numpy.asarray(mo_coeff, order='C')
+    # Newer PySCF stores the rotation dimension on the optimizer itself.
+    if hasattr(localizer, 'norb'):
+        localizer.norb = localizer.mo_coeff.shape[1]
     if localizer.mo_coeff.shape[1] <= 1:
         return localizer.mo_coeff
 
@@ -92,9 +96,9 @@ def kernel(localizer, mo_coeff=None, callback=None, verbose=None,
         tot_hop += stat.tot_hop
 
     rotaiter.close()
-    log.info('macro X = %d  f(x)= %.14g  |g|= %g  %d intor %d KF %d Hx',
+    log.info('macro X = %d  f(x)= %.14g  |g|= %g  %d KF %d Hx',
              imacro+1, e, norm_gorb,
-             (imacro+1)*2, tot_kf+imacro+1, tot_hop)
+             tot_kf+imacro+1, tot_hop)
 # Sort the localized orbitals, to make each localized orbitals as close as
 # possible to the corresponding input orbitals
     sorted_idx = mo_mapping.mo_1to1map(u0)
@@ -105,6 +109,8 @@ def kernel(localizer, mo_coeff=None, callback=None, verbose=None,
 
 
 class Boys(pyscf_boys.Boys):
+    """CIAH Boys optimization with dipoles projected once per forward solve."""
+
     def get_init_guess(self, key='atomic'):
         if hasattr(key, 'shape'):
             u0 = numpy.asarray(key)
@@ -112,7 +118,79 @@ class Boys(pyscf_boys.Boys):
             u0 = pyscf_boys.Boys.get_init_guess(self, key=key)
         return u0
 
-    kernel = kernel
+    @contextmanager
+    def _cache_dipoles(self, mo_coeff=None):
+        """Scope numerical caches to one fixed molecule and orbital subspace.
+
+        Only projected dipoles and the scalar r2 trace are cached during CIAH.
+        The differentiable optimality condition builds its own live dipoles.
+        """
+        coeff = numpy.asarray(self.mo_coeff if mo_coeff is None else mo_coeff)
+        center = (numpy.einsum('z,zx->x', self.mol.atom_charges(), self.mol.atom_coords())
+                  / self.mol.atom_charges().sum())
+        dipoles = pyscf_boys.dipole_integral(self.mol, coeff, center)
+        with self.mol.with_common_origin(center):
+            r2 = numpy.asarray(self.mol.intor_symmetric('int1e_r2'))
+        spread_trace = numpy.einsum('pi,pi->', coeff.conj(), r2 @ coeff).real
+        del r2
+        previous = getattr(self, '_boys_dipole_cache', None)
+        self._boys_dipole_cache = (dipoles, spread_trace)
+        try:
+            yield
+        finally:
+            if previous is None:
+                del self._boys_dipole_cache
+            else:
+                self._boys_dipole_cache = previous
+
+    def _rotated_cached_dipoles(self, u):
+        dipoles = self._boys_dipole_cache[0]
+        return dipoles if u is None else u.conj().T @ (dipoles @ u)
+
+    def get_grad(self, u=None, dip=None):
+        if dip is None and getattr(self, '_boys_dipole_cache', None) is not None:
+            dip = self._rotated_cached_dipoles(u)
+        return super().get_grad(u, dip)
+
+    def gen_g_hop(self, u=None):
+        if getattr(self, '_boys_dipole_cache', None) is None:
+            return super().gen_g_hop(u)
+        # Same analytic gradient/Hessian action as PySCF Boys.gen_g_hop,
+        # evaluated entirely in the fixed localization subspace.
+        dip = self._rotated_cached_dipoles(u)
+        g0 = numpy.einsum('xii,xip->pi', dip, dip)
+        g = self.get_grad(u, dip)
+        h_diag = numpy.einsum('xii,xpp->pi', dip, dip) * 2
+        h_diag -= g0.diagonal() + g0.diagonal().reshape(-1, 1)
+        h_diag += numpy.einsum('xip,xip->pi', dip, dip) * 2
+        h_diag += numpy.einsum('xip,xpi->pi', dip, dip) * 2
+        h_diag = -self.pack_uniq_var(h_diag) * 4
+        g0 = g0 + g0.conj().T
+
+        def h_op(x):
+            x = self.unpack_uniq_var(x)
+            norb = x.shape[0]
+            hx = numpy.dot(x.T, g0.T).conj()
+            hx += numpy.einsum('xip,xi->pi', dip, numpy.einsum('qi,xiq->xi', x, dip)) * 2
+            hx -= numpy.einsum('xpp,xip->pi', dip,
+                              numpy.dot(dip.reshape(-1, norb), x).reshape(3, norb, norb)) * 2
+            hx -= numpy.einsum('xip,xp->pi', dip, numpy.einsum('qp,xpq->xp', x, dip)) * 2
+            return -self.pack_uniq_var(hx-hx.conj().T) * 2
+
+        return g, h_op, h_diag
+
+    def cost_function(self, u=None):
+        if getattr(self, '_boys_dipole_cache', None) is None:
+            return super().cost_function(u)
+        dip = self._rotated_cached_dipoles(u)
+        return self._boys_dipole_cache[1] - numpy.einsum('xii,xii->', dip, dip).real
+
+    def kernel(self, mo_coeff=None, callback=None, verbose=None, return_u=False):
+        coeff = self.mo_coeff if mo_coeff is None else mo_coeff
+        if coeff.shape[1] <= 1:
+            return kernel(self, mo_coeff, callback, verbose, return_u)
+        with self._cache_dipoles(coeff):
+            return kernel(self, mo_coeff, callback, verbose, return_u)
 
 
 def dipole_integral(mol, mo_coeff):
@@ -243,12 +321,11 @@ def _boys(x, mol, mo_coeff, *,
     loc.ah_conv_tol = min(loc.ah_conv_tol, inner_tol)
     loc.ah_lindep = min(loc.ah_lindep, inner_tol)
 
-    if init_guess is None:
-        u, sorted_idx = loc.kernel(mo_coeff=mo_coeff, return_u=True)
-    else:
-        u, sorted_idx = loc.kernel(mo_coeff=None, return_u=True)
-
-    x = _extract_x0(loc, u)
+    # Include the final Hessian-diagonal check in the same cache lifetime.
+    with loc._cache_dipoles():
+        u, sorted_idx = kernel(loc,
+            mo_coeff=mo_coeff if init_guess is None else None, return_u=True)
+        x = _extract_x0(loc, u)
     return x, sorted_idx
 
 def boys(mol, mo_coeff, *,
@@ -272,10 +349,15 @@ def boys(mol, mo_coeff, *,
             `pyscfad.tools.linear_solver.gen_gmres` for other options.
 
     Notes:
+        The forward CIAH solve caches three projected dipole matrices and the
+        rotation-invariant r2 trace. Every solve rebuilds these from its current
+        molecule and input orbitals; only small orbital-space rotations are
+        performed during optimization.
+
         The response uses occupied-space dipoles and a compiled rotation
         gradient. A diagonal preconditioner is applied to compatible host
         solvers; traced and JAX solves retain the exact projected response
-        without a host preconditioner. The forward localization is unchanged.
+        without a host preconditioner.
 
         Set ``BOYS_RESPONSE_VARIANT=baseline`` to recover the original response
         and solver defaults, or ``projected`` for the unpreconditioned projected

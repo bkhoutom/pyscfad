@@ -790,6 +790,15 @@ def test_local_direct_nr_e2_h5_bwd_uses_bounded_dataset_slices(
         lno_df_direct._int3c_cross_opt, 'int3c_cross', tracked_int3c_cross
     )
 
+    # Native geometry contraction bypasses the explicit int3c_ip1 wrapper.
+    original_bwd = lno_df_direct._int3c_cross_opt.int3c_cross_bwd
+    def tracked_bwd(intor, comp, aosym, shells, out, residual, seed):
+        shl0, shl1 = shells[4] - fake_mol.nbas, shells[5] - fake_mol.nbas
+        integral_ranges.append(('int3c2e_ip1', int(auxmol.ao_loc[shl0]),
+                                int(auxmol.ao_loc[shl1])))
+        return original_bwd(intor, comp, aosym, shells, out, residual, seed)
+    monkeypatch.setattr(lno_df_direct._int3c_cross_opt, 'int3c_cross_bwd', tracked_bwd)
+
     lno_df_h5._local_direct_nr_e2_h5_bwd(
         fake_mol, auxmol, coeff, orbs_slice, path
     )

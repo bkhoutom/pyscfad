@@ -19,14 +19,14 @@ def _assert_same(left, right):
 
 def test_live_lis_profile_preserves_layout_gradient_and_one_construction(monkeypatch, capsys):
     calls = []
-    frozen = np.array([0, 3], dtype=np.int32)
+    frozen = np.empty(0, dtype=np.int32)
     def construct(mf, common, static, index, *, matrices, frame, frame_fragment_index):
         calls.append(index)
         coeff = frame.occupied_coeff * (mf + matrices['occupied'])
         coeff = coeff + frame.virtual_coeff * (common + matrices['virtual'])
-        full = jnp.concatenate((coeff, 2 * coeff, 3 * coeff, 4 * coeff), axis=1)
+        full = jnp.concatenate((coeff, 2 * coeff), axis=1)
         return SimpleNamespace(mo_coeff=full, fragment_iao_coeff=coeff * common,
-            active_occupied_coeff=full[:, 1:2], active_virtual_coeff=full[:, 2:3],
+            active_occupied_coeff=full[:, :1], active_virtual_coeff=full[:, 1:],
             frozen=frozen)
     monkeypatch.setattr(lis, 'build_fragment_lis', construct)
     def energy(mf, common, blocks, occupied, virtual):

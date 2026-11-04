@@ -125,7 +125,6 @@ def test_invalid_variance_allocations_rejected(settings):
 
 def test_default_single_pass_matches_two_pass_energy_and_full_gradient(molecular_group, monkeypatch):
     case = molecular_group
-    monkeypatch.setenv('PYSCFAD_LNO_SHARED_LOCAL_DF_REVERSE', '1')
     counts = counted_frames(monkeypatch)
     forwards, reverses = [], []
     solve, reverse = ccsd.backend.solve_matrices, ccsd.backend.pullback_matrices
@@ -185,7 +184,6 @@ def test_public_gradient_factory_with_occupied_count_budget(
         molecular_group, monkeypatch, clear_jax_caches, tmp_path):
     """Exercise detached selection, live S/F reuse and total-SE allocation together."""
     case = molecular_group
-    monkeypatch.setenv('PYSCFAD_LNO_SHARED_LOCAL_DF_REVERSE', '1')
     monkeypatch.setenv('PYSCFAD_STC_CLEAR_JAX_CACHES', '0')
     plans = []
 

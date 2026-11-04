@@ -1,4 +1,5 @@
 #include <stdlib.h>
+#include <math.h>
 #include "config.h"
 #include "np_helper/np_helper.h"
 #include "vhf/fblas.h"
@@ -425,4 +426,62 @@ int AO2MOnr_e2_cderi_bar_pack_aux_block(
     }
     free(tmp);
     return allocation_failed;
+}
+
+
+/* Finish a half-transformed density directly in packed AO coordinates.
+ * half[P,u,k] and coeff[u,k] are row-major. Each task owns one lower AO
+ * tile and writes half*coeff^T + coeff*half^T, halving its diagonal.
+ * The caller supplies one tile per worker and runs BLAS serially inside
+ * this OpenMP region. No AO-square temporary or internal allocation is used.
+ */
+void AO2MOhalf_to_packed_tiles(
+        double *out, const double *half, const double *coeff, double *work,
+        int naux, int nao, int rank, int tile, int nthreads, int accumulate)
+{
+    if (naux <= 0 || nao <= 0 || rank <= 0 || tile <= 0 || nthreads <= 0) {
+        return;
+    }
+    const int ntile = (nao + tile - 1) / tile;
+    const size_t ntasks = (size_t)ntile * (ntile + 1) / 2;
+    const size_t npair = (size_t)nao * (nao + 1) / 2;
+    const double D1 = 1.0, D0 = 0.0;
+    const char T = 'T', N = 'N';
+#pragma omp parallel num_threads(nthreads)
+    {
+        double *buf = work + (size_t)omp_get_thread_num() * tile * tile;
+#pragma omp for schedule(static)
+        for (size_t task = 0; task < (size_t)naux * ntasks; task++) {
+            const size_t pair = task % ntasks;
+            const int p = task / ntasks;
+            int i = (int)((sqrt(8.0 * pair + 1.0) - 1.0) * 0.5);
+            // Correct any floating-point rounding at a triangular boundary.
+            while ((size_t)(i + 1) * (i + 2) / 2 <= pair) i++;
+            while ((size_t)i * (i + 1) / 2 > pair) i--;
+            const int j = pair - (size_t)i * (i + 1) / 2;
+            const int i0 = i * tile, j0 = j * tile;
+            const int ni = nao - i0 < tile ? nao - i0 : tile;
+            const int nj = nao - j0 < tile ? nao - j0 : tile;
+            const double *hp = half + (size_t)p * nao * rank;
+            double *op = out + (size_t)p * npair;
+            // buf is row-major (ni,nj); Fortran sees its transpose.
+            dgemm_(&T, &N, &nj, &ni, &rank, &D1,
+                   coeff + (size_t)j0 * rank, &rank,
+                   hp + (size_t)i0 * rank, &rank, &D0, buf, &nj);
+            dgemm_(&T, &N, &nj, &ni, &rank, &D1,
+                   hp + (size_t)j0 * rank, &rank,
+                   coeff + (size_t)i0 * rank, &rank, &D1, buf, &nj);
+            for (int u = 0; u < ni; u++) {
+                const int row = i0 + u;
+                const size_t base = (size_t)row * (row + 1) / 2 + j0;
+                const int count = i == j ? u + 1 : nj;
+                for (int v = 0; v < count; v++) {
+                    const double value = buf[(size_t)u * nj + v]
+                        * (row == j0 + v ? 0.5 : 1.0);
+                    if (accumulate) op[base + v] += value;
+                    else op[base + v] = value;
+                }
+            }
+        }
+    }
 }

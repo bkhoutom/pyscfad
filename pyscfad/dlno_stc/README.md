@@ -52,6 +52,104 @@ The integral-direct local-DF buffer target defaults to `512`. Set
 uses decimal MB, while backward block targets use MiB; this is a workspace
 target rather than a process-memory limit.
 
+SCF disk storage contains fitted `j3c` factors only. Raw `(P|mu nu)` inputs
+are generated locally in bounded shell tiles and are never cached on disk.
+Fragment DF has two modes, selected by
+`PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE` (benchmark: `--fragment-df-mode`):
+
+- `half` (default, option 2): one integral-generation pass per domain group.
+  Retain `H_ED[P,mu,p] = sum_nu (P|mu nu) C_ED[nu,p]` and fitted `B_ED,ov`.
+  Each LIS lies in its occupied/virtual ED parent span, so `H_LIS = H_ED U`.
+  Its fitted oo/ov/vv blocks and both coefficient-response legs use this H.
+  The current LIS H/output is released after its correction; ED H and MP2
+  factors remain live through the W/MP2 pullback. No `A_ED` is retained.
+- `direct` (option 1): regenerate integrals for each ED/LIS forward transform
+  and coefficient pullback. One ED and one LIS require four passes for an
+  energy plus gradient; a group with `k` LIS solves requires `2*(1+k)`.
+  Forward-only execution needs `1+k` passes.
+
+These counts refer to ordinary three-center inputs. Gradient runs still
+compute derivative integrals. Both modes cache one metric, Cholesky factor
+and response tape per group, and combine all local three-center/metric
+coordinate responses into one contraction. ED/LIS coefficient pullbacks
+remain separate and feed the W/D and orbital responses normally. This works
+with deterministic and stochastic triples, independently of their integral
+rotation option. Use `single_pass=True` for W to avoid a selection prepass.
+
+For `m` orbital columns, H uses `8*naux*nao*m` bytes; overlapping left/right
+slices are stored only once. The ED cache and current LIS cache coexist.
+Resident input admission uses `mol.max_memory` (`--max-memory-mb`), current
+RSS, and the optional aggregate cap `PYSCFAD_LNO_HALF_DF_CACHE_MB` (decimal MB).
+It reserves output-conversion space and leaves half the current RSS headroom
+for subsequent work. `mf.with_df.max_memory` (`--df-memory-mb`) limits
+workspace, not resident H storage. Generation and reverse contractions use
+bounded tiles under the workspace allowance, RSS headroom and local integral
+tile target. Insufficient resident allowance raises `MemoryError` before a
+new integral pass; select `direct` for lower resident input memory. These
+allocation budgets do not impose a hard RSS cap on the entire CC solver.
+
+Only deferred MO integral **adjoints** are spooled to disk; neither raw AO
+inputs nor H tensors are spilled. Both modes retain the packed-density
+optimization below. Receipts report `cache_mode`, `raw_integral_builds`,
+`raw_source_passes`, `half_builds`, `half_rotations`, `half_cache_hits`,
+`half_pullbacks`, `half_releases`, `half_resident_bytes` and `half_peak_bytes`.
+The raw-storage helpers/switches, projected cache, and option 3's `A_ED` cache
+and combined ED-pair adjoint have been removed.
+
+Serial `value_and_grad` calls also combine the global AO-Fock and implicit
+SCF DF geometry responses when the out-of-core DF source is built or attached
+inside the traced SCF builder. A producer boundary returns the summed seed
+through the original AO/auxiliary geometry maps. Density and orbital response
+remain immediate; compatible coordinate seeds share one derivative-integral
+pass and one metric/Cholesky tape. This works with either fragment DF mode.
+`Shared global SCF DF reverse` reports consumers, seed groups, disk
+contributions, and geometry/metric passes. Set `PYSCFAD_STC_COMBINE_SCF_DF=0`
+before tracing for the separate-response reference path. MPI and externally
+staged DF sources retain their existing ownership rules.
+
+Local DF geometry responses fill the derivative contractor's packed AO-pair
+buffer directly, including the correct diagonal weights. They avoid a full
+AO-square symmetric-sum array, and shared consumers accumulate in packed
+space. `PYSCFAD_DF_MO_DENSITY_BACKEND=auto` selects an AO-tiled native
+projection for at least 512 AOs and orbital contraction rank at most 128;
+Larger orbital ranks use batched GEMM followed by direct symmetric packing.
+The tiled projection uses up to 16 OpenMP workers, each with a 128-by-128
+tile, and serial BLAS inside that parallel region. Its scratch is reused
+across auxiliary blocks and capped by the caller's existing conservative
+density-workspace reservation. Auxiliary reads remain bounded; neither raw
+integrals nor the complete packed AO-adjoint tensor are retained by packing.
+Set the backend to `gemm`, `tiled`, or `legacy` for controlled comparisons.
+An older `pyscfadlib` without the tiled symbol falls back to GEMM packing;
+rebuild that library to enable tiling. The derivative-integral kernel and
+ED/LIS cache choices are independent of this option.
+`examples/dlno_stc/benchmark_df_density_packing.py` compares the original,
+GEMM-packed and automatic paths on representative water-32 dimensions.
+
+Within that serial response, occupied-factor caching is enabled by default.
+Its shared allowance with the preconditioner uses half the current RSS
+headroom under `mol.max_memory` (or explicit `precond_total_memory`). Global
+geometry panels use the same headroom policy after the root cache is freed.
+Explicit `PYSCFAD_SCF_RESPONSE_FACTOR_CACHE_MB`,
+`PYSCFAD_PRECOND_CACHE_MEMORY_MB`, and `PYSCFAD_FACTOR_PANEL_MEMORY_MB` values
+remain upper bounds in MiB; `PYSCFAD_SCF_OCCUPIED_CACHE=0` disables the occupied
+panel. This removes the implicit 1 GiB/256 MiB cache ceilings from this path
+without changing the user's total memory allowance or DF workspace limit.
+`SCF response factor cache` receipts report reservations, hits, and rejected
+allocations for the completed root solve.
+
+The DF-CCSD response retains update intermediates from its single converged-
+amplitude linearization through the final integral adjoint, eliminating a
+second forward update replay. Smooth (T) similarly retains orbital-rotation
+prefixes for the current Laplace node and releases them in its pullback.
+Their allowance is half current RSS headroom under the CC solver's total
+memory budget; `PYSCFAD_TRIPLES_DRESSING_CACHE_MB` optionally lowers it (MiB,
+zero disables caching). Insufficient headroom selects bounded rematerialization.
+Fixed-count stochastic runs prepare all pilots first and reconstruct each
+current node's prefixes once when needed; discarded pilots compute no VJP.
+Diagnostics report `dressing_cache_peak_bytes`, `dressing_cache_hits`, and
+`dressing_cache_rebuilds`. Cached and uncached paths have the same energies,
+sampling streams, and full Fock/orbital response.
+
 Domain selection and the domain driver lazily enable persistent JAX compilation
 caching in `$XDG_CACHE_HOME/pyscfad/jax`, falling back to `~/.cache/pyscfad/jax`.
 The automatic policy retains small kernels for reuse in subsequent processes.
@@ -530,14 +628,21 @@ remain 1.
 `value_and_grad`. Each physical Boys fragment has its own retained LIS and
 CCSD(T) correction; identical extended domains may share preparation.
 
-Occupied and virtual LNO eigenproblems always use extended-domain coordinates;
-there is no global-space selection option. The occupied calculation projects
-out the original fragment targets, selects an independent basis of the
-remaining domain span, and diagonalizes the density there. Every original
-target is retained exactly. Projection metrics, target projectors and domain
-maps all carry their pullbacks, preserving the global-space subspace definition.
-A zero cutoff retains the full corresponding molecular active space directly,
-without a density eigenproblem.
+Domain-space LIS is the only supported construction. D/W is diagonalized
+within the orthonormal occupied/virtual ED frames. Occupied selection retains
+the normalized projections of the physical fragment's original Boys targets
+and selects LNOs in their orthogonal complement. Virtual selection uses the
+ED matrix directly. Zero cutoffs retain the entire corresponding ED space.
+The `lis_space` checkpoint marker and optional Python argument accept only
+`"domain"`; the benchmark no longer has a `--lis-space` selector.
+
+CCSD receives the explicit local occupied count and only active LIS columns.
+Fragment weights use the normalized domain targets. The global SCF AO Fock
+is projected into the LIS, including occupied-virtual entries. SCF, Boys/PAO,
+ED, D/W and retained-space responses remain differentiated. Smooth frames
+and deterministic or stochastic triples use this same domain definition.
+Global-space LIS checkpoints are rejected and must be rebuilt. Selection
+schema 10 remains valid for existing domain-space checkpoints.
 
 `build_static_selections` defaults to `single_pass=True` for serial W calculations
 and returns a plan without a W prepass. Production
@@ -602,7 +707,7 @@ force-comparison examples. Library triples defaults are deterministic mode,
 point and trace exponent 5.0. The MP2 trace model uses exponent 1.4. The production
 examples request total triples SE `5e-5` Eh (0.05 mEh). These controls affect energies and
 their gradients; production energy and derivative estimates share samples.
-CC selections use schema 9; rebuild saved selections/checkpoints after changing
+CC selections use schema 10; rebuild saved selections/checkpoints after changing
 from earlier implementations. Native energy/VJP entry points are
 `triples_asymmetric_energy` and `triples_asymmetric_energy_vjp`.
 

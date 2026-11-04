@@ -176,8 +176,9 @@ def test_cached_and_direct_molecular_response_gradients(optimized, custom_respon
     original_gradient = dfccsd.lagrangian_grad
     response_calls = []
 
-    def inspect_gradient(*args):
-        bar = original_gradient(*args)
+    def inspect_gradient(*args, **kwargs):
+        assert kwargs.get('intermediates') is not None
+        bar = original_gradient(*args, **kwargs)
         assert bar._vvvv_pair is None
         assert bar.ovvv is None
         response_calls.append(True)

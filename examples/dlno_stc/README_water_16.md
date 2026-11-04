@@ -72,12 +72,12 @@ compilation caches at eager calculation boundaries. It preserves live derivative
 tapes and scientific settings, but increases compilation time and does not
 guarantee a fixed RAM ceiling. `PYSCFAD_DLNO_RESOURCE_PROFILE=1` logs the cleanup
 stages and their measured memory changes.
-The launcher defaults to this cache cleanup, shared disk-backed local DF
-reverse, synchronous JAX CPU dispatch, and disabled Eigen multithreading;
+The launcher defaults to this cache cleanup, direct local DF inputs with shared
+disk-backed adjoints, synchronous JAX CPU dispatch, and disabled Eigen multithreading;
 explicit environment values override those defaults. `PJRT_NPROC` still follows
 `THREADS`, so the JAX CPU worker pools use the requested parallelism.
 
-The separate occupied-factor cache for the SCF response remains off by default.
+This example explicitly keeps the separate occupied-factor cache for the SCF response off.
 For this water16 input it retains about 1260 MiB and saved only 3.6 seconds in
 the measured response after the J/K workspace fix (136.5 to 132.9 seconds).
 That comparison reused a warm recorded SCF pullback; it included the occupied
@@ -100,10 +100,22 @@ and Python environment with the CMake instructions in
 [`pyscfad/dlno_stc/README.md`](../../pyscfad/dlno_stc/README.md#build-and-checks).
 This requires pybind11, Armadillo, and OpenMP. Rebuild after native source changes.
 
-On this workstation the extension is built for `.venv` and loads its Armadillo
-and BLAS libraries from `.local/stc-build-deps/lib`; keep that directory in place.
-PySCF 2.14.0 in `.venv` was rebuilt with the Homebrew OpenMP runtime. The previous
-PySCF 2.13.1 installation is backed up in `.local/stc-backup-pyscf-2.13.1`.
+Use a PySCF installation with OpenMP enabled to parallelize integral construction
+as well as the STC extension. Configure Armadillo/BLAS library discovery for the
+selected environment as described in the build instructions.
+
+The current branch also supports resident half-transformed DF inputs. Set
+`PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE=half` to enable them for this example;
+the core driver defaults to `half`, while these launchers retain the measured
+lower-memory `direct` policy. Both modes share the local integral adjoints.
+Resident inputs consume additional memory and are admitted under the process
+allowance; the core README documents their sizes and optional cap.
+
+The upstream domain-only LIS update uses selection schema 10. Start fresh
+output directories after this update: the older schema-9 water runs and their
+timing/energy comparisons describe the previous implementation. The component
+benchmarks above are historical measurements, not a full benchmark of the merged
+schema-10 method.
 
 The defaults are:
 

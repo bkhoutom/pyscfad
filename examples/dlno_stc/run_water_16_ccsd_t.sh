@@ -18,7 +18,9 @@ export PJRT_NPROC="$threads"
 export JAX_CPU_ENABLE_ASYNC_DISPATCH="${JAX_CPU_ENABLE_ASYNC_DISPATCH:-false}"
 export XLA_FLAGS="${XLA_FLAGS:---xla_cpu_multi_thread_eigen=false}"
 export PYSCFAD_STC_CLEAR_JAX_CACHES="${PYSCFAD_STC_CLEAR_JAX_CACHES:-1}"
-export PYSCFAD_LNO_SHARED_LOCAL_DF_REVERSE="${PYSCFAD_LNO_SHARED_LOCAL_DF_REVERSE:-1}"
+# Keep the measured low-memory input policy; opt into resident H reuse with half.
+export PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE="${PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE:-direct}"
+export PYSCFAD_SCF_OCCUPIED_CACHE="${PYSCFAD_SCF_OCCUPIED_CACHE:-0}"
 # Open MPI otherwise may bind the sole rank to one core. Other MPI implementations ignore this.
 export OMPI_MCA_hwloc_base_binding_policy=none
 

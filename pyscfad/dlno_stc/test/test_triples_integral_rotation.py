@@ -20,7 +20,8 @@ def integrals(bvo, boo, bvv):
 
 @pytest.mark.parametrize('degenerate', [False, True])
 @pytest.mark.parametrize('node', [0., .37, 3.])
-def test_rotation_and_all_input_cotangents(degenerate, node):
+@pytest.mark.parametrize('cache_bytes', [0, 2**25])
+def test_rotation_and_all_input_cotangents(degenerate, node, cache_bytes):
     rng = np.random.default_rng(293)
     no, nv = 3, 4
     foo = rng.normal(scale=.03, size=(no, no)); foo = (foo+foo.T)/2-np.eye(no)
@@ -43,11 +44,13 @@ def test_rotation_and_all_input_cotangents(degenerate, node):
 
     expected, pullback = jax.vjp(reference, *map(jnp.asarray, inputs))
     engine = triples_native().TriplesDressing(inputs, integral_inputs=True)
-    for got, want in zip(engine.prepare(node), expected):
+    for got, want in zip(engine.prepare(node, cache_limit_bytes=cache_bytes), expected):
         np.testing.assert_allclose(got, want, rtol=2e-12, atol=2e-12)
     seeds = tuple(rng.normal(size=x.shape) for x in expected)
     for got, want in zip(engine.pullback(node, seeds), pullback(tuple(map(jnp.asarray, seeds)))):
         np.testing.assert_allclose(got, want, rtol=2e-11, atol=5e-11)
+    assert engine.cache_bytes == 0
+    assert engine.cache_hits == bool(cache_bytes)
 
 
 def native_inputs():
@@ -133,7 +136,15 @@ def test_native_integral_input_contract(name, invalid):
 
 @pytest.mark.parametrize('mode', ['deterministic', 'fixed', 'adaptive'])
 @pytest.mark.parametrize('whole', [False, True])
-def test_solver_energy_and_full_response_match_factor_path(mode, whole):
+def test_solver_energy_and_full_response_match_factor_path(mode, whole, monkeypatch):
+    native_calls = []
+    native = smooth_triples._native
+
+    def counted_native(*args, **kwargs):
+        native_calls.append(kwargs['with_grad'])
+        return native(*args, **kwargs)
+
+    monkeypatch.setattr(smooth_triples, '_native', counted_native)
     x = jax.tree.map(jnp.asarray, triples_fixture(grouped=True))
     rng = np.random.default_rng(72)
     no, nv = x['t1'].shape
@@ -181,10 +192,13 @@ def test_solver_energy_and_full_response_match_factor_path(mode, whole):
         assert diagnostics['rotated_integrals']
         assert not reference_diag['rotated_integrals']
         for timing in (diagnostics, reference_diag):
-            if mode == 'fixed' and with_grad:
-                assert 0 < timing['pilot_reverse_seconds'] <= timing['pilot_seconds']
-            else:
-                assert timing['pilot_reverse_seconds'] == 0
+            # Independent allocation pilots are energy-only in every mode.
+            assert timing['pilot_reverse_seconds'] == 0
+    if mode == 'fixed':
+        # Two allocation pilots precede two production calls for each path.
+        # The energy-only passes use no VJPs; derivative passes differentiate
+        # production only, preserving upstream's elimination of pilot work.
+        assert native_calls == [False]*8 + [False, False, True, True]*2
     if mode == 'deterministic':
         # Check quadrature-weighted cotangents independently of both reverse
         # implementations, including simultaneous integral and Fock changes.

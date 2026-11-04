@@ -15,6 +15,7 @@ only the final derivative-integral pass. No derivative tensor is retained.
 from contextlib import contextmanager, ExitStack
 from contextvars import ContextVar
 import hashlib
+import itertools
 import os
 from pathlib import Path
 import time
@@ -27,6 +28,75 @@ from pyscf.gto.mole import AS_RINV_ORIG_ATOM
 from pyscfad.lib import _cotangent_buffer
 
 _scope = ContextVar('pyscfad_ooc_geometry_scope', default=None)
+_capture = ContextVar('pyscfad_ooc_geometry_producers', default=False)
+_producer_ids = itertools.count()
+
+
+@contextmanager
+def capture_producers(enabled=True):
+    """Mark a complete traced SCF build's DF coordinate dependency boundary."""
+    enabled = enabled and os.environ.get('PYSCFAD_STC_COMBINE_SCF_DF', '1').lower() in (
+        '1', 'true', 'yes', 'on')
+    token = _capture.set(enabled)
+    try:
+        yield
+    finally:
+        _capture.reset(token)
+
+
+@jax.custom_vjp
+def _geometry_producer(obj):
+    return obj
+
+
+def _producer_forward(obj):
+    return obj, obj
+
+
+def _producer_backward(obj, bar):
+    scope = _scope.get()
+    if (scope is not None and scope.automatic_producer and not scope.finished
+            and getattr(obj, '_ooc_geometry_producer', None) is not None
+            and obj._ooc_geometry_producer == getattr(scope.df_input, '_ooc_geometry_producer', None)):
+        from pyscfad.tools import resource_profile
+        with resource_profile.section('df.shared_scf_geometry'):
+            bar = scope.finish(bar)
+    return (bar,)
+
+
+_geometry_producer.defvjp(_producer_forward, _producer_backward)
+
+
+def register_producer(obj):
+    """Insert an identity VJP before consumers, preserving both geometry maps.
+
+    The final summed DF coordinate seed rejoins the original mol/auxmol
+    construction here, including nonidentity auxiliary coordinate mappings.
+    Outside the explicitly owned SCF trace, ordinary DF objects are unchanged.
+    """
+    if (not _capture.get() or not obj._has_outcore_cderi_placeholder()
+            or getattr(obj, '_ooc_geometry_producer', None) is not None
+            or not any(isinstance(x, jax.core.Tracer) for x in jax.tree_util.tree_leaves(obj))):
+        return
+    # PySCF's pickle/copy protocol deliberately drops auxmol. A pytree copy
+    # preserves every differentiable leaf and this producer's source token.
+    original = jax.tree_util.tree_map(lambda x: x, obj)
+    original._ooc_geometry_producer = next(_producer_ids)
+    linked = _geometry_producer(original)
+    obj.mol, obj.auxmol = linked.mol, linked.auxmol
+    obj._ooc_geometry_producer = original._ooc_geometry_producer
+
+
+@contextmanager
+def producer_scope(obj):
+    """Own automatic geometry accumulation only when its producer is live."""
+    if (_scope.get() is not None or obj is None
+            or getattr(obj, '_ooc_geometry_producer', None) is None):
+        yield None
+    else:
+        with geometry_scope(obj) as scope:
+            scope.automatic_producer = True
+            yield scope
 
 
 class _RawMOSeed:
@@ -135,13 +205,27 @@ class GeometryScope:
         self.mo_pending = []
         self.raw_ram_bytes = 0
         self.finished = False
+        self.automatic_producer = False
+        self.low = self.metric_pullback = None
         self.stats = dict(enabled=enabled, consumers=0, seed_groups=0,
                           geometry_passes=0, disk_contributions=0,
                           compact_contributions=0, compact_exchange_ranks=[],
                           mo_consumers=0, mo_raw_disk_seeds=0,
                           mo_raw_peak_ram_bytes=0, mo_prepare_seconds=0.,
                           factor_response_seconds=0., prepare_seconds=0.,
-                          contract_seconds=0.)
+                          contract_seconds=0., metric_builds=0, cholesky_builds=0)
+
+    def metric_factor(self):
+        if self.low is None:
+            from jax import scipy as jsp
+            def factor(aux):
+                return jsp.linalg.cholesky(
+                    aux.intor(self.df_input.mol._add_suffix('int2c2e'), hermi=1), lower=True)
+            low, self.metric_pullback = jax.vjp(factor, self.df_input.auxmol)
+            self.low = numpy.asarray(low)
+            self.stats['metric_builds'] += 1
+            self.stats['cholesky_builds'] += 1
+        return self.low
 
     def finish(self, df_bar):
         """Add deferred geometry to the original DF-input cotangent exactly once."""
@@ -241,7 +325,16 @@ def geometry_scope(df_input, *, enabled=True, coalesce=True, force_disk=False):
             seed.close()
         scope.mo_pending.clear()
         scope.raw_ram_bytes = 0
+        scope.low = scope.metric_pullback = None
         _scope.reset(token)
+
+
+def metric_scope(obj):
+    scope = _scope.get()
+    if (scope is not None and scope.enabled and not scope.finished
+            and scope.key is not None and _source_key(obj) == scope.key):
+        return scope
+    return None
 
 
 def defer_backward(with_j, with_k, factor_response, residual, cotangents,

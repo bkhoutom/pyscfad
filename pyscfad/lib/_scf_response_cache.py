@@ -13,20 +13,59 @@ import numpy
 
 _current = ContextVar('pyscfad_scf_response_cache', default=None)
 _recorders = ContextVar('pyscfad_scf_response_cache_recorders', default=())
+_total_memory_mb = ContextVar('pyscfad_scf_response_total_memory_mb', default=None)
+
+
+@contextmanager
+def memory_scope(dfobj):
+    """Use the user's total RSS budget for serial SCF response caches.
+
+    At most half currently free headroom is admitted, reserving the rest for
+    mandatory matrices and block scratch. Explicit cache caps remain caps.
+    """
+    total = getattr(dfobj, 'precond_total_memory', None)
+    if total is None:
+        total = dfobj.mol.max_memory
+    total = float(total)
+    if not numpy.isfinite(total) or total <= 0:
+        raise ValueError('SCF response total memory must be finite and positive')
+    token = _total_memory_mb.set(total)
+    try:
+        yield
+    finally:
+        _total_memory_mb.reset(token)
+
+
+def automatic_budget_mb():
+    """Current optional-cache allowance in MiB, or None outside owned work."""
+    total = _total_memory_mb.get()
+    if total is None:
+        return None
+    from pyscf import lib
+    return max(0., total - lib.current_memory()[0]) * .5e6 / 1024**2
+
+
+def total_memory_mb():
+    return _total_memory_mb.get()
 
 
 def _enabled():
-    return os.environ.get('PYSCFAD_SCF_OCCUPIED_CACHE', '0').strip().lower() in (
+    default = '1' if _total_memory_mb.get() is not None else '0'
+    return os.environ.get('PYSCFAD_SCF_OCCUPIED_CACHE', default).strip().lower() in (
         '1', 'true', 'yes', 'on')
 
 
 def _budget_bytes():
+    automatic = automatic_budget_mb()
+    default = 1024. if automatic is None else automatic
     try:
-        value = float(os.environ.get('PYSCFAD_SCF_RESPONSE_FACTOR_CACHE_MB', '1024'))
+        value = float(os.environ.get('PYSCFAD_SCF_RESPONSE_FACTOR_CACHE_MB', default))
         if not numpy.isfinite(value) or value < 0:
-            value = 1024.
+            value = default
     except ValueError:
-        value = 1024.
+        value = default
+    if automatic is not None:
+        value = min(value, automatic)
     return int(value * 1024**2)
 
 

@@ -132,6 +132,9 @@ class DF(pyscf_df.DF):
             self._prefer_cderi_to_save = True
 
         del log
+        if need_disk:
+            from . import _ooc_cotangent
+            _ooc_cotangent.register_producer(self)
         return self
 
     def attach_outcore_cderi(self, path):
@@ -147,6 +150,8 @@ class DF(pyscf_df.DF):
         self._cderi_to_save = path
         self._cderi = numpy.zeros(_OUTCORE_CDERI_PLACEHOLDER_SHAPE)
         self._prefer_cderi_to_save = True
+        from . import _ooc_cotangent
+        _ooc_cotangent.register_producer(self)
         return self
 
     def reset(self, mol=None):
@@ -162,6 +167,7 @@ class DF(pyscf_df.DF):
             self._cderi_to_save = tempfile.NamedTemporaryFile(dir=pyscf_lib.param.TMPDIR)
         self._vjopt = None
         self._rsh_df = {}
+        self.__dict__.pop('_ooc_geometry_producer', None)
         return self
 
     def get_naoaux(self):

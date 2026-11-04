@@ -94,6 +94,11 @@ def _local_direct_nr_e2_impl(mol, auxmol, mo_coeff, max_memory, orbs_slice):
     coeff_k = numpy.asarray(jax.device_get(mo_coeff[:, k0:k1]), order='F')
     coeff_l = numpy.asarray(jax.device_get(mo_coeff[:, l0:l1]), order='F')
     nkl = int(coeff_k.shape[1] * coeff_l.shape[1])
+    from ._df_shared import matching_scope
+    if matching_scope(mol, auxmol) is not None:
+        # The shared scope retains the metric and optionally H inputs.
+        return _local_direct_wide_nr_e2(
+            mol, auxmol, mo_coeff, max_memory, orbs_slice)
     # PySCF's MP2 helper reuses an AO-pair buffer for its MO output.  An
     # all-pair CC transform can be wider, especially after AO projection.
     # Stream those transforms into their own result instead of overflowing
@@ -117,16 +122,23 @@ def _local_direct_nr_e2_impl(mol, auxmol, mo_coeff, max_memory, orbs_slice):
 
 
 def _local_direct_wide_nr_e2(mol, auxmol, mo_coeff, max_memory, orbs_slice):
-    """Shell-blocked transform when MO pairs outnumber packed AO pairs."""
+    """Blocked transform for shared inputs or MO pairs wider than AO pairs."""
     from pyscf.ao2mo import _ao2mo as pyscf_ao2mo
 
     k0, k1, l0, l1 = map(int, orbs_slice)
     nkl = (k1 - k0) * (l1 - l0)
     npair = mol.nao * (mol.nao + 1) // 2
     coeff = numpy.asarray(jax.device_get(mo_coeff), order='F')
-    metric = numpy.asarray(jax.device_get(auxmol.intor('int2c2e', hermi=1)))
-    low = scipy_linalg.cholesky(metric, lower=True, check_finite=False)
-    del metric
+    from ._df_shared import matching_scope
+    scope = matching_scope(mol, auxmol)
+    if scope is None:
+        metric = numpy.asarray(jax.device_get(auxmol.intor('int2c2e', hermi=1)))
+        low = scipy_linalg.cholesky(metric, lower=True, check_finite=False)
+        del metric
+    else:
+        low = scope.metric_factor()
+        if scope.half is not None:
+            return scope.half.transform(coeff, orbs_slice, low)
     result = numpy.empty((auxmol.nao, nkl), order='F')
     available_bytes = max(0., (float(max_memory)
         - pyscf_lib.current_memory()[0]) * 1e6 - result.nbytes)
@@ -146,6 +158,36 @@ def _local_direct_wide_nr_e2(mol, auxmol, mo_coeff, max_memory, orbs_slice):
 
 
 def _local_direct_raw_int3c_blocks(
+        mol, auxmol, z_aux_block_max_rows=None):
+    """Generate bounded local integral tiles; never read or spool AO inputs."""
+    from ._df_shared import matching_scope
+    scope = matching_scope(mol, auxmol)
+    if scope is not None:
+        pairs = mol.nao * (mol.nao + 1) // 2
+        remaining = scope.max_memory_mb - pyscf_lib.current_memory()[0]
+        budget = min(scope.workspace_mb, .5 * max(0., remaining),
+                     _local_direct_int3c_block_mb()) * 1e6
+        # Direct streaming has only one indivisible minimum row. Preserve
+        # the scope's advisory fallback when RSS exhausts the target; the
+        # resident half-cache performs its separate, strict admission first.
+        scope._warn_minimum_row(16*pairs, budget, operation='integral')
+        rows = max(1, int(budget // (16*pairs)))
+        if z_aux_block_max_rows is not None:
+            if int(z_aux_block_max_rows) <= 0:
+                raise ValueError('z_aux_block_max_rows must be positive')
+            rows = min(rows, int(z_aux_block_max_rows))
+        z_aux_block_max_rows = rows
+        scope.receipt['raw_source_passes'] += 1
+        scope.receipt['raw_integral_builds'] += 1
+        scope.receipt['raw_integral_bytes'] = 8*auxmol.nao*pairs
+    for p0, p1, block in _generate_local_raw_int3c_blocks(
+            mol, auxmol, z_aux_block_max_rows):
+        if scope is not None:
+            scope.receipt['max_raw_rows'] = max(scope.receipt['max_raw_rows'], p1-p0)
+        yield p0, p1, block
+
+
+def _generate_local_raw_int3c_blocks(
         mol, auxmol, z_aux_block_max_rows=None):
     """Yield disjoint ``(auxiliary AO slice, raw int3c block)`` triples."""
     npair = mol.nao * (mol.nao + 1) // 2
@@ -199,6 +241,11 @@ def _local_direct_mo_coeff_vjp_from_z_reader(
     kl_count = (k1 - k0) * (l1 - l0)
     if kl_count == 0:
         return np.asarray(mo_coeff_bar)
+    from ._df_shared import matching_scope
+    scope = matching_scope(mol, auxmol)
+    if scope is not None and scope.half is not None:
+        return np.asarray(scope.half.coefficient_pullback(
+            numpy.asarray(jax.device_get(mo_coeff)), read_z_aux_block, orbs_slice))
     for p0, p1, raw_ints in _local_direct_raw_int3c_blocks(
             mol, auxmol, z_aux_block_max_rows=z_aux_block_max_rows):
         z_block = numpy.asarray(read_z_aux_block(p0, p1))
@@ -283,8 +330,14 @@ def _local_direct_nr_e2_bwd(max_memory, orbs_slice, res, fitted_mo_bar):
             lower=True,
         )
 
-    low, metric_pullback = jax.vjp(metric_cholesky, auxmol)
-    low = numpy.asarray(jax.device_get(low))
+    from ._df_shared import matching_scope
+    scope = matching_scope(mol, auxmol)
+    if scope is None:
+        low, metric_pullback = jax.vjp(metric_cholesky, auxmol)
+        low = numpy.asarray(jax.device_get(low))
+    else:
+        low = scope.metric_factor()
+        metric_pullback = None
     if (
         low.shape != (auxmol.nao, auxmol.nao)
         or not numpy.all(numpy.isfinite(low))

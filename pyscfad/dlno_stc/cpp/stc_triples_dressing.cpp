@@ -138,6 +138,18 @@ class Dressing {
     Spectrum occupied_,virtual_;
     std::vector<std::vector<Axis>> axes_;
     std::vector<size_t> sources_;
+    // Only the current quadrature node owns a tape. A new prepare or a
+    // pullback releases it; the caller supplies its available RAM allowance.
+    std::vector<std::vector<Array>> prefixes_;
+    std::vector<arma::mat> transforms_;
+    double cached_node_=0.;
+    size_t cached_bytes_=0, cache_hits_=0, peak_cache_bytes_=0, cache_rebuilds_=0;
+    size_t prefix_bytes() const {
+        size_t bytes=0;
+        for(size_t i=0;i<axes_.size();++i)
+            bytes+=(axes_[i].size()-1)*size_t(inputs_[sources_[i]].size())*sizeof(double);
+        return bytes;
+    }
     const Spectrum& spectrum_for(size_t m) const { return m%2 ? virtual_ : occupied_; }
     std::vector<arma::mat> matrices(double node) const {
         if(!std::isfinite(node)) throw py::value_error("smooth triples dressing: nonfinite node");
@@ -187,20 +199,65 @@ public:
         axes_.push_back({{0,2}}); sources_.push_back(8);
         axes_.push_back({{0,0}}); sources_.push_back(8);
     }
-    py::tuple prepare(double node) const {
+    void clear_cache() {
+        prefixes_.clear(); transforms_.clear(); cached_bytes_=0;
+    }
+    size_t cache_bytes() const { return cached_bytes_; }
+    size_t cache_hits() const { return cache_hits_; }
+    size_t peak_cache_bytes() const { return peak_cache_bytes_; }
+    size_t cache_rebuilds() const { return cache_rebuilds_; }
+    py::tuple prepare(double node,size_t cache_limit_bytes=0) {
+        clear_cache();
         const auto transforms=matrices(node);
-        py::tuple result(axes_.size());
-        for(size_t i=0;i<axes_.size();++i) {
-            Array output=copy(inputs_[sources_[i]]);
-            { py::gil_scoped_release release;
-              for(auto axis:axes_[i]) axis_transform(output,axis.axis,transforms[axis.matrix]); }
-            result[i]=std::move(output);
+        const size_t required=prefix_bytes();
+        const bool retain=required<=cache_limit_bytes && cache_limit_bytes>0;
+        if(retain) {
+            prefixes_.resize(axes_.size()); transforms_=transforms;
+            cached_node_=node;
         }
+        py::tuple result(axes_.size());
+        try { for(size_t i=0;i<axes_.size();++i) {
+            Array output=copy(inputs_[sources_[i]]);
+            for(size_t k=0;k<axes_[i].size();++k) {
+                const auto axis=axes_[i][k];
+                { py::gil_scoped_release release;
+                  axis_transform(output,axis.axis,transforms[axis.matrix]); }
+                if(retain && k+1<axes_[i].size()) prefixes_[i].push_back(copy(output));
+            }
+            result[i]=std::move(output);
+        } } catch(...) { clear_cache(); throw; }
+        cached_bytes_=retain ? required : 0;
+        peak_cache_bytes_=std::max(peak_cache_bytes_,cached_bytes_);
         return result;
     }
-    py::tuple pullback(double node,py::tuple cotangents) const {
+    py::tuple pullback(double node,py::tuple cotangents,size_t cache_limit_bytes=0) {
+        // Move ownership out immediately, also releasing a tape on exceptions.
+        auto prefixes=std::move(prefixes_);
+        auto saved_transforms=std::move(transforms_);
+        bool cached=!prefixes.empty() && node==cached_node_;
+        clear_cache();
+        if(!cached) { prefixes.clear(); saved_transforms.clear(); }
         if(cotangents.size()!=axes_.size()) throw py::value_error("smooth triples dressing: invalid cotangent count");
-        const auto transforms=matrices(node);
+        const auto transforms=cached ? std::move(saved_transforms) : matrices(node);
+        cache_hits_+=size_t(cached);
+        if(!cached && cache_limit_bytes>0 && prefix_bytes()<=cache_limit_bytes) {
+            // Fixed-count stochastic runs prepare all pilots before allocating
+            // production draws. Rebuild each prefix once for the current node,
+            // instead of replaying its 3+2+1 axes during the reverse sweep.
+            prefixes.resize(axes_.size());
+            for(size_t i=0;i<axes_.size();++i) {
+                Array stage=copy(inputs_[sources_[i]]);
+                for(size_t k=0;k+1<axes_[i].size();++k) {
+                    const auto axis=axes_[i][k];
+                    { py::gil_scoped_release release;
+                      axis_transform(stage,axis.axis,transforms[axis.matrix]); }
+                    prefixes[i].push_back(copy(stage));
+                }
+            }
+            cached=true;
+            ++cache_rebuilds_;
+            peak_cache_bytes_=std::max(peak_cache_bytes_,prefix_bytes());
+        }
         std::vector<arma::mat> matrix_bars(4);
         for(size_t m=0;m<4;++m)
             matrix_bars[m].zeros(transforms[m].n_rows,transforms[m].n_cols);
@@ -213,16 +270,17 @@ public:
             Array bar=copy(cotangent);
             // Rematerialize preceding axes in one shared staging tensor.
             // This avoids retaining four full T2 intermediates for its VJP.
-            Array stage(shape(input));
+            Array stage=cached ? Array() : Array(shape(input));
             for(size_t k=axes_[i].size();k-->0;) {
                 const Array* raw=&input;
-                if(k) {
+                if(k && cached) raw=&prefixes[i][k-1];
+                else if(k) {
                     std::memcpy(stage.mutable_data(),input.data(),size_t(input.size())*sizeof(double));
                     raw=&stage;
                 }
                 const auto axis=axes_[i][k];
                 { py::gil_scoped_release release;
-                  for(size_t j=0;j<k;++j) {
+                  for(size_t j=0;!cached && j<k;++j) {
                       const auto previous=axes_[i][j];
                       axis_transform(stage,previous.axis,transforms[previous.matrix]);
                   }
@@ -252,7 +310,14 @@ void bind_triples_dressing(py::module_& module) {
     py::class_<Dressing>(module,"TriplesDressing")
         .def(py::init<py::tuple,bool>(), py::arg("inputs"),
              py::kw_only(),py::arg("integral_inputs")=false)
-        .def("prepare",&Dressing::prepare)
-        .def("pullback",&Dressing::pullback);
+        .def("prepare",&Dressing::prepare,py::arg("node"),
+             py::kw_only(),py::arg("cache_limit_bytes")=0)
+        .def("clear_cache",&Dressing::clear_cache)
+        .def_property_readonly("cache_bytes",&Dressing::cache_bytes)
+        .def_property_readonly("cache_hits",&Dressing::cache_hits)
+        .def_property_readonly("peak_cache_bytes",&Dressing::peak_cache_bytes)
+        .def_property_readonly("cache_rebuilds",&Dressing::cache_rebuilds)
+        .def("pullback",&Dressing::pullback,py::arg("node"),py::arg("cotangents"),
+             py::kw_only(),py::arg("cache_limit_bytes")=0);
 }
 }} // namespace pyscfad::dlno_stc

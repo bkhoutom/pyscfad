@@ -75,7 +75,8 @@ def main():
             ('JAX_CPU_ENABLE_ASYNC_DISPATCH', 'false'),
             ('XLA_FLAGS', '--xla_cpu_multi_thread_eigen=false'),
             ('PYSCFAD_STC_CLEAR_JAX_CACHES', '1'),
-            ('PYSCFAD_LNO_SHARED_LOCAL_DF_REVERSE', '1')):
+            ('PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE', 'direct'),
+            ('PYSCFAD_SCF_OCCUPIED_CACHE', '0')):
         os.environ.setdefault(name, value)
     output = args.output_dir.resolve()
     if (output / 'result.json').exists():
@@ -151,7 +152,7 @@ def calculate(args):
                     df_jk_workspace_mb=args.df_memory_mb if args.df_storage == 'outcore' else None,
                     moleintor_opt=True, matrix_target_batch_size=args.matrix_target_batch_size,
                     runtime_environment={key: os.environ.get(key) for key in
-                        ('PYSCFAD_STC_CLEAR_JAX_CACHES', 'PYSCFAD_LNO_SHARED_LOCAL_DF_REVERSE',
+                        ('PYSCFAD_STC_CLEAR_JAX_CACHES', 'PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE',
                          'JAX_CPU_ENABLE_ASYNC_DISPATCH', 'XLA_FLAGS', 'PJRT_NPROC',
                          'PYSCFAD_DENSE_BLAS_THREADS', 'PYSCFAD_STC_DENSE_BLAS_THREADS',
                          'PYSCFAD_SCF_OCCUPIED_CACHE', 'PYSCFAD_SCF_RESPONSE_FACTOR_CACHE_MB')},

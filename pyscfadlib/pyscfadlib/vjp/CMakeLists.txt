@@ -42,7 +42,7 @@ add_library(ao2mo_vjp SHARED
 set_target_properties(ao2mo_vjp PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}
 )
-target_link_libraries(ao2mo_vjp PRIVATE np_helper_ad vjp_util ${BLAS_LIBRARIES} ${OPENMP_C_PROPERTIES})
+target_link_libraries(ao2mo_vjp PRIVATE np_helper_ad vjp_util ${VJP_MATH_LIBRARY} ${BLAS_LIBRARIES} ${OPENMP_C_PROPERTIES})
 
 #vhf
 add_library(cvhf_vjp SHARED

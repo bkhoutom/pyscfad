@@ -54,14 +54,48 @@ def choose_cpus(allowed, count):
     return (physical + [cpu for cpu in allowed if cpu not in physical])[:count]
 
 
+def choose_balanced_cpus(allowed, count):
+    """Round-robin physical cores across NUMA nodes and L3 groups."""
+    groups = {}
+    seen = set()
+    for cpu in sorted(allowed):
+        path = Path(f'/sys/devices/system/cpu/cpu{cpu}')
+        socket = int((path/'topology/physical_package_id').read_text())
+        core = int((path/'topology/core_id').read_text())
+        if (socket, core) in seen:
+            continue
+        seen.add((socket, core))
+        nodes = list(path.glob('node[0-9]*'))
+        node = int(nodes[0].name[4:]) if nodes else socket
+        cache = (path/'cache/index3/shared_cpu_list').read_text().strip()
+        groups.setdefault((node, cache), []).append(cpu)
+    selected = []
+    while len(selected) < count:
+        advanced = False
+        for cores in groups.values():
+            if cores:
+                selected.append(cores.pop(0))
+                advanced = True
+                if len(selected) == count:
+                    return sorted(selected)
+        if not advanced:
+            raise RuntimeError(f'Only {len(selected)} distinct physical cores are available')
+    return selected
+
+
 def configure_cpu_workload(count):
     """All subsequently created threads/children inherit this CPU affinity."""
     if count < 1:
         raise ValueError("threads must be positive")
     allowed = set(os.sched_getaffinity(0))
     requested = os.environ.get("PYSCFAD_BENCHMARK_CPU_LIST")
+    policy = os.environ.get('PYSCFAD_BENCHMARK_CPU_POLICY', 'compact')
+    thread_policy = os.environ.get('PYSCFAD_BENCHMARK_THREAD_POLICY', 'fixed')
+    if policy not in ('compact', 'balanced') or thread_policy not in ('fixed', 'auto'):
+        raise ValueError('CPU policy must be compact/balanced; thread policy fixed/auto')
+    choose = choose_balanced_cpus if policy == 'balanced' else choose_cpus
     cpus = ([int(value) for value in requested.split(",")]
-            if requested else choose_cpus(allowed, count))
+            if requested else choose(allowed, count))
     if len(set(cpus)) != count or not set(cpus) <= allowed:
         raise RuntimeError("benchmark CPU list must contain exactly the requested allowed CPUs")
     os.sched_setaffinity(0, cpus)
@@ -72,8 +106,9 @@ def configure_cpu_workload(count):
                  "TF_NUM_INTRAOP_THREADS"):
         os.environ[name] = str(count)
     os.environ["TF_NUM_INTEROP_THREADS"] = "1"
-    os.environ["OMP_DYNAMIC"] = "FALSE"
-    os.environ["MKL_DYNAMIC"] = "FALSE"
+    dynamic = 'TRUE' if thread_policy == 'auto' else 'FALSE'
+    os.environ["OMP_DYNAMIC"] = dynamic
+    os.environ["MKL_DYNAMIC"] = dynamic
     os.environ["OMP_MAX_ACTIVE_LEVELS"] = "1"
     # Retain the inherited mask; do not let an OpenMP placement policy widen it
     # or bind the Python main thread to a single CPU before JAX initializes.

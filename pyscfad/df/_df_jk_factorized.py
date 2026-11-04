@@ -8,7 +8,9 @@ Runtime memory budgets (MiB) can be set with
 ``PYSCFAD_FACTOR_PANEL_MEMORY_MB`` (combined panel threshold, default 256)
 and ``PYSCFAD_SOLVE_MEMORY_MB`` (solve workspace target, default 64).
 Finite nonnegative values are accepted; unset or invalid values use the defaults.
-Zero forces disk panels or single-column solve slabs, respectively.
+Zero forces disk panels or single-column solve slabs, respectively. In an
+owned serial SCF response, the default panel allowance follows available
+headroom under the user's total memory budget; explicit limits remain caps.
 """
 
 from functools import partial
@@ -39,11 +41,17 @@ _SOLVE_MEMORY_MB = 64.0
 
 def _memory_mb(name, default):
     """Read a runtime budget without changing the fallback module constants."""
+    from pyscfad.lib import _scf_response_cache
+    automatic = (_scf_response_cache.automatic_budget_mb()
+                 if name == 'PYSCFAD_FACTOR_PANEL_MEMORY_MB' else None)
+    if automatic is not None:
+        default = automatic
     try:
         value = float(os.environ.get(name, default))
     except ValueError:
         return default
-    return value if math.isfinite(value) and value >= 0 else default
+    value = value if math.isfinite(value) and value >= 0 else default
+    return value if automatic is None else min(value, automatic)
 
 
 @contextmanager
@@ -251,10 +259,15 @@ def _prepare_reverse(with_j, with_k, factor_response, residual, cotangents, T, R
 
     auxmol = dfobj.auxmol
     int2c = dfobj.mol._add_suffix('int2c2e')
-    metric = numpy.asarray(auxmol.intor(int2c, hermi=1))
-    with dense_blas_threads():
-        low = scipy.linalg.cholesky(metric, lower=True, check_finite=False)
-    del metric
+    from . import _ooc_cotangent
+    shared_metric = _ooc_cotangent.metric_scope(dfobj)
+    if shared_metric is not None:
+        low = shared_metric.metric_factor()
+    else:
+        metric = numpy.asarray(auxmol.intor(int2c, hermi=1))
+        with dense_blas_threads():
+            low = scipy.linalg.cholesky(metric, lower=True, check_finite=False)
+        del metric
     lowbar = numpy.zeros_like(low)
     a = b = numpy.zeros(naux)
     if with_j:
@@ -427,7 +440,13 @@ def contract_geometry(contributions):
     def metric_cholesky(aux):
         return jax_scipy.linalg.cholesky(aux.intor(int2c, hermi=1), lower=True)
 
-    _, metric_pullback = jax.vjp(metric_cholesky, auxmol)
+    from . import _ooc_cotangent
+    shared_metric = _ooc_cotangent.metric_scope(dfobj)
+    if shared_metric is None:
+        _, metric_pullback = jax.vjp(metric_cholesky, auxmol)
+    else:
+        shared_metric.metric_factor()
+        metric_pullback = shared_metric.metric_pullback
     _cderi_vjp._zero_strict_upper_inplace(lowbar)
     auxbar = _cderi_vjp._tree_add(auxbar, metric_pullback(np.asarray(lowbar))[0])
     leaves, tree = tree_flatten(dfobj)

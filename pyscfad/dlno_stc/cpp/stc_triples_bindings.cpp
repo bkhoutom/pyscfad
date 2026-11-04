@@ -287,7 +287,7 @@ void bind_triples(py::module_& module) {
 #endif
     // Immutable identity covers the extended native numerical sources and binding.
     module.attr("TRIPLES_VERSION")=
-        "stc_triples:asymmetric-only:sha256:header=3ef7f213319f9b11b39424261fb449b65fb9842f489324fd655c0ab2bad61a40:asymmetric=cb743bd59e4a8612089cf87672d1196320c9f924499c4ab99cdb766feb2020d2:sampler=3cb84a2fd873ab706d3b67b9f0f9f3119981d22a9ca291535075dd78072f7a96:dressing=fa84104230baf6b00af9cac1a22249ac1001410df60b8ffbf4f23984f3e7f92a:mp2_gradient=1414da61595bc0674be42479f354881f2f6e1ad0e84e3e3d6a1dac9170923bbd:scoped_blas=8f402a8ec775910668e556e8ca81f56e0852eac3abfec8ae1ec9e0405509dbc5:binding-12-scoped-openblas";
+        "stc_triples:asymmetric-only:sha256:header=3ef7f213319f9b11b39424261fb449b65fb9842f489324fd655c0ab2bad61a40:asymmetric=235666a7809d36ade07465a1643fc1796f78c8e016cced24566f4c5a0c098889:sampler=3cb84a2fd873ab706d3b67b9f0f9f3119981d22a9ca291535075dd78072f7a96:dressing=5212e9d7e375a7f92fac8202fb3025151d53eea13355d7963cd7705beb2c1cb5:mp2_gradient=1414da61595bc0674be42479f354881f2f6e1ad0e84e3e3d6a1dac9170923bbd:scoped_blas=8f402a8ec775910668e556e8ca81f56e0852eac3abfec8ae1ec9e0405509dbc5:binding-12-scoped-openblas";
     for (bool vjp : {false,true}) {
         module.def(vjp ? "triples_asymmetric_energy_vjp" : "triples_asymmetric_energy",
             [vjp](py::handle t1,py::handle t2,py::handle Bvo,py::handle Boo,

@@ -504,7 +504,7 @@ stc_triples::triples_result stc_triples::asymmetric_triples(
     const double volume=double(ns)*double(no)*double(no)*double(nv)*double(nv)*double(nv);
     if(exact && volume>=double(std::numeric_limits<size_t>::max()))
         throw std::overflow_error("asymmetric (T): exact enumeration too large");
-    const size_t batch_size=2048;
+    const size_t batch_size=512;
     auto stream=[&](size_t count,std::uint64_t stream_seed,double tolerance,bool derivatives,bool enumerate) {
         moments all;
         size_t round=count,batch_offset=0;

@@ -7,8 +7,38 @@ import pytest
 
 from pyscfad import config_update, gto, lib, scf
 from pyscfad.cc import dfccsd
+from pyscfad.cc import ccsd_lambda
 from pyscfad.dlno_stc import ccsd
 from pyscfad.lno import ccsd as lno_ccsd
+
+
+def test_response_integral_adjoint_reuses_the_single_linearization(monkeypatch):
+    with config_update('pyscfad_moleintor_opt', True):
+        mol = gto.Mole(atom='H 0 0 0; H 0 0 1.4; H 0 0 3.4; H 0 0 4.8',
+                       basis='sto-3g', unit='Bohr', verbose=0)
+        mol.build(trace_exp=False, trace_ctr_coeff=False)
+        solver = dfccsd.RCCSD(scf.RHF(mol).density_fit().run())
+        eris = solver.ao2mo()
+        solver.kernel(eris=eris)
+        t1, t2 = solver.t1, solver.t2
+        _, expected_lambda = ccsd_lambda.solve_response_lambda(
+            solver, eris, t1, t2, 1., t1 * .01, t2 * .02, max_cycle=3)
+        expected = dfccsd.lagrangian_grad(solver, eris, t1, t2, 1., expected_lambda)
+        calls = []
+        original = solver.update_amps
+        def counted(*args, **kwargs):
+            calls.append(True)
+            return original(*args, **kwargs)
+        monkeypatch.setattr(solver, 'update_amps', counted)
+        _, actual_lambda, saved = ccsd_lambda.solve_response_lambda(
+            solver, eris, t1, t2, 1., t1 * .01, t2 * .02,
+            max_cycle=3, return_intermediates=True)
+        actual = dfccsd.lagrangian_grad(
+            solver, eris, t1, t2, 1., actual_lambda, intermediates=saved)
+        assert len(calls) == 1
+        numpy.testing.assert_allclose(actual_lambda, expected_lambda, atol=1e-12, rtol=0)
+        for got, want in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+            numpy.testing.assert_allclose(got, want, atol=1e-11, rtol=0)
 
 
 def test_ccsd_reads_cached_ovvv_for_updates_and_amplitude_response():

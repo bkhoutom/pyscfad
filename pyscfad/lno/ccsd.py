@@ -273,12 +273,12 @@ _build_eris_tensors_from_Lpq.defvjp(
 )
 
 class RCCSD(dfccsd.RCCSD):
-    def ao2mo(self, mo_coeff=None, fockao=None):
-        return _make_df_eris_incore(self, mo_coeff, fockao)
+    def ao2mo(self, mo_coeff=None, fockao=None, s1e=None):
+        return _make_df_eris_incore(self, mo_coeff, fockao, s1e)
 
 class RDCSD(dfdcsd.RDCSD):
-    def ao2mo(self, mo_coeff=None, fockao=None):
-        return _make_df_eris_incore(self, mo_coeff, fockao)
+    def ao2mo(self, mo_coeff=None, fockao=None, s1e=None):
+        return _make_df_eris_incore(self, mo_coeff, fockao, s1e)
 
 class _ChemistsERIs(dfccsd._ChemistsERIs):
     def _common_init_(self, mycc, mo_coeff=None, fockao=None):
@@ -299,7 +299,7 @@ class _ChemistsERIs(dfccsd._ChemistsERIs):
         self.mo_energy = np.diagonal(self.fock).real
         return self
 
-def _make_df_eris_incore(cc, mo_coeff=None, fockao=None):
+def _make_df_eris_incore(cc, mo_coeff=None, fockao=None, s1e=None):
     eris = _ChemistsERIs()
     eris._common_init_(cc, mo_coeff, fockao)
     nocc = eris.nocc
@@ -309,8 +309,13 @@ def _make_df_eris_incore(cc, mo_coeff=None, fockao=None):
     mo = np.asarray(eris.mo_coeff)
     ijslice = (0, nmo, 0, nmo)
     atmlst = getattr(cc, '_domain_atmlst', None)
+    local = getattr(cc, '_domain_orbitals', False)
+    if local:
+        from .tools import ao_index_by_atom
+        mo = mo[ao_index_by_atom(cc.mol, atmlst)]
     Lpq = lno_df.transform_df_to_mo(
-        cc._scf, mo, ijslice, aosym='s2', mosym='s1', atmlst=atmlst
+        cc._scf, mo, ijslice, aosym='s2', mosym='s1', atmlst=atmlst, s1e=s1e,
+        coeff_is_local=local,
     ).reshape(-1, nmo, nmo)
 
     if _USE_CUSTOM_VJP_AO2MO_DF_ERIS:
@@ -458,7 +463,7 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
                          verbose_imp=0, ccsd_t=False, dcsd=False,
                          profile_info=None, profile_pass=None,
                          triples_solver=None, mp2_solver=None, vvvv_direct=False,
-                         amplitude_solver=None):
+                         amplitude_solver=None, active_nocc=None):
     '''Numerical core of :func:`impurity_solve`; see that function for docs.
 
     Takes ``fock`` and ``s1e`` directly (rather than the parent ``eris``
@@ -473,11 +478,26 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
     differentiable amplitudes in this original LIS basis and CC diagnostics.
     Integral preparation, the physical fragment energy and triples are shared
     with the deterministic path. Its diagnostics are returned under ``ccsd``.
+
+    ``active_nocc`` accepts an occupied-first, unfrozen domain LIS without
+    completing it to the global HF orbital layout. The supplied AO Fock is
+    projected into that LIS, including its occupied-virtual block.
     '''
     log = logger.new_logger(mf)
-    maskocc = mf.mo_occ > lno_base.THRESH_OCC
+    if active_nocc is None:
+        mo_occ = mf.mo_occ
+    else:
+        # Domain LIS columns are already the complete local solver basis.
+        # Its electron count must not be inferred from the global HF object.
+        has_frozen = frozen is not None and (bool(frozen) if numpy.isscalar(frozen) else len(frozen) > 0)
+        if (not isinstance(active_nocc, (int, numpy.integer))
+                or not 0 <= active_nocc <= mo_coeff.shape[1] or has_frozen):
+            raise ValueError('active_nocc requires an unfrozen occupied-first local LIS')
+        frozen = None
+        mo_occ = numpy.r_[numpy.full(active_nocc, 2.), numpy.zeros(mo_coeff.shape[1]-active_nocc)]
+    maskocc = mo_occ > lno_base.THRESH_OCC
     nocc = numpy.count_nonzero(maskocc)
-    nmo = mf.mo_occ.size
+    nmo = mo_occ.size
 
     frozen, maskact = get_maskact(frozen, nmo)
 
@@ -521,9 +541,9 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
 
     # solve impurity problem
     if dcsd:
-        mcc = RDCSD(mf, mo_coeff=mo_coeff, frozen=frozen)
+        mcc = RDCSD(mf, mo_coeff=mo_coeff, mo_occ=mo_occ, frozen=frozen)
     else:
-        mcc = RCCSD(mf, mo_coeff=mo_coeff, frozen=frozen)
+        mcc = RCCSD(mf, mo_coeff=mo_coeff, mo_occ=mo_occ, frozen=frozen)
     mcc.vvvv_direct = vvvv_direct
     diis_space = int(os.environ.get('PYSCFAD_LNO_CCSD_DIIS_SPACE', '3'))
     if diis_space <= 0:
@@ -532,6 +552,7 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
         mcc.incore_complete = True
         mcc.diis_space = diis_space
     mcc._domain_atmlst = None if frag_prescreen is None else frag_prescreen.get('extended_primary_domain')
+    mcc._domain_orbitals = active_nocc is not None
     mcc.e_hf = mf.e_tot  #avoid MP2 recompute e_hf
     mcc.profile_pass = profile_pass
     mcc.lno_ccsd_t_timing = _should_print_t_timing(
@@ -540,7 +561,7 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
     total_start = time.perf_counter()
     phase_start = time.perf_counter()
     profile_phase = resource_profile.start()
-    imp_eris = mcc.ao2mo(fockao=fock)
+    imp_eris = mcc.ao2mo(fockao=fock, s1e=s1e)
     phase_times = {'ao2mo_s': time.perf_counter() - phase_start}
     resource_profile.finish(
         'solver.df_ao2mo_and_eris',

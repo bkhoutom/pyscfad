@@ -496,12 +496,13 @@ def _dfccsd_kernel_custom_bwd(res, cotangent):
     )
 
     profile_lambda = resource_profile.start()
-    lambda_converged, lambda_vec = ccsd_lambda.solve_response_lambda(
+    lambda_converged, lambda_vec, intermediates = ccsd_lambda.solve_response_lambda(
         mycc, eris, t1, t2,
         bar_e_val, bar_t1_val, bar_t2_val,
         max_cycle=mycc.max_cycle,
         tol=mycc.conv_tol_normt,
         verbose=mycc.verbose,
+        return_intermediates=True,
     )
     resource_profile.finish(
         'ccsd_bwd.response_lambda',
@@ -513,12 +514,14 @@ def _dfccsd_kernel_custom_bwd(res, cotangent):
         converged=lambda_converged,
     )
     profile_lagrangian = resource_profile.start()
-    eris_bar = lagrangian_grad(mycc, eris, t1, t2, bar_e_val, lambda_vec)
+    eris_bar = lagrangian_grad(mycc, eris, t1, t2, bar_e_val, lambda_vec,
+                              intermediates=intermediates)
     resource_profile.finish(
         'ccsd_bwd.lagrangian_gradient',
         profile_lagrangian,
         nocc=nocc,
         nvir=nvir,
+        reused_update_intermediates=True,
     )
     resource_profile.finish(
         'ccsd_bwd.total',
@@ -635,7 +638,7 @@ def _dfccsd_ovvv_vjp_native(Lov, Lvv, t1, theta, tau, t1new_bar,
 
 
 def _dfccsd_update_amps_eris_cotangent(mycc, eris, t1, t2,
-                                       t1new_bar, t2new_bar):
+                                       t1new_bar, t2new_bar, *, intermediates=None):
     if mycc.cc2:
         raise NotImplementedError
     if mycc.direct:
@@ -646,14 +649,10 @@ def _dfccsd_update_amps_eris_cotangent(mycc, eris, t1, t2,
         raise NotImplementedError('lagrangian_grad requires DF Lov/Lvv leaves')
 
     nocc, nvir = t1.shape
-    nmo = nocc + nvir
     nvir_pair = nvir * (nvir + 1) // 2
-    dtype = t1.dtype
 
     fock = eris.fock
     mo_energy = eris.mo_energy
-    mo_e_o = mo_energy[:nocc]
-    mo_e_v = mo_energy[nocc:] + mycc.level_shift
 
     fock_bar = np.zeros_like(fock)
     mo_energy_bar = np.zeros_like(mo_energy)
@@ -664,139 +663,25 @@ def _dfccsd_update_amps_eris_cotangent(mycc, eris, t1, t2,
     Lov_bar = np.zeros_like(eris.Lov)
     Lvv_bar = np.zeros_like(eris.Lvv)
 
-    # Forward replay of update_amps, keeping only the intermediates needed for
-    # the explicit adjoint equations below.
-    idx_occ = numpy.tril_indices(nocc)
-    tau_vvvv = t2[idx_occ]
-    tau_vvvv = tau_vvvv + np.einsum('ia,jb->ijab', t1, t1)[idx_occ]
-    Ht2tril = eris._contract_vvvv_t2(mycc, tau_vvvv)
-    t2work = ccsd._unpack_t2_tril(Ht2tril, nocc, nvir, t2sym='jiba') * .5
-
-    t1work = np.zeros_like(t1)
-    fov = fock[:nocc, nocc:].copy()
-    t1work = t1work + fov
-    foo = fock[:nocc, :nocc] - np.diag(mo_e_o)
-    foo = foo + .5 * np.einsum('ia,ja->ij', fock[:nocc, nocc:], t1)
-    fvv = fock[nocc:, nocc:] - np.diag(mo_e_v)
-    fvv = fvv - .5 * np.einsum('ia,ib->ab', t1, fock[:nocc, nocc:])
-
+    # The response linearization already evaluated this exact update. Its
+    # auxiliary outputs share the JAX residual arrays and live only until the
+    # integral adjoint finishes. Standalone callers can still prepare them.
+    if intermediates is None:
+        _, intermediates = mycc.update_amps(
+            t1, t2, eris, return_intermediates=True)
+    (eia, eijab, t1work, t2sym, fov, foo, fvv, ft_ij, ft_ab,
+     woooo, wVOov, wVooV, theta_ovvv, tau_for_vvvo, tmp_acc,
+     tmp_oovv_voov, theta, tau_full, tau_half, tau_resp, eris_VOov,
+     theta_t1, theta_t2, tau_final) = (
+        intermediates[name] for name in (
+            'eia', 'eijab', 't1work', 't2sym', 'fov', 'foo', 'fvv', 'ft_ij', 'ft_ab',
+            'woooo', 'wVOov', 'wVooV', 'theta_ovvv', 'tau_for_vvvo', 'tmp_acc',
+            'tmp_oovv_voov', 'theta', 'tau_full', 'tau_half', 'tau_resp', 'eris_VOov',
+            'theta_t1', 'theta_t2', 'tau_final'))
+    eris_ovoo, eris_oovv = eris.ovoo, eris.oovv
+    eris_voov = eris.ovvo.conj().transpose(1, 0, 3, 2)
+    tau_vvvv = tau_full[numpy.tril_indices(nocc)]
     blksize = max(1, min(_CCSD_OVVV_BLKSIZE, nvir))
-    wooVV_flat = np.zeros((nocc, nocc * nvir_pair), dtype=dtype)
-    wVOov = np.zeros((nvir, nocc, nocc, nvir), dtype=dtype)
-    theta_ovvv = t2.transpose(1, 2, 0, 3) * 2
-    theta_ovvv = theta_ovvv - t2.transpose(0, 2, 1, 3)
-    tau_for_vvvo = t2 + np.einsum('ia,jb->ijab', t1, t1)
-    tmp_acc = np.zeros((nocc, nocc, nvir, nocc), dtype=dtype)
-
-    for p0 in range(0, nvir, blksize):
-        p1 = min(p0 + blksize, nvir)
-        bw = p1 - p0
-        if eris.ovvv is not None:
-            vovv_packed = eris.ovvv[:, p0:p1].transpose(1, 0, 2)
-        else:
-            Lov_tile = eris.Lov[:, :, p0:p1]
-            vovv_packed = np.einsum('xia,xb->aib', Lov_tile, eris.Lvv)
-        wooVV_flat = wooVV_flat - np.dot(
-            t1[:, p0:p1],
-            vovv_packed.reshape(bw, nocc * nvir_pair),
-        )
-        vovv_tile = lib.unpack_tril(
-            vovv_packed.reshape(bw * nocc, nvir_pair)
-        )
-        vovv_tile = vovv_tile.reshape(bw, nocc, nvir, nvir)
-        fvv = fvv + 2 * np.einsum('kc,ckab->ab',
-                                   t1[:, p0:p1], vovv_tile)
-        fvv = fvv.at[:, p0:p1].add(
-            -np.einsum('kc,bkca->ab', t1, vovv_tile)
-        )
-        vvvo_tile = vovv_tile.transpose(0, 2, 3, 1)
-        tmp_acc = tmp_acc + np.einsum(
-            'ijcd,cdbk->ijbk',
-            tau_for_vvvo[:, :, p0:p1, :],
-            vvvo_tile,
-        )
-        wVOov = wVOov.at[p0:p1].set(
-            np.einsum('biac,jc->bija', vovv_tile, t1)
-        )
-        t1work = t1work + np.einsum(
-            'icjb,cjba->ia',
-            theta_ovvv[:, p0:p1, :, :],
-            vovv_tile,
-        )
-
-    t2work = t2work - np.einsum('ka,ijbk->ijab', t1, tmp_acc)
-    wooVV = lib.unpack_tril(wooVV_flat.reshape(nocc**2, nvir_pair))
-    wVooV = wooVV.reshape(nocc, nocc, nvir, nvir).transpose(2, 1, 0, 3)
-
-    woooo = np.asarray(eris.oooo).transpose(0, 2, 1, 3).copy()
-    eris_ovoo = eris.ovoo
-    eris_oovv = eris.oovv
-    foo = foo + np.einsum('kc,kcji->ij', 2 * t1, eris_ovoo)
-    foo = foo + np.einsum('kc,icjk->ij', -t1, eris_ovoo)
-    tmp = np.einsum('la,jaik->lkji', t1, eris_ovoo)
-    woooo = woooo + tmp + tmp.transpose(1, 0, 3, 2)
-    wVOov = wVOov - np.einsum('jbik,ka->bjia', eris_ovoo, t1)
-    t2work = t2work + wVOov.transpose(1, 2, 0, 3)
-    wVooV = wVooV + np.einsum('kbij,ka->bija', eris_ovoo, t1)
-
-    eris_ovvo = eris.ovvo
-    t1work = t1work - np.einsum('jb,jiab->ia', t1, eris_oovv)
-    wVooV = wVooV - eris_oovv.transpose(2, 0, 1, 3)
-    wVOov = wVOov + wVooV * .5
-    t2work = t2work + (eris_ovvo * .5).transpose(0, 3, 1, 2)
-    eris_voov = eris_ovvo.conj().transpose(1, 0, 3, 2)
-    t1work = t1work + 2 * np.einsum('jb,aijb->ia', t1, eris_voov)
-
-    tmp = np.einsum('ic,kjbc->ibkj', t1, eris_oovv)
-    tmp = tmp + np.einsum('bjkc,ic->jbki', eris_voov, t1)
-    tmp_oovv_voov = tmp
-    t2work = t2work - np.einsum('ka,jbki->jiba', t1, tmp)
-    fov = fov + np.einsum('kc,aikc->ia', t1, eris_voov) * 2
-    fov = fov - np.einsum('kc,akic->ia', t1, eris_voov)
-
-    tau_theta = np.einsum('ia,jb->ijab', t1 * .5, t1) + t2
-    theta = tau_theta.transpose(1, 0, 2, 3) * 2 - tau_theta
-    fvv = fvv - np.einsum(
-        'cjia,cjib->ab', theta.transpose(2, 1, 0, 3), eris_voov)
-    foo = foo + np.einsum('aikb,kjab->ij', eris_voov, theta)
-
-    tau_full = np.einsum('ia,jb->ijab', t1, t1) + t2
-    woooo = woooo + np.einsum('ijab,aklb->ijkl', tau_full, eris_voov)
-    tau_half = np.einsum('ia,jb->ijab', t1, t1) + t2 * .5
-    wVooV = wVooV + np.einsum('bkic,jkca->bija', eris_voov, tau_half)
-
-    tmp = np.einsum('jkca,ckib->jaib', t2, wVooV)
-    t2work = t2work + tmp.transpose(2, 0, 1, 3)
-    t2work = t2work + (tmp * .5).transpose(0, 2, 1, 3)
-
-    wVOov = wVOov + eris_voov
-    eris_VOov = -.5 * eris_voov.transpose(0, 2, 1, 3)
-    tau_resp = t2.transpose(1, 3, 0, 2) * 2
-    tau_resp = tau_resp - t2.transpose(0, 3, 1, 2)
-    tau1_resp = -np.einsum('ia,jb->ibja', t1 * 2, t1)
-    tau_resp = tau_resp + tau1_resp
-    eris_VOov = eris_VOov + eris_voov
-    wVOov = wVOov + .5 * np.einsum('aikc,kcjb->aijb',
-                                    eris_VOov, tau_resp)
-
-    theta_t2 = t2 * 2 - t2.transpose(1, 0, 2, 3)
-    t2work = t2work + np.einsum('kica,ckjb->ijab', theta_t2, wVOov)
-    theta_t1 = t2.transpose(1, 0, 2, 3) * 2 - t2
-    t1work = t1work + np.einsum('jb,ijba->ia', fov, theta_t1)
-    t1work = t1work - np.einsum('jbki,kjba->ia', eris_ovoo, theta_t1)
-
-    tau_final = np.einsum('ia,jb->ijab', t1, t1) + t2
-    t2work = t2work + .5 * np.einsum('ijkl,klab->ijab', woooo, tau_final)
-    ft_ij = foo + np.einsum('ja,ia->ij', .5 * t1, fov)
-    ft_ab = fvv - np.einsum('ia,ib->ab', .5 * t1, fov)
-    t2work = t2work + np.einsum('ijac,bc->ijab', t2, ft_ab)
-    t2work = t2work - np.einsum('ki,kjab->ijab', ft_ij, t2)
-    t1work = t1work + np.einsum('ib,ab->ia', t1, fvv)
-    t1work = t1work - np.einsum('ja,ji->ia', t1, foo)
-
-    eia = mo_e_o[:, None] - mo_e_v
-    eijab = eia[:, None, :, None] + eia[None, :, None, :]
-    t2sym = t2work + t2work.transpose(1, 0, 3, 2)
 
     # Reverse replay.
     eia_bar = -t1new_bar * t1work / (eia * eia)
@@ -1052,14 +937,14 @@ def _energy_eris_cotangent(eris, t1, t2, bar_e):
     return fock_bar, ovov_bar
 
 
-def lagrangian_grad(mycc, eris, t1, t2, bar_e_val, lambda_vec):
+def lagrangian_grad(mycc, eris, t1, t2, bar_e_val, lambda_vec, *, intermediates=None):
     """Hand-coded ERI cotangent of the DF-CCSD response Lagrangian."""
     nocc, nvir = t1.shape
     t1new_bar, t2new_bar = _amplitudes_to_vector_cotangent(
         lambda_vec, nocc, nvir
     )
     update_bars = _dfccsd_update_amps_eris_cotangent(
-        mycc, eris, t1, t2, t1new_bar, t2new_bar
+        mycc, eris, t1, t2, t1new_bar, t2new_bar, intermediates=intermediates
     )
     e_fock_bar, e_ovov_bar = _energy_eris_cotangent(
         eris, t1, t2, bar_e_val

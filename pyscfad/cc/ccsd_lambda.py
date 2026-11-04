@@ -638,7 +638,8 @@ def kernel(mycc, eris, t1, t2, max_cycle=50, tol=1e-8, verbose=None):
 
 
 def solve_response_lambda(mycc, eris, t1, t2, bar_e, bar_t1, bar_t2,
-                          max_cycle=50, tol=1e-8, verbose=None):
+                          max_cycle=50, tol=1e-8, verbose=None,
+                          return_intermediates=False):
     """Solve the CCSD response lambda equation in implicit-diff form.
 
     Returns the vector ``lambda_vec`` (in the same packing as
@@ -654,6 +655,8 @@ def solve_response_lambda(mycc, eris, t1, t2, bar_e, bar_t1, bar_t2,
 
     Picard iteration with optional DIIS acceleration.  Inputs are expected to
     be concrete arrays; the iteration uses a Python convergence check.
+    ``return_intermediates`` additionally returns the DF update's auxiliary
+    tape for the final integral adjoint; it is not differentiated as output.
     """
     profile_total = resource_profile.start()
     log = logger.new_logger(mycc, verbose)
@@ -664,13 +667,20 @@ def solve_response_lambda(mycc, eris, t1, t2, bar_e, bar_t1, bar_t2,
 
     def update_fn(amp_):
         t1_, t2_ = mycc.vector_to_amplitudes(amp_)
+        if return_intermediates:
+            (t1new, t2new), saved = mycc.update_amps(
+                t1_, t2_, eris, return_intermediates=True)
+            return mycc.amplitudes_to_vector(t1new, t2new), saved
         t1new, t2new = mycc.update_amps(t1_, t2_, eris)
         return mycc.amplitudes_to_vector(t1new, t2new)
 
     # Linearize update_amps at the converged amplitudes; vjp_fn(u) returns
     # u @ d(update_amps)/dt.
     profile_build_vjp = resource_profile.start()
-    _, vjp_fn = jax.vjp(update_fn, amp)
+    if return_intermediates:
+        _, vjp_fn, intermediates = jax.vjp(update_fn, amp, has_aux=True)
+    else:
+        _, vjp_fn = jax.vjp(update_fn, amp)
     resource_profile.finish(
         'ccsd_response.build_update_vjp',
         profile_build_vjp,
@@ -778,6 +788,8 @@ def solve_response_lambda(mycc, eris, t1, t2, bar_e, bar_t1, bar_t2,
         converged=conv,
         response_vector_mib=resource_profile.estimated_array_mib(lambda_vec),
     )
+    if return_intermediates:
+        return conv, lambda_vec, intermediates
     return conv, lambda_vec
 
 

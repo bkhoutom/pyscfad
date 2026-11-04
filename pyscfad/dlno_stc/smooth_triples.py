@@ -12,6 +12,7 @@ The numerator factors this as L R.T, L=O^-1 U, R=O U, and contracts
 directly over the physical selected space S. Whole-LIS targets use U=I.
 """
 import importlib
+import os
 import time
 
 import jax
@@ -19,6 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from pyscfad import lib
+from pyscf.lib import current_memory, param
 from .controls import (DEFAULT_TRIPLES_TRACE_EXPONENT, _finite_control,
                        _triples_integral_transform)
 
@@ -93,6 +95,18 @@ def _make_dresser(inputs, *, integral_inputs=False):
                                   integral_inputs=integral_inputs)
 
 
+def _dressing_cache_bytes(max_memory):
+    """Use at most half current process headroom for one node's reverse tape."""
+    available = max(0., float(max_memory) - current_memory()[0]) * .5e6
+    cap = os.environ.get('PYSCFAD_TRIPLES_DRESSING_CACHE_MB')
+    if cap is not None:
+        cap = float(cap)
+        if not np.isfinite(cap) or cap < 0:
+            raise ValueError('PYSCFAD_TRIPLES_DRESSING_CACHE_MB must be finite and nonnegative')
+        available = min(available, cap * 1024**2)
+    return int(available)
+
+
 def make_solver(controls, grid, *, with_grad):
     nodes, weights, _ = grid
     removed = {'dressing', 'dressing_backend', 'adaptive'} & controls.keys()
@@ -108,6 +122,7 @@ def make_solver(controls, grid, *, with_grad):
     # Independent, discarded pilots choose the initial production allocation.
     # Adaptive production continues its own stream using its measured SE.
     seeds = np.random.SeedSequence([seed, 0x4c41504c]).generate_state(2 * len(nodes), dtype=np.uint64)
+    max_memory = 0.
 
     def run(inputs):
         started = time.perf_counter()
@@ -125,6 +140,7 @@ def make_solver(controls, grid, *, with_grad):
         prepare = dresser.prepare
         prepare_seconds, pilot_seconds = time.perf_counter() - phase, 0.
         prepared = None
+        dressing_cache_peak_bytes = 0
         if stochastic and not target:
             # Preserve legacy fixed-total-count allocation, which depends on
             # all pilot variances. Positive-target runs instead finish one
@@ -134,7 +150,9 @@ def make_solver(controls, grid, *, with_grad):
             jax.block_until_ready(prepared)
             prepare_seconds += time.perf_counter() - phase
             phase = time.perf_counter()
-            pilots = [_native(values, pilot_count, seeds[i], with_grad=with_grad,
+            # Pilot cotangents are discarded; only their variances allocate
+            # the independent production streams.
+            pilots = [_native(values, pilot_count, seeds[i], with_grad=False,
                               **native_options)
                       for i, values in enumerate(prepared)]
             pilot_se = np.array([r['standard_error'] for r in pilots])
@@ -158,7 +176,10 @@ def make_solver(controls, grid, *, with_grad):
         point_energies, point_variances, point_samples, initial_errors = [], [], [], []
         for i, (node, weight) in enumerate(zip(nodes, weights)):
             phase = time.perf_counter()
-            transformed = prepare(float(node)) if prepared is None else prepared[i]
+            transformed = (prepare(float(node), cache_limit_bytes=(
+                _dressing_cache_bytes(max_memory) if with_grad else 0))
+                if prepared is None else prepared[i])
+            dressing_cache_peak_bytes = max(dressing_cache_peak_bytes, dresser.cache_bytes)
             values = transformed if prepared is None else prepared[i]
             jax.block_until_ready(values)
             prepare_seconds += time.perf_counter() - phase
@@ -213,7 +234,10 @@ def make_solver(controls, grid, *, with_grad):
                 phase = time.perf_counter()
                 transformed_bars = tuple(np.asarray(result['cotangents'][name]) * weight
                                          for name in (*names, 'L', 'R'))
-                contribution = dresser.pullback(float(node), transformed_bars)
+                contribution = dresser.pullback(float(node), transformed_bars,
+                    cache_limit_bytes=_dressing_cache_bytes(max_memory))
+                dressing_cache_peak_bytes = max(dressing_cache_peak_bytes,
+                                                 dresser.peak_cache_bytes)
                 for a, b in zip(bars, contribution):
                     np.add(a, b, out=a)
                 jax.block_until_ready(bars)
@@ -239,6 +263,9 @@ def make_solver(controls, grid, *, with_grad):
             asymmetric_dressing=True,
             native_dressing=True,
             rotated_integrals=rotate,
+            dressing_cache_peak_bytes=dressing_cache_peak_bytes,
+            dressing_cache_hits=dresser.cache_hits,
+            dressing_cache_rebuilds=dresser.cache_rebuilds,
             target_met=bool(not target or np.sqrt(variance) <= target),
             laplace_nodes=np.asarray(nodes), laplace_weights=np.asarray(weights),
             point_variance_fractions=fractions, point_variance_targets=point_targets,
@@ -267,6 +294,8 @@ def make_solver(controls, grid, *, with_grad):
     evaluate.defvjp(forward, backward)
 
     def solver(mcc, eris, prjlo, *, t1, t2, verbose=0):
+        nonlocal max_memory
+        max_memory = getattr(mcc, 'max_memory', param.MAX_MEMORY)
         no = t1.shape[0]
         # The identity frame projector and the physical fragment target are
         # different objects. A partial S retains U and its full response.

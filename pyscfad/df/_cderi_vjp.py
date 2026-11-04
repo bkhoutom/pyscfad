@@ -94,6 +94,11 @@ if _NR_E2_CDERI_BAR_AUX_NATIVE:
     ]
     libao2mo_vjp.AO2MOnr_e2_cderi_bar_pack_aux_block.restype = ctypes.c_int
 
+_half_to_packed_tiles = getattr(libao2mo_vjp, 'AO2MOhalf_to_packed_tiles', None)
+if _half_to_packed_tiles is not None:
+    _half_to_packed_tiles.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 6
+    _half_to_packed_tiles.restype = None
+
 
 def _profile_enabled():
     value = os.environ.get('PYSCFAD_PROFILE_BACKWARD_PHASES')
@@ -1591,6 +1596,19 @@ def _int3c_mo_physical_density(mo_k, mo_l, z_blk):
     two contractions it replaces and therefore preserves their real/complex
     convention.
     """
+    density = _int3c_mo_density_matrix(mo_k, mo_l, z_blk)
+    # Preserve the original dense fallback's orientation and output layout.
+    if mo_k.shape[1] <= mo_l.shape[1]:
+        density = density.swapaxes(1, 2)
+    return density + density.swapaxes(1, 2)
+
+
+def _int3c_mo_density_matrix(mo_k, mo_l, z_blk):
+    """Unsymmetrized AO density, or its transpose, in contiguous row order.
+
+    Either orientation gives the same symmetric coordinate seed. Keeping
+    the GEMM output's layout avoids an AO-square transpose copy before packing.
+    """
     kc = int(mo_k.shape[1])
     lc = int(mo_l.shape[1])
     naux = int(z_blk.shape[0])
@@ -1602,7 +1620,7 @@ def _int3c_mo_physical_density(mo_k, mo_l, z_blk):
             tmp = (z_blk.reshape(-1, lc) @ mo_l.T).reshape(naux, kc, nao)
             density = (
                 tmp.transpose(0, 2, 1).reshape(-1, kc) @ mo_k.T
-            ).reshape(naux, nao, nao).swapaxes(1, 2)
+            ).reshape(naux, nao, nao)
         else:
             # Make the AO-square contraction run over the smaller l space.
             tmp = (
@@ -1610,7 +1628,90 @@ def _int3c_mo_physical_density(mo_k, mo_l, z_blk):
             ).reshape(naux, lc, nao).transpose(0, 2, 1)
             density = (tmp.reshape(-1, lc) @ mo_l.T).reshape(naux, nao, nao)
     tmp = None
-    return density + density.swapaxes(1, 2)
+    return density
+
+
+def _use_packed_mo_density():
+    return _symmetric_pack is not None and _mo_density_backend() != 'legacy'
+
+
+def _mo_density_backend():
+    backend = os.environ.get('PYSCFAD_DF_MO_DENSITY_BACKEND', 'auto').lower()
+    if backend not in ('auto', 'gemm', 'tiled', 'legacy'):
+        raise ValueError('PYSCFAD_DF_MO_DENSITY_BACKEND must be auto, gemm, tiled or legacy')
+    return backend
+
+
+def _density_workspace(workspace, name, shape):
+    array = workspace.get(name)
+    if array is None or array.size < numpy.prod(shape):
+        array = workspace[name] = numpy.empty(shape)
+    return array.reshape(-1)[:numpy.prod(shape)].reshape(shape)
+
+
+def _int3c_mo_packed_density(mo_k, mo_l, z_blk, out=None, *,
+                            accumulate=False, workspace=None):
+    """Write coordinate weights, with bounded, reusable packing workspace.
+
+    Small orbital ranks use AO tiles; dense ED ranks retain batched GEMM.
+    The tiled worker buffers together occupy no more than one AO-square
+    slab, already reserved by the caller's conservative density workspace.
+    """
+    if any(x.dtype != numpy.float64 for x in (mo_k, mo_l, z_blk)):
+        raise TypeError('Packed MO density requires float64 inputs')
+    naux, kc, lc = z_blk.shape
+    nao = mo_k.shape[0]
+    if mo_k.shape != (nao, kc) or mo_l.shape != (nao, lc):
+        raise ValueError('Packed MO density coefficient dimensions do not match its seed')
+    shape = (naux, nao * (nao + 1) // 2)
+    if out is None:
+        if accumulate:
+            raise ValueError('Accumulating a packed density requires an output buffer')
+        out = numpy.empty(shape)
+    if (not isinstance(out, numpy.ndarray) or out.dtype != numpy.float64
+            or out.shape != shape or not out.flags.c_contiguous or not out.flags.writeable):
+        raise ValueError('Packed density output must be writable contiguous float64 with the expected shape')
+    if any(numpy.shares_memory(out, x) for x in (mo_k, mo_l, z_blk)):
+        raise ValueError('Packed density output must not overlap its inputs')
+    workspace = {} if workspace is None else workspace
+    rank = min(kc, lc)
+    if not naux or not nao or not rank:
+        if not accumulate:
+            out.fill(0.)
+        return out
+    backend = _mo_density_backend()
+    tiled = (_half_to_packed_tiles is not None and
+             (backend == 'tiled' or backend == 'auto' and nao >= 512 and rank <= 128))
+    if tiled:
+        with dense_blas_threads():
+            if kc <= lc:
+                half = (z_blk.reshape(-1, lc) @ mo_l.T).reshape(naux, kc, nao)
+                coeff = numpy.ascontiguousarray(mo_k)
+            else:
+                half = (z_blk.transpose(0, 2, 1).reshape(-1, kc) @ mo_k.T).reshape(naux, lc, nao)
+                coeff = numpy.ascontiguousarray(mo_l)
+            half = numpy.ascontiguousarray(half.transpose(0, 2, 1))
+        tile = min(128, nao)
+        tiles = (nao + tile - 1) // tile
+        # On measured ED/LIS slabs a larger team adds overhead. Cap the
+        # team and account for every worker's tile before calling native code.
+        threads = min(max(1, pyscf_lib.num_threads()), 16,
+                      naux * tiles * (tiles + 1) // 2,
+                      max(1, naux * nao * nao // (tile * tile)))
+        work = _density_workspace(workspace, 'tiles', (threads, tile, tile))
+        with blas_threads(1):
+            _half_to_packed_tiles(out.ctypes.data, half.ctypes.data,
+                coeff.ctypes.data, work.ctypes.data, naux, nao, rank, tile,
+                threads, int(accumulate))
+        return out
+    density = _int3c_mo_density_matrix(mo_k, mo_l, z_blk)
+    if accumulate:
+        scratch = _density_workspace(workspace, 'packed', shape)
+        _pack_tril_symmetric_sum(density, out=scratch)
+        out += scratch
+    else:
+        _pack_tril_symmetric_sum(density, out=out)
+    return out
 
 
 def _int3c_ip1_mo_density_contractions(ints, mo_k, mo_l, z_blk):
@@ -1762,6 +1863,7 @@ def _int3c_mo_deriv_coords_vjp_from_z_reader(
     profile = _profile_enabled()
     density_seconds = native_seconds = fallback_seconds = 0.0
     native_blocks = fallback_blocks = 0
+    packing_workspace = {}
 
     for shl0, shl1, _ in aux_ranges:
         p0, p1 = int(aux_loc[shl0]), int(aux_loc[shl1])
@@ -1787,6 +1889,16 @@ def _int3c_mo_deriv_coords_vjp_from_z_reader(
                         f'got {z_blk.shape}, expected {expected_shape}'
                     )
                 dtype = z_blk.dtype
+                if native_supported and dtype == numpy.float64 and _use_packed_mo_density():
+                    if packed is None:
+                        packed = numpy.empty((p1 - p0, npair))
+                    _int3c_mo_packed_density(mo_k, mo_l,
+                        z_blk.reshape(read1 - read0, kc, lc),
+                        out=packed[read0 - p0:read1 - p0], workspace=packing_workspace)
+                    z_blk = None
+                    if profile:
+                        density_seconds += time.perf_counter() - started
+                    continue
                 density = _int3c_mo_physical_density(
                     mo_k, mo_l, z_blk.reshape(read1 - read0, kc, lc))
                 z_blk = None

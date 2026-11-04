@@ -20,7 +20,8 @@ def integrals(bvo, boo, bvv):
 
 @pytest.mark.parametrize('degenerate', [False, True])
 @pytest.mark.parametrize('node', [0., .37, 3.])
-def test_rotation_and_all_input_cotangents(degenerate, node):
+@pytest.mark.parametrize('cache_bytes', [0, 2**25])
+def test_rotation_and_all_input_cotangents(degenerate, node, cache_bytes):
     rng = np.random.default_rng(293)
     no, nv = 3, 4
     foo = rng.normal(scale=.03, size=(no, no)); foo = (foo+foo.T)/2-np.eye(no)
@@ -43,11 +44,13 @@ def test_rotation_and_all_input_cotangents(degenerate, node):
 
     expected, pullback = jax.vjp(reference, *map(jnp.asarray, inputs))
     engine = triples_native().TriplesDressing(inputs, integral_inputs=True)
-    for got, want in zip(engine.prepare(node), expected):
+    for got, want in zip(engine.prepare(node, cache_limit_bytes=cache_bytes), expected):
         np.testing.assert_allclose(got, want, rtol=2e-12, atol=2e-12)
     seeds = tuple(rng.normal(size=x.shape) for x in expected)
     for got, want in zip(engine.pullback(node, seeds), pullback(tuple(map(jnp.asarray, seeds)))):
         np.testing.assert_allclose(got, want, rtol=2e-11, atol=5e-11)
+    assert engine.cache_bytes == 0
+    assert engine.cache_hits == bool(cache_bytes)
 
 
 def native_inputs():

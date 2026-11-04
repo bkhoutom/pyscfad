@@ -6,7 +6,7 @@
 """
 
 from functools import partial
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import gc
 import math
 import warnings
@@ -268,13 +268,34 @@ def _finish(state, *, with_grad, include_hf,
     if not with_grad:
         jax.block_until_ready(energy)
         return energy
-    mf_bar = state["mf_bar"]
-    if state.get("common_pullback") is not None:
-        with resource_profile.section('stc.domain.common_pullback'):
-            common_mf_bar, = state["common_pullback"](state["common_bar"])
-            mf_bar = jax.tree_util.tree_map(_add_cotangent, mf_bar, common_mf_bar)
-            jax.block_until_ready(mf_bar)
-    return _finish_response(state, energy, mf_bar, include_hf=include_hf)
+    with _global_df_response(state):
+        mf_bar = state["mf_bar"]
+        if state.get("common_pullback") is not None:
+            with resource_profile.section('stc.domain.common_pullback'):
+                common_mf_bar, = state["common_pullback"](state["common_bar"])
+                mf_bar = jax.tree_util.tree_map(_add_cotangent, mf_bar, common_mf_bar)
+                jax.block_until_ready(mf_bar)
+        return _finish_response(state, energy, mf_bar, include_hf=include_hf)
+
+
+@contextmanager
+def _global_df_response(state):
+    """Share the serial common-Fock/SCF geometry pass and response headroom."""
+    from pyscfad.df import _ooc_cotangent
+    from pyscfad.lib import _scf_response_cache
+    obj = getattr(state['mf'], 'with_df', None)
+    if obj is None or getattr(obj, '_ooc_geometry_producer', None) is None:
+        yield
+        return
+    with (_scf_response_cache.record_response_caches() as roots,
+          _scf_response_cache.memory_scope(obj),
+          _ooc_cotangent.producer_scope(obj) as shared):
+        yield
+    if shared is not None:
+        lib.logger.info(state['mf'], 'Shared global SCF DF reverse: %s', shared.stats)
+    for receipt in roots:
+        if receipt['occupied_transform_calls'] or receipt['preconditioner_cache_bytes']:
+            lib.logger.info(state['mf'], 'SCF response factor cache: %s', receipt)
 
 
 def _finish_response(state, energy, mf_bar, *, include_hf):
@@ -410,12 +431,14 @@ def _system_active_indices(mf, frozen):
     return occupied, virtual
 
 
-def _initialize_scf(mol, build_mf, *, fix_phases=True):
+def _initialize_scf(mol, build_mf, *, fix_phases=True, combine_df=False):
     """Build one implicit SCF VJP shared by both correlation scopes."""
     _coordinate_only(mol)
     if not callable(build_mf):
         raise TypeError("build_mf must be callable")
-    with (config_update("pyscfad_scf_implicit_diff", True),
+    from pyscfad.df._ooc_cotangent import capture_producers
+    with (capture_producers(enabled=combine_df),
+          config_update("pyscfad_scf_implicit_diff", True),
           config_update("pyscfad_scf_first_order_custom", False)):
         build = (lambda mol_: _fix_restart_mo_phases(build_mf(mol_))) if fix_phases else build_mf
         return jax.vjp(build, mol)
@@ -702,7 +725,7 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
         elif scope == "domain":
             _validate_static(static)
         with (resource_profile.section('stc.domain.scf') if scope == 'domain' else nullcontext()):
-            mf, scf_pullback = _initialize_scf(mol, build_mf)
+            mf, scf_pullback = _initialize_scf(mol, build_mf, combine_df=comm is None)
         if comm is None:
             scf_pullback = _serial_scf_pullback(scf_pullback)
         if scope == "system":

@@ -36,13 +36,14 @@ constexpr const char* matrix_kernel_version =
     "src_code_rdm_v2:427459d9b91fc70f:standalone-1";
 
 // OpenMP ICVs belong to this calling thread. Forward and replay use the saved
-// explicit count; the embedding process's previous settings are restored.
+// explicit count for stochastic replay. Deterministic kernels respect the
+// caller's dynamic-team policy. Previous settings are restored on return.
 struct ThreadScope {
     int previous = omp_get_max_threads();
     int dynamic = omp_get_dynamic();
 
-    explicit ThreadScope(int threads) {
-        omp_set_dynamic(0);
+    explicit ThreadScope(int threads, bool fixed_replay = false) {
+        if (fixed_replay) omp_set_dynamic(0);
         omp_set_num_threads(threads);
     }
 
@@ -532,7 +533,7 @@ py::dict solve_matrices(py::handle foo, py::handle fvv, py::handle b,
     MatrixOutput output;
     {
         py::gil_scoped_release release;
-        ThreadScope team(settings.replay->threads);
+        ThreadScope team(settings.replay->threads, settings.replay->stochastic);
         if (!settings.replay->stochastic) {
             output = deterministic_forward(inputs, *settings.replay);
         } else if (kind == "D") {
@@ -603,7 +604,7 @@ py::dict pullback_matrices(py::handle foo, py::handle fvv, py::handle b,
     Result bars;
     {
         py::gil_scoped_release release;
-        ThreadScope team(replay.threads);
+        ThreadScope team(replay.threads, replay.stochastic);
         bars = replay_pullback(inputs, replay, energy_bar, occupied_seed, virtual_seed);
     }
     finite_outputs(0, bars.foo, bars.fvv);

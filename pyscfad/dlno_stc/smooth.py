@@ -37,7 +37,8 @@ def rebuild_frame(coeff, overlap, frame):
     the projected anchor's normalization.
     """
     # C C^T S is the AO projector: arbitrary HF rotations cancel here.
-    candidate = coeff @ (coeff.T @ overlap @ jnp.asarray(frame.anchor))
+    rotation = coeff.T @ overlap @ jnp.asarray(frame.anchor)
+    candidate = coeff @ rotation
     return orthonormalize(candidate, overlap)
 
 

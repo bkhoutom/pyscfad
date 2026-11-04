@@ -2,8 +2,8 @@
 
 The supplied blocks and BoysEDFrame must describe the same native call. The
 reference step saves only discrete labels; reconstruction differentiates the
-blocks, numerical frame, global orbitals and original Boys target overlaps.
-The discarded-complement rotation keeps the historical DLNO stopped gauge.
+blocks, numerical ED frame and original Boys target overlaps. Every LIS
+orbital stays within its occupied or virtual ED parent span.
 """
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ from jax.scipy.linalg import solve_triangular
 import numpy
 import scipy.linalg as scipy_linalg
 from pyscfad import numpy as np, scipy
-from pyscfad.ops import stop_grad
 from pyscfad.lno import lno_base
 from ._selection import DomainSelections, _physical_groups
 from .domain import BoysEDFrame, DomainData, build_boys_ed_frame, rebuild_domain_data
@@ -31,8 +30,8 @@ class FragmentLISSelection:
     """Fixed rank/label choices for one fragment LIS.
 
     All index arrays refer to ascending Hermitian-eigenvalue order at the
-    corresponding reference eigenproblem.  ``internal_*_keep`` index the
-    target-row Gram matrix. ``*_lno_keep`` index the external density after
+    corresponding reference eigenproblem. ``internal_occ_keep`` enumerates
+    the retained projected Boys targets. ``*_lno_keep`` index the density after
     removing the internal target span. Both LNO index arrays use compact
     extended-domain coordinates. ``occupied_map_columns`` selects a fixed
     independent column basis after removing the occupied target span.
@@ -48,6 +47,8 @@ class FragmentLISSelection:
     full_occupied_space: bool
     full_virtual_space: bool
     occupied_map_columns: numpy.ndarray
+    lis_space: str = 'domain'
+    parent_dimensions: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -56,7 +57,8 @@ class LISSelections:
 
     ``mp2_static`` holds :class:`DomainSelections`; its historical field name
     is part of the checkpoint format. Zero occupied or virtual LNO thresholds
-    retain the corresponding full global active-HF space.
+    retain the full corresponding ED parent space. ``lis_space`` records the
+    domain-only definition for checkpoint validation.
     ``smooth_frames`` and ``smooth_grid``, when present, are tuples indexed
     by physical fragment. Empty or unselected fragments have None entries.
     """
@@ -69,34 +71,20 @@ class LISSelections:
     fragments: tuple[FragmentLISSelection, ...]
     smooth_frames: object = None
     smooth_grid: object = None
+    lis_space: str = 'domain'
 
 
 @dataclass(frozen=True)
 class FragmentLIS:
     """One rebuilt fragment LIS and the data needed by an impurity solver.
 
-    All ``*_coeff`` arrays and ``fragment_occupied_anchor`` have global AO
-    rows. ``mo_coeff`` has shape ``(nao, nmo)`` and contains six column blocks:
-    original frozen occupied, discarded active occupied, LIS occupied, LIS
-    virtual, discarded active virtual, original frozen virtual. ``frozen``
-    indexes all columns outside the two LIS blocks, as required by
-    :mod:`pyscfad.lno.ccsd`. The ``active_*_coeff`` fields contain those two
-    semicanonical or smooth LIS blocks, of shapes ``(nao, nocc_lis)`` and
-    ``(nao, nvir_lis)``.
-
-    ``occupied_projector`` has shape ``(nocc_active, nocc_active)`` in global
-    active-HF occupied coordinates; its virtual counterpart has shape
-    ``(nvir_active, nvir_active)``. Both ``density_*_active`` fields are None:
-    selection never forms global active-space density matrices.
-    ``density_*_ed`` instead use the occupied
-    or virtual supplied ED coordinates, of dimensions ``nocc_ed`` and
-    ``nvir_ed``. The coefficient arrays inside ``domain`` have local ED AO rows.
-
-    ``fragment_iao_coeff`` is the raw target block, shape ``(nao, ntarget)``;
-    the historical name also covers Boys targets. ``fragment_occupied_anchor``
-    is its projection into the global active occupied space, with the same
-    shape and overlaps with the occupied LIS. It supplies the occupied-space
-    weight for the fragment energy partition.
+    All ``*_coeff`` arrays have global AO rows, with zeros outside the ED.
+    ``mo_coeff`` contains LIS occupied then virtual columns; ``frozen`` is
+    empty. The solver receives the explicit occupied LIS count. Projectors
+    and D/W blocks use the orthonormal ED occupied/virtual coordinates.
+    ``density_*_active`` are None; no global active-space density is formed.
+    Both target fields contain the normalized domain projection of the
+    physical Boys block used for the fragment energy partition.
     """
 
     mo_coeff: object
@@ -131,44 +119,15 @@ class FragmentLIS:
 
     @property
     def orbfragloc(self):
-        """Raw target block used by the historical fragment interface."""
+        """Normalized domain target block used by the fragment interface."""
 
         return self.fragment_iao_coeff
-
-
-def _fixed_row_space(matrix, keep):
-    """Rebuild ``(nspace, nkeep)`` columns from ``(ntarget, nspace)`` rows.
-
-    ``keep`` contains fixed target-row Gram-eigenvector labels. The returned
-    columns are orthonormal in global active occupied or virtual coordinates.
-    """
-
-    matrix = np.asarray(matrix)
-    keep = numpy.asarray(keep, dtype=numpy.int32)
-    if matrix.shape[0] == 0 or keep.size == 0:
-        return np.zeros((matrix.shape[1], 0), dtype=matrix.dtype)
-    gram = _hermitize(matrix @ matrix.T.conj())
-    _, vectors = scipy.linalg.eigh(
-        gram, deg_thresh=lno_base.COMPRESS_DEG_THRESH
-    )
-    candidate = matrix.T.conj() @ vectors[:, keep]
-    # The fixed reference rank guarantees a nonsingular retained Gram matrix.
-    metric = _hermitize(candidate.T.conj() @ candidate)
-    chol = np.linalg.cholesky(metric)
-    return solve_triangular(chol, candidate.T.conj(), lower=True).T.conj()
 
 
 def _physical_target_block(common, static, fragment_index):
     members = _physical_groups(static)[fragment_index]
     return np.concatenate(tuple(common.fragment_occupied_data[member].iao_coeff
                                 for member in members), axis=1)
-
-
-def _internal_projection_matrices(common, static, fragment_index):
-    """Original global Boys block overlaps; Boys has no internal virtual span."""
-    target = _physical_target_block(common, static, fragment_index)
-    occupied = target.T.conj() @ common.s1e @ common.occupied_coeff
-    return occupied, np.zeros((0, common.virtual_coeff.shape[1]), dtype=occupied.dtype)
 
 
 def _external_density(density, internal):
@@ -198,9 +157,9 @@ def _density_keep_numpy(density, internal, threshold, full_space):
 
 
 def _fixed_density_space(density, internal, keep, full_space):
-    """Rebuild internal plus retained LNO columns in global active-HF coordinates.
+    """Rebuild internal plus retained LNO columns in ED coordinates.
 
-    ``full_space`` returns the whole manifold in its original HF gauge.
+    ``full_space`` returns the whole ED manifold.
     """
 
     nspace = int(density.shape[0])
@@ -224,135 +183,12 @@ def _fixed_density_space(density, internal, keep, full_space):
     return np.concatenate((internal, lno), axis=1)
 
 
-def _orthonormalize_complement(space, thresh=1e-10):
-    """Keep left singular vectors above the complement rank threshold."""
-
-    space = np.asarray(space)
-    if space.ndim != 2:
-        raise ValueError('Input space must be a rank-2 array.')
-    if space.shape[1] == 0:
-        return np.zeros((space.shape[0], 0), dtype=space.dtype)
-    vectors, singular_values, _ = scipy.linalg.svd(space, full_matrices=False)
-    keep = numpy.where(abs(singular_values) > thresh)[0]
-    if len(keep) == 0:
-        return np.zeros((space.shape[0], 0), dtype=space.dtype)
-    return vectors[:, keep]
-
-
-def _active_complement(selected, threshold):
-    """Complete selected columns in global active-HF coordinates.
-
-    The complement rotation has a frozen gauge: its SVD and projector carry no
-    response. Multiplication by the current HF coefficients in the caller
-    still carries their response into the discarded AO-space orbitals.
-    """
-
-    nspace = int(selected.shape[0])
-    if selected.shape[1] == nspace:
-        return np.zeros((nspace, 0), dtype=selected.dtype)
-    identity = np.eye(nspace, dtype=selected.dtype)
-    threshold = max(float(threshold), 1e-8)
-    if selected.shape[1] == 0:
-        return stop_grad(_orthonormalize_complement(identity, thresh=threshold))
-    residual = identity - np.dot(
-        stop_grad(selected),
-        np.dot(stop_grad(selected.T.conj()), stop_grad(identity)),
-    )
-    return stop_grad(_orthonormalize_complement(residual, thresh=threshold))
-
-
 def _semicanonical_space(coeff, fock):
     """Diagonalize the Fock matrix within a possibly empty AO-space block."""
 
     if coeff.shape[1] == 0:
         return coeff
     return lno_base.semicanonicalize(fock, coeff)[1]
-
-
-def _assemble_full_mo_layout(
-    mf,
-    domain_selections,
-    occupied_coeff,
-    virtual_coeff,
-    fock,
-    occupied_rotation,
-    virtual_rotation,
-    rank_threshold,
-    smooth_frames=None,
-    overlap=None,
-):
-    """Complete the LIS to the occupied-first MO layout of the impurity solver.
-
-    ``occupied_coeff`` and ``virtual_coeff`` have global AO rows and span the
-    active-HF manifolds. The corresponding ``*_rotation`` arrays have shapes
-    ``(nocc_active, nocc_lis)`` and ``(nvir_active, nvir_lis)``. Only the selected
-    LIS blocks use semicanonical or anchored smooth frames; the discarded
-    complements use a frozen rotation gauge, and originally frozen MOs keep
-    their original columns.
-    """
-
-    # Identify original HF columns excluded by the global frozen selection.
-    mo_coeff = np.asarray(mf.mo_coeff)
-    mo_occ_host = numpy.asarray(jax.device_get(mf.mo_occ))
-    nmo = int(mo_occ_host.size)
-    all_indices = numpy.arange(nmo, dtype=numpy.int32)
-    occupied_indices = all_indices[mo_occ_host > lno_base.THRESH_OCC]
-    virtual_indices = all_indices[mo_occ_host <= lno_base.THRESH_OCC]
-    active_occ_indices = numpy.asarray(
-        domain_selections.active_occ_indices, dtype=numpy.int32
-    )
-    active_vir_indices = numpy.asarray(
-        domain_selections.active_vir_indices, dtype=numpy.int32
-    )
-    frozen_occ_indices = numpy.setdiff1d(
-        occupied_indices, active_occ_indices, assume_unique=False
-    )
-    frozen_vir_indices = numpy.setdiff1d(
-        virtual_indices, active_vir_indices, assume_unique=False
-    )
-
-    # Complete each active-HF manifold, then express its LIS in the AO basis.
-    occ_complement = _active_complement(
-        occupied_rotation, rank_threshold
-    )
-    vir_complement = _active_complement(
-        virtual_rotation, rank_threshold
-    )
-    if smooth_frames is None:
-        occupied_lis_coeff = _semicanonical_space(occupied_coeff @ occupied_rotation, fock)
-        virtual_lis_coeff = _semicanonical_space(virtual_coeff @ virtual_rotation, fock)
-    else:
-        from .smooth import rebuild_frame
-        occupied_lis_coeff = rebuild_frame(occupied_coeff @ occupied_rotation, overlap,
-                                           smooth_frames[0])
-        virtual_lis_coeff = rebuild_frame(virtual_coeff @ virtual_rotation, overlap,
-                                          smooth_frames[1])
-    occupied_discarded_coeff = occupied_coeff @ occ_complement
-    virtual_discarded_coeff = virtual_coeff @ vir_complement
-
-    # Pack six blocks: frozen occ | discarded occ | LIS occ | LIS vir |
-    # discarded vir | frozen vir. The two LIS blocks are contiguous.
-    blocks = (
-        mo_coeff[:, frozen_occ_indices],
-        occupied_discarded_coeff,
-        occupied_lis_coeff,
-        virtual_lis_coeff,
-        virtual_discarded_coeff,
-        mo_coeff[:, frozen_vir_indices],
-    )
-    full_coeff = np.concatenate(blocks, axis=1)
-    nocc_total = int(occupied_indices.size)
-    n_frozen_occ = int(frozen_occ_indices.size + occ_complement.shape[1])
-    n_active_vir = int(virtual_lis_coeff.shape[1])
-    # Freeze the leading occupied and trailing virtual columns; the occupied
-    # count is unchanged by rotations within the active-HF manifold.
-    frozen = numpy.concatenate((
-        numpy.arange(n_frozen_occ, dtype=numpy.int32),
-        numpy.arange(
-            nocc_total + n_active_vir, nmo, dtype=numpy.int32
-        ),
-    ))
-    return full_coeff, frozen, occupied_lis_coeff, virtual_lis_coeff
 
 
 def _validate_kind(matrix_kind):
@@ -412,12 +248,76 @@ def _frame_and_matrices(common, static, index, frame, matrices):
     return frame, blocks[0], blocks[1]
 
 
-def _domain_maps(common, frame):
-    """Map ED orbitals into the molecular active spaces, retaining response."""
-    overlap_columns = common.s1e[:, frame.extended_ao_indices]
-    ro = common.occupied_coeff.T.conj() @ overlap_columns @ frame.occupied_coeff
-    rv = common.virtual_coeff.T.conj() @ overlap_columns @ frame.virtual_coeff
-    return ro, rv
+def _validate_lis_space(lis_space):
+    if lis_space != 'domain':
+        raise ValueError("Only lis_space='domain' is supported; rebuild domain-space LIS selections")
+    return lis_space
+
+
+def _domain_targets(common, domains, index, frame):
+    """Coordinates of the physical targets projected into the occupied ED.
+
+    Use the projected original Boys block, not orthogonalized ED column
+    labels: Cholesky orthogonalization can mix a target with its partners.
+    """
+    target = _physical_target_block(common, domains, index)
+    cross = common.s1e[frame.extended_ao_indices] @ target
+    coordinates = frame.occupied_coeff.T.conj() @ cross
+    from .smooth import orthonormalize
+    return orthonormalize(coordinates, np.eye(coordinates.shape[0]))
+
+
+def _build_domain_lis(mf, common, static, index, frame, occupied, virtual):
+    """Select and frame LIS orbitals entirely within the orthonormal ED.
+
+    Global AO rows are a zero-padded representation only. There is no global
+    HF occupied/virtual projection or completion with frozen HF orbitals.
+    The impurity solver receives an explicit local occupied count instead.
+    """
+    selection = static.fragments[index]
+    internal = _domain_targets(common, static.mp2_static, index, frame)
+    frames = None if static.smooth_frames is None else static.smooth_frames[index]
+    parents, rotations, coefficients = [], [], []
+    for spin, (parent, density, target, keep, full) in enumerate((
+            (frame.occupied_coeff, occupied, internal, selection.occupied_lno_keep,
+             selection.full_occupied_space),
+            (frame.virtual_coeff, virtual, np.zeros((virtual.shape[0], 0)),
+             selection.virtual_lno_keep, selection.full_virtual_space))):
+        embedded = np.zeros((common.s1e.shape[0], parent.shape[1]), dtype=parent.dtype)
+        embedded = embedded.at[frame.extended_ao_indices].set(parent)
+        if full:
+            rotation = np.eye(parent.shape[1], dtype=parent.dtype)
+        else:
+            mapping = np.eye(parent.shape[1], dtype=parent.dtype)
+            if spin == 0:
+                # Work in the actual target complement. A projected n_ED by
+                # n_ED density contains numerical zero modes along the target,
+                # which tiny positive cutoffs must never select as extra LNOs.
+                mapping, density = _compact_mapped_density(
+                    _external_map(mapping, target), density, selection.occupied_map_columns)
+            rotation = _mapped_density_space(density, mapping, target, keep,
+                embedded, common.s1e, None if frames is None else frames[spin])
+        coeff = embedded @ rotation
+        if frames is None:
+            coeff = _semicanonical_space(coeff, common.fock)
+        else:
+            from .smooth import rebuild_frame
+            coeff = rebuild_frame(coeff, common.s1e, frames[spin])
+        parents.append(embedded)
+        rotations.append(rotation)
+        coefficients.append(coeff)
+    anchor = parents[0] @ internal
+    co, cv = coefficients
+    return FragmentLIS(
+        mo_coeff=np.concatenate((co, cv), axis=1), frozen=numpy.zeros(0, dtype=numpy.int32),
+        fragment_occupied_anchor=anchor, fragment_iao_coeff=anchor,
+        active_occupied_coeff=co, active_virtual_coeff=cv,
+        occupied_projector=_hermitize(rotations[0] @ rotations[0].T.conj()),
+        virtual_projector=_hermitize(rotations[1] @ rotations[1].T.conj()),
+        density_occupied_ed=occupied, density_virtual_ed=virtual,
+        density_occupied_active=None, density_virtual_active=None,
+        domain=frame, n_internal_occ=internal.shape[1], n_internal_vir=0,
+        n_lno_occ=co.shape[1]-internal.shape[1], n_lno_vir=cv.shape[1])
 
 
 def _compact_mapped_density(mapping, density, columns=None):
@@ -472,7 +372,7 @@ def _mapped_density_space(density, mapping, internal, keep, coeff, overlap, anch
     if len(keep):
         retained = retained_projector(tuple(int(i) for i in keep))(density)
         candidate = candidate + mapping @ (retained @ (mapping.T.conj() @ projected_anchor))
-    # These are orthonormal active-HF coordinates; avoid a molecular-sized
+    # These are orthonormal ED coordinates; avoid a molecular-sized
     # identity matrix and its multiplication during anchor normalization.
     metric = _hermitize(candidate.T.conj() @ candidate)
     low = np.linalg.cholesky(metric)
@@ -482,17 +382,18 @@ def _mapped_density_space(density, mapping, internal, keep, coeff, overlap, anch
 def build_fragment_lis_selection(
     mf, mp2_static, fragment_index, *, matrices, matrix_kind, common=None,
     frame=None, frame_fragment_index=None, thresh_occ=1e-4, thresh_vir=1e-5,
-    internal_rank_threshold=LIS_INTERNAL_RANK_THRESHOLD,
+    internal_rank_threshold=LIS_INTERNAL_RANK_THRESHOLD, lis_space='domain',
 ):
     """Save target rank and LNO eigenvector labels from one supplied D/W pair.
 
     This concrete reference step runs outside AD. A zero threshold selects
-    the full corresponding global active-HF manifold; otherwise the strict
+    the full corresponding ED parent manifold; otherwise the strict
     absolute eigenvalue cutoff applies, including signed W eigenvalues.
     W examples should always set its occupied and virtual cutoffs explicitly.
     No density or native matrix provider is invoked by this function.
     """
     _validate_kind(matrix_kind)
+    _validate_lis_space(lis_space)
     _validate_thresholds(thresh_occ, thresh_vir, internal_rank_threshold)
     index = _fragment_index(mp2_static, fragment_index)
     if common is None:
@@ -500,45 +401,35 @@ def build_fragment_lis_selection(
     representative = (_physical_groups(mp2_static)[index][0] if frame_fragment_index is None
                       else frame_fragment_index)
     frame, occupied, virtual = _frame_and_matrices(common, mp2_static, representative, frame, matrices)
-    occ_projection, _ = _internal_projection_matrices(common, mp2_static, index)
-    # Retain all n_F original occupied targets, independent of the rank cutoff.
-    occ_keep = numpy.arange(occ_projection.shape[0], dtype=numpy.int32)
-    vir_keep = numpy.zeros(0, dtype=numpy.int32)
-    occ_internal = _fixed_row_space(occ_projection, occ_keep)
+    internal = _domain_targets(common, mp2_static, index, frame)
     full_occ, full_vir = float(thresh_occ) == 0, float(thresh_vir) == 0
-    ro, rv = _domain_maps(common, frame)
-    occ_columns = numpy.empty(0, dtype=numpy.int32)
-    lno_keep = []
-    for mapping, density, full in ((ro, occupied, full_occ), (rv, virtual, full_vir)):
-        if full:
-            lno_keep.append(numpy.empty(0, dtype=numpy.int32))
-            continue
-        is_occupied = len(lno_keep) == 0
-        columns = None
-        if is_occupied:
-            mapping = _external_map(mapping, occ_internal)
-            columns = occ_columns = _range_columns(mapping)
-        _, compact = _compact_mapped_density(mapping, density, columns)
-        if not numpy.isfinite(numpy.asarray(jax.device_get(compact))).all():
-            raise ValueError('domain map is rank deficient; rebuild domain selections')
-        lno_keep.append(_density_keep_numpy(compact, np.zeros((compact.shape[0], 0)),
-            thresh_occ if is_occupied else thresh_vir, False))
-    return FragmentLISSelection(index, occ_keep, vir_keep,
-        *lno_keep, full_occ, full_vir, occ_columns)
+    columns = numpy.zeros(0, dtype=numpy.int32)
+    occ_keep = numpy.zeros(0, dtype=numpy.int32)
+    if not full_occ:
+        external = _external_map(np.eye(occupied.shape[0]), internal)
+        columns = _range_columns(external)
+        _, compact = _compact_mapped_density(external, occupied, columns)
+        occ_keep = _density_keep_numpy(compact, np.zeros((compact.shape[0], 0)),
+                                       thresh_occ, False)
+    vir_keep = _density_keep_numpy(virtual, np.zeros((virtual.shape[0], 0)),
+                                   thresh_vir, full_vir)
+    return FragmentLISSelection(index, numpy.arange(internal.shape[1], dtype=numpy.int32),
+        numpy.zeros(0, dtype=numpy.int32), occ_keep, vir_keep, full_occ, full_vir,
+        columns, lis_space='domain',
+        parent_dimensions=(occupied.shape[0], virtual.shape[0]))
 
 
 def build_fragment_lis(mf, common, static, fragment_index, *, matrices,
                        matrix_kind=None, frame=None, frame_fragment_index=None):
     """Replay fixed LIS labels with current D/W blocks and the matching ED frame.
 
-    The output contains the original global-HF six-block MO layout, original
-    Boys target and its occupied anchor. Blocks, ED maps, target overlaps and
-    retained orbitals respond to AD. Only the historical discarded rotation
-    is stopped; multiplication by parent global-HF coefficients responds.
+    The output contains only the domain LIS and its normalized target block.
+    D/W blocks, ED orbitals, target overlaps and retained orbitals respond to AD.
     """
     if not isinstance(static, LISSelections):
         raise TypeError('static must be LISSelections')
     kind = _validate_kind(static.matrix_kind)
+    _validate_lis_space(static.lis_space)
     if matrix_kind is not None and _validate_kind(matrix_kind) != kind:
         raise ValueError('matrix_kind does not match the saved LIS selections')
     _validate_thresholds(static.thresh_occ, static.thresh_vir, static.internal_rank_threshold)
@@ -548,50 +439,9 @@ def build_fragment_lis(mf, common, static, fragment_index, *, matrices,
         raise ValueError('obsolete LIS selection; rebuild domain-space selections')
     if selection.fragment_index != index:
         raise ValueError('fragment selection order is inconsistent')
+    _validate_lis_space(selection.lis_space)
     representative = (_physical_groups(static.mp2_static)[index][0] if frame_fragment_index is None
                       else frame_fragment_index)
     frame, occupied_ed, virtual_ed = _frame_and_matrices(
         common, static.mp2_static, representative, frame, matrices)
-    ro, rv = _domain_maps(common, frame)
-    occ_projection, _ = _internal_projection_matrices(common, static.mp2_static, index)
-    smooth_frames = None if static.smooth_frames is None else static.smooth_frames[index]
-    if smooth_frames is None:
-        occ_internal = _fixed_row_space(occ_projection, selection.internal_occ_keep)
-    else:
-        from .smooth import orthonormalize
-        # Every original Boys target is retained. Cholesky avoids choosing
-        # eigenvectors inside its (often exactly degenerate) Gram matrix.
-        occ_internal = orthonormalize(occ_projection.T, np.eye(ro.shape[0]))
-    if selection.full_occupied_space:
-        occ_rotation = np.eye(ro.shape[0], dtype=ro.dtype)
-    else:
-        occupied_map, occupied = _compact_mapped_density(
-            _external_map(ro, occ_internal), occupied_ed, selection.occupied_map_columns)
-        occ_rotation = _mapped_density_space(occupied, occupied_map, occ_internal,
-            selection.occupied_lno_keep, common.occupied_coeff, common.s1e,
-            None if smooth_frames is None else smooth_frames[0])
-    if selection.full_virtual_space:
-        vir_rotation = np.eye(rv.shape[0], dtype=rv.dtype)
-    else:
-        virtual_map, virtual = _compact_mapped_density(rv, virtual_ed)
-        vir_rotation = _mapped_density_space(virtual, virtual_map,
-            np.zeros((rv.shape[0], 0), dtype=rv.dtype), selection.virtual_lno_keep,
-            common.virtual_coeff, common.s1e, None if smooth_frames is None else smooth_frames[1])
-    target = _physical_target_block(common, static.mp2_static, index)
-    full_coeff, frozen, occ_coeff, vir_coeff = _assemble_full_mo_layout(
-        mf, static.mp2_static, common.occupied_coeff, common.virtual_coeff,
-        common.fock, occ_rotation, vir_rotation, static.internal_rank_threshold,
-        smooth_frames=smooth_frames, overlap=common.s1e)
-    return FragmentLIS(
-        mo_coeff=full_coeff, frozen=frozen,
-        fragment_occupied_anchor=common.occupied_coeff @ occ_projection.T.conj(),
-        fragment_iao_coeff=target, active_occupied_coeff=occ_coeff,
-        active_virtual_coeff=vir_coeff,
-        occupied_projector=_hermitize(occ_rotation @ occ_rotation.T.conj()),
-        virtual_projector=_hermitize(vir_rotation @ vir_rotation.T.conj()),
-        density_occupied_ed=occupied_ed, density_virtual_ed=virtual_ed,
-        density_occupied_active=None, density_virtual_active=None,
-        domain=frame, n_internal_occ=int(selection.internal_occ_keep.size),
-        n_internal_vir=int(selection.internal_vir_keep.size),
-        n_lno_occ=int(occ_rotation.shape[1] - selection.internal_occ_keep.size),
-        n_lno_vir=int(vir_rotation.shape[1] - selection.internal_vir_keep.size))
+    return _build_domain_lis(mf, common, static, index, frame, occupied_ed, virtual_ed)

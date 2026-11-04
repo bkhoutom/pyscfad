@@ -125,20 +125,33 @@ def build_local_Lov_h5(
     )
 
 
-def transform_df_to_mo(mf, mo_coeff, orbs_slice, aosym='s2', mosym='s1', atmlst=None):
+def transform_df_to_mo(mf, mo_coeff, orbs_slice, aosym='s2', mosym='s1', atmlst=None,
+                       s1e=None, coeff_is_local=False):
     """Transform with the domain's AO and auxiliary bases when atoms are given.
 
     The fitting space is independent of the parent's DF storage policy.
     Fragment CCSD and its LIS MP2 subtraction must use the same local metric
     as the extended-domain W/MP2 construction.
+
+    ``s1e`` may supply an existing differentiable AO overlap. Its projection
+    adjoints then join that producer instead of rebuilding overlap integrals.
+    ``coeff_is_local=True`` accepts coefficients already in the domain AO
+    basis, avoiding an identity projection for domain-local LIS orbitals.
     """
     atmlst = _local_domain_atmlst(mf, atmlst)
+    if coeff_is_local and atmlst is None:
+        raise ValueError('Local AO coefficients require a domain atom list')
     if atmlst is not None:
         ao_idx = lno_tools.ao_index_by_atom(mf.mol, atmlst)
-        s1e = mf.get_ovlp()
-        s21 = s1e[ao_idx]
-        s22 = s1e[np.ix_(ao_idx, ao_idx)]
-        mo_coeff = lno_tools.project_mo(mo_coeff, s21, s22)
+        if coeff_is_local:
+            if mo_coeff.shape[0] != len(ao_idx):
+                raise ValueError('Local AO coefficient rows must match the domain')
+        else:
+            if s1e is None:
+                s1e = mf.get_ovlp()
+            s21 = s1e[ao_idx]
+            s22 = s1e[np.ix_(ao_idx, ao_idx)]
+            mo_coeff = lno_tools.project_mo(mo_coeff, s21, s22)
         if aosym == 's2' and mosym == 's1':
             local_mol = make_local_mol(mf.mol, atmlst)
             auxmol = df_addons.make_auxmol(local_mol, mf.with_df.auxbasis)

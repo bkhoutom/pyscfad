@@ -222,9 +222,19 @@ def kernel(mycc, eris=None, t1=None, t2=None, max_cycle=50, tol=1e-8,
 
 
 #@jit
-def update_amps(mycc, t1, t2, eris):
+def update_amps(mycc, t1, t2, eris, *, return_intermediates=False):
+    """Update amplitudes, optionally returning the DF integral-adjoint tape.
+
+    The response solver obtains the tape as VJP auxiliary outputs, sharing
+    its converged-amplitude linearization instead of replaying this update.
+    """
     if mycc.cc2:
         raise NotImplementedError
+    saved = {} if return_intermediates else None
+    if return_intermediates and (mycc.dcsd or mycc.direct
+            or getattr(eris, 'Lov', None) is None
+            or getattr(eris, 'Lvv', None) is None):
+        raise NotImplementedError('Saved update intermediates require ordinary DF-CCSD')
 
     nocc, nvir = t1.shape
     nvir_pair = nvir * (nvir+1) // 2
@@ -317,6 +327,9 @@ def update_amps(mycc, t1, t2, eris):
             ovvv_body, init, scan_idx)[0]
 
         t2new = t2new - np.einsum('ka,ijbk->ijab', t1, tmp_acc)
+        if saved is not None:
+            saved.update(theta_ovvv=theta, tau_for_vvvo=tau_for_vvvo,
+                         tmp_acc=tmp_acc)
         tmp_acc = None
         tau_for_vvvo = None
 
@@ -377,6 +390,8 @@ def update_amps(mycc, t1, t2, eris):
 
     tmp  = np.einsum('ic,kjbc->ibkj', t1, eris_oovv)
     tmp += np.einsum('bjkc,ic->jbki', eris_voov, t1)
+    if saved is not None:
+        saved['tmp_oovv_voov'] = tmp
     t2new -= np.einsum('ka,jbki->jiba', t1, tmp)
 
     fov += np.einsum('kc,aikc->ia', t1, eris_voov) * 2
@@ -392,6 +407,8 @@ def update_amps(mycc, t1, t2, eris):
         tau += t2
     theta  = tau.transpose(1,0,2,3) * 2
     theta -= tau
+    if saved is not None:
+        saved['theta'] = theta
     fvv -= np.einsum('cjia,cjib->ab', theta.transpose(2,1,0,3), eris_voov)
     foo += np.einsum('aikb,kjab->ij', eris_voov, theta)
 
@@ -401,11 +418,15 @@ def update_amps(mycc, t1, t2, eris):
     else:
         tau += t2
     woooo += np.einsum('ijab,aklb->ijkl', tau, eris_voov)
+    if saved is not None:
+        saved['tau_full'] = tau
 
     tau = np.einsum('ia,jb->ijab', t1, t1)
     if not mycc.dcsd:
         tau += t2 * .5
     wVooV += np.einsum('bkic,jkca->bija', eris_voov, tau)
+    if saved is not None:
+        saved['tau_half'] = tau
 
     tmp = np.einsum('jkca,ckib->jaib', t2, wVooV)
     t2new += tmp.transpose(2,0,1,3)
@@ -424,12 +445,18 @@ def update_amps(mycc, t1, t2, eris):
     else:
         eris_VOov += eris_voov
         wVOov += .5 * np.einsum('aikc,kcjb->aijb', eris_VOov, tau)
+    if saved is not None:
+        saved.update(tau_resp=tau, eris_VOov=eris_VOov)
 
     theta  = t2 * 2
     theta -= t2.transpose(1,0,2,3)
+    if saved is not None:
+        saved['theta_t2'] = theta
     t2new += np.einsum('kica,ckjb->ijab', theta, wVOov)
 
     theta = t2.transpose(1,0,2,3) * 2 - t2
+    if saved is not None:
+        saved['theta_t1'] = theta
     t1new += np.einsum('jb,ijba->ia', fov, theta)
     t1new -= np.einsum('jbki,kjba->ia', eris.ovoo, theta)
 
@@ -438,6 +465,8 @@ def update_amps(mycc, t1, t2, eris):
         t2new += .5 * np.einsum('ijkl,klab->ijab', woooo_t2, tau)
     tau += t2
     t2new += .5 * np.einsum('ijkl,klab->ijab', woooo, tau)
+    if saved is not None:
+        saved['tau_final'] = tau
 
     ft_ij = foo + np.einsum('ja,ia->ij', .5*t1, fov)
     ft_ab = fvv - np.einsum('ia,ib->ab', .5*t1, fov)
@@ -453,9 +482,15 @@ def update_amps(mycc, t1, t2, eris):
 
     eia = mo_e_o[:,None] - mo_e_v
     eijab = eia[:,None,:,None] + eia[None,:,None,:]
+    if saved is not None:
+        saved.update(t1work=t1new, t2sym=t2new, eia=eia, eijab=eijab,
+                     fov=fov, foo=foo, fvv=fvv, ft_ij=ft_ij, ft_ab=ft_ab,
+                     woooo=woooo, wVOov=wVOov, wVooV=wVooV)
     t1new /= eia
     t2new /= eijab
     eia = eijab = None
+    if saved is not None:
+        return (t1new, t2new), saved
     return t1new, t2new
 
 

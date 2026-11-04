@@ -55,14 +55,15 @@ def public_reference(monkeypatch):
     domain = SimpleNamespace(fragments=(object(),) * 16,
         frag_lolist=tuple((i,) for i in range(16)), boys_grouping='singleton',
         physical_groups=tuple((i,) for i in range(16)))
-    lis = LISSelections(domain, 'D', 0., 0., 1e-6, (object(),) * 16,
+    fragments = tuple(SimpleNamespace(lis_space='domain') for _ in range(16))
+    lis = LISSelections(domain, 'D', 0., 0., 1e-6, fragments,
                         smooth_frames=(object(),)*16)
     static = ccsd.CCSDSelections(lis, ccsd._scientific_identity(baseline, matrix))
     monkeypatch.setattr(ccsd, '_group_cc_fragments', lambda static, group:
         tuple((i, (target,)) for i, target in
               zip(group.fragment_indices, group.target_indices)))
     monkeypatch.setattr(ccsd.driver, '_coordinate_only', lambda mol: None)
-    monkeypatch.setattr(ccsd.driver, '_initialize_scf', lambda mol, build: (None, None))
+    monkeypatch.setattr(ccsd.driver, '_initialize_scf', lambda mol, build, **kw: (None, None))
     monkeypatch.setattr(ccsd.driver, '_initialize', lambda *a, **k: dict(
         energy=np.float64(0.), variance=0., baseline_energy=0., weak_energy=0.))
     monkeypatch.setattr(ccsd, '_finish', lambda state, static, records, **k: tuple(records))

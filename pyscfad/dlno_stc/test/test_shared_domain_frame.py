@@ -70,13 +70,13 @@ def counted_frames(monkeypatch):
     return counts
 
 
-@pytest.mark.parametrize('shared_integrals', [False, True])
+@pytest.mark.parametrize('df_mode', ['direct', 'half'])
 def test_molecular_shared_frame_matches_rebuilt_energy_and_gradient(
-    molecular_group, monkeypatch, shared_integrals,
+    molecular_group, monkeypatch, df_mode,
 ):
     """Real local DF, W feedback, LIS CCSD and sampled (T), with final SCF response."""
     case = molecular_group
-    monkeypatch.setenv('PYSCFAD_LNO_SHARED_LOCAL_DF_REVERSE', str(int(shared_integrals)))
+    monkeypatch.setenv('PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE', df_mode)
     counts = counted_frames(monkeypatch)
     solve = ccsd._solve_fragment
     triples = ccsd.normalize_triples_controls(
@@ -123,11 +123,11 @@ def test_molecular_shared_frame_matches_rebuilt_energy_and_gradient(
     forward, _, energy_counts, _ = run(with_grad=False)
     np.testing.assert_allclose(forward, reference, atol=2e-12, rtol=0)
     assert energy_counts == dict(forward=1, reverse=0)
-    accept.record_result('shared_domain_frame_' + str(int(shared_integrals)), {
+    accept.record_result('shared_domain_frame_' + df_mode, {
         'energy_Eh': float(value), 'reference_energy_Eh': float(reference),
         'max_gradient_difference_Eh_per_bohr': float(np.max(np.abs(gradient.coords-ref_grad.coords))),
         'reference_frame_counts': ref_counts, 'shared_frame_counts': actual_counts,
-        'shared_integral_reverse': shared_integrals,
+        'df_mode': df_mode,
         'corrected_fragments': list(case.indices),
     })
 

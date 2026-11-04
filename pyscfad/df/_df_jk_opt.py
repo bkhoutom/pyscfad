@@ -620,7 +620,8 @@ def _capture_geometry_factors(dfobj, dm, hermi, activity):
     preventing exact coalescing with the implicit root's geometry seed.
     This small residual is independent of the full AO-density cotangent.
     """
-    if (os.environ.get('PYSCFAD_DF_OOC_CAPTURE_FACTORS', '0').lower()
+    default = '1' if getattr(dfobj, '_ooc_geometry_producer', None) is not None else '0'
+    if (os.environ.get('PYSCFAD_DF_OOC_CAPTURE_FACTORS', default).lower()
             not in ('1', 'true', 'yes', 'on') or hermi != 1
             or not (activity[2] or activity[3])
             or _has_tracer(dfobj, dm)):
@@ -985,6 +986,8 @@ def _precond_memory_plan(dfobj, nao, naux, nocc, nvir):
     final protection against allocations made elsewhere in the calculation.
     """
     total = getattr(dfobj, 'precond_total_memory', None)
+    if total is None:
+        total = _scf_response_cache.total_memory_mb()
     workspace = getattr(dfobj, 'precond_workspace_memory', None)
     explicit = total is not None
     for name, value in (('precond_total_memory', total),
@@ -994,12 +997,14 @@ def _precond_memory_plan(dfobj, nao, naux, nocc, nvir):
     total = float(dfobj.max_memory if total is None else total)
     rss = lib.current_memory()[0]
     remaining = max(total - rss, 0.) * 1e6
+    automatic = _scf_response_cache.automatic_budget_mb()
+    default_cap = 1024. if automatic is None else automatic
     try:
-        cap = float(os.environ.get('PYSCFAD_PRECOND_CACHE_MEMORY_MB', '1024'))
+        cap = float(os.environ.get('PYSCFAD_PRECOND_CACHE_MEMORY_MB', default_cap))
         if not numpy.isfinite(cap) or cap < 0:
-            cap = 1024.
+            cap = default_cap
     except ValueError:
-        cap = 1024.
+        cap = default_cap
     cache_bytes = naux * nvir * nocc * 8
     cache_limit = min(cap * 1024**2, .5 * remaining)
     # Conservative metric/factorization reserve plus small MO/gap arrays.

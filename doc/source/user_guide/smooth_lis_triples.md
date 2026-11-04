@@ -20,12 +20,17 @@ frames and the older adaptive Gaussian triples grid have been removed.
 
 ## Frames and physical selection
 
-LNO eigenproblems use only extended-domain occupied and virtual coordinates.
-Original occupied fragment targets are retained exactly; the occupied density
-is projected outside their span before its compact eigenproblem. The domain
-projection metrics, map response and target-projector response are retained.
-No global-space diagonalization option is exposed. Zero cutoffs keep the full
-corresponding molecular active space directly, without diagonalizing D/W.
+LNO eigenproblems use only the orthonormal extended-domain occupied and virtual
+frames. Occupied selection retains normalized domain projections of the original
+Boys fragment targets and diagonalizes the density in their orthogonal
+complement. Every LIS orbital stays within its corresponding domain span;
+zero cutoffs retain the full corresponding domain space. Domain frames,
+projected targets and retained D/W spaces remain differentiated.
+
+CCSD receives the local occupied count and only the active LIS columns. The
+global AO Fock is projected into this basis, including occupied-virtual entries.
+Selection schema 10 records this domain-only definition; rebuild checkpoints
+from earlier schemas or global-space LIS calculations.
 
 `build_static_selections` chooses LIS ranks, AO anchors and Laplace grids once,
 outside differentiation. With `single_pass=True` it returns a plan, and those
@@ -95,8 +100,11 @@ The native `TriplesDressing(inputs)` constructor takes nine arrays:
 `t1, t2, Bvo, Boo, Bvv, fov, Foo, Fvv, U`. It returns six dressed tensors plus L
 and R. Reverse mode includes derivatives of both Fock blocks and of U. Stable
 matrix-function derivatives handle internal Fock degeneracies without
-individual-eigenvector derivatives. Tensor panels bound dressing scratch, and
-reverse mode rematerializes panels instead of saving every T2 intermediate.
+individual-eigenvector derivatives. Tensor panels bound dressing scratch.
+The current node's rotation intermediates are retained within half the available
+memory headroom and released by its pullback; insufficient headroom selects
+rematerialization. `PYSCFAD_TRIPLES_DRESSING_CACHE_MB` can lower this allowance,
+with zero disabling the cache.
 
 The only native triples entry points are `triples_asymmetric_energy` and
 `triples_asymmetric_energy_vjp`. With `nsamples=0` they enumerate a small exact

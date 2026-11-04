@@ -11,6 +11,7 @@ from pyscfad import gto
 from pyscfad import numpy as np
 from pyscfad.lno import df as lno_df
 from pyscfad.lno import _df_shared
+from pyscfad.lno import _df_direct
 from pyscfad.dlno_stc import ccsd
 
 
@@ -31,14 +32,14 @@ def _problem(nmo):
     return mol, coeff
 
 
-def _energy(mol, coeff):
+def _energy(mol, coeff, s1e=None):
     # Different ED OV and LIS all-pair spaces, with a downstream dependence
     # on ED factors standing in for the W -> LIS frame response.
     ed = lno_df.transform_df_to_mo(_mf(mol), coeff,
-                                  (0, 2, 2, coeff.shape[1]), atmlst=ATOMS)
+                                  (0, 2, 2, coeff.shape[1]), atmlst=ATOMS, s1e=s1e)
     lis_coeff = coeff[:, :3] * (1 + .03 * np.sum(ed**2))
     lis = lno_df.transform_df_to_mo(_mf(mol), lis_coeff, (0, 3, 0, 3),
-                                   atmlst=ATOMS).reshape(-1, 3, 3)
+                                   atmlst=ATOMS, s1e=s1e).reshape(-1, 3, 3)
     weight = np.asarray([[.2, -.1, .3], [.5, .7, -.2], [-.4, .2, .1]])
     return .1*np.sum(ed**2) + np.sum(lis**2*weight) - .2*np.sum(lis[:, :1, 1:]**2)
 
@@ -67,6 +68,7 @@ def test_shared_coordinate_and_orbital_bars_match_separate_reverses(nmo, seed, m
         assert scope.receipt['spooled_bytes'] > 0
         assert scope.terms == []
     assert scope._file is None and scope._handle is None
+    assert scope.metric is None and scope.low is None
     # Finite differences include the overlap projection and ED-to-LIS chain.
     step = 1e-5
     # Update libcint's geometry as well as the traced coordinate attribute.
@@ -78,6 +80,102 @@ def test_shared_coordinate_and_orbital_bars_match_separate_reverses(nmo, seed, m
     fd = (objective(plus, coeff) - objective(minus, coeff)) / (2*step)
     numpy.testing.assert_allclose(mol_bar.coords[2, 1] + geometry[2, 1], fd,
                                   atol=2e-8, rtol=3e-6)
+
+
+def test_direct_reuses_metric_but_generates_four_integral_passes(monkeypatch):
+    mol, coeff = _problem(7)
+    reference, ref_bars = jax.value_and_grad(_energy, argnums=(0, 1))(mol, coeff)
+    counts = dict(metric=0, cholesky=0, raw=0)
+    coverage = []
+    intor = type(mol).intor
+    cholesky = _df_shared.jsp_linalg.cholesky
+    generate = _df_direct._generate_local_raw_int3c_blocks
+
+    def metric(self, name, *args, **kwargs):
+        if name in ('int2c2e', 'int2c2e_sph'):
+            counts['metric'] += 1
+        return intor(self, name, *args, **kwargs)
+
+    def factor(*args, **kwargs):
+        counts['cholesky'] += 1
+        return cholesky(*args, **kwargs)
+
+    def raw(*args, **kwargs):
+        counts['raw'] += 1
+        for p0, p1, block in generate(*args, **kwargs):
+            coverage.append((p0, p1))
+            yield p0, p1, block
+
+    monkeypatch.setattr(type(mol), 'intor', metric)
+    monkeypatch.setattr(_df_shared.jsp_linalg, 'cholesky', factor)
+    monkeypatch.setattr(_df_direct, '_generate_local_raw_int3c_blocks', raw)
+    def no_full_dataset(self, *args, **kwargs):
+        pytest.fail('Shared DF inputs must be read as bounded slices')
+    monkeypatch.setattr(h5py.Dataset, '__array__', no_full_dataset)
+    with _df_shared.reverse_scope(_mf(mol), ATOMS) as scope:
+        value, (mol_bar, coeff_bar) = jax.value_and_grad(_energy, argnums=(0, 1))(mol, coeff)
+        geometry = scope.finish()
+        numpy.testing.assert_allclose(value, reference, atol=2e-12, rtol=0)
+        numpy.testing.assert_allclose(mol_bar.coords + geometry, ref_bars[0].coords,
+                                      atol=2e-9, rtol=2e-8)
+        numpy.testing.assert_allclose(coeff_bar, ref_bars[1], atol=2e-10, rtol=2e-9)
+        assert counts == dict(metric=1, cholesky=1, raw=4)
+        assert scope.receipt['metric_builds'] == scope.receipt['cholesky_builds'] == 1
+        assert scope.receipt['raw_integral_builds'] == scope.receipt['raw_source_passes'] == 4
+        assert set(scope._file) == {'0', '1'}  # Only MO adjoints reach disk.
+    assert scope._file is None
+    assert scope.metric is None and scope.low is None
+
+
+def test_shared_overlap_preserves_all_projection_response(monkeypatch):
+    mol, coeff = _problem(4)
+    reference, ref_bars = jax.value_and_grad(_energy, argnums=(0, 1))(mol, coeff)
+    holder = _mf
+    def no_overlap(m):
+        mf = holder(m)
+        def forbidden():
+            pytest.fail('LIS transform must consume the supplied overlap')
+        mf.get_ovlp = forbidden
+        return mf
+    monkeypatch.setattr(sys.modules[__name__], '_mf', no_overlap)
+    def energy(m, c):
+        return _energy(m, c, s1e=m.intor('int1e_ovlp'))
+    with _df_shared.reverse_scope(_mf(mol), ATOMS) as scope:
+        value, (mol_bar, coeff_bar) = jax.value_and_grad(energy, argnums=(0, 1))(mol, coeff)
+        geometry = scope.finish()
+    numpy.testing.assert_allclose(value, reference, atol=2e-12, rtol=0)
+    numpy.testing.assert_allclose(mol_bar.coords + geometry, ref_bars[0].coords,
+                                  atol=2e-9, rtol=2e-8)
+    numpy.testing.assert_allclose(coeff_bar, ref_bars[1], atol=2e-10, rtol=2e-9)
+
+
+def test_scope_does_not_reuse_inputs_for_different_geometry():
+    mol, _ = _problem(4)
+    shifted = mol.set_geom_(numpy.asarray(mol.coords.at[2, 1].add(.1)),
+                            unit='Bohr', inplace=False)
+    local = lno_df.make_local_mol(shifted, ATOMS)
+    aux = lno_df.df_addons.make_auxmol(local, 'weigend')
+    with _df_shared.reverse_scope(_mf(mol), ATOMS) as scope:
+        assert _df_shared.matching_scope(local, aux) is None
+        assert _df_shared.matching_scope(scope.mol, scope.auxmol) is scope
+        scope.finish()
+
+
+def test_scope_is_closed_after_generation_failure(monkeypatch):
+    mol, coeff = _problem(4)
+    generate = _df_direct._generate_local_raw_int3c_blocks
+    def failing(*args, **kwargs):
+        first = next(generate(*args, **kwargs))
+        yield first
+        raise RuntimeError('interrupted integral generation')
+    monkeypatch.setattr(_df_direct, '_generate_local_raw_int3c_blocks', failing)
+    with pytest.raises(RuntimeError, match='interrupted integral generation'):
+        with _df_shared.reverse_scope(_mf(mol), ATOMS) as scope:
+            jax.grad(lambda m: _energy(m, coeff))(mol)
+    assert scope._file is None and scope._handle is None
+    assert scope.metric is None and scope.low is None
+    assert scope._metric_pullback is None and scope._factor_pullback is None
+    assert _df_shared._ACTIVE.get() is None
 
 
 def test_owner_adds_shared_geometry_once_and_preserves_other_bars(monkeypatch):
@@ -94,7 +192,6 @@ def test_owner_adds_shared_geometry_once_and_preserves_other_bars(monkeypatch):
         state['mf_bar'] = SimpleNamespace(mol=bar)
         return [float(value)]
     monkeypatch.setattr(ccsd, '_run_group_responses', responses)
-    monkeypatch.setenv('PYSCFAD_LNO_SHARED_LOCAL_DF_REVERSE', '1')
     records = ccsd._run_group(state, static, group, {}, {}, with_grad=True,
                               verbose_imp=0, ccsd_t=True)
     numpy.testing.assert_allclose(records, [expected], atol=1e-13)

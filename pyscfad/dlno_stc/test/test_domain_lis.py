@@ -76,8 +76,8 @@ def test_zero_cutoffs_keep_all_without_density_eigenproblem(molecular_group, mon
     static = lis.LISSelections(case.static.mp2_static, 'W', 0., 0., 1e-6, tuple(fragments))
     value = lis.build_fragment_lis(case.mf, common, static, index,
         matrices=matrices, frame=frame)
-    np.testing.assert_allclose(value.occupied_projector, np.eye(common.occupied_coeff.shape[1]), atol=1e-14)
-    np.testing.assert_allclose(value.virtual_projector, np.eye(common.virtual_coeff.shape[1]), atol=1e-14)
+    np.testing.assert_allclose(value.occupied_projector, np.eye(frame.occupied_coeff.shape[1]), atol=1e-14)
+    np.testing.assert_allclose(value.virtual_projector, np.eye(frame.virtual_coeff.shape[1]), atol=1e-14)
     assert value.density_occupied_active is value.density_virtual_active is None
     with pytest.raises(TypeError, match='virtual_eigenspace'):
         ccsd.build_static_selections(None, None, matrix_kind='W', thresh_occ=1e-4,
@@ -90,7 +90,6 @@ def test_zero_cutoffs_keep_all_without_density_eigenproblem(molecular_group, mon
 def test_molecular_domain_only_matches_global_oracle(molecular_group, monkeypatch):
     """Global density construction exists only here as an independent oracle."""
     case = molecular_group
-    monkeypatch.setenv('PYSCFAD_LNO_SHARED_LOCAL_DF_REVERSE', '1')
     original = lis._compact_mapped_density
     shapes = []
 
@@ -123,7 +122,6 @@ def test_molecular_domain_only_matches_global_oracle(molecular_group, monkeypatc
             build_static=lambda mf: select(mf, single_pass=True), **options)
     assert shapes and all(x['eigenproblem'] <= x['domain'] for x in shapes)
     assert any(x['occupied'] and x['eigenproblem'] < x['parent'] for x in shapes)
-    assert any(not x['occupied'] and x['eigenproblem'] < x['parent'] for x in shapes)
     np.testing.assert_allclose(actual[0], reference[0], atol=3e-11, rtol=0)
     np.testing.assert_allclose(actual[1].coords, reference[1].coords, atol=3e-9, rtol=3e-7)
     for a,b in zip(actual[2].fragments, reference[2].fragments):

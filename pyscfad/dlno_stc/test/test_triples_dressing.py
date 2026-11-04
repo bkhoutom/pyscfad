@@ -10,7 +10,8 @@ from pyscfad.dlno_stc.test._triples_dressing_reference import symmetric_exp, dre
 @pytest.mark.parametrize('fragment', ['whole', 'selected'])
 @pytest.mark.parametrize('degenerate', [False, True])
 @pytest.mark.parametrize('node', [0., .37, 3.])
-def test_native_dressing_all_cotangents(fragment, degenerate, node):
+@pytest.mark.parametrize('cache_bytes', [0, 2**25])
+def test_native_dressing_all_cotangents(fragment, degenerate, node, cache_bytes):
     rng = np.random.default_rng(293)
     no, nv, npaux = 3, 4, 5
     foo = rng.normal(size=(no,no))*.03; foo = (foo+foo.T)/2 - np.eye(no)
@@ -28,11 +29,14 @@ def test_native_dressing_all_cotangents(fragment, degenerate, node):
         return result
     expected, pullback = jax.vjp(transform, *map(jnp.asarray, arrays))
     engine = native.TriplesDressing(tuple(arrays))
-    actual = engine.prepare(node)
+    actual = engine.prepare(node, cache_limit_bytes=cache_bytes)
+    assert bool(engine.cache_bytes) == bool(cache_bytes)
     for got, want in zip(actual, expected):
         np.testing.assert_allclose(got, want, rtol=2e-12, atol=2e-12)
     cotangents = tuple(rng.normal(size=x.shape) for x in expected)
     bars = engine.pullback(node, cotangents)
+    assert engine.cache_bytes == 0
+    assert engine.cache_hits == bool(cache_bytes)
     reference = pullback(tuple(map(jnp.asarray, cotangents)))
     for got, want in zip(bars, reference):
         np.testing.assert_allclose(got, want, rtol=2e-11, atol=5e-11)
@@ -56,3 +60,28 @@ def test_panel_boundaries_and_full_fock_blas_pullback():
     cotangents = tuple(rng.normal(size=x.shape) for x in expected)
     for got, want in zip(engine.pullback(.7, cotangents), pullback(tuple(map(jnp.asarray, cotangents)))):
         np.testing.assert_allclose(got, want, rtol=3e-10, atol=3e-10)
+
+
+@pytest.mark.parametrize('integrals', [False, True])
+def test_node_tape_ownership_rebuild_and_bounded_fallback(integrals):
+    rng = np.random.default_rng(81)
+    no, nv, naux = 2, 3, 4
+    shapes = ([(no,nv,nv,nv), (no,nv,no,no), (no,nv,no,nv)] if integrals
+              else [(naux,no,nv), (naux,no,no), (naux,nv,nv)])
+    inputs = tuple(rng.normal(size=s) for s in [(no,nv), (no,no,nv,nv),
+                  *shapes, (no,nv)]) + (-np.eye(no), np.eye(nv), np.eye(no))
+    engine = native.TriplesDressing(inputs, integral_inputs=integrals)
+    values = engine.prepare(.3)
+    seeds = tuple(rng.normal(size=x.shape) for x in values)
+    expected = engine.pullback(.3, seeds)
+    for node, cap in ((.3, 2**20), (.7, 2**20), (.3, 1)):
+        engine.prepare(node, cache_limit_bytes=cap)
+        actual = engine.pullback(.3, seeds, cache_limit_bytes=cap)
+        assert engine.cache_bytes == 0
+        for got, want in zip(actual, expected):
+            np.testing.assert_allclose(got, want, atol=1e-12, rtol=1e-12)
+    assert engine.cache_hits == 1 and engine.cache_rebuilds == 1
+    engine.prepare(.3, cache_limit_bytes=2**20)
+    with pytest.raises(ValueError, match='cotangent count'):
+        engine.pullback(.3, seeds[:-1])
+    assert engine.cache_bytes == 0

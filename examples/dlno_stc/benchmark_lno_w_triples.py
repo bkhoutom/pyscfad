@@ -42,6 +42,9 @@ def main():
                         help="store DF factors in RAM or stream them and their response from disk")
     parser.add_argument("--df-memory-mb", type=float, default=4000,
                         help="working-memory budget for streamed DF operations")
+    parser.add_argument("--fragment-df-mode", choices=("direct", "half"),
+                        default=os.environ.get('PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE', 'half'),
+                        help="regenerate local integrals or retain H_ED for one-pass reuse (default)")
     parser.add_argument("--cc-conv-tol", type=float, default=1e-7)
     parser.add_argument("--cc-conv-tol-normt", type=float, default=1e-5)
     parser.add_argument("--lno-thresh-occ", type=float, default=1e-4,
@@ -65,6 +68,7 @@ def main():
     parser.add_argument("--reference", type=Path,
                         help="reuse a validated deterministic energy/force result")
     args = parser.parse_args()
+    os.environ['PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE'] = args.fragment_df_mode
     if args.single_pass_w and (args.selection_only or args.reference):
         parser.error('selection-only/reference reuse requires --no-single-pass-w')
     if args.single_pass_w and args.triples_variance_allocation != 'occupied_count':
@@ -132,6 +136,7 @@ def main():
         for key, value, old_default in (
                 ('single_pass_w', args.single_pass_w, False),
                 ('lis_eigenspace', 'domain', 'global'),
+                ('lis_space', 'domain', 'global'),
                 ('triples_variance_allocation', args.triples_variance_allocation, 'mp2_energy')):
             if previous.get(key, old_default) != value:
                 raise ValueError(f'{key} differs; use a new output directory')
@@ -289,6 +294,7 @@ def main():
     report(f"Configuring W-LIS selection: occupied cutoff={args.lno_thresh_occ:g}, "
            f"virtual cutoff={args.lno_thresh_vir:g}")
     selection_options = dict(matrix_kind="W", thresh_occ=args.lno_thresh_occ,
+                             lis_space="domain",
                              thresh_vir=args.lno_thresh_vir,
                              baseline_controls=baseline, matrix_controls=matrix,
                              merge_identical=True)
@@ -316,6 +322,7 @@ def main():
                     pair_energy_model=domains.pair_energy_model,
                     lno_thresh_occ=args.lno_thresh_occ, lno_thresh_vir=args.lno_thresh_vir,
                     single_pass_w=args.single_pass_w,
+                    lis_space="domain",
                     lis_eigenspace='domain',
                     triples_variance_allocation=args.triples_variance_allocation,
                     selection_timer_scope='plan_only' if args.single_pass_w else 'complete_prepass',
@@ -325,6 +332,10 @@ def main():
                     cpu_affinity=benchmark_cpus, affinity_check=affinity,
                     max_memory_mb=args.max_memory_mb, cc_conv_tol=args.cc_conv_tol,
                     df_storage=args.df_storage, df_memory_mb=args.df_memory_mb,
+                    thread_policy=os.environ.get('PYSCFAD_BENCHMARK_THREAD_POLICY', 'fixed'),
+                    omp_dynamic=os.environ.get('OMP_DYNAMIC'),
+                    mkl_dynamic=os.environ.get('MKL_DYNAMIC'),
+                    shared_df_cache_mode=args.fragment_df_mode,
                     scf_response_solver="eager_gmres" if cderi_path is not None else "default",
                     scf_df_precond=args.scf_df_precond,
                     scf_precond_total_memory_mb=args.max_memory_mb if args.scf_df_precond else None,
@@ -377,6 +388,7 @@ def main():
     if args.reference:
         reference = json.loads(args.reference.read_text())
         if (reference["basis"] != args.basis or reference["frozen"] != args.frozen
+                or reference.get("lis_space", "global") != 'domain'
                 or reference.get("lno_thresh_occ") != args.lno_thresh_occ
                 or reference.get("lno_thresh_vir") != args.lno_thresh_vir
                 or reference.get("force_full_domains", True) != force_full_domains
@@ -438,6 +450,10 @@ def main():
                       threads=args.threads,
                       scf_df_precond=args.scf_df_precond,
                       df_storage=args.df_storage, df_memory_mb=args.df_memory_mb,
+                      thread_policy=os.environ.get('PYSCFAD_BENCHMARK_THREAD_POLICY', 'fixed'),
+                      omp_dynamic=os.environ.get('OMP_DYNAMIC'),
+                      mkl_dynamic=os.environ.get('MKL_DYNAMIC'),
+                      shared_df_cache_mode=args.fragment_df_mode,
                       force_full_domains=force_full_domains,
                       domain_thresholds=asdict(domains.thresholds),
                       mp2_domains=mp2_domains,
@@ -445,6 +461,7 @@ def main():
                       triples_mode=args.triples_method,
                       triples_integral_transform=args.triples_integral_transform,
                       single_pass_w=args.single_pass_w,
+                      lis_space="domain",
                       lis_eigenspace='domain',
                       triples_variance_allocation=args.triples_variance_allocation,
                       smooth_frame_mode=frame_mode,

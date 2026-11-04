@@ -5,6 +5,7 @@ STC frame; the shared Python solver retains the original Boys energy target.
 """
 from dataclasses import dataclass, replace
 import gc
+import os
 
 import jax
 import numpy
@@ -13,6 +14,7 @@ from pyscfad import numpy as np
 from pyscfad.lno.ccsd import _impurity_solve_core
 
 from . import backend, driver, _stc_precision
+from ._profile import response as profile_response
 from ._memory import memory_calculation
 from ._selection import (DomainSelections, _physical_groups, _strong_preparation_key,
                          build_domain_groups)
@@ -25,6 +27,21 @@ from .protocol import validate_full_result, validate_input_cotangents
 
 
 CC_SELECTIONS_SCHEMA_VERSION = 9
+
+
+def _clear_jax_caches(stage, *live_results, **metadata):
+    """Optionally trade recompilation for lower residency between eager stages.
+
+    Saved VJP residuals remain live: only JAX's compilation caches are cleared.
+    This does not impose a hard memory limit or change the selected spaces.
+    """
+    if os.environ.get('PYSCFAD_STC_CLEAR_JAX_CACHES', '0').lower() not in (
+            '1', 'true', 'yes', 'on'):
+        return
+    with resource_profile.section('stc.cc.clear_jax_caches', stage=stage, **metadata):
+        jax.block_until_ready(live_results)
+        jax.clear_caches()
+        gc.collect()
 
 
 @dataclass(frozen=True)
@@ -481,18 +498,57 @@ def _triples_fragment_seed(global_seed, fragment_index):
     return int(sequence.generate_state(1, dtype=numpy.uint64)[0])
 
 
+@jax.tree_util.register_pytree_node_class
+@dataclass(frozen=True)
+class _SolverLIS:
+    """Numerical solver inputs with the constructor's frozen layout unchanged."""
+    mo_coeff: object
+    fragment_iao_coeff: object
+    active_occupied_coeff: object
+    active_virtual_coeff: object
+    frozen: tuple
+
+    def tree_flatten(self):
+        return ((self.mo_coeff, self.fragment_iao_coeff,
+                 self.active_occupied_coeff, self.active_virtual_coeff), self.frozen)
+
+    @classmethod
+    def tree_unflatten(cls, frozen, arrays):
+        return cls(*arrays, frozen)
+
+
+def _build_solver_lis(mf, common, static, fragment_index, matrices, frame, representative):
+    from .lis import build_fragment_lis
+    if not resource_profile.enabled():
+        return build_fragment_lis(mf, common, static, fragment_index,
+            matrices=matrices, frame=frame, frame_fragment_index=representative)
+    # Differentiate only numerical outputs used by the solver. Frozen labels
+    # come from the existing constructor and remain static pytree metadata.
+    frame_metadata = frame._replace(occupied_coeff=None, virtual_coeff=None)
+    def build(current, data, blocks, occupied, virtual):
+        current_frame = frame_metadata._replace(occupied_coeff=occupied, virtual_coeff=virtual)
+        lis = build_fragment_lis(current, data, static, fragment_index,
+            matrices=blocks, frame=current_frame, frame_fragment_index=representative)
+        return _SolverLIS(lis.mo_coeff, lis.fragment_iao_coeff,
+            lis.active_occupied_coeff, lis.active_virtual_coeff,
+            tuple(int(index) for index in lis.frozen))
+    with resource_profile.section('stc.lis.build', frag=fragment_index+1):
+        lis = profile_response('stc.lis.pullback', build, mf, common, matrices,
+            frame.occupied_coeff, frame.virtual_coeff, frag=fragment_index+1)
+        jax.block_until_ready(lis)
+    return lis
+
+
 def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
                     verbose_imp, ccsd_t, triples_controls=None, with_grad=False,
                     vvvv_direct=False, cc_solver='deterministic', stc_cc_controls=None,
                     frame=None):
     """Return MP2-LIS, CCSD and triples; stochastic calls also return diagnostics."""
-    from .lis import build_fragment_lis
     representative = group.representative_index
     if frame is None:
         frame = build_boys_ed_frame(common, static.mp2_static, representative)
-    lis = build_fragment_lis(mf, common, static.lis_static, fragment_index,
-                             matrices=matrices, frame=frame,
-                             frame_fragment_index=representative)
+    lis = _build_solver_lis(mf, common, static.lis_static, fragment_index,
+                            matrices, frame, representative)
     stochastic = triples_controls is not None and triples_controls['mode'] == 'stochastic'
     if not lis.active_occupied_coeff.shape[1] or not lis.active_virtual_coeff.shape[1]:
         zero = np.zeros((), dtype=common.s1e.dtype)
@@ -510,6 +566,10 @@ def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
         from .smooth import noncanonical_mp2
         from .smooth_triples import make_solver
         options['mp2_solver'] = noncanonical_mp2
+        if resource_profile.enabled():
+            options['mp2_solver'] = lambda eris, projection: profile_response(
+                'solver.mp2_reference_pullback', noncanonical_mp2, eris, projection,
+                frag=fragment_index+1)
         if ccsd_t:
             local_controls = dict(triples_controls)
             local_controls['global_seed'] = _triples_fragment_seed(
@@ -548,7 +608,7 @@ def _run_group(state, static, group, baseline_controls, matrix_controls, *,
         records = _run_group_responses(state, static, group, baseline_controls,
                                        matrix_controls, **options)
         with resource_profile.section('stc.cc.shared_df_integral_pullback',
-                                      frag=group.representative_index+1):
+                                      domain_representative=group.representative_index+1):
             coords = shared.finish()
             state['mf_bar'].mol.coords = state['mf_bar'].mol.coords + np.asarray(coords)
             jax.block_until_ready(state['mf_bar'].mol.coords)
@@ -626,6 +686,7 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
         matrices = {name: np.asarray(forward[name]) for name in ('occupied', 'virtual')}
         fragment_static = (_select_current_fragment(state, static, index, group, frame, forward)
                            if getattr(static, 'deferred_selection', None) is not None else static)
+        _clear_jax_caches('before_correction', matrices, frame_coeff, frag=index+1)
         local_triples = _fragment_triples_controls(triples_controls, index)
         pilot_mf = None
         def evaluate(configuration, need_grad):
@@ -664,6 +725,7 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
                 energy, pullback, auxiliary = jax.vjp(
                     correction, state['mf'], state['common'], matrices, frame_coeff, has_aux=True)
                 jax.block_until_ready((energy, auxiliary))
+            _clear_jax_caches('before_correction_pullback', energy, auxiliary, frag=index+1)
             with resource_profile.section('stc.cc.correction_pullback', frag=index+1):
                 bars = pullback(np.ones_like(energy))
                 jax.block_until_ready(bars)
@@ -682,18 +744,28 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
             # accumulated frame contribution once through preparation below.
             direct_norm = _bar_norm(mf_bar, common_bar)
             driver._add_bars(state, mf_bar, common_bar)
+            # These bars have been accumulated into state/frame_bars. Release
+            # their separate trees and completed CC response executables before
+            # the native W reverse allocates domain-sized factor buffers.
+            del correction_bars, mf_bar, common_bar, coeff_bars
+            _clear_jax_caches('before_matrix_pullback', state['mf_bar'],
+                              state['common_bar'], frame_bars, matrix_bars,
+                              frag=index+1)
             with resource_profile.section('stc.cc.matrix_pullback', frag=index+1):
                 bars = backend.pullback_matrices(
                     host, forward, energy_bar=float(baseline_from_w), occupied_bar=matrix_bars['occupied'],
                     virtual_bar=matrix_bars['virtual'])
             validate_input_cotangents(bars, inputs)
             if input_bars is None:
-                input_bars = {name: numpy.array(value, dtype=numpy.float64, copy=True)
+                # Native outputs are owned and writable, including the empty
+                # fast path. Adopt them without duplicating the domain-sized
+                # B bar; diagnostic wrappers may return read-only snapshots.
+                input_bars = {name: value if value.flags.writeable else value.copy()
                               for name, value in bars.items()}
             else:
                 for name in inputs:
                     input_bars[name] += bars[name]
-            del correction_bars, mf_bar, common_bar, matrix_bars, coeff_bars, bars
+            del matrix_bars, bars
         else:
             direct_norm = None
         values, diagnostics = auxiliary
@@ -788,6 +860,8 @@ def _run_serial(state, static, baseline, matrix, *, with_grad, include_hf,
                     triples_controls=triples_controls, vvvv_direct=vvvv_direct,
                     include_baseline=include_baseline, fragment_indices=fragment_indices,
                     **solver_options))
+                _clear_jax_caches('after_group', state['energy'], state['mf_bar'],
+                                  state['common_bar'], frag=group.representative_index+1)
             save_progress(checkpoint, state, records, position + 1, False, with_grad=with_grad)
             gc.collect()
         if not weak_done:
@@ -834,6 +908,7 @@ def _run(initializer, worker_initializer, comm, *, checkpoint_dir, resume,
     if not isinstance(options.get('vvvv_direct', False), bool):
         raise TypeError('vvvv_direct must be a bool')
     state, static, baseline, matrix = initializer()
+    _clear_jax_caches('initialization', state.get('mf'), state.get('common'))
     options['fragment_indices'] = state.pop('cc_fragment_indices')
     options['triples_controls'] = state.pop('cc_triples_controls')
     options.update(state.pop('cc_solver_options', {}))
@@ -982,7 +1057,10 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
             if _stc_precision.enabled(solver_options.get('stc_cc_controls')):
                 prechecked_indices = _fragment_indices(static, fragment_indices)
                 _stc_precision.validate_seed_independence(solver_options['stc_cc_controls'], prechecked_indices)
-        mf, scf_pullback = driver._initialize_scf(mol, build_mf)
+        with resource_profile.section('stc.domain.scf'):
+            mf, scf_pullback = driver._initialize_scf(mol, build_mf)
+            if resource_profile.enabled():
+                jax.block_until_ready(mf)
         if comm is None:
             scf_pullback = driver._serial_scf_pullback(scf_pullback)
         selected = static

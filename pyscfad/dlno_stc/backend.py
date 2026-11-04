@@ -6,6 +6,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 
 import numpy as np
+from pyscfad.tools import resource_profile
 
 from .protocol import (
     ARRAY_NAMES, validate_full_inputs, validate_full_result,
@@ -287,6 +288,7 @@ def solve_matrices(inputs, metadata, controls, *, matrix_kind="D", aux_offsets=N
               "virtual": np.zeros((nvir, nvir)), "matrix_kind": matrix_kind,
               "metadata": saved_metadata, "controls": deepcopy(settings)}
     plans, batch_diagnostics = [], []
+    native_timings = {}
     variance = {name: 0. for name in ("energy", "occupied", "virtual")}
     matrix_variance = {name: np.zeros_like(result[name]) for name in ("occupied", "virtual")}
     production_draws = 0
@@ -299,6 +301,8 @@ def solve_matrices(inputs, metadata, controls, *, matrix_kind="D", aux_offsets=N
         for name in ("energy", "occupied", "virtual"):
             result[name] += local[name]
         diagnostics = dict(local["diagnostics"])
+        for name, seconds in diagnostics.get("native_timings", {}).items():
+            native_timings[name] = native_timings.get(name, 0.) + float(seconds)
         if diagnostics["native_version"] != native_version:
             raise ValueError("matrix result native version changed during forward")
         saved_metadata["native_options"].append(deepcopy(diagnostics["effective_options"]))
@@ -321,6 +325,7 @@ def solve_matrices(inputs, metadata, controls, *, matrix_kind="D", aux_offsets=N
         "estimated_process_peak_mb": None if peak_bytes is None else peak_bytes/1e6,
         "uncertainty_convention": "independent_batch_sum",
         "energy_standard_error": math.sqrt(variance["energy"]),
+        "native_timings": native_timings,
     }
     for name in ("occupied", "virtual"):
         se = math.sqrt(variance[name])
@@ -329,6 +334,9 @@ def solve_matrices(inputs, metadata, controls, *, matrix_kind="D", aux_offsets=N
         diagnostics[name+"_target_met"] = (
             settings["mode"] == "deterministic" or se <= settings["matrix_tolerance"])
     result["diagnostics"] = diagnostics
+    if native_timings:
+        resource_profile.checkpoint('stc.matrix.native_forward_timings',
+            frag=metadata.get('fragment_id', 0) + 1, timings=native_timings)
     # Fingerprint resolved source defaults as well as the requested controls.
     fingerprint = matrix_request_fingerprint(arrays, saved_metadata, settings,
                                              matrix_kind, offsets)
@@ -372,13 +380,29 @@ def pullback_matrices(inputs, forward, *, energy_bar, occupied_bar, virtual_bar)
         return {name: np.zeros_like(inputs[name]) for name in ARRAY_NAMES}
     arrays = host_inputs(inputs)
     total = None
+    native_timings = {}
+    timed_pullback = getattr(extension, 'pullback_matrices_with_timings', None)
     for plan in replay.batches:
-        bars = extension.pullback_matrices(*(arrays[key] for key in ARRAY_NAMES), plan,
-                                           float(seed), seeds["occupied"], seeds["virtual"])
+        arguments = (*(arrays[key] for key in ARRAY_NAMES), plan,
+                     float(seed), seeds["occupied"], seeds["virtual"])
+        if timed_pullback is None:
+            bars = extension.pullback_matrices(*arguments)
+        else:
+            bars, timings = timed_pullback(*arguments)
+            for name, seconds in timings.items():
+                native_timings[name] = native_timings.get(name, 0.) + float(seconds)
         validate_input_cotangents(bars, arrays)
         if total is None:
             total = bars
         else:
             for name in ARRAY_NAMES:
                 total[name] += bars[name]
+        # Only the accumulated result is needed by the next native batch.
+        # Keeping the last batch here overlaps another full B cotangent with
+        # the following call (hundreds of MB for large local domains).
+        del bars
+    forward['diagnostics']['native_reverse_timings'] = native_timings
+    if native_timings:
+        resource_profile.checkpoint('stc.matrix.native_reverse_timings',
+            frag=forward['metadata'].get('fragment_id', 0) + 1, timings=native_timings)
     return total

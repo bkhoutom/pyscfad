@@ -8,6 +8,7 @@ Enable it with ``PYSCFAD_DLNO_RESOURCE_PROFILE=1``.
 """
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 import ctypes
 import os
 import resource
@@ -21,6 +22,7 @@ _ENV_NAME = 'PYSCFAD_DLNO_RESOURCE_PROFILE'
 _PREFIX = '[DLNO-RESOURCE]'
 _HEADER_PRINTED = False
 _DARWIN_LIBC = None
+_EVENT_SINK = ContextVar('resource_profile_event_sink', default=None)
 
 
 class Snapshot(NamedTuple):
@@ -41,11 +43,42 @@ class ProfileStart(NamedTuple):
 
 
 def enabled():
+    if _EVENT_SINK.get() is not None:
+        return True
     value = os.environ.get(_ENV_NAME)
     return (
         value is not None
         and value.strip().lower() in ('1', 'true', 'yes', 'on')
     )
+
+
+@contextmanager
+def capture_events(sink):
+    """Send structured, process-local timing events to ``sink(event)``.
+
+    Start/end counters permit callers to distinguish nested inclusive timers
+    from an additive wall-time breakdown. Capturing also enables profiling;
+    no numerical operations or device synchronization are introduced here.
+    """
+    token = _EVENT_SINK.set(sink)
+    try:
+        yield
+    finally:
+        _EVENT_SINK.reset(token)
+
+
+def _emit_event(phase, before, after, details):
+    sink = _EVENT_SINK.get()
+    if sink is not None:
+        sink(dict(phase=str(phase), rank=int(_mpi_rank()),
+                  start_wall_s=None if before is None else before.wall_s,
+                  end_wall_s=after.wall_s,
+                  start_cpu_s=None if before is None else before.user_s + before.system_s,
+                  end_cpu_s=after.user_s + after.system_s,
+                  wall_s=None if before is None else max(after.wall_s-before.wall_s, 0.),
+                  cpu_s=None if before is None else max(
+                      after.user_s + after.system_s - before.user_s - before.system_s, 0.),
+                  rss_mib=after.rss_mib, details=details))
 
 
 def _mpi_rank():
@@ -320,6 +353,7 @@ def finish(phase, before, **details):
         if value is not None
     )
     print(f'{_PREFIX} ' + ' '.join(fields), flush=True)
+    _emit_event(phase, before, after, details)
 
 
 def checkpoint(phase, **details):
@@ -358,6 +392,7 @@ def checkpoint(phase, **details):
         if value is not None
     )
     print(f'{_PREFIX} ' + ' '.join(fields), flush=True)
+    _emit_event(phase, None, now, details)
 
 
 @contextmanager

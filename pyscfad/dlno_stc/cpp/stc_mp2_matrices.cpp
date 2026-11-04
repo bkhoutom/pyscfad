@@ -6,6 +6,7 @@
 #include "native/stc_mp2_stochastic_w.h"
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
+#include <map>
 #include <set>
 
 namespace libgmbpt {
@@ -370,12 +371,35 @@ MatrixSettings read_settings(const Inputs& inputs, py::handle targets,
     return settings;
 }
 
+using MatrixTimings = std::map<std::string, double>;
+
+MatrixTimings deterministic_timings(const density::deterministic_result& result) {
+    // Subphases overlap their parent totals; retain the names so callers can
+    // report exclusive preparation/contraction/reverse stages without reruns.
+    return {{"native_total_seconds", result.seconds},
+            {"propagation_seconds", result.propagation_seconds},
+            {"amplitude_seconds", result.amplitude_seconds},
+            {"contraction_seconds", result.contraction_seconds},
+            {"seed_seconds", result.seed_seconds},
+            {"reverse_seconds", result.reverse_seconds},
+            {"reverse_factor_seconds", result.reverse_factor_seconds},
+            {"amplitude_vjp_seconds", result.amplitude_vjp_seconds},
+            {"propagator_vjp_seconds", result.propagator_vjp_seconds},
+            {"propagation_allocation_seconds", result.propagation_allocation_seconds},
+            {"propagation_occupied_seconds", result.propagation_occupied_seconds},
+            {"propagation_virtual_seconds", result.propagation_virtual_seconds},
+            {"spin_seconds", result.spin_seconds},
+            {"occupied_density_seconds", result.occupied_density_seconds},
+            {"virtual_energy_seconds", result.virtual_energy_seconds}};
+}
+
 struct MatrixOutput {
     double energy = 0, energy_se = 0;
     double occupied_frobenius_se = 0, virtual_frobenius_se = 0;
     bool occupied_target_met = true, virtual_target_met = true;
     size_t pilot_draws = 0, production_draws = 0;
     arma::mat occupied, virtuals, occupied_se, virtual_se;
+    MatrixTimings timings;
 };
 
 MatrixOutput deterministic_forward(const Inputs& inputs, const MatrixReplay& replay) {
@@ -386,6 +410,7 @@ MatrixOutput deterministic_forward(const Inputs& inputs, const MatrixReplay& rep
         inputs.foo, inputs.fvv, inputs.B, replay.beta, replay.weights,
         replay.targets, replay.threads);
     MatrixOutput output;
+    output.timings = deterministic_timings(result);
     output.energy = result.energy;
     output.occupied = density_output
         ? std::move(result.occupied) : std::move(result.energy_occupied);
@@ -510,6 +535,7 @@ py::dict matrix_result(const MatrixOutput& output,
     diagnostics["virtual_target_met"] = output.virtual_target_met;
     diagnostics["pilot_draws"] = output.pilot_draws;
     diagnostics["production_draws"] = output.production_draws;
+    diagnostics["native_timings"] = output.timings;
     py::dict result;
     result["energy"] = output.energy;
     result["occupied"] = as_array(output.occupied);
@@ -533,6 +559,7 @@ py::dict solve_matrices(py::handle foo, py::handle fvv, py::handle b,
     {
         py::gil_scoped_release release;
         ThreadScope team(settings.replay->threads);
+        const double started = omp_get_wtime();
         if (!settings.replay->stochastic) {
             output = deterministic_forward(inputs, *settings.replay);
         } else if (kind == "D") {
@@ -540,13 +567,14 @@ py::dict solve_matrices(py::handle foo, py::handle fvv, py::handle b,
         } else {
             output = stochastic_w_forward(inputs, settings);
         }
+        output.timings["native_total_seconds"] = omp_get_wtime() - started;
     }
     return matrix_result(output, settings.replay);
 }
 
 Result replay_pullback(const Inputs& inputs, const MatrixReplay& replay,
                        double energy_bar, const arma::mat& occupied_bar,
-                       const arma::mat& virtual_bar) {
+                       const arma::mat& virtual_bar, MatrixTimings& timings) {
     Result bars;
     if (!replay.stochastic) {
         auto result = replay.kind == "D" ? density::selected_deterministic_mp2_vjp(
@@ -555,6 +583,7 @@ Result replay_pullback(const Inputs& inputs, const MatrixReplay& replay,
             : density::selected_deterministic_mp2_w_vjp(
             inputs.foo, inputs.fvv, inputs.B, replay.beta, replay.weights,
             replay.targets, replay.threads, energy_bar, occupied_bar, virtual_bar);
+        timings = deterministic_timings(result);
         bars.foo = std::move(result.bar_fo);
         bars.fvv = std::move(result.bar_fv);
         bars.B = std::move(result.bar_b);
@@ -579,7 +608,7 @@ Result replay_pullback(const Inputs& inputs, const MatrixReplay& replay,
     return bars;
 }
 
-py::dict pullback_matrices(py::handle foo, py::handle fvv, py::handle b,
+std::pair<py::dict, MatrixTimings> pullback_matrices(py::handle foo, py::handle fvv, py::handle b,
                            const MatrixReplay& replay, double energy_bar,
                            py::handle occupied_bar, py::handle virtual_bar) {
     if (replay.native_version != matrix_kernel_version) {
@@ -601,10 +630,13 @@ py::dict pullback_matrices(py::handle foo, py::handle fvv, py::handle b,
     const auto occupied_seed = from_array(occupied);
     const auto virtual_seed = from_array(virtuals);
     Result bars;
+    MatrixTimings timings;
     {
         py::gil_scoped_release release;
         ThreadScope team(replay.threads);
-        bars = replay_pullback(inputs, replay, energy_bar, occupied_seed, virtual_seed);
+        const double started = omp_get_wtime();
+        bars = replay_pullback(inputs, replay, energy_bar, occupied_seed, virtual_seed, timings);
+        timings["native_total_seconds"] = omp_get_wtime() - started;
     }
     finite_outputs(0, bars.foo, bars.fvv);
     if (!bars.B.is_finite()) {
@@ -614,7 +646,7 @@ py::dict pullback_matrices(py::handle foo, py::handle fvv, py::handle b,
     result["foo"] = as_array(bars.foo);
     result["fvv"] = as_array(bars.fvv);
     result["B"] = as_df_array(bars.B, inputs.foo.n_rows, inputs.fvv.n_rows);
-    return result;
+    return {std::move(result), std::move(timings)};
 }
 
 } // namespace
@@ -668,7 +700,14 @@ void bind_matrices(py::module_& module) {
                py::arg("foo"), py::arg("fvv"), py::arg("B"), py::arg("target_indices"),
                py::arg("controls"), py::arg("matrix_kind") = "D",
                py::arg("aux_offsets") = py::none());
-    module.def("pullback_matrices", &pullback_matrices,
+    module.def("pullback_matrices", [](py::handle foo, py::handle fvv, py::handle b,
+            const MatrixReplay& replay, double energy_bar,
+            py::handle occupied_bar, py::handle virtual_bar) {
+        return pullback_matrices(foo, fvv, b, replay, energy_bar,
+                                 occupied_bar, virtual_bar).first;
+    }, py::arg("foo"), py::arg("fvv"), py::arg("B"), py::arg("forward_replay"),
+       py::arg("energy_bar"), py::arg("occupied_bar"), py::arg("virtual_bar"));
+    module.def("pullback_matrices_with_timings", &pullback_matrices,
                py::arg("foo"), py::arg("fvv"), py::arg("B"), py::arg("forward_replay"),
                py::arg("energy_bar"), py::arg("occupied_bar"), py::arg("virtual_bar"));
 }

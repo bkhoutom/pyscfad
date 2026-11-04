@@ -20,6 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from pyscfad import lib
+from pyscfad.tools import resource_profile
 from pyscf.lib import current_memory, param
 from .controls import (DEFAULT_TRIPLES_TRACE_EXPONENT, _finite_control,
                        _triples_integral_transform)
@@ -139,6 +140,7 @@ def make_solver(controls, grid, *, with_grad):
         dresser = _make_dresser(inputs, integral_inputs=rotate)
         prepare = dresser.prepare
         prepare_seconds, pilot_seconds = time.perf_counter() - phase, 0.
+        pilot_reverse_seconds = 0.
         prepared = None
         dressing_cache_peak_bytes = 0
         if stochastic and not target:
@@ -155,6 +157,8 @@ def make_solver(controls, grid, *, with_grad):
             pilots = [_native(values, pilot_count, seeds[i], with_grad=False,
                               **native_options)
                       for i, values in enumerate(prepared)]
+            # Pilots are energy-only. Retain the zero reverse-time field for
+            # timing-report compatibility; only production computes VJPs.
             pilot_se = np.array([r['standard_error'] for r in pilots])
             pilot_counts[:] = pilot_count
             sigmas = np.abs(weights) * pilot_se * np.sqrt(pilot_count)
@@ -172,15 +176,16 @@ def make_solver(controls, grid, *, with_grad):
             'vjp_grouping_seconds', 'vjp_accumulation_seconds', 'vjp_finalize_seconds')}
         native_memory = {name: 0 for name in ('resident_tensor_bytes', 'proposal_bytes',
                                              'reverse_buffer_bytes')}
+        native_blas_threads = {name: 0 for name in ('packing_blas_threads',
+                              'sampling_blas_threads', 'finalize_blas_threads')}
         setup_threads, sampling_threads = 0, 0
         point_energies, point_variances, point_samples, initial_errors = [], [], [], []
         for i, (node, weight) in enumerate(zip(nodes, weights)):
             phase = time.perf_counter()
-            transformed = (prepare(float(node), cache_limit_bytes=(
+            values = (prepare(float(node), cache_limit_bytes=(
                 _dressing_cache_bytes(max_memory) if with_grad else 0))
                 if prepared is None else prepared[i])
             dressing_cache_peak_bytes = max(dressing_cache_peak_bytes, dresser.cache_bytes)
-            values = transformed if prepared is None else prepared[i]
             jax.block_until_ready(values)
             prepare_seconds += time.perf_counter() - phase
             native_target = 0.
@@ -201,6 +206,12 @@ def make_solver(controls, grid, *, with_grad):
             options = {} if pilot is None else {'pilot': pilot}
             result = _native(values, number, seeds[count + i], target=native_target,
                              with_grad=with_grad, **native_options, **options)
+            # Native sampling has finished reading this node. Its returned
+            # cotangents own their storage; dressing's reverse uses the original
+            # inputs, so the full transformed tensors need not overlap it.
+            if prepared is not None:
+                prepared[i] = None
+            del values
             native_wall = time.perf_counter() - phase
             if native_target and (not np.isfinite(result['standard_error']) or
                                   result['standard_error'] > native_target):
@@ -228,12 +239,18 @@ def make_solver(controls, grid, *, with_grad):
                 native_timings[name] += result.get(name, 0.)
             for name in native_memory:
                 native_memory[name] = max(native_memory[name], int(result.get(name, 0)))
+            for name in native_blas_threads:
+                native_blas_threads[name] = max(native_blas_threads[name], int(result.get(name, 0)))
             setup_threads = max(setup_threads, int(result.get('setup_threads', 0)))
             sampling_threads = max(sampling_threads, int(result.get('sampling_threads', 0)))
             if with_grad:
                 phase = time.perf_counter()
-                transformed_bars = tuple(np.asarray(result['cotangents'][name]) * weight
+                transformed_bars = tuple(result['cotangents'][name]
                                          for name in (*names, 'L', 'R'))
+                # The binding returns independent writable NumPy arrays, used
+                # only here. Reuse them instead of allocating a weighted copy.
+                for bar in transformed_bars:
+                    np.multiply(bar, weight, out=bar)
                 contribution = dresser.pullback(float(node), transformed_bars,
                     cache_limit_bytes=_dressing_cache_bytes(max_memory))
                 dressing_cache_peak_bytes = max(dressing_cache_peak_bytes,
@@ -241,20 +258,19 @@ def make_solver(controls, grid, *, with_grad):
                 for a, b in zip(bars, contribution):
                     np.add(a, b, out=a)
                 jax.block_until_ready(bars)
-                del contribution, transformed_bars
+                del contribution, transformed_bars, bar
                 pullback_seconds += time.perf_counter() - phase
-            if prepared is not None:
-                prepared[i] = None
-            del result, values, transformed
+            del result
         elapsed = time.perf_counter() - started
         diagnostics = dict(standard_error=np.sqrt(variance), samples=samples,
             pilot_samples=int(pilot_counts.sum()),
             laplace_points=count, sampling_seconds=native_seconds,
             smooth_triples_seconds=elapsed,
             laplace_prepare_seconds=prepare_seconds, pilot_seconds=pilot_seconds,
+            pilot_reverse_seconds=pilot_reverse_seconds,
             production_seconds=production_seconds, laplace_pullback_seconds=pullback_seconds,
             overhead_seconds=elapsed-prepare_seconds-pilot_seconds-production_seconds-pullback_seconds,
-            **native_timings, **native_memory,
+            **native_timings, **native_memory, **native_blas_threads,
             setup_threads=setup_threads, sampling_threads=sampling_threads,
             target_standard_error=target,
             trace_exponent=trace_exponent,
@@ -279,6 +295,14 @@ def make_solver(controls, grid, *, with_grad):
             point_production_samples=np.asarray(point_samples),
             point_weighted_energies=np.asarray(point_energies),
             point_weighted_variances=np.asarray(point_variances))
+        # Native numerator VJPs and dressing pullbacks run eagerly here,
+        # during the forward call. These component times are inclusive parts
+        # of solver.perturbative_triples, not additional elapsed work.
+        resource_profile.checkpoint('stc.triples.native_timings',
+            timings={name: value for name, value in diagnostics.items()
+                     if name.endswith('_seconds')},
+            blas_threads=native_blas_threads,
+            with_grad=with_grad, seed=int(seed))
         return (jnp.asarray(energy), jax.tree_util.tree_map(jnp.asarray, diagnostics)), bars
 
     @jax.custom_vjp
@@ -289,7 +313,13 @@ def make_solver(controls, grid, *, with_grad):
         return run(inputs)
 
     def backward(bars, output_bar):
-        return tuple(output_bar[0] * value for value in bars)
+        if not resource_profile.enabled() or any(isinstance(value, jax.core.Tracer)
+                for value in jax.tree_util.tree_leaves((bars, output_bar))):
+            return tuple(output_bar[0] * value for value in bars)
+        with resource_profile.section('stc.triples.pullback_scale', seed=int(seed)):
+            scaled = tuple(output_bar[0] * value for value in bars)
+            jax.block_until_ready(scaled)
+        return scaled
 
     evaluate.defvjp(forward, backward)
 

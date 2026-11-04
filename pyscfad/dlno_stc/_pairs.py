@@ -15,6 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from pyscfad.lno.tools import fake_mol_by_atom, project_mo
+from pyscfad.tools import resource_profile
 from pyscfad.lib._compilation_cache import configure_compilation_cache
 from pyscfad.lib._multipole import (
     coordinate_moment_jvp, endpoint_matches_reference,
@@ -295,12 +296,18 @@ def _check_endpoint_replay(rebuilt, original, index):
 def weak_pair_energy_sum(mf, common, static, *, pairs=None):
     """Evaluate all weak edges while constructing each endpoint only once."""
     pairs = weak_pair_indices(static) if pairs is None else tuple(pairs)
-    endpoints = {index: pad_endpoint(value) for index, value in
-                 _weak_endpoints(mf, common, static, pairs).items()}
-    energy = jnp.zeros((), dtype=common.s1e.dtype)
-    for left, right in pairs:
-        energy += _multipole_pair_energy(
-            endpoints[left], endpoints[right], static.thresholds.multipole_order)
+    with resource_profile.section('stc.domain.weak_prepare'):
+        endpoints = {index: pad_endpoint(value) for index, value in
+                     _weak_endpoints(mf, common, static, pairs).items()}
+        if resource_profile.enabled():
+            jax.block_until_ready(endpoints)
+    with resource_profile.section('stc.cc.weak_forward', pairs=len(pairs)):
+        energy = jnp.zeros((), dtype=common.s1e.dtype)
+        for left, right in pairs:
+            energy += _multipole_pair_energy(
+                endpoints[left], endpoints[right], static.thresholds.multipole_order)
+        if resource_profile.enabled():
+            jax.block_until_ready(energy)
     return jnp.real(energy)
 
 
@@ -318,30 +325,39 @@ def weak_pair_energy_and_grad(mf, common, static, *, pairs=None):
     bars = zero_term_cotangents(mf, common)
     energy = jnp.zeros((), dtype=common.s1e.dtype)
     originals, linearizations = {}, {}
-    for index in sorted({index for pair in pairs for index in pair}):
-        originals[index], linearizations[index] = _prepare_weak_endpoint(
-            mf, common, static, index)
-    endpoints = {index: pad_endpoint(value) for index, value in originals.items()}
-    endpoint_bars = {index: jax.tree_util.tree_map(jnp.zeros_like, value)
-                     for index, value in endpoints.items()}
-    for left, right in pairs:
-        value, (left_bar, right_bar) = pair_energy_and_grad(
-            endpoints[left], endpoints[right], static.thresholds.multipole_order)
-        endpoint_bars[left] = jax.tree_util.tree_map(add_cotangent, endpoint_bars[left], left_bar)
-        endpoint_bars[right] = jax.tree_util.tree_map(add_cotangent, endpoint_bars[right], right_bar)
-        energy += value
-        del left_bar, right_bar
-    for index in tuple(endpoint_bars):
-        endpoint_bar = endpoint_bars.pop(index)
-        del endpoints[index]
-        original = originals.pop(index)
-        linearization = linearizations.pop(index)
-        rebuilt, pullback = _replay_weak_endpoint(mf, linearization, static, index)
-        _check_endpoint_replay(rebuilt, original, index)
-        contribution = pullback(crop_endpoint_cotangent(endpoint_bar, original))
-        bars = jax.tree_util.tree_map(add_cotangent, bars, contribution)
-        jax.block_until_ready(bars)
-        del rebuilt, original, pullback, contribution, endpoint_bar, linearization
+    with resource_profile.section('stc.domain.weak_prepare'):
+        for index in sorted({index for pair in pairs for index in pair}):
+            originals[index], linearizations[index] = _prepare_weak_endpoint(
+                mf, common, static, index)
+        endpoints = {index: pad_endpoint(value) for index, value in originals.items()}
+        endpoint_bars = {index: jax.tree_util.tree_map(jnp.zeros_like, value)
+                         for index, value in endpoints.items()}
+        if resource_profile.enabled():
+            jax.block_until_ready((endpoints, endpoint_bars))
+    # The shared pair kernel is one compiled value-and-gradient executable.
+    # Keep its existing call/work intact and report its combined time honestly.
+    with resource_profile.section('stc.cc.weak_pair_value_and_grad', pairs=len(pairs)):
+        for left, right in pairs:
+            value, (left_bar, right_bar) = pair_energy_and_grad(
+                endpoints[left], endpoints[right], static.thresholds.multipole_order)
+            endpoint_bars[left] = jax.tree_util.tree_map(add_cotangent, endpoint_bars[left], left_bar)
+            endpoint_bars[right] = jax.tree_util.tree_map(add_cotangent, endpoint_bars[right], right_bar)
+            energy += value
+            del left_bar, right_bar
+        if resource_profile.enabled():
+            jax.block_until_ready((energy, endpoint_bars))
+    with resource_profile.section('stc.domain.weak_pullback', includes_replay=True):
+        for index in tuple(endpoint_bars):
+            endpoint_bar = endpoint_bars.pop(index)
+            del endpoints[index]
+            original = originals.pop(index)
+            linearization = linearizations.pop(index)
+            rebuilt, pullback = _replay_weak_endpoint(mf, linearization, static, index)
+            _check_endpoint_replay(rebuilt, original, index)
+            contribution = pullback(crop_endpoint_cotangent(endpoint_bar, original))
+            bars = jax.tree_util.tree_map(add_cotangent, bars, contribution)
+            jax.block_until_ready(bars)
+            del rebuilt, original, pullback, contribution, endpoint_bar, linearization
     if pairs:
         # Release each tape promptly, but scan the Python heap only after
         # the complete weak response. Automatic collection remains enabled.

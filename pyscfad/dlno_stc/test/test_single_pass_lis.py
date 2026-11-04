@@ -179,9 +179,12 @@ def test_default_single_pass_matches_two_pass_energy_and_full_gradient(molecular
         corrected_fragments=list(case.indices), lis_eigenspace='domain'))
 
 
-def test_public_gradient_factory_with_occupied_count_budget(molecular_group, monkeypatch):
+@pytest.mark.parametrize('clear_jax_caches', [False, True])
+def test_public_gradient_factory_with_occupied_count_budget(
+        molecular_group, monkeypatch, clear_jax_caches, tmp_path):
     """Exercise detached selection, live S/F reuse and total-SE allocation together."""
     case = molecular_group
+    monkeypatch.setenv('PYSCFAD_STC_CLEAR_JAX_CACHES', '0')
     plans = []
 
     def build_static(mf):
@@ -200,8 +203,32 @@ def test_public_gradient_factory_with_occupied_count_budget(molecular_group, mon
     with (config_update('pyscfad_scf_implicit_diff', True),
           config_update('pyscfad_scf_first_order_custom', False)):
         reference = ccsd.value_and_grad(case.mf.mol, accept.build_mf, case.static, **options)
-        actual = ccsd.value_and_grad(case.mf.mol, accept.build_mf,
-                                    build_static=build_static, **options)
+        clear_calls = []
+        original_clear = jax.clear_caches
+        original_boundary = ccsd._clear_jax_caches
+        current_stage = None
+
+        def boundary(stage, *args, **kwargs):
+            nonlocal current_stage
+            current_stage = stage
+            return original_boundary(stage, *args, **kwargs)
+
+        def clear():
+            original_clear()
+            clear_calls.append(current_stage)
+
+        monkeypatch.setattr(jax, 'clear_caches', clear)
+        monkeypatch.setattr(ccsd, '_clear_jax_caches', boundary)
+        monkeypatch.setenv('PYSCFAD_STC_CLEAR_JAX_CACHES', str(int(clear_jax_caches)))
+        from pyscfad.dlno_stc.timings import TimingReport
+        with TimingReport(tmp_path) as timing:
+            actual = ccsd.value_and_grad(case.mf.mol, accept.build_mf,
+                                        build_static=build_static, **options)
+        assert any(event['phase'] == 'stc.lis.pullback' for event in timing.events)
+        assert any(event['phase'] == 'stc.domain.scf' for event in timing.events)
+    assert bool(clear_calls) is clear_jax_caches
+    if clear_jax_caches:
+        assert clear_calls.count('before_matrix_pullback') == len(case.indices)
     assert len(plans) == 1
     assert plans[0].mp2_fragment_energies is None
     np.testing.assert_allclose(actual[0], reference[0], atol=3e-11, rtol=0)

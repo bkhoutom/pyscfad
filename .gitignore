@@ -142,6 +142,11 @@ dmypy.json
 /output/
 /tmp/
 
+# Generated example calculations (keep large DF factors out of workspace diffs)
+/examples/dlno_stc/output/
+/examples/lno/*_cderi.h5
+/examples/lno/*_df_rhf.chk
+
 # Native build products generated in the source tree
 *.dylib
 /pyscfadlib/pyscfadlib/config.h

@@ -19,6 +19,9 @@ public:
         double sampling_seconds;
         int setup_threads;
         int sampling_threads;
+        int packing_blas_threads;
+        int sampling_blas_threads;
+        int finalize_blas_threads;
         size_t pilot_samples;
         double pilot_standard_error;
         double amplitude_packing_seconds;

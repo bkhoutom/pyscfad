@@ -129,6 +129,7 @@ def _run_jobs(initializer, worker_initializer, comm, *, with_grad,
         if rank != 0:
             state['mf_bar'], state['common_bar'] = (
                 zero_term_cotangents(state['mf'], state['common']) if with_grad else (None, None))
+        ccsd._clear_jax_caches('initialization', state['mf'], state['common'])
 
     _collective_call(comm, setup, 'CC worker reference setup')
     if with_grad:
@@ -152,6 +153,8 @@ def _run_jobs(initializer, worker_initializer, comm, *, with_grad,
                 fragment_indices=options['fragment_indices'],
                 **({key: options[key] for key in ('cc_solver', 'stc_cc_controls')}
                    if options.get('cc_solver') == 'stc' else {})))
+            ccsd._clear_jax_caches('after_group', state['energy'], state['mf_bar'],
+                                  state['common_bar'], frag=group.representative_index+1)
             gc.collect()
     except Exception as exc:
         error = _error(exc, f'CC group {group_id}')

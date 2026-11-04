@@ -362,11 +362,18 @@ allocated physical cores:
 
 ```bash
 OMP_NUM_THREADS=2 OMP_THREAD_LIMIT=2 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
-PYSCFAD_DENSE_BLAS_THREADS=2 XLA_FLAGS=--xla_cpu_multi_thread_eigen=false \
+PYSCFAD_DENSE_BLAS_THREADS=2 PJRT_NPROC=2 XLA_FLAGS=--xla_cpu_multi_thread_eigen=false \
 mpiexec -n 4 python examples/dlno_stc/water_tetramer.py \
   --mpi --xyz-file water_4.xyz --basis cc-pvtz --auxbasis cc-pvtz-jkfit \
   --output results/water4.json
 ```
+
+With JAX 0.9.1, `PJRT_NPROC` sizes the CPU runtime's worker pools before the
+backend initializes. OpenMP/BLAS limits and `xla_cpu_multi_thread_eigen=false`
+alone do not limit those pools. The water-16 launcher and input set
+`PJRT_NPROC` from `THREADS` / `--threads` and record it in `settings.json`.
+Compilation and helper threads can still make the process's total thread count
+larger than this setting; it is not a process-wide thread or memory limit.
 
 Memory limits apply per process. Round-robin balances group counts rather than
 runtime, so large domains can accumulate on one rank; the slowest owner limits
@@ -603,6 +610,26 @@ The optional extension links Armadillo and OpenMP; it requires no Q-Chem or MPI
 library. Imports do not compile or download anything. Examples include the
 small disk workflow, finite `water_tetramer.py`, and unchanged system-scope
 `water_tetramer_full.py`.
+
+Scoped BLAS threading for the triples DF contractions is optional and disabled
+by default. To enable it, add these options to the CMake configure command:
+
+```bash
+  -DPYSCFAD_STC_OPENBLAS_THREAD_CONTROL=ON \
+  -DPYSCFAD_STC_OPENBLAS_LIBRARY="/absolute/path/to/pthread/libopenblas.so"
+```
+
+Use the same pthread OpenBLAS shared library that Armadillo uses at runtime;
+the OpenMP OpenBLAS backend is not supported by this option. At runtime, set
+`PYSCFAD_STC_DENSE_BLAS_THREADS=8` while retaining `OPENBLAS_NUM_THREADS=1` for
+the surrounding OpenMP work. Only the large forward DF contractions and final
+DF-factor adjoints use the requested BLAS count. The previous count is restored
+before sampling and on exceptions. Leaving the environment variable unset
+preserves the existing BLAS policy; setting it without a supported build raises
+an error. BLAS thread limits are process-wide, so concurrent calls that change
+this policy are unsupported. The enabled build adds a CTest for scope restoration;
+`pyscfad/dlno_stc/test/test_triples_blas_threads.py` checks numerical parity and
+observed thread counts.
 
 Restart algorithm ABI 3 and grouping convention `boys_exact_domain_groups_v3`
 require fresh checkpoints after restoring the anchored virtual frame. Older

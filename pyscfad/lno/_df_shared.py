@@ -13,6 +13,7 @@ VJPs are unchanged; scopes cannot be nested, reused, or left unfinished.
 from contextlib import contextmanager
 from contextvars import ContextVar
 import tempfile
+import warnings
 
 import h5py
 import jax
@@ -52,6 +53,7 @@ class LocalDFReverse:
         self._file = self._handle = None
         self.half = None
         self.finished = False
+        self._minimum_row_warned = False
         self._packing_workspace = {}
         self.receipt = dict(consumers=0, spooled_bytes=0, geometry_passes=0,
                             metric_passes=0, max_density_rows=0,
@@ -102,14 +104,33 @@ class LocalDFReverse:
         # derivative buffers. One indivisible auxiliary shell may be larger;
         # the native driver already partitions reads within that shell.
         from ._df_direct import _local_direct_int3c_block_mb
-        remaining = self.max_memory_mb - pyscf_lib.current_memory()[0]
+        resident_mb = float(pyscf_lib.current_memory()[0])
+        remaining = self.max_memory_mb - resident_mb
+        block_mb = _local_direct_int3c_block_mb()
         budget = min(self.workspace_mb, .5 * max(0., remaining),
-                     _local_direct_int3c_block_mb()) * 1e6
+                     block_mb) * 1e6
         row_bytes = 8 * (6*self.mol.nao**2 + pair_count
                          + self.mol.nao*orbital_width + 3*self.mol.nao)
-        if budget < row_bytes:
-            raise MemoryError('Insufficient user memory budget for one local DF reverse row')
+        self._warn_minimum_row(row_bytes, budget)
+        # As in the direct AO2MO path, a configured budget is not a hard
+        # physical limit. Preserve bounded tiling even after RSS exhausts it.
         return min(self.auxmol.nao, max(1, int(budget // row_bytes)))
+
+    def _warn_minimum_row(self, row_bytes, budget, *, operation='reverse'):
+        """Warn once when an indivisible streamed row exceeds its target."""
+        if budget < row_bytes and not self._minimum_row_warned:
+            from ._df_direct import _local_direct_int3c_block_mb
+            self._minimum_row_warned = True
+            warnings.warn(
+                f'Local DF {operation} minimum row exceeds the advisory workspace: '
+                f'row estimate={row_bytes / 1e6:.6g} MB, '
+                f'available target={budget / 1e6:.6g} MB, '
+                f'RSS={pyscf_lib.current_memory()[0]:.1f} MB, '
+                f'configured max_memory={self.max_memory_mb:.1f} MB, '
+                f'DF workspace={self.workspace_mb:.1f} MB, '
+                f'block target={_local_direct_int3c_block_mb():.1f} MB; '
+                'continuing with one auxiliary row',
+                RuntimeWarning, stacklevel=2)
 
     def add(self, coeff, z, low_bar, slices):
         if self.finished:

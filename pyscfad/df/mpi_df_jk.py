@@ -55,6 +55,7 @@ from pyscfad._src.implicit_diff import is_implicit_diff_solve_matvec
 from pyscfad.df import addons
 from pyscfad.df import _cderi_vjp
 from pyscfad.df import _df_jk_opt
+from pyscfad.df import _jk_memory
 
 
 __all__ = [
@@ -304,7 +305,9 @@ def local_jk(
         zeros = numpy.zeros(dm.shape, dtype=dm.dtype)
         return zeros.copy(), zeros.copy()
 
-    local_df = _LocalDFView(dfobj, q0, q1)
+    # Copy the source DF before restricting its rows: copying _LocalDFView
+    # would delegate to the underlying DF and lose the rank partition.
+    local_df = _LocalDFView(_jk_memory.forward_df(dfobj), q0, q1)
     tagged_dm = _tag_density(dm, mo_coeff, mo_occ)
     vj, vk = pyscf_df_jk.get_jk(
         local_df,

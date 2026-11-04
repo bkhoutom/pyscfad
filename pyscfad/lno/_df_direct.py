@@ -27,6 +27,7 @@ from pyscfad import numpy as np
 from pyscfad.ao2mo import _ao2mo
 from pyscfad.df import _cderi_vjp
 from pyscfad.df import _int3c_cross_opt
+from pyscfad.lib._threading import dense_blas_threads
 from ._profile import _vjp_progress_section
 
 
@@ -166,8 +167,10 @@ def _local_direct_raw_int3c_blocks(
         remaining = scope.max_memory_mb - pyscf_lib.current_memory()[0]
         budget = min(scope.workspace_mb, .5 * max(0., remaining),
                      _local_direct_int3c_block_mb()) * 1e6
-        if budget < 16*pairs:
-            raise MemoryError('Insufficient user memory budget for one local DF integral row')
+        # Direct streaming has only one indivisible minimum row. Preserve
+        # the scope's advisory fallback when RSS exhausts the target; the
+        # resident half-cache performs its separate, strict admission first.
+        scope._warn_minimum_row(16*pairs, budget, operation='integral')
         rows = max(1, int(budget // (16*pairs)))
         if z_aux_block_max_rows is not None:
             if int(z_aux_block_max_rows) <= 0:
@@ -347,17 +350,19 @@ def _local_direct_nr_e2_bwd(max_memory, orbs_slice, res, fitted_mo_bar):
 
     fitted_mo_np = numpy.asarray(jax.device_get(fitted_mo))
     fitted_mo_bar_np = numpy.asarray(jax.device_get(fitted_mo_bar))
-    z = scipy_linalg.solve_triangular(
-        low.T,
-        fitted_mo_bar_np,
-        lower=False,
-        check_finite=False,
-    )
-
     # If Y = L^{-1} T and Z = L^{-T} Ybar, then Lbar = -Z Y^T.  Form this
     # small auxiliary-metric cotangent before the streamed integral work so
     # the much larger Y and Ybar buffers can reach their last use here.
-    low_bar = -numpy.dot(z, fitted_mo_np.T)
+    # These dense operations are serial callers. Restore the embedding BLAS
+    # policy before the integral and MO-coefficient OpenMP kernels below.
+    with dense_blas_threads():
+        z = scipy_linalg.solve_triangular(
+            low.T,
+            fitted_mo_bar_np,
+            lower=False,
+            check_finite=False,
+        )
+        low_bar = -numpy.dot(z, fitted_mo_np.T)
     del fitted_mo_np, fitted_mo_bar_np, fitted_mo, fitted_mo_bar, low
 
     # Consume the metric tape before streaming the three-center integrals.

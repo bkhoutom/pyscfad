@@ -8,8 +8,9 @@ import numpy as np
 import pytest
 from pyscf import lib
 
-from pyscfad.df import _df_jk_opt
-from pyscfad.df.mpi_df_jk import MPIDFJKExecutor, local_density_vjp
+from pyscfad.df import _df_jk_opt, mpi_df_jk
+from pyscfad.df.df import DF
+from pyscfad.df.mpi_df_jk import MPIDFJKExecutor, local_density_vjp, local_jk
 
 
 def _synthetic_df():
@@ -18,6 +19,62 @@ def _synthetic_df():
         _cderi=np.random.default_rng(872).normal(size=(11, 6)),
         blockdim=2, max_memory=1000, verbose=0, stdout=sys.stdout,
     )
+
+
+def _workspace_df():
+    obj = DF(SimpleNamespace(nao=3, incore_anyway=False, max_memory=.1,
+                             verbose=0, stdout=sys.stdout))
+    obj._cderi = np.random.default_rng(873).normal(size=(11, 6))
+    obj.blockdim = 12
+    return obj
+
+
+@pytest.mark.parametrize('workspace,expected_rows', [(None, 4), (.1, 12)])
+@pytest.mark.parametrize('service_view', [False, True])
+@pytest.mark.parametrize('tagged', [False, True])
+def test_workspace_preserves_rank_partition_and_source(
+        monkeypatch, workspace, expected_rows, service_view, tagged):
+    obj = _workspace_df()
+    source = obj._cderi
+    saved_source = source.copy()
+    if service_view:
+        from pyscfad.dlno_stc._mpi_scf import _source_view
+        obj = _source_view(obj, lambda: source)
+    obj.jk_workspace_memory = workspace
+    original_cderi = obj._cderi
+    monkeypatch.setattr(lib, 'current_memory', lambda: (20., 0.))
+    blocks = []
+    iterate = mpi_df_jk._iter_cderi_range
+
+    def observed(dfobj, q0, q1, blksize=None):
+        blocks.append((q0, q1, blksize))
+        yield from iterate(dfobj, q0, q1, blksize)
+
+    monkeypatch.setattr(mpi_df_jk, '_iter_cderi_range', observed)
+    coeff = np.array([[.7], [.2], [-.4]])
+    density = coeff @ coeff.T
+    tags = dict(mo_coeff=coeff, mo_occ=np.ones(1)) if tagged else {}
+    parts = [local_jk(obj, density, rank=rank, size=2, **tags)
+             for rank in range(2)]
+    vj, vk = np.sum(parts, axis=0)
+    factors = lib.unpack_tril(source)
+    expected_j = np.einsum('Luv,uv,Lij->ij', factors, density, factors)
+    expected_k = np.einsum('Liu,uv,Lvj->ij', factors, density, factors)
+    np.testing.assert_allclose(vj, expected_j, atol=2e-12, rtol=2e-12)
+    np.testing.assert_allclose(vk, expected_k, atol=2e-12, rtol=2e-12)
+    assert blocks == [(0, 5, expected_rows), (5, 11, expected_rows)]
+    assert obj.max_memory == .1
+    assert obj._cderi is original_cderi
+    assert obj._get_cderi_source() is source
+    np.testing.assert_array_equal(source, saved_source)
+
+
+@pytest.mark.parametrize('workspace', [0, -1, float('nan'), float('inf')])
+def test_forward_rejects_invalid_jk_workspace(workspace):
+    obj = _workspace_df()
+    obj.jk_workspace_memory = workspace
+    with pytest.raises(ValueError, match='jk_workspace_memory'):
+        local_jk(obj, np.eye(3))
 
 
 @pytest.mark.parametrize('batch', [False, True])

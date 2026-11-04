@@ -216,6 +216,9 @@ py::dict asymmetric(py::handle t1_value, py::handle t2_value,
     out["energy"]=result.energy; out["standard_error"]=result.standard_error;
     out["samples"]=result.samples; out["setup_threads"]=result.setup_threads;
     out["sampling_threads"]=result.sampling_threads;
+    out["packing_blas_threads"]=result.packing_blas_threads;
+    out["sampling_blas_threads"]=result.sampling_blas_threads;
+    out["finalize_blas_threads"]=result.finalize_blas_threads;
     out["pilot_samples"]=result.pilot_samples;
     out["pilot_standard_error"]=result.pilot_standard_error;
     out["probability_setup_seconds"]=result.probability_setup_seconds;
@@ -277,9 +280,14 @@ namespace pyscfad { namespace dlno_stc {
 void bind_triples_dressing(py::module_& module);
 void bind_triples(py::module_& module) {
     bind_triples_dressing(module);
+#ifdef PYSCFAD_STC_OPENBLAS_THREAD_CONTROL
+    module.attr("TRIPLES_OPENBLAS_THREAD_CONTROL")=true;
+#else
+    module.attr("TRIPLES_OPENBLAS_THREAD_CONTROL")=false;
+#endif
     // Immutable identity covers the extended native numerical sources and binding.
     module.attr("TRIPLES_VERSION")=
-        "stc_triples:asymmetric-only:sha256:header=805276502cd09fa0d8e4c51db58a97c0ae01abf9ad158ebccc02d49bf699b078:asymmetric=2c8ad2a0c8616a765b49beaec99ce2542eec87c6f3f443a0a98690bb7ca2eb47:sampler=3cb84a2fd873ab706d3b67b9f0f9f3119981d22a9ca291535075dd78072f7a96:dressing=fa84104230baf6b00af9cac1a22249ac1001410df60b8ffbf4f23984f3e7f92a:mp2_gradient=1414da61595bc0674be42479f354881f2f6e1ad0e84e3e3d6a1dac9170923bbd:binding-11-integrals";
+        "stc_triples:asymmetric-only:sha256:header=3ef7f213319f9b11b39424261fb449b65fb9842f489324fd655c0ab2bad61a40:asymmetric=235666a7809d36ade07465a1643fc1796f78c8e016cced24566f4c5a0c098889:sampler=3cb84a2fd873ab706d3b67b9f0f9f3119981d22a9ca291535075dd78072f7a96:dressing=5212e9d7e375a7f92fac8202fb3025151d53eea13355d7963cd7705beb2c1cb5:mp2_gradient=1414da61595bc0674be42479f354881f2f6e1ad0e84e3e3d6a1dac9170923bbd:scoped_blas=8f402a8ec775910668e556e8ca81f56e0852eac3abfec8ae1ec9e0405509dbc5:binding-12-scoped-openblas";
     for (bool vjp : {false,true}) {
         module.def(vjp ? "triples_asymmetric_energy_vjp" : "triples_asymmetric_energy",
             [vjp](py::handle t1,py::handle t2,py::handle Bvo,py::handle Boo,

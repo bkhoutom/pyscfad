@@ -136,7 +136,15 @@ def test_native_integral_input_contract(name, invalid):
 
 @pytest.mark.parametrize('mode', ['deterministic', 'fixed', 'adaptive'])
 @pytest.mark.parametrize('whole', [False, True])
-def test_solver_energy_and_full_response_match_factor_path(mode, whole):
+def test_solver_energy_and_full_response_match_factor_path(mode, whole, monkeypatch):
+    native_calls = []
+    native = smooth_triples._native
+
+    def counted_native(*args, **kwargs):
+        native_calls.append(kwargs['with_grad'])
+        return native(*args, **kwargs)
+
+    monkeypatch.setattr(smooth_triples, '_native', counted_native)
     x = jax.tree.map(jnp.asarray, triples_fixture(grouped=True))
     rng = np.random.default_rng(72)
     no, nv = x['t1'].shape
@@ -183,6 +191,26 @@ def test_solver_energy_and_full_response_match_factor_path(mode, whole):
         assert diagnostics['samples'] == reference_diag['samples']
         assert diagnostics['rotated_integrals']
         assert not reference_diag['rotated_integrals']
+        for timing in (diagnostics, reference_diag):
+            # Independent allocation pilots are energy-only in every mode.
+            assert timing['pilot_reverse_seconds'] == 0
+    if mode == 'fixed':
+        # Two allocation pilots precede two production calls for each path.
+        # The energy-only passes use no VJPs; derivative passes differentiate
+        # production only, preserving upstream's elimination of pilot work.
+        assert native_calls == [False]*8 + [False, False, True, True]*2
+    if mode == 'deterministic':
+        # Check quadrature-weighted cotangents independently of both reverse
+        # implementations, including simultaneous integral and Fock changes.
+        direction = jax.tree.map(
+            lambda value: jnp.asarray(rng.normal(scale=.01, size=value.shape)), x)
+        step = 1e-5
+        plus = jax.tree.map(lambda value, delta: value + step*delta, x, direction)
+        minus = jax.tree.map(lambda value, delta: value - step*delta, x, direction)
+        finite_difference = (evaluate(plus, 'rotate', False)[0]
+                             - evaluate(minus, 'rotate', False)[0]) / (2*step)
+        response = sum(jnp.sum(bar[key] * direction[key]) for key in x)
+        np.testing.assert_allclose(response, finite_difference, rtol=3e-6, atol=2e-10)
 
 
 @pytest.mark.parametrize('mode', ['deterministic', 'stochastic'])

@@ -76,7 +76,7 @@ def run(mode, output, *, fixture='small', fixture_dir=None, threads=1, vvvv_dire
     comm = MPI.COMM_WORLD
     rank = comm.rank
     with_grad = mode != 'kernel'
-    enabled = mode not in ('disabled', 'serial') and comm.size > 1
+    enabled = mode not in ('default', 'disabled', 'serial') and comm.size > 1
     counts = dict(forward=0, density_vjp=0, coordinate_vjp=0)
     norms = dict.fromkeys(counts, 0.)
     phases = {name: dict.fromkeys(counts, 0) for name in ('initial', 'final')}
@@ -97,6 +97,8 @@ def run(mode, output, *, fixture='small', fixture_dir=None, threads=1, vvvv_dire
         build_static = None
     else:
         mol, base_builder, static = accept.molecule(), accept.build_mf, None
+        # Leave headroom for JAX executables accumulated across CC fragments.
+        mol.max_memory = 10000
         baseline = dict(accept.controls(), threads=threads)
         matrix = dict(baseline)
         def build_static(mf):
@@ -250,9 +252,10 @@ def run(mode, output, *, fixture='small', fixture_dir=None, threads=1, vvvv_dire
                         'invalid-option': 'parallel_scf_jk must be a bool'}.get(mode)
     failed = False
     options = dict(baseline_controls=baseline, matrix_controls=matrix, ccsd_t=True,
-                   include_hf=True, parallel_scf_jk=mode != 'disabled',
-                   vvvv_direct=vvvv_direct,
+                   include_hf=True, vvvv_direct=vvvv_direct,
                    comm=None if mode == 'serial' else comm)
+    if mode not in ('default', 'serial'):
+        options['parallel_scf_jk'] = mode != 'disabled'
     if mode == 'invalid-option':
         options['parallel_scf_jk'] = 'invalid' if rank == 0 else False
     if build_static is not None:
@@ -345,6 +348,9 @@ def run(mode, output, *, fixture='small', fixture_dir=None, threads=1, vvvv_dire
             assert all(row['source_fingerprint'] == observations[0]['source_fingerprint'] for row in observations), observations
         else:
             assert all(not any(row['counts'].values()) and row['serves'] == 0 for row in observations), observations
+            assert observations[0]['builder_calls'] == dict(scf=1, skeleton=0), observations
+            assert all(row['builder_calls'] == dict(scf=0, skeleton=1)
+                       for row in observations[1:]), observations
         if fixture == 'water4':
             assert all(row['source_path'] == str(fixture_dir / 'scf_cderi.h5') for row in observations), observations
         observed_caches = [cache for row in observations for cache in row['ladder_caches']]
@@ -369,7 +375,7 @@ def run(mode, output, *, fixture='small', fixture_dir=None, threads=1, vvvv_dire
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--mode', default='enabled', choices=('enabled', 'disabled', 'serial',
+    parser.add_argument('--mode', default='default', choices=('default', 'enabled', 'disabled', 'serial',
                         'kernel', 'group-failure', 'response-failure', 'invalid-option'))
     parser.add_argument('--fixture', default='small', choices=('small', 'water4'))
     parser.add_argument('--fixture-dir', type=Path)

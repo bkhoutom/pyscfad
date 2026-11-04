@@ -8,18 +8,19 @@ from pyscfad.dlno_stc import ccsd
 from pyscfad.dlno_stc.test import _boys_acceptance as accept
 
 
-@pytest.mark.parametrize('enabled', [True, False])
+@pytest.mark.parametrize('enabled', [None, True, False])
 def test_energy_service_uses_supplied_worker_skeleton(monkeypatch, enabled):
     mf = SimpleNamespace()
 
     def run(initializer, worker_initializer, comm, *, parallel_scf_jk,
             scf_worker_initializer, **options):
-        assert parallel_scf_jk is enabled
+        assert parallel_scf_jk is (False if enabled is None else enabled)
         return scf_worker_initializer()
 
     monkeypatch.setattr(ccsd, '_run', run)
+    options = {} if enabled is None else {'parallel_scf_jk': enabled}
     assert ccsd.kernel(mf, None, baseline_controls=None, matrix_controls=None,
-                       parallel_scf_jk=enabled) is mf
+                       **options) is mf
 
 
 def test_gradient_service_worker_adopts_closed_shell_placeholders_without_scf(monkeypatch):
@@ -40,7 +41,7 @@ def test_gradient_service_worker_adopts_closed_shell_placeholders_without_scf(mo
 
     monkeypatch.setattr(ccsd, '_run', run)
     assert ccsd.value_and_grad(mol, build_mf, baseline_controls=None,
-                               matrix_controls=None) is skeleton
+                               matrix_controls=None, parallel_scf_jk=True) is skeleton
     numpy.testing.assert_array_equal(supplied['coeff'], numpy.eye(mol.nao))
     numpy.testing.assert_array_equal(supplied['energy'], numpy.zeros(mol.nao))
     expected_occ = numpy.zeros(mol.nao)

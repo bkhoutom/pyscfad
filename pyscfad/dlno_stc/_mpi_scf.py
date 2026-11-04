@@ -256,7 +256,9 @@ class DomainSCFService:
                 elif self.worker_df.auxmol is None:
                     self.worker_df.auxmol = make_auxmol(self.worker_df.mol, self.worker_df.auxbasis)
                 self.worker_df = self.executor.source_view(self.worker_df)
-                _source_fingerprint(self.worker_df)
+                # Every rank checks complete contents collectively before
+                # the first contraction. Avoid a redundant full disk scan
+                # here; source_view already checks the packed layout.
 
             _collective_call(comm, setup, 'SCF service worker setup')
         except BaseException:

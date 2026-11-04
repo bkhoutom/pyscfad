@@ -1,4 +1,4 @@
-# Serial DF, SCF and pullback performance
+# Root-owned DF, SCF and pullback performance
 
 The `dlno-stc` branch already contains the shared resident DF cotangent buffer,
 compact/fused out-of-core geometry contraction, low-rank SCF exchange, bounded
@@ -29,15 +29,25 @@ the SCF response equation or adding the experimental OV solver.
    about 5% in the study. Keep Coulomb available for systems where it improves
    convergence or total time; fewer iterations alone are insufficient.
 
-## Ordinary serial STC gradients
+## Serial and root-owned MPI STC gradients
 
-`dlno_stc.value_and_grad(..., comm=None)` now scopes its final complete SCF
-pullback with the existing resident-buffer and BLAS-controller helpers. Both
-system and domain calls use this boundary. The separate
-`pyscfad.dlno_stc.ccsd.value_and_grad` entry point also uses it for serial CCSD
-and CCSD(T) response. An existing caller-owned reverse
+`dlno_stc.value_and_grad` scopes its final complete SCF pullback with the
+existing resident-buffer, occupied-factor-cache and BLAS-controller helpers
+when SCF runs on root. Both system and domain calls use this boundary. The
+separate `pyscfad.dlno_stc.ccsd.value_and_grad` entry point also uses it for
+CCSD and CCSD(T) response. This includes serial calls and MPI calls with the
+default `parallel_scf_jk=False`: fragments remain distributed, their completed
+cotangents are reduced to root, and root closes shared response once.
+An existing caller-owned reverse
 scope is reused, including a deliberately disabled one. Work is synchronized
-before an owned scope is closed. MPI paths are unchanged.
+before an owned scope is closed. Explicit `parallel_scf_jk=True` uses the
+distributed DF J/K service and its existing response ownership.
+
+Eligible out-of-core DF sources built or attached inside the traced SCF
+builder also combine global AO-Fock and implicit SCF geometry seeds at their
+shared producer. Root performs one compatible geometry/metric reverse after
+the fragment cotangents arrive. Set `PYSCFAD_STC_COMBINE_SCF_DF=0` before
+tracing to use separate geometry responses.
 
 Enable buffer registration **before tracing** `build_mf`. For this workstation,
 the water8/water12 runs used eight physical cores and these thread settings;
@@ -82,7 +92,7 @@ an explicit scope still return explicit cotangents.
 
 ## Staged OOC benchmark and workstation choice
 
-OOC geometry fusion still needs the existing explicit DF-input cotangent
+Externally staged OOC geometry fusion needs an explicit DF-input cotangent
 boundary: enter `pyscfad.df._ooc_cotangent.geometry_scope(df_input)`, execute the
 SCF reverse, then pass `scope.finish(df_input_bar)` to the DF producer reverse.
 This is already wired in `TEST_general/test_scf/benchmark_common/driver.py`.
@@ -98,11 +108,10 @@ preconditioner defaults.
 ## Changes deliberately excluded
 
 The exploratory OV solver and its implicit-differentiation hooks showed no
-reliable benefit. The retained metric-VJP plumbing saved only a small fraction
-of the large OOC DF contraction. Combining the global STC input geometry with
-SCF geometry saved more total host reverse time, but requires an additional
-producer/finalization contract inside the currently opaque SCF tape. These
-changes remain in the experimental study rather than this small integration.
+reliable benefit. The experimental retained metric-VJP plumbing saved only a
+small fraction of the large OOC DF contraction and remains excluded. The
+supported shared-producer geometry path above is separate from those solver
+experiments.
 No claim is made that OOC DF pullback has fallen from about 20 s to 9 s.
 
 The quoted measurements are from the preceding kernel investigation. They are

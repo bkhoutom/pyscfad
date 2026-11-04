@@ -282,11 +282,12 @@ def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_v
     The two-pass path saves MP2 fragment proxies for optional triples variance
     allocation. ``variance_allocation='occupied_count'`` needs no proxies.
     By default (``single_pass=True``), return a plan without preparing domains or W.
-    Each serial production fragment selects its discrete LIS labels from its
+    Each production fragment selects its discrete LIS labels from its
     own W result, then uses that same result in the complete pullback. This
     path uses occupied-count triples budgets and retains only one domain's
-    preparation tape at a time. Set ``single_pass=False`` for D matrices,
-    multi-rank MPI, or concrete LIS selections, anchors and grids before production.
+    preparation tape at a time on each group owner, including MPI workers.
+    Set ``single_pass=False`` for D matrices or concrete LIS selections,
+    anchors and grids before production.
     Occupied and virtual LNO eigenproblems always
     use compact extended-domain coordinates, preserving the projected target
     occupied span and all domain-frame/target-projector responses.
@@ -845,7 +846,7 @@ def _finish(state, static, records, *, with_grad, include_hf, return_components)
 
 
 def _run(initializer, worker_initializer, comm, *, checkpoint_dir, resume,
-         parallel_scf_jk=True, scf_worker_initializer=None, **options):
+         parallel_scf_jk=False, scf_worker_initializer=None, **options):
     if comm is not None and comm.Get_size() > 1:
         from ._mpi_ccsd import _run_mpi
         def check_options():
@@ -870,7 +871,7 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
            ccsd_t=False, triples_controls=None, verbose_imp=0, include_hf=False,
            return_components=False,
            merge_identical=True, comm=None, fragment_indices=None, include_baseline=True,
-           checkpoint_dir=None, resume=False, parallel_scf_jk=True, vvvv_direct=False,
+           checkpoint_dir=None, resume=False, parallel_scf_jk=False, vvvv_direct=False,
            cc_solver='deterministic', stc_cc_controls=None):
     """Return correlation energy, or total energy with ``include_hf=True``.
 
@@ -897,9 +898,10 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
     that option returns only selected CC-minus-MP2-LIS corrections and forbids HF.
     ``vvvv_direct=False`` caches the DF virtual ladder integrals when
     memory permits; ``True`` uses the improved uncached contraction.
-    Multi-rank calls distribute common-preparation DF J/K work by default.
+    Multi-rank calls distribute complete correlation groups and their
+    single-pass LIS selections. Shared preparation runs on root by default.
     Each rank must supply a matching MF skeleton; preceding SCF is caller-owned.
-    ``parallel_scf_jk=False`` retains root-only shared work. Serial and
+    ``parallel_scf_jk=True`` also distributes common-preparation DF J/K work. Serial and
     single-rank calls keep their existing behavior.
 
     ``cc_solver='stc'`` selects the experimental external ``stc_cc_jax``
@@ -919,9 +921,6 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
     def initialize():
         solver_options = _cc_solver_options(cc_solver, stc_cc_controls)
         triples = normalize_triples_controls(triples_controls, ccsd_t=ccsd_t)
-        if (getattr(static, 'deferred_selection', None) is not None and
-                comm is not None and comm.Get_size() > 1):
-            raise NotImplementedError('single-pass LIS selection currently requires serial execution')
         if include_hf and not include_baseline:
             raise ValueError('include_hf requires include_baseline=True')
         baseline, matrix = _validate_run(static, baseline_controls, matrix_controls, matrix_kind)
@@ -961,7 +960,7 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
                    verbose_imp=0, include_hf=False,
                    return_components=False, merge_identical=True, comm=None, build_static=None,
                    fragment_indices=None, include_baseline=True, checkpoint_dir=None, resume=False,
-                   parallel_scf_jk=True, vvvv_direct=False,
+                   parallel_scf_jk=False, vvvv_direct=False,
                    cc_solver='deterministic', stc_cc_controls=None):
     """Return ``(energy, mol_bar)``; ``mol_bar.coords`` is a nuclear gradient.
 
@@ -973,13 +972,16 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
     ``triples_controls`` has the same independent sampling semantics as in
     :func:`kernel`; the reported triples SE estimates energy uncertainty only.
     ``vvvv_direct`` has the memory/performance semantics of :func:`kernel`.
-    Multi-rank calls distribute DF J/K work in SCF, common preparation and
-    their coordinate pullbacks by default. Worker ``build_mf`` must accept
+    Multi-rank calls distribute complete correlation groups, including deferred
+    single-pass LIS selection, while SCF and shared response run on root.
+    ``parallel_scf_jk=True`` also distributes DF J/K work in SCF, common
+    preparation and their coordinate pullbacks. Worker ``build_mf`` must accept
     ``mo_coeff_init``, ``mo_energy_init``, ``mo_occ_init`` and ``e_tot_init``,
     adopt these values and skip SCF. An attached out-of-core CDERI source
     must be available on every rank. ``parallel_scf_jk=False`` retains
-    root-only SCF and shared response. Serial calls (comm=None) use the same
-    opt-in resident DF buffer and BLAS-controller scopes as the MP2 driver;
+    root-only SCF and shared response. All root-owned calls use the same
+    DF geometry fusion, response caching, opt-in resident DF buffer and
+    BLAS-controller scopes as the MP2 driver;
     the complete SCF pullback must reach its DF producer. See
     README_SERIAL_DF_SCF.md for activation and prebuilt-factor ownership.
 
@@ -1006,16 +1008,14 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
             if _stc_precision.enabled(solver_options.get('stc_cc_controls')):
                 prechecked_indices = _fragment_indices(static, fragment_indices)
                 _stc_precision.validate_seed_independence(solver_options['stc_cc_controls'], prechecked_indices)
-        mf, scf_pullback = driver._initialize_scf(mol, build_mf, combine_df=comm is None)
-        if comm is None:
+        local_response = driver._root_owned_scf_response(comm, parallel_scf_jk)
+        mf, scf_pullback = driver._initialize_scf(mol, build_mf, combine_df=local_response)
+        if local_response:
             scf_pullback = driver._serial_scf_pullback(scf_pullback)
         selected = static
         scf_data = scf_data_pullback = None
         if build_static is not None:
             selected, scf_data, scf_data_pullback = driver._select_domain_reference(mf, build_static)
-        if (getattr(selected, 'deferred_selection', None) is not None and
-                comm is not None and comm.Get_size() > 1):
-            raise NotImplementedError('single-pass LIS selection currently requires serial execution')
         baseline, matrix = _validate_run(selected, baseline_controls, matrix_controls, matrix_kind)
         indices = (_fragment_indices(selected, fragment_indices)
                    if prechecked_indices is None else prechecked_indices)

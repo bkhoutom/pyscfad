@@ -16,6 +16,7 @@ import numpy
 import scipy.linalg
 from pyscf import lib
 from pyscfad import numpy as np
+from pyscfad.lib._threading import dense_blas_threads
 
 
 class HalfTransformedDFCache:
@@ -75,8 +76,9 @@ class HalfTransformedDFCache:
         if parent is not None and kc*lc:
             basis = parent.coeff[:, parent.columns]
             selected = coeff[:, columns]
-            rotation = scipy.linalg.lstsq(basis, selected, check_finite=False)[0]
-            error = numpy.linalg.norm(basis @ rotation - selected)
+            with dense_blas_threads():
+                rotation = scipy.linalg.lstsq(basis, selected, check_finite=False)[0]
+                error = numpy.linalg.norm(basis @ rotation - selected)
             if error > 1e-11 * max(1., numpy.linalg.norm(selected)):
                 raise ValueError('Domain LIS leaves the retained ED orbital span; '
                                  'cannot reuse H_ED without a new integral pass')
@@ -111,19 +113,25 @@ class HalfTransformedDFCache:
         if kc*lc and rotation is not None:
             for p0 in range(0, naux, rows):
                 p1 = min(p0+rows, naux)
-                numpy.matmul(parent.h[p0:p1], rotation, out=h[p0:p1])
-                result[p0:p1] = (coeff[:, k0:k1].T @ h[p0:p1, :, right]).reshape(p1-p0, -1)
+                with dense_blas_threads():
+                    numpy.matmul(parent.h[p0:p1], rotation, out=h[p0:p1])
+                    result[p0:p1] = (coeff[:, k0:k1].T @ h[p0:p1, :, right]).reshape(p1-p0, -1)
         elif kc*lc:
             selected = numpy.ascontiguousarray(coeff[:, columns])
             for p0, p1, raw in _local_direct_raw_int3c_blocks(
                     scope.mol, scope.auxmol, rows):
+                # Integral generation and unpacking use OpenMP; keep their
+                # surrounding BLAS policy separate from these dense products.
                 full = lib.unpack_tril(numpy.ascontiguousarray(raw))
-                numpy.matmul(full, selected, out=h[p0:p1])
-                result[p0:p1] = (coeff[:, k0:k1].T @ h[p0:p1, :, right]).reshape(p1-p0, -1)
+                with dense_blas_threads():
+                    numpy.matmul(full, selected, out=h[p0:p1])
+                    result[p0:p1] = (coeff[:, k0:k1].T @ h[p0:p1, :, right]).reshape(p1-p0, -1)
                 del full, raw
             del selected
-        fitted = np.asarray(scipy.linalg.solve_triangular(
-            low, result, lower=True, overwrite_b=True, check_finite=False))
+        with dense_blas_threads():
+            result = scipy.linalg.solve_triangular(
+                low, result, lower=True, overwrite_b=True, check_finite=False)
+        fitted = np.asarray(result)
         entry = SimpleNamespace(
             coeff=numpy.array(coeff, copy=True), slices=tuple(slices),
             left=left, right=right, h=h, fitted=fitted, consumed=False,
@@ -154,10 +162,11 @@ class HalfTransformedDFCache:
                 p1 = min(p0+rows, self.scope.auxmol.nao)
                 z = numpy.asarray(read_z(p0, p1)).reshape(p1-p0, kc, lc)
                 h = entry.h[p0:p1]
-                bar[:, k0:k1] += numpy.einsum(
-                    'pml,pkl->mk', h[:, :, entry.right], z, optimize=True)
-                bar[:, l0:l1] += numpy.einsum(
-                    'pmk,pkl->ml', h[:, :, entry.left], z, optimize=True)
+                with dense_blas_threads():
+                    bar[:, k0:k1] += numpy.einsum(
+                        'pml,pkl->mk', h[:, :, entry.right], z, optimize=True)
+                    bar[:, l0:l1] += numpy.einsum(
+                        'pmk,pkl->ml', h[:, :, entry.left], z, optimize=True)
         entry.consumed = True
         self.scope.receipt['half_pullbacks'] += 1
         return bar

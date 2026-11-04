@@ -33,11 +33,14 @@ Selection schema 10 records this domain-only definition; rebuild checkpoints
 from earlier schemas or global-space LIS calculations.
 
 `build_static_selections` defaults to `single_pass=True` and returns a plan for
-serial W calculations. LIS ranks, AO anchors and Laplace grids are chosen from
+W calculations, including MPI across domain groups. LIS ranks, AO anchors and
+Laplace grids are chosen from
 each fragment's production W while its preparation pullback remains live;
 these discrete choices are held fixed during differentiation. Set
-`single_pass=False` to choose them in a separate prepass, or for D matrices or
-multi-rank MPI. `select_frame` saves semicanonical reference anchors;
+`single_pass=False` to choose them in a separate prepass, or for D matrices.
+With MPI, each owner retains its local preparation and LIS pullbacks; completed
+cotangents are reduced for shared response on root. `select_frame` saves
+semicanonical reference anchors;
 `rebuild_frame` transports those anchors with the current LIS and AO overlap.
 Its input contains no Fock matrix, so the Fock-frame cotangent is zero.
 
@@ -214,7 +217,7 @@ See the [domain and MP2 guide](../../../pyscfad/dlno_stc/README.md) for their de
 | `internal_rank_threshold` | `1e-6` | Numerical rank threshold for constructing discarded complements when completing the full MO layout; all original S orbitals are retained. |
 | `merge_identical` | `True` | Reuse identical-domain preparation while retaining physical S identities. |
 | `fragment_indices` | `None` | Select all physical fragments; otherwise select only the listed zero-based S indices. |
-| `single_pass` | `True` | Select LIS from each production W without a prepass. Serial W only; set `False` for D matrices, multi-rank MPI, or concrete selections, anchors and grids before production. |
+| `single_pass` | `True` | Select LIS from each production W without a prepass, including MPI domain owners. Set `False` for D matrices or concrete selections, anchors and grids before production. |
 | `smooth` | `True` | Full occupied/virtual anchored frames. `False` retains the conventional deterministic reference. |
 | `smooth_laplace_points` | `10` | Positive integer; fit a separate positive triples quadrature for each nonempty LIS. Used with `smooth=True`. |
 
@@ -255,7 +258,7 @@ These keywords are common to `ccsd.kernel` and `ccsd.value_and_grad`:
 | `merge_identical` | `True` | Share identical-domain preparation. |
 | `verbose_imp` | `0` | Impurity solver verbosity. |
 | `comm` | `None` | Serial execution; optionally supply an MPI communicator. |
-| `parallel_scf_jk` | `True` | For multiple MPI ranks, distribute shared DF J/K work and its applicable response; no effect on serial calls. |
+| `parallel_scf_jk` | `False` | Keep SCF and shared response on root while fragment work uses MPI. Set to `True` to distribute shared DF J/K work and its applicable response; no effect on serial calls. |
 | `checkpoint_dir` | `None` | Optional serial progress checkpoint directory. |
 | `resume` | `False` | Resume compatible progress; requires `checkpoint_dir`. Multiple-rank CC progress checkpoints are not supported. |
 

@@ -243,12 +243,27 @@ def test_scheduler_uneven_owners_and_idle_live_bars(monkeypatch):
     monkeypatch.setattr(_mpi, '_validate_shared_reference', lambda *args, **kwargs: None)
     monkeypatch.setattr(_mpi, '_build_worker', lambda *args: mf)
     captured = {}
+    root_bars = None
+    allocated = []
+    zero_cotangents = adjoint.zero_term_cotangents
+
+    def initialize_cotangents(*args):
+        allocated.append(threading.current_thread().name)
+        return zero_cotangents(*args)
+
+    monkeypatch.setattr(adjoint, 'zero_term_cotangents', initialize_cotangents)
 
     def initialize():
+        nonlocal root_bars
         assert threading.current_thread().name == 'rank-0'
-        return dict(mf=mf, common=common, static=static, weak_pairs=())
+        root_bars = initialize_cotangents(mf, common)
+        return dict(mf=mf, common=common, static=static, weak_pairs=(),
+                    mf_bar=root_bars[0], common_bar=root_bars[1])
 
     def prepare(state, selected, group, controls, with_grad):
+        if threading.current_thread().name == 'rank-0':
+            assert state['mf_bar'] is root_bars[0]
+            assert state['common_bar'] is root_bars[1]
         def fn(m, c):
             return {'foo': m.mo_coeff * (group.representative_index+1) + c.s1e,
                     'fvv': jnp.ones((1, 1)), 'B': jnp.ones((1, 1, 1))}
@@ -263,7 +278,7 @@ def test_scheduler_uneven_owners_and_idle_live_bars(monkeypatch):
 
     def weak(m, c, selected, pairs, comm, *, with_grad):
         captured[comm.Get_rank()] = (m, c)
-        return jnp.array(0.), adjoint.zero_term_cotangents(m, c)
+        return jnp.array(0.), zero_cotangents(m, c)
 
     monkeypatch.setattr(driver, '_prepare', prepare)
     monkeypatch.setattr(backend, 'solve', solve)
@@ -287,6 +302,7 @@ def test_scheduler_uneven_owners_and_idle_live_bars(monkeypatch):
     numpy.testing.assert_allclose(results[0][1], 5.)
     assert results[1:] == [None, None, None]
     assert set(captured) == {0, 1, 2, 3}
+    assert sorted(allocated) == ['rank-0', 'rank-1', 'rank-2', 'rank-3']
     diagnostics = _mpi.LAST_RUN_DIAGNOSTICS
     assert [row['owner'] for row in diagnostics['groups']] == [0, 1]
     assert [len(row['groups']) for row in diagnostics['ranks']] == [1, 1, 0, 0]
@@ -387,7 +403,9 @@ def test_scheduler_zero_global_work_finishes_response_once(monkeypatch, with_gra
     def initialize():
         assert threading.current_thread().name == 'rank-0'
         calls['initialize'] += 1
+        bars = (driver._zero_term_cotangents(mf, common) if with_grad else (None, None))
         return dict(mf=mf, common=common, static=static, weak_pairs=(),
+                    mf_bar=bars[0], common_bar=bars[1],
                     common_pullback=common_response, scf_pullback=scf_response)
 
     def forbidden_prepare(*args, **kwargs):

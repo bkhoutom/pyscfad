@@ -462,6 +462,9 @@ def correlation_value_and_grad(
                 _, left, _ = spec
                 profile_frame_build = resource_profile.start()
                 frame_start = time.perf_counter() if collect_timing else None
+                # Use the same AD primal as the later replay: an eager build
+                # can differ at roundoff and fail the byte-identical gauge
+                # check. Release this preparation tape before worker solves.
                 frame, pullback = jax.vjp(
                     lambda common_: build_strong_ed_domain(common_, static, left),
                     common,

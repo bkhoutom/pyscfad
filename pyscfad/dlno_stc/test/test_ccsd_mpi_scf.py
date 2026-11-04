@@ -45,9 +45,10 @@ def launch(tmp_path, mode='enabled', ranks=2, *, vvvv_direct=False):
     return json.loads(output.read_text())
 
 
-def test_cc_parallel_scf_matches_serial_and_opt_out(tmp_path):
+def test_cc_root_only_default_and_parallel_scf_opt_in_match_serial(tmp_path):
     reference = launch(tmp_path, 'serial', 1)
-    for mode, ranks, direct in (('enabled', 1, False), ('disabled', 2, False),
+    for mode, ranks, direct in (('enabled', 1, False), ('default', 2, False),
+                                ('disabled', 2, False),
                                 ('enabled', 2, False), ('enabled', 2, True)):
         result = launch(tmp_path, mode, ranks, vvvv_direct=direct)
         np.testing.assert_allclose(result['energy'], reference['energy'], atol=2e-10, rtol=0)

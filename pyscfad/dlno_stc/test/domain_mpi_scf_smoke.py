@@ -28,7 +28,7 @@ def run(mode, output):
 
     comm = MPI.COMM_WORLD
     rank = comm.rank
-    expect_service = mode not in ('disabled', 'serial', 'system') and comm.size > 1
+    expect_service = mode not in ('default', 'disabled', 'serial', 'system') and comm.size > 1
     shared_phases = dict(common_forward=0, common_reverse=0, scf_reverse=0)
     counts = dict(forward=0, density_vjp=0, coordinate_vjp=0)
     preconditioner_counts = dict(setup=0, apply=0)
@@ -140,6 +140,8 @@ def run(mode, output):
     options = {}
     if mode == 'disabled':
         options['parallel_scf_jk'] = False
+    elif mode not in ('default', 'serial', 'system'):
+        options['parallel_scf_jk'] = True
     if mode == 'system':
         options.update(scope='system', frozen=2)
     else:
@@ -208,6 +210,11 @@ def run(mode, output):
         else:
             assert all(not any(row['counts'].values()) for row in observations), observations
             assert all(row['source_builds'] == 0 for row in observations[1:]), observations
+            assert all(row['serves'] == 0 for row in observations), observations
+            assert observations[0]['builder_calls'] == dict(scf=1, skeleton=0), observations
+            if mode != 'system':
+                assert all(row['builder_calls'] == dict(scf=0, skeleton=1)
+                           for row in observations[1:]), observations
         if rank == 0:
             energy, bar = result
             assert np.isfinite(energy) and np.isfinite(np.asarray(bar.coords)).all()
@@ -226,7 +233,7 @@ def run(mode, output):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--mode', default='default', choices=('default', 'serial', 'disabled',
+    parser.add_argument('--mode', default='default', choices=('default', 'serial', 'disabled', 'enabled',
                         'system', 'worker-failure', 'worker-df-failure', 'root-failure', 'response-failure',
                         'source-corruption', 'group-failure'))
     parser.add_argument('--output', type=Path)

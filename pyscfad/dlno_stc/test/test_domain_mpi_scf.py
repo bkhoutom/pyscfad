@@ -43,9 +43,10 @@ def launch(tmp_path, mode='default', ranks=2):
     return json.loads(output.read_text())
 
 
-def test_domain_default_parallel_scf_matches_serial_and_opt_out(tmp_path):
+def test_domain_root_only_default_and_parallel_scf_opt_in_match_serial(tmp_path):
     reference = launch(tmp_path, 'serial', 1)
-    for mode, ranks in (('default', 1), ('disabled', 2), ('default', 2), ('default', 4)):
+    for mode, ranks in (('default', 1), ('default', 2), ('disabled', 2),
+                        ('enabled', 2), ('enabled', 4)):
         result = launch(tmp_path, mode, ranks)
         np.testing.assert_allclose(result['energy'], reference['energy'], atol=2e-10, rtol=0)
         np.testing.assert_allclose(result['gradient'], reference['gradient'], atol=2e-8, rtol=0)

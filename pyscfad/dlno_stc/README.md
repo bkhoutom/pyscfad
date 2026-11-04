@@ -1,6 +1,6 @@
 # STC selected-target MP2
 
-See the [serial DF/SCF optimization guide](../../README_SERIAL_DF_SCF.md) for
+See the [root-owned DF/SCF optimization guide](../../README_SERIAL_DF_SCF.md) for
 shared-buffer activation, preconditioning, thread settings and staged OOC use.
 
 STC owns Boys selection, exact-frame grouping, weak-pair correction, restart
@@ -96,16 +96,19 @@ optimization below. Receipts report `cache_mode`, `raw_integral_builds`,
 The raw-storage helpers/switches, projected cache, and option 3's `A_ED` cache
 and combined ED-pair adjoint have been removed.
 
-Serial `value_and_grad` calls also combine the global AO-Fock and implicit
-SCF DF geometry responses when the out-of-core DF source is built or attached
+Serial and root-owned MPI `value_and_grad` calls also combine the global
+AO-Fock and implicit SCF DF geometry responses when the out-of-core DF source
+is built or attached
 inside the traced SCF builder. A producer boundary returns the summed seed
 through the original AO/auxiliary geometry maps. Density and orbital response
 remain immediate; compatible coordinate seeds share one derivative-integral
 pass and one metric/Cholesky tape. This works with either fragment DF mode.
 `Shared global SCF DF reverse` reports consumers, seed groups, disk
 contributions, and geometry/metric passes. Set `PYSCFAD_STC_COMBINE_SCF_DF=0`
-before tracing for the separate-response reference path. MPI and externally
-staged DF sources retain their existing ownership rules.
+before tracing for the separate-response reference path. With the default
+`parallel_scf_jk=False`, MPI fragment owners reduce completed cotangents to
+root, which closes the combined shared response once. Explicit distributed
+SCF and externally staged DF sources retain their existing ownership rules.
 
 Local DF geometry responses fill the derivative contractor's packed AO-pair
 buffer directly, including the correct diagonal weights. They avoid a full
@@ -125,7 +128,7 @@ ED/LIS cache choices are independent of this option.
 `examples/dlno_stc/benchmark_df_density_packing.py` compares the original,
 GEMM-packed and automatic paths on representative water-32 dimensions.
 
-Within that serial response, occupied-factor caching is enabled by default.
+Within that root-owned response, occupied-factor caching is enabled by default.
 Its shared allowance with the preconditioner uses half the current RSS
 headroom under `mol.max_memory` (or explicit `precond_total_memory`). Global
 geometry panels use the same headroom policy after the root cache is freed.
@@ -296,13 +299,25 @@ partitioned. Cotangents are summed, and communicator rank zero drives the common
 and SCF response once, including HF once when requested. Only rank zero returns
 the public energy or `(energy, mol_bar)`; other ranks return `None`.
 
-Multi-rank domain calls enable `parallel_scf_jk=True` by default. The existing
-MPI DF executor distributes SCF J/K contractions, their density response, and
+Multi-rank domain calls use `parallel_scf_jk=False` by default: SCF and common
+response run on root while domain jobs remain distributed. Opt in with
+`parallel_scf_jk=True` to use the existing MPI DF executor for SCF J/K
+contractions, their density response, and
 the independent three-center coordinate derivative blocks. Root retains the
 SCF iteration and differentiation tape, localization, and coupled metric
 response. Common Fock preparation and its pullback use the same executor.
 Workers serve these collective phases, then resume their independent domain
-work. Set `parallel_scf_jk=False` to retain root-only SCF/common response.
+work.
+
+MP2 and CC owners call the same domain preparation and solver kernels as
+serial execution, including half-transformed DF reuse and retained CC integral
+blocks. Both schedulers initialize persistent compilation caches on workers
+and reuse root's existing response buffers. The optional distributed SCF
+service validates density factors like serial, reuses block scratch during
+each density response, and verifies each rank's DF contents once before its
+first contraction. It does not yet cache occupied panels across response
+iterations or use serial factorized geometry response; these optimizations
+are available through the default root-owned SCF path.
 
 Every rank calls the driver with the same molecule and configured MF type.
 Only root supplies controls and either `static` or `build_static`. The gradient
@@ -617,14 +632,16 @@ and deterministic or stochastic triples use this same domain definition.
 Global-space LIS checkpoints are rejected and must be rebuilt. Selection
 schema 10 remains valid for existing domain-space checkpoints.
 
-`build_static_selections` defaults to `single_pass=True` for serial W calculations
+`build_static_selections` defaults to `single_pass=True` for W calculations
 and returns a plan without a W prepass. Production
 prepares one domain group, selects each fragment's LIS from its W result, and
 retains the same input/frame pullback through its CCSD(T)-MP2 correction and
 joint W/MP2 reverse. Set `single_pass=False` for two-pass selection, required for
-D matrices, multi-rank MPI, or callers that need concrete LIS selections, anchors
+D matrices or callers that need concrete LIS selections, anchors
 and grids before production. `benchmark_lno_w_triples.py` also defaults to
-single-pass. Both paths use only domain
+single-pass. With MPI, each owner selects and differentiates the LIS for its
+assigned domain groups; shared SCF and common response run once on root by
+default. Both paths use only domain
 eigensystems. The former `virtual_eigenspace` Python argument and
 `--lis-virtual-eigenspace` CLI switch have been removed.
 

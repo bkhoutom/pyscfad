@@ -351,7 +351,7 @@ def _timed_section(name, totals, stage):
 
 def _run_domain_mpi(initializer, worker_initializer, static, controls, comm, *,
                     with_grad, include_hf=False, merge_identical=True,
-                    parallel_scf_jk=True, scf_worker_initializer=None):
+                    parallel_scf_jk=False, scf_worker_initializer=None):
     """Schedule domains between distributed shared SCF/reference sessions."""
     from . import driver
 
@@ -430,8 +430,10 @@ def _run_domain_jobs(initializer, worker_initializer, static, controls, comm, *,
                                        payload['common'], signature, static, with_grad=with_grad)
             state['energy'] = np.zeros((), dtype=common.s1e.dtype)
             state['variance'] = 0.0
-            state['mf_bar'], state['common_bar'] = (
-                zero_term_cotangents(state['mf'], state['common']) if with_grad else (None, None))
+            # Root already owns live zero trees from driver._initialize.
+            if rank != 0:
+                state['mf_bar'], state['common_bar'] = (
+                    zero_term_cotangents(state['mf'], state['common']) if with_grad else (None, None))
             jax.block_until_ready((state['energy'], state['mf_bar'], state['common_bar']))
 
         _collective_call(comm, setup, 'worker shared-reference setup')

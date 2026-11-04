@@ -1,7 +1,9 @@
 """Complete CC group jobs on their owners, then close shared response on root.
 
-Only fixed selections, numerical reference arrays, scalar records and completed
-host cotangents cross MPI. Native matrix replay and Python pullbacks stay local.
+Only selection metadata, numerical reference arrays, scalar records and completed
+host cotangents cross MPI. A deferred single-pass plan is materialized from each
+owner's W result inside _run_group. Its new LIS choices, native matrix replay
+and Python pullbacks stay local to that group.
 """
 import gc
 
@@ -37,7 +39,7 @@ def _build_cc_worker(worker_initializer, canonical, signature):
 def _run_mpi(initializer, worker_initializer, comm, *, with_grad,
              include_hf=False, merge_identical=True, verbose_imp=0,
              ccsd_t=False, return_components=False, include_baseline=True,
-             fragment_indices=None, parallel_scf_jk=True, scf_worker_initializer=None,
+             fragment_indices=None, parallel_scf_jk=False, scf_worker_initializer=None,
              vvvv_direct=False):
     """Run CC owner jobs between optional distributed SCF/reference sessions."""
     _collective_call(comm, _check_mpi_thread_support, 'CC MPI thread preflight')
@@ -111,6 +113,8 @@ def _run_jobs(initializer, worker_initializer, comm, *, with_grad,
 
     def setup():
         nonlocal state
+        from pyscfad.lib._compilation_cache import configure_compilation_cache
+        configure_compilation_cache()
         if rank != 0:
             mf = _build_cc_worker(worker_initializer, payload['canonical'], signature)
             state = dict(mf=mf, common=jax.tree_util.tree_map(np.asarray, payload['common']),
@@ -121,8 +125,10 @@ def _run_jobs(initializer, worker_initializer, comm, *, with_grad,
                                    with_grad=with_grad)
         state.update(energy=np.zeros((), dtype=state['common'].s1e.dtype),
                      variance=0., baseline_energy=0., weak_energy=0.)
-        state['mf_bar'], state['common_bar'] = (
-            zero_term_cotangents(state['mf'], state['common']) if with_grad else (None, None))
+        # Preserve the live root trees already allocated by driver._initialize.
+        if rank != 0:
+            state['mf_bar'], state['common_bar'] = (
+                zero_term_cotangents(state['mf'], state['common']) if with_grad else (None, None))
 
     _collective_call(comm, setup, 'CC worker reference setup')
     if with_grad:
@@ -134,6 +140,9 @@ def _run_jobs(initializer, worker_initializer, comm, *, with_grad,
         for position in range(rank, len(groups), size):
             group = groups[position]
             group_id = group.representative_index
+            # The broadcast static may be a deferred plan. _run_group selects
+            # each requested LIS from its live W, consumes its complete VJP,
+            # and returns only component records; it never mutates the plan.
             records.extend(ccsd._run_group(
                 state, static, group, allocated, matrix, with_grad=with_grad,
                 verbose_imp=options['verbose_imp'], ccsd_t=options['ccsd_t'],

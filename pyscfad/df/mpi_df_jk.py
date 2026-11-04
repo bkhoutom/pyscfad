@@ -428,8 +428,16 @@ def local_density_vjp(
     if q0 == q1:
         return numpy.asarray(dm_bars).reshape(dm_shape)
 
+    blksize = min(max(int(getattr(dfobj, "blockdim", 240)), 1), q1 - q0)
+    if with_k and lowrank_factors is not None:
+        # Match the serial transpose: reuse bounded work arrays across the
+        # local auxiliary blocks instead of allocating on every iteration.
+        response_rank = occ_coeff.shape[1]
+        buf_occ = numpy.empty((blksize * response_rank, nao))
+        buf_response = numpy.empty_like(buf_occ)
+
     native_exchange_vjp = _df_jk_opt._DF_VK_DM_VJP
-    for eri1 in _iter_cderi_range(dfobj, q0, q1):
+    for eri1 in _iter_cderi_range(dfobj, q0, q1, blksize=blksize):
         naux_block, pair_block = eri1.shape
         if pair_block != npair:
             raise RuntimeError(
@@ -445,9 +453,6 @@ def local_density_vjp(
         if not with_k:
             continue
         if lowrank_factors is not None:
-            response_rank = occ_coeff.shape[1]
-            buf_occ = numpy.empty((naux_block * response_rank, nao))
-            buf_response = numpy.empty_like(buf_occ)
             _df_jk_opt._df_vk_dm_vjp_lowrank(
                 dm_bars[0],
                 eri1,
@@ -742,7 +747,9 @@ class MPIDFJKExecutor:
         if hermi != 1:
             raise NotImplementedError("MPI DF-J/K currently requires hermi=1")
 
-        dm_fast = _df_jk_opt._tag_dm_for_fast_exchange(dfobj, dm)
+        dm_fast = _df_jk_opt._tag_dm(
+            _df_jk_opt._tag_dm_for_fast_exchange(dfobj, dm), hermi
+        )
         dm_host = _require_real_rhf_array("density", dm_fast)
         mo_coeff = getattr(dm_fast, "mo_coeff", None)
         mo_occ = getattr(dm_fast, "mo_occ", None)

@@ -280,7 +280,7 @@ def _finish(state, *, with_grad, include_hf,
 
 @contextmanager
 def _global_df_response(state):
-    """Share the serial common-Fock/SCF geometry pass and response headroom."""
+    """Share root-owned common-Fock/SCF geometry work and response headroom."""
     from pyscfad.df import _ooc_cotangent
     from pyscfad.lib import _scf_response_cache
     obj = getattr(state['mf'], 'with_df', None)
@@ -444,12 +444,18 @@ def _initialize_scf(mol, build_mf, *, fix_phases=True, combine_df=False):
         return jax.vjp(build, mol)
 
 
+def _root_owned_scf_response(comm, parallel_scf_jk, *, scope='domain'):
+    """Whether the complete shared reverse runs without a distributed J/K service."""
+    return (scope == 'system' or comm is None or comm.Get_size() <= 1
+            or not parallel_scf_jk)
+
+
 def _serial_scf_pullback(pullback):
-    """Use existing DF buffers/thread scopes for one complete serial reverse.
+    """Use existing DF buffers/thread scopes for one complete root-owned reverse.
 
     Producer registration remains opt-in before tracing. An enclosing caller
     scope owns its finalization; otherwise this pullback must include the DF
-    producer. Standalone/partial VJPs and MPI calls keep their existing paths.
+    producer. Standalone/partial VJPs and distributed J/K keep their existing paths.
     """
     from pyscfad.lib import _cotangent_buffer
     from pyscfad.lib._threading import dense_blas_scope
@@ -616,7 +622,7 @@ def _run_system(initializer, controls, comm, *, with_grad, include_hf=False):
 
 @memory_calculation
 def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
-           lo_kwargs=None, merge_identical=True, parallel_scf_jk=True):
+           lo_kwargs=None, merge_identical=True, parallel_scf_jk=False):
     """Return correlation energy on root.
 
     Domain jobs share identical saved frames by default. ``merge_identical=False``
@@ -624,8 +630,9 @@ def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
     With a multi-rank domain communicator, each rank supplies a matching MF
     object; workers may use an unconverged skeleton. Root's canonical state
     is installed on workers without SCF. Only root needs selections/controls.
-    ``parallel_scf_jk=True`` distributes common-preparation DF J/K work for
-    multi-rank domain calls. SCF preceding this energy-only API is caller-owned.
+    Shared DF J/K work stays on root by default, independently of MPI fragment
+    ownership. ``parallel_scf_jk=True`` distributes common-preparation DF J/K
+    work for multi-rank domain calls. SCF preceding this energy-only API is caller-owned.
     System, serial and single-rank calls retain their existing behavior.
     """
     scope = _shared_scope(static, scope, frozen, comm, lo_kwargs)
@@ -665,7 +672,7 @@ def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
 @memory_calculation
 def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
                    controls, comm=None, include_hf=False, lo_kwargs=None, merge_identical=True,
-                   build_static=None, parallel_scf_jk=True):
+                   build_static=None, parallel_scf_jk=False):
     """Return ``(energy, mol_bar)`` on root; worker ranks return ``None``.
 
     Discrete selections and the Laplace grid are fixed. System scope fixes
@@ -695,15 +702,18 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
     ``mo_occ_init`` and ``e_tot_init``, adopt their supplied values, and skip
     SCF. Workers may pass ``None`` for selections and controls; ``build_static``
     runs only on root. Results are returned only on communicator rank zero.
-    Multi-rank domain calls also distribute DF J/K contractions in SCF,
-    common-data preparation and their coordinate pullbacks by default.
-    Workers first build an unrun reference with placeholder canonical arrays
-    to prepare compatible global DF factors, then adopt root's converged state.
+    SCF and shared response stay on root by default. Explicitly setting
+    ``parallel_scf_jk=True`` distributes DF J/K contractions in SCF,
+    common-data preparation and their coordinate pullbacks.
+    With this option, workers first build an unrun reference with placeholder
+    canonical arrays to prepare compatible global DF factors, then adopt
+    root's converged state.
     An attached out-of-core CDERI source must be available on every rank.
     ``parallel_scf_jk=False`` retains root-only SCF and common response.
     System, serial and single-rank calls never activate this executor.
-    Serial calls (comm=None) scope the complete SCF pullback for resident DF
-    buffer sharing and dense-BLAS controller reuse. Enable
+    All root-owned calls, including MPI fragment execution, scope the complete
+    SCF pullback for DF geometry fusion, response caching, resident DF buffer
+    sharing and dense-BLAS controller reuse. Enable
     PYSCFAD_DF_SHARED_COTANGENT before tracing build_mf to use shared buffers;
     build_mf must include their DF producer. A caller-owned complete reverse
     scope is reused. See README_SERIAL_DF_SCF.md for staged/prebuilt DF cases.
@@ -724,9 +734,10 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
                 raise TypeError("build_static must be callable")
         elif scope == "domain":
             _validate_static(static)
+        local_response = _root_owned_scf_response(comm, parallel_scf_jk, scope=scope)
         with (resource_profile.section('stc.domain.scf') if scope == 'domain' else nullcontext()):
-            mf, scf_pullback = _initialize_scf(mol, build_mf, combine_df=comm is None)
-        if comm is None:
+            mf, scf_pullback = _initialize_scf(mol, build_mf, combine_df=local_response)
+        if local_response:
             scf_pullback = _serial_scf_pullback(scf_pullback)
         if scope == "system":
             return _initialize_system(mf, frozen, controls, with_grad=True,

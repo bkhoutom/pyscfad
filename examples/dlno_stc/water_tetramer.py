@@ -21,7 +21,7 @@ def main():
     parser.add_argument('--unmerged', action='store_true')
     parser.add_argument('--mpi', action='store_true', help='distribute domains over MPI ranks')
     parser.add_argument('--parallel-scf-jk', action=argparse.BooleanOptionalAction,
-                        default=True, help='distribute DF SCF/common work for multi-rank domain MPI')
+                        default=False, help='opt in to distributed DF SCF/common work for multi-rank domain MPI')
     parser.add_argument('--output', type=Path, help='write root JSON results to this file')
     args = parser.parse_args()
     # Set OpenMP/BLAS/JAX thread limits in the launcher before these imports.

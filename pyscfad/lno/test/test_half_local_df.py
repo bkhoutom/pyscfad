@@ -9,6 +9,78 @@ from pyscfad.lno._df_half import HalfTransformedDFCache
 from pyscfad.lno.test import test_shared_local_df_reverse as shared
 
 
+@pytest.mark.parametrize('dense_threads', [2, 3])
+def test_half_transforms_scope_dense_threads_without_changing_integral_threads(
+        monkeypatch, dense_threads):
+    """Catch missing dense limits or limits leaking into OpenMP integral work."""
+    import scipy.linalg
+    from pyscf import lib
+    from threadpoolctl import threadpool_info
+    from pyscfad.lib._threading import blas_threads, dense_blas_scope
+
+    monkeypatch.setenv('PYSCFAD_DENSE_BLAS_THREADS', str(dense_threads))
+    mol, _ = shared._problem(4)
+    rng = numpy.random.default_rng(91)
+    seen = set()
+
+    def pools(api):
+        return {item['filepath']: item['num_threads']
+                for item in threadpool_info() if item['user_api'] == api}
+
+    with blas_threads(1), dense_blas_scope(), \
+            _df_shared.reverse_scope(shared._mf(mol), shared.ATOMS) as scope:
+        scope.half = cache = HalfTransformedDFCache(scope)
+        low = scope.metric_factor()
+        coeff = rng.normal(size=(scope.mol.nao, 4))
+        child = coeff @ rng.normal(size=(4, 3))
+        baseline_blas, baseline_omp = pools('blas'), pools('openmp')
+        assert baseline_blas and set(baseline_blas.values()) == {1}
+
+        def check(label, count):
+            seen.add(label)
+            assert pools('blas') == dict.fromkeys(baseline_blas, count), label
+            assert pools('openmp') == baseline_omp, label
+
+        def observe(func, label, count):
+            def call(*args, **kwargs):
+                check(label, count)
+                return func(*args, **kwargs)
+            return call
+
+        raw = _df_direct._local_direct_raw_int3c_blocks
+        def integral_blocks(*args, **kwargs):
+            check('integrals', 1)
+            for block in raw(*args, **kwargs):
+                check('integrals', 1)
+                yield block
+                check('integrals', 1)
+
+        def read_z(p0, p1, width):
+            check('adjoint read', 1)
+            return numpy.ones((p1-p0, width))
+
+        with monkeypatch.context() as patch:
+            for module, name in ((numpy, 'matmul'), (numpy, 'einsum'),
+                                 (scipy.linalg, 'lstsq'),
+                                 (scipy.linalg, 'solve_triangular')):
+                patch.setattr(module, name,
+                              observe(getattr(module, name), name, dense_threads))
+            patch.setattr(lib, 'unpack_tril', observe(lib.unpack_tril, 'unpack', 1))
+            patch.setattr(_df_direct, '_local_direct_raw_int3c_blocks', integral_blocks)
+            cache.transform(coeff, (0, 2, 2, 4), low)
+            check('after ED', 1)
+            cache.transform(child, (0, 3, 0, 3), low)
+            check('after LIS', 1)
+            cache.coefficient_pullback(coeff, lambda p0, p1: read_z(p0, p1, 4),
+                                       (0, 2, 2, 4))
+            cache.coefficient_pullback(child, lambda p0, p1: read_z(p0, p1, 9),
+                                       (0, 3, 0, 3))
+            check('after pullbacks', 1)
+        assert {'matmul', 'einsum', 'lstsq', 'solve_triangular',
+                'integrals', 'unpack', 'adjoint read'} <= seen
+        scope.finish()
+
+
 @pytest.mark.parametrize('nmo', [4, 7])
 def test_dependent_frames_use_one_pass_and_no_reverse_reads(monkeypatch, nmo):
     mol, coeff = shared._problem(nmo)

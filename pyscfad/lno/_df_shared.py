@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 import os
 import tempfile
+import warnings
 
 import h5py
 import jax
@@ -23,6 +24,7 @@ import numpy
 from pyscf import lib as pyscf_lib
 
 from pyscfad.df import _cderi_vjp
+from pyscfad.lib._threading import blas_threads, dense_blas_threads
 
 
 _ACTIVE = ContextVar('pyscfad_local_df_integral_reverse', default=None)
@@ -53,9 +55,11 @@ class LocalDFReverse:
         self.max_memory_mb = float(mf.mol.max_memory)
         self.workspace_mb = float(mf.with_df.max_memory)
         self.terms = []
+        self._packed_terms = None
         self.metric_bar = None
         self._file = self._handle = None
         self.finished = False
+        self._minimum_row_warned = False
         self.receipt = dict(consumers=0, spooled_bytes=0, geometry_passes=0,
                             metric_passes=0, max_density_rows=0)
 
@@ -71,13 +75,25 @@ class LocalDFReverse:
         # derivative buffers. One indivisible auxiliary shell may be larger;
         # the native driver already partitions reads within that shell.
         from ._df_direct import _local_direct_int3c_block_mb
-        remaining = self.max_memory_mb - pyscf_lib.current_memory()[0]
+        resident_mb = float(pyscf_lib.current_memory()[0])
+        remaining = self.max_memory_mb - resident_mb
+        block_mb = _local_direct_int3c_block_mb()
         budget = min(self.workspace_mb, .5 * max(0., remaining),
-                     _local_direct_int3c_block_mb()) * 1e6
+                     block_mb) * 1e6
         row_bytes = 8 * (6*self.mol.nao**2 + pair_count
                          + self.mol.nao*orbital_width + 3*self.mol.nao)
-        if budget < row_bytes:
-            raise MemoryError('Insufficient user memory budget for one local DF reverse row')
+        if budget < row_bytes and not self._minimum_row_warned:
+            self._minimum_row_warned = True
+            warnings.warn(
+                'Local DF reverse minimum row exceeds the advisory workspace: '
+                f'row estimate={row_bytes / 1e6:.6g} MB, '
+                f'available target={budget / 1e6:.6g} MB, RSS={resident_mb:.1f} MB, '
+                f'configured max_memory={self.max_memory_mb:.1f} MB, '
+                f'DF workspace={self.workspace_mb:.1f} MB, block target={block_mb:.1f} MB; '
+                'continuing with one auxiliary row',
+                RuntimeWarning, stacklevel=2)
+        # As in the direct AO2MO path, a configured budget is not a hard
+        # physical limit. Preserve bounded tiling even after RSS exhausts it.
         return min(self.auxmol.nao, max(1, int(budget // row_bytes)))
 
     def add(self, coeff, z, low_bar, slices):
@@ -123,6 +139,42 @@ class LocalDFReverse:
             self.receipt['max_density_rows'], p1-p0)
         return density
 
+    def _fill_packed_density(self, p0, p1, out):
+        """Sum native AO-pair bars without materializing symmetric densities.
+
+        The packed projection already sums the off-diagonal AO legs and
+        retains a single diagonal leg, exactly the native derivative driver's
+        convention. Keep the dense reader for unsupported coordinate inputs.
+        Prepare contiguous coefficient blocks once, outside the shell loop.
+        """
+        if self._packed_terms is None:
+            self._packed_terms = []
+            for dataset, coeff, slices in self.terms:
+                k0, k1, l0, l1 = slices
+                k = numpy.asarray(coeff[:, k0:k1], order='C')
+                l = numpy.asarray(coeff[:, l0:l1], order='C')
+                swapped = l1-l0 > k1-k0
+                self._packed_terms.append(
+                    (dataset, l if swapped else k, k if swapped else l,
+                     k1-k0, l1-l0, swapped))
+        out.fill(0.)
+        for dataset, k, l, kc, lc, swapped in self._packed_terms:
+            z = numpy.asarray(dataset[p0:p1]).reshape(p1-p0, kc, lc)
+            if swapped:
+                z = z.transpose(0, 2, 1)
+            # The native producer distributes auxiliary rows across OpenMP
+            # threads; its inner GEMMs must stay serial. The fallback instead
+            # uses isolated dense BLAS operations.
+            context = (blas_threads(1)
+                       if _cderi_vjp._use_native_cderi_bar_aux_block(z, k, l)
+                       else dense_blas_threads())
+            with context:
+                contribution = _cderi_vjp._nr_e2_cderi_bar_packed_aux_block_prepared(z, k, l)
+            out += contribution
+            del z, contribution
+        self.receipt['max_density_rows'] = max(
+            self.receipt['max_density_rows'], p1-p0)
+
     def finish(self):
         if self.finished:
             raise RuntimeError('Local DF reverse already finished')
@@ -140,7 +192,8 @@ class LocalDFReverse:
             self.mol, self.auxmol, numpy.zeros((self.mol.nao, 1)), None,
             (0, 1, 0, 1), int3c=self.mol._add_suffix('int3c2e'), aosym='s2ij',
             block_memory_mb=self.workspace_mb, z_dtype=numpy.float64,
-            z_aux_block_max_rows=rows, read_density_aux_block=self._density)
+            z_aux_block_max_rows=rows, read_density_aux_block=self._density,
+            fill_packed_density_aux_block=self._fill_packed_density)
         self.receipt['geometry_passes'] += 1
         _, pullback = jax.vjp(lambda a: jsp_linalg.cholesky(
             a.intor(a._add_suffix('int2c2e'), hermi=1), lower=True), self.auxmol)
@@ -150,11 +203,13 @@ class LocalDFReverse:
                  + numpy.asarray(metric_bar.coords))
         numpy.add.at(coords, self.atoms, local)
         self.terms.clear()
+        self._packed_terms = None
         self.metric_bar = None
         return coords
 
     def close(self):
         self.terms.clear()
+        self._packed_terms = None
         self.metric_bar = None
         if self._file is not None:
             self._file.close()

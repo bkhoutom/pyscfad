@@ -43,6 +43,35 @@ def _energy(mol, coeff):
     return .1*np.sum(ed**2) + np.sum(lis**2*weight) - .2*np.sum(lis[:, :1, 1:]**2)
 
 
+@pytest.mark.parametrize('native', [False, True])
+def test_shared_packed_density_matches_both_ao_legs(native, monkeypatch):
+    """Unequal/transposed MO blocks share the native diagonal convention."""
+    if not native:
+        monkeypatch.setattr(_df_shared._cderi_vjp, '_NR_E2_CDERI_BAR_AUX_NATIVE', False)
+    mol, _ = _problem(7)
+    scope = _df_shared.LocalDFReverse(_mf(mol), ATOMS)
+    rng = numpy.random.default_rng(811)
+    expected = numpy.zeros((2, scope.mol.nao, scope.mol.nao))
+    try:
+        for slices in ((1, 3, 2, 7), (1, 6, 3, 5)):
+            k0, k1, l0, l1 = slices
+            coeff = rng.normal(size=(scope.mol.nao, 7))
+            z = rng.normal(size=(scope.auxmol.nao, (k1-k0)*(l1-l0)))
+            scope.add(coeff, z, numpy.zeros((scope.auxmol.nao,)*2), slices)
+            expected += numpy.einsum('uk,pkl,vl->puv', coeff[:, k0:k1],
+                z[1:3].reshape(2, k1-k0, l1-l0), coeff[:, l0:l1])
+        rows, cols = numpy.tril_indices(scope.mol.nao)
+        packed = (expected + expected.swapaxes(1, 2))[:, rows, cols]
+        packed[:, rows == cols] *= .5
+        out = numpy.empty_like(packed)
+        scope._fill_packed_density(1, 3, out)
+        numpy.testing.assert_allclose(out, packed, atol=2e-13, rtol=2e-13)
+        assert scope.receipt['max_density_rows'] == 2
+    finally:
+        scope.close()
+    assert scope._packed_terms is None
+
+
 @pytest.mark.parametrize('nmo', [4, 7])
 @pytest.mark.parametrize('seed', [.7, -.3])
 def test_shared_coordinate_and_orbital_bars_match_separate_reverses(nmo, seed, monkeypatch):
@@ -141,11 +170,18 @@ def test_stc_replica_mean_scales_integral_response_with_shared_optimization_enab
 
 def test_budget_exhaustion_and_scope_failure_do_not_leak(monkeypatch):
     mol, coeff = _problem(4)
-    with pytest.raises(MemoryError, match='user memory'):
+    reference = jax.grad(lambda m: _energy(m, coeff))(mol)
+    with pytest.warns(RuntimeWarning, match='minimum row exceeds the advisory workspace') as caught:
         with _df_shared.reverse_scope(_mf(mol), ATOMS) as scope:
             monkeypatch.setattr(_df_shared.pyscf_lib, 'current_memory',
                                 lambda: (mol.max_memory+1., 0.))
-            jax.grad(lambda m: _energy(m, coeff))(mol)
+            bar = jax.grad(lambda m: _energy(m, coeff))(mol)
+            geometry = scope.finish()
+            assert scope.receipt['tile_rows'] == 1
+            assert scope.receipt['max_density_rows'] == 1
+    assert len(caught) == 1
+    numpy.testing.assert_allclose(bar.coords + geometry, reference.coords,
+                                  atol=2e-9, rtol=2e-8)
     assert scope._file is None and scope._handle is None
     assert _df_shared._ACTIVE.get() is None
     monkeypatch.undo()
@@ -157,6 +193,23 @@ def test_budget_exhaustion_and_scope_failure_do_not_leak(monkeypatch):
     # A subsequent ordinary gradient must still include its integral response.
     bar = jax.grad(lambda m: _energy(m, coeff))(mol)
     assert numpy.isfinite(bar.coords).all()
+
+
+def test_shared_reverse_respects_available_block_workspace(monkeypatch):
+    mol, _ = _problem(4)
+    monkeypatch.setattr(_df_shared.pyscf_lib, 'current_memory', lambda: (0., 0.))
+    monkeypatch.setenv('PYSCFAD_LNO_LOCAL_DIRECT_INT3C_BLOCK_MB', '0.01')
+    # The public block control has a 1 MB minimum. A smaller DF workspace is
+    # still respected when it can hold complete auxiliary rows.
+    mf = _mf(mol)
+    mf.with_df.max_memory = .01
+    with _df_shared.reverse_scope(mf, ATOMS) as scope:
+        row_bytes = 8 * (6 * scope.mol.nao**2 + 21 + 3 * scope.mol.nao + 3 * scope.mol.nao)
+        rows = scope._rows(21, 3)
+        assert rows == min(scope.auxmol.nao, int(.01 * 1e6 // row_bytes))
+        assert rows * row_bytes <= .01 * 1e6
+        assert not scope._minimum_row_warned
+        scope.finish()
 
 
 def test_nested_scope_and_double_finish_rejected():

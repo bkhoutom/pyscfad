@@ -40,18 +40,21 @@ int AO2MOmmm_nr_vjp_s2_iltj(double *eri_bar, double *mo_coeff_bar,
     int j_start = envs->ket_start;
     int j_count = envs->ket_count;
     double *mo_coeff = envs->mo_coeff; // F order
-    double *eri_bar_s1 = buf + nao * i_count;
 
     // |ij) C_qj = |iq); |ij) in C order
     dgemm_(&TRANS_T, &TRANS_T, &i_count, &nao, &j_count,
            &D1, ybar, &j_count, mo_coeff+j_start*nao, &nao,
            &D0, buf, &i_count);
-    // |iq) C_pi = |pq); |pq) in C order
-    dgemm_(&TRANS_T, &TRANS_T, &nao, &nao, &i_count,
-           &D1, buf, &i_count, mo_coeff+i_start*nao, &nao,
-           &D0, eri_bar_s1, &nao);
-
-    pack_tril(nao, eri_bar, eri_bar_s1);
+    // A coefficient-only caller still needs |iq), but not its AO projection.
+    // The full VJP keeps the original AO cotangent and packing operation.
+    if (eri_bar != NULL) {
+        double *eri_bar_s1 = buf + nao * i_count;
+        // |iq) C_pi = |pq); |pq) in C order
+        dgemm_(&TRANS_T, &TRANS_T, &nao, &nao, &i_count,
+               &D1, buf, &i_count, mo_coeff+i_start*nao, &nao,
+               &D0, eri_bar_s1, &nao);
+        pack_tril(nao, eri_bar, eri_bar_s1);
+    }
 
     // |iq) |pq) = C'_pi; |pq), C'_pi in C order
     dsymm_(&SIDE_R, &UPLO_U, &i_count, &nao,
@@ -93,18 +96,19 @@ int AO2MOmmm_nr_vjp_s2_igtj(double *eri_bar, double *mo_coeff_bar,
     int j_start = envs->ket_start;
     int j_count = envs->ket_count;
     double *mo_coeff = envs->mo_coeff; // C order
-    double *eri_bar_s1 = buf + nao * j_count;
 
     // C_pi |ij) = |pj); C_pi, |ij) in C order
     dgemm_(&TRANS_T, &TRANS_T, &nao, &j_count, &i_count,
            &D1, mo_coeff+i_start, &nmo, ybar, &j_count,
            &D0, buf, &nao);
-    // C_qj |pj) = |pq); C_qj, |pq) in C order
-    dgemm_(&TRANS_T, &TRANS_T, &nao, &nao, &j_count,
-           &D1, mo_coeff+j_start, &nmo, buf, &nao,
-           &D0, eri_bar_s1, &nao);
-
-    pack_tril(nao, eri_bar, eri_bar_s1);
+    if (eri_bar != NULL) {
+        double *eri_bar_s1 = buf + nao * j_count;
+        // C_qj |pj) = |pq); C_qj, |pq) in C order
+        dgemm_(&TRANS_T, &TRANS_T, &nao, &nao, &j_count,
+               &D1, mo_coeff+j_start, &nmo, buf, &nao,
+               &D0, eri_bar_s1, &nao);
+        pack_tril(nao, eri_bar, eri_bar_s1);
+    }
 
     // |pq) |pj) = C'_qj; |pq) in C order
     dsymm_(&SIDE_L, &UPLO_U, &nao, &j_count,
@@ -230,16 +234,16 @@ void AO2MOnr_e2_mo_coeff_vjp_drv(int (*fmmm)(),
             mo_coeff_bar_priv = calloc(nao*nmo, sizeof(double));
         }
         mo_coeff_bar_bufs[thread_id] = mo_coeff_bar_priv;
-        double *eri_bar_row = malloc(sizeof(double) * nao2);
-        double *buf = malloc(sizeof(double) * (nao*nao*2 + nao*MIN(i_count, j_count)));
+        // The first AO matrix holds the unpacked input; the remaining buffer
+        // holds |iq) or |pj). No AO-cotangent matrix is needed by this driver.
+        double *buf = malloc(sizeof(double) * (nao*nao + nao*MIN(i_count, j_count)));
         #pragma omp for schedule(static)
         for (i = 0; i < nij; i++) {
             NPdunpack_tril(nao, eri + nao2*i, buf, 0);
-            (*fmmm)(eri_bar_row, mo_coeff_bar_priv, buf,
+            (*fmmm)(NULL, mo_coeff_bar_priv, buf,
                     ybar + ij_pair*i, buf + nao*nao, &envs, 0);
         }
         free(buf);
-        free(eri_bar_row);
 
         omp_dsum_reduce_inplace(mo_coeff_bar_bufs, nao*nmo);
         if (thread_id != 0) {

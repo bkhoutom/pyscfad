@@ -229,11 +229,17 @@ def get_local_Lov(mf, mo_coeff_local, nocc, atmlst,
                 (auxmol.nao, nocc, nmo - nocc), dtype=mo_coeff_local.dtype
             )
         try:
+            # The direct builder expects a total-process memory ceiling,
+            # while with_df.max_memory is the available DF workspace.
+            max_memory = min(
+                mf.mol.max_memory,
+                pyscf_lib.current_memory()[0] + mf.with_df.max_memory,
+            )
             lov = _local_direct_nr_e2(
                 fake_mol,
                 auxmol,
                 mo_coeff_local,
-                mf.with_df.max_memory,
+                max_memory,
                 (0, nocc, nocc, nmo),
             )
         except ImportError as err:

@@ -102,18 +102,25 @@ def test_full_lis_mp2_matches_extended_domain_mp2():
     numpy.testing.assert_allclose(mp2(cc_lov), mp2(ed_lov), atol=1e-10, rtol=1e-11)
 
 
-def test_fragment_direct_budget_respects_user_total_and_workspace(monkeypatch):
+@pytest.mark.parametrize('builder', ['fragment', 'domain_mp2'])
+def test_fragment_direct_budget_respects_user_total_and_workspace(monkeypatch, builder):
     mol, atoms, coeff = _problem()
     mf = _holder(mol, False)
     seen = []
     def capture(m, a, c, limit, slices):
         seen.append(limit)
-        return np.zeros((a.nao, 16))
+        k0, k1, l0, l1 = slices
+        return np.zeros((a.nao, (k1-k0)*(l1-l0)))
     monkeypatch.setattr(lno_df, '_local_direct_nr_e2', capture)
     monkeypatch.setattr(lno_df.pyscf_lib, 'current_memory', lambda: (1000., 0.))
-    lno_df.transform_df_to_mo(mf, coeff, (0, 4, 0, 4), atmlst=atoms)
+    def build():
+        if builder == 'fragment':
+            return lno_df.transform_df_to_mo(mf, coeff, (0, 4, 0, 4), atmlst=atoms)
+        return lno_df.get_local_Lov(mf, _project(mol, coeff, atoms), 2, atoms,
+                                    integral_direct=True)
+    build()
     mol.max_memory = 1100
-    lno_df.transform_df_to_mo(mf, coeff, (0, 4, 0, 4), atmlst=atoms)
+    build()
     assert seen == [1200, 1100]
 
 

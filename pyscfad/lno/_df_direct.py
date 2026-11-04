@@ -27,6 +27,7 @@ from pyscfad import numpy as np
 from pyscfad.ao2mo import _ao2mo
 from pyscfad.df import _cderi_vjp
 from pyscfad.df import _int3c_cross_opt
+from pyscfad.lib._threading import dense_blas_threads
 from ._profile import _vjp_progress_section
 
 
@@ -296,17 +297,19 @@ def _local_direct_nr_e2_bwd(max_memory, orbs_slice, res, fitted_mo_bar):
 
     fitted_mo_np = numpy.asarray(jax.device_get(fitted_mo))
     fitted_mo_bar_np = numpy.asarray(jax.device_get(fitted_mo_bar))
-    z = scipy_linalg.solve_triangular(
-        low.T,
-        fitted_mo_bar_np,
-        lower=False,
-        check_finite=False,
-    )
-
     # If Y = L^{-1} T and Z = L^{-T} Ybar, then Lbar = -Z Y^T.  Form this
     # small auxiliary-metric cotangent before the streamed integral work so
     # the much larger Y and Ybar buffers can reach their last use here.
-    low_bar = -numpy.dot(z, fitted_mo_np.T)
+    # These dense operations are serial callers. Restore the embedding BLAS
+    # policy before the integral and MO-coefficient OpenMP kernels below.
+    with dense_blas_threads():
+        z = scipy_linalg.solve_triangular(
+            low.T,
+            fitted_mo_bar_np,
+            lower=False,
+            check_finite=False,
+        )
+        low_bar = -numpy.dot(z, fitted_mo_np.T)
     del fitted_mo_np, fitted_mo_bar_np, fitted_mo, fitted_mo_bar, low
 
     # Consume the metric tape before streaming the three-center integrals.

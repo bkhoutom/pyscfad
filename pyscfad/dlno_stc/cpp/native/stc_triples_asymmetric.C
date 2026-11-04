@@ -1,5 +1,6 @@
 #include "stc_triples.h"
 #include "triples_block_sampler.h"
+#include "scoped_openblas_threads.h"
 #include <array>
 #include <exception>
 #include <limits>
@@ -206,6 +207,7 @@ stc_triples::triples_result stc_triples::asymmetric_triples(
                  !std::isfinite(pilot->allocation_target) || pilot->allocation_target<=0))
         throw std::invalid_argument("asymmetric (T): invalid independent pilot");
     const bool gradient=vjp && cotangent!=0., exact=nsamples==0;
+    const int dense_blas_threads=detail::requested_dense_blas_threads();
     int threads=1;
     #pragma omp parallel
     {
@@ -243,7 +245,10 @@ stc_triples::triples_result stc_triples::asymmetric_triples(
         arma::mat gg(bank[GG].value.memptr(),no*nv,no*nv,false,true);
         if(integrals) {
             gv=integrals->ovvv; go=integrals->ovoo; gg=integrals->ovov;
+            result.packing_blas_threads=detail::observed_blas_threads();
         } else {
+            detail::scoped_openblas_threads blas_scope(dense_blas_threads);
+            result.packing_blas_threads=detail::observed_blas_threads();
             gv=Bvv.t()*Bvo; go=Boo.t()*Bvo; gg=Bvo.t()*Bvo;
         }
     }
@@ -595,6 +600,7 @@ stc_triples::triples_result stc_triples::asymmetric_triples(
         result.independent_pilot_seconds=omp_get_wtime()-start;
     }
     const double sampling_start=omp_get_wtime();
+    result.sampling_blas_threads=detail::observed_blas_threads();
     const auto production=stream(exact ? size_t(volume) : nsamples,seed,target,gradient,exact);
     result.energy=production.energy; result.standard_error=production.standard_error;
     result.samples=production.samples; result.pilot_samples=production.pilot_samples;
@@ -624,7 +630,10 @@ stc_triples::triples_result stc_triples::asymmetric_triples(
         arma::mat ggbar(bank[GG].bar.memptr(),no*nv,no*nv,false,true);
         if(integrals) {
             vjp->integrals.ovvv=gvbar; vjp->integrals.ovoo=gobar; vjp->integrals.ovov=ggbar;
+            result.finalize_blas_threads=detail::observed_blas_threads();
         } else {
+            detail::scoped_openblas_threads blas_scope(dense_blas_threads);
+            result.finalize_blas_threads=detail::observed_blas_threads();
             vjp->Bvv=Bvo*gvbar.t(); vjp->Boo=Bvo*gobar.t();
             vjp->Bvo=Bvv*gvbar+Boo*gobar+Bvo*(ggbar+ggbar.t());
         }

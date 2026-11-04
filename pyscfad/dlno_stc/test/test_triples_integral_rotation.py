@@ -180,6 +180,23 @@ def test_solver_energy_and_full_response_match_factor_path(mode, whole):
         assert diagnostics['samples'] == reference_diag['samples']
         assert diagnostics['rotated_integrals']
         assert not reference_diag['rotated_integrals']
+        for timing in (diagnostics, reference_diag):
+            if mode == 'fixed' and with_grad:
+                assert 0 < timing['pilot_reverse_seconds'] <= timing['pilot_seconds']
+            else:
+                assert timing['pilot_reverse_seconds'] == 0
+    if mode == 'deterministic':
+        # Check quadrature-weighted cotangents independently of both reverse
+        # implementations, including simultaneous integral and Fock changes.
+        direction = jax.tree.map(
+            lambda value: jnp.asarray(rng.normal(scale=.01, size=value.shape)), x)
+        step = 1e-5
+        plus = jax.tree.map(lambda value, delta: value + step*delta, x, direction)
+        minus = jax.tree.map(lambda value, delta: value - step*delta, x, direction)
+        finite_difference = (evaluate(plus, 'rotate', False)[0]
+                             - evaluate(minus, 'rotate', False)[0]) / (2*step)
+        response = sum(jnp.sum(bar[key] * direction[key]) for key in x)
+        np.testing.assert_allclose(response, finite_difference, rtol=3e-6, atol=2e-10)
 
 
 @pytest.mark.parametrize('mode', ['deterministic', 'stochastic'])

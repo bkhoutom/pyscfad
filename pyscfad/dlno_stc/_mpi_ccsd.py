@@ -39,7 +39,7 @@ def _build_cc_worker(worker_initializer, canonical, signature):
 def _run_mpi(initializer, worker_initializer, comm, *, with_grad,
              include_hf=False, merge_identical=True, verbose_imp=0,
              ccsd_t=False, return_components=False, include_baseline=True,
-             fragment_indices=None, parallel_scf_jk=False, scf_worker_initializer=None,
+             fragment_indices=None, parallel_scf_jk=True, scf_worker_initializer=None,
              vvvv_direct=False):
     """Run CC owner jobs between optional distributed SCF/reference sessions."""
     _collective_call(comm, _check_mpi_thread_support, 'CC MPI thread preflight')

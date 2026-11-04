@@ -191,6 +191,7 @@ def test_solver_energy_and_full_response_match_factor_path(mode, whole, monkeypa
         assert diagnostics['samples'] == reference_diag['samples']
         assert diagnostics['rotated_integrals']
         assert not reference_diag['rotated_integrals']
+        assert diagnostics['stable_dressing'] and reference_diag['stable_dressing']
         for timing in (diagnostics, reference_diag):
             # Independent allocation pilots are energy-only in every mode.
             assert timing['pilot_reverse_seconds'] == 0

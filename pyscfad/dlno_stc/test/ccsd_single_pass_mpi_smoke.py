@@ -101,9 +101,9 @@ def run(output, *, serial=False, gradient=False, include_baseline=False,
                        pilot_samples=16, global_seed=71, integral_transform='rotate',
                        variance_allocation='occupied_count', energy_tolerance=1e-3),
                    comm=None if serial else comm)
-    # Preserve the omitted-option path to exercise the root-owned default.
-    if parallel_scf_jk:
-        options['parallel_scf_jk'] = True
+    # Preserve the omitted-option path to exercise the distributed default.
+    if not parallel_scf_jk:
+        options['parallel_scf_jk'] = False
     with ExitStack() as stack:
         stack.enter_context(config_update('pyscfad_moleintor_opt', True))
         stack.enter_context(config_update('pyscfad_scf_df_precond', False))

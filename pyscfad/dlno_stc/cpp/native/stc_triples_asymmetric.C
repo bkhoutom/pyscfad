@@ -1,4 +1,5 @@
 #include "stc_triples.h"
+#include "triples_prepared.h"
 #include "triples_block_sampler.h"
 #include "scoped_openblas_threads.h"
 #include <array>
@@ -8,12 +9,13 @@
 #include <memory>
 #include <tuple>
 #include <omp.h>
+#include <cstring>
 
 namespace libgmbpt { namespace qchem { namespace {
 
 using index4 = std::array<size_t,4>;
 using index6 = std::array<size_t,6>;
-enum { T1, T2, GV, GO, GG, FOV, NTYPES };
+
 const size_t permutations[6][3]={{0,1,2},{1,2,0},{2,0,1},{0,2,1},{1,0,2},{2,1,0}};
 const double spin_weights[6]={4,1,1,-2,-2,-2};
 
@@ -21,22 +23,23 @@ struct tensor {
     int kind;
     index4 dims;
     arma::vec value, bar;
-    tensor(int k,index4 d,bool gradient) : kind(k),dims(d) {
+    tensor(int k,index4 d,bool gradient,const double* values=nullptr) : kind(k),dims(d) {
         size_t length=1;
         for(auto n:d) {
             if(n && length>std::numeric_limits<size_t>::max()/n)
                 throw std::overflow_error("asymmetric (T): tensor dimensions overflow");
             length*=n;
         }
-        value.zeros(length);
+        if(values) value=arma::vec(const_cast<double*>(values),length,false,true);
+        else value.zeros(length);
         if(gradient) bar.zeros(length);
     }
     size_t offset(const index4& x) const {
         return ((x[0]*dims[1]+x[1])*dims[2]+x[2])*dims[3]+x[3];
     }
-    size_t owners() const { return kind==T2 ? dims[1]*dims[2] : dims[0]*dims[1]; }
+    size_t owners() const { return triples_doubles_kind(kind) ? dims[1]*dims[2] : dims[0]*dims[1]; }
     size_t owner(const index4& x) const {
-        return kind==T2 ? x[1]*dims[2]+x[2] : x[0]*dims[1]+x[1];
+        return triples_doubles_kind(kind) ? x[1]*dims[2]+x[2] : x[0]*dims[1]+x[1];
     }
 };
 
@@ -184,22 +187,26 @@ stc_triples::triples_result stc_triples::asymmetric_triples(
     const arma::mat& left,const arma::mat& right,
     size_t nsamples,std::uint64_t seed,double target,
     triples_vjp* vjp,double cotangent,const arma::mat* fov,const pilot_controls* pilot,
-    const triples_integrals* integrals) {
-    const size_t no=t1.n_elem,nv=no ? t1(0).n_elem : 0,ns=left.n_cols;
-    if(!no || !nv || !ns || ns>no || left.n_rows!=no || right.n_rows!=no || right.n_cols!=ns ||
-       !left.is_finite() || !right.is_finite() ||
-       t2.n_rows!=no || t2.n_cols!=no || (fov && (fov->n_rows!=no || fov->n_cols!=nv || !fov->is_finite())))
-        throw std::invalid_argument("asymmetric (T): inconsistent dimensions or nonfinite inputs");
-    if(integrals) {
-        const auto& g=*integrals;
-        if(g.ovvv.n_rows!=nv*nv || g.ovoo.n_rows!=no*no || g.ovov.n_rows!=no*nv ||
-           g.ovvv.n_cols!=no*nv || g.ovoo.n_cols!=no*nv || g.ovov.n_cols!=no*nv ||
-           !g.ovvv.is_finite() || !g.ovoo.is_finite() || !g.ovov.is_finite())
-            throw std::invalid_argument("asymmetric (T): invalid integral tensors");
-    } else if(!Bvo.n_rows || Bvo.n_cols!=no*nv || Boo.n_cols!=no*no ||
-              Bvv.n_cols!=nv*nv || Bvo.n_rows!=Boo.n_rows || Bvo.n_rows!=Bvv.n_rows ||
-              !Bvo.is_finite() || !Boo.is_finite() || !Bvv.is_finite()) {
-        throw std::invalid_argument("asymmetric (T): invalid DF factors");
+    const triples_integrals* integrals,const triples_prepared* prepared) {
+    const size_t no=prepared ? prepared->no : t1.n_elem;
+    const size_t nv=prepared ? prepared->nv : (no ? t1(0).n_elem : 0);
+    const size_t ns=prepared ? prepared->ns : left.n_cols;
+    if(!prepared) {
+        if(!no || !nv || !ns || ns>no || left.n_rows!=no || right.n_rows!=no || right.n_cols!=ns ||
+           !left.is_finite() || !right.is_finite() ||
+           t2.n_rows!=no || t2.n_cols!=no || (fov && (fov->n_rows!=no || fov->n_cols!=nv || !fov->is_finite())))
+            throw std::invalid_argument("asymmetric (T): inconsistent dimensions or nonfinite inputs");
+        if(integrals) {
+            const auto& g=*integrals;
+            if(g.ovvv.n_rows!=nv*nv || g.ovoo.n_rows!=no*no || g.ovov.n_rows!=no*nv ||
+               g.ovvv.n_cols!=no*nv || g.ovoo.n_cols!=no*nv || g.ovov.n_cols!=no*nv ||
+               !g.ovvv.is_finite() || !g.ovoo.is_finite() || !g.ovov.is_finite())
+                throw std::invalid_argument("asymmetric (T): invalid integral tensors");
+        } else if(!Bvo.n_rows || Bvo.n_cols!=no*nv || Boo.n_cols!=no*no ||
+                  Bvv.n_cols!=nv*nv || Bvo.n_rows!=Boo.n_rows || Bvo.n_rows!=Bvv.n_rows ||
+                  !Bvo.is_finite() || !Boo.is_finite() || !Bvv.is_finite()) {
+            throw std::invalid_argument("asymmetric (T): invalid DF factors");
+        }
     }
     if(nsamples==1 || !std::isfinite(target) || target<0 || (target>0 && !nsamples) || !std::isfinite(cotangent))
         throw std::invalid_argument("asymmetric (T): invalid sample count, target or cotangent");
@@ -219,60 +226,73 @@ stc_triples::triples_result stc_triples::asymmetric_triples(
     const double packing_start=omp_get_wtime();
     std::vector<tensor> bank;
     bank.reserve(32);
-    bank.emplace_back(T1,index4{{no,nv,1,1}},gradient);
-    bank.emplace_back(T2,index4{{no,no,nv,nv}},gradient);
-    bank.emplace_back(GV,index4{{no,nv,nv,nv}},gradient);
-    bank.emplace_back(GO,index4{{no,nv,no,no}},gradient);
-    bank.emplace_back(GG,index4{{no,nv,no,nv}},gradient);
-    bank.emplace_back(FOV,index4{{no,nv,1,1}},gradient);
-    for(size_t i=0;i<no;++i) {
-        if(t1(i).n_elem!=nv || !t1(i).is_finite())
-            throw std::invalid_argument("asymmetric (T): invalid T1");
-        for(size_t a=0;a<nv;++a) {
-            bank[T1].value[i*nv+a]=t1(i)(a);
-            bank[FOV].value[i*nv+a]=fov ? (*fov)(i,a) : 0.;
-        }
-        for(size_t j=0;j<no;++j) {
-            if(t2(i,j).n_rows!=nv || t2(i,j).n_cols!=nv || !t2(i,j).is_finite())
-                throw std::invalid_argument("asymmetric (T): invalid T2");
-            arma::mat packed(bank[T2].value.memptr()+(i*no+j)*nv*nv,nv,nv,false,true);
-            packed=t2(i,j).t();
-        }
-    }
-    {
-        arma::mat gv(bank[GV].value.memptr(),nv*nv,no*nv,false,true);
-        arma::mat go(bank[GO].value.memptr(),no*no,no*nv,false,true);
-        arma::mat gg(bank[GG].value.memptr(),no*nv,no*nv,false,true);
-        if(integrals) {
-            gv=integrals->ovvv; go=integrals->ovoo; gg=integrals->ovov;
-            result.packing_blas_threads=detail::observed_blas_threads();
-        } else {
-            detail::scoped_openblas_threads blas_scope(dense_blas_threads);
-            result.packing_blas_threads=detail::observed_blas_threads();
-            gv=Bvv.t()*Bvo; go=Boo.t()*Bvo; gg=Bvo.t()*Bvo;
-        }
-    }
-    result.amplitude_packing_seconds=omp_get_wtime()-packing_start;
-    const double projection_start=omp_get_wtime();
     size_t projected[2][NTYPES][2];
     struct projection { size_t source,dest,axis,side; };
     std::vector<projection> projections;
-    for(size_t side=0;side<2;++side) for(size_t kind=0;kind<NTYPES;++kind)
-        for(size_t slot=0;slot<2;++slot) projected[side][kind][slot]=kind;
-    for(size_t side=0;side<2;++side) for(size_t kind=0;kind<NTYPES;++kind) {
-        if(side==0 && (kind==T1 || kind==GG || kind==FOV)) continue;
-        const size_t slots=(kind==T2 || kind==GO || kind==GG) ? 2 : 1;
-        for(size_t slot=0;slot<slots;++slot) {
-            const size_t axis=slot ? (kind==T2 ? 1 : 2) : 0;
-            auto dims=bank[kind].dims; dims[axis]=ns;
-            const size_t id=bank.size();
-            bank.emplace_back(int(kind),dims,gradient);
-            projected[side][kind][slot]=id;
-            projections.push_back({kind,id,axis,side});
-            project_tensor(bank[kind],bank[id],axis,side ? right : left);
+    if(prepared) {
+        result.packing_blas_threads=detail::observed_blas_threads();
+        triples_layout layout(no,nv,ns);
+        if(prepared->tensors.size()!=layout.tensors.size())
+            throw std::invalid_argument("stable triples: inconsistent tensor count");
+        for(size_t i=0;i<layout.tensors.size();++i) {
+            const auto& spec=layout.tensors[i];
+            bank.emplace_back(int(spec.kind),spec.dims,gradient,prepared->tensors[i].memptr());
         }
+        std::memcpy(projected,layout.projected,sizeof(projected));
+        result.amplitude_packing_seconds=omp_get_wtime()-packing_start;
+    } else {
+        bank.emplace_back(T1,index4{{no,nv,1,1}},gradient);
+        bank.emplace_back(T2,index4{{no,no,nv,nv}},gradient);
+        bank.emplace_back(GV,index4{{no,nv,nv,nv}},gradient);
+        bank.emplace_back(GO,index4{{no,nv,no,no}},gradient);
+        bank.emplace_back(GG,index4{{no,nv,no,nv}},gradient);
+        bank.emplace_back(FOV,index4{{no,nv,1,1}},gradient);
+        for(size_t i=0;i<no;++i) {
+            if(t1(i).n_elem!=nv || !t1(i).is_finite())
+                throw std::invalid_argument("asymmetric (T): invalid T1");
+            for(size_t a=0;a<nv;++a) {
+                bank[T1].value[i*nv+a]=t1(i)(a);
+                bank[FOV].value[i*nv+a]=fov ? (*fov)(i,a) : 0.;
+            }
+            for(size_t j=0;j<no;++j) {
+                if(t2(i,j).n_rows!=nv || t2(i,j).n_cols!=nv || !t2(i,j).is_finite())
+                    throw std::invalid_argument("asymmetric (T): invalid T2");
+                arma::mat packed(bank[T2].value.memptr()+(i*no+j)*nv*nv,nv,nv,false,true);
+                packed=t2(i,j).t();
+            }
+        }
+        {
+            arma::mat gv(bank[GV].value.memptr(),nv*nv,no*nv,false,true);
+            arma::mat go(bank[GO].value.memptr(),no*no,no*nv,false,true);
+            arma::mat gg(bank[GG].value.memptr(),no*nv,no*nv,false,true);
+            if(integrals) {
+                gv=integrals->ovvv; go=integrals->ovoo; gg=integrals->ovov;
+                result.packing_blas_threads=detail::observed_blas_threads();
+            } else {
+                detail::scoped_openblas_threads blas_scope(dense_blas_threads);
+                result.packing_blas_threads=detail::observed_blas_threads();
+                gv=Bvv.t()*Bvo; go=Boo.t()*Bvo; gg=Bvo.t()*Bvo;
+            }
+        }
+        result.amplitude_packing_seconds=omp_get_wtime()-packing_start;
+        const double projection_start=omp_get_wtime();
+        for(size_t side=0;side<2;++side) for(size_t kind=0;kind<6;++kind)
+            for(size_t slot=0;slot<2;++slot) projected[side][kind][slot]=kind;
+        for(size_t side=0;side<2;++side) for(size_t kind=0;kind<6;++kind) {
+            if(side==0 && (kind==T1 || kind==GG || kind==FOV)) continue;
+            const size_t slots=(kind==T2 || kind==GO || kind==GG) ? 2 : 1;
+            for(size_t slot=0;slot<slots;++slot) {
+                const size_t axis=slot ? (triples_doubles_kind(kind) ? 1 : 2) : 0;
+                auto dims=bank[kind].dims; dims[axis]=ns;
+                const size_t id=bank.size();
+                bank.emplace_back(int(kind),dims,gradient);
+                projected[side][kind][slot]=id;
+                projections.push_back({kind,id,axis,side});
+                project_tensor(bank[kind],bank[id],axis,side ? right : left);
+            }
+        }
+        result.projection_setup_seconds=omp_get_wtime()-projection_start;
     }
-    result.projection_setup_seconds=omp_get_wtime()-projection_start;
     for(const auto& b:bank) result.resident_tensor_bytes+=(b.value.n_elem+b.bar.n_elem)*sizeof(double);
     auto selected_id=[&](size_t side,size_t kind,int slot) {
         return slot<0 ? kind : projected[side][kind][size_t(slot)];
@@ -282,9 +302,9 @@ stc_triples::triples_result stc_triples::asymmetric_triples(
         const size_t i=x[0],j=x[1],k=x[2],a=x[3],b=x[4],c=x[5],s=t.selected;
         operations op;
         op.ids={{selected_id(side,GV,s==0 ? 0 : -1),
-                 selected_id(side,T2,s==2 ? 0 : (s==1 ? 1 : -1)),
+                 selected_id(side,prepared ? T2V : T2,s==2 ? 0 : (s==1 ? 1 : -1)),
                  selected_id(side,GO,s==0 ? 0 : (s==1 ? 1 : -1)),
-                 selected_id(side,T2,s==2 ? 1 : -1),
+                 selected_id(side,prepared ? T2O : T2,s==2 ? 1 : -1),
                  selected_id(side,GG,s==0 ? 0 : (s==1 ? 1 : -1)),
                  selected_id(side,T1,s==2 ? 0 : -1),
                  selected_id(side,FOV,s==2 ? 0 : -1),
@@ -616,26 +636,31 @@ stc_triples::triples_result stc_triples::asymmetric_triples(
                 project_pullback(bank[p.source],bank[p.dest],p.axis,p.side ? right : left,
                                  p.side ? vjp->occupied_right : vjp->occupied_left);
         } else for(auto& b:bank) b.bar.zeros(b.value.n_elem);
-        vjp->t1.set_size(no); vjp->t2.set_size(no,no); vjp->fov.zeros(no,nv);
-        for(size_t i=0;i<no;++i) {
-            vjp->t1(i)=bank[T1].bar.subvec(i*nv,(i+1)*nv-1);
-            for(size_t a=0;a<nv;++a) vjp->fov(i,a)=bank[FOV].bar[i*nv+a];
-            for(size_t j=0;j<no;++j) {
-                arma::mat packed(bank[T2].bar.memptr()+(i*no+j)*nv*nv,nv,nv,false,true);
-                vjp->t2(i,j)=packed.t();
-            }
-        }
-        arma::mat gvbar(bank[GV].bar.memptr(),nv*nv,no*nv,false,true);
-        arma::mat gobar(bank[GO].bar.memptr(),no*no,no*nv,false,true);
-        arma::mat ggbar(bank[GG].bar.memptr(),no*nv,no*nv,false,true);
-        if(integrals) {
-            vjp->integrals.ovvv=gvbar; vjp->integrals.ovoo=gobar; vjp->integrals.ovov=ggbar;
+        if(prepared) {
             result.finalize_blas_threads=detail::observed_blas_threads();
+            for(auto& b:bank) vjp->prepared.push_back(std::move(b.bar));
         } else {
-            detail::scoped_openblas_threads blas_scope(dense_blas_threads);
-            result.finalize_blas_threads=detail::observed_blas_threads();
-            vjp->Bvv=Bvo*gvbar.t(); vjp->Boo=Bvo*gobar.t();
-            vjp->Bvo=Bvv*gvbar+Boo*gobar+Bvo*(ggbar+ggbar.t());
+            vjp->t1.set_size(no); vjp->t2.set_size(no,no); vjp->fov.zeros(no,nv);
+            for(size_t i=0;i<no;++i) {
+                vjp->t1(i)=bank[T1].bar.subvec(i*nv,(i+1)*nv-1);
+                for(size_t a=0;a<nv;++a) vjp->fov(i,a)=bank[FOV].bar[i*nv+a];
+                for(size_t j=0;j<no;++j) {
+                    arma::mat packed(bank[T2].bar.memptr()+(i*no+j)*nv*nv,nv,nv,false,true);
+                    vjp->t2(i,j)=packed.t();
+                }
+            }
+            arma::mat gvbar(bank[GV].bar.memptr(),nv*nv,no*nv,false,true);
+            arma::mat gobar(bank[GO].bar.memptr(),no*no,no*nv,false,true);
+            arma::mat ggbar(bank[GG].bar.memptr(),no*nv,no*nv,false,true);
+            if(integrals) {
+                vjp->integrals.ovvv=gvbar; vjp->integrals.ovoo=gobar; vjp->integrals.ovov=ggbar;
+                result.finalize_blas_threads=detail::observed_blas_threads();
+            } else {
+                detail::scoped_openblas_threads blas_scope(dense_blas_threads);
+                result.finalize_blas_threads=detail::observed_blas_threads();
+                vjp->Bvv=Bvo*gvbar.t(); vjp->Boo=Bvo*gobar.t();
+                vjp->Bvo=Bvv*gvbar+Boo*gobar+Bvo*(ggbar+ggbar.t());
+            }
         }
         result.vjp_finalize_seconds=omp_get_wtime()-start;
         result.vjp_reverse_seconds+=result.vjp_finalize_seconds;

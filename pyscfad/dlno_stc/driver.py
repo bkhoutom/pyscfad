@@ -622,7 +622,7 @@ def _run_system(initializer, controls, comm, *, with_grad, include_hf=False):
 
 @memory_calculation
 def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
-           lo_kwargs=None, merge_identical=True, parallel_scf_jk=False):
+           lo_kwargs=None, merge_identical=True, parallel_scf_jk=True):
     """Return correlation energy on root.
 
     Domain jobs share identical saved frames by default. ``merge_identical=False``
@@ -630,9 +630,9 @@ def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
     With a multi-rank domain communicator, each rank supplies a matching MF
     object; workers may use an unconverged skeleton. Root's canonical state
     is installed on workers without SCF. Only root needs selections/controls.
-    Shared DF J/K work stays on root by default, independently of MPI fragment
-    ownership. ``parallel_scf_jk=True`` distributes common-preparation DF J/K
-    work for multi-rank domain calls. SCF preceding this energy-only API is caller-owned.
+    The default ``parallel_scf_jk=True`` distributes common-preparation DF J/K
+    work for multi-rank domain calls; ``False`` keeps this work on root.
+    SCF preceding this energy-only API is caller-owned.
     System, serial and single-rank calls retain their existing behavior.
     """
     scope = _shared_scope(static, scope, frozen, comm, lo_kwargs)
@@ -672,7 +672,7 @@ def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
 @memory_calculation
 def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
                    controls, comm=None, include_hf=False, lo_kwargs=None, merge_identical=True,
-                   build_static=None, parallel_scf_jk=False):
+                   build_static=None, parallel_scf_jk=True):
     """Return ``(energy, mol_bar)`` on root; worker ranks return ``None``.
 
     Discrete selections and the Laplace grid are fixed. System scope fixes
@@ -702,8 +702,7 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
     ``mo_occ_init`` and ``e_tot_init``, adopt their supplied values, and skip
     SCF. Workers may pass ``None`` for selections and controls; ``build_static``
     runs only on root. Results are returned only on communicator rank zero.
-    SCF and shared response stay on root by default. Explicitly setting
-    ``parallel_scf_jk=True`` distributes DF J/K contractions in SCF,
+    The default ``parallel_scf_jk=True`` distributes DF J/K contractions in SCF,
     common-data preparation and their coordinate pullbacks.
     With this option, workers first build an unrun reference with placeholder
     canonical arrays to prepare compatible global DF factors, then adopt

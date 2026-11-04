@@ -351,7 +351,7 @@ def _timed_section(name, totals, stage):
 
 def _run_domain_mpi(initializer, worker_initializer, static, controls, comm, *,
                     with_grad, include_hf=False, merge_identical=True,
-                    parallel_scf_jk=False, scf_worker_initializer=None):
+                    parallel_scf_jk=True, scf_worker_initializer=None):
     """Schedule domains between distributed shared SCF/reference sessions."""
     from . import driver
 

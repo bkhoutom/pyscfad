@@ -1,5 +1,6 @@
 // Packing and validation for the native triples kernels.
 #include "native/stc_triples.h"
+#include "native/triples_prepared.h"
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <cmath>
@@ -132,7 +133,7 @@ py::dict asymmetric(py::handle t1_value, py::handle t2_value,
                     py::handle left_value, py::handle right_value,
                     py::handle sample_value, py::handle seed_value,
                     py::handle target_value, py::handle fov_value, bool with_vjp,
-                    py::object pilot_value, bool integral_inputs=false) {
+                    py::object pilot_value, bool integral_inputs=false, py::object prepared_value=py::none()) {
     const auto samples=unsigned_integer(sample_value,"nsamples");
     const auto seed=unsigned_integer(seed_value,"seed");
     const auto target=standard_error_target(target_value);
@@ -168,7 +169,9 @@ py::dict asymmetric(py::handle t1_value, py::handle t2_value,
     t2.shape({no,no,nv,nv});
     arma::mat Bvo,Boo,Bvv;
     Triples::triples_integrals integrals;
-    if(integral_inputs) {
+    if(!prepared_value.is_none()) {
+        // Raw integral packing is bypassed for already prepared stable tensors.
+    } else if(integral_inputs) {
         InputArray ovvv(bvo_value,"ovvv",4), ovoo(boo_value,"ovoo",4), ovov(bvv_value,"ovov",4);
         ovvv.shape({no,nv,nv,nv}); ovoo.shape({no,nv,no,no}); ovov.shape({no,nv,no,nv});
         integrals.ovvv=integral_matrix(ovvv);
@@ -194,13 +197,35 @@ py::dict asymmetric(py::handle t1_value, py::handle t2_value,
     const auto L=matrix(left), R=matrix(right);
     arma::field<arma::vec> singles(no);
     arma::field<arma::mat> doubles(no,no);
-    for (py::ssize_t i=0; i<no; ++i) {
+    if(prepared_value.is_none()) for (py::ssize_t i=0; i<no; ++i) {
         singles(i).set_size(nv);
         for (py::ssize_t a=0; a<nv; ++a) singles(i)(a)=t1.get({i,a});
         for (py::ssize_t j=0; j<no; ++j) {
             doubles(i,j).set_size(nv,nv);
             for (py::ssize_t a=0; a<nv; ++a)
                 for (py::ssize_t b=0; b<nv; ++b) doubles(i,j)(a,b)=t2.get({i,j,a,b});
+        }
+    }
+    Triples::triples_prepared prepared;
+    std::vector<py::array_t<double,py::array::c_style>> retained;
+    if(!prepared_value.is_none()) {
+        prepared.no=size_t(no); prepared.nv=size_t(nv); prepared.ns=size_t(left.size(1));
+        const auto values=prepared_value.cast<py::tuple>();
+        const libgmbpt::qchem::triples_layout layout(prepared.no,prepared.nv,prepared.ns);
+        if(values.size()!=layout.tensors.size()) throw py::value_error("stable triples: inconsistent tensor count");
+        retained.reserve(values.size()); prepared.tensors.reserve(values.size());
+        for(size_t i=0;i<values.size();++i) {
+            const auto& spec=layout.tensors[i];
+            InputArray input(values[i],"prepared tensor",int(spec.rank));
+            for(size_t d=0;d<spec.rank;++d)
+                if(input.size(d)!=py::ssize_t(spec.dims[d]))
+                    throw py::value_error("stable triples: inconsistent tensor shape");
+            retained.push_back(py::array_t<double,py::array::c_style>::ensure(values[i]));
+            const auto& a=retained.back();
+            if(!a) throw py::value_error("stable triples: invalid array");
+            for(py::ssize_t j=0;j<a.size();++j)
+                if(!std::isfinite(a.data()[j])) throw py::value_error("stable triples: nonfinite tensor");
+            prepared.tensors.emplace_back(const_cast<double*>(a.data()),size_t(a.size()),false,true);
         }
     }
     Triples::triples_result result;
@@ -210,7 +235,8 @@ py::dict asymmetric(py::handle t1_value, py::handle t2_value,
         result=Triples::asymmetric_triples(singles,doubles,Bvo,Boo,Bvv,
             L,R,size_t(samples),seed,target,
             with_vjp ? &bars : nullptr,1.0,fov_ptr,pilot_ptr,
-            integral_inputs ? &integrals : nullptr);
+            integral_inputs ? &integrals : nullptr,
+            prepared_value.is_none() ? nullptr : &prepared);
     }
     py::dict out;
     out["energy"]=result.energy; out["standard_error"]=result.standard_error;
@@ -247,7 +273,18 @@ py::dict asymmetric(py::handle t1_value, py::handle t2_value,
     timings["vjp_accumulation_seconds"]=result.vjp_accumulation_seconds;
     timings["vjp_finalize_seconds"]=result.vjp_finalize_seconds;
     out["timings"]=timings;
-    if (with_vjp) {
+    if(with_vjp && !prepared_value.is_none()) {
+        const libgmbpt::qchem::triples_layout layout(prepared.no,prepared.nv,prepared.ns);
+        py::tuple cotangents(layout.tensors.size());
+        for(size_t i=0;i<layout.tensors.size();++i) {
+            const auto& spec=layout.tensors[i];
+            std::vector<py::ssize_t> dims(spec.dims.begin(),spec.dims.begin()+spec.rank);
+            py::array_t<double> value(dims);
+            std::memcpy(value.mutable_data(),bars.prepared[i].memptr(),bars.prepared[i].n_elem*sizeof(double));
+            cotangents[i]=std::move(value);
+        }
+        out["cotangents"]=std::move(cotangents);
+    } else if (with_vjp) {
         py::dict cotangents;
         py::array_t<double> t1bar({no,nv}), t2bar({no,no,nv,nv});
         auto s=t1bar.mutable_unchecked<2>(); auto d=t2bar.mutable_unchecked<4>();
@@ -287,8 +324,20 @@ void bind_triples(py::module_& module) {
 #endif
     // Immutable identity covers the extended native numerical sources and binding.
     module.attr("TRIPLES_VERSION")=
-        "stc_triples:asymmetric-only:sha256:header=3ef7f213319f9b11b39424261fb449b65fb9842f489324fd655c0ab2bad61a40:asymmetric=235666a7809d36ade07465a1643fc1796f78c8e016cced24566f4c5a0c098889:sampler=3cb84a2fd873ab706d3b67b9f0f9f3119981d22a9ca291535075dd78072f7a96:dressing=5212e9d7e375a7f92fac8202fb3025151d53eea13355d7963cd7705beb2c1cb5:mp2_gradient=1414da61595bc0674be42479f354881f2f6e1ad0e84e3e3d6a1dac9170923bbd:scoped_blas=8f402a8ec775910668e556e8ca81f56e0852eac3abfec8ae1ec9e0405509dbc5:binding-12-scoped-openblas";
+        "stc_triples:stable-external-legs:sha256:0c5032626d8138b6bb727a4a92c35f7daf443389fb40560832943e705bcb6e89";
     for (bool vjp : {false,true}) {
+        module.def(vjp ? "triples_prepared_energy_vjp" : "triples_prepared_energy",
+            [vjp](py::tuple tensors,py::handle nsamples,py::handle seed,
+                  py::handle target,py::object pilot) {
+                if(tensors.size()!=26) throw py::value_error("stable triples: expected 26 tensors");
+                InputArray t1(tensors[0],"t1",2), selected(tensors[8],"selected ovvv",4);
+                py::array_t<double> placeholder({t1.size(0),selected.size(0)});
+                std::fill(placeholder.mutable_data(),placeholder.mutable_data()+placeholder.size(),0.);
+                return asymmetric(tensors[0],tensors[1],tensors[2],tensors[3],tensors[4],
+                    placeholder,placeholder,nsamples,seed,target,py::none(),vjp,pilot,true,tensors);
+            },py::arg("tensors"),py::arg("nsamples"),py::arg("seed")=71,
+              py::arg("target_standard_error")=0.,py::kw_only(),py::arg("pilot")=py::none(),
+              "Stable Laplace numerator with undressed internal legs and direct physical projections.");
         module.def(vjp ? "triples_asymmetric_energy_vjp" : "triples_asymmetric_energy",
             [vjp](py::handle t1,py::handle t2,py::handle Bvo,py::handle Boo,
                   py::handle Bvv,py::handle L,py::object R,py::handle nsamples,

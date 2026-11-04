@@ -1,15 +1,12 @@
 """Orbital-invariant Laplace (T) with physical fragment energy weights.
 
-Each quadrature node dresses all six external numerator legs by half an
-exponential. Reciprocal factors on contracted internal legs cancel exactly.
-The existing native kernel then evaluates the dressed numerator with D=-1.
-Full Fock-block response enters through stable matrix-function derivatives.
-By default, each node dresses DF factors and contracts integral blocks. The
-optional integral_transform='rotate' dresses cached CCSD blocks directly.
-
-For a partial occupied target M=U U.T, the numerator weight is O^-1 M O.
-The numerator factors this as L R.T, L=O^-1 U, R=O U, and contracts
-directly over the physical selected space S. Whole-LIS targets use U=I.
+Each quadrature node dresses only external numerator legs. Internal contracted
+legs are left undressed, using separate T2 forms for virtual and occupied
+contractions. Physical projections are built directly with U.T and U.T O^2;
+no inverse exponential is formed. Matrix-function derivatives retain the full
+Fock and physical-projector response, including degenerate spectra.
+The DF path constructs raw integral blocks once per fragment; rotate reuses
+cached CCSD integral blocks. Both use the same stable native numerator.
 """
 import importlib
 import os
@@ -84,16 +81,14 @@ def _native(inputs, samples, seed, target=0., with_grad=True, *, pilot=None,
     native = importlib.import_module('pyscfad.dlno_stc._stc_mp2')
     values = [np.asarray(x, dtype=np.float64) for x in inputs]
     options = {} if pilot is None else {'pilot': pilot}
-    name = 'triples_asymmetric_' + ('integrals_' if integral_inputs else '') + 'energy'
-    function = getattr(native, name + ('_vjp' if with_grad else ''))
-    return function(*values[:5], *values[6:], nsamples=int(samples), seed=int(seed),
-                    target_standard_error=float(target), fov=values[5], **options)
+    function = getattr(native, 'triples_prepared_energy' + ('_vjp' if with_grad else ''))
+    return function(tuple(values), nsamples=int(samples), seed=int(seed),
+                    target_standard_error=float(target), **options)
 
 
 def _make_dresser(inputs, *, integral_inputs=False):
     native = importlib.import_module('pyscfad.dlno_stc._stc_mp2')
-    return native.TriplesDressing(tuple(np.asarray(x, dtype=np.float64) for x in inputs),
-                                  integral_inputs=integral_inputs)
+    return native.StableTriplesDressing(tuple(np.asarray(x, dtype=np.float64) for x in inputs))
 
 
 def _dressing_cache_bytes(max_memory):
@@ -115,8 +110,7 @@ def make_solver(controls, grid, *, with_grad):
         raise ValueError('removed triples options: ' + ', '.join(sorted(removed)))
     stochastic = controls['mode'] == 'stochastic'
     rotate = _triples_integral_transform(controls) == 'rotate'
-    names = INTEGRAL_NAMES if rotate else NAMES
-    native_options = {'integral_inputs': True} if rotate else {}
+    native_options = {}
     trace_exponent = _finite_control('trace_exponent',
         controls.get('trace_exponent', DEFAULT_TRIPLES_TRACE_EXPONENT))
     seed = controls.get('global_seed', 71)
@@ -245,8 +239,7 @@ def make_solver(controls, grid, *, with_grad):
             sampling_threads = max(sampling_threads, int(result.get('sampling_threads', 0)))
             if with_grad:
                 phase = time.perf_counter()
-                transformed_bars = tuple(result['cotangents'][name]
-                                         for name in (*names, 'L', 'R'))
+                transformed_bars = tuple(result['cotangents'])
                 # The binding returns independent writable NumPy arrays, used
                 # only here. Reuse them instead of allocating a weighted copy.
                 for bar in transformed_bars:
@@ -277,6 +270,7 @@ def make_solver(controls, grid, *, with_grad):
             adaptive=bool(stochastic and target),
             point_preparation_reused=bool(stochastic and target),
             asymmetric_dressing=True,
+            stable_dressing=True,
             native_dressing=True,
             rotated_integrals=rotate,
             dressing_cache_peak_bytes=dressing_cache_peak_bytes,
@@ -337,7 +331,12 @@ def make_solver(controls, grid, *, with_grad):
             ovvv = lib.unpack_tril(eris.ovvv.reshape(no * nv, -1)).reshape(no, nv, nv, nv)
             tensors = (ovvv, eris.ovoo, eris.ovov)
         else:
-            tensors = (eris.Lov, eris.Loo, lib.unpack_tril(eris.Lvv))
+            bvo, boo, bvv = eris.Lov, eris.Loo, lib.unpack_tril(eris.Lvv)
+            # Contract once, before the node loop. AD returns the accumulated
+            # integral cotangents to the original DF factors once as well.
+            tensors = (jnp.einsum('Pia,Pbc->iabc', bvo, bvv),
+                       jnp.einsum('Pia,Pjk->iajk', bvo, boo),
+                       jnp.einsum('Pia,Pjb->iajb', bvo, bvo))
         inputs = (t1, t2, *tensors,
                   eris.fock[:no, no:], eris.fock[:no, :no], eris.fock[no:, no:], u)
         energy, diagnostics = evaluate(*inputs) if with_grad else run(inputs)[0]

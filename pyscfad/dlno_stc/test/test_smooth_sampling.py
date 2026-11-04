@@ -44,8 +44,8 @@ def test_pilots_set_counts_for_each_variance_target_and_preserve_gradient(monkey
                       independent_pilot_standard_error=sigmas[q]/np.sqrt(pilot['samples']),
                       independent_pilot_seconds=0.)
         if with_grad:
-            result['cotangents'] = dict(zip((*triples.NAMES, 'L', 'R'), [2*np.asarray(values[0]),
-                *(np.zeros_like(v) for v in values[1:])]))
+            result['cotangents'] = (2*np.asarray(values[0]),
+                *(np.zeros_like(v) for v in values[1:]))
         return result
     monkeypatch.setattr(triples, '_native', native)
     target = .01
@@ -118,8 +118,8 @@ def test_adaptive_production_uses_point_target_and_keeps_extended_gradient(monke
             independent_pilot_standard_error=.1/np.sqrt(pilot['samples']),
             independent_pilot_seconds=0.)
         if with_grad:
-            result['cotangents'] = dict(zip((*triples.NAMES, 'L', 'R'), [2*np.asarray(values[0]),
-                *(np.zeros_like(v) for v in values[1:])]))
+            result['cotangents'] = (2*np.asarray(values[0]),
+                *(np.zeros_like(v) for v in values[1:]))
         return result
     monkeypatch.setattr(triples, '_native', native)
     solver = triples.make_solver(dict(mode='stochastic', nsamples=2,

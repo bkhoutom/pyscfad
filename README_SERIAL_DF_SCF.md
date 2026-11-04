@@ -36,11 +36,11 @@ existing resident-buffer, occupied-factor-cache and BLAS-controller helpers
 when SCF runs on root. Both system and domain calls use this boundary. The
 separate `pyscfad.dlno_stc.ccsd.value_and_grad` entry point also uses it for
 CCSD and CCSD(T) response. This includes serial calls and MPI calls with the
-default `parallel_scf_jk=False`: fragments remain distributed, their completed
+explicit `parallel_scf_jk=False`: fragments remain distributed, their completed
 cotangents are reduced to root, and root closes shared response once.
 An existing caller-owned reverse
 scope is reused, including a deliberately disabled one. Work is synchronized
-before an owned scope is closed. Explicit `parallel_scf_jk=True` uses the
+before an owned scope is closed. The default `parallel_scf_jk=True` uses the
 distributed DF J/K service and its existing response ownership.
 
 Eligible out-of-core DF sources built or attached inside the traced SCF

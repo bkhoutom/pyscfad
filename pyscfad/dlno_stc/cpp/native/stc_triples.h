@@ -4,6 +4,7 @@
 #include <armadillo>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace libgmbpt { namespace qchem {
 
@@ -56,6 +57,12 @@ public:
         arma::mat occupied_left, occupied_right;
         arma::mat Bvo, Boo, Bvv;
         triples_integrals integrals;
+        std::vector<arma::vec> prepared;
+    };
+
+    struct triples_prepared {
+        size_t no, nv, ns;
+        std::vector<arma::vec> tensors;
     };
 
     // Denominator-free Laplace numerator, contracted directly over a small
@@ -69,7 +76,8 @@ public:
         size_t nsamples, std::uint64_t seed, double target_standard_error,
         triples_vjp* vjp, double cotangent, const arma::mat* fov = nullptr,
         const pilot_controls* pilot = nullptr,
-        const triples_integrals* integrals = nullptr);
+        const triples_integrals* integrals = nullptr,
+        const triples_prepared* prepared = nullptr);
 
 };
 

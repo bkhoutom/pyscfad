@@ -920,7 +920,7 @@ def _finish(state, static, records, *, with_grad, include_hf, return_components)
 
 
 def _run(initializer, worker_initializer, comm, *, checkpoint_dir, resume,
-         parallel_scf_jk=False, scf_worker_initializer=None, **options):
+         parallel_scf_jk=True, scf_worker_initializer=None, **options):
     if comm is not None and comm.Get_size() > 1:
         from ._mpi_ccsd import _run_mpi
         def check_options():
@@ -946,7 +946,7 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
            ccsd_t=False, triples_controls=None, verbose_imp=0, include_hf=False,
            return_components=False,
            merge_identical=True, comm=None, fragment_indices=None, include_baseline=True,
-           checkpoint_dir=None, resume=False, parallel_scf_jk=False, vvvv_direct=False,
+           checkpoint_dir=None, resume=False, parallel_scf_jk=True, vvvv_direct=False,
            cc_solver='deterministic', stc_cc_controls=None):
     """Return correlation energy, or total energy with ``include_hf=True``.
 
@@ -974,7 +974,7 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
     ``vvvv_direct=False`` caches the DF virtual ladder integrals when
     memory permits; ``True`` uses the improved uncached contraction.
     Multi-rank calls distribute complete correlation groups and their
-    single-pass LIS selections. Shared preparation runs on root by default.
+    single-pass LIS selections. Shared preparation uses distributed DF J/K by default.
     Each rank must supply a matching MF skeleton; preceding SCF is caller-owned.
     ``parallel_scf_jk=True`` also distributes common-preparation DF J/K work. Serial and
     single-rank calls keep their existing behavior.
@@ -1035,7 +1035,7 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
                    verbose_imp=0, include_hf=False,
                    return_components=False, merge_identical=True, comm=None, build_static=None,
                    fragment_indices=None, include_baseline=True, checkpoint_dir=None, resume=False,
-                   parallel_scf_jk=False, vvvv_direct=False,
+                   parallel_scf_jk=True, vvvv_direct=False,
                    cc_solver='deterministic', stc_cc_controls=None):
     """Return ``(energy, mol_bar)``; ``mol_bar.coords`` is a nuclear gradient.
 
@@ -1048,8 +1048,8 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
     :func:`kernel`; the reported triples SE estimates energy uncertainty only.
     ``vvvv_direct`` has the memory/performance semantics of :func:`kernel`.
     Multi-rank calls distribute complete correlation groups, including deferred
-    single-pass LIS selection, while SCF and shared response run on root.
-    ``parallel_scf_jk=True`` also distributes DF J/K work in SCF, common
+    single-pass LIS selection. The default ``parallel_scf_jk=True``
+    also distributes DF J/K work in SCF, common
     preparation and their coordinate pullbacks. Worker ``build_mf`` must accept
     ``mo_coeff_init``, ``mo_energy_init``, ``mo_occ_init`` and ``e_tot_init``,
     adopt these values and skip SCF. An attached out-of-core CDERI source

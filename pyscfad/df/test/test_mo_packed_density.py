@@ -102,3 +102,66 @@ def test_output_alias_and_backend_validation(monkeypatch):
     monkeypatch.setenv('PYSCFAD_DF_MO_DENSITY_BACKEND', 'typo')
     with pytest.raises(ValueError, match='BACKEND'):
         v._use_packed_mo_density()
+
+
+@pytest.mark.parametrize('threads', [1, 4])
+@pytest.mark.parametrize('dims', [(1, 7, 1), (3, 129, 7), (2, 257, 5),
+                                  (1, 535, 145), (0, 7, 3), (2, 7, 0)])
+def test_symmetric_tiles_match_both_legs_and_accumulate(monkeypatch, threads, dims):
+    monkeypatch.setenv('PYSCFAD_DF_MO_DENSITY_BACKEND', 'tiled')
+    monkeypatch.setattr(v.pyscf_lib, 'num_threads', lambda: threads)
+    nq, nao, rank = dims
+    rng = np.random.default_rng(781)
+    c = rng.normal(size=(nao, 2*rank))[:, ::2]
+    z = rng.normal(size=(nq, rank, rank))
+    z = .5*(z+z.swapaxes(1, 2))
+    expected = v._pack_tril_symmetric_sum(
+        np.einsum('ui,pij,vj->puv', c, z, c, optimize=True))
+    storage = np.full((nq+2, nao*(nao+1)//2), np.nan)
+    out = storage[1:-1]
+    workspace = {}
+    v._int3c_mo_packed_density(c, c, z, out, symmetric=True, workspace=workspace)
+    np.testing.assert_allclose(out, expected, atol=2e-10, rtol=2e-11)
+    v._int3c_mo_packed_density(c, c, -.3*z, out, symmetric=True,
+                             accumulate=True, workspace=workspace)
+    np.testing.assert_allclose(out, .7*expected, atol=2e-10, rtol=2e-11)
+    assert np.isnan(storage[[0, -1]]).all()
+    if 'tiles' in workspace:
+        assert workspace['tiles'].size <= nq*nao*nao
+
+
+@pytest.mark.parametrize('generic_available', [False, True])
+def test_symmetric_seed_fallback_for_old_native_library(monkeypatch, generic_available):
+    monkeypatch.setattr(v, '_half_to_packed_symmetric_tiles', None)
+    if not generic_available:
+        monkeypatch.setattr(v, '_half_to_packed_tiles', None)
+    monkeypatch.setenv('PYSCFAD_DF_MO_DENSITY_BACKEND', 'tiled')
+    rng = np.random.default_rng(72)
+    c = rng.normal(size=(129, 5)); z = rng.normal(size=(2, 5, 5))
+    z += z.swapaxes(1, 2).copy()
+    actual = v._int3c_mo_packed_density(c, c, z, symmetric=True)
+    expected = v._pack_tril_symmetric_sum(
+        np.einsum('ui,pij,vj->puv', c, z, c, optimize=True))
+    np.testing.assert_allclose(actual, expected, atol=2e-12)
+    with pytest.raises(ValueError, match='identical orbital frames'):
+        v._int3c_mo_packed_density(c, -c, z, symmetric=True)
+
+
+@pytest.mark.parametrize('nao,rank', [(508, 93), (624, 145), (872, 120)])
+def test_auto_selects_symmetric_kernel_for_c20_lis_shapes(monkeypatch, nao, rank):
+    native = v._half_to_packed_symmetric_tiles
+    if native is None:
+        pytest.skip('Updated AO2MO native library is unavailable')
+    calls = []
+    def record(*args):
+        calls.append(1)
+        return native(*args)
+    monkeypatch.setattr(v, '_half_to_packed_symmetric_tiles', record)
+    monkeypatch.setenv('PYSCFAD_DF_MO_DENSITY_BACKEND', 'auto')
+    rng = np.random.default_rng(923)
+    c = rng.normal(size=(nao, rank))
+    z = np.eye(rank)[None]
+    actual = v._int3c_mo_packed_density(c, c, z, symmetric=True)
+    assert calls == [1]
+    np.testing.assert_allclose(actual, v._pack_tril_symmetric_sum((c@c.T)[None]),
+                               atol=2e-11, rtol=2e-12)

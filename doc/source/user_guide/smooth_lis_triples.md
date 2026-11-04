@@ -83,38 +83,41 @@ or make a changing LIS rank differentiable.
 
 ## Asymmetric Laplace triples
 
-At time t define
+The default implementation dresses only external numerator legs. At time t,
+`O = exp(t (F_oo - mu I)/2)` and `V = exp(-t (F_vv - mu I)/2)`, with a common
+shift mu inside the occupied–virtual gap. The shift cancels in each sampled
+product and keeps the exponentials bounded.
 
-```
-O = exp(t F_oo / 2),  V = exp(-t F_vv / 2)
-L = O^-1 U,          R = O U
-```
+Internal contracted indices are left undressed. Three T2 forms serve the
+virtual contraction, occupied contraction, and disconnected terms. The first
+two omit the transform on their internal index. Likewise, ovvv and ovoo omit
+the internal transform. This cancels reciprocal factors algebraically before
+floating-point evaluation, avoiding instability for broad core–valence spectra.
 
-External numerator legs receive half exponentials. Reciprocal factors on
-contracted internal legs cancel. The physical weight becomes
-`O^-1 U U^T O = L R^T`; the native kernel contracts the selected S index directly.
-It evaluates the denominator-free numerator, including its physical sign and
-normalization. The quadrature sum supplies the energy denominator.
+The physical selected-space projection is applied directly to each raw tensor:
+`U^T` on the left and `U^T O^2` on the right. No inverse exponential is formed.
+Both partial and whole-LIS targets use this formulation. Reverse mode includes
+full off-diagonal Fock response and U response through matrix-function divided
+differences, including degenerate spectra. It differentiates the simplified
+expression, so canceled internal factors do not introduce unstable derivative
+cancellations.
 
-Both partial and whole-LIS targets use this asymmetric kernel. Whole-LIS
-sampling therefore follows the selected-space proposal as well; individual
-seed realizations from the removed whole/canonical kernel are not preserved.
-The deterministic energy and its full derivative remain the validation target.
+`StableTriplesDressing(inputs)` takes nine arrays:
+`t1, t2, ovvv, ovoo, ovov, fov, Foo, Fvv, U`. It prepares eight base tensors
+(including three T2 forms) and eighteen smaller projected tensors. Relative to
+the old numerator, this adds two full T2 forms and four T2 projections. It
+requires no additional full ovvv copy or six-index triples tensor. Only the
+current quadrature node retains a reverse tape, bounded by available memory;
+otherwise the dresser recomputes intermediate transforms during reverse.
 
-The native `TriplesDressing(inputs)` constructor takes nine arrays:
-`t1, t2, Bvo, Boo, Bvv, fov, Foo, Fvv, U`. It returns six dressed tensors plus L
-and R. Reverse mode includes derivatives of both Fock blocks and of U. Stable
-matrix-function derivatives handle internal Fock degeneracies without
-individual-eigenvector derivatives. Tensor panels bound dressing scratch.
-The current node's rotation intermediates are retained within half the available
-memory headroom and released by its pullback; insufficient headroom selects
-rematerialization. `PYSCFAD_TRIPLES_DRESSING_CACHE_MB` can lower this allowance,
-with zero disabling the cache.
-
-The only native triples entry points are `triples_asymmetric_energy` and
-`triples_asymmetric_energy_vjp`. With `nsamples=0` they enumerate a small exact
-reference. Positive counts use selected-space restricted sampling. The VJP
-returns derivatives from the same draws as the energy; reverse does not resample.
+The production entry points are `triples_prepared_energy` and
+`triples_prepared_energy_vjp`. With `nsamples=0` they enumerate a small exact
+reference. Positive counts use selected-space sampling with proposal tables
+built from the stable factors. The VJP uses the same draws as the energy.
+Individual seeded realizations change because the proposal factors changed;
+the deterministic energy and full derivative are preserved. The older
+`TriplesDressing` and `triples_asymmetric_*` interfaces remain as low-level
+reference interfaces and are not used by the default solver.
 
 ## Controls
 
@@ -258,7 +261,7 @@ These keywords are common to `ccsd.kernel` and `ccsd.value_and_grad`:
 | `merge_identical` | `True` | Share identical-domain preparation. |
 | `verbose_imp` | `0` | Impurity solver verbosity. |
 | `comm` | `None` | Serial execution; optionally supply an MPI communicator. |
-| `parallel_scf_jk` | `False` | Keep SCF and shared response on root while fragment work uses MPI. Set to `True` to distribute shared DF J/K work and its applicable response; no effect on serial calls. |
+| `parallel_scf_jk` | `True` | Distribute shared DF J/K work and its applicable response for MPI domain calls. Set to `False` to keep SCF and shared response on root; no effect on serial calls. |
 | `checkpoint_dir` | `None` | Optional serial progress checkpoint directory. |
 | `resume` | `False` | Resume compatible progress; requires `checkpoint_dir`. Multiple-rank CC progress checkpoints are not supported. |
 
@@ -276,7 +279,7 @@ on workers. The comparison runners below use one process.
 | Key | Default | Meaning / allowed values |
 | --- | --- | --- |
 | `mode` | `"deterministic"` | `deterministic` or `stochastic`. With smooth selections, deterministic means exact numerator enumeration on the fitted Laplace grid, not exact integration of the denominator. |
-| `integral_transform` | `"df"` | `df` dresses DF factors and rebuilds the three numerator integral blocks at each point; `rotate` rotates cached CCSD `ovvv`, `ovoo`, and `ovov` blocks directly. Rotation requires smooth selections and supports both modes. |
+| `integral_transform` | `"df"` | `df` contracts raw DF factors into three integral blocks once per fragment; `rotate` reuses cached CCSD `ovvv`, `ovoo`, and `ovov`. Both apply the same stable dressing and support deterministic and stochastic modes. |
 | `nsamples` | Required in stochastic mode | Integer ≥ 2. Nominal production samples per S in fixed-count mode. Still required with a positive tolerance; it does not cap adaptive production. |
 | `global_seed` | `71` | Nonnegative integer smaller than `2**64`. |
 | `energy_tolerance` | Omitted; `0` is equivalent | Total requested triples SE in Eh. Positive values enable adaptive production. |

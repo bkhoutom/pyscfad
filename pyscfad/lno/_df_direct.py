@@ -27,8 +27,8 @@ from pyscfad import numpy as np
 from pyscfad.ao2mo import _ao2mo
 from pyscfad.df import _cderi_vjp
 from pyscfad.df import _int3c_cross_opt
-from pyscfad.lib._threading import dense_blas_threads
 from ._profile import _vjp_progress_section
+from . import _df_symmetric
 
 
 def _env_flag(name, default=False):
@@ -234,7 +234,7 @@ def _generate_local_raw_int3c_blocks(
 
 def _local_direct_mo_coeff_vjp_from_z_reader(
         mol, auxmol, mo_coeff, read_z_aux_block, orbs_slice,
-        z_aux_block_max_rows=None):
+        z_aux_block_max_rows=None, *, symmetric=False):
     """MO-coefficient pullback with bounded z reads per integral block."""
     mo_coeff_bar = numpy.zeros_like(numpy.asarray(jax.device_get(mo_coeff)))
     k0, k1, l0, l1 = map(int, orbs_slice)
@@ -245,7 +245,8 @@ def _local_direct_mo_coeff_vjp_from_z_reader(
     scope = matching_scope(mol, auxmol)
     if scope is not None and scope.half is not None:
         return np.asarray(scope.half.coefficient_pullback(
-            numpy.asarray(jax.device_get(mo_coeff)), read_z_aux_block, orbs_slice))
+            numpy.asarray(jax.device_get(mo_coeff)), read_z_aux_block, orbs_slice,
+            symmetric=symmetric))
     for p0, p1, raw_ints in _local_direct_raw_int3c_blocks(
             mol, auxmol, z_aux_block_max_rows=z_aux_block_max_rows):
         z_block = numpy.asarray(read_z_aux_block(p0, p1))
@@ -270,7 +271,7 @@ def _local_direct_mo_coeff_vjp_from_z_reader(
 
 def _local_direct_mo_coeff_vjp(
         mol, auxmol, mo_coeff, z, orbs_slice,
-        z_aux_block_max_rows=None):
+        z_aux_block_max_rows=None, *, symmetric=False):
     """MO-coefficient pullback from a full z array or auxiliary reader."""
     if callable(z):
         read_z_aux_block = z
@@ -287,6 +288,7 @@ def _local_direct_mo_coeff_vjp(
         read_z_aux_block,
         orbs_slice,
         z_aux_block_max_rows=z_aux_block_max_rows,
+        symmetric=symmetric,
     )
 
 
@@ -350,32 +352,30 @@ def _local_direct_nr_e2_bwd(max_memory, orbs_slice, res, fitted_mo_bar):
 
     fitted_mo_np = numpy.asarray(jax.device_get(fitted_mo))
     fitted_mo_bar_np = numpy.asarray(jax.device_get(fitted_mo_bar))
-    # If Y = L^{-1} T and Z = L^{-T} Ybar, then Lbar = -Z Y^T.  Form this
-    # small auxiliary-metric cotangent before the streamed integral work so
-    # the much larger Y and Ybar buffers can reach their last use here.
-    # These dense operations are serial callers. Restore the embedding BLAS
-    # policy before the integral and MO-coefficient OpenMP kernels below.
-    with dense_blas_threads():
-        z = scipy_linalg.solve_triangular(
-            low.T,
-            fitted_mo_bar_np,
-            lower=False,
-            check_finite=False,
-        )
-        low_bar = -numpy.dot(z, fitted_mo_np.T)
+    symmetric = _df_symmetric.same_orbital_pair(orbs_slice)
+    z, low_bar = _df_symmetric.factor_pullback(
+        low, fitted_mo_np, fitted_mo_bar_np, symmetric=symmetric,
+        receipt=None if scope is None else scope.receipt)
     del fitted_mo_np, fitted_mo_bar_np, fitted_mo, fitted_mo_bar, low
+    if symmetric:
+        width = orbs_slice[1] - orbs_slice[0]
+        read_z = lambda p0, p1: _df_symmetric.unpack_symmetric(
+            z[p0:p1], width).reshape(p1-p0, width*width)
+    else:
+        read_z = z
 
     # Consume the metric tape before streaming the three-center integrals.
     # Its pullback uses only the lower triangle of the factor cotangent.
     _cderi_vjp._zero_strict_upper_inplace(low_bar)
     from ._df_shared import defer_geometry
-    if defer_geometry(mol, auxmol, mo_coeff, z, low_bar, orbs_slice):
+    if defer_geometry(mol, auxmol, mo_coeff, z, low_bar, orbs_slice,
+                      symmetric_packed=symmetric):
         # Coefficient bars must remain immediate: LIS orbital derivatives
         # determine the W cotangent that later joins this domain's response.
         del metric_pullback, low_bar
         with _vjp_progress_section('local DF MO-coeff backward'):
             mo_coeff_bar = _local_direct_mo_coeff_vjp(
-                mol, auxmol, mo_coeff, z, orbs_slice)
+                mol, auxmol, mo_coeff, read_z, orbs_slice, symmetric=symmetric)
         return (_cderi_vjp._coords_tree_like(mol, numpy.zeros((mol.natm, 3))),
                 _cderi_vjp._coords_tree_like(auxmol, numpy.zeros((auxmol.natm, 3))),
                 mo_coeff_bar)
@@ -384,18 +384,19 @@ def _local_direct_nr_e2_bwd(max_memory, orbs_slice, res, fitted_mo_bar):
 
     with _vjp_progress_section('local DF MO-coeff backward'):
         mo_coeff_bar = _local_direct_mo_coeff_vjp(
-            mol, auxmol, mo_coeff, z, orbs_slice
+            mol, auxmol, mo_coeff, read_z, orbs_slice, symmetric=symmetric
         )
     with _vjp_progress_section('local DF integral derivative backward'):
         mol_bar, auxmol_bar = _cderi_vjp._int3c_mo_deriv_coords_vjp(
             mol,
             auxmol,
             mo_coeff,
-            z,
+            read_z,
             orbs_slice,
             int3c=mol._add_suffix('int3c2e'),
             aosym='s2ij',
             block_memory_mb=_local_direct_int3c_block_mb(),
+            symmetric=symmetric,
         )
     del z
 

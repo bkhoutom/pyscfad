@@ -25,7 +25,8 @@ def test_half_transforms_scope_dense_threads_without_changing_integral_threads(
 
     def pools(api):
         return {item['filepath']: item['num_threads']
-                for item in threadpool_info() if item['user_api'] == api}
+                for item in threadpool_info() if item['user_api'] == api
+                and item.get('threading_layer') != 'disabled'}
 
     with blas_threads(1), dense_blas_scope(), \
             _df_shared.reverse_scope(shared._mf(mol), shared.ATOMS) as scope:

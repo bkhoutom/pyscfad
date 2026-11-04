@@ -1,4 +1,4 @@
-"""MPI fragment distribution must not implicitly enable distributed SCF."""
+"""Preserve the local distributed-SCF default while retaining root-only mode."""
 import inspect
 
 import pytest
@@ -18,5 +18,5 @@ from pyscfad.dlno_stc import _mpi, _mpi_ccsd, ccsd, driver
     _mpi._run_domain_mpi,
     _mpi_ccsd._run_mpi,
 ], ids=lambda entry_point: f'{entry_point.__module__}.{entry_point.__name__}')
-def test_parallel_scf_requires_explicit_opt_in(entry_point):
-    assert inspect.signature(entry_point).parameters['parallel_scf_jk'].default is False
+def test_parallel_scf_preserves_local_default(entry_point):
+    assert inspect.signature(entry_point).parameters['parallel_scf_jk'].default is True

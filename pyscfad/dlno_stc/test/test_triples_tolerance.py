@@ -65,7 +65,8 @@ def public_reference(monkeypatch):
     monkeypatch.setattr(ccsd.driver, '_coordinate_only', lambda mol: None)
     monkeypatch.setattr(ccsd.driver, '_initialize_scf', lambda mol, build, **kw: (None, None))
     monkeypatch.setattr(ccsd.driver, '_initialize', lambda *a, **k: dict(
-        energy=np.float64(0.), variance=0., baseline_energy=0., weak_energy=0.))
+        energy=np.float64(0.), variance=0., baseline_energy=0., weak_energy=0.,
+        mf_bar=None, common_bar=None))
     monkeypatch.setattr(ccsd, '_finish', lambda state, static, records, **k: tuple(records))
     return static, settings
 

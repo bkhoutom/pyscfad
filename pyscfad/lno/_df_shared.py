@@ -13,6 +13,7 @@ VJPs are unchanged; scopes cannot be nested, reused, or left unfinished.
 from contextlib import contextmanager
 from contextvars import ContextVar
 import tempfile
+import time
 import warnings
 
 import h5py
@@ -22,6 +23,7 @@ import numpy
 from pyscf import lib as pyscf_lib
 
 from pyscfad.df import _cderi_vjp
+from . import _df_symmetric
 
 
 _ACTIVE = ContextVar('pyscfad_local_df_integral_reverse', default=None)
@@ -56,6 +58,8 @@ class LocalDFReverse:
         self._minimum_row_warned = False
         self._packing_workspace = {}
         self.receipt = dict(consumers=0, spooled_bytes=0, geometry_passes=0,
+                            symmetric_consumers=0, symmetric_saved_bytes=0,
+                            density_pack_seconds=0.,
                             metric_passes=0, max_density_rows=0,
                             metric_builds=0, cholesky_builds=0,
                             raw_integral_builds=0, raw_integral_bytes=0,
@@ -132,7 +136,7 @@ class LocalDFReverse:
                 'continuing with one auxiliary row',
                 RuntimeWarning, stacklevel=2)
 
-    def add(self, coeff, z, low_bar, slices):
+    def add(self, coeff, z, low_bar, slices, *, symmetric_packed=False):
         if self.finished:
             raise RuntimeError('Cannot add to a finished local DF reverse')
         z = numpy.asarray(z)
@@ -141,16 +145,24 @@ class LocalDFReverse:
             raise TypeError('Shared local DF reverse requires real float64 inputs')
         k0, k1, l0, l1 = map(int, slices)
         pair_count = (k1-k0)*(l1-l0)
-        if z.shape != (self.auxmol.nao, pair_count):
+        if symmetric_packed and not _df_symmetric.same_orbital_pair(slices):
+            raise ValueError('Symmetric DF pullback requires identical orbital slices')
+        stored_pairs = ((k1-k0)*(k1-k0+1)//2 if symmetric_packed else pair_count)
+        if z.shape != (self.auxmol.nao, stored_pairs):
             raise ValueError('Shared local DF cotangent shape mismatch')
         rows = self._rows(pair_count, min(k1-k0, l1-l0))
         self._open_file()
         dataset = self._file.create_dataset(str(len(self.terms)), shape=z.shape,
                                             dtype='f8')
+        dataset.attrs['symmetric_packed'] = symmetric_packed
         for p0 in range(0, z.shape[0], rows):
             dataset[p0:p0+rows] = z[p0:p0+rows]
         self.terms.append((dataset, numpy.array(coeff, copy=True), tuple(slices)))
         self.receipt['spooled_bytes'] += z.nbytes
+        if symmetric_packed:
+            self.receipt['symmetric_consumers'] += 1
+            self.receipt['symmetric_saved_bytes'] += (
+                self.auxmol.nao * pair_count * 8 - z.nbytes)
         if self.metric_bar is None:
             self.metric_bar = numpy.array(low_bar, copy=True)
         else:
@@ -161,7 +173,7 @@ class LocalDFReverse:
         density = None
         for dataset, coeff, slices in self.terms:
             k0, k1, l0, l1 = slices
-            z = numpy.asarray(dataset[p0:p1]).reshape(p1-p0, k1-k0, l1-l0)
+            z = self._read_term(dataset, slices, p0, p1)
             contribution = _cderi_vjp._int3c_mo_physical_density(
                 coeff[:, k0:k1], coeff[:, l0:l1], z)
             if density is None:
@@ -175,14 +187,25 @@ class LocalDFReverse:
 
     def _fill_packed_density(self, p0, p1, out):
         """Sum consumers directly in the integral driver's packed AO buffer."""
+        started = time.perf_counter()
         for i, (dataset, coeff, slices) in enumerate(self.terms):
             k0, k1, l0, l1 = slices
-            z = numpy.asarray(dataset[p0:p1]).reshape(p1-p0, k1-k0, l1-l0)
+            z = self._read_term(dataset, slices, p0, p1)
             _cderi_vjp._int3c_mo_packed_density(
                 coeff[:, k0:k1], coeff[:, l0:l1], z,
-                out=out, accumulate=i > 0, workspace=self._packing_workspace)
+                out=out, accumulate=i > 0, workspace=self._packing_workspace,
+                symmetric=bool(dataset.attrs['symmetric_packed']))
+        self.receipt['density_pack_seconds'] += time.perf_counter() - started
         self.receipt['max_density_rows'] = max(
             self.receipt['max_density_rows'], p1-p0)
+
+    @staticmethod
+    def _read_term(dataset, slices, p0, p1):
+        k0, k1, l0, l1 = slices
+        block = numpy.asarray(dataset[p0:p1])
+        if dataset.attrs['symmetric_packed']:
+            return _df_symmetric.unpack_symmetric(block, k1-k0)
+        return block.reshape(p1-p0, k1-k0, l1-l0)
 
     def finish(self):
         if self.finished:
@@ -193,7 +216,8 @@ class LocalDFReverse:
             return coords
         self.metric_factor()
         self.finished = True
-        max_pairs = max(dataset.shape[1] for dataset, _, _ in self.terms)
+        # Readers expand symmetric pairs for one slab. Reserve its full size.
+        max_pairs = max((s[1]-s[0])*(s[3]-s[2]) for _, _, s in self.terms)
         width = max(min(s[1]-s[0], s[3]-s[2]) for _, _, s in self.terms)
         rows = self._rows(max_pairs, width)
         self.receipt['tile_rows'] = rows
@@ -259,11 +283,11 @@ def matching_scope(mol, auxmol):
     return scope
 
 
-def defer_geometry(mol, auxmol, coeff, z, low_bar, slices):
+def defer_geometry(mol, auxmol, coeff, z, low_bar, slices, *, symmetric_packed=False):
     scope = matching_scope(mol, auxmol)
     if scope is None:
         return False
-    scope.add(coeff, z, low_bar, slices)
+    scope.add(coeff, z, low_bar, slices, symmetric_packed=symmetric_packed)
     return True
 
 

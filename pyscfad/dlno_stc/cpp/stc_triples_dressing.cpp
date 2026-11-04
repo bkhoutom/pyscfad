@@ -1,5 +1,6 @@
 // Smooth Laplace dressing: MP2 matrix functions and bounded tensor panels.
 #include "stc_mp2_kernel.h"
+#include "native/triples_prepared.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
@@ -305,8 +306,18 @@ public:
         return result;
     }
 };
+#include "stc_triples_stable.inc"
 } // namespace
 void bind_triples_dressing(py::module_& module) {
+    py::class_<StableDressing>(module,"StableTriplesDressing")
+        .def(py::init<py::tuple>())
+        .def("prepare",&StableDressing::prepare,py::arg("node"),py::arg("cache_limit_bytes")=0)
+        .def("pullback",&StableDressing::pullback,py::arg("node"),py::arg("cotangents"),py::arg("cache_limit_bytes")=0)
+        .def("clear_cache",&StableDressing::clear_cache)
+        .def_property_readonly("cache_bytes",&StableDressing::cache_bytes)
+        .def_property_readonly("cache_hits",&StableDressing::cache_hits)
+        .def_property_readonly("peak_cache_bytes",&StableDressing::peak_cache_bytes)
+        .def_property_readonly("cache_rebuilds",&StableDressing::cache_rebuilds);
     py::class_<Dressing>(module,"TriplesDressing")
         .def(py::init<py::tuple,bool>(), py::arg("inputs"),
              py::kw_only(),py::arg("integral_inputs")=false)

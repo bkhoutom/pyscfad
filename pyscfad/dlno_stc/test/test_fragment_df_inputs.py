@@ -7,7 +7,7 @@ import numpy
 import pytest
 
 from pyscfad import config_update, df, scf
-from pyscfad.lno import _df_direct, _df_shared
+from pyscfad.lno import _df_direct, _df_shared, _df_symmetric
 from pyscfad.dlno_stc import ccsd
 from pyscfad.dlno_stc.adjoint import fix_restart_mo_phases
 from pyscfad.dlno_stc.test import _boys_acceptance as accept
@@ -79,7 +79,10 @@ def test_default_half_matches_direct_with_one_integral_pass(
             ccsd_t=True, triples_controls=triples, fragment_indices=case.indices)
         value, gradient = ccsd.driver._finish(state, with_grad=True, include_hf=False)
         return value, gradient, records, (state['mf_bar'], state['common_bar'])
-    reference, ref_gradient, ref_records, ref_bars = run('direct')
+    # Independent baseline: full, unsymmetrized pair adjoints and raw inputs.
+    with monkeypatch.context() as original:
+        original.setattr(_df_symmetric, 'same_orbital_pair', lambda slices: False)
+        reference, ref_gradient, ref_records, ref_bars = run('direct')
     assert receipts[-1]['raw_integral_builds'] == 2*(1+len(case.indices))
     reads = []
     generate = _df_direct._generate_local_raw_int3c_blocks
@@ -97,6 +100,8 @@ def test_default_half_matches_direct_with_one_integral_pass(
     assert receipt['half_releases'] == receipt['half_pullbacks'] == 1+len(case.indices)
     assert receipt['half_resident_bytes'] == 0
     assert receipt['consumers'] == 1+len(case.indices)
+    assert receipt['symmetric_consumers'] == len(case.indices)
+    assert receipt['symmetric_saved_bytes'] > 0
     assert receipt['geometry_passes'] == receipt['metric_passes'] == 1
     numpy.testing.assert_allclose(value, reference, atol=3e-12, rtol=0)
     numpy.testing.assert_allclose(gradient.coords, ref_gradient.coords, atol=3e-9, rtol=3e-7)

@@ -14,7 +14,7 @@ def test_energy_service_uses_supplied_worker_skeleton(monkeypatch, enabled):
 
     def run(initializer, worker_initializer, comm, *, parallel_scf_jk,
             scf_worker_initializer, **options):
-        assert parallel_scf_jk is (False if enabled is None else enabled)
+        assert parallel_scf_jk is (True if enabled is None else enabled)
         return scf_worker_initializer()
 
     monkeypatch.setattr(ccsd, '_run', run)

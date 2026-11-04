@@ -435,9 +435,10 @@ int AO2MOnr_e2_cderi_bar_pack_aux_block(
  * The caller supplies one tile per worker and runs BLAS serially inside
  * this OpenMP region. No AO-square temporary or internal allocation is used.
  */
-void AO2MOhalf_to_packed_tiles(
+static void half_to_packed_tiles(
         double *out, const double *half, const double *coeff, double *work,
-        int naux, int nao, int rank, int tile, int nthreads, int accumulate)
+        int naux, int nao, int rank, int tile, int nthreads, int accumulate,
+        int symmetric)
 {
     if (naux <= 0 || nao <= 0 || rank <= 0 || tile <= 0 || nthreads <= 0) {
         return;
@@ -468,20 +469,115 @@ void AO2MOhalf_to_packed_tiles(
             dgemm_(&T, &N, &nj, &ni, &rank, &D1,
                    coeff + (size_t)j0 * rank, &rank,
                    hp + (size_t)i0 * rank, &rank, &D0, buf, &nj);
-            dgemm_(&T, &N, &nj, &ni, &rank, &D1,
-                   hp + (size_t)j0 * rank, &rank,
-                   coeff + (size_t)i0 * rank, &rank, &D1, buf, &nj);
+            if (!symmetric) {
+                dgemm_(&T, &N, &nj, &ni, &rank, &D1,
+                       hp + (size_t)j0 * rank, &rank,
+                       coeff + (size_t)i0 * rank, &rank, &D1, buf, &nj);
+            }
             for (int u = 0; u < ni; u++) {
                 const int row = i0 + u;
                 const size_t base = (size_t)row * (row + 1) / 2 + j0;
                 const int count = i == j ? u + 1 : nj;
                 for (int v = 0; v < count; v++) {
-                    const double value = buf[(size_t)u * nj + v]
-                        * (row == j0 + v ? 0.5 : 1.0);
+                    double value = buf[(size_t)u * nj + v];
+                    if (symmetric) {
+                        // half = coeff * Z with Z symmetric. Off-diagonal
+                        // AO tiles need only one product, doubled for both
+                        // orbital legs. Average roundoff within diagonal
+                        // tiles; native diagonal AO pairs have unit weight.
+                        if (i != j) value *= 2.0;
+                        else if (u != v) value += buf[(size_t)v * nj + u];
+                    } else if (row == j0 + v) {
+                        value *= 0.5;
+                    }
                     if (accumulate) op[base + v] += value;
                     else op[base + v] = value;
                 }
             }
+        }
+    }
+}
+
+void AO2MOhalf_to_packed_tiles(
+        double *out, const double *half, const double *coeff, double *work,
+        int naux, int nao, int rank, int tile, int nthreads, int accumulate)
+{
+    half_to_packed_tiles(out, half, coeff, work, naux, nao, rank, tile,
+                         nthreads, accumulate, 0);
+}
+
+void AO2MOhalf_to_packed_symmetric_tiles(
+        double *out, const double *half, const double *coeff, double *work,
+        int naux, int nao, int rank, int tile, int nthreads, int accumulate)
+{
+    half_to_packed_tiles(out, half, coeff, work, naux, nao, rank, tile,
+                         nthreads, accumulate, 1);
+}
+
+/* Project arbitrary matrix cotangents onto symmetric matrices. The fitted
+ * factors use the same operation with pair multiplicities for Lbar. Write
+ * Fortran-order RHSs directly for the triangular solve, in auxiliary tiles
+ * so neither the source rows nor the destination columns are long-strided.
+ */
+void AO2MOsymmetric_pair_pack(double *out, const double *input, int naux,
+                            int width, int fortran, int weighted, int nthreads)
+{
+    const size_t square = (size_t)width * width;
+    const size_t pairs = (size_t)width * (width + 1) / 2;
+    const double scale = weighted ? 1.0 : 0.5;
+    if (naux <= 0 || width <= 0 || nthreads <= 0) return;
+    if (fortran) {
+        const int block = 32;
+#pragma omp parallel for schedule(static) num_threads(nthreads) if(nthreads > 1)
+        for (int p0 = 0; p0 < naux; p0 += block) {
+            const int p1 = p0 + block < naux ? p0 + block : naux;
+            for (int i = 0; i < width; i++) {
+                const size_t base = (size_t)i * (i + 1) / 2;
+                for (int j = 0; j < i; j++) {
+                    for (int p = p0; p < p1; p++) {
+                        const double *a = input + (size_t)p * square;
+                        out[(base+j)*naux+p] = scale *
+                            (a[(size_t)i*width+j] + a[(size_t)j*width+i]);
+                    }
+                }
+                for (int p = p0; p < p1; p++) {
+                    out[(base+i)*naux+p] = input[(size_t)p*square+(size_t)i*width+i];
+                }
+            }
+        }
+    } else {
+#pragma omp parallel for schedule(static) num_threads(nthreads) if(nthreads > 1)
+        for (int p = 0; p < naux; p++) {
+            const double *a = input + (size_t)p * square;
+            double *b = out + (size_t)p * pairs;
+            for (int i = 0; i < width; i++) {
+                const size_t base = (size_t)i * (i + 1) / 2;
+                for (int j = 0; j < i; j++) {
+                    b[base+j] = scale * (a[(size_t)i*width+j] + a[(size_t)j*width+i]);
+                }
+                b[base+i] = a[(size_t)i*width+i];
+            }
+        }
+    }
+}
+
+/* Only bounded auxiliary slabs are expanded for coefficient/AO assembly. */
+void AO2MOsymmetric_pair_unpack(double *out, const double *input, int naux,
+                              int width, int nthreads)
+{
+    const size_t square = (size_t)width * width;
+    const size_t pairs = (size_t)width * (width + 1) / 2;
+    if (naux <= 0 || width <= 0 || nthreads <= 0) return;
+#pragma omp parallel for schedule(static) num_threads(nthreads) if(nthreads > 1)
+    for (int p = 0; p < naux; p++) {
+        const double *a = input + (size_t)p * pairs;
+        double *b = out + (size_t)p * square;
+        for (int i = 0; i < width; i++) {
+            const size_t base = (size_t)i * (i + 1) / 2;
+            for (int j = 0; j < i; j++) {
+                b[(size_t)i*width+j] = b[(size_t)j*width+i] = a[base+j];
+            }
+            b[(size_t)i*width+i] = a[base+i];
         }
     }
 }

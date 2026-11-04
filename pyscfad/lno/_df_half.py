@@ -145,13 +145,15 @@ class HalfTransformedDFCache:
                                               scope.receipt['half_resident_bytes'])
         return fitted
 
-    def coefficient_pullback(self, coeff, read_z, slices):
+    def coefficient_pullback(self, coeff, read_z, slices, *, symmetric=False):
         if self.scope.finished:
             raise RuntimeError('Cannot use a finished local DF reverse')
         entry = self._find(numpy.asarray(coeff), slices)
         if entry is None:
             raise RuntimeError('Missing resident half-transformed DF forward inputs')
         k0, k1, l0, l1 = slices
+        if symmetric and (k0 != l0 or k1 != l1):
+            raise ValueError('Symmetric DF pullback requires identical orbital slices')
         kc, lc = k1-k0, l1-l0
         bar = numpy.zeros_like(coeff)
         if kc*lc:
@@ -163,10 +165,16 @@ class HalfTransformedDFCache:
                 z = numpy.asarray(read_z(p0, p1)).reshape(p1-p0, kc, lc)
                 h = entry.h[p0:p1]
                 with dense_blas_threads():
-                    bar[:, k0:k1] += numpy.einsum(
-                        'pml,pkl->mk', h[:, :, entry.right], z, optimize=True)
-                    bar[:, l0:l1] += numpy.einsum(
-                        'pmk,pkl->ml', h[:, :, entry.left], z, optimize=True)
+                    if symmetric:
+                        # Both orbital legs contribute, including AO directions
+                        # outside the retained ED/LIS subspace.
+                        bar[:, k0:k1] += 2 * numpy.einsum(
+                            'pml,pkl->mk', h[:, :, entry.right], z, optimize=True)
+                    else:
+                        bar[:, k0:k1] += numpy.einsum(
+                            'pml,pkl->mk', h[:, :, entry.right], z, optimize=True)
+                        bar[:, l0:l1] += numpy.einsum(
+                            'pmk,pkl->ml', h[:, :, entry.left], z, optimize=True)
         entry.consumed = True
         self.scope.receipt['half_pullbacks'] += 1
         return bar

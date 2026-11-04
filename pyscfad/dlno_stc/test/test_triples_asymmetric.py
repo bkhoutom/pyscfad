@@ -96,12 +96,13 @@ def test_asymmetric_invalid_right_projection_rejected(value):
         triples_native().triples_asymmetric_energy_vjp(**dict(inputs, R=value), nsamples=2)
 
 
-def test_only_asymmetric_native_entry_points_remain():
+def test_stable_and_reference_native_entry_points():
     native = triples_native()
     assert {name for name in dir(native) if name.startswith('triples_')} == {
         'triples_asymmetric_energy', 'triples_asymmetric_energy_vjp',
-        'triples_asymmetric_integrals_energy', 'triples_asymmetric_integrals_energy_vjp'}
-    assert 'asymmetric-only' in native.TRIPLES_VERSION
+        'triples_asymmetric_integrals_energy', 'triples_asymmetric_integrals_energy_vjp',
+        'triples_prepared_energy', 'triples_prepared_energy_vjp'}
+    assert 'stable-external-legs' in native.TRIPLES_VERSION
 
 
 def binding_inputs():

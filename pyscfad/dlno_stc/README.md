@@ -105,7 +105,7 @@ remain immediate; compatible coordinate seeds share one derivative-integral
 pass and one metric/Cholesky tape. This works with either fragment DF mode.
 `Shared global SCF DF reverse` reports consumers, seed groups, disk
 contributions, and geometry/metric passes. Set `PYSCFAD_STC_COMBINE_SCF_DF=0`
-before tracing for the separate-response reference path. With the default
+before tracing for the separate-response reference path. With explicit
 `parallel_scf_jk=False`, MPI fragment owners reduce completed cotangents to
 root, which closes the combined shared response once. Explicit distributed
 SCF and externally staged DF sources retain their existing ownership rules.
@@ -299,9 +299,8 @@ partitioned. Cotangents are summed, and communicator rank zero drives the common
 and SCF response once, including HF once when requested. Only rank zero returns
 the public energy or `(energy, mol_bar)`; other ranks return `None`.
 
-Multi-rank domain calls use `parallel_scf_jk=False` by default: SCF and common
-response run on root while domain jobs remain distributed. Opt in with
-`parallel_scf_jk=True` to use the existing MPI DF executor for SCF J/K
+Multi-rank domain calls preserve `parallel_scf_jk=True` by default and
+use the MPI DF executor for SCF J/K
 contractions, their density response, and
 the independent three-center coordinate derivative blocks. Root retains the
 SCF iteration and differentiation tape, localization, and coupled metric
@@ -317,7 +316,7 @@ service validates density factors like serial, reuses block scratch during
 each density response, and verifies each rank's DF contents once before its
 first contraction. It does not yet cache occupied panels across response
 iterations or use serial factorized geometry response; these optimizations
-are available through the default root-owned SCF path.
+are available through the root-owned SCF path selected with `parallel_scf_jk=False`.
 
 Every rank calls the driver with the same molecule and configured MF type.
 Only root supplies controls and either `static` or `build_static`. The gradient
@@ -667,8 +666,8 @@ joint W/MP2 reverse. Set `single_pass=False` for two-pass selection, required fo
 D matrices or callers that need concrete LIS selections, anchors
 and grids before production. `benchmark_lno_w_triples.py` also defaults to
 single-pass. With MPI, each owner selects and differentiates the LIS for its
-assigned domain groups; shared SCF and common response run once on root by
-default. Both paths use only domain
+assigned domain groups. SCF and common response can stay on root with
+`parallel_scf_jk=False`. Both paths use only domain
 eigensystems. The former `virtual_eigenspace` Python argument and
 `--lis-virtual-eigenspace` CLI switch have been removed.
 
@@ -694,7 +693,8 @@ Both modes always cache packed `(ov|vv)`, along with the existing `oooo`,
 and the analytical response replay read tiles from the packed cache; they
 do not rebuild `(ov|vv)` from DF factors. Its float64 storage is
 `8 * nocc * nvir * [nvir * (nvir + 1) / 2]` bytes per active fragment.
-Smooth triples defaults to its existing factor-based construction. Set
+Smooth triples uses the stable external-leg numerator in both input modes.
+The default input mode constructs its integral blocks from DF factors. Set
 `triples_controls={"mode": "deterministic", "integral_transform": "rotate"}`
 to rotate cached `ovvv`, `ovoo`, and `ovov` blocks at each Laplace point instead.
 The same `integral_transform` option is available in stochastic mode. This path

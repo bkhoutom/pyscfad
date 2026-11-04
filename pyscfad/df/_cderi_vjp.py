@@ -98,6 +98,11 @@ _half_to_packed_tiles = getattr(libao2mo_vjp, 'AO2MOhalf_to_packed_tiles', None)
 if _half_to_packed_tiles is not None:
     _half_to_packed_tiles.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 6
     _half_to_packed_tiles.restype = None
+_half_to_packed_symmetric_tiles = getattr(
+    libao2mo_vjp, 'AO2MOhalf_to_packed_symmetric_tiles', None)
+if _half_to_packed_symmetric_tiles is not None:
+    _half_to_packed_symmetric_tiles.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 6
+    _half_to_packed_symmetric_tiles.restype = None
 
 
 def _profile_enabled():
@@ -1650,12 +1655,14 @@ def _density_workspace(workspace, name, shape):
 
 
 def _int3c_mo_packed_density(mo_k, mo_l, z_blk, out=None, *,
-                            accumulate=False, workspace=None):
+                            accumulate=False, workspace=None, symmetric=False):
     """Write coordinate weights, with bounded, reusable packing workspace.
 
     Small orbital ranks use AO tiles; dense ED ranks retain batched GEMM.
     The tiled worker buffers together occupy no more than one AO-square
     slab, already reserved by the caller's conservative density workspace.
+    With ``symmetric=True``, the producer guarantees a symmetric seed and
+    identical orbital frames. Native off-diagonal tiles then need one GEMM.
     """
     if any(x.dtype != numpy.float64 for x in (mo_k, mo_l, z_blk)):
         raise TypeError('Packed MO density requires float64 inputs')
@@ -1663,6 +1670,8 @@ def _int3c_mo_packed_density(mo_k, mo_l, z_blk, out=None, *,
     nao = mo_k.shape[0]
     if mo_k.shape != (nao, kc) or mo_l.shape != (nao, lc):
         raise ValueError('Packed MO density coefficient dimensions do not match its seed')
+    if symmetric and (kc != lc or not numpy.array_equal(mo_k, mo_l)):
+        raise ValueError('Symmetric packed density requires identical orbital frames')
     shape = (naux, nao * (nao + 1) // 2)
     if out is None:
         if accumulate:
@@ -1680,8 +1689,13 @@ def _int3c_mo_packed_density(mo_k, mo_l, z_blk, out=None, *,
             out.fill(0.)
         return out
     backend = _mo_density_backend()
-    tiled = (_half_to_packed_tiles is not None and
-             (backend == 'tiled' or backend == 'auto' and nao >= 512 and rank <= 128))
+    specialized = symmetric and _half_to_packed_symmetric_tiles is not None
+    kernel = _half_to_packed_symmetric_tiles if specialized else _half_to_packed_tiles
+    # C20-sized slabs with 508--872 AOs and LIS ranks through 145 benefit
+    # from the single-product tiles. Preserve the generic ED crossover.
+    min_ao, max_rank = (384, 160) if specialized else (512, 128)
+    tiled = (kernel is not None and
+             (backend == 'tiled' or backend == 'auto' and nao >= min_ao and rank <= max_rank))
     if tiled:
         with dense_blas_threads():
             if kc <= lc:
@@ -1700,7 +1714,7 @@ def _int3c_mo_packed_density(mo_k, mo_l, z_blk, out=None, *,
                       max(1, naux * nao * nao // (tile * tile)))
         work = _density_workspace(workspace, 'tiles', (threads, tile, tile))
         with blas_threads(1):
-            _half_to_packed_tiles(out.ctypes.data, half.ctypes.data,
+            kernel(out.ctypes.data, half.ctypes.data,
                 coeff.ctypes.data, work.ctypes.data, naux, nao, rank, tile,
                 threads, int(accumulate))
         return out
@@ -1773,7 +1787,7 @@ def _int3c_mo_deriv_coords_vjp_from_z_reader(
         mol, auxmol, mo_coeff, read_z_aux_block, orbs_slice,
         int3c='int3c2e', aosym='s2ij', block_memory_mb=None,
         z_dtype=None, z_aux_block_max_rows=None, read_density_aux_block=None,
-        fill_packed_density_aux_block=None):
+        fill_packed_density_aux_block=None, symmetric=False):
     """Coordinate pullback with bounded reads per auxiliary-shell block.
 
     An optional ``fill_packed_density_aux_block(begin, end, out)`` writes
@@ -1795,6 +1809,8 @@ def _int3c_mo_deriv_coords_vjp_from_z_reader(
     naux = auxmol.nao
     nbas = mol.nbas
     k0, k1, l0, l1 = orbs_slice
+    if symmetric and (k0 != l0 or k1 != l1):
+        raise ValueError('Symmetric DF pullback requires identical orbital slices')
     kc = k1 - k0
     lc = l1 - l0
     mo_k = mo_l = None
@@ -1894,7 +1910,8 @@ def _int3c_mo_deriv_coords_vjp_from_z_reader(
                         packed = numpy.empty((p1 - p0, npair))
                     _int3c_mo_packed_density(mo_k, mo_l,
                         z_blk.reshape(read1 - read0, kc, lc),
-                        out=packed[read0 - p0:read1 - p0], workspace=packing_workspace)
+                        out=packed[read0 - p0:read1 - p0], workspace=packing_workspace,
+                        symmetric=symmetric)
                     z_blk = None
                     if profile:
                         density_seconds += time.perf_counter() - started
@@ -1987,7 +2004,7 @@ def _int3c_mo_deriv_coords_vjp_from_z_reader(
 def _int3c_mo_deriv_coords_vjp(mol, auxmol, mo_coeff, z,
                                orbs_slice, int3c='int3c2e',
                                aosym='s2ij', block_memory_mb=None,
-                               z_aux_block_max_rows=None):
+                               z_aux_block_max_rows=None, *, symmetric=False):
     """Coordinate pullback from a full ``z`` array or auxiliary-block reader."""
     if callable(z):
         read_z_aux_block = z
@@ -2010,6 +2027,7 @@ def _int3c_mo_deriv_coords_vjp(mol, auxmol, mo_coeff, z,
         block_memory_mb=block_memory_mb,
         z_dtype=z_dtype,
         z_aux_block_max_rows=z_aux_block_max_rows,
+        symmetric=symmetric,
     )
 
 

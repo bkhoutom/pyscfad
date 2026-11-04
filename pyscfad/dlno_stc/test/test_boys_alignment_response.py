@@ -89,3 +89,46 @@ def test_nearly_degenerate_canonical_eigenvectors_do_not_amplify_alignment(gap):
     fd = (objective(1e-4) - objective(-1e-4)) / 2e-4
     assert abs(derivative) < 1.
     np.testing.assert_allclose(derivative, fd, atol=3e-7, rtol=1e-6)
+
+
+def test_stationary_saddle_replay_keeps_labels_and_implicit_response(monkeypatch):
+    """A second escape would rotate a saved saddle by 45 degrees and fail matching."""
+    from contextlib import contextmanager
+    from pyscfad.lo import boys
+    mol = gto.Mole(atom='O 0 0 0; H .1 -.75 .57; H 0 .8 .61',
+                   basis='sto-3g', verbose=0)
+    mol.build(trace_exp=False, trace_ctr_coeff=False)
+    overlap = np.asarray(mol.intor('int1e_ovlp'))
+    rng = np.random.default_rng(155)
+    coeff = np.linalg.inv(np.linalg.cholesky(overlap).T) @ np.linalg.qr(rng.normal(size=(7, 3)))[0]
+    dipoles = np.zeros((3, 3, 3))
+    dipoles[0] = [[0., 1., 0.], [1., 0., 0.], [0., 0., 3.]]
+    dual = overlap @ coeff
+    ao_dipoles = np.einsum('pi,aij,qj->apq', dual, dipoles, dual)
+
+    def projected(mol, orbitals):
+        return jnp.einsum('pi,apq,qj->aij', orbitals, ao_dipoles, orbitals)
+
+    @contextmanager
+    def cache(loc, mo_coeff=None):
+        orbitals = loc.mo_coeff if mo_coeff is None else mo_coeff
+        loc._boys_dipole_cache = (np.asarray(projected(loc.mol, orbitals)), 0.)
+        try:
+            yield
+        finally:
+            del loc._boys_dipole_cache
+
+    monkeypatch.setattr(boys.Boys, '_cache_dipoles', cache)
+    monkeypatch.setattr(boys, 'dipole_integral', projected)
+    monkeypatch.delenv('BOYS_RESPONSE_VARIANT', raising=False)
+    static = SimpleNamespace(target_reference_coeff=coeff,
+                             target_reference_coords=np.asarray(mol.atom_coords()),
+                             lo_kwargs=dict(conv_tol=1e-12, conv_tol_grad=1e-9))
+    run = lambda orbitals: domain._rebuild_boys_targets(SimpleNamespace(mol=mol), orbitals, static)
+    with pytest.warns(RuntimeWarning, match='disabled for branch replay'):
+        actual, pullback = jax.vjp(run, jnp.asarray(coeff))
+    np.testing.assert_allclose(actual, coeff, atol=1e-12)
+    orbital_bar, = pullback(jnp.asarray(rng.normal(size=coeff.shape)))
+    assert np.all(np.isfinite(orbital_bar))
+    gauge_bar = coeff.T @ np.asarray(orbital_bar)
+    np.testing.assert_allclose(gauge_bar, gauge_bar.T, atol=1e-11)

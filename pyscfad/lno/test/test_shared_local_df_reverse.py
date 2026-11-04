@@ -18,6 +18,13 @@ from pyscfad.dlno_stc import ccsd
 ATOMS = numpy.asarray([0, 2], dtype=numpy.int32)
 
 
+@pytest.fixture(autouse=True)
+def no_local_df_disk(monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail('Local DF inputs and adjoints must not open HDF5 storage')
+    monkeypatch.setattr(h5py, 'File', forbidden)
+
+
 def _mf(mol):
     return SimpleNamespace(mol=mol, get_ovlp=lambda: mol.intor('int1e_ovlp'),
         with_df=SimpleNamespace(auxbasis='weigend', max_memory=64),
@@ -45,7 +52,8 @@ def _energy(mol, coeff, s1e=None):
 
 
 @pytest.mark.parametrize('backend', ['gemm', 'tiled'])
-def test_shared_packed_density_matches_both_ao_legs(backend, monkeypatch):
+@pytest.mark.parametrize('order', ['C', 'F'])
+def test_shared_packed_density_matches_both_ao_legs(backend, order, monkeypatch):
     """Unequal/transposed MO blocks share the native diagonal convention."""
     monkeypatch.setenv('PYSCFAD_DF_MO_DENSITY_BACKEND', backend)
     mol, _ = _problem(7)
@@ -56,8 +64,11 @@ def test_shared_packed_density_matches_both_ao_legs(backend, monkeypatch):
         for slices in ((1, 3, 2, 7), (1, 6, 3, 5)):
             k0, k1, l0, l1 = slices
             coeff = rng.normal(size=(scope.mol.nao, 7))
-            z = rng.normal(size=(scope.auxmol.nao, (k1-k0)*(l1-l0)))
-            scope.add(coeff, z, numpy.zeros((scope.auxmol.nao,)*2), slices)
+            z = numpy.array(rng.normal(size=(scope.auxmol.nao, (k1-k0)*(l1-l0))),
+                            order=order)
+            retained_z = scope.add(coeff, z, numpy.zeros((scope.auxmol.nao,)*2), slices)
+            assert numpy.shares_memory(retained_z, z)
+            assert scope.terms[-1].z is retained_z
             expected += numpy.einsum('uk,pkl,vl->puv', coeff[:, k0:k1],
                 z[1:3].reshape(2, k1-k0, l1-l0), coeff[:, l0:l1])
         rows, cols = numpy.tril_indices(scope.mol.nao)
@@ -86,7 +97,9 @@ def test_shared_coordinate_and_orbital_bars_match_separate_reverses(nmo, seed, m
     with _df_shared.reverse_scope(_mf(mol), ATOMS) as scope:
         value, (mol_bar, coeff_bar) = jax.value_and_grad(objective, argnums=(0, 1))(mol, coeff)
         assert len(scope.terms) == 2
-        assert all(isinstance(term[0], h5py.Dataset) for term in scope.terms)
+        assert all(isinstance(term.z, numpy.ndarray) for term in scope.terms)
+        retained = sum(term.z.nbytes + term.coeff.nbytes for term in scope.terms)
+        assert scope.receipt['adjoint_resident_bytes'] == retained
         geometry = scope.finish()
         numpy.testing.assert_allclose(mol_bar.coords + geometry, mol_ref.coords,
                                       atol=2e-9, rtol=2e-8)
@@ -95,9 +108,10 @@ def test_shared_coordinate_and_orbital_bars_match_separate_reverses(nmo, seed, m
         assert scope.receipt['consumers'] == 2
         assert scope.receipt['geometry_passes'] == scope.receipt['metric_passes'] == 1
         assert scope.receipt['max_density_rows'] <= 2
-        assert scope.receipt['spooled_bytes'] > 0
+        assert scope.receipt['adjoint_peak_bytes'] == retained
+        assert scope.receipt['adjoint_resident_bytes'] == 0
         assert scope.terms == []
-    assert scope._file is None and scope._handle is None
+    assert scope.terms == []
     assert scope.metric is None and scope.low is None
     # Finite differences include the overlap projection and ED-to-LIS chain.
     step = 1e-5
@@ -152,8 +166,9 @@ def test_direct_reuses_metric_but_generates_four_integral_passes(monkeypatch):
         assert counts == dict(metric=1, cholesky=1, raw=4)
         assert scope.receipt['metric_builds'] == scope.receipt['cholesky_builds'] == 1
         assert scope.receipt['raw_integral_builds'] == scope.receipt['raw_source_passes'] == 4
-        assert set(scope._file) == {'0', '1'}  # Only MO adjoints reach disk.
-    assert scope._file is None
+        assert scope.receipt['adjoint_peak_bytes'] > 0
+        assert scope.receipt['adjoint_resident_bytes'] == 0
+    assert scope.terms == []
     assert scope.metric is None and scope.low is None
 
 
@@ -202,7 +217,7 @@ def test_scope_is_closed_after_generation_failure(monkeypatch):
     with pytest.raises(RuntimeError, match='interrupted integral generation'):
         with _df_shared.reverse_scope(_mf(mol), ATOMS) as scope:
             jax.grad(lambda m: _energy(m, coeff))(mol)
-    assert scope._file is None and scope._handle is None
+    assert scope.terms == [] and scope.receipt['adjoint_resident_bytes'] == 0
     assert scope.metric is None and scope.low is None
     assert scope._metric_pullback is None and scope._factor_pullback is None
     assert _df_shared._ACTIVE.get() is None
@@ -280,13 +295,13 @@ def test_budget_exhaustion_and_scope_failure_do_not_leak(monkeypatch):
     assert len(caught) == 1
     numpy.testing.assert_allclose(bar.coords + geometry, reference.coords,
                                   atol=2e-9, rtol=2e-8)
-    assert scope._file is None and scope._handle is None
+    assert scope.terms == [] and scope.receipt['adjoint_resident_bytes'] == 0
     assert _df_shared._ACTIVE.get() is None
     monkeypatch.undo()
     with pytest.raises(RuntimeError, match='finished and added'):
         with _df_shared.reverse_scope(_mf(mol), ATOMS) as unfinished:
             jax.grad(lambda m: _energy(m, coeff))(mol)
-    assert unfinished._file is None and unfinished._handle is None
+    assert unfinished.terms == [] and unfinished.receipt['adjoint_resident_bytes'] == 0
     assert _df_shared._ACTIVE.get() is None
     # A subsequent ordinary gradient must still include its integral response.
     bar = jax.grad(lambda m: _energy(m, coeff))(mol)
@@ -296,9 +311,7 @@ def test_budget_exhaustion_and_scope_failure_do_not_leak(monkeypatch):
 def test_shared_reverse_respects_available_block_workspace(monkeypatch):
     mol, _ = _problem(4)
     monkeypatch.setattr(_df_shared.pyscf_lib, 'current_memory', lambda: (0., 0.))
-    monkeypatch.setenv('PYSCFAD_LNO_LOCAL_DIRECT_INT3C_BLOCK_MB', '0.01')
-    # The public block control has a 1 MB minimum. A smaller DF workspace is
-    # still respected when it can hold complete auxiliary rows.
+    # A small DF workspace is respected when it holds complete auxiliary rows.
     mf = _mf(mol)
     mf.with_df.max_memory = .01
     with _df_shared.reverse_scope(mf, ATOMS) as scope:

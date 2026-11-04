@@ -31,7 +31,7 @@ from pyscfad import numpy as np
 from pyscfad.df import _cderi_vjp
 from pyscfad.tools import resource_profile
 from ._df_direct import (
-    _local_direct_int3c_block_mb,
+    _local_direct_workspace_mb,
     _local_direct_mo_coeff_vjp,
     _tree_add,
 )
@@ -159,9 +159,9 @@ def _run_local_direct_h5_producer(
 
 
 def _local_direct_h5_effective_max_memory(max_memory):
-    """Cap raw integral buffers when the fitted Lov itself is on disk."""
+    """Give raw integral buffers half the available process headroom."""
     current_mb = float(pyscf_lib.current_memory()[0])
-    requested_mb = current_mb + _local_direct_int3c_block_mb() / 0.7
+    requested_mb = current_mb + _local_direct_workspace_mb(max_memory) / 0.7
     return max(current_mb, min(float(max_memory), requested_mb))
 
 
@@ -608,7 +608,7 @@ def _local_direct_nr_e2_h5_bwd(
                     orbs_slice,
                     int3c=mol._add_suffix('int3c2e'),
                     aosym='s2ij',
-                    block_memory_mb=_local_direct_int3c_block_mb(),
+                    block_memory_mb=_local_direct_workspace_mb(mol.max_memory) * 1e6 / 1024**2,
                     z_aux_block_max_rows=z_aux_block_max_rows,
                 )
 

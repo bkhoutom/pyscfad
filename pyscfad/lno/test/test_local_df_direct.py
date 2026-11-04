@@ -174,25 +174,15 @@ def test_integral_direct_reverse_rejects_invalid_metric_before_streaming(
         )
 
 
-@pytest.mark.parametrize(
-    ("configured_mb", "expected_mb"),
-    ((None, 512.0), (7.0, 7.0), ("invalid", 512.0)),
-)
-def test_integral_direct_coordinate_vjp_uses_forward_block_budget(
-    monkeypatch, configured_mb, expected_mb
+@pytest.mark.parametrize('max_memory', [200., 4000.])
+def test_integral_direct_coordinate_vjp_uses_available_workspace(
+    monkeypatch, max_memory
 ):
     mol = _water_mol()
+    mol.max_memory = max_memory
     atmlst = numpy.asarray([0, 1], dtype=numpy.int32)
     coeff = _local_coeff(mol, atmlst)
-    if configured_mb is None:
-        monkeypatch.delenv(
-            "PYSCFAD_LNO_LOCAL_DIRECT_INT3C_BLOCK_MB", raising=False
-        )
-    else:
-        monkeypatch.setenv(
-            "PYSCFAD_LNO_LOCAL_DIRECT_INT3C_BLOCK_MB",
-            str(configured_mb),
-        )
+    monkeypatch.setattr(pyscf_lib, 'current_memory', lambda: (0., 0.))
 
     real_vjp = lno_df_direct._cderi_vjp._int3c_mo_deriv_coords_vjp
     seen = []
@@ -209,7 +199,7 @@ def test_integral_direct_coordinate_vjp_uses_forward_block_budget(
     jax.value_and_grad(
         lambda mol_: _lov_norm(mol_, coeff, atmlst, True)
     )(mol)
-    assert seen == [expected_mb]
+    assert seen == [max_memory * .5 * 1e6 / 1024**2]
 
 
 def test_integral_direct_local_lov_general_cotangent_matches_coordinate_fd():

@@ -46,30 +46,25 @@ def _tree_add(x, y):
     return jax.tree_util.tree_map(lambda a, b: a + b, x, y)
 
 
-def _local_direct_int3c_block_mb():
-    """Memory target for the two raw-int3c buffers in direct local AO2MO."""
-    try:
-        return max(
-            float(os.environ.get('PYSCFAD_LNO_LOCAL_DIRECT_INT3C_BLOCK_MB', 512.0)),
-            1.0,
-        )
-    except ValueError:
-        return 512.0
+def _local_direct_workspace_mb(max_memory, workspace_mb=None, reserve_bytes=0):
+    """Decimal MB for temporary tiles after reserving persistent outputs."""
+    remaining = ((float(max_memory) - pyscf_lib.current_memory()[0]) * 1e6
+                 - reserve_bytes)
+    budget = .5 * max(0., remaining) / 1e6
+    return budget if workspace_mb is None else min(float(workspace_mb), budget)
 
 
 def _local_direct_effective_max_memory(max_memory, naux, nkl):
-    """Cap PySCF's direct-DF shell buffer without shrinking the Lov result.
+    """Give PySCF half the headroom remaining after the Lov allocation.
 
     ``_init_mp_df_eris_direct`` subtracts the resident ``ovL`` array before
-    assigning 70 percent of the remaining memory to two AO-pair buffers.  A
-    large process-wide memory limit would therefore make a single ED request
-    multi-gigabyte work buffers.  Supplying this tighter, current-RSS-aware
-    limit keeps the block near the explicit target while retaining the same
-    integral-direct algorithm.
+    assigning 70 percent of the remaining memory to two AO-pair buffers.
+    Translate our workspace allowance into that producer's memory ceiling.
     """
     current_mb = float(pyscf_lib.current_memory()[0])
     lov_mb = float(naux) * float(nkl) * numpy.dtype(numpy.float64).itemsize / 1e6
-    requested_mb = current_mb + lov_mb + _local_direct_int3c_block_mb() / 0.7
+    budget = _local_direct_workspace_mb(max_memory, reserve_bytes=lov_mb * 1e6)
+    requested_mb = current_mb + lov_mb + budget / 0.7
     return max(current_mb + lov_mb, min(float(max_memory), requested_mb))
 
 
@@ -140,10 +135,10 @@ def _local_direct_wide_nr_e2(mol, auxmol, mo_coeff, max_memory, orbs_slice):
         if scope.half is not None:
             return scope.half.transform(coeff, orbs_slice, low)
     result = numpy.empty((auxmol.nao, nkl), order='F')
-    available_bytes = max(0., (float(max_memory)
-        - pyscf_lib.current_memory()[0]) * 1e6 - result.nbytes)
-    block_bytes = min(_local_direct_int3c_block_mb() * 1024**2,
-                      .7 * available_bytes)
+    block_bytes = _local_direct_workspace_mb(
+        max_memory if scope is None else scope.max_memory_mb,
+        None if scope is None else scope.workspace_mb,
+        reserve_bytes=result.nbytes) * 1e6
     rows = max(1, int(block_bytes // (8 * (npair + nkl))))
     for p0, p1, raw in _local_direct_raw_int3c_blocks(
             mol, auxmol, z_aux_block_max_rows=rows):
@@ -164,9 +159,8 @@ def _local_direct_raw_int3c_blocks(
     scope = matching_scope(mol, auxmol)
     if scope is not None:
         pairs = mol.nao * (mol.nao + 1) // 2
-        remaining = scope.max_memory_mb - pyscf_lib.current_memory()[0]
-        budget = min(scope.workspace_mb, .5 * max(0., remaining),
-                     _local_direct_int3c_block_mb()) * 1e6
+        budget = _local_direct_workspace_mb(
+            scope.max_memory_mb, scope.workspace_mb) * 1e6
         # Direct streaming has only one indivisible minimum row. Preserve
         # the scope's advisory fallback when RSS exhausts the target; the
         # resident half-cache performs its strict minimum-tile check first.
@@ -191,19 +185,15 @@ def _generate_local_raw_int3c_blocks(
         mol, auxmol, z_aux_block_max_rows=None):
     """Yield disjoint ``(auxiliary AO slice, raw int3c block)`` triples."""
     npair = mol.nao * (mol.nao + 1) // 2
-    target_bytes = _local_direct_int3c_block_mb() * 1024.0**2
-    aux_blksize = max(
-        1,
-        min(
-            auxmol.nao,
-            int(target_bytes // max(npair * numpy.dtype(numpy.float64).itemsize, 1)),
-        ),
-    )
-    if z_aux_block_max_rows is not None:
+    if z_aux_block_max_rows is None:
+        target_bytes = _local_direct_workspace_mb(mol.max_memory) * 1e6
+        aux_blksize = max(1, min(auxmol.nao, int(target_bytes // max(16*npair, 1))))
+    else:
         z_aux_block_max_rows = int(z_aux_block_max_rows)
         if z_aux_block_max_rows <= 0:
             raise ValueError('z_aux_block_max_rows must be positive')
-        aux_blksize = min(aux_blksize, z_aux_block_max_rows)
+        # The caller has already budgeted its integral and transform buffers.
+        aux_blksize = min(auxmol.nao, z_aux_block_max_rows)
     for shl0, shl1, _ in balance_partition(auxmol.ao_loc, aux_blksize):
         p0 = int(auxmol.ao_loc[shl0])
         p1 = int(auxmol.ao_loc[shl1])
@@ -234,7 +224,7 @@ def _generate_local_raw_int3c_blocks(
 
 def _local_direct_mo_coeff_vjp_from_z_reader(
         mol, auxmol, mo_coeff, read_z_aux_block, orbs_slice,
-        z_aux_block_max_rows=None, *, symmetric=False):
+        z_aux_block_max_rows=None, *, symmetric=False, max_memory=None):
     """MO-coefficient pullback with bounded z reads per integral block."""
     mo_coeff_bar = numpy.zeros_like(numpy.asarray(jax.device_get(mo_coeff)))
     k0, k1, l0, l1 = map(int, orbs_slice)
@@ -247,6 +237,12 @@ def _local_direct_mo_coeff_vjp_from_z_reader(
         return np.asarray(scope.half.coefficient_pullback(
             numpy.asarray(jax.device_get(mo_coeff)), read_z_aux_block, orbs_slice,
             symmetric=symmetric))
+    if scope is None and max_memory is not None:
+        pairs = mol.nao * (mol.nao + 1) // 2
+        budget = _local_direct_workspace_mb(max_memory) * 1e6
+        rows = max(1, int(budget // (8 * (2*pairs + kl_count))))
+        z_aux_block_max_rows = (rows if z_aux_block_max_rows is None
+                               else min(rows, z_aux_block_max_rows))
     for p0, p1, raw_ints in _local_direct_raw_int3c_blocks(
             mol, auxmol, z_aux_block_max_rows=z_aux_block_max_rows):
         z_block = numpy.asarray(read_z_aux_block(p0, p1))
@@ -271,7 +267,7 @@ def _local_direct_mo_coeff_vjp_from_z_reader(
 
 def _local_direct_mo_coeff_vjp(
         mol, auxmol, mo_coeff, z, orbs_slice,
-        z_aux_block_max_rows=None, *, symmetric=False):
+        z_aux_block_max_rows=None, *, symmetric=False, max_memory=None):
     """MO-coefficient pullback from a full z array or auxiliary reader."""
     if callable(z):
         read_z_aux_block = z
@@ -289,6 +285,7 @@ def _local_direct_mo_coeff_vjp(
         orbs_slice,
         z_aux_block_max_rows=z_aux_block_max_rows,
         symmetric=symmetric,
+        max_memory=max_memory,
     )
 
 
@@ -307,7 +304,6 @@ def _local_direct_nr_e2_fwd(mol, auxmol, mo_coeff, max_memory, orbs_slice):
 
 
 def _local_direct_nr_e2_bwd(max_memory, orbs_slice, res, fitted_mo_bar):
-    del max_memory
     mol, auxmol, mo_coeff, fitted_mo = res
     del res
     if mol.exp is not None or mol.ctr_coeff is not None or mol.r0 is not None:
@@ -357,34 +353,35 @@ def _local_direct_nr_e2_bwd(max_memory, orbs_slice, res, fitted_mo_bar):
         low, fitted_mo_np, fitted_mo_bar_np, symmetric=symmetric,
         receipt=None if scope is None else scope.receipt)
     del fitted_mo_np, fitted_mo_bar_np, fitted_mo, fitted_mo_bar, low
+    # Consume the metric tape before streaming the three-center integrals.
+    # Its pullback uses only the lower triangle of the factor cotangent.
+    _cderi_vjp._zero_strict_upper_inplace(low_bar)
+    from ._df_shared import defer_geometry
+    deferred_z = defer_geometry(mol, auxmol, mo_coeff, z, low_bar, orbs_slice,
+                               symmetric_packed=symmetric)
+    if deferred_z is not None:
+        # Coefficient bars must remain immediate: LIS orbital derivatives
+        # determine the W cotangent that later joins this domain's response.
+        del metric_pullback, low_bar, z
+        with _vjp_progress_section('local DF MO-coeff backward'):
+            mo_coeff_bar = _local_direct_mo_coeff_vjp(
+                mol, auxmol, mo_coeff, deferred_z, orbs_slice, symmetric=symmetric)
+        return (_cderi_vjp._coords_tree_like(mol, numpy.zeros((mol.natm, 3))),
+                _cderi_vjp._coords_tree_like(auxmol, numpy.zeros((auxmol.natm, 3))),
+                mo_coeff_bar)
     if symmetric:
         width = orbs_slice[1] - orbs_slice[0]
         read_z = lambda p0, p1: _df_symmetric.unpack_symmetric(
             z[p0:p1], width).reshape(p1-p0, width*width)
     else:
         read_z = z
-
-    # Consume the metric tape before streaming the three-center integrals.
-    # Its pullback uses only the lower triangle of the factor cotangent.
-    _cderi_vjp._zero_strict_upper_inplace(low_bar)
-    from ._df_shared import defer_geometry
-    if defer_geometry(mol, auxmol, mo_coeff, z, low_bar, orbs_slice,
-                      symmetric_packed=symmetric):
-        # Coefficient bars must remain immediate: LIS orbital derivatives
-        # determine the W cotangent that later joins this domain's response.
-        del metric_pullback, low_bar
-        with _vjp_progress_section('local DF MO-coeff backward'):
-            mo_coeff_bar = _local_direct_mo_coeff_vjp(
-                mol, auxmol, mo_coeff, read_z, orbs_slice, symmetric=symmetric)
-        return (_cderi_vjp._coords_tree_like(mol, numpy.zeros((mol.natm, 3))),
-                _cderi_vjp._coords_tree_like(auxmol, numpy.zeros((auxmol.natm, 3))),
-                mo_coeff_bar)
     aux_metric_bar = metric_pullback(np.asarray(low_bar))[0]
     del metric_pullback, low_bar
 
     with _vjp_progress_section('local DF MO-coeff backward'):
         mo_coeff_bar = _local_direct_mo_coeff_vjp(
-            mol, auxmol, mo_coeff, read_z, orbs_slice, symmetric=symmetric
+            mol, auxmol, mo_coeff, read_z, orbs_slice, symmetric=symmetric,
+            max_memory=max_memory,
         )
     with _vjp_progress_section('local DF integral derivative backward'):
         mol_bar, auxmol_bar = _cderi_vjp._int3c_mo_deriv_coords_vjp(
@@ -395,7 +392,7 @@ def _local_direct_nr_e2_bwd(max_memory, orbs_slice, res, fitted_mo_bar):
             orbs_slice,
             int3c=mol._add_suffix('int3c2e'),
             aosym='s2ij',
-            block_memory_mb=_local_direct_int3c_block_mb(),
+            block_memory_mb=_local_direct_workspace_mb(max_memory) * 1e6 / 1024**2,
             symmetric=symmetric,
         )
     del z

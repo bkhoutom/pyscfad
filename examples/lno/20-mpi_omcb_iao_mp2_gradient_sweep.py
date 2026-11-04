@@ -45,7 +45,6 @@ os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
-os.environ.setdefault("PYSCFAD_LNO_LOCAL_DIRECT_INT3C_BLOCK_MB", "128")
 os.environ.setdefault("PYSCFAD_DF_CDERI_BAR_AUX_BLOCK_MB", "128")
 
 import jax
@@ -464,9 +463,6 @@ def main():
                     "mpi_ranks": nproc,
                     "min_free_disk_gib": args.min_free_disk_gib,
                     "max_combined_rss_gib": args.max_combined_rss_gib,
-                    "local_direct_int3c_block_mb": os.environ.get(
-                        "PYSCFAD_LNO_LOCAL_DIRECT_INT3C_BLOCK_MB"
-                    ),
                     "cderi_bar_aux_block_mb": os.environ.get(
                         "PYSCFAD_DF_CDERI_BAR_AUX_BLOCK_MB"
                     ),

@@ -101,7 +101,9 @@ def test_default_half_matches_direct_with_one_integral_pass(
     assert receipt['half_resident_bytes'] == 0
     assert receipt['consumers'] == 1+len(case.indices)
     assert receipt['symmetric_consumers'] == len(case.indices)
-    assert receipt['symmetric_saved_bytes'] > 0
+    assert receipt['symmetric_expanded_bytes'] > 0
+    assert receipt['adjoint_peak_bytes'] > 0
+    assert receipt['adjoint_resident_bytes'] == 0
     assert receipt['geometry_passes'] == receipt['metric_passes'] == 1
     numpy.testing.assert_allclose(value, reference, atol=3e-12, rtol=0)
     numpy.testing.assert_allclose(gradient.coords, ref_gradient.coords, atol=3e-9, rtol=3e-7)

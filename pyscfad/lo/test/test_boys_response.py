@@ -146,15 +146,19 @@ def test_unknown_variant_is_rejected(case, monkeypatch):
         boys.boys(mol, coeff)
 
 
-@pytest.mark.parametrize('requested_tol', [None, 3e-9])
+@pytest.mark.parametrize('requested_tol,requested_atol',
+                         [(None, None), (None, 1e-12), (3e-9, 1e-12)])
+@pytest.mark.parametrize('optimized_integrals', [False, True])
 def test_default_response_solves_with_preconditioner_and_respects_options(
-        case, monkeypatch, requested_tol):
+        case, monkeypatch, requested_tol, requested_atol, optimized_integrals):
     """Catch a disabled default, dropped preconditioner, or overwritten tolerance."""
     mol, coeff, _, _ = case
     monkeypatch.delenv('BOYS_RESPONSE_VARIANT', raising=False)
-    requested = dict(atol=1e-12, restart=20, maxiter=100)
+    requested = dict(restart=20, maxiter=100)
     if requested_tol is not None:
         requested['tol'] = requested_tol
+    if requested_atol is not None:
+        requested['atol'] = requested_atol
     original_options = requested.copy()
     original = boys.gen_gmres
     records = []
@@ -172,16 +176,20 @@ def test_default_response_solves_with_preconditioner_and_respects_options(
         return recorded
 
     monkeypatch.setattr(boys, 'gen_gmres', instrumented_solver)
-    _, pullback = jax.vjp(lambda c: boys.boys(
-        mol, c, init_guess='atomic', conv_tol=1e-12, conv_tol_grad=1e-9,
-        gmres_options=requested), coeff)
-    bars = pullback(jnp.asarray(np.random.default_rng(28).normal(size=coeff.shape)))
+    from pyscfad import config_update
+    with config_update('pyscfad_moleintor_opt', optimized_integrals):
+        _, pullback = jax.vjp(lambda c: boys.boys(
+            mol, c, init_guess='atomic', conv_tol=1e-12, conv_tol_grad=1e-9,
+            gmres_options=requested), coeff)
+        bars = pullback(jnp.asarray(np.random.default_rng(28).normal(size=coeff.shape)))
     jax.block_until_ready(bars)
     assert requested == original_options, 'caller options must not be mutated'
     assert len(records) == 1
     options, operator, residual, rhs_norm, info = records[0]
-    expected_tol = 1e-10 if requested_tol is None else requested_tol
+    expected_tol = 1e-7 if requested_tol is None else requested_tol
+    expected_atol = 1e-7 if requested_atol is None else requested_atol
     assert options.get('tol') == expected_tol
+    assert options.get('atol') == expected_atol
     assert operator is not None, 'optimized Boys response must be enabled by default'
     assert info == 0
-    assert residual <= max(1e-12, expected_tol * rhs_norm)
+    assert residual <= max(expected_atol, expected_tol * rhs_norm)

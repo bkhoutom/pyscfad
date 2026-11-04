@@ -229,15 +229,38 @@ def _stable_virtual_frame(
     return _cholesky_metric_orthonormalize(projected, overlap22), columns
 
 
-# Boys replay and metric operations copied from dlno/dlno_base.py.
+@jax.custom_jvp
+def _polar_rotation(matrix):
+    """Orthogonal polar factor of a real, nonsingular square overlap.
+
+    Its derivative uses sums of singular values. Differentiating the SVD
+    vectors separately is undefined at the repeated singular values (all
+    equal to one) encountered when replaying the reference geometry.
+    """
+    left, _, right = np.linalg.svd(matrix, full_matrices=False)
+    return left @ right
+
+
+@_polar_rotation.defjvp
+def _polar_rotation_jvp(primals, tangents):
+    matrix, = primals
+    tangent, = tangents
+    left, singular, right = np.linalg.svd(matrix, full_matrices=False)
+    rotated = left.T @ tangent @ right.T
+    angular = (rotated - rotated.T) / (singular[:, None] + singular[None, :])
+    return left @ right, left @ angular @ right
+
+
+# Boys replay and metric operations originated in dlno/dlno_base.py.
 def _rebuild_boys_targets(mf, occupied, static):
     """Replay a saved Boys branch with the existing implicit-response wrapper.
 
-    Only the initializer and permutation/sign choices are concrete. Current
-    orbitals and their response always come from ``boys.boys``. Like the
-    production SCF/localization driver this boundary is eager, not JITted.
+    Differentiate the reference alignment, including the moving AO overlap.
+    This removes arbitrary rotations of the canonical occupied input before
+    the localization response, even when that response has gauge null modes.
+    Only the saved reference and permutation/sign choices are concrete.
     """
-    from pyscf import gto as pyscf_gto
+    from pyscfad.gto import mole as ad_mole
     from scipy.optimize import linear_sum_assignment
 
     reference = static.target_reference_coeff
@@ -246,31 +269,29 @@ def _rebuild_boys_targets(mf, occupied, static):
     reference = numpy.asarray(reference)
     if reference.shape != occupied.shape:
         raise ValueError("Boys reference and current active occupied spaces differ")
-    coords = _host_array(jax.lax.stop_gradient(mf.mol.atom_coords()))
-    current_mol = mf.mol.to_pyscf().set_geom_(coords, unit="Bohr", inplace=False)
-    reference_mol = current_mol.set_geom_(
+    reference_mol = jax.tree_util.tree_map(jax.lax.stop_gradient, mf.mol).set_geom_(
         numpy.asarray(static.target_reference_coords), unit="Bohr", inplace=False
     )
-    cross_overlap = pyscf_gto.intor_cross("int1e_ovlp", current_mol, reference_mol)
-    current_occupied = _host_array(jax.lax.stop_gradient(occupied))
-    projection = current_occupied.T @ cross_overlap @ reference
-    left, singular, right = scipy_linalg.svd(projection, check_finite=True)
+    cross_overlap = ad_mole.intor_cross("int1e_ovlp", mf.mol, reference_mol)
+    projection = occupied.T @ cross_overlap @ reference
+    singular = scipy_linalg.svdvals(_host_array(jax.lax.stop_gradient(projection)))
     if singular.min() < 0.5:
         raise ValueError("Boys reference no longer spans the current occupied space; rebuild selections")
     options = dict(static.lo_kwargs or {})
     # Rebase the optimizer at the reference-aligned occupied frame. Solving
     # for the small remaining rotation avoids nearly singular exponential
-    # coordinates for a large canonical-to-local rotation. The concrete
-    # alignment is a coordinate choice; current occupied coefficients and
-    # their localization response remain differentiated.
+    # coordinates for a large canonical-to-local rotation. The polar factor
+    # must respond too: C Q(C.T S_cross C_ref) is invariant under C -> C R.
+    # A stopped Q leaves an occupied-occupied cotangent that the SCF response
+    # can amplify by inverse near-degenerate orbital-energy gaps.
     options["init_guess"] = numpy.eye(occupied.shape[1])
     parent = ('stc.system.input_pullback' if isinstance(static, SystemBoysReference)
               else 'stc.domain.common_pullback')
     localized = response(parent + '.boys_response_total',
                          lambda mol, coeff: _build_boys_targets(mol, coeff, options),
-                         mf.mol, occupied @ (left @ right))
+                         mf.mol, occupied @ _polar_rotation(projection))
     current_localized = _host_array(jax.lax.stop_gradient(localized))
-    overlaps = reference.T @ cross_overlap.T @ current_localized
+    overlaps = reference.T @ _host_array(jax.lax.stop_gradient(cross_overlap)).T @ current_localized
     magnitude = numpy.abs(overlaps)
     rows, permutation = linear_sum_assignment(-magnitude)
     matched = magnitude[rows, permutation]

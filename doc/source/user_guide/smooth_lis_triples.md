@@ -477,7 +477,24 @@ only its s shells on hydrogen, and `def2-svp-jkfit` as the auxiliary basis.
 Both use DF-RHF thresholds `conv_tol=1e-9` and `conv_tol_grad=1e-6`, atomic Boys
 initialization with `conv_tol=1e-10`, and Boys derivative GMRES settings
 `restart=120`, `maxiter=100`. These are runner settings, not triples controls.
-Both fix CCSD `max_cycle=200`. The comparison script fixes memory at 800000 MB;
+Boys localization now checks the lowest orbital-Hessian curvature before its
+implicit response. A stationary saddle is restarted along a descending
+direction and reoptimized; failure after six restarts raises an error. This
+can change the localized orbitals and domains selected from a symmetric
+atomic guess. Rebuild selections that were saved at a saddle.
+
+STC Boys reference replay differentiates the occupied-frame polar alignment,
+including the current-geometry side of the cross-AO overlap. Its derivative
+uses sums of singular values, so equal singular values at the reference are
+well defined. Internal canonical occupied rotations cancel before the SCF
+response; occupied–virtual and overlap response remain included. This does
+not change SCF eigenvalue-gap thresholds or freeze localization response.
+The real restricted SCF fixed-point density also uses a spectral-projector
+derivative: equal-occupation blocks have zero Fock response and their exact
+overlap response. Only different-occupation blocks require energy denominators.
+This avoids cancellation noise in the density Jacobian at occupied or virtual
+degeneracies; individual canonical-orbital output derivatives are unchanged.
+The two runners fix CCSD `max_cycle=200`. The comparison script fixes memory at 800000 MB;
 the benchmark exposes it as a flag. This setting leaves room on the approximately
 900 GB host; STC planning budgets are advisory rather than memory reservations.
 

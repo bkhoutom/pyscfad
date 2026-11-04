@@ -105,6 +105,37 @@ def _get_veff_from_orbitals(mf, mol, dm, mo_coeff, mo_occ, **kwargs):
     return mf.get_veff(mol, dm, **kwargs) if vhf is None else vhf
 
 
+@ops.custom_jvp
+def _density_from_fock(fock, overlap, energy, coeff, occupation):
+    """Density with the fixed-occupation spectral-projector response.
+
+    The eigensystem is the forward value at (fock, overlap). Rotations inside
+    an equally occupied subspace never change its density. Cancel those terms
+    algebraically instead of dividing by small gaps and cancelling afterwards.
+    """
+    del fock, overlap, energy
+    return (coeff * occupation) @ coeff.T.conj()
+
+
+@_density_from_fock.defjvp
+def _density_from_fock_jvp(primals, tangents):
+    fock, overlap, energy, coeff, occupation = primals
+    dfock, doverlap, _, _, doccupation = tangents
+    # Match eigh's Hermitian input convention, including nonsymmetric Krylov
+    # trial densities and cotangents in the unrestricted AO matrix space.
+    f = coeff.T.conj() @ (.5 * (dfock + dfock.T.conj())) @ coeff
+    s = coeff.T.conj() @ (.5 * (doverlap + doverlap.T.conj())) @ coeff
+    different = occupation[:, None] != occupation[None, :]
+    gap = np.where(different, energy[None, :] - energy[:, None], 1.)
+    f_weight = (occupation[None, :] - occupation[:, None]) / gap
+    weighted_energy = occupation * energy
+    s_weight = np.where(different,
+                        (weighted_energy[None, :] - weighted_energy[:, None]) / gap,
+                        occupation[:, None])
+    tangent = coeff @ (f_weight * f - s_weight * s + np.diag(doccupation)) @ coeff.T.conj()
+    return _density_from_fock(*primals), tangent
+
+
 def _scf_fixed_point(dm, mf, s1e, h1e, root_factors=None):
     # Only this density is closed over in the external-root VJP. In Krylov
     # matvecs dm remains an independent variable and requires its full bar.
@@ -119,7 +150,13 @@ def _scf_fixed_point(dm, mf, s1e, h1e, root_factors=None):
     mo_energy, mo_coeff = mf.eig(fock, s1e)
     mo_occ = mf.get_occ(mo_energy, mo_coeff)
     _stash_dfjk_mo_data(mf, mo_coeff, mo_occ, s1e)
-    dm = mf.make_rdm1(mo_coeff, mo_occ)
+    # Restricted, real references use the density projector directly. Keep
+    # other occupation/layout conventions on their existing response path.
+    if (isinstance(mf, pyscf_hf.RHF) and dm.ndim == 2 and mo_coeff.ndim == 2
+            and not np.iscomplexobj(mo_coeff)):
+        dm = _density_from_fock(fock, s1e, mo_energy, mo_coeff, mo_occ)
+    else:
+        dm = mf.make_rdm1(mo_coeff, mo_occ)
     return dm, (mo_energy, mo_coeff, mo_occ)
 
 

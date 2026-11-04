@@ -298,6 +298,57 @@ def _extract_x0(loc, u):
     x = pack_uniq_var(numpy.real(mat))
     return x
 
+
+def _lowest_curvature(loc, u):
+    """Lowest eigenpair of the orbital Hessian, without a pair-pair matrix."""
+    from scipy.sparse.linalg import LinearOperator, eigsh
+
+    gradient, action, _ = loc.gen_g_hop(u)
+    size = gradient.size
+    if size <= 2:
+        matrix = numpy.column_stack([action(v) for v in numpy.eye(size)])
+        values, vectors = numpy.linalg.eigh(.5 * (matrix + matrix.T))
+        return float(values[0]), vectors[:, 0]
+    operator = LinearOperator((size, size), matvec=action, dtype=float)
+    # A nonsymmetric starting vector can see symmetry-breaking directions.
+    # A local RNG keeps the check repeatable without affecting user sampling.
+    initial = numpy.random.default_rng(7301).normal(size=size)
+    values, vectors = eigsh(operator, k=1, which='SA', tol=1e-8,
+                            v0=initial, maxiter=max(200, 10 * size))
+    return float(values[0]), vectors[:, 0]
+
+
+def _stabilize_boys(loc, u, sorted_idx):
+    """Escape stationary saddles before defining an implicit response.
+
+    A zero gradient and even a positive Hessian diagonal do not establish a
+    local minimum. Symmetric atomic guesses can otherwise stay at a saddle
+    with a singular response (notably the separated sigma/pi benzene frame).
+    """
+    from scipy.linalg import expm
+
+    for attempt in range(7):
+        curvature, direction = _lowest_curvature(loc, u)
+        if curvature >= -1e-6:
+            return u, sorted_idx
+        if attempt == 6:
+            raise RuntimeError('Boys localization remains at a saddle after six restarts; '
+                               'cannot differentiate this localization branch')
+        value = loc.cost_function(u)
+        for step in (.15, .075, .0375, .01875):
+            trials = [u @ expm(loc.unpack_uniq_var(sign * step * direction))
+                      for sign in (1., -1.)]
+            trial = min(trials, key=loc.cost_function)
+            if loc.cost_function(trial) < value - 1e-12:
+                break
+        else:
+            raise RuntimeError('Boys negative-curvature step failed to lower the objective')
+        logger.info(loc, 'Restarting Boys localization along negative curvature %.6g', curvature)
+        loc.init_guess = trial
+        u, sorted_idx = kernel(loc, return_u=True)
+    raise AssertionError('unreachable')
+
+
 def _boys(x, mol, mo_coeff, *,
           init_guess=None,
           conv_tol=None, conv_tol_grad=None, max_cycle=None):
@@ -325,6 +376,7 @@ def _boys(x, mol, mo_coeff, *,
     with loc._cache_dipoles():
         u, sorted_idx = kernel(loc,
             mo_coeff=mo_coeff if init_guess is None else None, return_u=True)
+        u, sorted_idx = _stabilize_boys(loc, u, sorted_idx)
         x = _extract_x0(loc, u)
     return x, sorted_idx
 
@@ -353,6 +405,10 @@ def boys(mol, mo_coeff, *,
         rotation-invariant r2 trace. Every solve rebuilds these from its current
         molecule and input orbitals; only small orbital-space rotations are
         performed during optimization.
+
+        Before differentiating, the lowest orbital-Hessian curvature is
+        checked. A stationary saddle is restarted along a descending direction;
+        failure to reach a minimum raises instead of returning its response.
 
         The response uses occupied-space dipoles and a compiled rotation
         gradient. A diagonal preconditioner is applied to compatible host

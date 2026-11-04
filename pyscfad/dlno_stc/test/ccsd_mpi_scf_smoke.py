@@ -104,7 +104,7 @@ def run(mode, output, *, fixture='small', fixture_dir=None, threads=1, vvvv_dire
             try:
                 return ccsd.build_static_selections(mf, accept.selection(mf), smooth=False, matrix_kind='W',
                     thresh_occ=1e-5, thresh_vir=1e-5,
-                    baseline_controls=baseline, matrix_controls=matrix)
+                    baseline_controls=baseline, matrix_controls=matrix, single_pass=False)
             finally:
                 state['selecting'] = False
 

@@ -32,10 +32,12 @@ global AO Fock is projected into this basis, including occupied-virtual entries.
 Selection schema 10 records this domain-only definition; rebuild checkpoints
 from earlier schemas or global-space LIS calculations.
 
-`build_static_selections` chooses LIS ranks, AO anchors and Laplace grids once,
-outside differentiation. With `single_pass=True` it returns a plan, and those
-choices are made from each fragment's production W while its preparation
-pullback remains live. `select_frame` saves semicanonical reference anchors;
+`build_static_selections` defaults to `single_pass=True` and returns a plan for
+serial W calculations. LIS ranks, AO anchors and Laplace grids are chosen from
+each fragment's production W while its preparation pullback remains live;
+these discrete choices are held fixed during differentiation. Set
+`single_pass=False` to choose them in a separate prepass, or for D matrices or
+multi-rank MPI. `select_frame` saves semicanonical reference anchors;
 `rebuild_frame` transports those anchors with the current LIS and AO overlap.
 Its input contains no Fock matrix, so the Fock-frame cotangent is zero.
 
@@ -142,8 +144,11 @@ Use `ccsd.value_and_grad` for forces. With `return_components=False`, they retur
 `(energy, components)` and `(energy, mol_bar, components)`.
 
 The tolerance is in Hartree and controls the system `(T)` energy standard error.
-Fragment variance budgets use absolute MP2 fragment energy proxies, or explicit
-`fragment_energies`. Point budgets use a trace model with configurable positive
+Single-pass fragment variance budgets default to `variance_allocation="occupied_count"`,
+using each fragment's original occupied count divided by the whole molecule's
+active occupied count. Two-pass selection defaults to `variance_allocation="mp2_energy"`,
+using absolute MP2 fragment energy proxies, or explicit `fragment_energies`.
+Point budgets use a trace model with configurable positive
 `trace_exponent` (default 5.0 in the API and both runners). The MP2 trace model
 uses exponent 1.4.
 
@@ -209,6 +214,7 @@ See the [domain and MP2 guide](../../../pyscfad/dlno_stc/README.md) for their de
 | `internal_rank_threshold` | `1e-6` | Numerical rank threshold for constructing discarded complements when completing the full MO layout; all original S orbitals are retained. |
 | `merge_identical` | `True` | Reuse identical-domain preparation while retaining physical S identities. |
 | `fragment_indices` | `None` | Select all physical fragments; otherwise select only the listed zero-based S indices. |
+| `single_pass` | `True` | Select LIS from each production W without a prepass. Serial W only; set `False` for D matrices, multi-rank MPI, or concrete selections, anchors and grids before production. |
 | `smooth` | `True` | Full occupied/virtual anchored frames. `False` retains the conventional deterministic reference. |
 | `smooth_laplace_points` | `10` | Positive integer; fit a separate positive triples quadrature for each nonempty LIS. Used with `smooth=True`. |
 
@@ -273,9 +279,10 @@ on workers. The comparison runners below use one process.
 | `energy_tolerance` | Omitted; `0` is equivalent | Total requested triples SE in Eh. Positive values enable adaptive production. |
 | `pilot_samples` | `10000` | Integer ≥ 2, per Laplace point per S; independent pilots are discarded. |
 | `trace_exponent` | `5.0` | Finite positive exponent for triples point variance allocation in tolerance mode. MP2 uses `1.4`. Fixed-count allocation uses measured pilot variances instead. |
-| `fragment_energies` | Saved MP2 proxies | Optional finite one-dimensional vector, one value for every physical S, even when running a subset; absolute values allocate variance. CCSD proxies must be supplied explicitly. |
+| `variance_allocation` | `"occupied_count"` for single-pass; `"mp2_energy"` for two-pass | Fragment variance shares in tolerance mode. Single-pass requires `occupied_count`. |
+| `fragment_energies` | Saved MP2 proxies in `mp2_energy` mode | Optional finite one-dimensional vector, one value for every physical S, even when running a subset; absolute values allocate variance. CCSD proxies must be supplied explicitly. Incompatible with `occupied_count`. |
 
-The last six keys are sampling controls and are rejected with deterministic
+The last seven keys are sampling controls and are rejected with deterministic
 mode. High-level stochastic `nsamples=0` is invalid: use deterministic mode for
 enumeration. The `nsamples=0` convention belongs only to the native entry points.
 
@@ -296,8 +303,19 @@ cost, so a speed advantage depends on fragment dimensions and auxiliary rank.
 
 ### Variance allocation and sample accounting
 
-For total requested SE T, requested fragment set I, and saved/overridden energies
-e_S, the fragment allocation is
+For total requested SE T and requested fragment set I, the default single-pass
+allocation (`variance_allocation="occupied_count"`) is
+
+```text
+f_S = n_occ,S / n_active,total
+T_S^2 = T^2 f_S.
+```
+
+The counts refer to original occupied fragment targets. The denominator includes
+all active occupied orbitals in the molecule, even when I is a subset.
+
+With `variance_allocation="mp2_energy"` (the two-pass default), saved/overridden
+energies e_S instead give
 
 ```text
 a_S = max(|e_S| / max_{R in I}|e_R|, 1e-12)
@@ -305,9 +323,9 @@ f_S = a_S / sum_{R in I} a_R
 T_S^2 = T^2 f_S.
 ```
 
-All-zero proxies use equal shares. Legacy selections without proxies also fall
-back to equal shares. For a subset of S, the total target is allocated over that
-subset; a one-S test gives that S the full requested target.
+In `mp2_energy` mode, all-zero proxies use equal shares. Legacy selections without
+proxies also fall back to equal shares. For a subset of S, this mode allocates the
+total target over that subset; a one-S test gives that S the full requested target.
 
 For node t_q, quadrature weight w_q, and trace exponent p:
 
@@ -318,7 +336,9 @@ T_Sq^2  = T_S^2 f_q
 native unweighted SE target = T_S sqrt(f_q) / |w_q|.
 ```
 
-Thus `sum_S sum_q T_Sq^2 = T^2`. The trace model fixes variance shares before
+Thus `sum_{S in I} sum_q T_Sq^2 = T^2 sum_{S in I} f_S`. This equals `T^2`
+for all fragments, or for a subset using `mp2_energy`; an `occupied_count` subset
+retains only its share of the whole-molecule budget. The trace model fixes variance shares before
 sampling. Independent pilots estimate how many production draws each share
 needs; they do not change these shares. The positive-target path completes one
 point at a time, reusing its prepared tensors and probability tables, and starts

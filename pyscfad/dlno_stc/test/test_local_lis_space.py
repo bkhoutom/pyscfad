@@ -113,7 +113,8 @@ def test_domain_gradient_finite_difference_and_forward_one_pass(molecular_case, 
     monkeypatch.setattr(RCCSD, 'conv_tol_normt', 1e-9)
     static = ccsd.build_static_selections(case.mf, case.domains, matrix_kind='W',
         thresh_occ=1e-4, thresh_vir=3e-5, baseline_controls=case.controls,
-        matrix_controls=case.controls, lis_space='domain', fragment_indices=case.indices)
+        matrix_controls=case.controls, lis_space='domain', fragment_indices=case.indices,
+        single_pass=False)
     receipts = []
     close = _df_shared.LocalDFReverse.close
     def closed(scope):
@@ -156,7 +157,7 @@ def test_density_selection_conventional_triples_and_restart(molecular_case, monk
     static = ccsd.build_static_selections(case.mf, case.domains, matrix_kind='D',
         thresh_occ=1e-4, thresh_vir=3e-5, baseline_controls=case.controls,
         matrix_controls=case.controls, lis_space='domain', smooth=False,
-        fragment_indices=case.indices)
+        fragment_indices=case.indices, single_pass=False)
     manager = RestartManager(tmp_path, resume=False, method='domain-lis-test',
                              scientific_payload={'lis_space': 'domain'})
     try:

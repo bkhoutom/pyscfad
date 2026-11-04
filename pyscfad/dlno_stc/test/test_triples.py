@@ -187,7 +187,7 @@ def checkpoint_reference():
         lo_kwargs={'conv_tol': 1e-12, 'conv_tol_grad': 1e-9})
     settings = {'mode': 'deterministic', 'threads': 1}
     static = ccsd.build_static_selections(mf, domain, smooth=False, matrix_kind='D', thresh_occ=0., thresh_vir=0.,
-        baseline_controls=settings, matrix_controls=settings)
+        baseline_controls=settings, matrix_controls=settings, single_pass=False)
     return mf, static
 
 

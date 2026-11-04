@@ -227,6 +227,7 @@ matrix_controls = dict(mode="deterministic", **grid)
 selected = ccsd.build_static_selections(
     mf, static, matrix_kind="D", thresh_occ=1e-6, thresh_vir=1e-6,
     baseline_controls=baseline_controls, matrix_controls=matrix_controls,
+    single_pass=False,
 )
 energy = ccsd.kernel(mf, selected, baseline_controls=baseline_controls,
                      matrix_controls=matrix_controls)
@@ -616,12 +617,14 @@ and deterministic or stochastic triples use this same domain definition.
 Global-space LIS checkpoints are rejected and must be rebuilt. Selection
 schema 10 remains valid for existing domain-space checkpoints.
 
-For serial W calculations, `build_static_selections(..., single_pass=True)`
-returns a plan without a W prepass. Production
+`build_static_selections` defaults to `single_pass=True` for serial W calculations
+and returns a plan without a W prepass. Production
 prepares one domain group, selects each fragment's LIS from its W result, and
 retains the same input/frame pullback through its CCSD(T)-MP2 correction and
-joint W/MP2 reverse. The library retains two-pass selection as its default;
-`benchmark_lno_w_triples.py` defaults to single-pass. Both use only domain
+joint W/MP2 reverse. Set `single_pass=False` for two-pass selection, required for
+D matrices, multi-rank MPI, or callers that need concrete LIS selections, anchors
+and grids before production. `benchmark_lno_w_triples.py` also defaults to
+single-pass. Both paths use only domain
 eigensystems. The former `virtual_eigenspace` Python argument and
 `--lis-virtual-eigenspace` CLI switch have been removed.
 

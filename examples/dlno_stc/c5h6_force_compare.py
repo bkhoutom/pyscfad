@@ -102,6 +102,7 @@ def main():
     selected = ccsd.build_static_selections(
         mf, domains, matrix_kind="W", thresh_occ=1e-4, thresh_vir=1e-5,
         baseline_controls=baseline, matrix_controls=matrix, merge_identical=True,
+        single_pass=False,
     )
     if len(selected.fragments) != 1 or selected.fragments[0] is None:
         raise RuntimeError("expected one populated molecular LIS")

@@ -169,7 +169,7 @@ def _local_direct_raw_int3c_blocks(
                      _local_direct_int3c_block_mb()) * 1e6
         # Direct streaming has only one indivisible minimum row. Preserve
         # the scope's advisory fallback when RSS exhausts the target; the
-        # resident half-cache performs its separate, strict admission first.
+        # resident half-cache performs its strict minimum-tile check first.
         scope._warn_minimum_row(16*pairs, budget, operation='integral')
         rows = max(1, int(budget // (16*pairs)))
         if z_aux_block_max_rows is not None:

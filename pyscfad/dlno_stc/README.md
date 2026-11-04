@@ -78,14 +78,17 @@ rotation option. Use `single_pass=True` for W to avoid a selection prepass.
 
 For `m` orbital columns, H uses `8*naux*nao*m` bytes; overlapping left/right
 slices are stored only once. The ED cache and current LIS cache coexist.
-Resident input admission uses `mol.max_memory` (`--max-memory-mb`), current
-RSS, and the optional aggregate cap `PYSCFAD_LNO_HALF_DF_CACHE_MB` (decimal MB).
-It reserves output-conversion space and leaves half the current RSS headroom
-for subsequent work. `mf.with_df.max_memory` (`--df-memory-mb`) limits
+The resident-memory estimate uses `mol.max_memory` (`--max-memory-mb`), current
+RSS, and the optional advisory cache limit `PYSCFAD_LNO_HALF_DF_CACHE_MB` (decimal MB).
+It includes output-conversion space and budgets half the current RSS headroom
+for subsequent work. Exceeding this headroom estimate or the cache limit emits
+a `RuntimeWarning` and continues with resident allocation.
+`mf.with_df.max_memory` (`--df-memory-mb`) limits
 workspace, not resident H storage. Generation and reverse contractions use
 bounded tiles under the workspace allowance, RSS headroom and local integral
-tile target. Insufficient resident allowance raises `MemoryError` before a
-new integral pass; select `direct` for lower resident input memory. These
+tile target. Insufficient allowance for even one processing tile still raises
+`MemoryError`, and actual allocation failures propagate. Select `direct` for
+lower resident input memory. These
 allocation budgets do not impose a hard RSS cap on the entire CC solver.
 
 Only deferred MO integral **adjoints** are spooled to disk; neither raw AO

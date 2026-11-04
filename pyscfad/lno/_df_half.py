@@ -10,6 +10,7 @@ integrals. Each consumer retains its ordinary analytic coefficient VJP;
 geometry and metric adjoints are combined by the owning scope.
 """
 import os
+import warnings
 from types import SimpleNamespace
 
 import numpy
@@ -93,15 +94,15 @@ class HalfTransformedDFCache:
         retained = h_bytes + fitted_bytes + coeff.nbytes
         current = scope.receipt['half_resident_bytes']
         remaining = (scope.max_memory_mb - lib.current_memory()[0]) * 1e6
-        # Include a second MO output during conversion to the AD backend,
-        # and leave half the RSS headroom for CC tensors and response work.
+        # Include a second MO output during conversion to the AD backend.
+        # Reserving half the RSS headroom for later work is advisory.
         reserve = retained + fitted_bytes + coeff.nbytes
         if current + retained > self.limit_bytes or reserve > .5*remaining:
-            raise MemoryError(
-                'Resident half-transformed DF cache exceeds the user memory budget '
+            warnings.warn(
+                'Resident half-transformed DF cache exceeds the advisory memory budget '
                 f'(new H/output {retained/1e6:.1f} MB, live cache {current/1e6:.1f} MB). '
-                'Increase the memory allowance or use PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE=direct; '
-                'half mode does not spill integral inputs to disk.')
+                'Continuing with resident allocation; half mode does not spill integral inputs to disk.',
+                RuntimeWarning, stacklevel=2)
         npair = n*(n+1)//2
         # Integral tile, unpacked AO tile, half transform and MO tile.
         words = (3*npair + n*n + 2*n*width + 2*kc*lc

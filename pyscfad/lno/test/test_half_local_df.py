@@ -1,4 +1,6 @@
 """Resident ED/LIS half transforms preserve complete first-order response."""
+from contextlib import nullcontext
+
 import h5py
 import jax
 import numpy
@@ -164,7 +166,7 @@ def test_completed_lis_released_while_ed_survives():
     assert entry.h is None and entry.fitted is None
 
 
-def test_cap_accounts_for_ed_and_lis_together():
+def test_cap_warns_for_combined_ed_and_lis_and_continues():
     mol, _ = shared._problem(4)
     with _df_shared.reverse_scope(shared._mf(mol), shared.ATOMS) as scope:
         scope.half = cache = HalfTransformedDFCache(scope)
@@ -174,11 +176,37 @@ def test_cap_accounts_for_ed_and_lis_together():
         ed = cache.entries[0]
         # Either entry fits individually, but their combined storage does not.
         cache.limit_bytes = ed.nbytes * 1.5
-        with pytest.raises(MemoryError, match='live cache'):
-            cache.transform(2*coeff, (0, 2, 2, 4), low)
+        with pytest.warns(RuntimeWarning, match='live cache'):
+            fitted = cache.transform(2*coeff, (0, 2, 2, 4), low)
+        numpy.testing.assert_allclose(fitted, 4*ed.fitted, atol=2e-12, rtol=2e-12)
         assert scope.receipt['raw_source_passes'] == 1
-        assert cache.entries == [ed] and ed.h is not None
+        assert len(cache.entries) == 2 and cache.entries[0] is ed
+        assert scope.receipt['half_resident_bytes'] == sum(e.nbytes for e in cache.entries)
         scope.finish()
+
+
+def test_half_headroom_warns_but_uses_available_tile_memory(monkeypatch):
+    mol, _ = shared._problem(4)
+    results = []
+    for constrained in (False, True):
+        with _df_shared.reverse_scope(shared._mf(mol), shared.ATOMS) as scope:
+            scope.half = cache = HalfTransformedDFCache(scope)
+            low = scope.metric_factor()
+            coeff = numpy.ones((scope.mol.nao, 4))
+            reserve = (8*scope.auxmol.nao*scope.mol.nao*4
+                       + 2*8*scope.auxmol.nao*4 + 2*coeff.nbytes)
+            with monkeypatch.context() as patch:
+                if constrained:
+                    patch.setattr(_df_shared.pyscf_lib, 'current_memory',
+                                  lambda: (scope.max_memory_mb - 1.5*reserve/1e6, 0.))
+                warning = (pytest.warns(RuntimeWarning, match='Resident half-transformed DF cache')
+                           if constrained else nullcontext())
+                with warning:
+                    results.append(cache.transform(coeff, (0, 2, 2, 4), low))
+            assert scope.receipt['raw_source_passes'] == 1
+            assert scope._file is None
+            scope.finish()
+    numpy.testing.assert_allclose(results[1], results[0], atol=2e-12, rtol=2e-12)
 
 
 def test_parent_reuse_rejects_outside_directions_before_reading(monkeypatch):
@@ -204,7 +232,7 @@ def test_parent_reuse_rejects_outside_directions_before_reading(monkeypatch):
         scope.finish()
 
 
-@pytest.mark.parametrize('cache_cap_mb', [None, '1'])
+@pytest.mark.parametrize('cache_cap_mb', [None, '1', '0'])
 def test_resident_inputs_can_exceed_workspace_with_correct_full_response(
         monkeypatch, cache_cap_mb):
     mol, coeff = shared._problem(4)
@@ -222,11 +250,16 @@ def test_resident_inputs_can_exceed_workspace_with_correct_full_response(
         seen.append((count, words, budget))
         return count, budget
     monkeypatch.setattr(HalfTransformedDFCache, '_rows', record_rows)
-    with _df_shared.reverse_scope(holder, shared.ATOMS) as scope:
+    warning = (pytest.warns(RuntimeWarning, match='Resident half-transformed DF cache')
+               if cache_cap_mb == '0' else nullcontext())
+    with warning, _df_shared.reverse_scope(holder, shared.ATOMS) as scope:
         scope.half = cache = HalfTransformedDFCache(scope)
         value, pullback = jax.vjp(shared._energy, mol, coeff)
         assert scope.receipt['half_resident_bytes'] > holder.with_df.max_memory * 1e6
-        assert cache.limit_bytes > holder.with_df.max_memory * 1e6
+        if cache_cap_mb == '0':
+            assert cache.limit_bytes == 0
+        else:
+            assert cache.limit_bytes > holder.with_df.max_memory * 1e6
         assert scope._file is None  # Resident inputs do not spill to disk.
         bars = pullback(numpy.asarray(1.))
         assert seen and all(count*8*words <= budget <= 4000 for count, words, budget in seen)
@@ -240,11 +273,9 @@ def test_resident_inputs_can_exceed_workspace_with_correct_full_response(
         numpy.testing.assert_allclose(bars[1], expected_bars[1], atol=2e-10, rtol=2e-9)
 
 
-@pytest.mark.parametrize('failure', ['cap', 'rss', 'source'])
+@pytest.mark.parametrize('failure', ['rss', 'source'])
 def test_memory_or_source_failure_cleans_up_without_disk_fallback(monkeypatch, failure):
     mol, coeff = shared._problem(4)
-    if failure == 'cap':
-        monkeypatch.setenv('PYSCFAD_LNO_HALF_DF_CACHE_MB', '0')
     raw = _df_direct._generate_local_raw_int3c_blocks
     calls = []
     def fail(*args, **kwargs):
@@ -255,7 +286,9 @@ def test_memory_or_source_failure_cleans_up_without_disk_fallback(monkeypatch, f
         raise RuntimeError('interrupted raw source')
     monkeypatch.setattr(_df_direct, '_generate_local_raw_int3c_blocks', fail)
     error = RuntimeError if failure == 'source' else MemoryError
-    with pytest.raises(error, match='raw source|memory budget'):
+    warning = (pytest.warns(RuntimeWarning, match='Resident half-transformed DF cache')
+               if failure == 'rss' else nullcontext())
+    with warning, pytest.raises(error, match='raw source|one half-transformed DF tile'):
         with _df_shared.reverse_scope(shared._mf(mol), shared.ATOMS) as scope:
             scope.half = cache = HalfTransformedDFCache(scope)
             if failure == 'rss':

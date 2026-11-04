@@ -33,6 +33,7 @@ from pyscf.df import df_jk as pyscf_df_jk
 from pyscfadlib import libcvhf_vjp as libvhf
 from pyscfad.df import incore as df_incore
 from pyscfad.df import _cderi_vjp
+from pyscfad.df import _jk_memory
 from pyscfad.lib import _cotangent_buffer, _scf_response_cache
 from pyscfad._src.implicit_diff import is_implicit_diff_solve_matvec
 
@@ -581,7 +582,7 @@ def get_jk(dfobj, dm, hermi=1, with_j=True, with_k=True, direct_scf_tol=1e-13):
     dm_forward = dm
     if with_k:
         dm_forward = _tag_dm(_tag_dm_for_fast_exchange(dfobj, dm), hermi)
-    return pyscf_df_jk.get_jk(dfobj, dm_forward, hermi=hermi,
+    return pyscf_df_jk.get_jk(_jk_memory.forward_df(dfobj), dm_forward, hermi=hermi,
                               with_j=with_j, with_k=with_k,
                               direct_scf_tol=direct_scf_tol)
 
@@ -828,7 +829,7 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
     symmetric_vk = (numpy.asarray(vk_array + vk_array.transpose(0, 2, 1), order='C')
                     if xs is not None else None)
     dms = [numpy.asarray(x, order='F') for x in dms]
-    max_memory = dfobj.max_memory - lib.current_memory()[0]
+    max_memory = _jk_memory.workspace_memory(dfobj)
     blksize = max(4, int(min(dfobj.blockdim, max_memory*.3e6/8/nao**2)))
     # Dense fallback computes both bars in one native call. Its unused outputs
     # are bounded block-local scratch, never global factor storage.

@@ -30,6 +30,7 @@ from pyscf.gto.mole import AS_RINV_ORIG_ATOM
 
 from pyscfad import numpy as np
 from pyscfad.df import _cderi_vjp
+from pyscfad.df import _jk_memory
 from pyscfad.lib._threading import dense_blas_threads, blas_threads
 
 _FACTOR_PANEL_MEMORY_MB = 256.0
@@ -69,7 +70,7 @@ def get_jk_from_occ(dfobj, factors, with_j=True, with_k=True, factor_response=Tr
     S = numpy.asarray(factors)
     dm = lib.tag_array(S @ S.T, mo_coeff=S,
                        mo_occ=numpy.ones(S.shape[1]))
-    J, K = pyscf_df_jk.get_jk(dfobj, dm, hermi=1,
+    J, K = pyscf_df_jk.get_jk(_jk_memory.forward_df(dfobj), dm, hermi=1,
                              with_j=with_j, with_k=with_k)
     zero = numpy.zeros_like(dm)
     return J if with_j else zero, K if with_k else zero

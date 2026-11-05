@@ -1,11 +1,14 @@
 """Optional external STC-CCSD amplitude solver for prepared DLNO fragments.
 
-Only the private sampling frame is localized.  The callback returns traced
-averaged amplitudes in the incoming LIS frame for the existing projected
-energy and triples code.  STC's total-energy orbital cotangent filter is never
-used: a projected fragment functional need not have that invariance.
+Only the private sampling frame is localized. By default the callback keeps
+traced averaged amplitudes, integrals and the physical projector in one shared
+Boys frame for projected CCSD and smooth triples. ``shared_local_frame=False``
+restores amplitude backrotation to the incoming LIS frame. STC's total-energy
+orbital cotangent filter is never used: a projected fragment functional need
+not have that invariance.
 """
 from collections.abc import Mapping
+from functools import cached_property
 import copy
 import math
 import numbers
@@ -19,7 +22,8 @@ from pyscfad import lib
 
 
 _DEFAULTS = dict(
-    localize=True, target_error=4e-4, error_tol=None, max_cycle=50, average=4,
+    localize=True, shared_local_frame=True,
+    target_error=4e-4, error_tol=None, max_cycle=50, average=4,
     seed=0, diis_space=4, diis_shift=4., init_damp=None, gamma=.5,
     batch_size=1 << 20, tail_batch_size=None, nrun=8, init_nsamples=10000,
     std_tol=[.02, .05], max_nsamples_var=1 << 24, min_nsamples=100,
@@ -102,7 +106,7 @@ def normalize_controls(controls):
         if name in {'gamma', 'init_damp'} and not 0 <= value <= 1:
             raise ValueError(f'{name} must be between zero and one')
         out[name] = float(value)
-    for name in {'localize', 'share_tables', 'iid_root', 'block_store_P', 'unroll', 'flat'}:
+    for name in {'localize', 'shared_local_frame', 'share_tables', 'iid_root', 'block_store_P', 'unroll', 'flat'}:
         if out[name] is None and name in {'unroll', 'flat'}:
             continue
         if not isinstance(out[name], bool):
@@ -264,6 +268,29 @@ def _numeric(value):
     return float(numpy.asarray(jax.lax.stop_gradient(value)))
 
 
+class _SharedFrameERIs:
+    """Downstream view; leave the external amplitude solver's pytree intact.
+
+    Smooth triples expects packed symmetric DF factors. Its cached-integral
+    path also needs ovvv, constructed only on first use, in this same frame.
+    All arrays retain their physical integral/Fock derivatives.
+    """
+    def __init__(self, local):
+        for name in ('fock', 'Loo', 'Lov', 'ovov', 'ovoo', 'mo_coeff', 'nocc', 'nvir', 'naux'):
+            setattr(self, name, getattr(local, name))
+        self._dense_lvv = local.Lvv
+
+    @cached_property
+    def Lvv(self):
+        return lib.pack_tril(self._dense_lvv)
+
+    @cached_property
+    def ovvv(self):
+        full = jnp.einsum('Pia,Pbc->iabc', self.Lov, self._dense_lvv)
+        return lib.pack_tril(full.reshape(self.nocc * self.nvir, self.nvir, self.nvir)).reshape(
+            self.nocc, self.nvir, -1)
+
+
 def make_solver(controls, fragment_index=0):
     """Create an independent fragment callback; optional STC imports are lazy."""
     config = normalize_controls(controls)
@@ -281,11 +308,11 @@ def make_solver(controls, fragment_index=0):
         except ImportError as exc:
             raise ImportError('STC CCSD requires the optional stc_cc_jax package and its dependencies; '
                               'install stc-cc-jax in the active environment before selecting cc_solver="stc"') from exc
-        from pyscfad.lno.ccsd import ccsd_fragment_energy
+        from pyscfad.lno.ccsd import ccsd_fragment_energy, FragmentAmplitudeResult
         qo, qv = _working_rotations(mcc, eris, config['localize'])
         local = _make_local_eris(mcc, eris, qo, qv, rccsd)
         stc_config = {k: v for k, v in config.items()
-                      if k != 'localize' and k not in _PRECISION_CONTROLS}
+                      if k not in {'localize', 'shared_local_frame'} and k not in _PRECISION_CONTROLS}
         stc_config.update(seed=seed, grad_seed=grad_seed, semicanonical=True,
                           mo_response_no_oo_vv_rotation=False)
         cc = rccsd.RCCSD(mcc._scf, frozen=mcc.frozen, mo_coeff=mcc.mo_coeff, **stc_config)
@@ -302,13 +329,22 @@ def make_solver(controls, fragment_index=0):
         sampling_projector = jax.lax.stop_gradient(prjlo @ qo)
         def record(state):
             # Covariant projected functional: avoid a full t2 backrotation at
-            # every iteration; only the returned mean amplitudes need it.
+            # every iteration; the legacy return path alone needs it.
             projected.append(_numeric(ccsd_fragment_energy(sampling_physical,
                 state['t1'], state['t2'], sampling_projector)))
         cc.callback = record
         vec, result = grad.amplitudes(cc, local, *guess)
         a, b = rccsd.vector_to_amplitudes(vec, cc.nmo, cc.nocc)
-        original = _backrotate_amplitudes(a, b, qo, qv)
+        shared = config['shared_local_frame']
+        if shared:
+            returned = (a, b)
+            # This is the physical projector, not the stopped diagnostic copy.
+            returned_projector = prjlo @ qo
+            returned_eris = _SharedFrameERIs(local)
+            diagnostic_eris, diagnostic_projector = sampling_physical, sampling_projector
+        else:
+            returned = _backrotate_amplitudes(a, b, qo, qv)
+            diagnostic_eris, diagnostic_projector = physical, projector
         window = projected[cc.burnin:]
         count = len(window)
         # Descriptive independent-iterate SE only: correlated iterates and finite
@@ -319,6 +355,8 @@ def make_solver(controls, fragment_index=0):
             grad_seed=seed if grad_seed is None else grad_seed,
             localize=config['localize'],
             localization_method='Boys' if config['localize'] else 'identity',
+            shared_local_frame=shared,
+            energy_frame='stc_local' if shared else 'lis',
             controls=copy.deepcopy(config), converged=bool(result[0]),
             termination_mode='fixed_iterations' if config['error_tol'] is None else 'energy_stderr',
             convergence_note=('Fixed iteration budget completed; converged does not certify CC residual convergence.'
@@ -329,13 +367,15 @@ def make_solver(controls, fragment_index=0):
             projected_iteration_energies=projected,
             projected_mean_iterate_energy=float(numpy.mean(window)),
             projected_mean_iterate_stderr_iid=se,
-            projected_energy_at_mean_amplitudes=_numeric(ccsd_fragment_energy(physical,
-                jax.lax.stop_gradient(original[0]), jax.lax.stop_gradient(original[1]), projector)),
+            projected_energy_at_mean_amplitudes=_numeric(ccsd_fragment_energy(diagnostic_eris,
+                jax.lax.stop_gradient(returned[0]), jax.lax.stop_gradient(returned[1]), diagnostic_projector)),
             projected_stderr_note='Observed IID-iterate SE; ignores autocorrelation and burn-in bias; not a force bound.',
             nsamples_forward_production=int(sum(numpy.asarray(c.get('nsamples', 0)).sum() for c in cc.cycles)),
             sample_count_note='Forward production draws only; excludes variance pilots and adjoint sampling.',
         )
-        return *original, diagnostic
+        if shared:
+            return FragmentAmplitudeResult(*returned, returned_eris, returned_projector, diagnostic)
+        return *returned, diagnostic
 
     solver.seed = seed
     solver.controls = copy.deepcopy(config)

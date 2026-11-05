@@ -174,6 +174,48 @@ exact screen, then applies the retained orbital pullback. Orbital and energy
 response remain differentiated; there is no eigensolver reconstruction or
 orbital-sign matching during replay.
 
+For gradient calls using `build_static`, serial MP2 and the CCSD driver now
+prepare these endpoints during domain screening. Weak energy and cotangents are
+completed after atom-group expansion of the strong mask, before strong-frame
+selection, and consumed once at the normal weak-completion boundary. The same
+live common-data frame and its pullback are adopted by initialization. Raw AO
+moments are shared within each identical ordered primary atom support during
+screening. Reverse replay accumulates raw AO-operator cotangents across that
+support before applying one shared molecular integral pullback. Each endpoint
+still applies its own saved orbital pullback. All direct molecular dependence
+of the current endpoint is through those raw AO moments; sharing their response
+does not freeze integral or orbital derivatives. No screening threshold or
+weak-energy formula changes.
+
+PAO preprojection is also shared across compatible weak endpoints. Concrete
+rank selection reuses the parent/support/representation algebra within that
+selection call. Differentiable screening shares the same algebra only for
+identical ordered parent columns, support and representation AOs, and retained
+canonical/overlap/completeness labels. Each target still has its own occupied
+projection, final metric rank and virtual semicanonicalization. Reverse mode
+sums preprojection cotangents and applies one shared pullback as soon as its
+last active endpoint contributes; unused groups release their tapes without
+reverse work. Detached selection values never replace the live PAO response.
+This changes no BLAS/OpenMP defaults and does not distribute CCSD's weak work
+across MPI ranks.
+
+This reuse is transient: no response tape is serialized into static selections
+or checkpoints. Saved-static callers, explicitly supplied target frames, and
+callbacks replacing the selected reference retain the ordinary preparation
+path. `include_baseline=False` does not prepare weak response. Resumed calls
+defer weak work until checkpoint progress is restored, so completed weak terms
+are not recomputed. Distributed MP2
+retains its existing distributed endpoint executor; CCSD MPI computes and
+consumes the reused weak contribution once on root. A completed checkpoint
+weak term discards any newly prepared contribution instead of adding it twice.
+
+The inclusive `stc.domain.selection` timer now contains common preparation and
+weak response. `stc.domain.selection_weak_response` identifies the nested weak
+work. Use the interval-partitioned timing report or subtract this marker before
+adding separately displayed weak phases; summing inclusive timers double-counts
+work. Pending numerical weak cotangents remain resident until consumption, but
+endpoint tapes are released before strong-frame construction.
+
 Only one AO-moment derivative tape lives at a time. Orbital pullbacks retain
 local algebra residuals until consumed; their memory can exceed the saved
 orbital coefficients alone. Endpoint values, cotangents and both pullbacks
@@ -839,14 +881,43 @@ virtual spans; `False` keeps their supplied frame. This private gauge is fixed
 in reverse mode. Tensor transformations, physical domain/LIS preparation,
 projector response and SCF response remain differentiable. Semicanonical
 Fock denominators are constructed in the private frame. The external adjoint
-acts on differentiable **averaged amplitudes**, which are backrotated before
-the ordinary projected fragment energy and triples are evaluated. The
+acts on differentiable **averaged amplitudes**, which by default stay in the
+shared private Boys frame for projected fragment energy and smooth triples. The
 external total-energy-only orbital cotangent filter is not applied. Stable
 physical fragment IDs receive distinct reproducible sampling streams;
 changing MPI ownership does not change the intended fragment seed.
 
+Selecting `cc_solver="stc"` defaults to `localize=True` and
+`shared_local_frame=True`; no extra frame flags are needed. The shared frame
+retains the averaged amplitudes in the private Boys frame and evaluates both
+the projected CCSD energy and smooth (T) in that same frame, using the rotated
+DF factors, full Fock matrix and physical projector `prjlo @ Q_occ`. There is
+no final amplitude backrotation, including for diagnostics. The original LIS
+MP2 subtraction is unchanged. With `localize=False` the shared frame is the
+incoming LIS frame, without an additional Boys rotation.
+
+The occupied/virtual rotations are computed once per fragment solve and held
+fixed through its CCSD, triples and saved adjoint evaluation. The rotated
+physical projector remains differentiable; fixing the private rotation does
+not freeze domain/LIS, integral or SCF response. No numerical frame is cached
+across fragments or geometries. This is the same fixed-private-gauge response
+convention as the original STC adapter, not an additional Boys response solve.
+
+Shared-frame triples requires `smooth=True` and supports deterministic and
+stochastic triples, with either `integral_transform="df"` or `"rotate"`.
+The cached-integral path constructs its local `ovvv` block lazily from the
+already rotated DF factors. Full-Fock Laplace dressing is still required at
+each node. Conventional diagonal-denominator triples rejects a shared frame.
+To restore the previous backrotation route, set
+`stc_cc_controls={"shared_local_frame": False}` alongside any sampling controls.
+This explicit override is also required for STC+(T) with `smooth=False`.
+The frame option changes the representation, not the retained LIS, CCSD
+equations or precision budget. The overall solver default remains deterministic.
+Finite stochastic (T) samples need not be identical in different frames even
+though the deterministic functional is rotation invariant.
+
 Supported local controls include `target_error` (or `target_error_mEh`), optional `error_tol` (or `error_tol_mEh`), `max_cycle`,
-`average`, `seed`, `localize`; `diis_space` (`None` disables it, otherwise at
+`average`, `seed`, `localize`, `shared_local_frame`; `diis_space` (`None` disables it, otherwise at
 least two), `diis_shift`, `init_damp`; `gamma`, `batch_size`, `tail_batch_size`,
 `nrun`, `init_nsamples`, `std_tol`, `max_nsamples_var`, `min_nsamples`;
 `sampled_terms`, `share_tables`, `iid_root`, `unroll`, `flat`, `sampler`,

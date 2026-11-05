@@ -1,5 +1,6 @@
 """Weak response shares endpoint work while retaining the full chain rule."""
 from collections import Counter
+from itertools import permutations
 from types import SimpleNamespace
 from typing import NamedTuple
 import weakref
@@ -19,6 +20,19 @@ class Inputs(NamedTuple):
 
 class Common(NamedTuple):
     s1e: object
+
+
+class ScreeningMolecule(NamedTuple):
+    coordinates: object
+
+    def atom_coords(self):
+        return self.coordinates
+
+
+class ScreeningInputs(NamedTuple):
+    coordinates: object
+    scale: object
+    mol: object
 
 
 @pytest.mark.parametrize('order', [2, 3, 4])
@@ -84,7 +98,7 @@ def _install_split(monkeypatch, endpoint, screen_calls=None, moment_calls=None):
             screen_calls[index] += 1
         return c.s1e
 
-    def moments(m, saved, static, fragment_index):
+    def moments(m, saved, static, fragment_index, *, ao_moments=None):
         index = fragment_index
         if moment_calls is not None:
             moment_calls[index] += 1
@@ -92,6 +106,204 @@ def _install_split(monkeypatch, endpoint, screen_calls=None, moment_calls=None):
 
     monkeypatch.setattr(_pairs, 'build_weak_multipole_screen', screen)
     monkeypatch.setattr(_pairs, '_weak_endpoint_from_screen', moments)
+    monkeypatch.setattr(_pairs, '_fake_mol_with_traced_centers', lambda mol, atoms: mol)
+    monkeypatch.setattr(_pairs, '_origin_zero_moments', lambda mol, order: (None,) * 4)
+
+
+def _screening_fixture(order):
+    mf, common, static, endpoint = _fixture(order)
+    mf = ScreeningInputs(mf.coordinates, mf.scale,
+                         ScreeningMolecule(jnp.array([[0., 0., 0.], [5., 0., 0.],
+                                                      [10., 0., 0.], [15., 0., 0.]])))
+    static.fragments = tuple(SimpleNamespace(weak_virtual=object(), primary_atoms=np.array([i]))
+                             for i in range(3)) + (
+        SimpleNamespace(weak_virtual=None),)
+    static.frag_atmlist = tuple(np.array([i]) for i in range(4))
+    static.thresholds.pair_energy = 1.
+    static.thresholds.near_pair_distance = 0.
+
+    def symmetric_endpoint(m, c, s, index):
+        center, mu, gap, theta, omega = endpoint(m, c, s, index)
+        # Screening and completion traverse opposite pair orientations. Real
+        # Cartesian moments are symmetric in their spatial tensor indices.
+        if theta is not None:
+            theta = (theta + theta.swapaxes(0, 1)) / 2
+        if omega is not None:
+            omega = sum(omega.transpose(*axes, 3)
+                        for axes in permutations(range(3))) / 6
+        return center, mu, gap, theta, omega
+
+    return mf, common, static, symmetric_endpoint
+
+
+@pytest.mark.parametrize('order', [2, 3, 4])
+@pytest.mark.parametrize('missing', [(), (1,)])
+def test_screening_reuses_endpoint_response_and_falls_back_only_for_missing(monkeypatch, order, missing):
+    mf, common, static, endpoint = _screening_fixture(order)
+    screen_calls, moment_calls = Counter(), Counter()
+    _install_split(monkeypatch, endpoint, screen_calls, moment_calls)
+    prepared = {99: object()}
+    _, weak, forced, static.strong_mask = _pairs.screen_pairs(
+        mf, common, static, prepared_endpoints=prepared)
+    assert set(prepared) == {0, 1, 2}
+    assert np.all(forced[3]) and np.all(static.strong_mask[3])
+    assert screen_calls == Counter({0: 1, 1: 1, 2: 1})
+    for index in missing:
+        prepared.pop(index)
+
+    pairs = _pairs.weak_pair_indices(static)
+    def direct(m, c):
+        return sum(_pairs._multipole_pair_energy(endpoint(m, c, static, i),
+                   endpoint(m, c, static, j), order) for i, j in pairs)
+
+    expected, expected_bars = jax.value_and_grad(direct, argnums=(0, 1))(mf, common)
+    actual, actual_bars = _pairs.weak_pair_energy_and_grad(
+        mf, common, static, prepared_endpoints=prepared)
+    assert prepared == {}
+    np.testing.assert_allclose(actual, sum(weak[i, j] for i, j in pairs), rtol=2e-12, atol=1e-14)
+    np.testing.assert_allclose(actual, expected, rtol=2e-12, atol=1e-14)
+    for got, want in zip(jax.tree_util.tree_leaves(actual_bars),
+                         jax.tree_util.tree_leaves(expected_bars)):
+        np.testing.assert_allclose(got, want, rtol=2e-11, atol=1e-13)
+    assert screen_calls == Counter({i: 1 + (i in missing) for i in range(3)})
+    assert moment_calls == Counter({i: 2 + (i in missing) for i in range(3)})
+
+    # Consumption cannot leave old-reference tapes available to another call.
+    changed = Common(common.s1e + .3)
+    changed_value, changed_bars = _pairs.weak_pair_energy_and_grad(
+        mf, changed, static, prepared_endpoints=prepared)
+    changed_expected, changed_expected_bars = jax.value_and_grad(
+        direct, argnums=(0, 1))(mf, changed)
+    np.testing.assert_allclose(changed_value, changed_expected, rtol=2e-12, atol=1e-14)
+    for got, want in zip(jax.tree_util.tree_leaves(changed_bars),
+                         jax.tree_util.tree_leaves(changed_expected_bars)):
+        np.testing.assert_allclose(got, want, rtol=2e-11, atol=1e-13)
+
+
+@pytest.mark.parametrize('empty_graph', [False, True])
+def test_screening_response_releases_unused_endpoint_tapes(monkeypatch, empty_graph):
+    mf, common, static, endpoint = _screening_fixture(2)
+    _install_split(monkeypatch, endpoint)
+    prepared = {}
+    _pairs.screen_pairs(mf, common, static, prepared_endpoints=prepared)
+    values = [weakref.ref(value[0][0]) for value in prepared.values()]
+    tapes = [weakref.ref(value[1][1]) for value in prepared.values()]
+    static.strong_mask[:] = True
+    if not empty_graph:
+        static.strong_mask[0, 1] = static.strong_mask[1, 0] = False
+    value, bars = _pairs.weak_pair_energy_and_grad(
+        mf, common, static, prepared_endpoints=prepared)
+    assert prepared == {}
+    assert all(reference() is None for reference in values + tapes)
+    if empty_graph:
+        assert float(value) == 0.
+        for leaf in jax.tree_util.tree_leaves(bars):
+            np.testing.assert_array_equal(leaf, np.zeros_like(leaf))
+
+
+@pytest.mark.parametrize('options', [{'model': 'all'}, {'force_full_domains': True}])
+def test_all_strong_screening_discards_stale_preparations(monkeypatch, options):
+    mf, common, static, endpoint = _screening_fixture(2)
+    calls = Counter()
+    _install_split(monkeypatch, endpoint, calls)
+    prepared = {0: object()}
+    _, _, _, strong = _pairs.screen_pairs(
+        mf, common, static, prepared_endpoints=prepared, **options)
+    assert np.all(strong)
+    assert prepared == {}
+    assert calls == Counter()
+
+
+@pytest.mark.parametrize('order', [2, 3, 4])
+@pytest.mark.parametrize('grouped_response', [False, True])
+def test_screening_shares_raw_ao_moments_by_ordered_support_with_full_response(
+        monkeypatch, order, grouped_response):
+    mf, common, static, _ = _screening_fixture(order)
+    static.thresholds.pair_energy = 1e30
+    supports = ((0, 1), (0, 1), (1, 0))
+    for fragment, atoms in zip(static.fragments, supports):
+        fragment.primary_atoms = np.asarray(atoms)
+    builds, derivative_builds, live_raw = [], [], []
+    monitor_lifetime = False
+
+    def fake_molecule(mol, atoms):
+        builds.append(tuple(atoms))
+        return ScreeningMolecule(mol.coordinates[jnp.asarray(atoms)])
+
+    def raw_moments(mol, max_order):
+        if monitor_lifetime:
+            assert all(reference() is None for reference in live_raw)
+        coordinates = mol.coordinates
+        if isinstance(coordinates, jax.core.Tracer):
+            derivative_builds.append(True)
+        displacement = coordinates[:, None, :] - coordinates[None, :, :]
+        overlap = jnp.exp(-.1 * jnp.sum(displacement**2, axis=-1))
+        midpoint = (coordinates[:, None, :] + coordinates[None, :, :]) / 2
+        first = jnp.einsum('uvx,uv->xuv', midpoint, overlap)
+        second = (jnp.einsum('uvx,uvy,uv->xyuv', midpoint, midpoint, overlap)
+                  if max_order >= 2 else None)
+        third = (jnp.einsum('uvx,uvy,uvz,uv->xyzuv', midpoint, midpoint, midpoint, overlap)
+                 if max_order >= 3 else None)
+        result = overlap, first, second, third
+        if monitor_lifetime:
+            live_raw[:] = [weakref.ref(value) for value in result if value is not None]
+        return result
+
+    def screen(current, static, fragment_index):
+        if static.fragments[fragment_index].weak_virtual is None:
+            return None
+        angle = .2 + .25 * fragment_index + .1 * current.s1e[fragment_index]
+        occupied = jnp.array([[jnp.cos(angle)], [jnp.sin(angle)]])
+        nvir = 1 + fragment_index % 2
+        virtual = (jnp.array([[-jnp.sin(angle)], [jnp.cos(angle)]])
+                   * (1 + .2 * jnp.arange(nvir))[None, :])
+        return _pairs.WeakScreen(jnp.array([-.6]), occupied,
+                                 .3 + .15 * jnp.arange(nvir)
+                                 + .1 * current.s1e[fragment_index], virtual)
+
+    monkeypatch.setattr(_pairs, '_fake_mol_with_traced_centers', fake_molecule)
+    monkeypatch.setattr(_pairs, '_origin_zero_moments', raw_moments)
+    monkeypatch.setattr(_pairs, 'build_weak_multipole_screen', screen)
+    legacy = _pairs.screen_pairs(mf, common, static)
+    assert builds == list(supports)
+    builds.clear()
+    monitor_lifetime = True
+    prepared = {}
+    shared = _pairs.screen_pairs(mf, common, static, prepared_endpoints=prepared)
+    assert builds == [(0, 1), (1, 0)]
+    assert all(reference() is None for reference in live_raw)
+    for actual, expected in zip(shared, legacy):
+        np.testing.assert_array_equal(actual, expected)
+
+    monitor_lifetime = False
+    static.strong_mask = shared[-1]
+    assert _pairs.weak_pair_indices(static) == ((0, 1), (0, 2), (1, 2))
+    builds.clear()
+    value, bars = _pairs.weak_pair_energy_and_grad(
+        mf, common, static, prepared_endpoints=prepared,
+        _grouped_ao_response=grouped_response)
+    # Forward reuse must not freeze the AO-integral coordinate dependence.
+    assert builds == ([(0, 1), (1, 0)] if grouped_response else list(supports))
+    assert len(derivative_builds) == (2 if grouped_response else 3)
+    assert np.linalg.norm(bars[0].mol.coordinates) > 0
+    assert np.linalg.norm(bars[1].s1e) > 0
+    fallback_value, fallback_bars = _pairs.weak_pair_energy_and_grad(mf, common, static)
+    np.testing.assert_allclose(value, fallback_value, rtol=2e-12, atol=1e-14)
+    for actual, expected in zip(jax.tree_util.tree_leaves(bars),
+                                jax.tree_util.tree_leaves(fallback_bars)):
+        np.testing.assert_allclose(actual, expected, rtol=2e-11, atol=1e-13)
+
+    def direct(current_mf, current_common):
+        endpoints = [_pairs.build_weak_endpoint(current_mf, current_common, static, i)
+                     for i in range(3)]
+        return sum(_pairs._multipole_pair_energy(endpoints[i], endpoints[j], order)
+                   for i, j in ((0, 1), (0, 2), (1, 2)))
+
+    expected_value, expected_bars = jax.value_and_grad(direct, argnums=(0, 1))(mf, common)
+    np.testing.assert_allclose(value, expected_value, rtol=2e-12, atol=1e-14)
+    for actual, expected in zip(jax.tree_util.tree_leaves(bars),
+                                jax.tree_util.tree_leaves(expected_bars)):
+        np.testing.assert_allclose(actual, expected, rtol=2e-11, atol=1e-13)
 
 
 @pytest.mark.parametrize('order', [2, 3, 4])

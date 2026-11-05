@@ -20,6 +20,7 @@ import os
 import time
 import numpy
 from functools import reduce, partial
+from dataclasses import dataclass
 
 import jax
 from jax import custom_vjp
@@ -65,6 +66,23 @@ _USE_CUSTOM_VJP_AO2MO_DF_ERIS = True
 # attributes ride along as aux data through the pytree round-trip and
 # leak stale outer-trace tracers into the re-traced bwd.
 _USE_CUSTOM_VJP_IMPURITY_SOLVE = True
+
+
+@dataclass(frozen=True)
+class FragmentAmplitudeResult:
+    """Amplitudes and a matching frame for projected CCSD and smooth triples.
+
+    Optional amplitude callbacks may return this instead of the legacy
+    ``(t1, t2, diagnostics)`` tuple. The ERIs and physical projector must be
+    expressed in the amplitudes' occupied/virtual frame and retain their AD
+    dependencies. Conventional diagonal-denominator triples cannot consume a
+    changed frame; provide a full-Fock triples callback when triples are used.
+    """
+    t1: object
+    t2: object
+    eris: object
+    prjlo: object
+    diagnostics: dict
 
 
 def _print_forward_t_energy(et, wall_time=None):
@@ -476,8 +494,10 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
 
     An optional ``amplitude_solver(mcc, eris, t1, t2, prjlo=...)`` returns
     differentiable amplitudes in this original LIS basis and CC diagnostics.
-    Integral preparation, the physical fragment energy and triples are shared
-    with the deterministic path. Its diagnostics are returned under ``ccsd``.
+    Alternatively, ``FragmentAmplitudeResult`` carries a consistent amplitude,
+    integral and projector frame used for both projected CCSD and triples.
+    The MP2 subtraction remains in the prepared LIS. Diagnostics are returned
+    under ``ccsd``.
 
     ``active_nocc`` accepts an occupied-first, unfrozen domain LIS without
     completing it to the global HF orbital layout. The supplied AO Fock is
@@ -597,11 +617,19 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
     phase_start = time.perf_counter()
     profile_phase = resource_profile.start()
     cc_diagnostics = None
+    energy_eris, energy_prjlo = imp_eris, prjlo
     if amplitude_solver is None:
         t1, t2 = mcc.kernel(eris=imp_eris, t1=t1, t2=t2)[1:]
     else:
-        t1, t2, cc_diagnostics = amplitude_solver(mcc, imp_eris, t1, t2, prjlo=prjlo)
-    elcorr_cc = ccsd_fragment_energy(imp_eris, t1, t2, prjlo)
+        amplitudes = amplitude_solver(mcc, imp_eris, t1, t2, prjlo=prjlo)
+        if isinstance(amplitudes, FragmentAmplitudeResult):
+            if ccsd_t and triples_solver is None:
+                raise ValueError('A shared local amplitude frame requires a smooth full-Fock triples solver')
+            t1, t2, cc_diagnostics = amplitudes.t1, amplitudes.t2, amplitudes.diagnostics
+            energy_eris, energy_prjlo = amplitudes.eris, amplitudes.prjlo
+        else:
+            t1, t2, cc_diagnostics = amplitudes
+    elcorr_cc = ccsd_fragment_energy(energy_eris, t1, t2, energy_prjlo)
     phase_times['ccsd_s'] = time.perf_counter() - phase_start
     resource_profile.finish(
         'solver.ccsd_iterations_and_energy',
@@ -624,10 +652,10 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
         profile_phase = resource_profile.start()
         if triples_solver is None:
             elcorr_cc_t = ccsd_t_mod.kernel(
-                mcc, imp_eris, prjlo, t1=t1, t2=t2, verbose=verbose_imp)
+                mcc, energy_eris, energy_prjlo, t1=t1, t2=t2, verbose=verbose_imp)
         else:
             elcorr_cc_t, triples_diagnostics = triples_solver(
-                mcc, imp_eris, prjlo, t1=t1, t2=t2, verbose=verbose_imp)
+                mcc, energy_eris, energy_prjlo, t1=t1, t2=t2, verbose=verbose_imp)
         phase_times['triples_s'] = time.perf_counter() - phase_start
         resource_profile.finish(
             'solver.perturbative_triples',

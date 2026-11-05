@@ -368,16 +368,8 @@ def _validate_boys_metric_rank(coeff, overlap, keep, threshold, label):
         raise RuntimeError(f"Boys {label} metric rank changed; rebuild domains")
 
 
-def _rebuild_selected_pao_space(
-    common,
-    selection,
-    representation_ao_indices,
-    occupied_for_projection,
-    *,
-    boys_metric_threshold=None,
-):
-    """Replay continuous PAO transformations with all labels held fixed."""
-
+def _rebuild_selected_pao_preprojection(common, selection, representation_ao_indices):
+    """Replay the target-independent PAO span in the requested AO support."""
     s1e = common.s1e
     pao_parent = common.pao_coeff[:, selection.parent_columns]
     gram = pao_parent.T.conj() @ s1e @ pao_parent
@@ -409,8 +401,29 @@ def _rebuild_selected_pao_space(
     representation_ao = numpy.asarray(
         representation_ao_indices, dtype=numpy.int32
     )
-    s22 = s1e[numpy.ix_(representation_ao, representation_ao)]
-    candidate = _project_to_ao_support(candidate, s1e, representation_ao)
+    return _project_to_ao_support(candidate, s1e, representation_ao)
+
+
+def _rebuild_selected_pao_space(
+    common,
+    selection,
+    representation_ao_indices,
+    occupied_for_projection,
+    *,
+    boys_metric_threshold=None,
+    preprojection=None,
+):
+    """Replay continuous PAO transformations with all labels held fixed.
+
+    A supplied preprojection must be the live differentiable output for
+    these PAO labels and AO supports. Only the occupied projection and final
+    metric normalization depend on the individual target.
+    """
+    candidate = (_rebuild_selected_pao_preprojection(
+        common, selection, representation_ao_indices)
+        if preprojection is None else preprojection)
+    representation_ao = numpy.asarray(representation_ao_indices, dtype=numpy.int32)
+    s22 = common.s1e[numpy.ix_(representation_ao, representation_ao)]
     candidate = _orthogonalize(
         occupied_for_projection, candidate, s22
     )

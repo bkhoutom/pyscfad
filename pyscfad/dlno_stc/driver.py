@@ -158,47 +158,73 @@ def _coordinate_only(mol):
         )
 
 
-def _select_domain_reference(mf, build_static):
+def _select_domain_reference(mf, build_static, *, reuse_weak=True):
     """Share live S/F with a callback through its detached numerical reference."""
     with resource_profile.section('stc.domain.scf_data_prepare'):
         scf_data, scf_data_pullback = jax.vjp(build_scf_data, mf)
         jax.block_until_ready(scf_data)
         host_data = tuple(numpy.asarray(jax.device_get(value)) for value in scf_data)
 
+    from ._selection_response import SelectionResponse
+    prepared = SelectionResponse(mf, scf_data, scf_data_pullback) if reuse_weak else None
+
     def select(reference):
         # Only the detached copy carries this selection-time cache. In
         # particular, it must never become metadata on the live SCF pytree.
         reference._stc_scf_data = host_data
+        reference._stc_selection_response = prepared
         try:
             return build_static(reference)
         finally:
             reference.__dict__.pop('_stc_scf_data', None)
+            reference.__dict__.pop('_stc_selection_response', None)
 
     with resource_profile.section('stc.domain.selection'):
         selected = stop_trace(select)(mf)
-    return selected, scf_data, scf_data_pullback
+    return selected, scf_data, scf_data_pullback, prepared
+
+
+def _build_common_with_pullback(mf, static, scf_data, scf_data_pullback):
+    common, construction_pullback = jax.vjp(
+        lambda current, data: rebuild_domain_data(current, static, scf_data=data),
+        mf, scf_data)
+
+    def common_pullback(common_bar):
+        direct, data_bar = construction_pullback(common_bar)
+        via_scf_data, = scf_data_pullback(data_bar)
+        return (jax.tree_util.tree_map(_add_cotangent, direct, via_scf_data),)
+
+    return common, common_pullback
+
+
+def _weak_energy_and_grad(state, static, pairs):
+    """Consume a selection-time contribution, or evaluate saved-static inputs."""
+    pairs = tuple(pairs)
+    pending = state.pop('_prepared_weak', None)
+    if pending is not None and pairs == pending[0]:
+        return pending[1]
+    return weak_pair_energy_and_grad(state['mf'], state['common'], static, pairs=pairs)
 
 
 def _initialize(mf, static, controls, *, with_grad, scf_pullback=None,
-                scf_data=None, scf_data_pullback=None):
+                scf_data=None, scf_data_pullback=None, prepared_domain=None):
     _validate_static(static)
     _validate_controls(controls)
     _validate_reference(mf, static)
     configure_compilation_cache()
+    pending = None
     with resource_profile.section('stc.domain.common_prepare'):
         if with_grad:
             if scf_data is None:
                 scf_data, scf_data_pullback = jax.vjp(build_scf_data, mf)
             if scf_data_pullback is None:
                 raise ValueError('live S/F data require their pullback for gradients')
-            common, construction_pullback = jax.vjp(
-                lambda current, data: rebuild_domain_data(current, static, scf_data=data),
-                mf, scf_data)
-
-            def common_pullback(common_bar):
-                direct, data_bar = construction_pullback(common_bar)
-                via_scf_data, = scf_data_pullback(data_bar)
-                return (jax.tree_util.tree_map(_add_cotangent, direct, via_scf_data),)
+            adopted = None if prepared_domain is None else prepared_domain.take(static)
+            if adopted is None:
+                common, common_pullback = _build_common_with_pullback(
+                    mf, static, scf_data, scf_data_pullback)
+            else:
+                common, common_pullback, pending = adopted
 
             mf_bar, common_bar = _zero_term_cotangents(mf, common)
         else:
@@ -210,7 +236,7 @@ def _initialize(mf, static, controls, *, with_grad, scf_pullback=None,
     return {"mf": mf, "static": static, "common": common, "common_pullback": common_pullback,
             "scf_pullback": scf_pullback, "mf_bar": mf_bar, "common_bar": common_bar,
             "energy": np.zeros((), dtype=common.s1e.dtype), "variance": 0.0,
-            "weak_pairs": tuple(weak_pair_indices(static))}
+            "weak_pairs": tuple(weak_pair_indices(static)), "_prepared_weak": pending}
 
 
 def _prepare(state, static, group, controls, with_grad, *, return_frame=False):
@@ -357,8 +383,7 @@ def _run_domain(initializer, static, controls, comm, *, with_grad, include_hf=Fa
     if pairs:
         def apply_weak():
             if with_grad:
-                energy, bars = weak_pair_energy_and_grad(
-                    state["mf"], state["common"], static, pairs=pairs)
+                energy, bars = _weak_energy_and_grad(state, static, pairs)
                 _add_bars(state, *bars)
             else:
                 energy = weak_pair_energy_sum(
@@ -743,12 +768,16 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
                                       scf_pullback=scf_pullback, lo_kwargs=lo_kwargs,
                                       fock_from_scf=True)
         selected = static
-        scf_data = scf_data_pullback = None
+        scf_data = scf_data_pullback = prepared_domain = None
         if build_static is not None:
-            selected, scf_data, scf_data_pullback = _select_domain_reference(mf, build_static)
+            # Distributed MP2 already owns endpoint work across ranks. Preserve
+            # that executor; CCSD's root-owned weak completion can reuse selection.
+            selected, scf_data, scf_data_pullback, prepared_domain = _select_domain_reference(
+                mf, build_static, reuse_weak=comm is None or comm.Get_size() == 1)
         return _initialize(mf, selected, controls, with_grad=True,
                            scf_pullback=scf_pullback, scf_data=scf_data,
-                           scf_data_pullback=scf_data_pullback)
+                           scf_data_pullback=scf_data_pullback,
+                           prepared_domain=prepared_domain)
 
     if scope == "system":
         return _run_system(initialize, controls, comm, with_grad=True, include_hf=include_hf)

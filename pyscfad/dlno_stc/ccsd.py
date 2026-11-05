@@ -162,6 +162,18 @@ def _cc_solver_options(cc_solver, stc_cc_controls):
     return dict(cc_solver='stc', stc_cc_controls=normalize_controls(stc_cc_controls))
 
 
+def _validate_shared_frame_triples(static, ccsd_t, stc_cc_controls):
+    """A local amplitude frame needs full-Fock rather than diagonal triples."""
+    if not ccsd_t or not (stc_cc_controls or {}).get('shared_local_frame', False):
+        return
+    deferred = getattr(static, 'deferred_selection', None)
+    smooth = (deferred['smooth'] if deferred is not None else
+              static.lis_static.smooth_frames is not None)
+    if not smooth:
+        raise ValueError('shared_local_frame with (T) requires smooth=True full-Fock triples; '
+                         'set shared_local_frame=False to backrotate to the incoming LIS frame')
+
+
 def _normalize_controls(baseline_controls, matrix_controls, matrix_kind):
     baseline = driver._driver_controls(baseline_controls, scope='domain')
     baseline.setdefault('mode', 'deterministic')
@@ -562,6 +574,7 @@ def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
                     vvvv_direct=False, cc_solver='deterministic', stc_cc_controls=None,
                     frame=None):
     """Return MP2-LIS, CCSD and triples; stochastic calls also return diagnostics."""
+    _validate_shared_frame_triples(static, ccsd_t, stc_cc_controls)
     representative = group.representative_index
     if frame is None:
         frame = build_boys_ed_frame(common, static.mp2_static, representative)
@@ -842,8 +855,7 @@ def _run_weak(state, static, *, with_grad, pairs=None):
     if not pairs:
         return
     if with_grad:
-        energy, bars = driver.weak_pair_energy_and_grad(
-            state['mf'], state['common'], static.mp2_static, pairs=pairs)
+        energy, bars = driver._weak_energy_and_grad(state, static.mp2_static, pairs)
         driver._add_bars(state, *bars)
     else:
         energy = driver.weak_pair_energy_sum(
@@ -872,6 +884,8 @@ def _run_serial(state, static, baseline, matrix, *, with_grad, include_hf,
                                   resume=resume, options=options)
     try:
         start, weak_done, records = restore_progress(checkpoint, state, with_grad=with_grad)
+        if weak_done or not include_baseline:
+            state.pop('_prepared_weak', None)
         if not 0 <= start <= len(groups):
             raise ValueError('CC checkpoint progress is outside the saved group worklist')
         for position in range(start, len(groups)):
@@ -982,9 +996,14 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
     ``cc_solver='stc'`` selects the experimental external ``stc_cc_jax``
     amplitude solver; ``stc_cc_controls`` contains its sampling/localization
     settings (unsuffixed energy fields: Hartree; explicit ``*_mEh`` aliases:
-    millihartree). All other stages retain their independent controls. The adapter returns differentiable averaged amplitudes in the
-    original LIS basis. Fragment CC diagnostics are separate from triples and
-    baseline uncertainty. The default does not import the optional dependency.
+    millihartree). All other stages retain their independent controls.
+    STC defaults to ``localize=True, shared_local_frame=True``: differentiable
+    averaged amplitudes, projected CCSD energy and smooth triples use one fixed
+    private Boys frame with consistently transformed integrals and projector.
+    Triples then requires a smooth selection. ``shared_local_frame=False``
+    restores amplitude backrotation to the original LIS basis. Fragment CC
+    diagnostics are separate from triples and baseline uncertainty. The default
+    deterministic solver does not import the optional dependency.
     ``stc_cc_controls['energy_tolerance_mEh']`` enables independent complete-solve
     replicas, allocating equal variance across the globally selected physical LIS.
     Independent pilots choose a fixed production count per LIS. Returned energies
@@ -999,6 +1018,7 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
         if include_hf and not include_baseline:
             raise ValueError('include_hf requires include_baseline=True')
         baseline, matrix = _validate_run(static, baseline_controls, matrix_controls, matrix_kind)
+        _validate_shared_frame_triples(static, ccsd_t, solver_options.get('stc_cc_controls'))
         indices = _fragment_indices(static, fragment_indices)
         _stc_precision.validate_stages(solver_options.get('stc_cc_controls'), baseline, matrix, triples)
         _stc_precision.validate_seed_independence(solver_options.get('stc_cc_controls'), indices)
@@ -1079,6 +1099,7 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
                 raise TypeError('build_static must be callable')
         else:
             early_baseline, early_matrix = _validate_run(static, baseline_controls, matrix_controls, matrix_kind)
+            _validate_shared_frame_triples(static, ccsd_t, solver_options.get('stc_cc_controls'))
             _stc_precision.validate_stages(solver_options.get('stc_cc_controls'), early_baseline, early_matrix, triples)
             if _stc_precision.enabled(solver_options.get('stc_cc_controls')):
                 prechecked_indices = _fragment_indices(static, fragment_indices)
@@ -1092,10 +1113,12 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
         if local_response:
             scf_pullback = driver._serial_scf_pullback(scf_pullback)
         selected = static
-        scf_data = scf_data_pullback = None
+        scf_data = scf_data_pullback = prepared_domain = None
         if build_static is not None:
-            selected, scf_data, scf_data_pullback = driver._select_domain_reference(mf, build_static)
+            selected, scf_data, scf_data_pullback, prepared_domain = driver._select_domain_reference(
+                mf, build_static, reuse_weak=include_baseline and not resume)
         baseline, matrix = _validate_run(selected, baseline_controls, matrix_controls, matrix_kind)
+        _validate_shared_frame_triples(selected, ccsd_t, solver_options.get('stc_cc_controls'))
         indices = (_fragment_indices(selected, fragment_indices)
                    if prechecked_indices is None else prechecked_indices)
         _stc_precision.validate_stages(solver_options.get('stc_cc_controls'), baseline, matrix, triples)
@@ -1104,7 +1127,8 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
         triples = _allocate_triples_controls(triples, len(indices), static=selected, indices=indices)
         state = driver._initialize(mf, selected.mp2_static, baseline, with_grad=True,
                                    scf_pullback=scf_pullback, scf_data=scf_data,
-                                   scf_data_pullback=scf_data_pullback)
+                                   scf_data_pullback=scf_data_pullback,
+                                   prepared_domain=prepared_domain)
         state['cc_fragment_indices'] = indices
         state['cc_triples_controls'] = triples
         if solver_options:

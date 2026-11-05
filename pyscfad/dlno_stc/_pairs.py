@@ -7,6 +7,7 @@ cotangents before replaying each endpoint response once; no native DLNO
 module is imported by this implementation.
 """
 import gc
+from collections import Counter
 from functools import partial
 from typing import NamedTuple
 
@@ -33,6 +34,43 @@ class WeakScreen(NamedTuple):
     occupied_coeff: object
     virtual_energy: object
     virtual_coeff: object
+
+
+class _SharedPAOPullback(NamedTuple):
+    """One target response and the shared live preprojection reverse rule."""
+
+    target_pullback: object
+    preprojection_pullback: object
+
+
+def _weak_pao_preprojection_key(fragment):
+    """Only identical ordered fixed labels identify the same live PAO map."""
+    from ._selection import FixedPAOSubspaceSelection
+    selection = fragment.weak_virtual
+    if not isinstance(selection, FixedPAOSubspaceSelection):
+        return None
+    return tuple(tuple(int(index) for index in labels) for labels in (
+        selection.parent_columns, selection.support_ao_indices,
+        fragment.primary_ao_indices, selection.canonical_keep,
+        selection.overlap_keep, selection.completeness_keep))
+
+
+def _apply_weak_screen_pullback(pullback, screen_bar, shared_pao_bars):
+    """Apply a shared reverse rule once, at its last active target."""
+    if isinstance(pullback, _SharedPAOPullback):
+        common_bar, pao_bar = pullback.target_pullback(screen_bar)
+        shared = pullback.preprojection_pullback
+        remaining, previous = shared_pao_bars.pop(shared)
+        pao_bar = pao_bar if previous is None else previous + pao_bar
+        if remaining == 1:
+            from .adjoint import add_cotangent
+            shared_bar, = shared(pao_bar)
+            common_bar = jax.tree_util.tree_map(add_cotangent, common_bar, shared_bar)
+        else:
+            shared_pao_bars[shared] = (remaining - 1, pao_bar)
+    else:
+        common_bar, = pullback(screen_bar)
+    return common_bar
 
 
 def _fake_mol_with_traced_centers(mol, atmlst):
@@ -152,7 +190,7 @@ def _origin_zero_moments(fake_mol, order):
     return overlap, r, rr, rrr
 
 
-def _multipole_orbital_data(mol, screen, atoms, order):
+def _multipole_orbital_data(mol, screen, atoms, order, *, ao_moments=None):
     """Build the one Boys endpoint using translated raw transition moments."""
     if order not in (2, 3, 4):
         raise ValueError("multipole order must be 2, 3, or 4")
@@ -162,10 +200,10 @@ def _multipole_orbital_data(mol, screen, atoms, order):
         raise ValueError("a Boys weak screen requires one occupied target")
     if virtual.ndim != 2 or virtual.shape[0] != occupied.shape[0]:
         raise ValueError("weak-screen occupied and virtual AO dimensions differ")
-    fake_mol = _fake_mol_with_traced_centers(mol, atoms)
-    overlap, dipole, second, third = _origin_zero_moments(
-        fake_mol, max(1, order - 1)
-    )
+    if ao_moments is None:
+        fake_mol = _fake_mol_with_traced_centers(mol, atoms)
+        ao_moments = _origin_zero_moments(fake_mol, max(1, order - 1))
+    overlap, dipole, second, third = ao_moments
     center, mu, theta, omega = transition_moments(
         occupied, virtual, overlap, dipole, second, third, order
     )
@@ -175,7 +213,7 @@ def _multipole_orbital_data(mol, screen, atoms, order):
             None if omega is None else omega[0])
 
 
-def build_weak_multipole_screen(common, static, fragment_index):
+def build_weak_multipole_screen(common, static, fragment_index, *, _pao_preprojection=None):
     """Replay saved primary supports/ranks with a normalized current target."""
     from .domain import (_fixed_metric_orthonormalize, _fixed_semicanonicalize,
                          _rebuild_selected_pao_space)
@@ -200,6 +238,7 @@ def build_weak_multipole_screen(common, static, fragment_index):
     virtual = _rebuild_selected_pao_space(
         common, fragment.weak_virtual, ao, span,
         boys_metric_threshold=static.thresholds.metric_rank,
+        preprojection=_pao_preprojection,
     )
     virtual_energy, virtual = _fixed_semicanonicalize(virtual, fock)
     gaps = np.asarray(jax.device_get(jax.lax.stop_gradient(virtual_energy[:, None] - occupied_energy)))
@@ -241,26 +280,47 @@ def build_weak_endpoint(mf, common, static, fragment_index):
     return _weak_endpoint_from_screen(mf, screen, static, fragment_index)
 
 
-def _weak_endpoint_from_screen(mf, screen, static, fragment_index):
+def _weak_endpoint_from_screen(mf, screen, static, fragment_index, *, ao_moments=None):
     """Contract AO moments using the supplied, differentiable orbital screen."""
     if screen is None:
         raise RuntimeError(f"a fixed weak endpoint {fragment_index} has no multipole screen")
     return _multipole_orbital_data(
         mf.mol, screen, static.fragments[fragment_index].primary_atoms,
-        static.thresholds.multipole_order,
+        static.thresholds.multipole_order, ao_moments=ao_moments,
     )
 
 
-def _prepare_weak_endpoint(mf, common, static, fragment_index):
-    """Retain the orbital reverse rule from the actual forward evaluation."""
+def _prepare_weak_endpoint(mf, common, static, fragment_index, *, ao_moments=None,
+                           pao_preparation=None):
+    """Retain the orbital reverse rule from the actual forward evaluation.
+
+    Optional raw AO moments serve only this primal contraction. They are
+    never retained by the orbital pullback; replay rebuilds their complete
+    molecular dependence when applying the endpoint cotangent.
+    """
+    moments = partial(_weak_endpoint_from_screen, static=static, fragment_index=fragment_index)
+    if ao_moments is not None:
+        moments = partial(moments, ao_moments=ao_moments)
+    if pao_preparation is not None:
+        preprojection, preprojection_pullback = pao_preparation
+        screen, target_pullback = jax.vjp(
+            lambda current, candidate: build_weak_multipole_screen(
+                current, static, fragment_index, _pao_preprojection=candidate),
+            common, preprojection)
+        return moments(mf, screen), (screen, _SharedPAOPullback(
+            target_pullback, preprojection_pullback))
     return prepare_endpoint(
         partial(build_weak_multipole_screen, static=static, fragment_index=fragment_index),
-        partial(_weak_endpoint_from_screen, static=static, fragment_index=fragment_index),
-        mf, common)
+        moments, mf, common)
 
 
-def _replay_weak_endpoint(mf, linearization, static, fragment_index):
+def _replay_weak_endpoint(mf, linearization, static, fragment_index, *,
+                          shared_pao_bars=None):
     """Replay AO moments in the saved screen and compose its orbital response."""
+    screen, screen_pullback = linearization
+    if isinstance(screen_pullback, _SharedPAOPullback):
+        linearization = (screen, lambda bar: (_apply_weak_screen_pullback(
+            screen_pullback, bar, shared_pao_bars),))
     return replay_endpoint(
         partial(_weak_endpoint_from_screen, static=static, fragment_index=fragment_index),
         mf, linearization)
@@ -311,13 +371,64 @@ def weak_pair_energy_sum(mf, common, static, *, pairs=None):
     return jnp.real(energy)
 
 
-def weak_pair_energy_and_grad(mf, common, static, *, pairs=None):
+def _grouped_weak_pullback(mf, static, endpoints, originals, linearizations,
+                          endpoint_bars, bars, shared_pao_bars):
+    """Replay one raw AO tape per ordered support and release it promptly."""
+    from .adjoint import add_cotangent
+    supports = {}
+    for index in endpoint_bars:
+        atoms = tuple(int(atom) for atom in static.fragments[index].primary_atoms)
+        supports.setdefault(atoms, []).append(index)
+    order = static.thresholds.multipole_order
+    for atoms, indices in supports.items():
+        raw, raw_pullback = jax.vjp(
+            lambda current: _origin_zero_moments(
+                _fake_mol_with_traced_centers(current.mol, atoms), max(1, order - 1)),
+            mf)
+        raw_bar = jax.tree_util.tree_map(jnp.zeros_like, raw)
+        for index in indices:
+            endpoint_bar = endpoint_bars.pop(index)
+            del endpoints[index]
+            original = originals.pop(index)
+            screen, screen_pullback = linearizations.pop(index)
+            rebuilt, moment_pullback = jax.vjp(
+                lambda saved, operators: _weak_endpoint_from_screen(
+                    mf, saved, static, index, ao_moments=operators),
+                screen, raw)
+            _check_endpoint_replay(rebuilt, original, index)
+            screen_bar, operators_bar = moment_pullback(
+                crop_endpoint_cotangent(endpoint_bar, original))
+            common_bar = _apply_weak_screen_pullback(
+                screen_pullback, screen_bar, shared_pao_bars)
+            bars = (bars[0], jax.tree_util.tree_map(add_cotangent, bars[1], common_bar))
+            raw_bar = jax.tree_util.tree_map(add_cotangent, raw_bar, operators_bar)
+            jax.block_until_ready((bars[1], raw_bar))
+            del (rebuilt, moment_pullback, original, endpoint_bar, screen,
+                 screen_pullback, screen_bar, operators_bar, common_bar)
+        mf_bar, = raw_pullback(raw_bar)
+        bars = (jax.tree_util.tree_map(add_cotangent, bars[0], mf_bar), bars[1])
+        jax.block_until_ready(bars)
+        del raw, raw_pullback, raw_bar, mf_bar
+    return bars
+
+
+def weak_pair_energy_and_grad(mf, common, static, *, pairs=None,
+                             prepared_endpoints=None, _grouped_ao_response=False):
     """Reuse orbital pullbacks and replay one AO-moment tape at a time.
 
     Each orbital screen and its reverse rule come from one forward VJP.
     Pair contractions share compact transition moments. Their accumulated
     bars pass through AO-moment replay using the exact saved screen, then
     through its retained orbital pullback. No eigensolver is replayed.
+
+    ``prepared_endpoints`` transfers ownership of screening preparations
+    made at these exact ``mf`` and ``common`` inputs. Entries are consumed
+    once; missing endpoints are prepared here and unused entries released.
+    The caller must retain the screening weak selections and only refine
+    the strong mask before consuming these preparations.
+
+    The selection-owned path may share the raw AO response across endpoints
+    with identical ordered supports, retaining only one support's AO tape.
     """
     from .adjoint import add_cotangent, zero_term_cotangents
     configure_compilation_cache()
@@ -327,8 +438,20 @@ def weak_pair_energy_and_grad(mf, common, static, *, pairs=None):
     originals, linearizations = {}, {}
     with resource_profile.section('stc.domain.weak_prepare'):
         for index in sorted({index for pair in pairs for index in pair}):
-            originals[index], linearizations[index] = _prepare_weak_endpoint(
-                mf, common, static, index)
+            if prepared_endpoints is not None and index in prepared_endpoints:
+                originals[index], linearizations[index] = prepared_endpoints.pop(index)
+            else:
+                originals[index], linearizations[index] = _prepare_weak_endpoint(
+                    mf, common, static, index)
+        if prepared_endpoints is not None:
+            # Strong-only endpoints have no response. Drop their orbital tapes
+            # before accumulating bars for the final weak graph.
+            prepared_endpoints.clear()
+        # Count only endpoints in the final weak graph. Clearing unused
+        # preparations above releases groups without any weak contribution.
+        shared_pao_bars = {pullback: (count, None) for pullback, count in Counter(
+            value[1].preprojection_pullback for value in linearizations.values()
+            if isinstance(value[1], _SharedPAOPullback)).items()}
         endpoints = {index: pad_endpoint(value) for index, value in originals.items()}
         endpoint_bars = {index: jax.tree_util.tree_map(jnp.zeros_like, value)
                          for index, value in endpoints.items()}
@@ -347,17 +470,26 @@ def weak_pair_energy_and_grad(mf, common, static, *, pairs=None):
         if resource_profile.enabled():
             jax.block_until_ready((energy, endpoint_bars))
     with resource_profile.section('stc.domain.weak_pullback', includes_replay=True):
-        for index in tuple(endpoint_bars):
-            endpoint_bar = endpoint_bars.pop(index)
-            del endpoints[index]
-            original = originals.pop(index)
-            linearization = linearizations.pop(index)
-            rebuilt, pullback = _replay_weak_endpoint(mf, linearization, static, index)
-            _check_endpoint_replay(rebuilt, original, index)
-            contribution = pullback(crop_endpoint_cotangent(endpoint_bar, original))
-            bars = jax.tree_util.tree_map(add_cotangent, bars, contribution)
-            jax.block_until_ready(bars)
-            del rebuilt, original, pullback, contribution, endpoint_bar, linearization
+        if _grouped_ao_response:
+            bars = _grouped_weak_pullback(
+                mf, static, endpoints, originals, linearizations, endpoint_bars,
+                bars, shared_pao_bars)
+        else:
+            for index in tuple(endpoint_bars):
+                endpoint_bar = endpoint_bars.pop(index)
+                del endpoints[index]
+                original = originals.pop(index)
+                linearization = linearizations.pop(index)
+                if isinstance(linearization[1], _SharedPAOPullback):
+                    rebuilt, pullback = _replay_weak_endpoint(
+                        mf, linearization, static, index, shared_pao_bars=shared_pao_bars)
+                else:
+                    rebuilt, pullback = _replay_weak_endpoint(mf, linearization, static, index)
+                _check_endpoint_replay(rebuilt, original, index)
+                contribution = pullback(crop_endpoint_cotangent(endpoint_bar, original))
+                bars = jax.tree_util.tree_map(add_cotangent, bars, contribution)
+                jax.block_until_ready(bars)
+                del rebuilt, original, pullback, contribution, endpoint_bar, linearization
     if pairs:
         # Release each tape promptly, but scan the Python heap only after
         # the complete weak response. Automatic collection remains enabled.
@@ -398,20 +530,59 @@ def _exact_boys_pair_scores(mf, common, static):
     return physical
 
 
-def screen_pairs(mf, common, static, model='multipole', force_full_domains=False):
-    """Concrete Boys pair classification on provisional primary selections."""
+def screen_pairs(mf, common, static, model='multipole', force_full_domains=False,
+                 *, prepared_endpoints=None):
+    """Concrete Boys pair classification on provisional primary selections.
+
+    When supplied, ``prepared_endpoints`` is cleared and filled with each
+    available endpoint and its orbital pullback from this evaluation. The
+    mapping belongs to this exact reference and is consumed by
+    :func:`weak_pair_energy_and_grad` after the final strong mask is known.
+    """
     model = str(model).lower().replace('_', '-')
     if model not in ('multipole', 'multipole-os', 'os-multipole', 'exact', 'all', 'all-strong'):
         raise ValueError(f"unsupported Boys pair energy model {model!r}")
+    if prepared_endpoints is not None:
+        prepared_endpoints.clear()
     nfrag = len(static.fragments)
     if force_full_domains or static.thresholds.pair_energy <= 0 or model in ('all', 'all-strong'):
         return (np.zeros((nfrag, nfrag)), np.zeros((nfrag, nfrag)),
                 np.ones((nfrag, nfrag), dtype=bool), np.ones((nfrag, nfrag), dtype=bool))
-    screens = [build_weak_multipole_screen(common, static, index) for index in range(nfrag)]
     order = static.thresholds.multipole_order
-    endpoints = [None if screen is None else pad_endpoint(_multipole_orbital_data(
-        mf.mol, screen, static.fragments[index].primary_atoms, order))
-        for index, screen in enumerate(screens)]
+    if prepared_endpoints is None:
+        screens = [build_weak_multipole_screen(common, static, index) for index in range(nfrag)]
+        endpoints = [None if screen is None else pad_endpoint(_multipole_orbital_data(
+            mf.mol, screen, static.fragments[index].primary_atoms, order))
+            for index, screen in enumerate(screens)]
+    else:
+        endpoints = [None] * nfrag
+        supports, pao_preparations = {}, {}
+        for index, fragment in enumerate(static.fragments):
+            if fragment.weak_virtual is not None:
+                atoms = tuple(int(atom) for atom in fragment.primary_atoms)
+                supports.setdefault(atoms, []).append(index)
+        for atoms, indices in supports.items():
+            # Raw AO operators depend on the ordered support, not the target.
+            # Keep only this group's arrays; no AO reverse tape is made here.
+            fake_mol = _fake_mol_with_traced_centers(mf.mol, atoms)
+            ao_moments = _origin_zero_moments(fake_mol, max(1, order - 1))
+            for index in indices:
+                fragment = static.fragments[index]
+                key = _weak_pao_preprojection_key(fragment)
+                preparation = {}
+                if key is not None:
+                    if key not in pao_preparations:
+                        from .domain import _rebuild_selected_pao_preprojection
+                        pao_preparations[key] = jax.vjp(partial(
+                            _rebuild_selected_pao_preprojection,
+                            selection=fragment.weak_virtual,
+                            representation_ao_indices=fragment.primary_ao_indices), common)
+                    preparation['pao_preparation'] = pao_preparations[key]
+                prepared_endpoints[index] = _prepare_weak_endpoint(
+                    mf, common, static, index, ao_moments=ao_moments, **preparation)
+                endpoints[index] = pad_endpoint(prepared_endpoints[index][0])
+            del ao_moments, fake_mol
+        pao_preparations.clear()
     weak = np.zeros((nfrag, nfrag))
     forced = np.eye(nfrag, dtype=bool)
     coordinates = np.asarray(mf.mol.atom_coords())

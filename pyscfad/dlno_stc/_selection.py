@@ -357,22 +357,11 @@ def _compute_completeness_numpy(candidate, overlap, ao_indices):
     return numpy.real(numpy.sum(recovered.conj() * values, axis=0))
 
 
-def _reference_pao_overlap_selection(
-    mol,
-    pao_coeff,
-    ao2pao_map,
-    overlap,
-    *,
-    parent_atoms,
-    support_atoms,
-    representation_atoms,
-    completeness_threshold,
-    overlap_threshold,
-    occupied_for_projection,
-    metric_threshold,
+def _reference_pao_preprojection(
+    mol, pao_coeff, ao2pao_map, overlap, *, parent_atoms, support_atoms,
+    representation_atoms, completeness_threshold, overlap_threshold,
 ):
-    """Reproduce a PAO build once and record every thresholded label."""
-
+    """Select and project the PAOs before removing any occupied target."""
     overlap = numpy.asarray(overlap)
     parent_columns = _pao_columns_on_atoms(
         mol, parent_atoms, ao2pao_map
@@ -418,9 +407,45 @@ def _reference_pao_overlap_selection(
     candidate = candidate[:, completeness_keep]
 
     if candidate.shape[1]:
-        s21 = overlap[representation_ao]
-        s22 = overlap[numpy.ix_(representation_ao, representation_ao)]
-        candidate_local = tools.project_mo(candidate, s21, s22)
+        candidate = tools.project_mo(
+            candidate, overlap[representation_ao],
+            overlap[numpy.ix_(representation_ao, representation_ao)],
+        )
+    else:
+        candidate = numpy.zeros((representation_ao.size, 0), dtype=pao_parent.dtype)
+    return (parent_columns, support_ao, representation_ao, canonical_keep,
+            overlap_keep, completeness_keep, candidate)
+
+
+def _reference_pao_overlap_selection(
+    mol, pao_coeff, ao2pao_map, overlap, *, parent_atoms, support_atoms,
+    representation_atoms, completeness_threshold, overlap_threshold,
+    occupied_for_projection, metric_threshold, preprojection_cache=None,
+):
+    """Record fixed PAO labels, optionally sharing one reference's preprojection.
+
+    The cache belongs to one selection invocation with fixed molecule, PAOs,
+    overlap and AO map. Never carry it across references or geometry changes.
+    Occupied projection and its metric rank are always evaluated per target.
+    """
+    key = (tuple(int(i) for i in parent_atoms),
+           tuple(int(i) for i in support_atoms),
+           tuple(int(i) for i in representation_atoms),
+           float(completeness_threshold), float(overlap_threshold))
+    prepared = None if preprojection_cache is None else preprojection_cache.get(key)
+    if prepared is None:
+        prepared = _reference_pao_preprojection(
+            mol, pao_coeff, ao2pao_map, overlap, parent_atoms=parent_atoms,
+            support_atoms=support_atoms, representation_atoms=representation_atoms,
+            completeness_threshold=completeness_threshold,
+            overlap_threshold=overlap_threshold,
+        )
+        if preprojection_cache is not None:
+            preprojection_cache[key] = prepared
+    (parent_columns, support_ao, representation_ao, canonical_keep,
+     overlap_keep, completeness_keep, candidate_local) = prepared
+    if candidate_local.shape[1]:
+        s22 = numpy.asarray(overlap)[numpy.ix_(representation_ao, representation_ao)]
         candidate_local = _orthogonalize(
             occupied_for_projection, candidate_local, s22
         )
@@ -429,10 +454,6 @@ def _reference_pao_overlap_selection(
         )
     else:
         metric_keep = numpy.zeros((0,), dtype=numpy.int32)
-        candidate_local = numpy.zeros(
-            (representation_ao.size, 0), dtype=pao_parent.dtype
-        )
-
     selection = FixedPAOSubspaceSelection(
         parent_columns=parent_columns,
         support_ao_indices=support_ao,
@@ -760,6 +781,7 @@ def build_domain_selections(
         primary_bp, primary = tuple(primary_bp), tuple(primary)
     empty = numpy.zeros(0, dtype=numpy.int32)
     fragments = []
+    pao_preprojections = {}
     for i, group in enumerate(groups):
         ao = tools.ao_index_by_atom(mol, primary[i]).astype(numpy.int32)
         s22 = overlap[numpy.ix_(ao, ao)]
@@ -775,11 +797,13 @@ def build_domain_selections(
                 mol, pao_coeff, ao2pao, overlap, parent_atoms=primary_bp[i], support_atoms=primary_bp[i],
                 representation_atoms=primary[i], completeness_threshold=thresholds.bp_pao,
                 overlap_threshold=thresholds.domain_pao, occupied_for_projection=occ_span, metric_threshold=thresholds.metric_rank,
+                preprojection_cache=pao_preprojections,
             )
             if not weak_coeff.shape[1]:
                 weak_virtual = None
         fragments.append(FragmentDomainSelection(i, group.copy(), None, empty, empty, empty, empty, empty,
                         None, primary[i], ao, primary_bp[i], norm_keep, span_keep, weak_virtual, -1))
+    del pao_preprojections
     common = DomainData(overlap, fock, occupied, virtual,
                         _host_array(mf.mo_energy)[active_occ], _host_array(mf.mo_energy)[active_vir], targets,
                         pao_coeff, tuple(TargetOccupiedData(targets[:, group]) for group in groups))
@@ -791,9 +815,24 @@ def build_domain_selections(
                               boys_grouping=boys_grouping,
                               physical_groups=tuple(tuple(int(i) for i in members)
                                                     for members in physical_groups))
-    pair, weak_pair, forced, strong = screen_pairs(mf, common, static, model=model, force_full_domains=force_full_domains)
+    response = getattr(mf, '_stc_selection_response', None)
+    # Explicit target frames need not be a stationary Boys solution. Keep their
+    # existing screening behavior, as well as callbacks changing the reference.
+    if response is not None and (target_coeff is not None or not response.matches_reference(mf)):
+        response = None
+    endpoints = None
+    screening_mf = mf
+    if response is not None:
+        common = response.prepare(static)
+        screening_mf = response.mf
+        endpoints = {}
+    pair, weak_pair, forced, strong = screen_pairs(
+        screening_mf, common, static, model=model, force_full_domains=force_full_domains,
+        **({'prepared_endpoints': endpoints} if response is not None else {}))
     if boys_grouping == "atom":
         strong = _expand_group_strong_mask(strong, physical_groups)
+    if response is not None:
+        response.complete_weak(static, strong, endpoints)
     fragments = list(static.fragments)
     strong_frames = {}
     for members in physical_groups:
@@ -841,4 +880,6 @@ def build_domain_selections(
                                        virtual_anchor_columns=anchors)
     static = replace(static, fragments=tuple(fragments), strong_mask=strong, pair_energy=pair,
                      weak_pair_energy=weak_pair, forced_strong_mask=forced)
+    if response is not None:
+        response.bind(static)
     return static

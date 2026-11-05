@@ -3,8 +3,10 @@
 Consumers reverse their MO coefficient transformations immediately, optionally
 using resident H tensors. Their integral adjoints are summed in bounded AO
 pair tiles before a single three-center and auxiliary-metric response.
-Only adjoints are spooled; integral inputs are generated directly and never
-written to disk. The metric and Cholesky factor/tapes are retained per scope.
+MO integral adjoints remain in RAM until the shared contraction completes.
+Symmetric LIS seeds are expanded once for coefficient and geometry response.
+Integral inputs are generated directly; no local DF inputs or adjoints use
+disk. The metric and Cholesky factor/tapes are retained per scope.
 
 This is an opt-in eager first-order orchestration facility. Its caller must
 add ``finish()``'s coordinate contribution exactly once. Ordinary standalone
@@ -12,11 +14,10 @@ VJPs are unchanged; scopes cannot be nested, reused, or left unfinished.
 """
 from contextlib import contextmanager
 from contextvars import ContextVar
-import tempfile
+from dataclasses import dataclass
 import time
 import warnings
 
-import h5py
 import jax
 import jax.scipy.linalg as jsp_linalg
 import numpy
@@ -27,6 +28,14 @@ from . import _df_symmetric
 
 
 _ACTIVE = ContextVar('pyscfad_local_df_integral_reverse', default=None)
+
+
+@dataclass(frozen=True)
+class _IntegralAdjoint:
+    z: numpy.ndarray
+    coeff: numpy.ndarray
+    slices: tuple
+    symmetric: bool
 
 
 def _same_domain(left, right):
@@ -52,13 +61,13 @@ class LocalDFReverse:
         self.metric_bar = None
         self.metric = self.low = None
         self._metric_pullback = self._factor_pullback = None
-        self._file = self._handle = None
         self.half = None
         self.finished = False
         self._minimum_row_warned = False
         self._packing_workspace = {}
-        self.receipt = dict(consumers=0, spooled_bytes=0, geometry_passes=0,
-                            symmetric_consumers=0, symmetric_saved_bytes=0,
+        self.receipt = dict(consumers=0, geometry_passes=0,
+                            adjoint_resident_bytes=0, adjoint_peak_bytes=0,
+                            symmetric_consumers=0, symmetric_expanded_bytes=0,
                             density_pack_seconds=0.,
                             metric_passes=0, max_density_rows=0,
                             metric_builds=0, cholesky_builds=0,
@@ -98,21 +107,13 @@ class LocalDFReverse:
             self.receipt['cholesky_builds'] += 1
         return self.low
 
-    def _open_file(self):
-        if self._file is None:
-            self._handle = tempfile.TemporaryFile(dir=pyscf_lib.param.TMPDIR)
-            self._file = h5py.File(self._handle, 'w', rdcc_nbytes=0)
-
     def _rows(self, pair_count, orbital_width=1):
         # Include the temporary density, symmetrization, accumulator, and
         # derivative buffers. One indivisible auxiliary shell may be larger;
         # the native driver already partitions reads within that shell.
-        from ._df_direct import _local_direct_int3c_block_mb
-        resident_mb = float(pyscf_lib.current_memory()[0])
-        remaining = self.max_memory_mb - resident_mb
-        block_mb = _local_direct_int3c_block_mb()
-        budget = min(self.workspace_mb, .5 * max(0., remaining),
-                     block_mb) * 1e6
+        from ._df_direct import _local_direct_workspace_mb
+        budget = _local_direct_workspace_mb(
+            self.max_memory_mb, self.workspace_mb) * 1e6
         row_bytes = 8 * (6*self.mol.nao**2 + pair_count
                          + self.mol.nao*orbital_width + 3*self.mol.nao)
         self._warn_minimum_row(row_bytes, budget)
@@ -123,7 +124,6 @@ class LocalDFReverse:
     def _warn_minimum_row(self, row_bytes, budget, *, operation='reverse'):
         """Warn once when an indivisible streamed row exceeds its target."""
         if budget < row_bytes and not self._minimum_row_warned:
-            from ._df_direct import _local_direct_int3c_block_mb
             self._minimum_row_warned = True
             warnings.warn(
                 f'Local DF {operation} minimum row exceeds the advisory workspace: '
@@ -131,12 +131,17 @@ class LocalDFReverse:
                 f'available target={budget / 1e6:.6g} MB, '
                 f'RSS={pyscf_lib.current_memory()[0]:.1f} MB, '
                 f'configured max_memory={self.max_memory_mb:.1f} MB, '
-                f'DF workspace={self.workspace_mb:.1f} MB, '
-                f'block target={_local_direct_int3c_block_mb():.1f} MB; '
+                f'DF workspace={self.workspace_mb:.1f} MB; '
                 'continuing with one auxiliary row',
                 RuntimeWarning, stacklevel=2)
 
     def add(self, coeff, z, low_bar, slices, *, symmetric_packed=False):
+        """Own a fresh MO seed in RAM and return its full orbital-pair view.
+
+        The caller must not mutate Z after handing it to this scope. ED seeds
+        reuse their existing storage; LIS seeds expand once after packed
+        whitening, sharing that expansion with the immediate coefficient VJP.
+        """
         if self.finished:
             raise RuntimeError('Cannot add to a finished local DF reverse')
         z = numpy.asarray(z)
@@ -150,30 +155,30 @@ class LocalDFReverse:
         stored_pairs = ((k1-k0)*(k1-k0+1)//2 if symmetric_packed else pair_count)
         if z.shape != (self.auxmol.nao, stored_pairs):
             raise ValueError('Shared local DF cotangent shape mismatch')
-        rows = self._rows(pair_count, min(k1-k0, l1-l0))
-        self._open_file()
-        dataset = self._file.create_dataset(str(len(self.terms)), shape=z.shape,
-                                            dtype='f8')
-        dataset.attrs['symmetric_packed'] = symmetric_packed
-        for p0 in range(0, z.shape[0], rows):
-            dataset[p0:p0+rows] = z[p0:p0+rows]
-        self.terms.append((dataset, numpy.array(coeff, copy=True), tuple(slices)))
-        self.receipt['spooled_bytes'] += z.nbytes
         if symmetric_packed:
             self.receipt['symmetric_consumers'] += 1
-            self.receipt['symmetric_saved_bytes'] += (
+            self.receipt['symmetric_expanded_bytes'] += (
                 self.auxmol.nao * pair_count * 8 - z.nbytes)
+            z = _df_symmetric.unpack_symmetric(z, k1-k0)
+        else:
+            z = z.reshape(self.auxmol.nao, k1-k0, l1-l0)
+        coeff = numpy.array(coeff, copy=True)
+        self.terms.append(_IntegralAdjoint(z, coeff, tuple(slices), symmetric_packed))
+        self.receipt['adjoint_resident_bytes'] += z.nbytes + coeff.nbytes
+        self.receipt['adjoint_peak_bytes'] = max(
+            self.receipt['adjoint_peak_bytes'], self.receipt['adjoint_resident_bytes'])
         if self.metric_bar is None:
             self.metric_bar = numpy.array(low_bar, copy=True)
         else:
             self.metric_bar += low_bar
         self.receipt['consumers'] += 1
+        return z
 
     def _density(self, p0, p1):
         density = None
-        for dataset, coeff, slices in self.terms:
-            k0, k1, l0, l1 = slices
-            z = self._read_term(dataset, slices, p0, p1)
+        for term in self.terms:
+            k0, k1, l0, l1 = term.slices
+            coeff, z = term.coeff, term.z[p0:p1]
             contribution = _cderi_vjp._int3c_mo_physical_density(
                 coeff[:, k0:k1], coeff[:, l0:l1], z)
             if density is None:
@@ -188,24 +193,16 @@ class LocalDFReverse:
     def _fill_packed_density(self, p0, p1, out):
         """Sum consumers directly in the integral driver's packed AO buffer."""
         started = time.perf_counter()
-        for i, (dataset, coeff, slices) in enumerate(self.terms):
-            k0, k1, l0, l1 = slices
-            z = self._read_term(dataset, slices, p0, p1)
+        for i, term in enumerate(self.terms):
+            k0, k1, l0, l1 = term.slices
+            coeff, z = term.coeff, term.z[p0:p1]
             _cderi_vjp._int3c_mo_packed_density(
                 coeff[:, k0:k1], coeff[:, l0:l1], z,
                 out=out, accumulate=i > 0, workspace=self._packing_workspace,
-                symmetric=bool(dataset.attrs['symmetric_packed']))
+                symmetric=term.symmetric)
         self.receipt['density_pack_seconds'] += time.perf_counter() - started
         self.receipt['max_density_rows'] = max(
             self.receipt['max_density_rows'], p1-p0)
-
-    @staticmethod
-    def _read_term(dataset, slices, p0, p1):
-        k0, k1, l0, l1 = slices
-        block = numpy.asarray(dataset[p0:p1])
-        if dataset.attrs['symmetric_packed']:
-            return _df_symmetric.unpack_symmetric(block, k1-k0)
-        return block.reshape(p1-p0, k1-k0, l1-l0)
 
     def finish(self):
         if self.finished:
@@ -216,9 +213,8 @@ class LocalDFReverse:
             return coords
         self.metric_factor()
         self.finished = True
-        # Readers expand symmetric pairs for one slab. Reserve its full size.
-        max_pairs = max((s[1]-s[0])*(s[3]-s[2]) for _, _, s in self.terms)
-        width = max(min(s[1]-s[0], s[3]-s[2]) for _, _, s in self.terms)
+        max_pairs = max(term.z.shape[1]*term.z.shape[2] for term in self.terms)
+        width = max(min(term.z.shape[1:]) for term in self.terms)
         rows = self._rows(max_pairs, width)
         self.receipt['tile_rows'] = rows
         # This reader returns the sum in the common domain AO frame. Integral
@@ -239,6 +235,7 @@ class LocalDFReverse:
                  + numpy.asarray(metric_bar.coords))
         numpy.add.at(coords, self.atoms, local)
         self.terms.clear()
+        self.receipt['adjoint_resident_bytes'] = 0
         self.metric_bar = None
         self.metric = self.low = None
         self._metric_pullback = self._factor_pullback = None
@@ -250,15 +247,10 @@ class LocalDFReverse:
             self.half.close()
             self.half = None
         self.terms.clear()
+        self.receipt['adjoint_resident_bytes'] = 0
         self.metric_bar = None
         self.metric = self.low = None
         self._metric_pullback = self._factor_pullback = None
-        if self._file is not None:
-            self._file.close()
-            self._file = None
-        if self._handle is not None:
-            self._handle.close()
-            self._handle = None
 
 
 @contextmanager
@@ -284,11 +276,11 @@ def matching_scope(mol, auxmol):
 
 
 def defer_geometry(mol, auxmol, coeff, z, low_bar, slices, *, symmetric_packed=False):
+    """Retain geometry response and return its resident full seed, or None."""
     scope = matching_scope(mol, auxmol)
     if scope is None:
-        return False
-    scope.add(coeff, z, low_bar, slices, symmetric_packed=symmetric_packed)
-    return True
+        return None
+    return scope.add(coeff, z, low_bar, slices, symmetric_packed=symmetric_packed)
 
 
 def release_consumed_inputs(*, forward_only=False):

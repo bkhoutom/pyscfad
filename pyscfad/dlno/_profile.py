@@ -2,7 +2,6 @@
 import os
 import h5py
 import numpy
-from pyscfad.lno._df_direct import _local_direct_int3c_block_mb
 from pyscfad.tools import resource_profile
 from .mp2_rdm import _H5_DENSITY_IO_PROFILE, _new_h5_io_profile
 
@@ -100,6 +99,5 @@ def density_call(function, arguments, *, fragment_index, coeff,
             hdf5_bytes_written=h5_io_profile["hdf5_bytes_written"],
             hdf5_read_seconds=h5_io_profile["hdf5_read_seconds"],
             hdf5_write_seconds=h5_io_profile["hdf5_write_seconds"],
-            local_direct_block_mb=_local_direct_int3c_block_mb(),
         )
     return density

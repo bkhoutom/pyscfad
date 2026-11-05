@@ -41,11 +41,9 @@ class HalfTransformedDFCache:
         return None
 
     def _rows(self, words, reserve_bytes=0):
-        from ._df_direct import _local_direct_int3c_block_mb
-        remaining = (self.scope.max_memory_mb - lib.current_memory()[0]) * 1e6
-        budget = min(self.scope.workspace_mb * 1e6,
-                     .5 * max(0., remaining - reserve_bytes),
-                     _local_direct_int3c_block_mb() * 1e6)
+        from ._df_direct import _local_direct_workspace_mb
+        budget = _local_direct_workspace_mb(
+            self.scope.max_memory_mb, self.scope.workspace_mb, reserve_bytes) * 1e6
         rows = int(budget // (8 * max(1, words)))
         if rows < 1:
             raise MemoryError('Insufficient user memory budget for one half-transformed DF tile')

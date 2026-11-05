@@ -477,11 +477,15 @@ only its s shells on hydrogen, and `def2-svp-jkfit` as the auxiliary basis.
 Both use DF-RHF thresholds `conv_tol=1e-9` and `conv_tol_grad=1e-6`, atomic Boys
 initialization with `conv_tol=1e-10`, and Boys derivative GMRES settings
 `restart=120`, `maxiter=100`. These are runner settings, not triples controls.
-Boys localization now checks the lowest orbital-Hessian curvature before its
-implicit response. A stationary saddle is restarted along a descending
-direction and reoptimized; failure after six restarts raises an error. This
-can change the localized orbitals and domains selected from a symmetric
-atomic guess. Rebuild selections that were saved at a saddle.
+Boys localization checks the lowest orbital-Hessian curvature before its
+implicit response and attempts up to three saddle escapes by default
+(`max_saddle_escapes=3`). If no minimum is found, it retains the best stationary
+solution with a warning; failure to find a stationary solution still raises.
+Saved STC branches replay with zero saddle escapes to preserve their orbital
+labels and domains. Negative response modes remain included. Every response
+checks the original equation's residual, with default relative and absolute
+tolerances of `1e-7`. Declared gauge null modes require a compatible right-hand
+side; incompatible components are rejected instead of silently discarded.
 
 STC Boys reference replay differentiates the occupied-frame polar alignment,
 including the current-geometry side of the cross-AO overlap. Its derivative

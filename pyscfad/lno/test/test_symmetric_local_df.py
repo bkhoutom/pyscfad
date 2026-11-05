@@ -1,4 +1,4 @@
-"""Packed LIS adjoints retain metric, both orbital legs, and domain response."""
+"""Packed whitening and resident LIS adjoints retain the complete response."""
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsl
@@ -75,15 +75,25 @@ def test_shared_packed_lis_matches_full_unsymmetrized_reverse(monkeypatch, resid
         old.setattr(sym, 'same_orbital_pair', lambda slices: False)
         value_ref, reference = jax.value_and_grad(objective, argnums=(0, 1))(mol, coeff)
     monkeypatch.setenv('PYSCFAD_DF_MO_DENSITY_BACKEND', backend)
+    expanded = []
+    unpack = sym.unpack_symmetric
+    def once(pairs, width):
+        expanded.append((pairs.shape[0], width))
+        return unpack(pairs, width)
+    monkeypatch.setattr(sym, 'unpack_symmetric', once)
     with _df_shared.reverse_scope(shared._mf(mol), shared.ATOMS) as scope:
         if resident:
             scope.half = HalfTransformedDFCache(scope)
         value, bars = jax.value_and_grad(objective, argnums=(0, 1))(mol, coeff)
-        packed = [d for d, _, _ in scope.terms if d.attrs['symmetric_packed']]
-        assert len(packed) == 1 and packed[0].shape == (scope.auxmol.nao, 6)
+        full = [term.z for term in scope.terms if term.symmetric]
+        assert len(full) == 1 and full[0].shape == (scope.auxmol.nao, 3, 3)
+        np.testing.assert_array_equal(full[0], full[0].swapaxes(1, 2))
         assert scope.receipt['symmetric_consumers'] == 1
-        assert scope.receipt['symmetric_saved_bytes'] == scope.auxmol.nao * 3 * 8
+        assert scope.receipt['symmetric_expanded_bytes'] == scope.auxmol.nao * 3 * 8
+        assert expanded == [(scope.auxmol.nao, 3)]
         geometry = scope.finish()
+        assert expanded == [(scope.auxmol.nao, 3)]
+        assert scope.receipt['adjoint_resident_bytes'] == 0
         assert scope.receipt['geometry_passes'] == scope.receipt['metric_passes'] == 1
     np.testing.assert_allclose(value, value_ref, atol=1e-12)
     np.testing.assert_allclose(bars[0].coords+geometry, reference[0].coords,

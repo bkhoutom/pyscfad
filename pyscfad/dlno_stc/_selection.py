@@ -594,7 +594,8 @@ def _resolve_boys_options(lo_kwargs):
         return {}
     if not isinstance(lo_kwargs, Mapping):
         raise TypeError("lo_kwargs must be a mapping or None")
-    allowed = {"init_guess", "conv_tol", "conv_tol_grad", "max_cycle", "symmetry", "gmres_options"}
+    allowed = {"init_guess", "conv_tol", "conv_tol_grad", "max_cycle", "symmetry", "gmres_options",
+               "max_saddle_escapes"}
     unknown = set(lo_kwargs) - allowed
     if unknown:
         raise ValueError(f"unsupported boys localization options: {sorted(unknown)}")

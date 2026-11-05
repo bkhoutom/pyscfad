@@ -285,6 +285,11 @@ def _rebuild_boys_targets(mf, occupied, static):
     # A stopped Q leaves an occupied-occupied cotangent that the SCF response
     # can amplify by inverse near-degenerate orbital-energy gaps.
     options["init_guess"] = numpy.eye(occupied.shape[1])
+    # Selection already spent its saddle-escape budget. Replay must refine
+    # that stationary branch, not start another search for a lower minimum
+    # and invalidate the saved orbital labels/domains. The implicit Boys
+    # response, stationarity test and orbital-match guard remain active.
+    options["max_saddle_escapes"] = 0
     parent = ('stc.system.input_pullback' if isinstance(static, SystemBoysReference)
               else 'stc.domain.common_pullback')
     localized = response(parent + '.boys_response_total',

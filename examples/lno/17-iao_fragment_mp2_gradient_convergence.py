@@ -640,9 +640,6 @@ def main(argv=None):
             "veclib_maximum_threads": os.environ.get(
                 "VECLIB_MAXIMUM_THREADS"
             ),
-            "direct_int3c_block_mb": os.environ.get(
-                "PYSCFAD_LNO_LOCAL_DIRECT_INT3C_BLOCK_MB"
-            ),
             "cderi_bar_aux_block_mb": os.environ.get(
                 "PYSCFAD_DF_CDERI_BAR_AUX_BLOCK_MB"
             ),

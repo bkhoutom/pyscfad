@@ -135,7 +135,7 @@ def check_domain_memory(mf, static, fragment_index, *, with_grad,
     peak. The shared SCF/localization tape remains resident across domains.
     """
     from pyscfad.lno import df as lno_df
-    from pyscfad.lno._df_direct import _local_direct_int3c_block_mb
+    from pyscfad.lno._df_direct import _local_direct_workspace_mb
 
     fragment = static.fragments[fragment_index]
     nocc = len(fragment.strong_occ_metric_keep)
@@ -154,7 +154,10 @@ def check_domain_memory(mf, static, fragment_index, *, with_grad,
     elements += (8 if with_grad else 4) * (nocc * nocc + nvir * nvir)
     block = min(nvir, int(virtual_block_size))
     elements += 8 * block * block + 6 * naux * block
-    estimate_mb = elements * 8 / 1e6 + _local_direct_int3c_block_mb()
+    estimate_mb = elements * 8 / 1e6
+    estimate_mb += _local_direct_workspace_mb(
+        mf.mol.max_memory, getattr(mf.with_df, 'max_memory', mf.mol.max_memory),
+        reserve_bytes=elements * 8)
     estimate_mb += _native_workspace_mb(naux, nocc, nvir,
                                         with_grad=with_grad, system=False,
                                         mode=mode, target_batch_size=target_batch_size,
@@ -177,7 +180,7 @@ def check_system_memory(mf, nocc, nvir, *, with_grad, virtual_block_size=16,
     Worker replicas use less memory because they have no SCF preparation.
     This is an estimate of known arrays, not a measured peak guarantee.
     """
-    from pyscfad.lno._df_direct import _local_direct_int3c_block_mb
+    from pyscfad.lno._df_direct import _local_direct_workspace_mb
 
     if nocc == 0 or nvir == 0:
         return 0.0
@@ -212,7 +215,9 @@ def check_system_memory(mf, nocc, nvir, *, with_grad, virtual_block_size=16,
             resident_bytes += math.prod(value.shape) * numpy.dtype(value.dtype).itemsize
     elements += (12 if with_grad else 4) * nao * nao
     estimate_mb = (8 * elements + (3 if with_grad else 1) * resident_bytes) / 1e6
-    estimate_mb += _local_direct_int3c_block_mb() + scatter_mb
+    estimate_mb += _local_direct_workspace_mb(
+        mf.mol.max_memory, getattr(with_df, 'max_memory', mf.mol.max_memory),
+        reserve_bytes=estimate_mb * 1e6 - resident_bytes) + scatter_mb
     estimate_mb += _native_workspace_mb(naux, nocc, nvir,
                                         with_grad=with_grad, system=True,
                                         mode=mode, target_batch_size=target_batch_size,

@@ -85,14 +85,15 @@ cache's allocation and first fill. To opt in, set both
 `PYSCFAD_SCF_OCCUPIED_CACHE=1` and `PYSCFAD_SCF_RESPONSE_FACTOR_CACHE_MB=2048`
 (the latter is a MiB cap). The cache is released after each implicit root solve.
 
-Local DF integral blocks use a 512 MB target by default, including in the local
-monitor (`PYSCFAD_LNO_LOCAL_DIRECT_INT3C_BLOCK_MB` overrides it). The shared reverse
-now forms packed AO-pair bars directly. A representative water16 domain benchmark
+Local DF integral blocks use the smaller of the configured DF workspace and
+half the available process-memory headroom, after output reservations. There
+is no separate fixed stripe cap. The shared reverse forms packed AO-pair bars
+directly. A representative water16 domain benchmark
 with synthetic bars took 17.12 seconds with dense bars and the former 128 MB target,
 versus 9.78 seconds with packed bars and the 512 MB target; coordinate derivatives
 agreed within `9e-16` for each matched tile size. This is a component benchmark,
-not a new full calculation. The tile target remains bounded by the configured DF
-workspace and available PySCF memory estimate.
+not a new full calculation; the quoted 128/512 MB targets describe that historical
+comparison rather than the current automatic workspace policy.
 
 The STC extension is required in the selected environment; ordinary PySCFAD
 imports alone do not establish that it is installed. Build it for this branch

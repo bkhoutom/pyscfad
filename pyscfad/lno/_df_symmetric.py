@@ -1,8 +1,9 @@
 """Exact symmetric-pair adjoints for same-frame local DF factors.
 
 Stored pairs are matrix entries, not doubled off-diagonal coordinates.
-Pair multiplicities enter only the metric contraction. Consumers expand
-bounded auxiliary slabs, never a full auxiliary-by-orbital-square adjoint.
+Pair multiplicities enter only the metric contraction. Shared local reverse
+scopes expand the solved seed once for resident coefficient/geometry reuse;
+standalone reverses can expand bounded auxiliary slabs instead.
 """
 import time
 import ctypes

@@ -47,10 +47,12 @@ retain the original singleton topology. `scope="system"` retains the complete
 active-space energy and system sampling policy. Its independent controls and
 canonical specialization remain available through the low-level full solver.
 
-The integral-direct local-DF buffer target defaults to `512`. Set
-`PYSCFAD_LNO_LOCAL_DIRECT_INT3C_BLOCK_MB` to override it. The forward allowance
-uses decimal MB, while backward block targets use MiB; this is a workspace
-target rather than a process-memory limit.
+Local-DF stripes use the smaller of `mf.with_df.max_memory` and half the
+remaining process allowance under `mf.mol.max_memory`, after reserving outputs
+that are about to be allocated. There is no separate fixed stripe cap. These
+are workspace estimates; indivisible auxiliary shells and runtime allocations
+mean they are not a hard process RSS limit. Retained H tensors have their own
+admission check and remain in RAM.
 
 SCF disk storage contains fitted `j3c` factors only. Raw `(P|mu nu)` inputs
 are generated locally in bounded shell tiles and are never cached on disk.
@@ -91,13 +93,29 @@ tile target. Insufficient allowance for even one processing tile still raises
 lower resident input memory. These
 allocation budgets do not impose a hard RSS cap on the entire CC solver.
 
-Only deferred MO integral **adjoints** are spooled to disk; neither raw AO
-inputs nor H tensors are spilled. Both modes retain the packed-density
-optimization below. Receipts report `cache_mode`, `raw_integral_builds`,
+Deferred ED/LIS MO integral adjoints always remain in RAM until the domain's
+combined derivative contraction finishes; there is no local adjoint disk
+fallback. ED occupied-virtual seeds retain their original storage. LIS seeds
+use packed symmetry for whitening and metric products, then expand once to
+full symmetric orbital pairs shared by the coefficient and geometry pullbacks.
+Their storage is `8*naux*nocc_ED*nvir_ED` and `8*naux*nmo_LIS**2` bytes,
+respectively, plus coefficient snapshots. All domain-group seeds are released
+after its derivative contraction or on failure. Resident adjoints add to the
+memory occupied by H and other solver data; contraction scratch remains tiled.
+Neither raw AO inputs nor H tensors are spilled. Both modes retain the
+packed-density optimization below. Receipts report `adjoint_resident_bytes`,
+`adjoint_peak_bytes` (including coefficient snapshots), `symmetric_expanded_bytes`,
+`cache_mode`, `raw_integral_builds`,
 `raw_source_passes`, `half_builds`, `half_rotations`, `half_cache_hits`,
 `half_pullbacks`, `half_releases`, `half_resident_bytes` and `half_peak_bytes`.
 The raw-storage helpers/switches, projected cache, and option 3's `A_ED` cache
 and combined ED-pair adjoint have been removed.
+
+Production domain setup builds one live AO Fock matrix in `common.fock`.
+ED and LIS Fock blocks are orbital projections of this resident matrix;
+fragments do not load an AO Fock matrix from disk or rebuild AO J/K for each
+projection. The initial shared Fock build may read fitted SCF DF factors.
+Fragment Fock cotangents accumulate before the common AO-Fock pullback.
 
 Serial and root-owned MPI `value_and_grad` calls also combine the global
 AO-Fock and implicit SCF DF geometry responses when the out-of-core DF source

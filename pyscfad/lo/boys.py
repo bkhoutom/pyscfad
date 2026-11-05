@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import warnings
 from contextlib import contextmanager
 from functools import partial
 import numpy
@@ -25,7 +26,7 @@ from pyscfad.soscf.ciah import (
     extract_rotation,
     pack_uniq_var,
 )
-from pyscfad.tools.linear_solver import gen_gmres, precond_by_hdiag
+from pyscfad.tools.linear_solver import gen_gmres, precond_by_hdiag, eager_gmres
 from pyscfad.scipy.linalg import logm
 
 # modified from pyscf v2.6
@@ -299,42 +300,90 @@ def _extract_x0(loc, u):
     return x
 
 
-def _lowest_curvature(loc, u):
-    """Lowest eigenpair of the orbital Hessian, without a pair-pair matrix."""
-    from scipy.sparse.linalg import LinearOperator, eigsh
+class BoysCurvatureError(RuntimeError):
+    """A stationary frame may survive an inconclusive curvature check."""
 
-    gradient, action, _ = loc.gen_g_hop(u)
+
+def _lowest_curvature(loc, u):
+    """Lowest Hessian eigenpair, normally using only Hessian actions."""
+    from scipy.linalg import eigh
+    from scipy.sparse.linalg import LinearOperator, eigsh, ArpackNoConvergence
+
+    gradient, action, diagonal = loc.gen_g_hop(u)
     size = gradient.size
+
+    def dense_minimum():
+        matrix = numpy.empty((size, size))
+        unit = numpy.zeros(size)
+        for column in range(size):
+            unit[column] = 1.
+            matrix[:, column] = action(unit)
+            unit[column] = 0.
+        return eigh(.5 * (matrix + matrix.T), subset_by_index=(0, 0))
+
     if size <= 2:
-        matrix = numpy.column_stack([action(v) for v in numpy.eye(size)])
-        values, vectors = numpy.linalg.eigh(.5 * (matrix + matrix.T))
+        values, vectors = dense_minimum()
         return float(values[0]), vectors[:, 0]
-    operator = LinearOperator((size, size), matvec=action, dtype=float)
+    # ARPACK's default 20-vector subspace stalls on the tightly clustered
+    # negative modes of long chains. A larger subspace resolves that cluster.
+    # A uniform shift also makes its relative convergence test meaningful for
+    # near-zero modes. This changes neither eigenvectors nor their ordering;
+    # the returned Rayleigh quotient and residual use the original Hessian.
+    shift = 2 * max(1., float(numpy.max(numpy.abs(diagonal))))
+    operator = LinearOperator((size, size),
+                              matvec=lambda x: action(x) - shift * x, dtype=float)
     # A nonsymmetric starting vector can see symmetry-breaking directions.
     # A local RNG keeps the check repeatable without affecting user sampling.
     initial = numpy.random.default_rng(7301).normal(size=size)
-    values, vectors = eigsh(operator, k=1, which='SA', tol=1e-8,
-                            v0=initial, maxiter=max(200, 10 * size))
-    return float(values[0]), vectors[:, 0]
+    try:
+        _, vectors = eigsh(operator, k=1, which='SA', tol=1e-8 / shift,
+                           ncv=min(size, 64), v0=initial, maxiter=max(200, 10 * size))
+    except ArpackNoConvergence:
+        # Bound dense fallback storage (one 4096-square array is 128 MiB).
+        # Never accept a missing or unconverged Ritz pair as a stable minimum.
+        if size > 4096:
+            raise
+        _, vectors = dense_minimum()
+    direction = vectors[:, 0]
+    applied = action(direction)
+    value = float(direction @ applied)
+    residual = numpy.linalg.norm(applied - value * direction)
+    if not numpy.isfinite(value) or not numpy.isfinite(residual) or residual > 1e-7:
+        raise BoysCurvatureError(f'Boys lowest-curvature eigenpair residual is {residual:g}')
+    return value, direction
 
 
-def _stabilize_boys(loc, u, sorted_idx):
-    """Escape stationary saddles before defining an implicit response.
-
-    A zero gradient and even a positive Hessian diagonal do not establish a
-    local minimum. Symmetric atomic guesses can otherwise stay at a saddle
-    with a singular response (notably the separated sigma/pi benzene frame).
-    """
+def _stabilize_boys(loc, u, sorted_idx, *, max_saddle_escapes=3):
+    """Try bounded saddle escapes, retaining the best stationary candidate."""
     from scipy.linalg import expm
+    from scipy.sparse.linalg import ArpackError
 
-    for attempt in range(7):
-        curvature, direction = _lowest_curvature(loc, u)
-        if curvature >= -1e-6:
-            return u, sorted_idx
-        if attempt == 6:
-            raise RuntimeError('Boys localization remains at a saddle after six restarts; '
-                               'cannot differentiate this localization branch')
+    tolerance = loc.conv_tol_grad
+    if tolerance is None:
+        tolerance = numpy.sqrt(loc.conv_tol * .1)
+    best = None
+    reason = ('saddle escapes disabled for branch replay' if max_saddle_escapes == 0
+              else 'three saddle escapes exhausted' if max_saddle_escapes == 3
+              else f'{max_saddle_escapes} saddle escapes exhausted')
+    for attempt in range(max_saddle_escapes + 1):
         value = loc.cost_function(u)
+        gradient = numpy.linalg.norm(loc.get_grad(u))
+        if not numpy.isfinite(value) or not numpy.isfinite(gradient):
+            raise RuntimeError('Boys localization has nonfinite objective or gradient')
+        if gradient <= tolerance and (best is None or value < best[0]):
+            best = (value, u.copy(), numpy.array(sorted_idx, copy=True), gradient)
+        try:
+            curvature, direction = _lowest_curvature(loc, u)
+        except (ArpackError, BoysCurvatureError) as error:
+            reason = f'curvature check unavailable ({error})'
+            break
+        if curvature >= -1e-6:
+            if gradient <= tolerance:
+                return u, sorted_idx
+            reason = 'optimizer stopped before satisfying the stationarity tolerance'
+            break
+        if attempt == max_saddle_escapes:
+            break
         for step in (.15, .075, .0375, .01875):
             trials = [u @ expm(loc.unpack_uniq_var(sign * step * direction))
                       for sign in (1., -1.)]
@@ -342,16 +391,28 @@ def _stabilize_boys(loc, u, sorted_idx):
             if loc.cost_function(trial) < value - 1e-12:
                 break
         else:
-            raise RuntimeError('Boys negative-curvature step failed to lower the objective')
+            reason = 'negative-curvature trial steps did not lower the objective'
+            break
         logger.info(loc, 'Restarting Boys localization along negative curvature %.6g', curvature)
         loc.init_guess = trial
         u, sorted_idx = kernel(loc, return_u=True)
-    raise AssertionError('unreachable')
+    if best is None:
+        raise RuntimeError(f'No sufficiently stationary Boys solution: {reason}; '
+                           f'last gradient {gradient:.6g}, tolerance {tolerance:.6g}')
+    warnings.warn(f'Boys localization: {reason}; retaining the best stationary solution '
+                  f'(gradient {best[3]:.6g}, tolerance {tolerance:.6g}). '
+                  'Negative curvature is allowed; the original response equation will be checked.',
+                  RuntimeWarning, stacklevel=2)
+    return best[1], best[2]
 
 
 def _boys(x, mol, mo_coeff, *,
           init_guess=None,
-          conv_tol=None, conv_tol_grad=None, max_cycle=None):
+          conv_tol=None, conv_tol_grad=None, max_cycle=None,
+          max_saddle_escapes=3):
+    if (not isinstance(max_saddle_escapes, (int, numpy.integer))
+            or max_saddle_escapes < 0):
+        raise ValueError('max_saddle_escapes must be a nonnegative integer')
     mo_coeff = numpy.array(mo_coeff, dtype=mo_coeff.dtype, order='C')
     loc = Boys(mol, mo_coeff=mo_coeff)
     if init_guess is not None:
@@ -368,36 +429,47 @@ def _boys(x, mol, mo_coeff, *,
     # cutoffs, or near-converged replay can discard every remaining step.
     grad_tol = (loc.conv_tol_grad if loc.conv_tol_grad is not None
                 else numpy.sqrt(loc.conv_tol * .1))
-    inner_tol = .01 * grad_tol ** 2
-    loc.ah_conv_tol = min(loc.ah_conv_tol, inner_tol)
-    loc.ah_lindep = min(loc.ah_lindep, inner_tol)
-
     # Include the final Hessian-diagonal check in the same cache lifetime.
     with loc._cache_dipoles():
+        # CIAH's discarded trial-vector norm is a rotation norm, not a
+        # gradient norm. Long molecules can have Hessian entries near 1e4,
+        # requiring correspondingly smaller rotations to finish convergence.
+        hessian_scale = max(1., float(numpy.max(numpy.abs(loc.gen_g_hop()[2]))))
+        inner_tol = .01 * (grad_tol / hessian_scale) ** 2
+        loc.ah_conv_tol = min(loc.ah_conv_tol, inner_tol)
+        loc.ah_lindep = min(loc.ah_lindep, inner_tol)
         u, sorted_idx = kernel(loc,
             mo_coeff=mo_coeff if init_guess is None else None, return_u=True)
-        u, sorted_idx = _stabilize_boys(loc, u, sorted_idx)
+        u, sorted_idx = _stabilize_boys(loc, u, sorted_idx,
+                                      max_saddle_escapes=max_saddle_escapes)
         x = _extract_x0(loc, u)
     return x, sorted_idx
 
 def boys(mol, mo_coeff, *,
          init_guess=None,
          conv_tol=None, conv_tol_grad=None, max_cycle=None,
-         symmetry=False, gmres_options=None):
+         symmetry=False, gmres_options=None, max_saddle_escapes=3):
     '''
     Boys localization. See also `pyscf.lo.boys.Boys`.
 
     Arguments:
+        max_saddle_escapes : int
+            Maximum negative-curvature restarts after the initial solve.
+            Default is three. Use zero when replaying a previously selected
+            stationary branch: additional escapes could invalidate its saved
+            orbital labels. Stationarity and response checks still apply.
         symmetry : bool
             For certain symmetric molecules, orbital localizations
             may have degenerate solutions. The orbital hessians are
             singular in such cases. Setting `symmetry=True` will
-            solve the linear equations in the range space when computing
-            the derivatives. Default valule is `False`.
+            declare these as gauge null modes and solve in the Hessian range.
+            The original response equation must remain compatible; a right-
+            hand side with a null component is rejected, never projected away
+            silently. Default value is `False`.
         gmres_options : dict
             Options of the GMRES solver for computing the derivatives.
-            The default projected, preconditioned response uses ``tol=1e-10``;
-            explicit caller options take precedence. See
+            Defaults are ``tol=1e-7`` and ``atol=1e-7`` for the original
+            response residual; explicit caller options take precedence. See
             `pyscfad.tools.linear_solver.gen_gmres` for other options.
 
     Notes:
@@ -406,22 +478,31 @@ def boys(mol, mo_coeff, *,
         molecule and input orbitals; only small orbital-space rotations are
         performed during optimization.
 
-        Before differentiating, the lowest orbital-Hessian curvature is
-        checked. A stationary saddle is restarted along a descending direction;
-        failure to reach a minimum raises instead of returning its response.
+        By default at most three saddle escapes are attempted. If a minimum
+        cannot be reached, the best sufficiently stationary candidate is
+        retained with a warning. Negative curvature is allowed in the response.
+        Failure to find any stationary candidate still raises.
+
+        Every response checks the original unpreconditioned residual. Small
+        concrete systems report a spectral condition number; large or traced
+        systems report response amplification and a condition estimate or
+        lower bound, which cannot certify the absence of other ill-conditioned
+        modes.
 
         The response uses occupied-space dipoles and a compiled rotation
-        gradient. A diagonal preconditioner is applied to compatible host
-        solvers; traced and JAX solves retain the exact projected response
-        without a host preconditioner.
+        gradient. The default explicitly selects the host GMRES adapter and
+        its diagonal preconditioner, independently of the integral backend.
+        Traced solves fall back to JAX without a host preconditioner.
 
-        Set ``BOYS_RESPONSE_VARIANT=baseline`` to recover the original response
-        and solver defaults, or ``projected`` for the unpreconditioned projected
-        response. The default is ``projected_precond``.
+        Set ``BOYS_RESPONSE_VARIANT=baseline`` to recover the original
+        optimality condition, or ``projected`` for the unpreconditioned
+        projected response. The default is ``projected_precond``.
     '''
     if mo_coeff.shape[-1] == 1:
         return mo_coeff
     gmres_options = {} if gmres_options is None else dict(gmres_options)
+    gmres_options.setdefault('tol', 1e-7)
+    gmres_options.setdefault('atol', 1e-7)
 
     # Retain the original response as an explicit diagnostic fallback.
     variant = os.environ.get('BOYS_RESPONSE_VARIANT', 'projected_precond')
@@ -431,16 +512,31 @@ def boys(mol, mo_coeff, *,
     elif variant == 'projected':
         optimality_cond = _projected_opt_cond
     elif variant == 'projected_precond':
-        # The tighter default keeps adjoints insensitive to the different
-        # preconditioned stopping history. Never override caller tolerances.
-        gmres_options.setdefault('tol', 1e-10)
         optimality_cond = _projected_opt_cond_aux
         response_options = dict(optimality_fun_has_aux=True,
                                 gen_precond=_projected_preconditioner,
                                 gen_precond_host_only=True)
     else:
         raise ValueError(f'Unknown BOYS_RESPONSE_VARIANT: {variant!r}')
-    solver = gen_gmres(safe=symmetry, **gmres_options)
+    from pyscfad.lo._boys_response import checked_solver
+    # The Boys wrapper checks gauge compatibility; the legacy generic safe
+    # solver can silently discard incompatible right-hand-side components.
+    if variant == 'projected_precond':
+        # Boys uses compiled orbital-space actions, irrespective of whether
+        # AO integrals use the optimized backend. Without this override the
+        # usual STC driver selects unpreconditioned JAX GMRES; its success
+        # status does not certify the requested true-residual tolerance.
+        # The host adapter still falls back to JAX when its inputs are traced.
+        with eager_gmres():
+            solver = gen_gmres(safe=False, **gmres_options)
+    else:
+        solver = gen_gmres(safe=False, **gmres_options)
+    solver = checked_solver(solver, symmetry=symmetry,
+                            tol=gmres_options['tol'],
+                            atol=gmres_options['atol'] or 0.,
+                            maxiter=gmres_options.get('maxiter', 30) or 30,
+                            restart=gmres_options.get('restart', 20) or 20,
+                            log=logger.new_logger(mol))
     _boys_iter = make_implicit_diff(_boys,
                                     implicit_diff=True,
                                     fixed_point=False,
@@ -453,7 +549,8 @@ def boys(mol, mo_coeff, *,
                                init_guess=init_guess,
                                conv_tol=conv_tol,
                                conv_tol_grad=conv_tol_grad,
-                               max_cycle=max_cycle)
+                               max_cycle=max_cycle,
+                               max_saddle_escapes=max_saddle_escapes)
 
     u = extract_rotation(x)
     # pylint: disable=invalid-sequence-index

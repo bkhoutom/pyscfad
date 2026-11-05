@@ -5,10 +5,27 @@ import h5py
 import jax
 import numpy
 import pytest
+from types import SimpleNamespace
 
 from pyscfad.lno import _df_direct, _df_shared
 from pyscfad.lno._df_half import HalfTransformedDFCache
 from pyscfad.lno.test import test_shared_local_df_reverse as shared
+
+
+@pytest.mark.parametrize('workspace_mb,reserve_bytes,expected_rows', [
+    (4000., 0, 3000),      # Half the 6000 MB RSS headroom, above the old cap.
+    (1200., 0, 1200),      # The DF workspace is tighter than RSS headroom.
+    (4000., 2e9, 2000),    # Reserve the forthcoming output before sizing scratch.
+])
+def test_half_stripes_use_df_workspace_and_rss_headroom(
+        monkeypatch, workspace_mb, reserve_bytes, expected_rows):
+    monkeypatch.setattr(_df_direct.pyscf_lib, 'current_memory', lambda: (2000., 0.))
+    scope = SimpleNamespace(max_memory_mb=8000., workspace_mb=workspace_mb,
+                            auxmol=SimpleNamespace(nao=10000))
+    cache = HalfTransformedDFCache(scope)
+    rows, budget = cache._rows(125000, reserve_bytes)  # One MB per row.
+    assert rows == expected_rows
+    assert budget == expected_rows * 1e6
 
 
 @pytest.mark.parametrize('dense_threads', [2, 3])
@@ -115,7 +132,7 @@ def test_dependent_frames_use_one_pass_and_no_reverse_reads(monkeypatch, nmo):
         assert lis.h.shape == (scope.auxmol.nao, scope.mol.nao, 3)
         assert ed.fitted.shape == (scope.auxmol.nao, 2*(nmo-2))
         assert all(isinstance(entry.h, numpy.ndarray) for entry in entries)
-        assert scope._file is None  # Neither H nor fitted MO inputs use disk.
+        assert not scope.terms  # Forward inputs do not create adjoint storage.
         # Reusing a forward result does not rebuild either H or fitted B.
         assert cache.transform(ed.coeff, ed.slices, scope.low) is ed.fitted
         assert reads == [1]*passes
@@ -140,7 +157,7 @@ def test_dependent_frames_use_one_pass_and_no_reverse_reads(monkeypatch, nmo):
         numpy.testing.assert_allclose(bars[1], expected_bars[1], atol=2e-10, rtol=2e-9)
         assert scope.receipt['geometry_passes'] == scope.receipt['metric_passes'] == 1
     assert scope.half is None and cache.scope is None
-    assert scope._file is None and scope._handle is None
+    assert scope.terms == [] and scope.receipt['adjoint_resident_bytes'] == 0
 
 
 def test_completed_lis_released_while_ed_survives():
@@ -204,7 +221,7 @@ def test_half_headroom_warns_but_uses_available_tile_memory(monkeypatch):
                 with warning:
                     results.append(cache.transform(coeff, (0, 2, 2, 4), low))
             assert scope.receipt['raw_source_passes'] == 1
-            assert scope._file is None
+            assert not scope.terms
             scope.finish()
     numpy.testing.assert_allclose(results[1], results[0], atol=2e-12, rtol=2e-12)
 
@@ -260,7 +277,7 @@ def test_resident_inputs_can_exceed_workspace_with_correct_full_response(
             assert cache.limit_bytes == 0
         else:
             assert cache.limit_bytes > holder.with_df.max_memory * 1e6
-        assert scope._file is None  # Resident inputs do not spill to disk.
+        assert not scope.terms
         bars = pullback(numpy.asarray(1.))
         assert seen and all(count*8*words <= budget <= 4000 for count, words, budget in seen)
         assert scope.receipt['raw_source_passes'] == scope.receipt['half_builds'] == 1
@@ -296,6 +313,6 @@ def test_memory_or_source_failure_cleans_up_without_disk_fallback(monkeypatch, f
                                     lambda: (mol.max_memory+1., 0.))
             jax.vjp(shared._energy, mol, coeff)
     assert scope.half is None and cache.scope is None and cache.entries == []
-    assert scope._file is None and scope._handle is None
+    assert scope.terms == [] and scope.receipt['adjoint_resident_bytes'] == 0
     assert _df_shared._ACTIVE.get() is None
     assert calls == ([1] if failure == 'source' else [])

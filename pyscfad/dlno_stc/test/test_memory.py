@@ -166,7 +166,7 @@ def workflow_mf(monkeypatch):
     static = SimpleNamespace(fragments=(fragment,))
     monkeypatch.setattr(_workflow.pyscf_df.addons, 'make_auxmol', lambda *a: aux)
     monkeypatch.setattr(lno_df, 'make_local_mol', lambda *a: mol)
-    monkeypatch.setattr(_df_direct, '_local_direct_int3c_block_mb', lambda: 0.)
+    monkeypatch.setattr(_df_direct, '_local_direct_workspace_mb', lambda *a, **k: 0.)
     monkeypatch.setattr(_workflow, '_native_workspace_mb', lambda *a, **k: 2.)
     monkeypatch.setattr(_memory, 'observe_memory', lambda: observation())
     return mf, static

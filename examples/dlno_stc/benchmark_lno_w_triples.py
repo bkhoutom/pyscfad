@@ -146,6 +146,7 @@ def main():
             raise ValueError('triples integral transform differs; use a new output directory')
         requested = dict(cc_conv_tol=args.cc_conv_tol,
                          cc_conv_tol_normt=args.cc_conv_tol_normt,
+                         scf_jk_workspace_memory_mb=args.df_memory_mb,
                          lno_thresh_occ=args.lno_thresh_occ,
                          lno_thresh_vir=args.lno_thresh_vir,
                          triples_mode=args.triples_method,
@@ -223,6 +224,9 @@ def main():
 
     def build_mf(current):
         mf = scf.RHF(current).density_fit(auxbasis=auxbasis)
+        # This is scratch space, not a ceiling on the whole process RSS.
+        # Keep J/K panels useful when retained correlation state exceeds it.
+        mf.with_df.jk_workspace_memory = args.df_memory_mb
         if args.scf_df_precond:
             mf.with_df.precond_total_memory = args.max_memory_mb
             mf.with_df.precond_workspace_memory = args.df_memory_mb
@@ -337,6 +341,7 @@ def main():
                     mkl_dynamic=os.environ.get('MKL_DYNAMIC'),
                     shared_df_cache_mode=args.fragment_df_mode,
                     scf_response_solver="eager_gmres" if cderi_path is not None else "default",
+                    scf_jk_workspace_memory_mb=mf.with_df.jk_workspace_memory,
                     scf_df_precond=args.scf_df_precond,
                     scf_precond_total_memory_mb=args.max_memory_mb if args.scf_df_precond else None,
                     scf_precond_workspace_memory_mb=args.df_memory_mb if args.scf_df_precond else None,

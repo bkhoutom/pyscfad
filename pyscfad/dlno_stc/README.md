@@ -217,10 +217,38 @@ reverse work. Detached selection values never replace the live PAO response.
 This changes no BLAS/OpenMP defaults and does not distribute CCSD's weak work
 across MPI ranks.
 
+Endpoint PAO construction uses shared reference products `Y = S @ P`,
+`G = P.conj().T @ Y`, and `S @ occupied_targets`. Fresh gradient selection
+localizes the Boys orbitals once and attaches their checked implicit response
+in the reference-aligned rotation chart; it does not run another localization
+optimizer. The stationarity check uses the requested tolerance. An unsuitable
+frame falls back to ordinary refinement, preserving the existing saddle and
+response checks. The PAOs, their normalization products, and the screening
+products are built once in the live reference. Concrete selection reads
+detached views of those same values. A primary domain
+then selects blocks of these products for its metric eigensolves, normalization
+and projection; it no longer repeats full-AO products for each endpoint or
+preprojection group. Full ordered AO representations retain the direct PAO
+identity projection. Standalone fallback calls form products only for their
+requested parent columns. Forward-only serial screening and energy sums covering
+every endpoint use the same sharing without retaining pullbacks. Single-pair
+and partial-endpoint energy queries retain selected-parent preparation so a
+small query never triggers an all-system product cache.
+
+Live response accumulates all product cotangents before applying one shared
+product pullback. Cached products use the exact transpose of their linear
+differential, without recomputing the forward products. The overlap, PAO and independent occupied-target derivatives
+are preserved, including directions away from the physical reference. This
+removes repeated global arithmetic, not the global reference or its response:
+shared products and accumulated cotangents still occupy global-sized storage.
+Static products remain available through weak response for subsequent strong
+selection, and local pullbacks can temporarily produce global-sized bars.
+
 This reuse is transient: no response tape is serialized into static selections
 or checkpoints. Saved-static callers, explicitly supplied target frames, and
 callbacks replacing the selected reference retain the ordinary preparation
-path. `include_baseline=False` does not prepare weak response. Resumed calls
+path. Selection callbacks that change the reference also rebuild its S/F data.
+`include_baseline=False` does not prepare weak response. Resumed calls
 defer weak work until checkpoint progress is restored, so completed weak terms
 are not recomputed. Distributed MP2
 retains its existing distributed endpoint executor; CCSD MPI computes and

@@ -500,6 +500,22 @@ def boys(mol, mo_coeff, *,
     '''
     if mo_coeff.shape[-1] == 1:
         return mo_coeff
+    _boys_iter = _boys_implicit_solver(
+        mol, _boys, symmetry=symmetry, gmres_options=gmres_options)
+    x, sorted_idx = _boys_iter(None, mol, mo_coeff,
+                               init_guess=init_guess,
+                               conv_tol=conv_tol,
+                               conv_tol_grad=conv_tol_grad,
+                               max_cycle=max_cycle,
+                               max_saddle_escapes=max_saddle_escapes)
+
+    u = extract_rotation(x)
+    # pylint: disable=invalid-sequence-index
+    return np.dot(mo_coeff, u[:,sorted_idx])
+
+
+def _boys_implicit_solver(mol, numerical_solver, *, symmetry, gmres_options):
+    """Attach the same checked response to an optimized or supplied root."""
     gmres_options = {} if gmres_options is None else dict(gmres_options)
     gmres_options.setdefault('tol', 1e-7)
     gmres_options.setdefault('atol', 1e-7)
@@ -537,21 +553,56 @@ def boys(mol, mo_coeff, *,
                             maxiter=gmres_options.get('maxiter', 30) or 30,
                             restart=gmres_options.get('restart', 20) or 20,
                             log=logger.new_logger(mol))
-    _boys_iter = make_implicit_diff(_boys,
-                                    implicit_diff=True,
-                                    fixed_point=False,
-                                    optimality_cond=optimality_cond,
-                                    solver=solver,
-                                    has_aux=True,
-                                    **response_options)
+    return make_implicit_diff(numerical_solver,
+                              implicit_diff=True,
+                              fixed_point=False,
+                              optimality_cond=optimality_cond,
+                              solver=solver,
+                              has_aux=True,
+                              **response_options)
 
-    x, sorted_idx = _boys_iter(None, mol, mo_coeff,
-                               init_guess=init_guess,
-                               conv_tol=conv_tol,
-                               conv_tol_grad=conv_tol_grad,
-                               max_cycle=max_cycle,
-                               max_saddle_escapes=max_saddle_escapes)
 
-    u = extract_rotation(x)
-    # pylint: disable=invalid-sequence-index
-    return np.dot(mo_coeff, u[:,sorted_idx])
+class BoysStationarityError(RuntimeError):
+    """A supplied frame requires localization refinement before reuse."""
+
+
+def _stationary_boys_root(x, mol, mo_coeff, *, conv_tol=None, conv_tol_grad=None):
+    """Validate the zero-rotation root, without optimizing or changing labels."""
+    loc = Boys(mol, mo_coeff=numpy.asarray(mo_coeff))
+    if conv_tol is not None:
+        loc.conv_tol = conv_tol
+    if conv_tol_grad is not None:
+        loc.conv_tol_grad = conv_tol_grad
+    tolerance = loc.conv_tol_grad
+    if tolerance is None:
+        tolerance = numpy.sqrt(loc.conv_tol * .1)
+    # Only the projected dipoles enter stationarity. In particular, neither
+    # the r2 integral nor another curvature/saddle search is needed here.
+    dipoles = numpy.asarray(dipole_integral(mol, mo_coeff))
+    gradient = numpy.linalg.norm(loc.get_grad(dip=dipoles))
+    if not numpy.isfinite(gradient) or not gradient <= tolerance:
+        raise BoysStationarityError(
+            f'Boys frame is not sufficiently stationary: gradient {gradient:.6g}, '
+            f'tolerance {tolerance:.6g}')
+    size = mo_coeff.shape[1]
+    return np.zeros(size * (size - 1) // 2, dtype=mo_coeff.dtype), numpy.arange(size)
+
+
+def _boys_at_stationary_frame(mol, mo_coeff, *, conv_tol=None, conv_tol_grad=None,
+                              symmetry=False, gmres_options=None):
+    """Attach Boys response to an already converged, reference-aligned frame.
+
+    This private entry point performs no localization search. The caller must
+    provide the same converged reference in a live, near-identity rotation
+    chart, including any differentiated polar alignment. A failed stationarity
+    check raises ``BoysStationarityError`` so the caller can refine normally.
+    Stationary saddles and declared gauge modes retain the ordinary Boys
+    implicit equation and its checked response; they are never frozen away.
+    """
+    if mo_coeff.shape[-1] == 1:
+        return mo_coeff
+    attach = _boys_implicit_solver(
+        mol, _stationary_boys_root, symmetry=symmetry, gmres_options=gmres_options)
+    x, order = attach(None, mol, mo_coeff,
+                      conv_tol=conv_tol, conv_tol_grad=conv_tol_grad)
+    return np.dot(mo_coeff, extract_rotation(x)[:, order])

@@ -252,7 +252,7 @@ def _polar_rotation_jvp(primals, tangents):
 
 
 # Boys replay and metric operations originated in dlno/dlno_base.py.
-def _rebuild_boys_targets(mf, occupied, static):
+def _rebuild_boys_targets(mf, occupied, static, *, _stationary=False):
     """Replay a saved Boys branch with the existing implicit-response wrapper.
 
     Differentiate the reference alignment, including the moving AO overlap.
@@ -292,8 +292,20 @@ def _rebuild_boys_targets(mf, occupied, static):
     options["max_saddle_escapes"] = 0
     parent = ('stc.system.input_pullback' if isinstance(static, SystemBoysReference)
               else 'stc.domain.common_pullback')
-    localized = response(parent + '.boys_response_total',
-                         lambda mol, coeff: _build_boys_targets(mol, coeff, options),
+    def localize(mol, coeff):
+        if _stationary:
+            from pyscfad.lo.boys import _boys_at_stationary_frame, BoysStationarityError
+            try:
+                return _boys_at_stationary_frame(mol, coeff, **{
+                    key: options[key] for key in
+                    ('conv_tol', 'conv_tol_grad', 'symmetry', 'gmres_options') if key in options})
+            except BoysStationarityError:
+                # Only an uncertified root falls back to refinement. Keep
+                # response-solver and gauge failures visible to the caller.
+                pass
+        return _build_boys_targets(mol, coeff, options)
+
+    localized = response(parent + '.boys_response_total', localize,
                          mf.mol, occupied @ _polar_rotation(projection))
     current_localized = _host_array(jax.lax.stop_gradient(localized))
     overlaps = reference.T @ _host_array(jax.lax.stop_gradient(cross_overlap)).T @ current_localized
@@ -373,23 +385,39 @@ def _validate_boys_metric_rank(coeff, overlap, keep, threshold, label):
         raise RuntimeError(f"Boys {label} metric rank changed; rebuild domains")
 
 
-def _rebuild_selected_pao_preprojection(common, selection, representation_ao_indices):
-    """Replay the target-independent PAO span in the requested AO support."""
+def _pao_products(pao_coeff, overlap):
+    """Full-AO products shared by all fixed PAO selections in one invocation."""
+    overlap_pao = overlap @ pao_coeff
+    return pao_coeff.T.conj() @ overlap_pao, overlap_pao
+
+
+def _rebuild_selected_pao_preprojection(
+    common, pao_products=None, *, selection, representation_ao_indices,
+):
+    """Rebuild a selected PAO span using only local blocks of shared products."""
     s1e = common.s1e
-    pao_parent = common.pao_coeff[:, selection.parent_columns]
-    gram = pao_parent.T.conj() @ s1e @ pao_parent
+    columns = selection.parent_columns
+    if pao_products is None:
+        # A standalone endpoint has no other consumers: restrict its global
+        # products to the selected parents instead of all system PAOs.
+        gram, overlap_pao = _pao_products(common.pao_coeff[:, columns], s1e)
+        product_columns = numpy.arange(len(columns))
+    else:
+        parent_gram, overlap_pao = pao_products
+        gram = parent_gram[numpy.ix_(columns, columns)]
+        product_columns = columns
     gram = 0.5 * (gram + gram.T.conj())
     gram_e, gram_v = scipy.linalg.eigh(
         gram, deg_thresh=max(_PAO_ORTH_THRESHOLD, 1e-9)
     )
     canonical_keep = selection.canonical_keep
     del gram_e
-    pao_orth = _cholesky_metric_orthonormalize(
-        pao_parent @ gram_v[:, canonical_keep], s1e
-    )
+    # Normalize in parent coordinates. Materializing P_J A would create a
+    # full-AO orbital frame and repeat S times that frame for every group.
+    transform = _cholesky_metric_orthonormalize(gram_v[:, canonical_keep], gram)
 
     support_ao = selection.support_ao_indices
-    tmp = s1e[support_ao] @ pao_orth
+    tmp = overlap_pao[numpy.ix_(support_ao, product_columns)] @ transform
     support_metric = s1e[numpy.ix_(support_ao, support_ao)]
     projected_overlap = tmp.T.conj() @ np.linalg.solve(
         support_metric, tmp
@@ -400,13 +428,16 @@ def _rebuild_selected_pao_preprojection(common, selection, representation_ao_ind
     _, overlap_v = scipy.linalg.eigh(
         projected_overlap, deg_thresh=max(_PAO_ORTH_THRESHOLD, 1e-9)
     )
-    candidate = pao_orth @ overlap_v[:, selection.overlap_keep]
-    candidate = candidate[:, selection.completeness_keep]
+    rotation = overlap_v[:, selection.overlap_keep][:, selection.completeness_keep]
 
     representation_ao = numpy.asarray(
         representation_ao_indices, dtype=numpy.int32
     )
-    return _project_to_ao_support(candidate, s1e, representation_ao)
+    if _all_columns(representation_ao, s1e.shape[0]):
+        # The full-basis projection is identity, with no cancelling solve.
+        return common.pao_coeff[:, columns] @ (transform @ rotation)
+    rhs = (overlap_pao[numpy.ix_(representation_ao, product_columns)] @ transform) @ rotation
+    return np.linalg.solve(s1e[numpy.ix_(representation_ao, representation_ao)], rhs)
 
 
 def _rebuild_selected_pao_space(
@@ -425,7 +456,7 @@ def _rebuild_selected_pao_space(
     metric normalization depend on the individual target.
     """
     candidate = (_rebuild_selected_pao_preprojection(
-        common, selection, representation_ao_indices)
+        common, selection=selection, representation_ao_indices=representation_ao_indices)
         if preprojection is None else preprojection)
     representation_ao = numpy.asarray(representation_ao_indices, dtype=numpy.int32)
     s22 = common.s1e[numpy.ix_(representation_ao, representation_ao)]
@@ -475,6 +506,46 @@ def build_scf_data(mf):
                        lambda mol: mol.intor_symmetric("int1e_ovlp"), mf.mol)
     fock = response('stc.domain.common_pullback.ao_fock', lambda mf: mf.get_fock(), mf)
     return overlap, fock
+
+
+def _build_selection_reference(
+    mf, scf_data, *, active_occ, active_vir, projected_out, groups,
+    reference_coeff, reference_coords, lo_kwargs, pao_norm,
+):
+    """Build one live common frame and auxiliary products for initial selection.
+
+    Discrete parent labels come from detached norms. Only retained columns
+    enter square roots, so discarded zero PAOs cannot poison the response.
+    Auxiliary products need their separate ambient common-data pullback when
+    used by weak screening; they are not differentiated through ``has_aux``.
+    """
+    from ._pairs import _WeakScreenProducts
+    overlap, fock = scf_data
+    coeff, energy = np.asarray(mf.mo_coeff), np.asarray(mf.mo_energy)
+    occupied, virtual = coeff[:, active_occ], coeff[:, active_vir]
+    reference = SimpleNamespace(target_reference_coeff=reference_coeff,
+                                target_reference_coords=reference_coords, lo_kwargs=lo_kwargs)
+    targets = _rebuild_boys_targets(mf, occupied, reference, _stationary=True)
+    out = coeff[:, projected_out]
+    raw = np.eye(overlap.shape[0], dtype=coeff.dtype) - out @ (out.T.conj() @ overlap)
+    overlap_raw = overlap @ raw
+    norm2 = np.real(np.einsum('ui,ui->i', raw.conj(), overlap_raw))
+    host_norm2 = _host_array(jax.lax.stop_gradient(norm2))
+    if not numpy.isfinite(host_norm2).all():
+        raise ValueError('initial PAO norms must be finite')
+    parent_columns = numpy.flatnonzero(
+        numpy.sqrt(numpy.maximum(host_norm2, 0.)) > pao_norm).astype(numpy.int32)
+    norms = np.sqrt(norm2[parent_columns])
+    pao = raw[:, parent_columns] / norms[None, :]
+    overlap_pao = overlap_raw[:, parent_columns] / norms[None, :]
+    gram = pao.T.conj() @ overlap_pao
+    overlap_targets = overlap @ targets
+    common = DomainData(overlap, fock, occupied, virtual,
+                        energy[active_occ], energy[active_vir], targets, pao,
+                        tuple(TargetOccupiedData(targets[:, group]) for group in groups))
+    products = _WeakScreenProducts(
+        (gram, overlap_pao), tuple(overlap_targets[:, group] for group in groups))
+    return common, (parent_columns, products)
 
 
 def rebuild_domain_data(mf, static, *, scf_data=None):

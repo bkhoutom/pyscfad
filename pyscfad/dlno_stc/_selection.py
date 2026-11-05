@@ -357,70 +357,64 @@ def _compute_completeness_numpy(candidate, overlap, ao_indices):
     return numpy.real(numpy.sum(recovered.conj() * values, axis=0))
 
 
+def _reference_pao_products(pao_coeff, overlap):
+    """Form shared reference products once, before selecting local spaces."""
+    pao = numpy.asarray(pao_coeff)
+    overlap_pao = numpy.asarray(overlap) @ pao
+    return pao.T.conj() @ overlap_pao, overlap_pao
+
+
 def _reference_pao_preprojection(
     mol, pao_coeff, ao2pao_map, overlap, *, parent_atoms, support_atoms,
     representation_atoms, completeness_threshold, overlap_threshold,
+    pao_products=None,
 ):
-    """Select and project the PAOs before removing any occupied target."""
+    """Select the PAO span using local blocks of shared reference products."""
     overlap = numpy.asarray(overlap)
-    parent_columns = _pao_columns_on_atoms(
-        mol, parent_atoms, ao2pao_map
-    )
-    pao_parent = numpy.asarray(pao_coeff)[:, parent_columns]
-
-    gram = pao_parent.T.conj() @ overlap @ pao_parent
-    gram_e, gram_v, canonical_keep = _eigh_keep_numpy(
-        gram, _PAO_ORTH_THRESHOLD
-    )
-    if canonical_keep.size:
-        pao_orth = pao_parent @ (
-            gram_v[:, canonical_keep]
-            / numpy.sqrt(numpy.real(gram_e[canonical_keep]))[None, :]
-        )
-    else:
-        pao_orth = numpy.zeros((mol.nao, 0), dtype=pao_parent.dtype)
-
+    parent_columns = _pao_columns_on_atoms(mol, parent_atoms, ao2pao_map)
     support_ao = tools.ao_index_by_atom(
         mol, numpy.asarray(support_atoms, dtype=numpy.int32)
     ).astype(numpy.int32, copy=False)
-    if pao_orth.shape[1]:
-        tmp = overlap[support_ao] @ pao_orth
-        local_metric = overlap[numpy.ix_(support_ao, support_ao)]
-        projected_overlap = tmp.T.conj() @ numpy.linalg.solve(local_metric, tmp)
-        _, overlap_v, overlap_keep = _eigh_keep_numpy(
-            projected_overlap, overlap_threshold
-        )
-        candidate = pao_orth @ overlap_v[:, overlap_keep]
-    else:
-        overlap_keep = numpy.zeros((0,), dtype=numpy.int32)
-        candidate = numpy.zeros((mol.nao, 0), dtype=pao_parent.dtype)
-
     representation_ao = tools.ao_index_by_atom(
         mol, numpy.asarray(representation_atoms, dtype=numpy.int32)
     ).astype(numpy.int32, copy=False)
-    completeness = _compute_completeness_numpy(
-        candidate, overlap, representation_ao
-    )
-    completeness_keep = numpy.where(
-        completeness > completeness_threshold
-    )[0].astype(numpy.int32)
-    candidate = candidate[:, completeness_keep]
-
-    if candidate.shape[1]:
-        candidate = tools.project_mo(
-            candidate, overlap[representation_ao],
-            overlap[numpy.ix_(representation_ao, representation_ao)],
-        )
+    if pao_products is None:
+        gram_all, overlap_pao = _reference_pao_products(
+            numpy.asarray(pao_coeff)[:, parent_columns], overlap)
+        product_columns = numpy.arange(parent_columns.size)
     else:
-        candidate = numpy.zeros((representation_ao.size, 0), dtype=pao_parent.dtype)
+        gram_all, overlap_pao = pao_products
+        product_columns = parent_columns
+    gram = gram_all[numpy.ix_(product_columns, product_columns)]
+    gram_e, gram_v, canonical_keep = _eigh_keep_numpy(gram, _PAO_ORTH_THRESHOLD)
+    empty = numpy.zeros((0,), dtype=numpy.int32)
+    if not canonical_keep.size:
+        return (parent_columns, support_ao, representation_ao, canonical_keep,
+                empty, empty, numpy.zeros((representation_ao.size, 0), dtype=gram.dtype))
+    # The small transform replaces a full-AO orthonormal coefficient matrix.
+    transform = (gram_v[:, canonical_keep]
+                 / numpy.sqrt(numpy.real(gram_e[canonical_keep]))[None, :])
+    tmp = overlap_pao[numpy.ix_(support_ao, product_columns)] @ transform
+    support_metric = overlap[numpy.ix_(support_ao, support_ao)]
+    projected_overlap = tmp.T.conj() @ numpy.linalg.solve(support_metric, tmp)
+    _, overlap_v, overlap_keep = _eigh_keep_numpy(projected_overlap, overlap_threshold)
+    transform = transform @ overlap_v[:, overlap_keep]
+    if not overlap_keep.size:
+        return (parent_columns, support_ao, representation_ao, canonical_keep,
+                overlap_keep, empty, numpy.zeros((representation_ao.size, 0), dtype=gram.dtype))
+    rhs = overlap_pao[numpy.ix_(representation_ao, product_columns)] @ transform
+    local_metric = overlap[numpy.ix_(representation_ao, representation_ao)]
+    candidate = numpy.linalg.solve(local_metric, rhs)
+    completeness = numpy.real(numpy.sum(candidate.conj() * rhs, axis=0))
+    completeness_keep = numpy.where(completeness > completeness_threshold)[0].astype(numpy.int32)
     return (parent_columns, support_ao, representation_ao, canonical_keep,
-            overlap_keep, completeness_keep, candidate)
+            overlap_keep, completeness_keep, candidate[:, completeness_keep])
 
 
 def _reference_pao_overlap_selection(
     mol, pao_coeff, ao2pao_map, overlap, *, parent_atoms, support_atoms,
     representation_atoms, completeness_threshold, overlap_threshold,
-    occupied_for_projection, metric_threshold, preprojection_cache=None,
+    occupied_for_projection, metric_threshold, preprojection_cache=None, pao_products=None,
 ):
     """Record fixed PAO labels, optionally sharing one reference's preprojection.
 
@@ -438,7 +432,7 @@ def _reference_pao_overlap_selection(
             mol, pao_coeff, ao2pao_map, overlap, parent_atoms=parent_atoms,
             support_atoms=support_atoms, representation_atoms=representation_atoms,
             completeness_threshold=completeness_threshold,
-            overlap_threshold=overlap_threshold,
+            overlap_threshold=overlap_threshold, pao_products=pao_products,
         )
         if preprojection_cache is not None:
             preprojection_cache[key] = prepared
@@ -712,7 +706,7 @@ def build_domain_selections(
     and puts every active occupied target in one physical fragment.
     """
     from .domain import DomainData, TargetOccupiedData, build_scf_data
-    from ._pairs import screen_pairs
+    from ._pairs import screen_pairs, _WeakScreenProducts
 
     thresholds = BoysDomainThresholds() if thresholds is None else thresholds
     if not isinstance(thresholds, BoysDomainThresholds):
@@ -727,7 +721,18 @@ def build_domain_selections(
         raise ValueError(f"unknown pair_energy_model: {pair_energy_model}")
     configure_compilation_cache()
     mol = mf.mol
+    response = getattr(mf, '_stc_selection_response', None)
     scf_data = getattr(mf, '_stc_scf_data', None)
+    if response is not None:
+        response.reset()
+        # A callback may have changed its detached reference. Its inherited
+        # S/F values then also belong to another calculation.
+        if not response.matches_reference(mf):
+            response = None
+            scf_data = None
+        elif target_coeff is not None:
+            # Supplied frames need not be a stationary Boys solution.
+            response = None
     overlap, fock = map(_host_array, build_scf_data(mf) if scf_data is None else scf_data)
     if numpy.iscomplexobj(overlap) or numpy.iscomplexobj(fock):
         raise NotImplementedError("Boys STC requires real overlap and Fock matrices")
@@ -749,17 +754,34 @@ def build_domain_selections(
             or numpy.max(abs(residual)) > 1e-8):
         raise ValueError("Boys targets must span the active occupied space")
     groups = _validate_boys_target_groups(frag_lolist, active_occ.size)
+    common = products = None
+    if response is not None:
+        common, pao_parent, products = response.prepare_reference(
+            active_occ=active_occ, active_vir=active_vir, projected_out=projected_out,
+            groups=groups, reference_coeff=targets.copy(),
+            reference_coords=_host_array(mol.atom_coords()).copy(),
+            lo_kwargs=options, pao_norm=thresholds.pao_norm)
+        targets, pao_coeff = map(_host_array, (common.iao_coeff, common.pao_coeff))
+        products = jax.tree_util.tree_map(_host_array, products)
+        pao_products = products.pao
+        overlap_targets = numpy.empty_like(targets)
+        for group, product in zip(groups, products.occupied):
+            overlap_targets[:, group] = product
+    else:
+        out = _host_array(mf.mo_coeff)[:, projected_out]
+        raw_pao = numpy.eye(mol.nao) - out @ (out.T @ overlap)
+        norms = numpy.sqrt(numpy.einsum("ui,uv,vi->i", raw_pao, overlap, raw_pao))
+        pao_parent = numpy.where(norms > thresholds.pao_norm)[0].astype(numpy.int32)
+        pao_coeff = raw_pao[:, pao_parent] / norms[pao_parent]
+        pao_products = _reference_pao_products(pao_coeff, overlap)
+        overlap_targets = overlap @ targets
+        products = _WeakScreenProducts(pao_products, tuple(overlap_targets[:, group] for group in groups))
     if boys_grouping == "molecule":
         physical_groups = (numpy.arange(len(groups), dtype=numpy.int32),)
     elif boys_grouping == "atom":
         physical_groups = _boys_atom_groups(mol, targets, groups)
     else:
         physical_groups = tuple(numpy.array([i], dtype=numpy.int32) for i in range(len(groups)))
-    out = _host_array(mf.mo_coeff)[:, projected_out]
-    raw_pao = numpy.eye(mol.nao) - out @ (out.T @ overlap)
-    norms = numpy.sqrt(numpy.einsum("ui,uv,vi->i", raw_pao, overlap, raw_pao))
-    pao_parent = numpy.where(norms > thresholds.pao_norm)[0].astype(numpy.int32)
-    pao_coeff = raw_pao[:, pao_parent] / norms[pao_parent]
     ao2pao = numpy.full(mol.nao, -1, dtype=numpy.int32)
     ao2pao[pao_parent] = numpy.arange(pao_parent.size)
     ordered = targets[:, [int(group[0]) for group in groups]]
@@ -786,7 +808,7 @@ def build_domain_selections(
     for i, group in enumerate(groups):
         ao = tools.ao_index_by_atom(mol, primary[i]).astype(numpy.int32)
         s22 = overlap[numpy.ix_(ao, ao)]
-        raw_occ = tools.project_mo(targets[:, group], overlap[ao], s22)
+        raw_occ = numpy.linalg.solve(s22, overlap_targets[numpy.ix_(ao, group)])
         norm2 = numpy.einsum("ui,uv,vi->i", raw_occ, s22, raw_occ)
         norm_keep = numpy.where(norm2 > thresholds.metric_rank)[0].astype(numpy.int32)
         span_keep = empty
@@ -798,16 +820,17 @@ def build_domain_selections(
                 mol, pao_coeff, ao2pao, overlap, parent_atoms=primary_bp[i], support_atoms=primary_bp[i],
                 representation_atoms=primary[i], completeness_threshold=thresholds.bp_pao,
                 overlap_threshold=thresholds.domain_pao, occupied_for_projection=occ_span, metric_threshold=thresholds.metric_rank,
-                preprojection_cache=pao_preprojections,
+                preprojection_cache=pao_preprojections, pao_products=pao_products,
             )
             if not weak_coeff.shape[1]:
                 weak_virtual = None
         fragments.append(FragmentDomainSelection(i, group.copy(), None, empty, empty, empty, empty, empty,
                         None, primary[i], ao, primary_bp[i], norm_keep, span_keep, weak_virtual, -1))
     del pao_preprojections
-    common = DomainData(overlap, fock, occupied, virtual,
-                        _host_array(mf.mo_energy)[active_occ], _host_array(mf.mo_energy)[active_vir], targets,
-                        pao_coeff, tuple(TargetOccupiedData(targets[:, group]) for group in groups))
+    if common is None:
+        common = DomainData(overlap, fock, occupied, virtual,
+                            _host_array(mf.mo_energy)[active_occ], _host_array(mf.mo_energy)[active_vir], targets,
+                            pao_coeff, tuple(TargetOccupiedData(targets[:, group]) for group in groups))
     static = DomainSelections(frozen, thresholds, active_occ, active_vir, projected_out, pao_parent,
                               ao2pao, groups, (None,) * nfrag, numpy.zeros((nfrag, nfrag), dtype=bool), tuple(fragments),
                               lo_kwargs=options, target_reference_coeff=targets.copy(), target_reference_coords=_host_array(mol.atom_coords()).copy(),
@@ -816,20 +839,16 @@ def build_domain_selections(
                               boys_grouping=boys_grouping,
                               physical_groups=tuple(tuple(int(i) for i in members)
                                                     for members in physical_groups))
-    response = getattr(mf, '_stc_selection_response', None)
-    # Explicit target frames need not be a stationary Boys solution. Keep their
-    # existing screening behavior, as well as callbacks changing the reference.
-    if response is not None and (target_coeff is not None or not response.matches_reference(mf)):
-        response = None
     endpoints = None
     screening_mf = mf
     if response is not None:
-        common = response.prepare(static)
         screening_mf = response.mf
         endpoints = {}
     pair, weak_pair, forced, strong = screen_pairs(
         screening_mf, common, static, model=model, force_full_domains=force_full_domains,
-        **({'prepared_endpoints': endpoints} if response is not None else {}))
+        **({'prepared_endpoints': endpoints,
+            '_products_preparation': response.products_preparation}
+           if response is not None else {'_products': products}))
     if boys_grouping == "atom":
         strong = _expand_group_strong_mask(strong, physical_groups)
     if response is not None:
@@ -852,8 +871,9 @@ def build_domain_selections(
         if frame_key not in strong_frames:
             ao = tools.ao_index_by_atom(mol, atoms).astype(numpy.int32)
             s22 = overlap[numpy.ix_(ao, ao)]
-            candidates = numpy.concatenate([targets[:, groups[p]] for p in partners], axis=1)
-            projected = tools.project_mo(candidates, overlap[ao], s22)
+            candidate_columns = numpy.concatenate([groups[p] for p in partners])
+            projected = numpy.linalg.solve(
+                s22, overlap_targets[numpy.ix_(ao, candidate_columns)])
             occupied_local, keep = _reference_metric_space(projected, s22, thresholds.metric_rank)
             if keep.size != partners.size:
                 raise RuntimeError(f"Boys domain {i} loses occupied target/partner labels; rebuild domains with tighter support")
@@ -861,6 +881,7 @@ def build_domain_selections(
                 mol, pao_coeff, ao2pao, overlap, parent_atoms=centers, support_atoms=atoms, representation_atoms=atoms,
                 completeness_threshold=thresholds.ed_pao, overlap_threshold=thresholds.domain_pao,
                 occupied_for_projection=occupied_local, metric_threshold=thresholds.metric_rank,
+                pao_products=pao_products,
             )
             if not coeff.shape[1]:
                 raise RuntimeError(f"Boys domain {i} has no retained virtual space; rebuild domains")

@@ -334,6 +334,7 @@ def _make_df_eris_incore(cc, mo_coeff=None, fockao=None, s1e=None):
     Lpq = lno_df.transform_df_to_mo(
         cc._scf, mo, ijslice, aosym='s2', mosym='s1', atmlst=atmlst, s1e=s1e,
         coeff_is_local=local,
+        correlation_auxbasis=getattr(cc, 'correlation_auxbasis', None),
     ).reshape(-1, nmo, nmo)
 
     if _USE_CUSTOM_VJP_AO2MO_DF_ERIS:
@@ -374,7 +375,7 @@ def _make_df_eris_incore(cc, mo_coeff=None, fockao=None, s1e=None):
 def impurity_solve(mf, mo_coeff, lo_coeff, eris=None, frozen=None,
                    frag_prescreen=None,
                    verbose_imp=0, ccsd_t=False, dcsd=False,
-                   profile_info=None, profile_pass=None):
+                   profile_info=None, profile_pass=None, correlation_auxbasis=None):
     r'''Solve impurity problem and calculate local correlation energy.
 
     Args:
@@ -401,12 +402,14 @@ def impurity_solve(mf, mo_coeff, lo_coeff, eris=None, frozen=None,
         return _impurity_solve_jax(
             mf, mo_coeff, lo_coeff, eris.fock, eris.s1e, frag_prescreen,
             frozen, verbose_imp, ccsd_t, dcsd, profile_info, profile_pass,
+            correlation_auxbasis,
         )
     return _impurity_solve_core(
         mf, mo_coeff, lo_coeff, eris.fock, eris.s1e,
         frozen=frozen, frag_prescreen=frag_prescreen,
         verbose_imp=verbose_imp, ccsd_t=ccsd_t, dcsd=dcsd,
         profile_info=profile_info, profile_pass=profile_pass,
+        correlation_auxbasis=correlation_auxbasis,
     )
 
 
@@ -426,39 +429,41 @@ def impurity_solve(mf, mo_coeff, lo_coeff, eris=None, frozen=None,
 # the unregistered ``_LNOERIS`` Python class never enters JAX tracing.
 #
 # nondiff_argnums (frozen, verbose_imp, ccsd_t, dcsd, profile_info,
-# profile_pass) are passed through unchanged;
+# profile_pass, correlation_auxbasis) are passed through unchanged;
 # profile_info is intentionally
 # set to None inside the bwd so the replay does not pollute the dict the
 # forward already filled in.
 # ---------------------------------------------------------------------------
 
-@partial(jax.custom_vjp, nondiff_argnums=(6, 7, 8, 9, 10, 11))
+@partial(jax.custom_vjp, nondiff_argnums=(6, 7, 8, 9, 10, 11, 12))
 def _impurity_solve_jax(mf, mo_coeff, lo_coeff, fock, s1e, frag_prescreen,
                         frozen, verbose_imp, ccsd_t, dcsd,
-                        profile_info, profile_pass):
+                        profile_info, profile_pass, correlation_auxbasis=None):
     return _impurity_solve_core(
         mf, mo_coeff, lo_coeff, fock, s1e,
         frozen=frozen, frag_prescreen=frag_prescreen,
         verbose_imp=verbose_imp, ccsd_t=ccsd_t, dcsd=dcsd,
         profile_info=profile_info, profile_pass=profile_pass,
+        correlation_auxbasis=correlation_auxbasis,
     )
 
 
 def _impurity_solve_jax_fwd(mf, mo_coeff, lo_coeff, fock, s1e, frag_prescreen,
                             frozen, verbose_imp, ccsd_t, dcsd,
-                            profile_info, profile_pass):
+                            profile_info, profile_pass, correlation_auxbasis=None):
     out = _impurity_solve_core(
         mf, mo_coeff, lo_coeff, fock, s1e,
         frozen=frozen, frag_prescreen=frag_prescreen,
         verbose_imp=verbose_imp, ccsd_t=ccsd_t, dcsd=dcsd,
         profile_info=profile_info, profile_pass=profile_pass,
+        correlation_auxbasis=correlation_auxbasis,
     )
     res = (mf, mo_coeff, lo_coeff, fock, s1e, frag_prescreen)
     return out, res
 
 
 def _impurity_solve_jax_bwd(frozen, verbose_imp, ccsd_t, dcsd,
-                            profile_info, profile_pass, res, ybar):
+                            profile_info, profile_pass, correlation_auxbasis, res, ybar):
     mf, mo_coeff, lo_coeff, fock, s1e, frag_prescreen = res
 
     def fn(mf_, mo_coeff_, lo_coeff_, fock_, s1e_, frag_prescreen_):
@@ -467,6 +472,7 @@ def _impurity_solve_jax_bwd(frozen, verbose_imp, ccsd_t, dcsd,
             frozen=frozen, frag_prescreen=frag_prescreen_,
             verbose_imp=verbose_imp, ccsd_t=ccsd_t, dcsd=dcsd,
             profile_info=None, profile_pass=profile_pass,
+            correlation_auxbasis=correlation_auxbasis,
         )
 
     _, vjp_fn = jax.vjp(fn, mf, mo_coeff, lo_coeff, fock, s1e, frag_prescreen)
@@ -481,7 +487,7 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
                          verbose_imp=0, ccsd_t=False, dcsd=False,
                          profile_info=None, profile_pass=None,
                          triples_solver=None, mp2_solver=None, vvvv_direct=False,
-                         amplitude_solver=None, active_nocc=None):
+                         amplitude_solver=None, active_nocc=None, correlation_auxbasis=None):
     '''Numerical core of :func:`impurity_solve`; see that function for docs.
 
     Takes ``fock`` and ``s1e`` directly (rather than the parent ``eris``
@@ -502,6 +508,9 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
     ``active_nocc`` accepts an occupied-first, unfrozen domain LIS without
     completing it to the global HF orbital layout. The supplied AO Fock is
     projected into that LIS, including its occupied-virtual block.
+
+    ``correlation_auxbasis`` selects the local correlation fit independently
+    of the SCF object's JK auxiliary basis and cached DF source.
     '''
     log = logger.new_logger(mf)
     if active_nocc is None:
@@ -565,6 +574,7 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
     else:
         mcc = RCCSD(mf, mo_coeff=mo_coeff, mo_occ=mo_occ, frozen=frozen)
     mcc.vvvv_direct = vvvv_direct
+    mcc.correlation_auxbasis = correlation_auxbasis
     diis_space = int(os.environ.get('PYSCFAD_LNO_CCSD_DIIS_SPACE', '3'))
     if diis_space <= 0:
         mcc.diis = False

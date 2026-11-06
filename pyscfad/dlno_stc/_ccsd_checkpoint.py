@@ -7,6 +7,7 @@ from dataclasses import asdict
 
 from ._restart import RestartManager
 from ._workflow import run_payload
+from ._df_basis import basis_kwargs
 
 
 def open_checkpoint(state, static, groups, *, checkpoint_dir, resume, options):
@@ -17,7 +18,8 @@ def open_checkpoint(state, static, groups, *, checkpoint_dir, resume, options):
     from . import _stc_mp2
     from pyscfad.lno.ccsd import RCCSD
     payload = dict(reference=run_payload(state['mf'], static.mp2_static.frozen,
-                                         driver='stc-global-hf-cc-v1'),
+                                         driver='stc-global-hf-cc-v1',
+                                         **basis_kwargs(state.get('correlation_auxbasis'))),
                    canonical={name: getattr(state['mf'], name)
                               for name in ('mo_coeff', 'mo_energy', 'mo_occ', 'e_tot')},
                    native_version=_stc_mp2.matrix_kernel_version,

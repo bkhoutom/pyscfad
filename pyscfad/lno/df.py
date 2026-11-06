@@ -93,6 +93,7 @@ def build_local_Lov_h5(
     nocc: int,
     atmlst,
     path: str | os.PathLike,
+    correlation_auxbasis=None,
 ) -> LocalLovH5Info:
     """Write local ``Lov`` directly to a contiguous HDF5 dataset.
 
@@ -114,7 +115,8 @@ def build_local_Lov_h5(
         raise ValueError('nocc must lie between zero and the local MO count')
 
     fake_mol = make_local_mol(mf.mol, atmlst)
-    auxmol = df_addons.make_auxmol(fake_mol, mf.with_df.auxbasis)
+    auxbasis = mf.with_df.auxbasis if correlation_auxbasis is None else correlation_auxbasis
+    auxmol = df_addons.make_auxmol(fake_mol, auxbasis)
     return _build_local_Lov_h5_impl(
         fake_mol,
         auxmol,
@@ -126,7 +128,7 @@ def build_local_Lov_h5(
 
 
 def transform_df_to_mo(mf, mo_coeff, orbs_slice, aosym='s2', mosym='s1', atmlst=None,
-                       s1e=None, coeff_is_local=False):
+                       s1e=None, coeff_is_local=False, correlation_auxbasis=None):
     """Transform with the domain's AO and auxiliary bases when atoms are given.
 
     The fitting space is independent of the parent's DF storage policy.
@@ -137,8 +139,17 @@ def transform_df_to_mo(mf, mo_coeff, orbs_slice, aosym='s2', mosym='s1', atmlst=
     adjoints then join that producer instead of rebuilding overlap integrals.
     ``coeff_is_local=True`` accepts coefficients already in the domain AO
     basis, avoiding an identity projection for domain-local LIS orbitals.
+
+    ``correlation_auxbasis`` selects a separate local fitting basis without
+    changing the parent's JK fit. With no domain it uses all atoms directly.
     """
     atmlst = _local_domain_atmlst(mf, atmlst)
+    if correlation_auxbasis is not None:
+        if aosym != 's2' or mosym != 's1':
+            raise NotImplementedError('Separate correlation fitting requires aosym=s2, mosym=s1')
+        if atmlst is None:
+            atmlst = numpy.arange(mf.mol.natm, dtype=numpy.int32)
+            coeff_is_local = True
     if coeff_is_local and atmlst is None:
         raise ValueError('Local AO coefficients require a domain atom list')
     if atmlst is not None:
@@ -154,7 +165,8 @@ def transform_df_to_mo(mf, mo_coeff, orbs_slice, aosym='s2', mosym='s1', atmlst=
             mo_coeff = lno_tools.project_mo(mo_coeff, s21, s22)
         if aosym == 's2' and mosym == 's1':
             local_mol = make_local_mol(mf.mol, atmlst)
-            auxmol = df_addons.make_auxmol(local_mol, mf.with_df.auxbasis)
+            auxbasis = mf.with_df.auxbasis if correlation_auxbasis is None else correlation_auxbasis
+            auxmol = df_addons.make_auxmol(local_mol, auxbasis)
             # Direct MO transformation avoids caching an AO-pair CDERI for
             # every fragment. Respect both total memory and the DF workspace.
             max_memory = min(
@@ -205,7 +217,7 @@ def transform_df_to_mo(mf, mo_coeff, orbs_slice, aosym='s2', mosym='s1', atmlst=
 
 
 def get_local_Lov(mf, mo_coeff_local, nocc, atmlst,
-                  integral_direct=None):
+                  integral_direct=None, correlation_auxbasis=None):
     """Transform a local-domain CDERI using local AO coefficients directly.
 
     ``get_Lov(..., atmlst=...)`` accepts full-molecule AO coefficients and
@@ -219,6 +231,8 @@ def get_local_Lov(mf, mo_coeff_local, nocc, atmlst,
     metric.  This avoids constructing the much larger local AO-pair CDERI.
     The default is false for compatibility; callers can enable it globally on
     a DF object with ``with_df._lno_local_lov_integral_direct = True``.
+    An explicit ``correlation_auxbasis`` always uses direct local integrals;
+    it never creates or replaces the parent's AO-pair DF source.
     """
     atmlst = numpy.asarray(atmlst, dtype=numpy.int32).ravel()
     ao_idx = lno_tools.ao_index_by_atom(mf.mol, atmlst)
@@ -234,9 +248,12 @@ def get_local_Lov(mf, mo_coeff_local, nocc, atmlst,
         integral_direct = bool(getattr(
             mf.with_df, '_lno_local_lov_integral_direct', False
         ))
+    if correlation_auxbasis is not None:
+        integral_direct = True
     if integral_direct:
         fake_mol = make_local_mol(mf.mol, atmlst)
-        auxmol = df_addons.make_auxmol(fake_mol, mf.with_df.auxbasis)
+        auxbasis = mf.with_df.auxbasis if correlation_auxbasis is None else correlation_auxbasis
+        auxmol = df_addons.make_auxmol(fake_mol, auxbasis)
         if nocc == 0 or nocc == nmo:
             return np.zeros(
                 (auxmol.nao, nocc, nmo - nocc), dtype=mo_coeff_local.dtype
@@ -256,6 +273,8 @@ def get_local_Lov(mf, mo_coeff_local, nocc, atmlst,
                 (0, nocc, nocc, nmo),
             )
         except ImportError as err:
+            if correlation_auxbasis is not None:
+                raise
             # PySCF exposes the shell-direct DF transformation through a
             # private helper whose availability is not guaranteed across the
             # full supported PySCF version range.  Retain a correct (but more
@@ -292,12 +311,13 @@ def get_local_Lov(mf, mo_coeff_local, nocc, atmlst,
     return lov.reshape((-1, nocc, nmo - nocc))
 
 
-def get_Lov(mf, mo_coeff, nocc, atmlst=None):
+def get_Lov(mf, mo_coeff, nocc, atmlst=None, correlation_auxbasis=None):
     assert hasattr(mf, 'with_df')
     nmo = mo_coeff.shape[-1]
     nvir = nmo - nocc
     ijslice = (0, nocc, nocc, nmo)
-    Lov = transform_df_to_mo(mf, mo_coeff, ijslice, aosym='s2', mosym='s1', atmlst=atmlst)
+    Lov = transform_df_to_mo(mf, mo_coeff, ijslice, aosym='s2', mosym='s1', atmlst=atmlst,
+                             correlation_auxbasis=correlation_auxbasis)
     naux = Lov.shape[0]
     Lov = Lov.reshape((naux, nocc, nvir))
     return Lov

@@ -35,6 +35,49 @@ structure from selection-only DF caches. Alternatively, pass existing
 ``DomainSelections`` as ``static``; do not supply both. System gradients need
 only ``mol`` and ``build_mf`` with ``scope="system"`` and a frozen-space setting.
 
+Pass `correlation_auxbasis="cc-pvdz-ri"` to use RIFIT for correlation while
+`build_mf` (or the supplied `mf`) continues to use its existing JKFIT setup:
+
+```python
+energy, gradient = dlno_stc.value_and_grad(
+    mol, build_mf,
+    build_static=lambda mf: dlno_stc.build_domain_selections(mf, frozen=4),
+    controls={"mode": "deterministic"}, include_hf=True,
+    correlation_auxbasis="cc-pvdz-ri",
+)
+```
+
+The same argument is accepted by MP2 and CCSD `kernel`/`value_and_grad`,
+domain/LIS selection builders, and MP2 export/replay helpers. Its default,
+`None`, preserves the existing SCF fitting configuration and workflow.
+Callbacks invoked through `build_static` inherit the run's correlation fit;
+when selecting or exporting separately, pass the same argument at each step.
+Exact pair screening and CC D/W selections record the fitting basis and
+reject reuse with a different fit. Multipole screening remains independent
+of the correlation fit. Restart and packet identities include the override.
+
+With an explicit override, each domain constructs its own auxiliary molecule,
+metric and factors in the chosen basis. Local factors are not slices of a
+global fitted tensor. HF, AO Fock and implicit SCF response continue using
+`mf.with_df`, including its existing global JKFIT file. Correlation coordinate
+response uses the local RIFIT metric/three-center derivatives; its orbital
+and Fock response still closes through the single JKFIT SCF pullback.
+The storage policies below are unchanged: this option does not create a
+global RIFIT disk file. A distinct system fit uses all atoms in the direct
+producer and retains the transformed correlation factors in RAM. An explicit
+basis identical to the SCF configuration reuses compatible cached SCF factors
+in system preparation and exact pair screening. Memory
+estimates use the chosen correlation auxiliary dimension; there is no new
+disk fallback for an oversized local factor, metric, H cache or adjoint.
+
+Standalone domain MP2 and direct system MP2 retain one auxiliary metric,
+Cholesky factor and derivative tape through each preparation/pullback pair,
+including MPI owner jobs and saved-packet replay. Positive definiteness is
+checked by the retained factorization, without a separate validation build.
+Cached system factors use a dimension check to reject rank-reduced fitting
+sources. MP2 keeps its direct integral streaming and does not allocate an H
+cache; the shared integral response finishes before common/Fock/SCF response.
+
 Nuclear gradients require coordinate-only molecule leaves
 (`mol.build(trace_exp=False, trace_ctr_coeff=False)`). Selections, domains,
 Laplace grid, retained ranks and PAO anchors remain fixed through response;

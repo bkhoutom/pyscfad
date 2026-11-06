@@ -281,6 +281,10 @@ def _encode_value(value, writer=None, *, require_registered_dataclass=True):
                     require_registered_dataclass=require_registered_dataclass,
                 )]
                 for field in dataclasses.fields(value)
+                # Preserve pre-override checkpoint bytes/digests for None.
+                if not (type(value).__name__ in ('DomainSelections', 'CCSDSelections')
+                        and field.name == 'correlation_basis_identity'
+                        and getattr(value, field.name) is None)
             ],
         }
     if isinstance(value, tuple):
@@ -424,7 +428,9 @@ def _decode_value(node, reader):
                 f"legacy {cls.__name__} checkpoint lacks physical fragment metadata. "
                 "Rebuild selections and checkpoints; migration is unsupported."
             )
-        if names != expected:
+        compatible = (tuple(name for name in expected if name != 'correlation_basis_identity')
+                      if cls.__name__ in ('DomainSelections', 'CCSDSelections') else expected)
+        if names not in (expected, compatible):
             raise RestartCorruptionError(
                 f"dataclass {tag} fields changed: {names} != {expected}"
             )

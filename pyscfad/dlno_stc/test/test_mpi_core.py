@@ -234,7 +234,8 @@ def test_scheduler_uneven_owners_and_idle_live_bars(monkeypatch):
 
     mf = MF(jnp.ones((1, 1)), jnp.ones(1), jnp.ones(1)*2, jnp.array(-1.))
     common = Common(jnp.ones((1, 1))*2)
-    static = SimpleNamespace(fragments=(object(), object()),
+    static = SimpleNamespace(fragments=tuple(
+        SimpleNamespace(extended_atoms=numpy.array([i])) for i in range(2)),
                              frag_lolist=(numpy.array([0]), numpy.array([1])))
     groups = (_selection.DomainGroup((0,), 0, (0,)),
               _selection.DomainGroup((1,), 1, (0,)))

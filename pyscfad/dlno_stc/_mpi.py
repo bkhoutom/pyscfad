@@ -14,6 +14,7 @@ import jax
 import numpy
 from pyscfad import numpy as np
 from pyscfad.tools import resource_profile
+from ._df_basis import basis_kwargs
 
 _TREE_REDUCE_CHUNK_BYTES = 64 * 1024**2
 _TREE_REDUCE_MAX_COUNT = int(numpy.iinfo(numpy.int32).max)
@@ -262,6 +263,16 @@ def _reference_signature(mf):
             'auxmol': None if auxmol is None else _molecule_signature(auxmol)}
 
 
+def _install_correlation_config(state, config):
+    """Install root's correlation fit without changing the SCF/JK reference."""
+    basis = config.get('correlation_auxbasis')
+    if ('correlation_auxbasis' in state
+            and _freeze(state['correlation_auxbasis']) != _freeze(basis)):
+        raise ValueError('worker correlation auxiliary basis differs from root')
+    if basis is not None:
+        state['correlation_auxbasis'] = basis
+
+
 def _same_array(actual, expected, label):
     actual, expected = numpy.asarray(actual), numpy.asarray(expected)
     if (actual.shape != expected.shape or actual.dtype != expected.dtype
@@ -285,12 +296,13 @@ def _validate_molecule_signature(actual, expected, label):
 
 
 def _validate_shared_reference(mf, common, canonical, expected_common, signature, static,
-                               *, with_grad):
+                               *, with_grad, correlation_auxbasis=None):
     """Require actual signed values and molecular definitions before owner work."""
     from . import driver
 
     driver._validate_static(static)
-    driver._validate_reference(mf, static)
+    driver._validate_reference(mf, static,
+        **basis_kwargs(correlation_auxbasis))
     if with_grad:
         driver._coordinate_only(mf.mol)
     actual_signature = _reference_signature(mf)
@@ -405,10 +417,11 @@ def _run_domain_jobs(initializer, worker_initializer, static, controls, comm, *,
             groups = build_domain_groups(authoritative, merge_identical=merge_identical)
             return (authoritative, groups, state['weak_pairs'], controls,
                     allocate_domain_controls(controls, len(groups)),
-                    _reference_signature(state['mf']))
+                    _reference_signature(state['mf']),
+                    {'correlation_auxbasis': state.get('correlation_auxbasis')})
 
         metadata = driver._root_call(comm, rank, root_metadata, 'shared domain selection')
-        static, groups, pairs, controls, settings, signature = comm.bcast(metadata, root=0)
+        static, groups, pairs, controls, settings, signature, correlation = comm.bcast(metadata, root=0)
         shared_tree = driver._root_call(comm, rank, lambda: {
             'canonical': {name: getattr(state['mf'], name)
                           for name in ('mo_coeff', 'mo_energy', 'mo_occ', 'e_tot')},
@@ -426,8 +439,10 @@ def _run_domain_jobs(initializer, worker_initializer, static, controls, comm, *,
                 mf = _build_worker(worker_initializer, payload['canonical'], signature)
                 state = {'mf': mf, 'common': common, 'static': static,
                          'scf_pullback': None, 'common_pullback': None, 'weak_pairs': pairs}
+            _install_correlation_config(state, correlation)
             _validate_shared_reference(state['mf'], state['common'], payload['canonical'],
-                                       payload['common'], signature, static, with_grad=with_grad)
+                                       payload['common'], signature, static, with_grad=with_grad,
+                                       **basis_kwargs(state.get('correlation_auxbasis')))
             state['energy'] = np.zeros((), dtype=common.s1e.dtype)
             state['variance'] = 0.0
             # Root already owns live zero trees from driver._initialize.
@@ -454,33 +469,35 @@ def _run_domain_jobs(initializer, worker_initializer, static, controls, comm, *,
                    'target_indices': tuple(group.target_indices),
                    'fragment_indices': tuple(group.fragment_indices), 'replica_count': 1}
             group_start = time.perf_counter()
-            with _timed_section('stc.domain.prepare', totals, 'prepare'):
-                stage_start = time.perf_counter()
-                prepared = driver._prepare(state, static, group, controls, with_grad)
-                row['prepare'] = time.perf_counter() - stage_start
-                row['input_shapes'] = {name: tuple(array.shape) for name, array in prepared[1].items()}
-            metadata = {
-                'fragment_id': group_id, 'target_indices': group.target_indices,
-                'fragment_indices': group.fragment_indices,
-                'global_target_orbitals': tuple(int(static.frag_lolist[i][0])
-                                                for i in group.fragment_indices),
-                'budget': {'total_tolerance': controls.get('energy_tolerance'),
-                           'effective_tolerance': settings.get('energy_tolerance'),
-                           'original_target_count': len(static.fragments), 'group_count': len(groups)},
-            }
-            with _timed_section('stc.domain.native', totals, 'native'):
-                stage_start = time.perf_counter()
-                result = run_backend(prepared[1], metadata, settings,
-                                     partial(backend.solve, with_grad=with_grad), comm=None)
-                row['native'] = time.perf_counter() - stage_start
-            with _timed_section('stc.domain.input_pullback', totals, 'input_pullback'):
-                stage_start = time.perf_counter()
-                if with_grad:
-                    driver._add_bars(state, *apply_selected_pullback(prepared[2], prepared[0], result))
-                state['energy'] = state['energy'] + result['energy']
-                state['variance'] += float(result['energy_standard_error']) ** 2
-                jax.block_until_ready((state['energy'], state['mf_bar'], state['common_bar']))
-                row['input_pullback'] = time.perf_counter() - stage_start
+            with driver._mp2_df_scope(state, static.fragments[group_id].extended_atoms) as shared:
+                with _timed_section('stc.domain.prepare', totals, 'prepare'):
+                    stage_start = time.perf_counter()
+                    prepared = driver._prepare(state, static, group, controls, with_grad)
+                    row['prepare'] = time.perf_counter() - stage_start
+                    row['input_shapes'] = {name: tuple(array.shape) for name, array in prepared[1].items()}
+                metadata = {
+                    'fragment_id': group_id, 'target_indices': group.target_indices,
+                    'fragment_indices': group.fragment_indices,
+                    'global_target_orbitals': tuple(int(static.frag_lolist[i][0])
+                                                    for i in group.fragment_indices),
+                    'budget': {'total_tolerance': controls.get('energy_tolerance'),
+                               'effective_tolerance': settings.get('energy_tolerance'),
+                               'original_target_count': len(static.fragments), 'group_count': len(groups)},
+                }
+                with _timed_section('stc.domain.native', totals, 'native'):
+                    stage_start = time.perf_counter()
+                    result = run_backend(prepared[1], metadata, settings,
+                                         partial(backend.solve, with_grad=with_grad), comm=None)
+                    row['native'] = time.perf_counter() - stage_start
+                with _timed_section('stc.domain.input_pullback', totals, 'input_pullback'):
+                    stage_start = time.perf_counter()
+                    if with_grad:
+                        driver._add_bars(state, *apply_selected_pullback(prepared[2], prepared[0], result))
+                    state['mf_bar'] = driver._finish_mp2_df(shared, state['mf_bar'])
+                    state['energy'] = state['energy'] + result['energy']
+                    state['variance'] += float(result['energy_standard_error']) ** 2
+                    jax.block_until_ready((state['energy'], state['mf_bar'], state['common_bar']))
+                    row['input_pullback'] = time.perf_counter() - stage_start
             row['energy'] = float(result['energy'])
             row['energy_standard_error'] = float(result['energy_standard_error'])
             row['elapsed'] = time.perf_counter() - group_start

@@ -188,7 +188,7 @@ def test_system_outcore_cache_preserves_factors_coordinate_and_coefficient_vjps(
     monkeypatch.setattr(h5py.Dataset, "__getitem__", checked_factor_read)
     # Make this tiny molecule exercise the same slab paths used by large fits.
     monkeypatch.setattr(_df_outcore, "_outcore_nr_e2_block_mb", lambda: 1e-6)
-    monkeypatch.setattr(_cderi_vjp, "_df_jk_style_blockdim", lambda *args: 2)
+    monkeypatch.setattr(_cderi_vjp, "_nr_e2_vjp_block_mb", lambda: 1e-6)
     real_coeff_source_vjp = _cderi_vjp.nr_e2_mo_coeff_vjp_from_cderi_source
 
     def checked_coefficient_source_vjp(*args, **kwargs):

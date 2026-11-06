@@ -9,6 +9,7 @@ from pyscfad.lno import df as lno_df
 
 from .domain import build_boys_ed_frame, build_system_local_frame
 from ._profile import response
+from ._df_basis import basis_kwargs, can_reuse_scf_df
 
 
 def _symmetric_fock_block(fock, coeff):
@@ -26,13 +27,14 @@ def _scf_fock_block(coeff, energies, overlap, indices, local_coeff):
     return 0.5 * (block + block.T)
 
 
-def _project_inputs(mf, fock, occupied_coeff, virtual_coeff, atoms, *, group=None):
+def _project_inputs(mf, fock, occupied_coeff, virtual_coeff, atoms, *, group=None,
+                    correlation_auxbasis=None):
     """Use one occupied/virtual frame for both Fock blocks and DF factors."""
     co, cv = occupied_coeff, virtual_coeff
     nocc, nvir = co.shape[1], cv.shape[1]
     coeff = np.concatenate((co, cv), axis=1)
     B = lno_df.get_local_Lov(
-        mf, coeff, nocc, atoms, integral_direct=True,
+        mf, coeff, nocc, atoms, integral_direct=True, **basis_kwargs(correlation_auxbasis),
     )
     foo, fvv = response('stc.domain.input_pullback.local_fock_blocks',
                         lambda f, o, v: (_symmetric_fock_block(f, o),
@@ -45,7 +47,8 @@ def _project_inputs(mf, fock, occupied_coeff, virtual_coeff, atoms, *, group=Non
     }
 
 
-def prepare_inputs(mf, common, static, fragment_index, *, return_frame=False):
+def prepare_inputs(mf, common, static, fragment_index, *, return_frame=False,
+                   correlation_auxbasis=None):
     """Prepare exactly three tensors in one fixed, labelled finite Boys frame.
 
     ``common`` is rebuilt by the independent Boys ``rebuild_domain_data``.
@@ -65,25 +68,27 @@ def prepare_inputs(mf, common, static, fragment_index, *, return_frame=False):
     inputs = _project_inputs(
         mf, common.fock[numpy.ix_(ao, ao)], frame.occupied_coeff,
         frame.virtual_coeff, frame.extended_atoms, group=fragment_index,
+        **basis_kwargs(correlation_auxbasis),
     )
     if return_frame:
         return (inputs, (frame.occupied_coeff, frame.virtual_coeff)), frame
     return inputs
 
 
-def prepare_boys_group_inputs(mf, common, static, group, *, return_frame=False):
+def prepare_boys_group_inputs(mf, common, static, group, *, return_frame=False,
+                              correlation_auxbasis=None):
     """Prepare three tensors once in the group's saved representative frame.
 
     The full occupied partner space is retained. Group membership and target
     slots stay outside the differentiable tensor dictionary.
     """
     return prepare_inputs(mf, common, static, group.representative_index,
-                          return_frame=return_frame)
+                          return_frame=return_frame, **basis_kwargs(correlation_auxbasis))
 
 
 def prepare_system_inputs(
     mf, active_occ_indices, active_vir_indices, *, boys_reference=None,
-    virtual_anchor_columns=None, fock_from_scf=False,
+    virtual_anchor_columns=None, fock_from_scf=False, correlation_auxbasis=None,
 ):
     """Project full Fock blocks and fitted factors into one complete local frame.
 
@@ -107,22 +112,20 @@ def prepare_system_inputs(
     )
     return _project_system_frame(
         mf, frame, active_occ_indices, active_vir_indices,
-        fock_from_scf=fock_from_scf,
+        fock_from_scf=fock_from_scf, **basis_kwargs(correlation_auxbasis),
     )
 
 
 def _project_system_frame(mf, frame, active_occ_indices, active_vir_indices, *,
-                          fock_from_scf=False):
+                          fock_from_scf=False, correlation_auxbasis=None):
     """Project either system frame without changing its DF storage strategy."""
     co, cv = frame.occupied_coeff, frame.virtual_coeff
-    get_cderi = getattr(mf.with_df, "_get_cderi_source", None)
-    cderi = get_cderi() if get_cderi is not None else mf.with_df._cderi
     nocc, nvir = co.shape[1], cv.shape[1]
     coeff = np.concatenate((co, cv), axis=1)
-    if cderi is None:
+    if not can_reuse_scf_df(mf, correlation_auxbasis):
         B = lno_df.get_local_Lov(
             mf, coeff, nocc, numpy.arange(mf.mol.natm, dtype=numpy.int32),
-            integral_direct=True,
+            integral_direct=True, **basis_kwargs(correlation_auxbasis),
         )
     else:
         B = lno_df.transform_df_to_mo(
@@ -157,7 +160,8 @@ def _canonical_system_space(coeff, energies, occupied, virtual):
             np.diag(energies[numpy.asarray(virtual)]))
 
 
-def prepare_canonical_system_inputs(mf, active_occ_indices, active_vir_indices):
+def prepare_canonical_system_inputs(mf, active_occ_indices, active_vir_indices, *,
+                                    correlation_auxbasis=None):
     """Prepare a validated canonical SCF frame using orbital-energy response.
 
     This is a reference path for deterministic frame-invariance checks, not
@@ -172,12 +176,10 @@ def prepare_canonical_system_inputs(mf, active_occ_indices, active_vir_indices):
     nocc, nvir = len(occupied), len(virtual)
     coeff, foo, fvv = _canonical_system_space(
         mf.mo_coeff, mf.mo_energy, occupied, virtual)
-    get_cderi = getattr(mf.with_df, "_get_cderi_source", None)
-    cderi = get_cderi() if get_cderi is not None else mf.with_df._cderi
-    if cderi is None:
+    if not can_reuse_scf_df(mf, correlation_auxbasis):
         B = lno_df.get_local_Lov(
             mf, coeff, nocc, numpy.arange(mf.mol.natm, dtype=numpy.int32),
-            integral_direct=True)
+            integral_direct=True, **basis_kwargs(correlation_auxbasis))
     else:
         B = lno_df.transform_df_to_mo(
             mf, coeff, (0, nocc, nocc, nocc + nvir), atmlst=None)

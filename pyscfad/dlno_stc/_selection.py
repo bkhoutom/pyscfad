@@ -120,6 +120,7 @@ class DomainSelections:
     forced_strong_mask: object = None
     boys_grouping: str = "singleton"
     physical_groups: tuple[tuple[int, ...], ...] = ()
+    correlation_basis_identity: str | None = None
 
     def __post_init__(self):
         # Synthetic new selections retain the historical singleton default.
@@ -694,7 +695,7 @@ def _validate_reference(mf, frozen):
 def build_domain_selections(
     mf, *, frozen, thresholds=None, lo_kwargs=None, target_coeff=None,
     frag_lolist=None, pair_energy_model="multipole", force_full_domains=False,
-    boys_grouping="singleton",
+    boys_grouping="singleton", correlation_auxbasis=None,
 ):
     """Select Boys domains, occupied labels, virtual ranks and fixed anchors.
 
@@ -707,6 +708,9 @@ def build_domain_selections(
     """
     from .domain import DomainData, TargetOccupiedData, build_scf_data
     from ._pairs import screen_pairs, _WeakScreenProducts
+    from ._df_basis import basis_kwargs, basis_identity, selection_auxbasis
+
+    correlation_auxbasis = selection_auxbasis(mf, correlation_auxbasis)
 
     thresholds = BoysDomainThresholds() if thresholds is None else thresholds
     if not isinstance(thresholds, BoysDomainThresholds):
@@ -838,7 +842,9 @@ def build_domain_selections(
                               pao_bp_domain=pao_bp, primary_domain=primary, pair_energy_model=model,
                               boys_grouping=boys_grouping,
                               physical_groups=tuple(tuple(int(i) for i in members)
-                                                    for members in physical_groups))
+                                                    for members in physical_groups),
+                              correlation_basis_identity=(basis_identity(mf, correlation_auxbasis)
+                                  if model == "exact" and correlation_auxbasis is not None else None))
     endpoints = None
     screening_mf = mf
     if response is not None:
@@ -846,6 +852,7 @@ def build_domain_selections(
         endpoints = {}
     pair, weak_pair, forced, strong = screen_pairs(
         screening_mf, common, static, model=model, force_full_domains=force_full_domains,
+        **basis_kwargs(correlation_auxbasis),
         **({'prepared_endpoints': endpoints,
             '_products_preparation': response.products_preparation}
            if response is not None else {'_products': products}))

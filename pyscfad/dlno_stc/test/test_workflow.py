@@ -25,7 +25,7 @@ def test_sixteen_targets_four_jobs_allocate_export_once(tmp_path, monkeypatch):
         target_reference_coords=np.zeros((4, 3)),
         frag_lolist=tuple(np.array([i]) for i in range(16)), frag_atmlist=(None,)*16,
         strong_mask=np.equal.outer(np.arange(16)//4, np.arange(16)//4))
-    mf = SimpleNamespace(with_df=SimpleNamespace(auxbasis='test'))
+    mf = SimpleNamespace(with_df=SimpleNamespace(auxbasis='test', auxmol=SimpleNamespace(nao=3)))
     from pyscfad.dlno_stc import driver
     monkeypatch.setattr(driver, '_validate_reference', lambda *args: None)
     payload_calls = []
@@ -33,7 +33,7 @@ def test_sixteen_targets_four_jobs_allocate_export_once(tmp_path, monkeypatch):
         payload_calls.append(frozen)
         return {'frozen': frozen}
     monkeypatch.setattr(mp2, '_run_payload', payload)
-    monkeypatch.setattr(mp2, 'check_memory', lambda *args: None)
+    monkeypatch.setattr(mp2, 'check_memory', lambda *args, **kwargs: None)
     monkeypatch.setattr(mp2, 'rebuild_domain_data', lambda *args: None)
     monkeypatch.setattr(mp2, 'prepare_boys_group_inputs', lambda *args: {
         'foo': -np.eye(4), 'fvv': np.eye(2), 'B': np.ones((3, 4, 2))})

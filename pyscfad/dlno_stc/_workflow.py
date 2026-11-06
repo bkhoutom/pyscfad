@@ -69,11 +69,11 @@ def format_domain_dimensions(rows):
     return "\n".join((header, "-" * len(header), *(line(row) for row in values)))
 
 
-def run_payload(mf, frozen, *, driver):
+def run_payload(mf, frozen, *, driver, correlation_auxbasis=None):
     """Identify molecular preparation while static selections live in HDF5."""
     mol = mf.mol
     with_df = getattr(mf, "with_df", None)
-    return {
+    payload = {
         "driver": driver,
         "coords_bohr": numpy.asarray(mol.atom_coords()),
         "atom_symbols": tuple(mol.atom_symbol(i) for i in range(mol.natm)),
@@ -88,6 +88,9 @@ def run_payload(mf, frozen, *, driver):
         "auxbasis": None if with_df is None else with_df.auxbasis,
         "df_source": df_source_fingerprint(mf),
     }
+    if correlation_auxbasis is not None:
+        payload["correlation_auxbasis"] = correlation_auxbasis
+    return payload
 
 
 def revision_status():
@@ -106,19 +109,29 @@ def revision_status():
         return "unknown", None
 
 
-def check_memory(mf, nocc, nvir):
+def packet_auxiliary_size(mf, *, correlation_auxbasis=None):
+    """Return the full auxiliary dimension used for packet memory forecasts."""
+    with_df = getattr(mf, "with_df", None)
+    if with_df is None:
+        raise ValueError("STC packet preparation requires density fitting")
+    auxmol = (getattr(with_df, "auxmol", None)
+              if correlation_auxbasis is None else None)
+    if auxmol is None:
+        auxbasis = with_df.auxbasis if correlation_auxbasis is None else correlation_auxbasis
+        auxmol = pyscf_df.addons.make_auxmol(mf.mol.to_pyscf(), auxbasis)
+    return int(auxmol.nao)
+
+
+def check_memory(mf, nocc, nvir, *, correlation_auxbasis=None, naux=None):
     """Warn about a potentially oversized in-core DF packet before allocation.
 
     The factor eight allows for input, imported bar, replay, and AD temporaries;
     it is a conservative prototype estimate, not a measured peak guarantee.
+    A caller exporting multiple packets may supply their shared auxiliary size.
     """
-    with_df = getattr(mf, "with_df", None)
-    if with_df is None:
-        raise ValueError("STC packet preparation requires density fitting")
-    auxmol = getattr(with_df, "auxmol", None)
-    if auxmol is None:
-        auxmol = pyscf_df.addons.make_auxmol(mf.mol.to_pyscf(), with_df.auxbasis)
-    estimate_mb = 8 * int(auxmol.nao) * int(nocc) * int(nvir) * 8 / 1e6
+    if naux is None:
+        naux = packet_auxiliary_size(mf, correlation_auxbasis=correlation_auxbasis)
+    estimate_mb = 8 * int(naux) * int(nocc) * int(nvir) * 8 / 1e6
     limit_mb = float(getattr(mf, "max_memory", mf.mol.max_memory))
     # The global auxiliary size is an upper estimate for finite packets, so it
     # cannot establish the unavoidable size of the actual local factor.
@@ -128,7 +141,7 @@ def check_memory(mf, nocc, nvir):
 
 def check_domain_memory(mf, static, fragment_index, *, with_grad,
                           virtual_block_size=16, mode="stochastic",
-                          target_batch_size=1, threads=None):
+                          target_batch_size=1, threads=None, correlation_auxbasis=None):
     """Guard one finite domain using its local auxiliary basis and buffers.
 
     This estimates the local solver/RI working set, not a measured process
@@ -143,7 +156,8 @@ def check_domain_memory(mf, static, fragment_index, *, with_grad,
     if nvir == 0:
         return 0.0
     local_mol = lno_df.make_local_mol(mf.mol, fragment.extended_atoms)
-    auxmol = pyscf_df.addons.make_auxmol(local_mol.to_pyscf(), mf.with_df.auxbasis)
+    auxbasis = mf.with_df.auxbasis if correlation_auxbasis is None else correlation_auxbasis
+    auxmol = pyscf_df.addons.make_auxmol(local_mol.to_pyscf(), auxbasis)
     naux = int(auxmol.nao)
     # Preparation residual/input, host/layout buffers, dressed factors and
     # reverse bars. Target branches have only one occupied row.
@@ -172,7 +186,7 @@ def check_domain_memory(mf, static, fragment_index, *, with_grad,
 
 def check_system_memory(mf, nocc, nvir, *, with_grad, virtual_block_size=16,
                         auxiliary_group_size=32, mode="stochastic",
-                        target_batch_size=1, threads=None):
+                        target_batch_size=1, threads=None, correlation_auxbasis=None):
     """Guard one complete replica plus root preparation/SCF residency.
 
     Conservative counts include tensor layout/host/AD copies, the dense
@@ -194,7 +208,8 @@ def check_system_memory(mf, nocc, nvir, *, with_grad, virtual_block_size=16,
         raise ValueError("system STC preparation requires density fitting")
     # Match the direct transformation's auxiliary regeneration, without
     # installing an auxmol on (and changing the pytree of) the SCF object.
-    auxmol = pyscf_df.addons.make_auxmol(mf.mol.to_pyscf(), with_df.auxbasis)
+    auxbasis = with_df.auxbasis if correlation_auxbasis is None else correlation_auxbasis
+    auxmol = pyscf_df.addons.make_auxmol(mf.mol.to_pyscf(), auxbasis)
     naux, nao = int(auxmol.nao), int(mf.mol.nao)
     ngroup = (naux + int(auxiliary_group_size) - 1) // int(auxiliary_group_size)
     # Budget six full B-sized buffers for preparation and solver work.

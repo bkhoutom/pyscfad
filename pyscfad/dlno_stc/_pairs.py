@@ -624,7 +624,7 @@ def weak_pair_energy_and_grad(mf, common, static, *, pairs=None,
     return jnp.real(energy), bars
 
 
-def _exact_boys_pair_scores(mf, common, static):
+def _exact_boys_pair_scores(mf, common, static, *, correlation_auxbasis=None):
     """Concrete exact classification through two labelled occupied contractions.
 
     Project amplitudes only after canonical denominators have been applied.
@@ -636,7 +636,14 @@ def _exact_boys_pair_scores(mf, common, static):
     pt = dfmp2.MP2(mf, frozen=static.frozen)
     eris = pt.ao2mo()
     nocc, nvir = int(pt.nocc), int(pt.nmo - pt.nocc)
-    lov = np.asarray(pt.loop_ao2mo(eris.mo_coeff, nocc, with_t2=False)).reshape(-1, nocc, nvir)
+    from ._df_basis import can_reuse_scf_df
+    if correlation_auxbasis is None or can_reuse_scf_df(mf, correlation_auxbasis):
+        lov = pt.loop_ao2mo(eris.mo_coeff, nocc, with_t2=False)
+    else:
+        from pyscfad.lno.df import get_local_Lov
+        lov = get_local_Lov(mf, eris.mo_coeff, nocc, np.arange(mf.mol.natm),
+                            integral_direct=True, correlation_auxbasis=correlation_auxbasis)
+    lov = np.asarray(lov).reshape(-1, nocc, nvir)
     rotation = np.asarray(common.occupied_coeff).T @ np.asarray(common.s1e) @ np.asarray(common.iao_coeff)
     rotation = rotation[:, [int(labels[0]) for labels in static.frag_lolist]]
     energies = np.asarray(eris.mo_energy)
@@ -658,7 +665,8 @@ def _exact_boys_pair_scores(mf, common, static):
 
 
 def screen_pairs(mf, common, static, model='multipole', force_full_domains=False,
-                 *, prepared_endpoints=None, _products_preparation=None, _products=None):
+                 *, prepared_endpoints=None, _products_preparation=None, _products=None,
+                 correlation_auxbasis=None):
     """Concrete Boys pair classification on provisional primary selections.
 
     When supplied, ``prepared_endpoints`` is cleared and filled with each
@@ -747,7 +755,9 @@ def screen_pairs(mf, common, static, model='multipole', force_full_domains=False
             if not np.isfinite(value):
                 raise RuntimeError(f"nonfinite Boys screening pair estimate for targets {left}, {right}")
             weak[left, right] = weak[right, left] = value
-    pair = _exact_boys_pair_scores(mf, common, static) if model == 'exact' else weak
+    from ._df_basis import basis_kwargs
+    pair = (_exact_boys_pair_scores(mf, common, static, **basis_kwargs(correlation_auxbasis))
+            if model == 'exact' else weak)
     strong = (np.abs(pair) > static.thresholds.pair_energy) | forced
     strong = strong | strong.T
     np.fill_diagonal(strong, True)

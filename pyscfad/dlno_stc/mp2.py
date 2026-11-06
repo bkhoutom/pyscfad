@@ -19,6 +19,7 @@ from .protocol import validate_result, canonical_json
 from ._workflow import (check_memory, format_domain_dimensions, revision_status,
                         run_payload, allocate_domain_controls)
 from ._memory import memory_calculation
+from ._df_basis import basis_kwargs
 
 _METHOD = "dlno-stc-selected-mp2"
 _ENERGY_KIND = "finite_boys_target_mp2_v1"
@@ -62,8 +63,9 @@ def solve_request(input_path, result_path, backend, *, comm=None):
 
 
 
-def _run_payload(mf, frozen):
-    return run_payload(mf, frozen, driver=_METHOD)
+def _run_payload(mf, frozen, *, correlation_auxbasis=None):
+    return run_payload(mf, frozen, driver=_METHOD,
+        **basis_kwargs(correlation_auxbasis))
 
 
 def _budget(controls, effective, static, groups):
@@ -86,9 +88,10 @@ def _validate_budget(budget, controls, static, groups):
         raise ValueError("packet sampling budget does not match grouped controls")
 
 
-def _run_identity(mf, static, groups, *, scientific_payload=None):
+def _run_identity(mf, static, groups, *, scientific_payload=None, correlation_auxbasis=None):
     if scientific_payload is None:
-        scientific_payload = _run_payload(mf, static.frozen)
+        scientific_payload = _run_payload(mf, static.frozen,
+            **basis_kwargs(correlation_auxbasis))
     revision, dirty = revision_status()
     return {"checkpoint_id": scientific_digest(static),
             "molecular_fingerprint": scientific_digest(scientific_payload),
@@ -96,11 +99,12 @@ def _run_identity(mf, static, groups, *, scientific_payload=None):
             "code_revision": revision, "dirty_worktree": dirty}
 
 
-def _packet_metadata(mf, static, group_id, group, inputs, groups, budget, *, identity=None):
+def _packet_metadata(mf, static, group_id, group, inputs, groups, budget, *, identity=None,
+                     correlation_auxbasis=None):
     fragment = static.fragments[group.representative_index]
     candidates = [int(static.fragments[i].iao_indices[0]) for i in fragment.strong_fragments]
     if identity is None:
-        identity = _run_identity(mf, static, groups)
+        identity = _run_identity(mf, static, groups, correlation_auxbasis=correlation_auxbasis)
     return {
         "schema_version": 1, "method": "mp2", "energy_kind": _ENERGY_KIND,
         "fragment_id": group.representative_index, "group_id": group_id,
@@ -116,7 +120,9 @@ def _packet_metadata(mf, static, group_id, group, inputs, groups, budget, *, ide
         "orbital_order": {"occupied": "saved Boys candidates, metric Cholesky before Fock diagonalization",
                           "virtual": "saved PAO anchors, metric Cholesky before Fock diagonalization"},
         "auxiliary_order": {"atoms": numpy.asarray(fragment.extended_atoms).tolist(),
-                            "auxbasis": str(mf.with_df.auxbasis)},
+                            "auxbasis": str(mf.with_df.auxbasis if correlation_auxbasis is None
+                                            else correlation_auxbasis)},
+        **basis_kwargs(correlation_auxbasis),
         **identity,
         "boys_domain_model": "local_selector_v1", "budget": budget,
         "domain_options": {"support": "finite", "lo_type": "boys",
@@ -127,17 +133,19 @@ def _packet_metadata(mf, static, group_id, group, inputs, groups, budget, *, ide
 
 
 def _validate_packet_identity(mf, static, group_id, group, inputs, metadata, controls, groups,
-                              *, identity=None):
+                              *, identity=None, correlation_auxbasis=None):
     _validate_budget(metadata.get("budget"), controls, static, groups)
     expected = _packet_metadata(mf, static, group_id, group, inputs, groups,
-                                metadata["budget"], identity=identity)
+                                metadata["budget"], identity=identity,
+                                correlation_auxbasis=correlation_auxbasis)
     for field, value in expected.items():
         if field not in ("code_revision", "dirty_worktree") and canonical_json(metadata.get(field)) != canonical_json(value):
             raise ValueError(f"request {field} does not match replay")
 
 
 @memory_calculation
-def export_run(mf, static, workdir, *, controls, reporter=None, merge_identical=True):
+def export_run(mf, static, workdir, *, controls, reporter=None, merge_identical=True,
+               correlation_auxbasis=None):
     """Export one selected MP2 packet per exact group and allocate once."""
     if not isinstance(static, DomainSelections):
         raise TypeError("static must be STC DomainSelections")
@@ -145,12 +153,13 @@ def export_run(mf, static, workdir, *, controls, reporter=None, merge_identical=
         raise ValueError("export requires an explicit frozen-space setting")
     from .driver import _driver_controls, _validate_static, _validate_reference
     _validate_static(static)
-    _validate_reference(mf, static)
+    correlation = basis_kwargs(correlation_auxbasis)
+    _validate_reference(mf, static, **correlation)
     controls = _driver_controls(controls, scope="domain")
     groups = build_domain_groups(static, merge_identical=merge_identical)
     effective = allocate_domain_controls(controls, len(groups))
     budget = _budget(controls, effective, static, groups)
-    scientific_payload = _run_payload(mf, static.frozen)
+    scientific_payload = _run_payload(mf, static.frozen, **correlation)
     identity = _run_identity(mf, static, groups, scientific_payload=scientific_payload)
     checkpoint = RestartManager(workdir, method=_METHOD,
         scientific_payload=scientific_payload, initialize=True)
@@ -161,14 +170,16 @@ def export_run(mf, static, workdir, *, controls, reporter=None, merge_identical=
             "controls": effective, "merge_identical": merge_identical})
         common = rebuild_domain_data(mf, static)
         rows = []
+        from ._workflow import packet_auxiliary_size
+        naux = packet_auxiliary_size(mf, **correlation) if groups else None
         for group_id, group in enumerate(groups):
             fragment = static.fragments[group.representative_index]
             nocc = len(fragment.strong_occ_metric_keep)
             nvir = len(fragment.strong_virtual.metric_keep)
-            check_memory(mf, nocc, nvir)
-            inputs = prepare_boys_group_inputs(mf, common, static, group)
+            check_memory(mf, nocc, nvir, naux=naux, **correlation)
+            inputs = prepare_boys_group_inputs(mf, common, static, group, **correlation)
             metadata = _packet_metadata(mf, static, group_id, group, inputs, groups, budget,
-                                        identity=identity)
+                                        identity=identity, **correlation)
             write_input(Path(workdir) / f"fragment_{group_id:04d}" / "input.h5", inputs, metadata, effective)
             rows.append({"fragment_id": group_id, "fragment_indices": group.fragment_indices,
                          "target_indices": group.target_indices, "ed_ao": len(fragment.extended_ao_indices),
@@ -182,12 +193,13 @@ def export_run(mf, static, workdir, *, controls, reporter=None, merge_identical=
         checkpoint.close()
 
 
-def load_static_from_run(mf, workdir, *, frozen, controls=None):
+def load_static_from_run(mf, workdir, *, frozen, controls=None, correlation_auxbasis=None):
     """Deserialize STC selections and validate saved grouping and budget."""
     if frozen is None:
         raise ValueError("import requires an explicit frozen-space setting")
     checkpoint = RestartManager(workdir, resume=True, method=_METHOD,
-        scientific_payload=_run_payload(mf, frozen), initialize=False)
+        scientific_payload=_run_payload(mf, frozen,
+            **basis_kwargs(correlation_auxbasis)), initialize=False)
     try:
         static = checkpoint.load_static(expected_type=DomainSelections)
         if static is None:
@@ -219,7 +231,8 @@ def load_disk_packet(workdir, fragment_id):
 
 def imported_value_and_grad(mol, build_mf, static, packet_loader, *,
                             fragment_ids=None, include_hf=True,
-                            include_weak=True, merge_identical=True):
+                            include_weak=True, merge_identical=True,
+                            correlation_auxbasis=None):
     """Replay saved grouped three-tensor MP2 bars, then weak/common/SCF response.
 
     Fragment IDs identify exported jobs. Replay consumes effective controls
@@ -229,7 +242,9 @@ def imported_value_and_grad(mol, build_mf, static, packet_loader, *,
         raise TypeError("static must be STC DomainSelections")
     if not callable(packet_loader):
         raise TypeError("packet_loader must be callable")
-    from .driver import _coordinate_only, _validate_static, _validate_reference
+    from .driver import (_coordinate_only, _validate_static, _validate_reference,
+                         _mp2_df_scope, _finish_mp2_df)
+    correlation = basis_kwargs(correlation_auxbasis)
     _coordinate_only(mol)
     _validate_static(static)
     groups = build_domain_groups(static, merge_identical=merge_identical)
@@ -242,8 +257,8 @@ def imported_value_and_grad(mol, build_mf, static, packet_loader, *,
     with (config_update("pyscfad_scf_implicit_diff", True),
           config_update("pyscfad_scf_first_order_custom", False)):
         mf, scf_pullback = jax.vjp(lambda m: fix_restart_mo_phases(build_mf(m)), mol)
-    _validate_reference(mf, static)
-    identity = _run_identity(mf, static, groups)
+    _validate_reference(mf, static, **correlation)
+    identity = _run_identity(mf, static, groups, **correlation)
     common, common_pullback = jax.vjp(lambda m: rebuild_domain_data(m, static), mf)
     mf_bar, common_bar = zero_term_cotangents(mf, common)
     energy = np.zeros((), dtype=common.s1e.dtype)
@@ -252,15 +267,19 @@ def imported_value_and_grad(mol, build_mf, static, packet_loader, *,
         group = groups[group_id]
         saved, metadata, controls, result = packet_loader(group_id)
         _validate_packet_identity(mf, static, group_id, group, saved, metadata, controls, groups,
-                                  identity=identity)
+                                  identity=identity, **correlation)
         control_identity = canonical_json({"controls": controls, "budget": metadata["budget"]})
         if run_controls is not None and control_identity != run_controls:
             raise ValueError("packet controls or budget differ within one run")
         run_controls = control_identity
         validate_result(result, saved, metadata, controls=controls)
-        bars = pullback_inputs(lambda m, c: prepare_boys_group_inputs(m, c, static, group),
-                               (mf, common), saved, result, replay_atol=1e-9)
-        mf_bar, common_bar = jax.tree_util.tree_map(add_cotangent, (mf_bar, common_bar), bars)
+        with _mp2_df_scope({"mf": mf, "correlation_auxbasis": correlation_auxbasis},
+                           static.fragments[group.representative_index].extended_atoms) as shared:
+            bars = pullback_inputs(lambda m, c: prepare_boys_group_inputs(m, c, static, group,
+                                                                        **correlation),
+                                   (mf, common), saved, result, replay_atol=1e-9)
+            mf_bar, common_bar = jax.tree_util.tree_map(add_cotangent, (mf_bar, common_bar), bars)
+            mf_bar = _finish_mp2_df(shared, mf_bar)
         energy += np.asarray(result["energy"])
         del saved, result, bars
         gc.collect()

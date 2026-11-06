@@ -12,10 +12,12 @@ import numpy
 from pyscfad import numpy as np
 
 from . import driver
+from ._df_basis import basis_kwargs
 from ._mpi import (
     _broadcast_array_tree, _build_worker, _check_mpi_thread_support,
     _collect_tree_schema, _collective_call, _error, _raise_if_any_rank_failed,
     _reference_signature, _validate_shared_reference, tree_sum_to_root,
+    _install_correlation_config,
 )
 from ._selection import build_domain_groups
 from ._workflow import allocate_domain_controls
@@ -100,10 +102,11 @@ def _run_jobs(initializer, worker_initializer, comm, *, with_grad,
                        fragment_indices=indices)
         options.update(state.get('cc_solver_options', {}))
         return (static, baseline, matrix, groups, state['weak_pairs'], options,
-                _reference_signature(state['mf']))
+                _reference_signature(state['mf']),
+                {'correlation_auxbasis': state.get('correlation_auxbasis')})
 
     metadata = driver._root_call(comm, rank, root_metadata, 'CC owner work selection')
-    static, baseline, matrix, groups, pairs, options, signature = comm.bcast(metadata, root=0)
+    static, baseline, matrix, groups, pairs, options, signature, correlation = comm.bcast(metadata, root=0)
     shared = driver._root_call(comm, rank, lambda: {
         'canonical': {name: getattr(state['mf'], name)
                       for name in ('mo_coeff', 'mo_energy', 'mo_occ', 'e_tot')},
@@ -120,9 +123,11 @@ def _run_jobs(initializer, worker_initializer, comm, *, with_grad,
             state = dict(mf=mf, common=jax.tree_util.tree_map(np.asarray, payload['common']),
                          static=static.mp2_static, common_pullback=None,
                          scf_pullback=None, weak_pairs=pairs)
+        _install_correlation_config(state, correlation)
         _validate_shared_reference(state['mf'], state['common'], payload['canonical'],
                                    payload['common'], signature, static.mp2_static,
-                                   with_grad=with_grad)
+                                   with_grad=with_grad,
+                                   **basis_kwargs(state.get('correlation_auxbasis')))
         state.update(energy=np.zeros((), dtype=state['common'].s1e.dtype),
                      variance=0., baseline_energy=0., weak_energy=0.)
         # Preserve the live root trees already allocated by driver._initialize.

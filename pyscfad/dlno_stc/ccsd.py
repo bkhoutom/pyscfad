@@ -20,6 +20,8 @@ from ._memory import memory_calculation
 from ._selection import (DomainSelections, _physical_groups, _strong_preparation_key,
                          build_domain_groups)
 from ._workflow import allocate_domain_controls
+from ._df_basis import (basis_kwargs, basis_identity, selection_auxbasis,
+                        validate_selection_basis)
 from .adjoint import apply_input_pullback
 from .controls import (normalize_matrix_controls, normalize_triples_controls,
                        DEFAULT_TRIPLES_TRACE_EXPONENT)
@@ -53,6 +55,7 @@ class CCSDSelections:
     schema_version: int = CC_SELECTIONS_SCHEMA_VERSION
     mp2_fragment_energies: tuple | None = None
     deferred_selection: dict | None = None
+    correlation_basis_identity: str | None = None
 
     @property
     def mp2_static(self):
@@ -294,9 +297,11 @@ def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_v
                             baseline_controls, matrix_controls,
                             internal_rank_threshold=1e-6, merge_identical=True, fragment_indices=None,
                             smooth=True, smooth_laplace_points=10, single_pass=True,
-                            lis_space='domain'):
+                            lis_space='domain', correlation_auxbasis=None):
     """Select physical-fragment LIS ranks from explicit D or W cutoffs and controls.
 
+    Use the run's ``correlation_auxbasis`` for D/W factors. ``None`` uses the
+    SCF fit, or inherits the fit inside a driver-owned selection callback.
     ``mp2_static`` is a concrete Boys ``DomainSelections``. D and W use
     separately supplied absolute-eigenvalue cutoffs, with no conversion.
     ``fragment_indices`` selects only those LIS ranks; unselected entries
@@ -327,6 +332,10 @@ def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_v
     Resident H_ED reuse is the default for energies and gradients; set
     PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE=direct for regeneration.
     """
+    correlation_auxbasis = selection_auxbasis(mf, correlation_auxbasis)
+    validate_selection_basis(mf, mp2_static, correlation_auxbasis)
+    identity = (None if correlation_auxbasis is None else
+                basis_identity(mf, correlation_auxbasis))
     from .lis import LISSelections, _validate_thresholds, _validate_lis_space
     _validate_lis_space(lis_space)
     if not isinstance(smooth, (bool, numpy.bool_)):
@@ -349,8 +358,10 @@ def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_v
             lis_space=lis_space)
         return CCSDSelections(lis, _scientific_identity(baseline, matrix),
             deferred_selection=dict(indices=tuple(indices), smooth=bool(smooth),
-                smooth_laplace_points=smooth_laplace_points))
-    state = driver._initialize(mf, mp2_static, baseline, with_grad=False)
+                smooth_laplace_points=smooth_laplace_points),
+            correlation_basis_identity=identity)
+    state = driver._initialize(mf, mp2_static, baseline, with_grad=False,
+                               **basis_kwargs(correlation_auxbasis))
     groups = build_domain_groups(mp2_static, merge_identical=merge_identical)
     driver.lib.logger.info(mf, 'STC CC physical fragments %d; Boys grouping %s; preparation groups %d',
                            len(physical), mp2_static.boys_grouping, len(groups))
@@ -385,7 +396,8 @@ def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_v
                         smooth_frames=tuple(frames) if smooth else None,
                         smooth_grid=tuple(grids) if smooth else None, lis_space=lis_space)
     static = CCSDSelections(lis, _scientific_identity(baseline, matrix),
-                            mp2_fragment_energies=tuple(mp2_energies))
+                            mp2_fragment_energies=tuple(mp2_energies),
+                            correlation_basis_identity=identity)
     for index in indices:
         driver.lib.logger.info(mf, 'STC CC fragment %d; LIS occupied %d; LIS virtual %d',
                                index, *_fragment_dimensions(static, index))
@@ -572,7 +584,7 @@ def _build_solver_lis(mf, common, static, fragment_index, matrices, frame, repre
 def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
                     verbose_imp, ccsd_t, triples_controls=None, with_grad=False,
                     vvvv_direct=False, cc_solver='deterministic', stc_cc_controls=None,
-                    frame=None):
+                    frame=None, correlation_auxbasis=None):
     """Return MP2-LIS, CCSD and triples; stochastic calls also return diagnostics."""
     _validate_shared_frame_triples(static, ccsd_t, stc_cc_controls)
     representative = group.representative_index
@@ -589,7 +601,7 @@ def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
     metadata = {'fragment_index': int(fragment_index),
                 'extended_primary_domain': numpy.asarray(
                     static.mp2_static.fragments[representative].extended_atoms, dtype=numpy.int32)}
-    options = {}
+    options = basis_kwargs(correlation_auxbasis)
     options['active_nocc'] = lis.active_occupied_coeff.shape[1]
     if cc_solver == 'stc':
         from .stc_ccsd import make_solver
@@ -635,7 +647,8 @@ def _run_group(state, static, group, baseline_controls, matrix_controls, *,
         return _run_group_responses(state, static, group, baseline_controls,
                                     matrix_controls, **options)
     atoms = static.mp2_static.fragments[group.representative_index].extended_atoms
-    with _df_shared.reverse_scope(state['mf'], atoms) as shared:
+    with _df_shared.reverse_scope(
+            state['mf'], atoms, **basis_kwargs(state.get('correlation_auxbasis'))) as shared:
         if state.get('common') is not None:
             from ._df_inputs import configure_cache
             configure_cache(shared, static)
@@ -734,7 +747,8 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
                 values = _solve_fragment(mf, common, fragment_static, index, blocks, group,
                                          verbose_imp=verbose_imp, ccsd_t=ccsd_t,
                                          triples_controls=local_triples, with_grad=need_grad,
-                                         vvvv_direct=vvvv_direct, frame=current_frame, **solver_options)
+                                         vvvv_direct=vvvv_direct, frame=current_frame, **solver_options,
+                                         **basis_kwargs(state.get('correlation_auxbasis')))
                 if cc_solver == 'stc' or (ccsd_t and (
                         getattr(getattr(fragment_static, 'lis_static', None), 'smooth_frames', None) is not None or
                         triples_controls is not None and triples_controls['mode'] == 'stochastic')):
@@ -961,9 +975,11 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
            return_components=False,
            merge_identical=True, comm=None, fragment_indices=None, include_baseline=True,
            checkpoint_dir=None, resume=False, parallel_scf_jk=True, vvvv_direct=False,
-           cc_solver='deterministic', stc_cc_controls=None):
+           cc_solver='deterministic', stc_cc_controls=None, correlation_auxbasis=None):
     """Return correlation energy, or total energy with ``include_hf=True``.
 
+    ``correlation_auxbasis`` selects local MP2, D/W and CC fitting; HF/Fock
+    retain the SCF fit. Use the same basis for selection and execution.
     ``return_components=True`` returns ``(energy, CCSDComponents)``. With W,
     strong-domain MP2 energy is read directly from its traces, in deterministic
     and stochastic modes, including fragments without a CC correction. Matrix
@@ -1025,7 +1041,9 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
         triples = _allocate_triples_controls(triples, len(indices), static=static, indices=indices)
         if any(isinstance(x, jax.core.Tracer) for x in jax.tree_util.tree_leaves(mf)):
             raise TypeError('STC CC kernel is forward-only; use value_and_grad')
-        state = driver._initialize(mf, static.mp2_static, baseline, with_grad=False)
+        validate_selection_basis(mf, static, correlation_auxbasis)
+        state = driver._initialize(mf, static.mp2_static, baseline, with_grad=False,
+                                   **basis_kwargs(correlation_auxbasis))
         state['cc_fragment_indices'] = indices
         state['cc_triples_controls'] = triples
         if solver_options:
@@ -1056,9 +1074,11 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
                    return_components=False, merge_identical=True, comm=None, build_static=None,
                    fragment_indices=None, include_baseline=True, checkpoint_dir=None, resume=False,
                    parallel_scf_jk=True, vvvv_direct=False,
-                   cc_solver='deterministic', stc_cc_controls=None):
+                   cc_solver='deterministic', stc_cc_controls=None, correlation_auxbasis=None):
     """Return ``(energy, mol_bar)``; ``mol_bar.coords`` is a nuclear gradient.
 
+    ``correlation_auxbasis`` follows :func:`kernel`; ``build_static`` inherits
+    it on its detached reference. The live SCF DF object remains unchanged.
     Include HF once with ``include_hf=True``. Append ``CCSDComponents`` with
     ``return_components=True``. A force is the negated coordinate gradient.
     ``build_static(mf)`` may select ranks once on the detached SCF reference.
@@ -1116,7 +1136,9 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
         scf_data = scf_data_pullback = prepared_domain = None
         if build_static is not None:
             selected, scf_data, scf_data_pullback, prepared_domain = driver._select_domain_reference(
-                mf, build_static, reuse_weak=include_baseline and not resume)
+                mf, build_static, reuse_weak=include_baseline and not resume,
+                **basis_kwargs(correlation_auxbasis))
+        validate_selection_basis(mf, selected, correlation_auxbasis)
         baseline, matrix = _validate_run(selected, baseline_controls, matrix_controls, matrix_kind)
         _validate_shared_frame_triples(selected, ccsd_t, solver_options.get('stc_cc_controls'))
         indices = (_fragment_indices(selected, fragment_indices)
@@ -1128,7 +1150,8 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
         state = driver._initialize(mf, selected.mp2_static, baseline, with_grad=True,
                                    scf_pullback=scf_pullback, scf_data=scf_data,
                                    scf_data_pullback=scf_data_pullback,
-                                   prepared_domain=prepared_domain)
+                                   prepared_domain=prepared_domain,
+                                   **basis_kwargs(correlation_auxbasis))
         state['cc_fragment_indices'] = indices
         state['cc_triples_controls'] = triples
         if solver_options:

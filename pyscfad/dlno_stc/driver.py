@@ -6,7 +6,7 @@
 """
 
 from functools import partial
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, ExitStack
 import gc
 import math
 import warnings
@@ -41,6 +41,7 @@ from .domain import (
 from .parallel import run_backend
 from .prepare import prepare_system_inputs, prepare_boys_group_inputs
 from .protocol import ARRAY_NAMES
+from ._df_basis import basis_kwargs, can_reuse_scf_df, validate_selection_basis
 
 
 def _root_call(comm, rank, function, phase):
@@ -133,7 +134,8 @@ def _validate_controls(controls):
         raise ValueError("virtual_block_size must be a positive integer")
 
 
-def _validate_reference(mf, static):
+def _validate_reference(mf, static, *, correlation_auxbasis=None):
+    validate_selection_basis(mf, static, correlation_auxbasis)
     _system_active_indices(mf, static.frozen)
     for name, expected in zip(
         ("active_occ_indices", "active_vir_indices", "pao_projected_out_indices"),
@@ -158,7 +160,8 @@ def _coordinate_only(mol):
         )
 
 
-def _select_domain_reference(mf, build_static, *, reuse_weak=True):
+def _select_domain_reference(mf, build_static, *, reuse_weak=True,
+                             correlation_auxbasis=None):
     """Share live S/F with a callback through its detached numerical reference."""
     with resource_profile.section('stc.domain.scf_data_prepare'):
         scf_data, scf_data_pullback = jax.vjp(build_scf_data, mf)
@@ -173,11 +176,13 @@ def _select_domain_reference(mf, build_static, *, reuse_weak=True):
         # particular, it must never become metadata on the live SCF pytree.
         reference._stc_scf_data = host_data
         reference._stc_selection_response = prepared
+        reference._stc_correlation_auxbasis = correlation_auxbasis
         try:
             return build_static(reference)
         finally:
             reference.__dict__.pop('_stc_scf_data', None)
             reference.__dict__.pop('_stc_selection_response', None)
+            reference.__dict__.pop('_stc_correlation_auxbasis', None)
 
     with resource_profile.section('stc.domain.selection'):
         selected = stop_trace(select)(mf)
@@ -207,10 +212,11 @@ def _weak_energy_and_grad(state, static, pairs):
 
 
 def _initialize(mf, static, controls, *, with_grad, scf_pullback=None,
-                scf_data=None, scf_data_pullback=None, prepared_domain=None):
+                scf_data=None, scf_data_pullback=None, prepared_domain=None,
+                correlation_auxbasis=None):
     _validate_static(static)
     _validate_controls(controls)
-    _validate_reference(mf, static)
+    _validate_reference(mf, static, **basis_kwargs(correlation_auxbasis))
     configure_compilation_cache()
     pending = None
     with resource_profile.section('stc.domain.common_prepare'):
@@ -233,7 +239,8 @@ def _initialize(mf, static, controls, *, with_grad, scf_pullback=None,
             common = rebuild_domain_data(mf, static, scf_data=scf_data)
             common_pullback = mf_bar = common_bar = None
         jax.block_until_ready(common)
-    return {"mf": mf, "static": static, "common": common, "common_pullback": common_pullback,
+    return {"mf": mf, "correlation_auxbasis": correlation_auxbasis, "static": static,
+            "common": common, "common_pullback": common_pullback,
             "scf_pullback": scf_pullback, "mf_bar": mf_bar, "common_bar": common_bar,
             "energy": np.zeros((), dtype=common.s1e.dtype), "variance": 0.0,
             "weak_pairs": tuple(weak_pair_indices(static)), "_prepared_weak": pending}
@@ -254,12 +261,14 @@ def _prepare(state, static, group, controls, with_grad, *, return_frame=False):
     check_domain_memory(state["mf"], static, group.representative_index,
                         with_grad=with_grad,
                         virtual_block_size=controls.get("virtual_block_size", 16),
-                        **memory_controls)
+                        **memory_controls, **basis_kwargs(state.get("correlation_auxbasis")))
     if return_frame:
         prepare = lambda mf_, common_: prepare_boys_group_inputs(
-            mf_, common_, static, group, return_frame=True)
+            mf_, common_, static, group, return_frame=True,
+            **basis_kwargs(state.get("correlation_auxbasis")))
     else:
-        prepare = lambda mf_, common_: prepare_boys_group_inputs(mf_, common_, static, group)
+        prepare = lambda mf_, common_: prepare_boys_group_inputs(
+            mf_, common_, static, group, **basis_kwargs(state.get("correlation_auxbasis")))
     with warnings.catch_warnings():
         warnings.filterwarnings("error", message="integral-direct local Lov is unavailable.*",
                                 category=RuntimeWarning)
@@ -337,6 +346,31 @@ def _finish_response(state, energy, mf_bar, *, include_hf):
     return energy, mol_bar
 
 
+def _mp2_df_scope(state, atoms=None):
+    """Retain one direct metric/tape, without allocating a half-transform cache."""
+    from pyscfad.lno import _df_shared
+    mf = state['mf']
+    if not hasattr(mf, 'mol'):
+        return nullcontext()
+    basis = state.get('correlation_auxbasis')
+    if atoms is None:
+        if can_reuse_scf_df(mf, basis):
+            return nullcontext()
+        atoms = numpy.arange(mf.mol.natm, dtype=numpy.int32)
+    return _df_shared.reverse_scope(mf, atoms, **basis_kwargs(basis))
+
+
+def _finish_mp2_df(shared, mf_bar):
+    """Consume deferred integral response once, before the final SCF response."""
+    if shared is not None:
+        with resource_profile.section('stc.mp2.shared_df_integral_pullback'):
+            coords = shared.finish()
+            if mf_bar is not None:
+                mf_bar.mol.coords += np.asarray(coords)
+                jax.block_until_ready(mf_bar.mol.coords)
+    return mf_bar
+
+
 def _run_domain(initializer, static, controls, comm, *, with_grad, include_hf=False,
                 merge_identical=True):
     rank = 0 if comm is None else comm.Get_rank()
@@ -353,31 +387,36 @@ def _run_domain(initializer, static, controls, comm, *, with_grad, include_hf=Fa
     settings = allocate_domain_controls(controls, len(groups)) if rank == 0 else None
     for group in groups:
         fragment_id = group.representative_index
-        with resource_profile.section('stc.domain.prepare'):
-            prepared = _root_call(comm, rank,
-                lambda: _prepare(state, static, group, controls, with_grad),
-                f"group {fragment_id} preparation")
-        metadata = ({"fragment_id": fragment_id, "target_indices": group.target_indices,
-                     "fragment_indices": group.fragment_indices,
-                     "global_target_orbitals": tuple(int(static.frag_lolist[i][0])
-                                                     for i in group.fragment_indices),
-                     "budget": {"total_tolerance": controls.get("energy_tolerance"),
-                                "effective_tolerance": settings.get("energy_tolerance"),
-                                "original_target_count": len(static.fragments),
-                                "group_count": len(groups)}} if rank == 0 else None)
-        with resource_profile.section('stc.domain.native'):
-            result = run_backend(prepared[1] if rank == 0 else None, metadata, settings,
-                                 partial(backend.solve, with_grad=with_grad), comm=comm)
+        with ExitStack() as resources:
+            shared = _root_call(comm, rank, lambda: resources.enter_context(
+                _mp2_df_scope(state, static.fragments[fragment_id].extended_atoms)),
+                f"group {fragment_id} DF setup")
+            with resource_profile.section('stc.domain.prepare'):
+                prepared = _root_call(comm, rank,
+                    lambda: _prepare(state, static, group, controls, with_grad),
+                    f"group {fragment_id} preparation")
+            metadata = ({"fragment_id": fragment_id, "target_indices": group.target_indices,
+                         "fragment_indices": group.fragment_indices,
+                         "global_target_orbitals": tuple(int(static.frag_lolist[i][0])
+                                                         for i in group.fragment_indices),
+                         "budget": {"total_tolerance": controls.get("energy_tolerance"),
+                                    "effective_tolerance": settings.get("energy_tolerance"),
+                                    "original_target_count": len(static.fragments),
+                                    "group_count": len(groups)}} if rank == 0 else None)
+            with resource_profile.section('stc.domain.native'):
+                result = run_backend(prepared[1] if rank == 0 else None, metadata, settings,
+                                     partial(backend.solve, with_grad=with_grad), comm=comm)
 
-        def apply_group():
-            if with_grad:
-                _add_bars(state, *apply_selected_pullback(prepared[2], prepared[0], result))
-            state["energy"] = state["energy"] + result["energy"]
-            state["variance"] += float(result["energy_standard_error"]) ** 2
-            jax.block_until_ready((state["energy"], state["mf_bar"], state["common_bar"]))
+            def apply_group():
+                if with_grad:
+                    _add_bars(state, *apply_selected_pullback(prepared[2], prepared[0], result))
+                state["mf_bar"] = _finish_mp2_df(shared, state["mf_bar"])
+                state["energy"] = state["energy"] + result["energy"]
+                state["variance"] += float(result["energy_standard_error"]) ** 2
+                jax.block_until_ready((state["energy"], state["mf_bar"], state["common_bar"]))
 
-        with resource_profile.section('stc.domain.input_pullback'):
-            _root_call(comm, rank, apply_group, f"group {fragment_id} pullback")
+            with resource_profile.section('stc.domain.input_pullback'):
+                _root_call(comm, rank, apply_group, f"group {fragment_id} pullback")
         del prepared, result, apply_group
         gc.collect()
     if pairs:
@@ -497,7 +536,7 @@ def _serial_scf_pullback(pullback):
 
 
 def _initialize_system(mf, frozen, controls, *, with_grad, scf_pullback=None,
-                       lo_kwargs=None, fock_from_scf=False):
+                       lo_kwargs=None, fock_from_scf=False, correlation_auxbasis=None):
     _validate_controls(controls)
     occupied, virtual = _system_active_indices(mf, frozen)
     requested_fock_from_scf = fock_from_scf
@@ -518,7 +557,8 @@ def _initialize_system(mf, frozen, controls, *, with_grad, scf_pullback=None,
         requested_fock_from_scf=requested_fock_from_scf, fock_from_scf=fock_from_scf,
         degeneracy_fallback=requested_fock_from_scf and not fock_from_scf)
     dtype = mf.mo_coeff.dtype
-    return {"mf": mf, "occupied": occupied, "virtual": virtual,
+    return {"mf": mf, "correlation_auxbasis": correlation_auxbasis,
+            "occupied": occupied, "virtual": virtual,
             "lo_kwargs": lo_kwargs, "fock_from_scf": fock_from_scf,
             "scf_pullback": scf_pullback, "energy": np.zeros((), dtype=dtype),
             "variance": 0.0,
@@ -551,26 +591,6 @@ def _validate_canonical_system(mf):
             f"exceeds {residual_limit:.3g} Eh")
 
 
-def _validate_system_metric(mf):
-    """Require the fitting metric used by system preparation to admit Cholesky."""
-    get_cderi = getattr(mf.with_df, "_get_cderi_source", None)
-    cderi = get_cderi() if get_cderi is not None else mf.with_df._cderi
-    auxmol = getattr(mf.with_df, "auxmol", None) if cderi is not None else None
-    if auxmol is None:
-        auxmol = pyscf_df.addons.make_auxmol(mf.mol.to_pyscf(), mf.with_df.auxbasis)
-    elif hasattr(auxmol, "to_pyscf"):
-        auxmol = auxmol.to_pyscf()
-    metric = auxmol.intor("int2c2e", hermi=1)
-    try:
-        if not numpy.isfinite(metric).all():
-            raise numpy.linalg.LinAlgError("nonfinite metric")
-        numpy.linalg.cholesky(metric)
-    except numpy.linalg.LinAlgError as exc:
-        raise NotImplementedError(
-            "system STC requires a positive-definite auxiliary fitting metric"
-        ) from exc
-
-
 def _prepare_system(state, controls, with_grad):
     memory_controls = ({"mode": "deterministic",
                         "target_batch_size": controls.get("target_batch_size", 1),
@@ -580,8 +600,22 @@ def _prepare_system(state, controls, with_grad):
                         with_grad=with_grad,
                         virtual_block_size=controls.get("virtual_block_size", 16),
                         auxiliary_group_size=controls.get("auxiliary_group_size", 32),
-                        **memory_controls)
-    _validate_system_metric(state["mf"])
+                        **memory_controls, **basis_kwargs(state.get("correlation_auxbasis")))
+    fitting = state["mf"].with_df
+    basis = state.get("correlation_auxbasis")
+    if can_reuse_scf_df(state["mf"], basis):
+        # Eigenvalue fallback drops auxiliary rows. Check an existing source's
+        # rank without rebuilding the metric solely for validation.
+        auxmol = fitting.auxmol
+        if auxmol is None:
+            auxmol = pyscf_df.addons.make_auxmol(state["mf"].mol.to_pyscf(), fitting.auxbasis)
+        if fitting.get_naoaux() != auxmol.nao:
+            raise NotImplementedError(
+                "system STC requires a full-rank cached factor for a positive-definite "
+                "auxiliary fitting metric; cached and auxiliary dimensions differ")
+        # Resolve source compatibility on the concrete reference. Separate
+        # geometry leaves become distinct tracers inside the preparation VJP.
+        basis = None
     # Save discrete labels before building the VJP; rebuild all continuous
     # coefficients inside it. System scope needs no domain selections.
     state["boys_reference"] = select_system_boys_reference(
@@ -594,7 +628,7 @@ def _prepare_system(state, controls, with_grad):
         mf_, state["occupied"], state["virtual"],
         boys_reference=state["boys_reference"],
         virtual_anchor_columns=state["virtual_anchor_columns"],
-        fock_from_scf=state["fock_from_scf"],
+        fock_from_scf=state["fock_from_scf"], **basis_kwargs(basis),
     )
     with warnings.catch_warnings():
         warnings.filterwarnings("error", message="integral-direct local Lov is unavailable.*",
@@ -616,28 +650,32 @@ def _run_system(initializer, controls, comm, *, with_grad, include_hf=False):
     if comm is not None:
         has_work = comm.bcast(has_work, root=0)
     if has_work:
-        with resource_profile.section('stc.system.prepare'):
-            prepared = _root_call(comm, rank, lambda: _prepare_system(state, controls, with_grad),
-                                  "system preparation")
-        with resource_profile.section('stc.system.native'):
-            result = run_backend(
-                prepared[1] if rank == 0 else None, {} if rank == 0 else None,
-                controls if rank == 0 else None,
-                partial(backend.solve, with_grad=with_grad, scope="system"),
-                comm=comm, array_names=ARRAY_NAMES,
-            )
+        with ExitStack() as resources:
+            shared = _root_call(comm, rank, lambda: resources.enter_context(
+                _mp2_df_scope(state)), "system DF setup")
+            with resource_profile.section('stc.system.prepare'):
+                prepared = _root_call(comm, rank, lambda: _prepare_system(state, controls, with_grad),
+                                      "system preparation")
+            with resource_profile.section('stc.system.native'):
+                result = run_backend(
+                    prepared[1] if rank == 0 else None, {} if rank == 0 else None,
+                    controls if rank == 0 else None,
+                    partial(backend.solve, with_grad=with_grad, scope="system"),
+                    comm=comm, array_names=ARRAY_NAMES,
+                )
 
-        def apply_system():
-            if with_grad:
-                # Validate the existing host mirror without compiling many
-                # bounded JAX slices solely for repeated finite-value checks.
-                state["mf_bar"], = apply_full_pullback(prepared[2], prepared[1], result)
-            state["energy"] = state["energy"] + result["energy"]
-            state["variance"] = float(result["energy_standard_error"]) ** 2
-            jax.block_until_ready((state["energy"], state["mf_bar"]))
+            def apply_system():
+                if with_grad:
+                    # Validate the existing host mirror without compiling many
+                    # bounded JAX slices solely for repeated finite-value checks.
+                    state["mf_bar"], = apply_full_pullback(prepared[2], prepared[1], result)
+                state["mf_bar"] = _finish_mp2_df(shared, state["mf_bar"])
+                state["energy"] = state["energy"] + result["energy"]
+                state["variance"] = float(result["energy_standard_error"]) ** 2
+                jax.block_until_ready((state["energy"], state["mf_bar"]))
 
-        with resource_profile.section('stc.system.input_pullback'):
-            _root_call(comm, rank, apply_system, "system pullback")
+            with resource_profile.section('stc.system.input_pullback'):
+                _root_call(comm, rank, apply_system, "system pullback")
         del prepared, result, apply_system
         gc.collect()
     with resource_profile.section('stc.system.response'):
@@ -647,9 +685,12 @@ def _run_system(initializer, controls, comm, *, with_grad, include_hf=False):
 
 @memory_calculation
 def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
-           lo_kwargs=None, merge_identical=True, parallel_scf_jk=True):
+           lo_kwargs=None, merge_identical=True, parallel_scf_jk=True,
+           correlation_auxbasis=None):
     """Return correlation energy on root.
 
+    ``correlation_auxbasis`` overrides local correlation fitting only. Its
+    default ``None`` retains the existing SCF fitting configuration/workflow.
     Domain jobs share identical saved frames by default. ``merge_identical=False``
     runs each singleton separately for diagnostic comparisons.
     With a multi-rank domain communicator, each rank supplies a matching MF
@@ -670,8 +711,8 @@ def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
             raise TypeError("STC kernel is forward-only; use value_and_grad")
         if scope == "system":
             return _initialize_system(mf, frozen, controls, with_grad=False,
-                                      lo_kwargs=lo_kwargs)
-        return _initialize(mf, static, controls, with_grad=False)
+                                      lo_kwargs=lo_kwargs, **basis_kwargs(correlation_auxbasis))
+        return _initialize(mf, static, controls, with_grad=False, **basis_kwargs(correlation_auxbasis))
 
     if scope == "system":
         return _run_system(initialize, controls, comm, with_grad=False)
@@ -697,9 +738,12 @@ def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
 @memory_calculation
 def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
                    controls, comm=None, include_hf=False, lo_kwargs=None, merge_identical=True,
-                   build_static=None, parallel_scf_jk=True):
+                   build_static=None, parallel_scf_jk=True, correlation_auxbasis=None):
     """Return ``(energy, mol_bar)`` on root; worker ranks return ``None``.
 
+    ``correlation_auxbasis`` selects local correlation fitting independently
+    of HF/Fock/SCF response. ``None`` preserves the existing fitting workflow.
+    A selection callback inherits the explicit correlation basis.
     Discrete selections and the Laplace grid are fixed. System scope fixes
     Boys reference labels and complete PAO virtual anchors, while coordinate
     response includes localization, projections, Cholesky orthonormalization,
@@ -766,18 +810,19 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
         if scope == "system":
             return _initialize_system(mf, frozen, controls, with_grad=True,
                                       scf_pullback=scf_pullback, lo_kwargs=lo_kwargs,
-                                      fock_from_scf=True)
+                                      fock_from_scf=True, **basis_kwargs(correlation_auxbasis))
         selected = static
         scf_data = scf_data_pullback = prepared_domain = None
         if build_static is not None:
             # Distributed MP2 already owns endpoint work across ranks. Preserve
             # that executor; CCSD's root-owned weak completion can reuse selection.
             selected, scf_data, scf_data_pullback, prepared_domain = _select_domain_reference(
-                mf, build_static, reuse_weak=comm is None or comm.Get_size() == 1)
+                mf, build_static, reuse_weak=comm is None or comm.Get_size() == 1,
+                **basis_kwargs(correlation_auxbasis))
         return _initialize(mf, selected, controls, with_grad=True,
                            scf_pullback=scf_pullback, scf_data=scf_data,
                            scf_data_pullback=scf_data_pullback,
-                           prepared_domain=prepared_domain)
+                           prepared_domain=prepared_domain, **basis_kwargs(correlation_auxbasis))
 
     if scope == "system":
         return _run_system(initialize, controls, comm, with_grad=True, include_hf=include_hf)

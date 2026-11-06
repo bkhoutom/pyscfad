@@ -48,13 +48,14 @@ def _same_domain(left, right):
 
 
 class LocalDFReverse:
-    def __init__(self, mf, atoms):
+    def __init__(self, mf, atoms, correlation_auxbasis=None):
         from .df import make_local_mol
         from pyscfad.df.addons import make_auxmol
         self.atoms = numpy.asarray(atoms, dtype=numpy.int32)
         self.global_natm = mf.mol.natm
         self.mol = make_local_mol(mf.mol, self.atoms)
-        self.auxmol = make_auxmol(self.mol, mf.with_df.auxbasis)
+        auxbasis = mf.with_df.auxbasis if correlation_auxbasis is None else correlation_auxbasis
+        self.auxmol = make_auxmol(self.mol, auxbasis)
         self.max_memory_mb = float(mf.mol.max_memory)
         self.workspace_mb = float(mf.with_df.max_memory)
         self.terms = []
@@ -254,10 +255,10 @@ class LocalDFReverse:
 
 
 @contextmanager
-def reverse_scope(mf, atoms):
+def reverse_scope(mf, atoms, correlation_auxbasis=None):
     if _ACTIVE.get() is not None:
         raise RuntimeError('Nested local DF reverse scopes are unsupported')
-    scope = LocalDFReverse(mf, atoms)
+    scope = LocalDFReverse(mf, atoms, correlation_auxbasis=correlation_auxbasis)
     token = _ACTIVE.set(scope)
     try:
         yield scope

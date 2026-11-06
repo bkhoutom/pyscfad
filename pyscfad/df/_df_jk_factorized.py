@@ -4,13 +4,10 @@ The input is S, with D=S S.T. Its reverse never constructs the generic
 AO-square density cotangent or the auxiliary-by-AO-pair integral cotangent.
 Coordinate work uses thin occupied factors and one bounded integral pass.
 
-Runtime memory budgets (MiB) can be set with
-``PYSCFAD_FACTOR_PANEL_MEMORY_MB`` (combined panel threshold, default 256)
-and ``PYSCFAD_SOLVE_MEMORY_MB`` (solve workspace target, default 64).
-Finite nonnegative values are accepted; unset or invalid values use the defaults.
-Zero forces disk panels or single-column solve slabs, respectively. In an
-owned serial SCF response, the default panel allowance follows available
-headroom under the user's total memory budget; explicit limits remain caps.
+Retained panels, transformation blocks and solve/read slabs share the DF
+workspace, bounded by total-process headroom. PYSCFAD_FACTOR_PANEL_MEMORY_MB
+and PYSCFAD_SOLVE_MEMORY_MB are optional MiB caps; unset values use the shared
+allowance. The standalone panel helper retains its legacy defaults.
 """
 
 from functools import partial
@@ -32,7 +29,7 @@ from pyscf.gto.mole import AS_RINV_ORIG_ATOM
 
 from pyscfad import numpy as np
 from pyscfad.df import _cderi_vjp
-from pyscfad.df import _jk_memory
+from pyscfad.df import _jk_memory, _response_memory
 from pyscfad.lib._threading import dense_blas_threads, blas_threads
 
 _FACTOR_PANEL_MEMORY_MB = 256.0
@@ -55,19 +52,30 @@ def _memory_mb(name, default):
 
 
 @contextmanager
-def _factor_panels(naux, nao, rank, with_k, *, force_disk=False):
+def _factor_panels(naux, nao, rank, with_k, *, force_disk=False,
+                   workspace=None, reservation=None, scratch_min=0):
     """Keep small thin panels in RAM; spill large ones to owned scratch."""
     if not with_k:
         yield None, None
         return
     shape = (naux, nao * rank)
-    panel_memory = _memory_mb('PYSCFAD_FACTOR_PANEL_MEMORY_MB', _FACTOR_PANEL_MEMORY_MB)
-    if not force_disk and 2 * numpy.prod(shape) * 8 <= panel_memory * 1024**2:
-        yield numpy.empty(shape), numpy.empty(shape)
+    size = 2 * int(numpy.prod(shape)) * 8
+    if workspace is None:
+        budget = _memory_mb('PYSCFAD_FACTOR_PANEL_MEMORY_MB', _FACTOR_PANEL_MEMORY_MB) * 1024**2
     else:
-        # Every later read/solve is a bounded slab. The file is closed and
-        # removed on success or failure, and never contains AO-pair bars.
-        with lib.H5TmpFile() as scratch:
+        budget = workspace.available(panels=True, reserve=scratch_min)
+    with ExitStack() as owned:
+        if workspace is not None:
+            reservation = reservation if reservation is not None else workspace.lease(panels=True)
+            owned.callback(reservation.close)
+        if not force_disk and size <= budget:
+            if reservation is not None:
+                reservation.resize(size)
+            # Do not bind the primal T in this generator: after preparation
+            # only the solved R closure should keep a panel alive.
+            yield numpy.empty(shape), numpy.empty(shape)
+        else:
+            scratch = owned.enter_context(lib.H5TmpFile())
             chunks = (min(naux, 16), min(shape[1], 1024))
             yield (scratch.create_dataset('T', shape, dtype='f8', chunks=chunks),
                    scratch.create_dataset('R', shape, dtype='f8', chunks=chunks))
@@ -174,16 +182,30 @@ class _GeometryContribution:
 
 
 def _prepare_backward(with_j, with_k, factor_response, residual, cotangents, *,
-                      force_disk=False):
+                      force_disk=False, workspace=None, fixed_reservation=None):
     """Return a geometry seed and immediate factor bar; caller closes the seed."""
     dfobj, factors = residual[:2]
     nao, rank = factors.shape
+    naux = dfobj.get_naoaux()
+    workspace = workspace or _response_memory.workspace_for(dfobj)
     resources = ExitStack()
     try:
+        fixed = resources.enter_context(
+            fixed_reservation if fixed_reservation is not None else workspace.lease())
+        fixed.resize(_response_memory.prepare_fixed_bytes(nao, naux, rank))
+        panel_reservation = workspace.lease(panels=True)
+        row_bytes = _response_memory.transform_row_bytes(nao, rank)
+        scratch_min = max(row_bytes * min(16, dfobj.blockdim, naux), 3 * 8 * naux)
         panels = resources.enter_context(_factor_panels(
-            dfobj.get_naoaux(), nao, rank, with_k, force_disk=force_disk))
+            naux, nao, rank, with_k, force_disk=force_disk,
+            workspace=workspace, reservation=panel_reservation, scratch_min=scratch_min))
         contribution, sbar = _prepare_reverse(
-            with_j, with_k, factor_response, (dfobj, factors), cotangents, *panels)
+            with_j, with_k, factor_response, (dfobj, factors), cotangents, *panels,
+            workspace=workspace)
+        panel_reservation.resize(naux * nao * rank * 8
+                                 if with_k and isinstance(panels[1], numpy.ndarray) else 0)
+        fixed.resize(_response_memory.retained_fixed_bytes(nao, naux, rank))
+        contribution.workspace = workspace
         contribution._resources = resources
         return contribution, sbar
     except BaseException:
@@ -199,16 +221,19 @@ def factor_pullback(dfobj, S, G, H, with_j=True, with_k=True):
     if not (with_j or with_k):
         return sbar
     nao = S.shape[0]
-    rows = max(1, min(dfobj.blockdim, int(128 * 1024**2 / (8 * nao * nao))))
-    for packed in dfobj.loop(rows):
-        b = lib.unpack_tril(packed)
-        with dense_blas_threads():
-            t = b @ S
-            if with_j:
-                g = numpy.einsum('ab,pab->p', G, b)
-                sbar += 2 * numpy.einsum('p,par->ar', g, t)
-            if with_k:
-                sbar += 2 * numpy.sum(b @ (H @ t), axis=0)
+    workspace = _response_memory.workspace_for(dfobj)
+    row_bytes = _response_memory.transform_row_bytes(nao, S.shape[1])
+    rows = workspace.block(row_bytes, min(dfobj.blockdim, dfobj.get_naoaux()), alignment=16)
+    with workspace.lease(rows * row_bytes):
+        for packed in dfobj.loop(rows):
+            b = lib.unpack_tril(packed)
+            with dense_blas_threads():
+                t = b @ S
+                if with_j:
+                    g = numpy.einsum('ab,pab->p', G, b)
+                    sbar += 2 * numpy.einsum('p,par->ar', g, t)
+                if with_k:
+                    sbar += 2 * numpy.sum(b @ (H @ t), axis=0)
     return sbar
 
 
@@ -222,38 +247,44 @@ def _reverse(with_j, with_k, factor_response, residual, cotangents, T, Rtilde):
         contribution.close()
 
 
-def _prepare_reverse(with_j, with_k, factor_response, residual, cotangents, T, Rtilde):
+def _prepare_reverse(with_j, with_k, factor_response, residual, cotangents, T, Rtilde,
+                     *, workspace=None):
     dfobj, factors = residual
     S = numpy.asarray(factors)
     G, H = (numpy.asarray(bar) for bar in cotangents)
     G, H = (G + G.T) * .5, (H + H.T) * .5
     nao, rank = S.shape
     naux = dfobj.get_naoaux()
-    # Bound unpacked AO matrices and their products independently of naux.
-    rows = max(1, min(dfobj.blockdim, int(128 * 1024**2 / (8 * nao * nao))))
+    workspace = workspace or _response_memory.workspace_for(dfobj)
+    row_bytes = _response_memory.transform_row_bytes(nao, rank)
+    rows = workspace.block(row_bytes, min(dfobj.blockdim, naux), alignment=16)
+    _cderi_vjp._profile_msg(
+        f'DF response transform rows={rows} workspace_bytes={workspace.limit} '
+        f'retained_bytes={workspace.used} scratch_bytes={rows * row_bytes}')
     Sbar = numpy.zeros_like(S) if factor_response else None
     q = numpy.zeros(naux)
     g = numpy.zeros(naux)
     end = 0
-    for packed in dfobj.loop(rows):
-        begin, end = end, end + len(packed)
-        B = lib.unpack_tril(packed)
-        with dense_blas_threads():
-            t = B @ S
-            if with_j:
-                q[begin:end] = numpy.einsum('ar,par->p', S, t)
-                g[begin:end] = numpy.einsum('ab,pab->p', G, B)
-                if factor_response:
-                    Sbar += 2 * numpy.einsum('p,par->ar', g[begin:end], t)
+    with workspace.lease(rows * row_bytes):
+        for packed in dfobj.loop(rows):
+            begin, end = end, end + len(packed)
+            B = lib.unpack_tril(packed)
+            with dense_blas_threads():
+                t = B @ S
+                if with_j:
+                    q[begin:end] = numpy.einsum('ar,par->p', S, t)
+                    g[begin:end] = numpy.einsum('ab,pab->p', G, B)
+                    if factor_response:
+                        Sbar += 2 * numpy.einsum('p,par->ar', g[begin:end], t)
+                if with_k:
+                    r = H @ t
+                    if factor_response:
+                        Sbar += 2 * numpy.sum(B @ r, axis=0)
+                    T[begin:end] = t.reshape(end - begin, -1)
+                    Rtilde[begin:end] = r.reshape(end - begin, -1)
+            del B, t, packed
             if with_k:
-                r = H @ t
-                if factor_response:
-                    Sbar += 2 * numpy.sum(B @ r, axis=0)
-                T[begin:end] = t.reshape(end - begin, -1)
-                Rtilde[begin:end] = r.reshape(end - begin, -1)
-        del B, t, packed
-        if with_k:
-            del r
+                del r
     if end != naux:
         raise RuntimeError('DF occupied reverse did not cover all auxiliary rows')
 
@@ -268,7 +299,7 @@ def _prepare_reverse(with_j, with_k, factor_response, residual, cotangents, T, R
         with dense_blas_threads():
             low = scipy.linalg.cholesky(metric, lower=True, check_finite=False)
         del metric
-    lowbar = numpy.zeros_like(low)
+    lowbar = numpy.zeros_like(low, order='F')
     a = b = numpy.zeros(naux)
     if with_j:
         with dense_blas_threads():
@@ -280,17 +311,22 @@ def _prepare_reverse(with_j, with_k, factor_response, residual, cotangents, T, R
     if with_k:
         # Each triangular solve requires all auxiliary rows but only a
         # bounded column slab; overwrite the R panels with L^-T R.
-        solve_memory = _memory_mb('PYSCFAD_SOLVE_MEMORY_MB', _SOLVE_MEMORY_MB)
-        width = max(1, int(solve_memory * 1024**2 / (3 * 8 * naux)))
-        for begin in range(0, Rtilde.shape[1], width):
-            end = min(begin + width, Rtilde.shape[1])
-            with dense_blas_threads():
-                z = scipy.linalg.solve_triangular(
-                    low.T, numpy.asarray(Rtilde[:, begin:end]),
-                    lower=False, check_finite=False)
-                lowbar -= 2 * z @ numpy.asarray(T[:, begin:end]).T
-            Rtilde[:, begin:end] = z
-            del z
+        width = workspace.solve_width(naux, Rtilde.shape[1])
+        _cderi_vjp._profile_msg(
+            f'DF response solve columns={width} disk={not isinstance(Rtilde, numpy.ndarray)} '
+            f'available_bytes={workspace.available()}')
+        with workspace.lease(3 * 8 * naux * min(width, Rtilde.shape[1])):
+            for begin in range(0, Rtilde.shape[1], width):
+                end = min(begin + width, Rtilde.shape[1])
+                with dense_blas_threads():
+                    z = scipy.linalg.solve_triangular(
+                        low.T, numpy.asarray(Rtilde[:, begin:end]),
+                        lower=False, check_finite=False)
+                    lowbar = scipy.linalg.blas.dgemm(
+                        -2., z, numpy.asarray(T[:, begin:end]).T,
+                        beta=1., c=lowbar, overwrite_c=1)
+                Rtilde[:, begin:end] = z
+                del z
     del low, q, g
 
     with dense_blas_threads():
@@ -425,35 +461,66 @@ def contract_geometry(contributions):
 
     packed_density = all(c.fill_packed_density_aux_block is not None
                          for c in contributions)
-    molbar, auxbar = _cderi_vjp._int3c_mo_deriv_coords_vjp_from_z_reader(
-        dfobj.mol, auxmol, None, None, (0, nao, 0, nao),
-        int3c=dfobj.mol._add_suffix('int3c2e'),
-        read_density_aux_block=read_density,
-        fill_packed_density_aux_block=fill_packed_density if packed_density else None,
-    )
+    workspace = getattr(first, 'workspace', None) or _response_memory.workspace_for(dfobj)
+    # Account for contributions prepared independently instead of silently
+    # borrowing the first contribution's unused workspace.
+    with ExitStack() as scratch:
+        for contribution in contributions:
+            if getattr(contribution, 'workspace', None) is not workspace:
+                panel = (0 if contribution.disk_panels else getattr(
+                    contribution, 'retained_panel_bytes',
+                    naux * getattr(contribution, 'compact_panel_columns',
+                                   nao * contribution.rank) * 8))
+                scratch.enter_context(workspace.lease(panel +
+                    _response_memory.retained_fixed_bytes(nao, naux, contribution.rank)))
+        scratch.enter_context(workspace.geometry_buffer(4 * 8 * naux**2))
+        cap = _response_memory.override_bytes('PYSCFAD_DF_INT3C_MO_VJP_BLOCK_MB')
+        available = workspace.available(cap=cap)
+        panel_columns = max(getattr(c, 'mo_panel_columns',
+                            getattr(c, 'compact_panel_columns', nao * c.rank))
+                            for c in contributions)
+        words_per_row = 6 * nao**2 + 3 * nao + 2 * max(0, panel_columns - nao**2)
+        min_rows = max(1, int(numpy.diff(auxmol.ao_loc).max()))
+        if available < min_rows * 8 * words_per_row:
+            raise MemoryError('DF response workspace cannot fit one auxiliary shell for geometry')
+        _cderi_vjp._profile_msg(
+            f'DF response geometry available_bytes={available} retained_bytes={workspace.used}')
+        rows = min(naux, available // (8 * words_per_row))
+        block_bytes = rows * 8 * words_per_row
+        with workspace.lease(block_bytes):
+            molbar, auxbar = _cderi_vjp._int3c_mo_deriv_coords_vjp_from_z_reader(
+                dfobj.mol, auxmol, None, None, (0, nao, 0, nao),
+                int3c=dfobj.mol._add_suffix('int3c2e'),
+                block_memory_mb=block_bytes / 1024**2,
+                # Also constrain rows: the generic helper has a legacy
+                # 1 MiB floor and does not know our retained panel ranks.
+                z_aux_block_max_rows=rows,
+                read_density_aux_block=read_density,
+                fill_packed_density_aux_block=fill_packed_density if packed_density else None,
+            )
 
-    lowbar = first.lowbar.copy()
-    for contribution in contributions[1:]:
-        lowbar += contribution.lowbar
-    int2c = dfobj.mol._add_suffix('int2c2e')
+        lowbar = first.lowbar.copy()
+        for contribution in contributions[1:]:
+            lowbar += contribution.lowbar
+        int2c = dfobj.mol._add_suffix('int2c2e')
 
-    def metric_cholesky(aux):
-        return jax_scipy.linalg.cholesky(aux.intor(int2c, hermi=1), lower=True)
+        def metric_cholesky(aux):
+            return jax_scipy.linalg.cholesky(aux.intor(int2c, hermi=1), lower=True)
 
-    from . import _ooc_cotangent
-    shared_metric = _ooc_cotangent.metric_scope(dfobj)
-    if shared_metric is None:
-        _, metric_pullback = jax.vjp(metric_cholesky, auxmol)
-    else:
-        shared_metric.metric_factor()
-        metric_pullback = shared_metric.metric_pullback
-    _cderi_vjp._zero_strict_upper_inplace(lowbar)
-    auxbar = _cderi_vjp._tree_add(auxbar, metric_pullback(np.asarray(lowbar))[0])
-    leaves, tree = tree_flatten(dfobj)
-    bars = [numpy.zeros_like(leaf) for leaf in leaves]
-    bars[0] = molbar.coords
-    bars[1] = auxbar.coords
-    return tree_unflatten(tree, bars)
+        from . import _ooc_cotangent
+        shared_metric = _ooc_cotangent.metric_scope(dfobj)
+        if shared_metric is None:
+            _, metric_pullback = jax.vjp(metric_cholesky, auxmol)
+        else:
+            shared_metric.metric_factor()
+            metric_pullback = shared_metric.metric_pullback
+        _cderi_vjp._zero_strict_upper_inplace(lowbar)
+        auxbar = _cderi_vjp._tree_add(auxbar, metric_pullback(np.asarray(lowbar))[0])
+        leaves, tree = tree_flatten(dfobj)
+        bars = [numpy.zeros_like(leaf) for leaf in leaves]
+        bars[0] = molbar.coords
+        bars[1] = auxbar.coords
+        return tree_unflatten(tree, bars)
 
 
 get_jk_from_occ.defvjp(_forward, _backward, symbolic_zeros=True)

@@ -19,7 +19,7 @@ import scipy.linalg
 from pyscf import lib
 from pyscf.ao2mo import _ao2mo
 
-from pyscfad.df import _cderi_vjp, _df_jk_factorized as factorized
+from pyscfad.df import _cderi_vjp, _response_memory, _df_jk_factorized as factorized
 from pyscfad.lib._threading import dense_blas_threads, blas_threads
 
 
@@ -45,7 +45,7 @@ def _exchange_factors(h):
     return q, signs
 
 
-def prepare_compact(with_j, with_k, residual, cotangents, *, force_disk=False):
+def prepare_compact(with_j, with_k, residual, cotangents, *, force_disk=False, workspace=None, fixed_reservation=None):
     """Return an owned compact geometry contribution, or None for fallback."""
     if not (with_j or with_k):
         return None
@@ -79,12 +79,24 @@ def prepare_compact(with_j, with_k, residual, cotangents, *, force_disk=False):
     if naux == 0:
         return None
 
+    workspace = workspace or _response_memory.workspace_for(dfobj)
     resources = ExitStack()
     try:
+        fixed = resources.enter_context(
+            fixed_reservation if fixed_reservation is not None else workspace.lease())
+        fixed.resize(_response_memory.prepare_fixed_bytes(nao, naux, occupied_rank))
+        panel_reservation = workspace.lease(panels=True)
+        scratch_min = max(_response_memory.transform_row_bytes(nao, occupied_rank) *
+                          min(16, dfobj.blockdim, naux), 3 * 8 * naux)
         p_panel, w_panel = resources.enter_context(factorized._factor_panels(
-            naux, exchange_rank, occupied_rank, active_k, force_disk=force_disk))
+            naux, exchange_rank, occupied_rank, active_k, force_disk=force_disk,
+            workspace=workspace, reservation=panel_reservation, scratch_min=scratch_min))
         contribution = _prepare(
-            dfobj, s, g, q_factor, signs, with_j, p_panel, w_panel)
+            dfobj, s, g, q_factor, signs, with_j, p_panel, w_panel, workspace)
+        panel_reservation.resize(naux * exchange_rank * occupied_rank * 8
+                                 if active_k and isinstance(w_panel, numpy.ndarray) else 0)
+        fixed.resize(_response_memory.retained_fixed_bytes(nao, naux, occupied_rank))
+        contribution.workspace = workspace
         contribution._resources = resources
         return contribution
     except BaseException:
@@ -92,7 +104,7 @@ def prepare_compact(with_j, with_k, residual, cotangents, *, force_disk=False):
         raise
 
 
-def _prepare(dfobj, s, g, q_factor, signs, with_j, p_panel, w_panel):
+def _prepare(dfobj, s, g, q_factor, signs, with_j, p_panel, w_panel, workspace):
     nao, occupied_rank = s.shape
     naux, exchange_rank = dfobj.get_naoaux(), len(signs)
     active_k = exchange_rank > 0
@@ -113,21 +125,25 @@ def _prepare(dfobj, s, g, q_factor, signs, with_j, p_panel, w_panel):
         column_signs = numpy.repeat(signs, occupied_rank)
     # The native projection consumes packed rows directly; no AO-square B block.
     npair = nao * (nao + 1) // 2
-    words_per_row = npair + 2 * exchange_rank * occupied_rank
-    rows = max(1, min(dfobj.blockdim, int(128 * 1024**2 / (8 * max(words_per_row, 1)))))
+    words_per_row = 2 * npair + 4 * exchange_rank * occupied_rank
+    rows = workspace.block(8 * words_per_row, min(dfobj.blockdim, naux), alignment=16)
     end = 0
-    for packed in dfobj.loop(rows):
-        begin, end = end, end + len(packed)
-        if with_j:
-            with dense_blas_threads():
-                vectors = packed @ jd_columns
-            g_vec[begin:end], q_vec[begin:end] = vectors[:, 0], vectors[:, 1]
-        if active_k:
-            projected = _ao2mo.nr_e2(packed, coeff, orbs_slice, aosym='s2')
-            p_panel[begin:end] = projected
-            w_panel[begin:end] = projected * column_signs
+    with workspace.lease(rows * 8 * words_per_row):
+        for packed in dfobj.loop(rows):
+            begin, end = end, end + len(packed)
+            if with_j:
+                with dense_blas_threads():
+                    vectors = packed @ jd_columns
+                g_vec[begin:end], q_vec[begin:end] = vectors[:, 0], vectors[:, 1]
+            if active_k:
+                projected = _ao2mo.nr_e2(packed, coeff, orbs_slice, aosym='s2')
+                p_panel[begin:end] = projected
+                w_panel[begin:end] = projected * column_signs
     if end != naux:
         raise RuntimeError('DF compact reverse did not cover all auxiliary rows')
+    del packed
+    if active_k:
+        del projected
 
     int2c = dfobj.mol._add_suffix('int2c2e')
     metric = numpy.asarray(dfobj.auxmol.intor(int2c, hermi=1))
@@ -144,19 +160,19 @@ def _prepare(dfobj, s, g, q_factor, signs, with_j, p_panel, w_panel):
             lowbar = scipy.linalg.blas.dger(-1., a, g_vec, a=lowbar, overwrite_a=1)
             lowbar = scipy.linalg.blas.dger(-1., b, q_vec, a=lowbar, overwrite_a=1)
     if active_k:
-        budget = factorized._memory_mb('PYSCFAD_SOLVE_MEMORY_MB', factorized._SOLVE_MEMORY_MB)
-        width = max(1, int(budget * 1024**2 / (3 * 8 * naux)))
-        for begin in range(0, w_panel.shape[1], width):
-            end = min(begin + width, w_panel.shape[1])
-            with dense_blas_threads():
-                transformed = scipy.linalg.solve_triangular(
-                    low.T, numpy.asarray(w_panel[:, begin:end]), lower=False,
-                    check_finite=False)
-                lowbar = scipy.linalg.blas.dgemm(
-                    -2., transformed, numpy.asarray(p_panel[:, begin:end]).T,
-                    beta=1., c=lowbar, overwrite_c=1)
-            w_panel[:, begin:end] = transformed
-        del transformed
+        width = workspace.solve_width(naux, w_panel.shape[1])
+        with workspace.lease(3 * 8 * naux * min(width, w_panel.shape[1])):
+            for begin in range(0, w_panel.shape[1], width):
+                end = min(begin + width, w_panel.shape[1])
+                with dense_blas_threads():
+                    transformed = scipy.linalg.solve_triangular(
+                        low.T, numpy.asarray(w_panel[:, begin:end]), lower=False,
+                        check_finite=False)
+                    lowbar = scipy.linalg.blas.dgemm(
+                        -2., transformed, numpy.asarray(p_panel[:, begin:end]).T,
+                        beta=1., c=lowbar, overwrite_c=1)
+                w_panel[:, begin:end] = transformed
+            del transformed
     del low, q_vec, g_vec
     doubled_st = numpy.asarray(2 * s.T, order='C')
 

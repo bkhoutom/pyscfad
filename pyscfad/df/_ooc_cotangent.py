@@ -26,6 +26,7 @@ from pyscf import lib
 from pyscf.gto.mole import AS_RINV_ORIG_ATOM
 
 from pyscfad.lib import _cotangent_buffer
+from pyscfad.df import _response_memory
 
 _scope = ContextVar('pyscfad_ooc_geometry_scope', default=None)
 _capture = ContextVar('pyscfad_ooc_geometry_producers', default=False)
@@ -101,25 +102,32 @@ def producer_scope(obj):
 
 class _RawMOSeed:
     """Own raw transformed factors and their seed until final DF preparation."""
-    def __init__(self, obj, coeff, orbs, output, bar, mask, disk, slab_bytes):
+    def __init__(self, obj, coeff, orbs, output, bar, mask, disk, workspace):
         self.obj, self.orbs, self.mask = obj, tuple(orbs), tuple(mask)
-        self.coeff = numpy.array(coeff, copy=True)
         self.resources = ExitStack()
-        self.disk = disk
-        self.ram_bytes = 0 if disk else output.size*16
         self.closed = False
+        self.coeff = self.output = self.bar = None
+        self.ram_bytes = 0
         try:
+            self.resources.enter_context(workspace.lease(coeff.size * 8))
+            self.coeff = numpy.array(coeff, copy=True)
+            size = output.size * 16
+            disk = disk or size > workspace.available(panels=True, reserve=3 * 8 * output.shape[0])
+            self.disk = disk
+            self.ram_bytes = 0 if disk else size
+            self.resources.enter_context(workspace.lease(self.ram_bytes, panels=True))
             if disk:
                 file = self.resources.enter_context(lib.H5TmpFile())
                 shape = output.shape
                 chunks = (min(shape[0],16), min(shape[1],1024))
                 self.output = file.create_dataset('primal',shape,dtype='f8',chunks=chunks)
                 self.bar = file.create_dataset('cotangent',shape,dtype='f8',chunks=chunks)
-                width = max(1, int(slab_bytes/(2*8*shape[0])))
-                for begin in range(0,shape[1],width):
-                    end = min(begin+width,shape[1])
-                    self.output[:,begin:end] = numpy.asarray(output[:,begin:end])
-                    self.bar[:,begin:end] = numpy.asarray(bar[:,begin:end])
+                width = workspace.solve_width(shape[0], shape[1])
+                with workspace.lease(3 * 8 * shape[0] * min(width, shape[1])):
+                    for begin in range(0,shape[1],width):
+                        end = min(begin+width,shape[1])
+                        self.output[:,begin:end] = numpy.asarray(output[:,begin:end])
+                        self.bar[:,begin:end] = numpy.asarray(bar[:,begin:end])
             else:
                 self.output = numpy.array(output,copy=True)
                 self.bar = numpy.array(bar,copy=True)
@@ -207,6 +215,7 @@ class GeometryScope:
         self.finished = False
         self.automatic_producer = False
         self.low = self.metric_pullback = None
+        self._workspace = None
         self.stats = dict(enabled=enabled, consumers=0, seed_groups=0,
                           geometry_passes=0, disk_contributions=0,
                           compact_contributions=0, compact_exchange_ranks=[],
@@ -214,6 +223,12 @@ class GeometryScope:
                           mo_raw_peak_ram_bytes=0, mo_prepare_seconds=0.,
                           factor_response_seconds=0., prepare_seconds=0.,
                           contract_seconds=0., metric_builds=0, cholesky_builds=0)
+
+    @property
+    def workspace(self):
+        if self._workspace is None:
+            self._workspace = _response_memory.Workspace(self.df_input)
+        return self._workspace
 
     def metric_factor(self):
         if self.low is None:
@@ -247,40 +262,44 @@ class GeometryScope:
                 match['with_j'] |= with_j
                 match['with_k'] |= with_k
         self.stats['seed_groups'] = len(groups)
-        # Reserve at most one shared panel budget across retained contributions.
-        budget = factorized._memory_mb('PYSCFAD_FACTOR_PANEL_MEMORY_MB',
-                                       factorized._FACTOR_PANEL_MEMORY_MB)*1024**2
+        workspace = self.workspace
         answer = jax.tree_util.tree_map(lambda x: x, df_bar)
         with ExitStack() as owned:
             masked = {}
-            retained = 0
+            naux, nao = self.df_input.get_naoaux(), self.df_input.mol.nao
+            # Reserve the mandatory final work and every retained seed before
+            # admitting optional RAM panels. A late seed must not leave the
+            # final contraction without room for even one block.
+            owned.enter_context(workspace.geometry_buffer(4 * 8 * naux**2))
+            raw_fixed = [owned.enter_context(workspace.lease(
+                _response_memory.retained_fixed_bytes(nao, naux,
+                    min(raw.orbs[1]-raw.orbs[0], raw.orbs[3]-raw.orbs[2]))))
+                for raw in self.mo_pending]
+            group_fixed = [owned.enter_context(workspace.lease(
+                _response_memory.retained_fixed_bytes(nao, naux, x['s'].shape[1])))
+                for x in groups]
             started = time.perf_counter()
-            for raw in self.mo_pending:
+            for raw, fixed in zip(self.mo_pending, raw_fixed):
                 from . import _cderi_vjp
-                z_bytes = raw.output.size*8
-                spill = self.force_disk or self.raw_ram_bytes+retained+z_bytes>budget
                 contribution = _cderi_vjp._prepare_outcore_mo_geometry(
-                    raw.obj,raw.coeff,raw.bar,raw.orbs,raw.output,force_disk=spill)
+                    raw.obj,raw.coeff,raw.bar,raw.orbs,raw.output,
+                    force_disk=self.force_disk, workspace=workspace, fixed_reservation=fixed)
                 owned.callback(contribution.close)
                 masked.setdefault(raw.mask,[]).append(contribution)
-                retained += _retained_panel_bytes(contribution)
                 self.stats['disk_contributions'] += int(contribution.disk_panels)
                 self.raw_ram_bytes -= raw.ram_bytes
                 raw.close()
             self.mo_pending.clear()
             self.stats['mo_prepare_seconds'] = time.perf_counter()-started
-            for x in groups:
-                panel_bytes = x['obj'].get_naoaux()*x['s'].size*8 if x['with_k'] else 0
-                # Only solved U survives each preparation. Compact seeds can
-                # retain much less than the conservative allocation estimate.
-                spill = self.force_disk or retained+2*panel_bytes>budget
+            for x, fixed in zip(groups, group_fixed):
                 contribution = None
                 if os.environ.get('PYSCFAD_DF_OOC_COMPACT', '0').lower() in (
                         '1', 'true', 'yes', 'on'):
                     from . import _df_jk_compact
                     contribution = _df_jk_compact.prepare_compact(
                         x['with_j'], x['with_k'], (x['obj'], x['s']),
-                        (x['g'], x['h']), force_disk=spill)
+                        (x['g'], x['h']), force_disk=self.force_disk, workspace=workspace,
+                        fixed_reservation=fixed)
                     if contribution is not None:
                         self.stats['compact_contributions'] += 1
                         self.stats['compact_exchange_ranks'].append(
@@ -288,10 +307,10 @@ class GeometryScope:
                 if contribution is None:
                     contribution, _ = factorized._prepare_backward(
                         x['with_j'], x['with_k'], False, (x['obj'], x['s']),
-                        (x['g'], x['h']), force_disk=spill)
+                        (x['g'], x['h']), force_disk=self.force_disk, workspace=workspace,
+                        fixed_reservation=fixed)
                 owned.callback(contribution.close)
                 masked.setdefault(x['mask'], []).append(contribution)
-                retained += _retained_panel_bytes(contribution,x['with_k'])
                 self.stats['disk_contributions'] += int(contribution.disk_panels)
             self.stats['prepare_seconds'] = time.perf_counter()-started
             started = time.perf_counter()
@@ -303,6 +322,9 @@ class GeometryScope:
                     answer.auxmol = jax.tree_util.tree_map(lambda x,y:x+y,answer.auxmol,bar.auxmol)
                 self.stats['geometry_passes'] += 1
             self.stats['contract_seconds'] = time.perf_counter()-started
+        self.stats['workspace_limit_bytes'] = workspace.limit
+        self.stats['workspace_peak_reserved_bytes'] = workspace.peak
+        self.stats['workspace_final_reserved_bytes'] = workspace.used
         self.pending.clear()
         self.finished = True
         return answer
@@ -393,14 +415,9 @@ def defer_mo_geometry(source_token,cderi_source,mol,auxmol,mo_coeff,orbs_slice,
     obj._cderi_to_save = cderi_source
     if _source_key(obj)!=scope.key:
         return False
-    from . import _df_jk_factorized as factorized
-    budget = factorized._memory_mb('PYSCFAD_FACTOR_PANEL_MEMORY_MB',
-                                  factorized._FACTOR_PANEL_MEMORY_MB)*1024**2
-    workspace = factorized._memory_mb('PYSCFAD_SOLVE_MEMORY_MB',
-                                     factorized._SOLVE_MEMORY_MB)*1024**2
-    disk = scope.force_disk or scope.raw_ram_bytes+saved_output.size*16>budget
     seed = _RawMOSeed(obj,mo_coeff,orbs_slice,saved_output,ybar,
-                      geometry_activity,disk,workspace)
+                      geometry_activity,scope.force_disk,scope.workspace)
+    disk = seed.disk
     scope.mo_pending.append(seed)
     scope.raw_ram_bytes += seed.ram_bytes
     scope.stats['mo_consumers'] += 1

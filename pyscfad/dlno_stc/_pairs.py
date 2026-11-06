@@ -535,7 +535,8 @@ def _grouped_weak_pullback(mf, static, endpoints, originals, linearizations,
 
 
 def weak_pair_energy_and_grad(mf, common, static, *, pairs=None,
-                             prepared_endpoints=None, _grouped_ao_response=False):
+                             prepared_endpoints=None, _grouped_ao_response=False,
+                             _prepared_pairs=None):
     """Reuse orbital pullbacks and replay one AO-moment tape at a time.
 
     Each orbital screen and its reverse rule come from one forward VJP.
@@ -551,6 +552,8 @@ def weak_pair_energy_and_grad(mf, common, static, *, pairs=None,
 
     The selection-owned path may share the raw AO response across endpoints
     with identical ordered supports, retaining only one support's AO tape.
+    Its ``_prepared_pairs`` transfers the screening energy and accumulated
+    endpoint bars, so pair contractions are not evaluated a second time.
     """
     from .adjoint import add_cotangent, zero_term_cotangents
     configure_compilation_cache()
@@ -583,18 +586,26 @@ def weak_pair_energy_and_grad(mf, common, static, *, pairs=None,
                          for index, value in endpoints.items()}
         if resource_profile.enabled():
             jax.block_until_ready((endpoints, endpoint_bars))
-    # The shared pair kernel is one compiled value-and-gradient executable.
-    # Keep its existing call/work intact and report its combined time honestly.
-    with resource_profile.section('stc.cc.weak_pair_value_and_grad', pairs=len(pairs)):
-        for left, right in pairs:
-            value, (left_bar, right_bar) = pair_energy_and_grad(
-                endpoints[left], endpoints[right], static.thresholds.multipole_order)
-            endpoint_bars[left] = jax.tree_util.tree_map(add_cotangent, endpoint_bars[left], left_bar)
-            endpoint_bars[right] = jax.tree_util.tree_map(add_cotangent, endpoint_bars[right], right_bar)
-            energy += value
-            del left_bar, right_bar
-        if resource_profile.enabled():
-            jax.block_until_ready((energy, endpoint_bars))
+    if _prepared_pairs is not None:
+        if _prepared_pairs['pairs'] != tuple(sorted(pairs)):
+            raise ValueError('screening pair response does not match the final weak graph')
+        if set(_prepared_pairs['endpoint_bars']) != set(endpoints):
+            raise ValueError('screening pair response has incompatible endpoints')
+        with resource_profile.section('stc.cc.weak_pair_reuse', pairs=len(pairs)):
+            energy = _prepared_pairs.pop('energy')
+            endpoint_bars = _prepared_pairs.pop('endpoint_bars')
+            _prepared_pairs.clear()
+    else:
+        with resource_profile.section('stc.cc.weak_pair_value_and_grad', pairs=len(pairs)):
+            for left, right in pairs:
+                value, (left_bar, right_bar) = pair_energy_and_grad(
+                    endpoints[left], endpoints[right], static.thresholds.multipole_order)
+                endpoint_bars[left] = jax.tree_util.tree_map(add_cotangent, endpoint_bars[left], left_bar)
+                endpoint_bars[right] = jax.tree_util.tree_map(add_cotangent, endpoint_bars[right], right_bar)
+                energy += value
+                del left_bar, right_bar
+            if resource_profile.enabled():
+                jax.block_until_ready((energy, endpoint_bars))
     with resource_profile.section('stc.domain.weak_pullback', includes_replay=True):
         if _grouped_ao_response:
             bars = _grouped_weak_pullback(
@@ -664,9 +675,76 @@ def _exact_boys_pair_scores(mf, common, static, *, correlation_auxbasis=None):
     return physical
 
 
+def _screen_pair_response(endpoints, static, forced, exact_scores, response):
+    """Classify and differentiate pairs once, keeping one group's temporary bars.
+
+    Atom grouping promotes a whole group pair when any member is strong.
+    Accumulate provisional bars only for that group pair, discarding them if
+    a later member promotes it. Completed weak groups contribute to one compact
+    bar per endpoint; no per-pair response tapes or bars survive the group.
+    """
+    from .adjoint import add_cotangent
+    nfrag = len(endpoints)
+    groups = (static.physical_groups if getattr(static, 'boys_grouping', 'singleton') == 'atom'
+              else tuple((i,) for i in range(nfrag)))
+    if sorted(i for group in groups for i in group) != list(range(nfrag)):
+        raise ValueError('screening response requires a complete disjoint physical-group partition')
+    weak = np.zeros((nfrag, nfrag))
+    retained, accumulated = [], {}
+    energy = jnp.zeros(())
+    order, threshold = static.thresholds.multipole_order, static.thresholds.pair_energy
+    with resource_profile.section('stc.domain.screen_pair_value_and_grad'):
+        for group_index, left_group in enumerate(groups):
+            for right_index, right_group in enumerate(groups[:group_index + 1]):
+                pairs = sorted({tuple(sorted((i, j)))
+                                for i in left_group for j in right_group if i != j})
+                strong = (group_index == right_index or any(forced[i, j] for i, j in pairs)
+                          or (exact_scores is not None and
+                              any(abs(exact_scores[i, j]) > threshold for i, j in pairs)))
+                group_bars, group_pairs = {}, []
+                group_energy = jnp.zeros(())
+                for left, right in pairs:
+                    if forced[left, right]:
+                        continue
+                    if strong:
+                        value = _multipole_pair_energy(endpoints[left], endpoints[right], order)
+                        pair_bars = None
+                    else:
+                        value, pair_bars = pair_energy_and_grad(
+                            endpoints[left], endpoints[right], order)
+                    score = float(value)
+                    if not np.isfinite(score):
+                        raise RuntimeError(f'nonfinite Boys screening pair estimate for targets {left}, {right}')
+                    weak[left, right] = weak[right, left] = score
+                    if exact_scores is None and abs(score) > threshold:
+                        strong = True
+                    if strong:
+                        group_bars.clear()
+                        group_pairs.clear()
+                        group_energy = jnp.zeros(())
+                    else:
+                        for index, bar in zip((left, right), pair_bars):
+                            group_bars[index] = (bar if index not in group_bars else
+                                jax.tree_util.tree_map(add_cotangent, group_bars[index], bar))
+                        group_pairs.append((left, right))
+                        group_energy += value
+                    del pair_bars
+                if not strong:
+                    retained.extend(group_pairs)
+                    energy += group_energy
+                    for index, bar in group_bars.items():
+                        accumulated[index] = (bar if index not in accumulated else
+                            jax.tree_util.tree_map(add_cotangent, accumulated[index], bar))
+                # Bound asynchronous dispatch as well as Python ownership.
+                jax.block_until_ready((energy, accumulated))
+    response.update(pairs=tuple(sorted(retained)), energy=jnp.real(energy),
+                    endpoint_bars=accumulated)
+    return weak
+
+
 def screen_pairs(mf, common, static, model='multipole', force_full_domains=False,
                  *, prepared_endpoints=None, _products_preparation=None, _products=None,
-                 correlation_auxbasis=None):
+                 _pair_response=None, correlation_auxbasis=None):
     """Concrete Boys pair classification on provisional primary selections.
 
     When supplied, ``prepared_endpoints`` is cleared and filled with each
@@ -675,12 +753,19 @@ def screen_pairs(mf, common, static, model='multipole', force_full_domains=False
     :func:`weak_pair_energy_and_grad` after the final strong mask is known.
     Private product inputs belong to the same reference: a preparation carries
     its ambient pullback; plain products serve forward-only selection.
+    ``_pair_response`` receives the final weak energy and compact endpoint bars
+    from the same pair evaluations used for classification.
     """
     model = str(model).lower().replace('_', '-')
     if model not in ('multipole', 'multipole-os', 'os-multipole', 'exact', 'all', 'all-strong'):
         raise ValueError(f"unsupported Boys pair energy model {model!r}")
     if prepared_endpoints is not None:
         prepared_endpoints.clear()
+    if _pair_response is not None:
+        if prepared_endpoints is None:
+            raise ValueError('pair response requires prepared screening endpoints')
+        _pair_response.clear()
+        _pair_response.update(pairs=(), energy=jnp.zeros(()), endpoint_bars={})
     nfrag = len(static.fragments)
     if force_full_domains or static.thresholds.pair_energy <= 0 or model in ('all', 'all-strong'):
         return (np.zeros((nfrag, nfrag)), np.zeros((nfrag, nfrag)),
@@ -751,13 +836,17 @@ def screen_pairs(mf, common, static, model='multipole', force_full_domains=False
                     or separation < static.thresholds.near_pair_distance):
                 forced[left, right] = forced[right, left] = True
                 continue
-            value = float(_multipole_pair_energy(endpoints[left], endpoints[right], order))
-            if not np.isfinite(value):
-                raise RuntimeError(f"nonfinite Boys screening pair estimate for targets {left}, {right}")
-            weak[left, right] = weak[right, left] = value
+            if _pair_response is None:
+                value = float(_multipole_pair_energy(endpoints[left], endpoints[right], order))
+                if not np.isfinite(value):
+                    raise RuntimeError(f"nonfinite Boys screening pair estimate for targets {left}, {right}")
+                weak[left, right] = weak[right, left] = value
     from ._df_basis import basis_kwargs
-    pair = (_exact_boys_pair_scores(mf, common, static, **basis_kwargs(correlation_auxbasis))
-            if model == 'exact' else weak)
+    exact = (_exact_boys_pair_scores(mf, common, static, **basis_kwargs(correlation_auxbasis))
+             if model == 'exact' else None)
+    if _pair_response is not None:
+        weak = _screen_pair_response(endpoints, static, forced, exact, _pair_response)
+    pair = exact if exact is not None else weak
     strong = (np.abs(pair) > static.thresholds.pair_energy) | forced
     strong = strong | strong.T
     np.fill_diagonal(strong, True)

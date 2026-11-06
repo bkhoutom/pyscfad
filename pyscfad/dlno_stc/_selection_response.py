@@ -65,7 +65,7 @@ class SelectionResponse:
             self.products_preparation = _cached_weak_screen_products(common, products)
         return common, parents, products
 
-    def complete_weak(self, static, strong, prepared_endpoints):
+    def complete_weak(self, static, strong, prepared_endpoints, pair_response=None):
         from ._pairs import weak_pair_indices, weak_pair_energy_and_grad
         selected = replace(static, strong_mask=strong)
         pairs = tuple(weak_pair_indices(selected))
@@ -73,10 +73,13 @@ class SelectionResponse:
             with resource_profile.section('stc.domain.selection_weak_response'):
                 result = weak_pair_energy_and_grad(
                     self.mf, self.common, selected, pairs=pairs,
-                    prepared_endpoints=prepared_endpoints, _grouped_ao_response=True)
+                    prepared_endpoints=prepared_endpoints, _grouped_ao_response=True,
+                    _prepared_pairs=pair_response)
                 jax.block_until_ready(result)
             self.pending = (pairs, result)
         prepared_endpoints.clear()
+        if pair_response is not None:
+            pair_response.clear()
         self.products_preparation = None
 
     def bind(self, static):

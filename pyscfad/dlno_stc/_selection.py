@@ -846,20 +846,23 @@ def build_domain_selections(
                               correlation_basis_identity=(basis_identity(mf, correlation_auxbasis)
                                   if model == "exact" and correlation_auxbasis is not None else None))
     endpoints = None
+    pair_response = None
     screening_mf = mf
     if response is not None:
         screening_mf = response.mf
         endpoints = {}
+        pair_response = {}
     pair, weak_pair, forced, strong = screen_pairs(
         screening_mf, common, static, model=model, force_full_domains=force_full_domains,
         **basis_kwargs(correlation_auxbasis),
         **({'prepared_endpoints': endpoints,
+            '_pair_response': pair_response,
             '_products_preparation': response.products_preparation}
            if response is not None else {'_products': products}))
     if boys_grouping == "atom":
         strong = _expand_group_strong_mask(strong, physical_groups)
     if response is not None:
-        response.complete_weak(static, strong, endpoints)
+        response.complete_weak(static, strong, endpoints, pair_response)
     fragments = list(static.fragments)
     strong_frames = {}
     for members in physical_groups:

@@ -33,11 +33,13 @@ class DF(pyscf_df.DF):
     # pylint: disable=redefined-outer-name
     _keys = pyscf_df.DF._keys.union({
         'incore', 'precond_total_memory', 'precond_workspace_memory',
-        'jk_workspace_memory'})
+        'jk_workspace_memory', 'outcore_builder'})
 
     def __init__(self, mol, auxbasis=None, incore=True, **kwargs):
         pyscf_df.DF.__init__(self, mol, auxbasis=auxbasis)
         self.incore = incore
+        # 'direct' writes final-layout panels without the upstream disk copy.
+        self.outcore_builder = 'standard'
         # Optional SCF response budgets in decimal MB. Keep the total process
         # budget distinct from a driver's DF working-memory/block limit.
         # None retains the existing max_memory policy for ordinary callers.
@@ -71,6 +73,9 @@ class DF(pyscf_df.DF):
 
     def build(self):
         log = logger.new_logger(self)
+
+        if self.outcore_builder not in ('standard', 'direct'):
+            raise ValueError("outcore_builder must be 'standard' or 'direct'")
 
         self.check_sanity()
         self.dump_flags()
@@ -116,7 +121,10 @@ class DF(pyscf_df.DF):
             cderi_file = self._cderi_to_save
             cderi_name = cderi_file if isinstance(cderi_file, str) else cderi_file.name
             log.info('_cderi_to_save = %s', cderi_name)
-            outcore.cholesky_eri(
+            builder = outcore
+            if self.outcore_builder == 'direct':
+                from pyscfad.df import direct_outcore as builder
+            builder.cholesky_eri(
                 mol,
                 cderi_file,
                 dataname='j3c',

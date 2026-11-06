@@ -479,3 +479,108 @@ def test_domain_collects_once_after_complete_weak_response(monkeypatch, with_gra
     assert moment_calls == Counter({0: 2 if with_grad else 1,
                                     1: 2 if with_grad else 1,
                                     2: 2 if with_grad else 1})
+
+
+@pytest.mark.parametrize('order', [2, 3, 4])
+@pytest.mark.parametrize('grouped, promote', [(False, False), (True, False), (True, True)])
+def test_screening_pair_value_and_response_are_evaluated_once(monkeypatch, order, grouped, promote):
+    """Reuse scalar pair work too, discarding bars of promoted atom-group pairs."""
+    from pyscfad.dlno_stc._selection import _expand_group_strong_mask
+    mf, common, static, endpoint = _screening_fixture(order)
+    _install_split(monkeypatch, endpoint)
+    static.boys_grouping = 'atom' if grouped else 'singleton'
+    static.physical_groups = ((0, 1), (2,), (3,)) if grouped else tuple((i,) for i in range(4))
+    primal, differentiated = _pairs._multipole_pair_energy, _pairs.pair_energy_and_grad
+    if promote:
+        values = [abs(float(primal(endpoint(mf, common, static, i),
+                                   endpoint(mf, common, static, 2), order))) for i in (0, 1)]
+        assert values[0] < values[1]  # The later pair invalidates already accumulated bars.
+        static.thresholds.pair_energy = sum(values)/2
+    calls = Counter()
+
+    def forward(*args):
+        calls['primal_only'] += 1
+        return primal(*args)
+
+    def joint(*args):
+        calls['value_and_grad'] += 1
+        return differentiated(*args)
+
+    monkeypatch.setattr(_pairs, '_multipole_pair_energy', forward)
+    monkeypatch.setattr(_pairs, 'pair_energy_and_grad', joint)
+    prepared, pair_response = {}, {}
+    _, weak, _, strong = _pairs.screen_pairs(
+        mf, common, static, prepared_endpoints=prepared, _pair_response=pair_response)
+    static.strong_mask = (_expand_group_strong_mask(strong, static.physical_groups)
+                          if grouped else strong)
+    pairs = _pairs.weak_pair_indices(static)
+    assert pair_response['pairs'] == tuple(sorted(pairs))
+    assert calls == Counter(primal_only=1 if grouped else 0,
+                            value_and_grad=2 if grouped else 3)
+    if promote:
+        assert pairs == () and pair_response['endpoint_bars'] == {}
+
+    def direct(m, c):
+        return sum((primal(endpoint(m, c, static, i), endpoint(m, c, static, j), order)
+                    for i, j in pairs), jnp.zeros(()))
+
+    expected, expected_bars = jax.value_and_grad(direct, argnums=(0, 1))(mf, common)
+
+    def forbidden(*args):
+        raise AssertionError('weak pair contraction repeated after screening')
+
+    monkeypatch.setattr(_pairs, 'pair_energy_and_grad', forbidden)
+    monkeypatch.setattr(_pairs, '_multipole_pair_energy', forbidden)
+    actual, actual_bars = _pairs.weak_pair_energy_and_grad(
+        mf, common, static, prepared_endpoints=prepared, _prepared_pairs=pair_response)
+    assert prepared == {} and pair_response == {}
+    np.testing.assert_allclose(actual, sum(weak[i, j] for i, j in pairs), atol=1e-14, rtol=2e-12)
+    np.testing.assert_allclose(actual, expected, atol=1e-14, rtol=2e-12)
+    for got, want in zip(jax.tree_util.tree_leaves(actual_bars), jax.tree_util.tree_leaves(expected_bars)):
+        np.testing.assert_allclose(got, want, atol=1e-13, rtol=2e-11)
+
+
+@pytest.mark.parametrize('correlation_auxbasis', [None, 'cc-pvdz-ri'])
+def test_joint_screening_uses_exact_scores_for_classification(monkeypatch, correlation_auxbasis):
+    mf, common, static, endpoint = _screening_fixture(2)
+    _install_split(monkeypatch, endpoint)
+    exact = np.zeros((4, 4))
+    exact[0, 1] = exact[1, 0] = 2*static.thresholds.pair_energy
+    def exact_scores(*args, **kwargs):
+        assert kwargs == ({} if correlation_auxbasis is None else
+                          {'correlation_auxbasis': 'cc-pvdz-ri'})
+        return exact
+    monkeypatch.setattr(_pairs, '_exact_boys_pair_scores', exact_scores)
+    prepared, response = {}, {}
+    scores, weak, _, static.strong_mask = _pairs.screen_pairs(
+        mf, common, static, model='exact', prepared_endpoints=prepared, _pair_response=response,
+        correlation_auxbasis=correlation_auxbasis)
+    np.testing.assert_array_equal(scores, exact)
+    assert response['pairs'] == ((0, 2), (1, 2))
+    assert abs(weak[0, 1]) < static.thresholds.pair_energy
+    np.testing.assert_allclose(response['energy'], weak[0, 2]+weak[1, 2], atol=1e-14)
+
+
+def test_forced_group_discards_all_pair_response_before_contraction(monkeypatch):
+    mf, common, static, endpoint = _screening_fixture(2)
+    _install_split(monkeypatch, endpoint)
+    static.boys_grouping, static.physical_groups = 'atom', ((0, 1), (2, 3))
+
+    def forbidden(*args):
+        raise AssertionError('a forced-strong group does not need pair gradients')
+
+    monkeypatch.setattr(_pairs, 'pair_energy_and_grad', forbidden)
+    response = {}
+    _pairs.screen_pairs(mf, common, static, prepared_endpoints={}, _pair_response=response)
+    assert response['pairs'] == () and response['endpoint_bars'] == {}
+    assert float(response['energy']) == 0
+
+
+@pytest.mark.parametrize('options', [{'model': 'all'}, {'force_full_domains': True}])
+def test_joint_screening_clears_stale_pair_response_for_all_strong(monkeypatch, options):
+    mf, common, static, endpoint = _screening_fixture(2)
+    _install_split(monkeypatch, endpoint)
+    response = dict(pairs=((0, 1),), energy=jnp.array(99.), endpoint_bars={0: object()})
+    _pairs.screen_pairs(mf, common, static, prepared_endpoints={}, _pair_response=response, **options)
+    assert response['pairs'] == () and response['endpoint_bars'] == {}
+    assert float(response['energy']) == 0

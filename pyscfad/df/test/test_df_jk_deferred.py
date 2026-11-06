@@ -15,6 +15,8 @@ from pyscfad.df import _cderi_vjp, _df_jk_factorized as factorized, incore
 @pytest.fixture
 def problem(tmp_path, monkeypatch):
     monkeypatch.setattr(lib.param, 'TMPDIR', str(tmp_path))
+    # Numerical equivalence is independent of JAX pages retained by prior tests.
+    monkeypatch.setattr(lib, 'current_memory', lambda: (0., 0.))
     monkeypatch.setenv('PYSCFAD_FACTOR_PANEL_MEMORY_MB', '32')
     monkeypatch.setenv('PYSCFAD_SOLVE_MEMORY_MB', '.001')
     mol = gto.Mole(atom='O .1 0 0; H 0 -.757 .587; H 0 .757 .587',

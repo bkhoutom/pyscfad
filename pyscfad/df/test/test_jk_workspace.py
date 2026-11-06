@@ -38,7 +38,7 @@ def test_ooc_scf_workspace_preserves_nonstationary_gradient(tmp_path, monkeypatc
     def objective(m, workspace):
         mf = scf.RHF(m).density_fit(auxbasis='weigend')
         mf.with_df.incore = False
-        mf.with_df.max_memory = .1
+        mf.with_df.max_memory = 1.
         mf.with_df.jk_workspace_memory = workspace
         mf.with_df.blockdim = 12
         mf.with_df.attach_outcore_cderi(path)
@@ -47,10 +47,10 @@ def test_ooc_scf_workspace_preserves_nonstationary_gradient(tmp_path, monkeypatc
         assert view._cderi is mf.with_df._cderi
         assert view._cderi.shape == (0, 0)
         assert view.auxmol is mf.with_df.auxmol
-        assert mf.with_df.max_memory == .1
+        assert mf.with_df.max_memory == 1.
         mf.conv_tol, mf.conv_tol_grad = 1e-12, 1e-8
         mf.kernel(dm0=dm0)
-        assert mf.with_df.max_memory == .1
+        assert mf.with_df.max_memory == 1.
         projections = weights.T @ mf.mo_coeff[:, :mol.nelectron // 2]
         return mf.e_tot + .5 * jax.numpy.sum(projections ** 2)
 
@@ -61,7 +61,7 @@ def test_ooc_scf_workspace_preserves_nonstationary_gradient(tmp_path, monkeypatc
         assert rows[0] == 4
         minimum_panels = rows.count(4)
         rows.clear()
-        on_value, on_grad = jax.value_and_grad(lambda m: objective(m, .1))(mol)
+        on_value, on_grad = jax.value_and_grad(lambda m: objective(m, 1.))(mol)
         assert rows[0] == 12 and rows.count(4) < minimum_panels
     np.testing.assert_allclose(on_value, off_value, atol=1e-11, rtol=0)
     np.testing.assert_allclose(on_grad.coords, off_grad.coords, atol=2e-9, rtol=2e-9)

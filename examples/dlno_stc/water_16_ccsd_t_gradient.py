@@ -27,6 +27,8 @@ def arguments():
                         help='PySCF and W workspace budget in MB, not a hard process limit')
     parser.add_argument('--df-storage', choices=('outcore', 'incore'), default='outcore',
                         help='store global SCF density-fitting factors on disk (default) or in RAM')
+    parser.add_argument('--df-builder', choices=('standard', 'direct'), default='standard',
+                        help='outcore builder: standard repacks scratch; direct writes final-layout panels')
     parser.add_argument('--df-memory-mb', type=float, default=1000,
                         help='working-memory budget for disk-backed density fitting in MB')
     parser.add_argument('--matrix-target-batch-size', type=int, default=4,
@@ -52,6 +54,8 @@ def arguments():
         parser.error('memory and triples tolerance must be finite and positive')
     if args.df_memory_mb > args.max_memory_mb:
         parser.error('df-memory-mb must not exceed max-memory-mb')
+    if args.df_builder == 'direct' and args.df_storage != 'outcore':
+        parser.error('--df-builder direct requires --df-storage outcore')
     if args.matrix_target_batch_size < 1:
         parser.error('matrix-target-batch-size must be positive')
     if not all(math.isfinite(v) and v >= 0 for v in (args.pair_energy, args.lno_occ, args.lno_vir)):
@@ -149,6 +153,7 @@ def calculate(args):
                     waters=args.waters, frozen=frozen, mpi_processes=1, threads=args.threads,
                     max_memory_mb=args.max_memory_mb, boys_grouping='atom',
                     df_storage=args.df_storage, df_memory_mb=args.df_memory_mb,
+                    df_builder=args.df_builder,
                     df_jk_workspace_mb=args.df_memory_mb if args.df_storage == 'outcore' else None,
                     moleintor_opt=True, matrix_target_batch_size=args.matrix_target_batch_size,
                     runtime_environment={key: os.environ.get(key) for key in
@@ -178,7 +183,8 @@ def calculate(args):
         # metadata and a completed packed dataset. This also speeds restarts.
         import h5py
         from pyscf.df.addons import make_auxmol
-        naux = make_auxmol(reference_mol, auxbasis).nao
+        reference_df.auxmol = make_auxmol(reference_mol, reference_df.auxbasis)
+        naux = reference_df.auxmol.nao
         fingerprint = dict(geometry_sha256=hashlib.sha256(xyz.read_bytes()).hexdigest(),
                            basis=args.basis, auxbasis=auxbasis, pyscf_version=pyscf.__version__,
                            shape=[naux, reference_mol.nao * (reference_mol.nao + 1) // 2])
@@ -196,9 +202,15 @@ def calculate(args):
             print(f'Reusing validated disk-backed DF factors at {cderi_path}', flush=True)
         else:
             manifest.unlink(missing_ok=True)
-            print(f'Building disk-backed DF factors at {cderi_path}', flush=True)
+            print(f'Building disk-backed DF factors ({args.df_builder}) at {cderi_path}', flush=True)
             with resource_profile.section('water.df_factors'):
-                reference_df.build()
+                if args.df_builder == 'direct':
+                    from pyscfad.df import direct_outcore
+                    direct_outcore.cholesky_eri(reference_mol, cderi_path,
+                                                auxmol=reference_df.auxmol,
+                                                max_memory=args.df_memory_mb, verbose=4)
+                else:
+                    reference_df.build()
             manifest.write_text(json.dumps(fingerprint, indent=2) + '\n')
         del reference_df, reference_mol
         print('Disk-backed DF factors ready; starting differentiable SCF', flush=True)

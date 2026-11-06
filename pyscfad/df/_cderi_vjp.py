@@ -2146,13 +2146,17 @@ def cholesky_eri_vjp_from_mo_coeff_ybar(mol, auxmol, cderi_source,
 
 
 @contextmanager
-def _outcore_mo_geometry_panel(naux, columns, *, force_disk=False):
+def _outcore_mo_geometry_panel(naux, columns, *, force_disk=False, workspace=None,
+                              reservation=None, scratch_min=0):
     """Own one transformed MO-space seed, with bounded disk access if needed."""
     from . import _df_jk_factorized as factorized
     shape = (naux, columns)
-    budget = factorized._memory_mb(
-        'PYSCFAD_FACTOR_PANEL_MEMORY_MB', factorized._FACTOR_PANEL_MEMORY_MB)
-    if columns == 0 or (not force_disk and naux * columns * 8 <= budget * 1024**2):
+    budget = (factorized._memory_mb(
+        'PYSCFAD_FACTOR_PANEL_MEMORY_MB', factorized._FACTOR_PANEL_MEMORY_MB) * 1024**2
+        if workspace is None else workspace.available(panels=True, reserve=scratch_min))
+    if columns == 0 or (not force_disk and naux * columns * 8 <= budget):
+        if reservation is not None:
+            reservation.resize(naux * columns * 8)
         yield numpy.empty(shape)
     else:
         with pyscf_lib.H5TmpFile() as scratch:
@@ -2161,7 +2165,7 @@ def _outcore_mo_geometry_panel(naux, columns, *, force_disk=False):
 
 
 def _prepare_outcore_mo_geometry(dfobj, mo_coeff, ybar, orbs_slice,
-                                 saved_output, *, force_disk=False):
+                                 saved_output, *, force_disk=False, workspace=None, fixed_reservation=None):
     """Prepare an owned MO-space geometry seed without derivative integrals.
 
     Raw Lov/ybar arrays or datasets are read by full-auxiliary column slabs.
@@ -2169,7 +2173,7 @@ def _prepare_outcore_mo_geometry(dfobj, mo_coeff, ybar, orbs_slice,
     coefficient blocks; the caller may release both raw inputs immediately.
     This first-order path does not mutate seeds or the reusable forward Lov.
     """
-    from . import _df_jk_factorized as factorized
+    from . import _df_jk_factorized as factorized, _response_memory
     mol, auxmol = dfobj.mol, dfobj.auxmol
     if any(isinstance(x, jax.core.Tracer) for x in
            jax.tree_util.tree_leaves((dfobj, mo_coeff, ybar, saved_output))):
@@ -2196,30 +2200,35 @@ def _prepare_outcore_mo_geometry(dfobj, mo_coeff, ybar, orbs_slice,
     mo_k = numpy.array(mo[:, k0:k1], order='C', copy=True)
     mo_l = numpy.array(mo[:, l0:l1], order='C', copy=True)
     packed_k, packed_l = (mo_l, mo_k) if lc > kc else (mo_k, mo_l)
+    workspace = workspace or _response_memory.workspace_for(dfobj)
     resources = ExitStack()
     try:
+        fixed = resources.enter_context(
+            fixed_reservation if fixed_reservation is not None else workspace.lease())
+        fixed.resize(_response_memory.prepare_fixed_bytes(mol.nao, naux, min(kc, lc)))
+        panel_reservation = resources.enter_context(workspace.lease(panels=True))
         z_panel = resources.enter_context(_outcore_mo_geometry_panel(
-            naux, columns, force_disk=force_disk))
+            naux, columns, force_disk=force_disk, workspace=workspace,
+            reservation=panel_reservation, scratch_min=3 * 8 * naux))
         metric = numpy.asarray(auxmol.intor(mol._add_suffix('int2c2e'), hermi=1))
         with dense_blas_threads():
             low = scipy.linalg.cholesky(metric, lower=True, check_finite=False)
         del metric
         lowbar = numpy.zeros((naux, naux), order='F')
-        solve_budget = factorized._memory_mb(
-            'PYSCFAD_SOLVE_MEMORY_MB', factorized._SOLVE_MEMORY_MB)
-        width = max(1, int(solve_budget * 1024**2 / (3 * 8 * naux)))
-        for begin in range(0, columns, width):
-            end = min(begin + width, columns)
-            # Do not coerce a whole HDF5 dataset to NumPy here.
-            with dense_blas_threads():
-                z = scipy.linalg.solve_triangular(
-                    low.T, numpy.asarray(ybar[:, begin:end]), lower=False,
-                    check_finite=False)
-                lowbar = scipy.linalg.blas.dgemm(
-                    -1., z, numpy.asarray(saved_output[:, begin:end]).T,
-                    beta=1., c=lowbar, overwrite_c=1)
-            z_panel[:, begin:end] = z
-            del z
+        width = workspace.solve_width(naux, columns)
+        with workspace.lease(3 * 8 * naux * min(width, columns)):
+            for begin in range(0, columns, width):
+                end = min(begin + width, columns)
+                # Do not coerce a whole HDF5 dataset to NumPy here.
+                with dense_blas_threads():
+                    z = scipy.linalg.solve_triangular(
+                        low.T, numpy.asarray(ybar[:, begin:end]), lower=False,
+                        check_finite=False)
+                    lowbar = scipy.linalg.blas.dgemm(
+                        -1., z, numpy.asarray(saved_output[:, begin:end]).T,
+                        beta=1., c=lowbar, overwrite_c=1)
+                z_panel[:, begin:end] = z
+                del z
         del low
 
         def read_density(begin, end):
@@ -2243,6 +2252,8 @@ def _prepare_outcore_mo_geometry(dfobj, mo_coeff, ybar, orbs_slice,
         disk = not isinstance(z_panel, numpy.ndarray)
         contribution = factorized._GeometryContribution(
             dfobj, min(kc, lc), lowbar, read_density, fill_packed_density, disk)
+        fixed.resize(_response_memory.retained_fixed_bytes(mol.nao, naux, min(kc, lc)))
+        contribution.workspace = workspace
         contribution._resources = resources
         contribution.mo_panel_columns = columns
         contribution.retained_panel_bytes = 0 if disk else naux * columns * 8

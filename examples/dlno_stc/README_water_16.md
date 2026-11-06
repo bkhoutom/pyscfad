@@ -64,6 +64,13 @@ derivatives, a three-component derivative tensor is about 45.97 GB. Setting
 startup problem, but later local CCSD and gradient intermediates can still exceed
 10 GB. The packed disk factors themselves occupy about 7.67 GB; building them
 also needs temporary disk space. `--df-storage incore` restores RAM storage.
+Add `--df-builder direct` to construct the final packed dataset without a second
+full tensor on disk. Generation, whitening, prefetch buffers and HDF5 staging
+are sized together under `--df-memory-mb`; an allowance too small for the metric
+and one shell panel raises an error before generation. This optional builder
+preserves the existing factor layout and derivative path. `standard` remains
+the default. See [serial DF construction](../../README_SERIAL_DF_SCF.md#optional-direct-to-final-layout-df-construction)
+for the memory policy and interrupted-file cleanup.
 Completed disk factors are reused only when their saved geometry/basis/version
 metadata and packed dataset dimensions match the current input.
 

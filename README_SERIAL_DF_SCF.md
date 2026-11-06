@@ -1,5 +1,58 @@
 # Root-owned DF, SCF and pullback performance
 
+## Optional direct-to-final-layout DF construction
+
+The serial benchmark and water drivers accept
+`--df-storage outcore --df-builder direct --df-memory-mb 500000`.
+`standard` remains the default builder. This setting is independent of
+`--fragment-df-mode`: it changes construction of the global SCF factors only.
+
+The direct builder generates and Cholesky-whitens AO-pair panels, writing them
+straight into one contiguous `j3c` dataset. Existing row readers and DF/SCF
+pullbacks use the same layout and Cholesky gauge. It eliminates the full
+temporary block tensor and subsequent assembly pass. For 64 waters with
+cc-pVTZ/cc-pVTZ-JKFIT, the new tensor occupies about 490.4 GB instead of the
+standard builder's approximately 980.9 GB peak for two tensors. This counts DF
+construction only; other calculation scratch and an existing old output file
+still take additional space.
+
+`--df-memory-mb` is a decimal-MB workspace allowance. The direct planner budgets
+the metric, two prefetched integral buffers, whitening/layout copies and a
+bounded HDF5 conversion tile together, leaving 20% for native-library overhead.
+The write tile is at most 64 MiB or 8% of the allowance, whichever is smaller.
+A budget too small for the metric and an indivisible shell panel raises
+`MemoryError` before generating integrals. This does not impose an OS RSS limit
+or count unrelated SCF/correlation state as builder workspace.
+
+For Python callers, build factors eagerly and attach them before tracing:
+
+```python
+from pyscfad.df import direct_outcore
+
+direct_outcore.cholesky_eri(
+    reference_mol, "scf_cderi.h5", auxmol=reference_auxmol,
+    max_memory=500000,
+)
+# Inside the differentiable SCF builder, at that same geometry:
+mf.with_df.attach_outcore_cderi("scf_cderi.h5")
+```
+
+Alternatively, an eager PySCFAD `DF` object supports
+`df.incore = False; df.outcore_builder = "direct"; df.build()`.
+That object's `max_memory` retains its existing PySCF convention: current RSS
+is subtracted before passing the remaining allowance to the builder. The
+explicit low-level call and driver `--df-memory-mb` pass the workspace directly.
+As with other disk-backed factors, prebuild before JAX tracing and reuse only
+at the matching geometry/basis. The direct path requires a full-rank positive
+definite auxiliary metric; rank-truncated eigenvalue factors are unsupported.
+
+Construction uses a hidden `.<filename>.direct-*.h5` file in the output
+directory, already in the final layout. Completion atomically renames it over
+the destination, with no data copy. The destination is a standalone DF file;
+unrelated datasets in an old destination are not retained. Ordinary exceptions
+remove the partial file and preserve the old destination. An uncatchable kill
+can leave the hidden partial file for later cleanup.
+
 The `dlno-stc` branch already contains the shared resident DF cotangent buffer,
 compact/fused out-of-core geometry contraction, low-rank SCF exchange, bounded
 response-factor caching and dense-BLAS thread helpers (commit `11ebb34b`).

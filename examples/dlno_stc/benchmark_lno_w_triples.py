@@ -40,6 +40,8 @@ def main():
     parser.add_argument("--max-memory-mb", type=float, default=800000)
     parser.add_argument("--df-storage", choices=("incore", "outcore"), default="incore",
                         help="store DF factors in RAM or stream them and their response from disk")
+    parser.add_argument("--df-builder", choices=("standard", "direct"), default="standard",
+                        help="outcore builder: standard repacks a scratch tensor; direct writes final-layout panels")
     parser.add_argument("--df-memory-mb", type=float, default=4000,
                         help="working-memory budget for streamed DF operations")
     parser.add_argument("--fragment-df-mode", choices=("direct", "half"),
@@ -91,6 +93,8 @@ def main():
     frame_mode = "full" if args.triples_method == "smooth" else None
     if not math.isfinite(args.df_memory_mb) or args.df_memory_mb <= 0:
         parser.error("DF memory budget must be finite and positive")
+    if args.df_builder == 'direct' and args.df_storage != 'outcore':
+        parser.error('--df-builder direct requires --df-storage outcore')
     if any(x <= 0 for x in args.targets_meh) or len(set(args.targets_meh)) != len(args.targets_meh):
         parser.error("targets must be positive and distinct")
     if any(x < 0 for x in args.seeds) or len(set(args.seeds)) != len(args.seeds):
@@ -161,7 +165,8 @@ def main():
         for key, value in requested.items():
             if previous.get(key) != value:
                 raise ValueError(f"{key} differs from existing results; use a new output directory")
-        if (previous.get("df_storage", "incore") != args.df_storage or
+        if (previous.get("df_builder", "standard") != args.df_builder or
+                previous.get("df_storage", "incore") != args.df_storage or
                 (args.df_storage == "outcore" and
                  previous.get("df_memory_mb") != args.df_memory_mb)):
             raise ValueError("DF storage settings differ; use a new output directory")
@@ -208,9 +213,17 @@ def main():
         ref.with_df._compatible_format = True
         ref.with_df._cderi_to_save = str(cderi_path)
         ref.with_df.max_memory = args.df_memory_mb
-        report(f"Building disk-backed DF factors; working-memory budget {args.df_memory_mb:g} MB")
+        report(f"Building disk-backed DF factors ({args.df_builder}); working-memory budget {args.df_memory_mb:g} MB")
         stage_start = time.perf_counter()
-        ref.with_df.build()
+        if args.df_builder == 'direct':
+            from pyscf.df.addons import make_auxmol
+            from pyscfad.df import direct_outcore
+            ref.with_df.auxmol = make_auxmol(refmol, ref.with_df.auxbasis)
+            direct_outcore.cholesky_eri(refmol, cderi_path, auxmol=ref.with_df.auxmol,
+                                        max_memory=args.df_memory_mb, verbose=4)
+            ref.with_df._cderi = str(cderi_path)
+        else:
+            ref.with_df.build()
         df_setup_seconds = time.perf_counter() - stage_start
         report(f"DF factors ready in {df_setup_seconds:.1f} s")
     ref.conv_tol, ref.conv_tol_grad = 1e-9, 1e-6
@@ -336,6 +349,7 @@ def main():
                     cpu_affinity=benchmark_cpus, affinity_check=affinity,
                     max_memory_mb=args.max_memory_mb, cc_conv_tol=args.cc_conv_tol,
                     df_storage=args.df_storage, df_memory_mb=args.df_memory_mb,
+                    df_builder=args.df_builder,
                     thread_policy=os.environ.get('PYSCFAD_BENCHMARK_THREAD_POLICY', 'fixed'),
                     omp_dynamic=os.environ.get('OMP_DYNAMIC'),
                     mkl_dynamic=os.environ.get('MKL_DYNAMIC'),
@@ -455,6 +469,7 @@ def main():
                       threads=args.threads,
                       scf_df_precond=args.scf_df_precond,
                       df_storage=args.df_storage, df_memory_mb=args.df_memory_mb,
+                      df_builder=args.df_builder,
                       thread_policy=os.environ.get('PYSCFAD_BENCHMARK_THREAD_POLICY', 'fixed'),
                       omp_dynamic=os.environ.get('OMP_DYNAMIC'),
                       mkl_dynamic=os.environ.get('MKL_DYNAMIC'),

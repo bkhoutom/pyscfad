@@ -1,7 +1,9 @@
 """Resumable smooth or conventional LNO(W)-CCSD(T) energy/force benchmark.
 
 The serial queue runs one realization per process with deterministic domain/LIS
-selection. Each result is written immediately after completion.
+selection. Fresh calculations share one differentiable SCF between selection
+and production, after an independent reference SCF. Each result is written
+immediately after completion.
 """
 
 import argparse
@@ -259,141 +261,179 @@ def main():
             raise RuntimeError("differentiable DF-RHF failed")
         return mf
 
-    stage_start = time.perf_counter()
-    mf = build_mf(mol)
-    jax.block_until_ready(mf)
-    initial_ad_scf_seconds = time.perf_counter() - stage_start
-    report(f"Initial differentiable SCF complete in {initial_ad_scf_seconds:.1f} s")
-    if abs(float(ref.e_tot) - float(mf.e_tot)) > 1e-7:
-        raise RuntimeError("reference and differentiable SCF disagree")
-    stage_start = time.perf_counter()
-    domains = dlno_stc.build_domain_selections(
-        mf, frozen=args.frozen, force_full_domains=force_full_domains,
-        thresholds=domain_thresholds,
-        boys_grouping=args.boys_grouping,
-        lo_kwargs=dict(init_guess="atomic", conv_tol=1e-10,
-                       gmres_options=dict(restart=120, maxiter=100)))
-    domain_selection_seconds = time.perf_counter() - stage_start
-    report(f"Domain selection complete in {domain_selection_seconds:.1f} s")
     expected_groups = 1 if args.boys_grouping == "molecule" else carbons
-    if len(domains.physical_groups) != expected_groups:
-        raise RuntimeError(f"expected {expected_groups} physical fragments")
-    mp2_domains = []
-    for index, members in enumerate(domains.physical_groups):
-        fragment = domains.fragments[members[0]]
-        mp2_domains.append(dict(fragment=index, target_orbitals=list(members),
-            primary_atoms=fragment.primary_atoms.tolist(),
-            extended_atoms=fragment.extended_atoms.tolist(),
-            nao=len(fragment.extended_ao_indices),
-            nocc=len(fragment.strong_occ_metric_keep),
-            nvir=len(fragment.virtual_anchor_columns)))
-    domain_report = dict(force_full_domains=force_full_domains,
-        thresholds=asdict(domains.thresholds), pair_energy_model=domains.pair_energy_model,
-        physical_fragments=expected_groups, molecular_nao=mol.nao,
-        total_active_occ=len(domains.active_occ_indices),
-        total_active_vir=len(domains.active_vir_indices),
-        full_ao_domains=sum(d['nao'] == mol.nao for d in mp2_domains),
-        weak_orbital_pairs=int(np.count_nonzero(np.triu(~domains.strong_mask, 1))),
-        fragments=mp2_domains)
-    save(output / "domain_selection.json", domain_report)
-    report(f"MP2 domain selection: force_full_domains={force_full_domains}; "
-           f"{domain_report['full_ao_domains']}/{expected_groups} domains span all AOs; "
-           f"(AO, occ, vir)={[(d['nao'], d['nocc'], d['nvir']) for d in mp2_domains]}")
-    energies = np.asarray(mf.mo_energy)
-    roots, weights, diagnostics = make_laplace_grid(
-        energies[domains.active_occ_indices], energies[domains.active_vir_indices],
-        kind="fitted", points=6, lambda_gradient=.1)
-    grid = dict(laplace_roots=roots, laplace_weights=weights)
-    baseline = dict(mode="deterministic", threads=args.threads, global_seed=666, **grid)
+    baseline = dict(mode="deterministic", threads=args.threads, global_seed=666)
     matrix = dict(mode="deterministic", threads=args.threads,
-                  memory_limit_mb=args.max_memory_mb, **grid)
-    selection_start = time.perf_counter()
-    report(f"Configuring W-LIS selection: occupied cutoff={args.lno_thresh_occ:g}, "
-           f"virtual cutoff={args.lno_thresh_vir:g}")
-    selection_options = dict(matrix_kind="W", thresh_occ=args.lno_thresh_occ,
-                             lis_space="domain",
-                             thresh_vir=args.lno_thresh_vir,
-                             baseline_controls=baseline, matrix_controls=matrix,
-                             merge_identical=True)
-    selected = ccsd.build_static_selections(
-        mf, domains, smooth=args.triples_method == "smooth",
-        smooth_laplace_points=args.smooth_laplace_points,
-        single_pass=args.single_pass_w,
-        **selection_options)
-    selection_seconds = time.perf_counter() - selection_start
-    dimensions = [ccsd._fragment_dimensions(selected, i) for i in range(expected_groups)]
-    frame_blocks = []
-    if args.triples_method == "smooth" and not args.single_pass_w:
-        for dims, frames in zip(dimensions, selected.lis_static.smooth_frames):
-            blocks = dict(occupied=[frames[0].anchor.shape[1]],
-                          virtual=[frames[1].anchor.shape[1]])
-            if blocks != dict(occupied=[dims[0]], virtual=[dims[1]]):
-                raise RuntimeError(f"full-Fock frame dimensions disagree: {blocks}")
-            frame_blocks.append(blocks)
-    affinity = check_worker_affinity(benchmark_cpus)
-    settings = dict(geometry=str(xyz), elements=elements, basis=args.basis,
-                    auxbasis=auxbasis or "auto", frozen=args.frozen, boys_grouping=args.boys_grouping,
-                    force_full_domains=force_full_domains, physical_fragments=expected_groups,
-                    domain_thresholds=asdict(domains.thresholds), mp2_domains=mp2_domains,
-                    mp2_energy_source="w_matrix_trace", mp2_response="joint_energy_w_pullback",
-                    pair_energy_model=domains.pair_energy_model,
-                    lno_thresh_occ=args.lno_thresh_occ, lno_thresh_vir=args.lno_thresh_vir,
-                    single_pass_w=args.single_pass_w,
-                    lis_space="domain",
-                    lis_eigenspace='domain',
-                    triples_variance_allocation=args.triples_variance_allocation,
-                    selection_timer_scope='plan_only' if args.single_pass_w else 'complete_prepass',
-                    fragment_occupied_counts=[len(members) for members in domains.physical_groups],
-                    total_active_occupied=len(domains.active_occ_indices),
-                    nao=mol.nao, lis_dimensions=dimensions, threads=args.threads,
-                    cpu_affinity=benchmark_cpus, affinity_check=affinity,
-                    max_memory_mb=args.max_memory_mb, cc_conv_tol=args.cc_conv_tol,
-                    df_storage=args.df_storage, df_memory_mb=args.df_memory_mb,
-                    df_builder=args.df_builder,
-                    thread_policy=os.environ.get('PYSCFAD_BENCHMARK_THREAD_POLICY', 'fixed'),
-                    omp_dynamic=os.environ.get('OMP_DYNAMIC'),
-                    mkl_dynamic=os.environ.get('MKL_DYNAMIC'),
-                    shared_df_cache_mode=args.fragment_df_mode,
-                    scf_response_solver="eager_gmres" if cderi_path is not None else "default",
-                    scf_jk_workspace_memory_mb=mf.with_df.jk_workspace_memory,
-                    scf_df_precond=args.scf_df_precond,
-                    scf_precond_total_memory_mb=args.max_memory_mb if args.scf_df_precond else None,
-                    scf_precond_workspace_memory_mb=args.df_memory_mb if args.scf_df_precond else None,
-                    scf_precond_cache_cap_mib=os.environ.get('PYSCFAD_PRECOND_CACHE_MEMORY_MB'),
-                    df_setup_seconds=df_setup_seconds,
-                    reference_scf_seconds=reference_scf_seconds,
-                    initial_ad_scf_seconds=initial_ad_scf_seconds,
-                    domain_selection_seconds=domain_selection_seconds,
-                    cc_conv_tol_normt=args.cc_conv_tol_normt, cc_max_cycle=200,
-                    targets_meh=args.targets_meh, seeds=args.seeds,
-                    pilot_samples=args.pilot_samples, triples_mode=args.triples_method,
-                    triples_integral_transform=args.triples_integral_transform,
-                    smooth_frame_mode=frame_mode,
-                    smooth_frame_blocks=frame_blocks,
-                    jax_persistent_cache_enabled=bool(jax.config.jax_enable_compilation_cache),
-                    jax_compilation_cache_dir=jax.config.jax_compilation_cache_dir,
-                    code_snapshot_sha256=os.environ.get("LNO_BENCHMARK_SNAPSHOT_SHA256"),
-                    source_package_path=str(Path(pyscfad.__file__).resolve()),
-                    smooth_laplace_points=(args.smooth_laplace_points
-                                           if args.triples_method == "smooth" else None),
-                    smooth_trace_exponent=(args.smooth_trace_exponent
-                                           if args.triples_method == "smooth" else None),
-                    selection_seconds=selection_seconds,
-                    preselection_setup_seconds=selection_start-started,
-                    mp2_laplace_grid=dict(roots=roots.tolist(), weights=weights.tolist(),
-                                          diagnostics=diagnostics),
-                    reference_hf_energy_eh=float(ref.e_tot),
-                    reused_reference=str(args.reference.resolve()) if args.reference else None,
-                    setup_seconds=time.perf_counter()-started)
-    save(output / "settings.json", settings)
-    report(f"CPU affinity {benchmark_cpus}; all {affinity['runtime_threads']} runtime threads verified")
-    if args.single_pass_w:
-        report(f"Planned {expected_groups} fragments: one W build and shared input pullback; "
-               "LIS ranks/anchors will be selected within each production fragment")
-    else:
-        report(f"Selected {expected_groups} W-LIS fragments; dimensions {dimensions}")
-    report(f"Smooth frame blocks {frame_blocks}; persistent JAX cache enabled: "
-           f"{bool(jax.config.jax_enable_compilation_cache)}")
+                  memory_limit_mb=args.max_memory_mb)
+    selection, settings = {}, {}
+    initial_ad_scf_seconds = 0.0
+    production_started = None
+    reference = json.loads(args.reference.read_text()) if args.reference else None
+
+    def build_static(mf):
+        """Share production SCF; later realizations reuse the same fixed labels."""
+        if abs(float(ref.e_tot) - float(mf.e_tot)) > 1e-7:
+            raise RuntimeError("reference and differentiable SCF disagree")
+        if selection:
+            return selection['static']
+        stage_start = time.perf_counter()
+        domains = dlno_stc.build_domain_selections(
+            mf, frozen=args.frozen, force_full_domains=force_full_domains,
+            thresholds=domain_thresholds,
+            boys_grouping=args.boys_grouping,
+            lo_kwargs=dict(init_guess="atomic", conv_tol=1e-10,
+                           gmres_options=dict(restart=120, maxiter=100)))
+        domain_selection_seconds = time.perf_counter() - stage_start
+        report(f"Domain selection complete in {domain_selection_seconds:.1f} s")
+        if len(domains.physical_groups) != expected_groups:
+            raise RuntimeError(f"expected {expected_groups} physical fragments")
+        mp2_domains = []
+        for index, members in enumerate(domains.physical_groups):
+            fragment = domains.fragments[members[0]]
+            mp2_domains.append(dict(fragment=index, target_orbitals=list(members),
+                primary_atoms=fragment.primary_atoms.tolist(),
+                extended_atoms=fragment.extended_atoms.tolist(),
+                nao=len(fragment.extended_ao_indices),
+                nocc=len(fragment.strong_occ_metric_keep),
+                nvir=len(fragment.virtual_anchor_columns)))
+        domain_report = dict(force_full_domains=force_full_domains,
+            thresholds=asdict(domains.thresholds), pair_energy_model=domains.pair_energy_model,
+            physical_fragments=expected_groups, molecular_nao=mol.nao,
+            total_active_occ=len(domains.active_occ_indices),
+            total_active_vir=len(domains.active_vir_indices),
+            full_ao_domains=sum(d['nao'] == mol.nao for d in mp2_domains),
+            weak_orbital_pairs=int(np.count_nonzero(np.triu(~domains.strong_mask, 1))),
+            fragments=mp2_domains)
+        save(output / "domain_selection.json", domain_report)
+        report(f"MP2 domain selection: force_full_domains={force_full_domains}; "
+               f"{domain_report['full_ao_domains']}/{expected_groups} domains span all AOs; "
+               f"(AO, occ, vir)={[(d['nao'], d['nocc'], d['nvir']) for d in mp2_domains]}")
+        energies = np.asarray(mf.mo_energy)
+        roots, weights, diagnostics = make_laplace_grid(
+            energies[domains.active_occ_indices], energies[domains.active_vir_indices],
+            kind="fitted", points=6, lambda_gradient=.1)
+        grid = dict(laplace_roots=roots, laplace_weights=weights)
+        # These dictionaries are shared with value_and_grad. Its callback runs
+        # before control validation, so selection and production use this exact grid.
+        baseline.update(grid)
+        matrix.update(grid)
+        selection_start = time.perf_counter()
+        report(f"Configuring W-LIS selection: occupied cutoff={args.lno_thresh_occ:g}, "
+               f"virtual cutoff={args.lno_thresh_vir:g}")
+        selection_options = dict(matrix_kind="W", thresh_occ=args.lno_thresh_occ,
+                                 lis_space="domain",
+                                 thresh_vir=args.lno_thresh_vir,
+                                 baseline_controls=baseline, matrix_controls=matrix,
+                                 merge_identical=True)
+        selected = ccsd.build_static_selections(
+            mf, domains, smooth=args.triples_method == "smooth",
+            smooth_laplace_points=args.smooth_laplace_points,
+            single_pass=args.single_pass_w,
+            **selection_options)
+        selection_seconds = time.perf_counter() - selection_start
+        dimensions = [ccsd._fragment_dimensions(selected, i) for i in range(expected_groups)]
+        frame_blocks = []
+        if args.triples_method == "smooth" and not args.single_pass_w:
+            for dims, frames in zip(dimensions, selected.lis_static.smooth_frames):
+                blocks = dict(occupied=[frames[0].anchor.shape[1]],
+                              virtual=[frames[1].anchor.shape[1]])
+                if blocks != dict(occupied=[dims[0]], virtual=[dims[1]]):
+                    raise RuntimeError(f"full-Fock frame dimensions disagree: {blocks}")
+                frame_blocks.append(blocks)
+        affinity = check_worker_affinity(benchmark_cpus)
+        settings.update(geometry=str(xyz), elements=elements, basis=args.basis,
+                        auxbasis=auxbasis or "auto", frozen=args.frozen, boys_grouping=args.boys_grouping,
+                        force_full_domains=force_full_domains, physical_fragments=expected_groups,
+                        domain_thresholds=asdict(domains.thresholds), mp2_domains=mp2_domains,
+                        mp2_energy_source="w_matrix_trace", mp2_response="joint_energy_w_pullback",
+                        pair_energy_model=domains.pair_energy_model,
+                        lno_thresh_occ=args.lno_thresh_occ, lno_thresh_vir=args.lno_thresh_vir,
+                        single_pass_w=args.single_pass_w,
+                        lis_space="domain",
+                        lis_eigenspace='domain',
+                        triples_variance_allocation=args.triples_variance_allocation,
+                        selection_timer_scope='plan_only' if args.single_pass_w else 'complete_prepass',
+                        fragment_occupied_counts=[len(members) for members in domains.physical_groups],
+                        total_active_occupied=len(domains.active_occ_indices),
+                        nao=mol.nao, lis_dimensions=dimensions, threads=args.threads,
+                        cpu_affinity=benchmark_cpus, affinity_check=affinity,
+                        max_memory_mb=args.max_memory_mb, cc_conv_tol=args.cc_conv_tol,
+                        df_storage=args.df_storage, df_memory_mb=args.df_memory_mb,
+                        df_builder=args.df_builder,
+                        thread_policy=os.environ.get('PYSCFAD_BENCHMARK_THREAD_POLICY', 'fixed'),
+                        omp_dynamic=os.environ.get('OMP_DYNAMIC'),
+                        mkl_dynamic=os.environ.get('MKL_DYNAMIC'),
+                        shared_df_cache_mode=args.fragment_df_mode,
+                        scf_response_solver="eager_gmres" if cderi_path is not None else "default",
+                        scf_jk_workspace_memory_mb=mf.with_df.jk_workspace_memory,
+                        scf_df_precond=args.scf_df_precond,
+                        scf_precond_total_memory_mb=args.max_memory_mb if args.scf_df_precond else None,
+                        scf_precond_workspace_memory_mb=args.df_memory_mb if args.scf_df_precond else None,
+                        scf_precond_cache_cap_mib=os.environ.get('PYSCFAD_PRECOND_CACHE_MEMORY_MB'),
+                        df_setup_seconds=df_setup_seconds,
+                        reference_scf_seconds=reference_scf_seconds,
+                        initial_ad_scf_seconds=initial_ad_scf_seconds,
+                        selection_in_production=production_started is not None,
+                        domain_selection_seconds=domain_selection_seconds,
+                        cc_conv_tol_normt=args.cc_conv_tol_normt, cc_max_cycle=200,
+                        targets_meh=args.targets_meh, seeds=args.seeds,
+                        pilot_samples=args.pilot_samples, triples_mode=args.triples_method,
+                        triples_integral_transform=args.triples_integral_transform,
+                        smooth_frame_mode=frame_mode,
+                        smooth_frame_blocks=frame_blocks,
+                        jax_persistent_cache_enabled=bool(jax.config.jax_enable_compilation_cache),
+                        jax_compilation_cache_dir=jax.config.jax_compilation_cache_dir,
+                        code_snapshot_sha256=os.environ.get("LNO_BENCHMARK_SNAPSHOT_SHA256"),
+                        source_package_path=str(Path(pyscfad.__file__).resolve()),
+                        smooth_laplace_points=(args.smooth_laplace_points
+                                               if args.triples_method == "smooth" else None),
+                        smooth_trace_exponent=(args.smooth_trace_exponent
+                                               if args.triples_method == "smooth" else None),
+                        selection_seconds=selection_seconds,
+                        preselection_setup_seconds=selection_start-started,
+                        mp2_laplace_grid=dict(roots=roots.tolist(), weights=weights.tolist(),
+                                              diagnostics=diagnostics),
+                        reference_hf_energy_eh=float(ref.e_tot),
+                        reused_reference=str(args.reference.resolve()) if args.reference else None,
+                        setup_seconds=((production_started if production_started is not None
+                                        else time.perf_counter())-started))
+        save(output / "settings.json", settings)
+        report(f"CPU affinity {benchmark_cpus}; all {affinity['runtime_threads']} runtime threads verified")
+        if args.single_pass_w:
+            report(f"Planned {expected_groups} fragments: one W build and shared input pullback; "
+                   "LIS ranks/anchors will be selected within each production fragment")
+        else:
+            report(f"Selected {expected_groups} W-LIS fragments; dimensions {dimensions}")
+        report(f"Smooth frame blocks {frame_blocks}; persistent JAX cache enabled: "
+               f"{bool(jax.config.jax_enable_compilation_cache)}")
+        selection.update(static=selected, hf_energy=float(mf.e_tot))
+        if reference is not None:
+            if (reference["basis"] != args.basis or reference["frozen"] != args.frozen
+                    or reference.get("lis_space", "global") != 'domain'
+                    or reference.get("lno_thresh_occ") != args.lno_thresh_occ
+                    or reference.get("lno_thresh_vir") != args.lno_thresh_vir
+                    or reference.get("force_full_domains", True) != force_full_domains
+                    or (not force_full_domains and reference.get("mp2_domains") != settings["mp2_domains"])
+                    or abs(reference["hf_energy"] - selection["hf_energy"]) > 1e-8
+                    or np.asarray(reference["force_eh_per_bohr"]).shape != (mol.natm, 3)
+                    or [(f["nocc_lis"], f["nvir_lis"])
+                        for f in reference["components"]["fragments"]] != settings["lis_dimensions"]):
+                raise ValueError("saved deterministic reference does not match this W-LIS")
+            save(output / "deterministic.json", reference)
+            report("Validated and reused deterministic reference")
+        return selected
+
+    # This diagnostic ends after selection and has no production calculation.
+    # Every energy/force calculation below uses the production SCF callback,
+    # including validation of a saved deterministic reference.
+    if args.selection_only:
+        stage_start = time.perf_counter()
+        mf = build_mf(mol)
+        jax.block_until_ready(mf)
+        initial_ad_scf_seconds = time.perf_counter() - stage_start
+        report(f"Initial differentiable SCF complete in {initial_ad_scf_seconds:.1f} s")
+        build_static(mf)
+        del mf
     if args.selection_only:
         return
     options = dict(baseline_controls=baseline, matrix_controls=matrix,
@@ -404,22 +444,7 @@ def main():
     if args.triples_integral_transform == "rotate":
         deterministic_controls['integral_transform'] = 'rotate'
     jobs = []
-    if args.reference:
-        reference = json.loads(args.reference.read_text())
-        if (reference["basis"] != args.basis or reference["frozen"] != args.frozen
-                or reference.get("lis_space", "global") != 'domain'
-                or reference.get("lno_thresh_occ") != args.lno_thresh_occ
-                or reference.get("lno_thresh_vir") != args.lno_thresh_vir
-                or reference.get("force_full_domains", True) != force_full_domains
-                or (not force_full_domains and reference.get("mp2_domains") != mp2_domains)
-                or abs(reference["hf_energy"] - float(mf.e_tot)) > 1e-8
-                or np.asarray(reference["force_eh_per_bohr"]).shape != (mol.natm, 3)
-                or [(f["nocc_lis"], f["nvir_lis"])
-                    for f in reference["components"]["fragments"]] != dimensions):
-            raise ValueError("saved deterministic reference does not match this W-LIS")
-        save(output / "deterministic.json", reference)
-        report("Validated and reused deterministic reference")
-    elif not args.stochastic_only:
+    if reference is None and not args.stochastic_only:
         jobs.append(("deterministic", deterministic_controls))
     for target_index, target in enumerate(args.targets_meh):
         for seed_index, seed in enumerate(args.seeds):
@@ -445,8 +470,13 @@ def main():
             continue
         report(f"BEGIN {label}")
         phase = time.perf_counter()
+        selection_in_production = not selection
+        if selection_in_production:
+            production_started = phase
+        report("Sharing production SCF with domain selection and weak-pair response")
         energy, molecule_bar, components = ccsd.value_and_grad(
-            mol, build_mf, selected, triples_controls=controls, **options)
+            mol, build_mf, build_static=build_static,
+            triples_controls=controls, **options)
         jax.block_until_ready((energy, molecule_bar))
         force = -np.asarray(molecule_bar.coords)
         if not np.isfinite(force).all() or not np.isfinite(float(energy)):
@@ -463,7 +493,7 @@ def main():
         result = dict(label=label, controls=controls, total_energy_eh=float(energy),
                       force_eh_per_bohr=force.tolist(), components=asdict(components),
                       geometry=str(xyz), basis=args.basis, frozen=args.frozen,
-                      hf_energy=float(mf.e_tot), boys_grouping=args.boys_grouping,
+                      hf_energy=selection["hf_energy"], boys_grouping=args.boys_grouping,
                       cc_conv_tol=args.cc_conv_tol,
                       cc_conv_tol_normt=args.cc_conv_tol_normt,
                       threads=args.threads,
@@ -475,8 +505,8 @@ def main():
                       mkl_dynamic=os.environ.get('MKL_DYNAMIC'),
                       shared_df_cache_mode=args.fragment_df_mode,
                       force_full_domains=force_full_domains,
-                      domain_thresholds=asdict(domains.thresholds),
-                      mp2_domains=mp2_domains,
+                      domain_thresholds=settings["domain_thresholds"],
+                      mp2_domains=settings["mp2_domains"],
                       mp2_energy_source="w_matrix_trace", mp2_response="joint_energy_w_pullback",
                       triples_mode=args.triples_method,
                       triples_integral_transform=args.triples_integral_transform,
@@ -485,11 +515,13 @@ def main():
                       lis_eigenspace='domain',
                       triples_variance_allocation=args.triples_variance_allocation,
                       smooth_frame_mode=frame_mode,
-                      smooth_frame_blocks=frame_blocks,
+                      smooth_frame_blocks=settings["smooth_frame_blocks"],
                       jax_persistent_cache_enabled=bool(jax.config.jax_enable_compilation_cache),
                       code_snapshot_sha256=os.environ.get("LNO_BENCHMARK_SNAPSHOT_SHA256"),
-                      selection_seconds=selection_seconds,
-                      preselection_setup_seconds=selection_start-started,
+                      selection_in_production=selection_in_production,
+                      setup_seconds=settings["setup_seconds"],
+                      selection_seconds=settings["selection_seconds"],
+                      preselection_setup_seconds=settings["preselection_setup_seconds"],
                       lno_thresh_occ=args.lno_thresh_occ, lno_thresh_vir=args.lno_thresh_vir,
                       elapsed_seconds=time.perf_counter()-phase,
                       completed_at_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))

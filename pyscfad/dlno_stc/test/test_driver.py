@@ -74,7 +74,7 @@ def test_finite_grouped_energy_gradient_weak_and_hf(monkeypatch):
         context.setattr(scf.hf.SCF, 'get_fock', counted_fock)
         energy, bar = dlno_stc.value_and_grad(
             mol, build_mf, build_static=build_static, controls=controls)
-    assert calls == dict(scf=1, selection=1, fock=1)
+    assert calls == dict(scf=1, selection=1, fock=0)
     singleton, singleton_bar = dlno_stc.value_and_grad(
         mol, accept.build_mf, static, controls=controls, merge_identical=False)
     np.testing.assert_allclose(energy, singleton, atol=2e-10, rtol=0)

@@ -714,6 +714,11 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         e_tot, last_hf_e = mf.energy_tot(dm, h1e, vhf), e_tot
 
         fock = mf.get_fock(h1e, s1e, vhf, dm)
+        # This physical Fock uses the density of the returned orbitals.
+        # An outer correlation VJP can expose it and S as additional outputs,
+        # sharing their construction and reverse work with the SCF energy.
+        from pyscfad.scf._response_data import record
+        record(mf, s1e, fock)
         norm_gorb = np.linalg.norm(mf.get_grad(mo_coeff, mo_occ, fock))
         if not TIGHT_GRAD_CONV_TOL:
             norm_gorb = norm_gorb / np.sqrt(norm_gorb.size)

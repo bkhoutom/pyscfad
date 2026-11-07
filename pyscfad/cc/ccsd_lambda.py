@@ -14,6 +14,7 @@ from functools import partial, reduce
 import jax
 import numpy
 from jax.interpreters import ad as jax_ad
+from pyscf.cc import ccsd as pyscf_ccsd
 
 from pyscfad import numpy as np
 from pyscfad import lib
@@ -637,6 +638,46 @@ def kernel(mycc, eris, t1, t2, max_cycle=50, tol=1e-8, verbose=None):
     return conv, l1, l2
 
 
+def _compile_response_action(pullback, vector):
+    """Compile one transpose-Jacobian action with runtime residual arrays.
+
+    Keep this executable local to the response solve. The pullback is a JAX
+    pytree: passing it explicitly avoids capturing its large saved tensors as
+    compiled constants. Only the action is compiled, not the DIIS/solve loop.
+    """
+    def apply(pullback, vector):
+        return pullback(vector)[0]
+
+    if jax.config.jax_disable_jit:
+        return apply
+
+    action = jax.jit(apply)
+    try:
+        return action.lower(pullback, vector).compile()
+    finally:
+        # The caller owns the executable. Do not retain per-fragment graphs
+        # in a long-lived JIT cache; reuse this executable for all iterations.
+        action.clear_cache()
+
+
+def _run_response_diis(mycc, vector, istep, normt, adiis):
+    """Keep the standard CCSD DIIS update in its native packed-vector form."""
+    if getattr(mycc.run_diis, '__func__', None) is pyscf_ccsd.CCSD.run_diis:
+        # The response passes de=0 to run_diis. Preserve its start conditions
+        # while avoiding unpack -> pack -> DIIS -> unpack -> pack each cycle.
+        if (adiis and istep >= mycc.diis_start_cycle
+                and 0 < mycc.diis_start_energy_diff):
+            vector = adiis.update(vector)
+            logger.debug1(mycc, 'DIIS for step %d', istep)
+        return vector
+
+    # User/subclass hooks may change amplitudes or implement another DIIS
+    # policy. Keep their existing amplitude-based interface and behavior.
+    t1, t2 = mycc.vector_to_amplitudes(vector)
+    t1, t2 = mycc.run_diis(t1, t2, istep, normt, 0, adiis)
+    return mycc.amplitudes_to_vector(t1, t2)
+
+
 def solve_response_lambda(mycc, eris, t1, t2, bar_e, bar_t1, bar_t2,
                           max_cycle=50, tol=1e-8, verbose=None,
                           return_intermediates=False):
@@ -653,8 +694,11 @@ def solve_response_lambda(mycc, eris, t1, t2, bar_e, bar_t1, bar_t2,
     the standard CCSD lambda multipliers when ``bar_e = 1`` and the amplitude
     cotangents vanish.
 
-    Picard iteration with optional DIIS acceleration.  Inputs are expected to
-    be concrete arrays; the iteration uses a Python convergence check.
+    Picard iteration with optional DIIS acceleration. The residual and
+    standard DIIS update stay packed. The complete transpose-Jacobian action
+    is compiled once for this solve, with the saved tensors as runtime inputs.
+    Inputs are expected to be concrete arrays; the iteration uses a Python
+    convergence check. ``jax.disable_jit()`` also disables action compilation.
     ``return_intermediates`` additionally returns the DF update's auxiliary
     tape for the final integral adjoint; it is not differentiated as output.
     """
@@ -689,6 +733,17 @@ def solve_response_lambda(mycc, eris, t1, t2, bar_e, bar_t1, bar_t2,
         response_vector_shape=tuple(amp.shape),
         response_vector_mib=resource_profile.estimated_array_mib(amp),
     )
+
+    if max_cycle > 0:
+        profile_compile = resource_profile.start()
+        response_action = _compile_response_action(vjp_fn, amp)
+        resource_profile.finish(
+            'ccsd_response.compile_action',
+            profile_compile,
+            nocc=nocc,
+            nvir=nvir,
+            compiled=not jax.config.jax_disable_jit,
+        )
 
     # Build the source: bar_e * dE/dt + bar_t (all as a single vector).
     profile_source = resource_profile.start()
@@ -728,7 +783,11 @@ def solve_response_lambda(mycc, eris, t1, t2, bar_e, bar_t1, bar_t2,
     for istep in range(max_cycle):
         profile_iteration = resource_profile.start()
         profile_iteration_vjp = resource_profile.start()
-        (lambda_df,) = vjp_fn(lambda_vec)
+        lambda_df = response_action(vjp_fn, lambda_vec)
+        if resource_profile.enabled():
+            # Attribute asynchronous action execution to this phase, rather
+            # than to the later DIIS/convergence synchronization.
+            jax.block_until_ready(lambda_df)
         resource_profile.finish(
             'ccsd_response.iteration_vjp',
             profile_iteration_vjp,
@@ -738,17 +797,11 @@ def solve_response_lambda(mycc, eris, t1, t2, bar_e, bar_t1, bar_t2,
         )
         profile_iteration_update = resource_profile.start()
         lambda_new = lambda_df + source
-        diff = mycc.amplitudes_to_vector(
-            *mycc.vector_to_amplitudes(lambda_new - lambda_vec)
-        )
+        diff = lambda_new - lambda_vec
         normt = np.linalg.norm(diff)
         lambda_vec = lambda_new
         if adiis is not None:
-            l1_iter, l2_iter = mycc.vector_to_amplitudes(lambda_vec)
-            l1_iter, l2_iter = mycc.run_diis(
-                l1_iter, l2_iter, istep, normt, 0, adiis
-            )
-            lambda_vec = mycc.amplitudes_to_vector(l1_iter, l2_iter)
+            lambda_vec = _run_response_diis(mycc, lambda_vec, istep, normt, adiis)
         normt_val = None
         if not _has_tracer(normt):
             normt_val = float(normt)

@@ -72,12 +72,13 @@ def source(tmp_path):
     return obj
 
 
-def test_multiple_contributions_spill_under_shared_budget_without_changing_gradient(source):
+@pytest.mark.parametrize('optimized_integrals', [False, True])
+def test_multiple_contributions_spill_under_shared_budget_without_changing_gradient(source, optimized_integrals):
     n, a, r = source.mol.nao, source.get_naoaux(), 60
     rng = np.random.default_rng(1903)
     factors = [rng.normal(size=(n, r)) for _ in range(2)]
     seeds = (np.eye(n), -.3 * np.eye(n))
-    with config_update('pyscfad_moleintor_opt', True):
+    with config_update('pyscfad_moleintor_opt', optimized_integrals):
         references = [factorized._backward(True, True, False, (source, x), seeds)[0]
                       for x in factors]
         fixed = memory.prepare_fixed_bytes(n, a, r)

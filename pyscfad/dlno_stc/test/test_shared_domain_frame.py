@@ -100,8 +100,10 @@ def test_molecular_shared_frame_matches_rebuilt_energy_and_gradient(
             state, case.static, case.group, case.controls, case.controls,
             with_grad=with_grad, verbose_imp=0, ccsd_t=True,
             triples_controls=triples, fragment_indices=case.indices)
+        # Finalization consumes the common frame and its saved response.
+        bars = state['mf_bar'], state['common_bar']
         result = ccsd.driver._finish(state, with_grad=with_grad, include_hf=False)
-        return result, rows, counts.copy(), (state['mf_bar'], state['common_bar'])
+        return result, rows, counts.copy(), bars
 
     (reference, ref_grad), ref_rows, ref_counts, ref_bars = run(rebuild=True)
     (value, gradient), rows, actual_counts, bars = run()

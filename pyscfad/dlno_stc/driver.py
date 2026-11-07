@@ -161,12 +161,15 @@ def _coordinate_only(mol):
 
 
 def _select_domain_reference(mf, build_static, *, reuse_weak=True,
-                             correlation_auxbasis=None):
+                             correlation_auxbasis=None,
+                             scf_data=None, scf_data_pullback=None):
     """Share live S/F with a callback through its detached numerical reference."""
-    with resource_profile.section('stc.domain.scf_data_prepare'):
-        scf_data, scf_data_pullback = jax.vjp(build_scf_data, mf)
-        jax.block_until_ready(scf_data)
-        host_data = tuple(numpy.asarray(jax.device_get(value)) for value in scf_data)
+    if scf_data is None:
+        # Standalone/prebuilt references have no jointly owned SCF output tape.
+        with resource_profile.section('stc.domain.scf_data_prepare'):
+            scf_data, scf_data_pullback = jax.vjp(build_scf_data, mf)
+            jax.block_until_ready(scf_data)
+    host_data = tuple(numpy.asarray(jax.device_get(value)) for value in scf_data)
 
     from ._selection_response import SelectionResponse
     prepared = SelectionResponse(mf, scf_data, scf_data_pullback) if reuse_weak else None
@@ -193,6 +196,9 @@ def _build_common_with_pullback(mf, static, scf_data, scf_data_pullback):
     common, construction_pullback = jax.vjp(
         lambda current, data: rebuild_domain_data(current, static, scf_data=data),
         mf, scf_data)
+    if scf_data_pullback is None:
+        # Independent output seeds rejoin the single SCF tape in _finish.
+        return common, construction_pullback
 
     def common_pullback(common_bar):
         direct, data_bar = construction_pullback(common_bar)
@@ -222,8 +228,11 @@ def _initialize(mf, static, controls, *, with_grad, scf_pullback=None,
     with resource_profile.section('stc.domain.common_prepare'):
         if with_grad:
             if scf_data is None:
+                scf_data = getattr(scf_pullback, 'scf_data', None)
+            if scf_data is None:
                 scf_data, scf_data_pullback = jax.vjp(build_scf_data, mf)
-            if scf_data_pullback is None:
+            if (scf_data_pullback is None
+                    and getattr(scf_pullback, 'scf_data', None) is None):
                 raise ValueError('live S/F data require their pullback for gradients')
             adopted = None if prepared_domain is None else prepared_domain.take(static)
             if adopted is None:
@@ -304,12 +313,23 @@ def _finish(state, *, with_grad, include_hf,
         jax.block_until_ready(energy)
         return energy
     with _global_df_response(state):
-        mf_bar = state["mf_bar"]
-        if state.get("common_pullback") is not None:
+        mf_bar = state.pop("mf_bar")
+        common_pullback = state.pop("common_pullback", None)
+        common_bar = state.pop("common_bar", None)
+        if common_pullback is not None:
             with resource_profile.section('stc.domain.common_pullback'):
-                common_mf_bar, = state["common_pullback"](state["common_bar"])
+                common_bars = common_pullback(common_bar)
+                common_mf_bar = common_bars[0]
+                if len(common_bars) == 2:
+                    state['_scf_data_bar'] = common_bars[1]
                 mf_bar = jax.tree_util.tree_map(_add_cotangent, mf_bar, common_mf_bar)
-                jax.block_until_ready(mf_bar)
+                jax.block_until_ready((mf_bar, common_bars[1:]))
+                del common_mf_bar, common_bars
+        # VJP callables retain their forward residuals even after being called.
+        # Consume the common frame before allocating the SCF-response workspace.
+        del common_pullback, common_bar
+        state.pop("common", None)
+        gc.collect()
         return _finish_response(state, energy, mf_bar, include_hf=include_hf)
 
 
@@ -341,8 +361,13 @@ def _finish_response(state, energy, mf_bar, *, include_hf):
         energy = energy + hf_energy
     scope = 'system' if 'fock_from_scf' in state else 'domain'
     with resource_profile.section(f'stc.{scope}.scf_response'):
-        mol_bar, = state["scf_pullback"](mf_bar)
+        scf_pullback = state.pop("scf_pullback")
+        data_bar = state.pop('_scf_data_bar', None)
+        mol_bar, = (scf_pullback(mf_bar) if data_bar is None
+                    else scf_pullback(mf_bar, data_bar))
         jax.block_until_ready((energy, mol_bar))
+        del scf_pullback
+        gc.collect()
     return energy, mol_bar
 
 
@@ -495,8 +520,27 @@ def _system_active_indices(mf, frozen):
     return occupied, virtual
 
 
-def _initialize_scf(mol, build_mf, *, fix_phases=True, combine_df=False):
-    """Build one implicit SCF VJP shared by both correlation scopes."""
+class _JointSCFPullback:
+    """One immutable SCF tape accepting orbital/energy and S/F output seeds."""
+
+    def __init__(self, pullback, scf_data):
+        self.pullback = pullback
+        self.scf_data = scf_data
+
+    def __call__(self, mf_bar, data_bar=None):
+        if data_bar is None:
+            data_bar = jax.tree_util.tree_map(np.zeros_like, self.scf_data)
+        return self.pullback((mf_bar, data_bar))
+
+
+def _initialize_scf(mol, build_mf, *, fix_phases=True, combine_df=False,
+                    share_scf_data=False):
+    """Build one implicit SCF VJP, optionally exposing its final live S/F.
+
+    Domain drivers request joint outputs so the common-frame cotangents can
+    join the original SCF tape. Builders that adopt a prebuilt reference or
+    use a different kernel retain the ordinary separate S/F response path.
+    """
     _coordinate_only(mol)
     if not callable(build_mf):
         raise TypeError("build_mf must be callable")
@@ -505,7 +549,19 @@ def _initialize_scf(mol, build_mf, *, fix_phases=True, combine_df=False):
           config_update("pyscfad_scf_implicit_diff", True),
           config_update("pyscfad_scf_first_order_custom", False)):
         build = (lambda mol_: _fix_restart_mo_phases(build_mf(mol_))) if fix_phases else build_mf
-        return jax.vjp(build, mol)
+        if not share_scf_data:
+            return jax.vjp(build, mol)
+        from pyscfad.scf._response_data import capture
+
+        def build_with_data(current):
+            with capture() as records:
+                mf = build(current)
+                saved = records.get(id(mf))
+                data = saved[1] if saved is not None and saved[0] is mf else None
+            return mf, data
+
+        (mf, data), pullback = jax.vjp(build_with_data, mol)
+        return mf, _JointSCFPullback(pullback, data)
 
 
 def _root_owned_scf_response(comm, parallel_scf_jk, *, scope='domain'):
@@ -524,14 +580,16 @@ def _serial_scf_pullback(pullback):
     from pyscfad.lib import _cotangent_buffer
     from pyscfad.lib._threading import dense_blas_scope
 
-    def apply(cotangent):
+    def apply(cotangent, data_bar=None):
         shared = (nullcontext() if _cotangent_buffer.is_active()
                   else _cotangent_buffer.reverse_scope())
         with shared, dense_blas_scope():
-            result = pullback(cotangent)
+            result = (pullback(cotangent) if data_bar is None
+                      else pullback(cotangent, data_bar))
             jax.block_until_ready(result)
         return result
 
+    apply.scf_data = getattr(pullback, 'scf_data', None)
     return apply
 
 
@@ -804,7 +862,8 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
             _validate_static(static)
         local_response = _root_owned_scf_response(comm, parallel_scf_jk, scope=scope)
         with (resource_profile.section('stc.domain.scf') if scope == 'domain' else nullcontext()):
-            mf, scf_pullback = _initialize_scf(mol, build_mf, combine_df=local_response)
+            mf, scf_pullback = _initialize_scf(
+                mol, build_mf, combine_df=local_response, share_scf_data=scope == 'domain')
         if local_response:
             scf_pullback = _serial_scf_pullback(scf_pullback)
         if scope == "system":
@@ -812,12 +871,14 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
                                       scf_pullback=scf_pullback, lo_kwargs=lo_kwargs,
                                       fock_from_scf=True, **basis_kwargs(correlation_auxbasis))
         selected = static
-        scf_data = scf_data_pullback = prepared_domain = None
+        scf_data = getattr(scf_pullback, 'scf_data', None)
+        scf_data_pullback = prepared_domain = None
         if build_static is not None:
             # Distributed MP2 already owns endpoint work across ranks. Preserve
             # that executor; CCSD's root-owned weak completion can reuse selection.
             selected, scf_data, scf_data_pullback, prepared_domain = _select_domain_reference(
                 mf, build_static, reuse_weak=comm is None or comm.Get_size() == 1,
+                scf_data=scf_data,
                 **basis_kwargs(correlation_auxbasis))
         return _initialize(mf, selected, controls, with_grad=True,
                            scf_pullback=scf_pullback, scf_data=scf_data,

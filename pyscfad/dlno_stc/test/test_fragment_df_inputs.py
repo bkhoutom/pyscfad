@@ -77,8 +77,9 @@ def test_default_half_matches_direct_with_one_integral_pass(
         records = ccsd._run_group(state, static, case.group,
             case.controls, case.controls, with_grad=True, verbose_imp=0,
             ccsd_t=True, triples_controls=triples, fragment_indices=case.indices)
+        bars = state['mf_bar'], state['common_bar']
         value, gradient = ccsd.driver._finish(state, with_grad=True, include_hf=False)
-        return value, gradient, records, (state['mf_bar'], state['common_bar'])
+        return value, gradient, records, bars
     # Independent baseline: full, unsymmetrized pair adjoints and raw inputs.
     with monkeypatch.context() as original:
         original.setattr(_df_symmetric, 'same_orbital_pair', lambda slices: False)

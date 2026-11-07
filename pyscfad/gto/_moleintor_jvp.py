@@ -300,13 +300,18 @@ def _int1e_jvp_r0(mol, mol_t, intor):
     jvp = _int1e_fill_jvp_r0_s2(s1, mol_t.coords, aoslices, idx)
     return jvp
 
+def _coordinate_tangent_by_ao(coords_t, aoslices, aoidx):
+    # Only an atom-by-AO ownership mask, never atom-by-AO-pair derivatives.
+    index = aoidx.reshape(1, -1)
+    mask = (index >= aoslices[:,0,None]) & (index < aoslices[:,1,None])
+    owner = np.argmax(mask, axis=0)
+    tangent = np.where(np.any(mask, axis=0)[:,None], coords_t[owner], 0)
+    return tangent.T.reshape((3, *aoidx.shape[1:]))
+
 @jit
 def _int1e_fill_jvp_r0_s2(ints, coords_t, aoslices, aoidx):
-    def _fill(sl, coord_t):
-        mask = (aoidx >= sl[0]) & (aoidx < sl[1])
-        grad = np.where(mask, ints, np.array(0, dtype=ints.dtype))
-        return np.einsum('xij,x->ij', grad, coord_t)
-    jvp = np.sum(vmap(_fill)(aoslices, coords_t), axis=0)
+    tangent = _coordinate_tangent_by_ao(coords_t, aoslices, aoidx)
+    jvp = np.sum(ints * tangent, axis=0)
     jvp += jvp.T.conj()
     return jvp
 
@@ -349,34 +354,34 @@ def _gen_int1e_jvp_r0(mol, mol_t, intor_a, intor_b,
 
 @jit
 def _gen_int1e_fill_jvp_r0(ints, coords_t, aoslices, aoidx):
-    def _fill(sl, coord_t):
-        mask = (aoidx >= sl[0]) & (aoidx < sl[1])
-        grad = np.where(mask, ints, np.array(0, dtype=ints.dtype))
-        return np.einsum('xyij,x->yij', grad, coord_t)
-    jvp = np.sum(vmap(_fill)(aoslices, coords_t), axis=0)
-    return jvp
+    # A vmap over atom masks would save (natm, 3, comp, naoi, naoj)
+    # derivatives in the reverse tape, including for the auxiliary metric.
+    # Select the displacement for each AO before contracting instead.
+    tangent = _coordinate_tangent_by_ao(coords_t, aoslices, aoidx)
+    return np.sum(ints * tangent, axis=0)
 
 def _int1e_r_jvp_r0(mol, mol_t, intor):
-    coords_t = mol_t.coords
-    atmlst = range(mol.natm)
-    aoslices = mol.aoslice_by_atom()
+    aoslices = mol.aoslice_by_atom()[:,2:4]
+    ao_atom = numpy.repeat(numpy.arange(mol.natm),
+                           aoslices[:,1] - aoslices[:,0])
     nao = mol.nao
     s1 = -intor2c(mol, intor).reshape(-1,3,nao,nao)
-    grad = [numpy.zeros_like(s1) for ia in atmlst]
-    grad = numpy.asarray(grad)
-    for k, ia in enumerate(atmlst):
-        p0, p1 = aoslices [ia,2:]
-        grad[k,...,p0:p1] = s1[...,p0:p1]
-    tangent_out = _int1e_r_dot_grad_tangent_r0(grad, coords_t)
-    return tangent_out
+    return _int1e_r_dot_grad_tangent_r0(s1, mol_t.coords, ao_atom)
 
 @jit
-def _int1e_r_dot_grad_tangent_r0(grad, tangent):
-    tangent_out = np.einsum('npxij,nx->pij', grad, tangent)
+def _int1e_r_dot_grad_tangent_r0(ints, tangent, ao_atom):
+    # Each ket AO belongs to one atom. Gather its displacement directly,
+    # avoiding an (natm, 3, 3, nao, nao) mostly-zero derivative tensor.
+    # Reverse mode scatters the AO contributions back to their parent atoms.
+    tangent_out = np.einsum('pxij,jx->pij', ints, tangent[ao_atom])
     tangent_out += tangent_out.transpose(0,2,1)
     return tangent_out
 
 def _int1e_nuc_jvp_rc(mol, mol_t, intor):
+    from ._nuclear_center_response import nuclear_center_tangent
+    streamed = nuclear_center_tangent(mol, mol_t.coords, intor, None, 1, None)
+    if streamed is not None:
+        return streamed.reshape(mol.nao, mol.nao)
     coords_t = mol_t.coords
     atmlst = range(mol.natm)
     nao = mol.nao
@@ -406,6 +411,11 @@ def _int1e_nuc_jvp_rc(mol, mol_t, intor):
 
 def _gen_int1e_nuc_jvp_rc(mol, mol_t, intor_a, intor_b,
                           hermi=0, shls_slice=None):
+    from ._nuclear_center_response import nuclear_center_tangent
+    streamed = nuclear_center_tangent(
+        mol, mol_t.coords, intor_a, intor_b, hermi, shls_slice)
+    if streamed is not None:
+        return streamed
     if shls_slice is None:
         shls_slice = (0, mol.nbas, 0, mol.nbas)
     ao_loc = make_loc(mol._bas, intor_a)

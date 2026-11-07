@@ -88,8 +88,11 @@ def test_response_profile_preserves_energy_gradient_and_work(scope, monkeypatch,
     assert phases[f'stc.{scope}.input_pullback.local_fock_blocks'] == group_count
     assert phases[f'stc.{scope}.scf_response'] == 1
     if scope == 'domain':
-        for component in ('pao', 'overlap', 'ao_fock'):
-            assert phases[parent + '.' + component] == 1
+        assert phases[parent + '.pao'] == 1
+        # S/F now come from SCF outputs and close through that single tape.
+        for component in ('overlap', 'ao_fock'):
+            assert phases[parent + '.' + component] == 0
+        assert phases['stc.domain.scf_data_prepare'] == 0
         assert all('group' in e for e in events if e['phase'].endswith('.virtual_frame'))
     else:
         state, = [e for e in events if e['phase'] == 'stc.system.fock_state']

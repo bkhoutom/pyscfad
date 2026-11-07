@@ -233,6 +233,10 @@ class GeometryScope:
     def metric_factor(self):
         if self.low is None:
             from jax import scipy as jsp
+            from . import _cderi_vjp
+            started = time.perf_counter()
+            _cderi_vjp._profile_msg(
+                f'DF response metric pullback start naux={self.df_input.get_naoaux()}')
             def factor(aux):
                 return jsp.linalg.cholesky(
                     aux.intor(self.df_input.mol._add_suffix('int2c2e'), hermi=1), lower=True)
@@ -240,6 +244,8 @@ class GeometryScope:
             self.low = numpy.asarray(low)
             self.stats['metric_builds'] += 1
             self.stats['cholesky_builds'] += 1
+            _cderi_vjp._profile_msg(
+                f'DF response metric pullback ready {time.perf_counter()-started:.2f} s')
         return self.low
 
     def finish(self, df_bar):

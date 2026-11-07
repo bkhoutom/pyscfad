@@ -59,6 +59,8 @@ class SelectionResponse:
             data_pullback = self.scf_data_pullback
             def common_pullback(common_bar):
                 direct, data_bar = construction_pullback(common_bar)
+                if data_pullback is None:
+                    return direct, data_bar
                 via_data, = data_pullback(data_bar)
                 return (jax.tree_util.tree_map(add_cotangent, direct, via_data),)
             self.common, self.common_pullback = common, common_pullback

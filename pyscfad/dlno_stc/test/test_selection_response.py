@@ -200,12 +200,13 @@ def test_public_ccsd_selection_reuses_weak_only_for_fresh_baseline(
     def build_mf(current):
         raise AssertionError('this control-flow test must not run SCF')
 
-    def initialize_scf(current, builder, *, combine_df):
-        assert current is mol and builder is build_mf and combine_df
+    def initialize_scf(current, builder, *, combine_df, share_scf_data):
+        assert current is mol and builder is build_mf and combine_df and share_scf_data
         return mf, lambda bar: (bar,)
 
-    def select_reference(current, selector, *, reuse_weak):
+    def select_reference(current, selector, *, reuse_weak, scf_data):
         assert current is mf
+        assert scf_data is None
         assert callable(selector)
         assert reuse_weak is expected_reuse
         calls.append(reuse_weak)

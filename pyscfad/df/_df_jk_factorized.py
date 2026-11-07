@@ -287,6 +287,7 @@ def _prepare_reverse(with_j, with_k, factor_response, residual, cotangents, T, R
                 del r
     if end != naux:
         raise RuntimeError('DF occupied reverse did not cover all auxiliary rows')
+    _cderi_vjp._profile_msg(f'DF response transform complete naux={naux}')
 
     auxmol = dfobj.auxmol
     int2c = dfobj.mol._add_suffix('int2c2e')

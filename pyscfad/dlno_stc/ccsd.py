@@ -1127,16 +1127,18 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
         local_response = driver._root_owned_scf_response(comm, parallel_scf_jk)
         with resource_profile.section('stc.domain.scf'):
             mf, scf_pullback = driver._initialize_scf(
-                mol, build_mf, combine_df=local_response)
+                mol, build_mf, combine_df=local_response, share_scf_data=True)
             if resource_profile.enabled():
                 jax.block_until_ready(mf)
         if local_response:
             scf_pullback = driver._serial_scf_pullback(scf_pullback)
         selected = static
-        scf_data = scf_data_pullback = prepared_domain = None
+        scf_data = getattr(scf_pullback, 'scf_data', None)
+        scf_data_pullback = prepared_domain = None
         if build_static is not None:
             selected, scf_data, scf_data_pullback, prepared_domain = driver._select_domain_reference(
                 mf, build_static, reuse_weak=include_baseline and not resume,
+                scf_data=scf_data,
                 **basis_kwargs(correlation_auxbasis))
         validate_selection_basis(mf, selected, correlation_auxbasis)
         baseline, matrix = _validate_run(selected, baseline_controls, matrix_controls, matrix_kind)

@@ -2,6 +2,7 @@
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+import ctypes
 import operator
 import os
 
@@ -9,6 +10,51 @@ from threadpoolctl import ThreadpoolController, threadpool_limits
 
 
 _BLAS_CONTROLLER = ContextVar('pyscfad_blas_controller', default=None)
+_FIXED_THREADS = ContextVar('pyscfad_fixed_threads', default=None)
+
+
+@contextmanager
+def fixed_threads():
+    """Use the current PySCF thread count without dynamic team shrinking.
+
+    Intended for eager J/K, response solves and final integral pullbacks.
+    Read the configured count at entry, rather than imposing a CPU budget.
+    Restore OpenMP/BLAS limits and OpenMP/MKL dynamic flags on every exit.
+    Inner kernel-specific BLAS limits (e.g. one BLAS thread inside OpenMP)
+    remain effective. Competing policies in concurrent Python calls are
+    unsupported, as with the other process-wide thread helpers.
+    """
+    from pyscf import lib
+    count = lib.num_threads()
+    if _FIXED_THREADS.get() == count:
+        yield
+        return
+    controller = ThreadpoolController()
+    dynamic = []
+    token = _FIXED_THREADS.set(count)
+    try:
+        with controller.limit(limits=count):
+            try:
+                for pool in controller.lib_controllers:
+                    names = (('omp_get_dynamic', 'omp_set_dynamic')
+                             if pool.user_api == 'openmp' else
+                             ('MKL_Get_Dynamic', 'MKL_Set_Dynamic')
+                             if pool.internal_api == 'mkl' else None)
+                    if names is None:
+                        continue
+                    get = getattr(pool.dynlib, names[0], None)
+                    set_ = getattr(pool.dynlib, names[1], None)
+                    if get is not None and set_ is not None:
+                        get.restype = ctypes.c_int
+                        set_.argtypes = [ctypes.c_int]
+                        dynamic.append((set_, get()))
+                        set_(0)
+                yield
+            finally:
+                for set_, previous in reversed(dynamic):
+                    set_(previous)
+    finally:
+        _FIXED_THREADS.reset(token)
 
 
 @contextmanager
@@ -54,14 +100,15 @@ def blas_threads(count):
 def dense_blas_threads():
     """Temporarily set BLAS threads, leaving OpenMP kernel limits unchanged.
 
-    ``PYSCFAD_DENSE_BLAS_THREADS`` is a positive integer, defaulting to one.
+    ``PYSCFAD_DENSE_BLAS_THREADS`` is a positive integer, defaulting to one
+    outside ``fixed_threads`` and to that scope's configured budget within it.
     Set it to the allocated CPU count to parallelize isolated dense operations.
     Never enclose OpenMP kernels or complete molecular reverse passes in this
     context. Limits affect process-wide library state; concurrent Python calls
     with competing policies are unsupported. Nested scopes restore prior limits,
     including when the enclosed operation raises an exception.
     """
-    value = os.environ.get('PYSCFAD_DENSE_BLAS_THREADS', '1')
+    value = os.environ.get('PYSCFAD_DENSE_BLAS_THREADS', str(_FIXED_THREADS.get() or 1))
     try:
         count = int(value)
         if count < 1:

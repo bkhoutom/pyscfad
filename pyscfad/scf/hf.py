@@ -87,6 +87,8 @@ def _mo_from_fock_eq78_jvp(primals, tangents):
 
 
 def _stash_dfjk_mo_data(mf, mo_coeff, mo_occ, s1e):
+    if getattr(mf, '_sgx_backend', None) is not None:
+        return
     with_df = getattr(mf, 'with_df', None)
     if with_df is None:
         return
@@ -136,6 +138,30 @@ def _density_from_fock_jvp(primals, tangents):
     return _density_from_fock(*primals), tangent
 
 
+@partial(ops.custom_jvp, nondiff_argnums=(4,))
+def _density_from_fock_rhf(fock, overlap, energy, coeff, nocc):
+    """Fixed closed-shell projector using occupied/virtual response blocks."""
+    del fock, overlap, energy
+    occupied = coeff[:, :nocc]
+    return 2 * occupied @ occupied.T
+
+
+@_density_from_fock_rhf.defjvp
+def _density_from_fock_rhf_jvp(nocc, primals, tangents):
+    fock, overlap, energy, coeff = primals
+    dfock, doverlap, _, _ = tangents
+    co, cv = coeff[:, :nocc], coeff[:, nocc:]
+    # Equal-occupation blocks have no Fock response. Avoid forming and
+    # multiplying full MO matrices on every implicit-response matvec.
+    df_co = (.5 * (dfock + dfock.T)) @ co
+    ds_co = (.5 * (doverlap + doverlap.T)) @ co
+    rotation = (cv.T @ df_co - (cv.T @ ds_co)*energy[:nocc])
+    rotation /= energy[:nocc] - energy[nocc:, None]
+    cross = (cv @ rotation) @ co.T
+    tangent = 2*(cross + cross.T - (co @ (co.T @ ds_co)) @ co.T)
+    return _density_from_fock_rhf(*primals, nocc), tangent
+
+
 def _scf_fixed_point(dm, mf, s1e, h1e, root_factors=None):
     # Only this density is closed over in the external-root VJP. In Krylov
     # matvecs dm remains an independent variable and requires its full bar.
@@ -154,7 +180,13 @@ def _scf_fixed_point(dm, mf, s1e, h1e, root_factors=None):
     # other occupation/layout conventions on their existing response path.
     if (isinstance(mf, pyscf_hf.RHF) and dm.ndim == 2 and mo_coeff.ndim == 2
             and not np.iscomplexobj(mo_coeff)):
-        dm = _density_from_fock(fock, s1e, mo_energy, mo_coeff, mo_occ)
+        nocc = mf.mol.nelectron // 2
+        if (getattr(mf, '_sgx_backend', None) is not None
+                and numpy.all(mo_occ[:nocc] == 2)
+                and numpy.all(mo_occ[nocc:] == 0)):
+            dm = _density_from_fock_rhf(fock, s1e, mo_energy, mo_coeff, nocc)
+        else:
+            dm = _density_from_fock(fock, s1e, mo_energy, mo_coeff, mo_occ)
     else:
         dm = mf.make_rdm1(mo_coeff, mo_occ)
     return dm, (mo_energy, mo_coeff, mo_occ)
@@ -182,6 +214,7 @@ def _gen_precond(aux, mf, s1e, h1e, root_factors=None, *, solver=None):
         solver = solver.func
     host_solver = solver in (linear_solver.pyscfad_gmres, linear_solver.gmres_safe)
     if (not config.scf_df_precond or not host_solver
+            or getattr(mf, '_sgx_backend', None) is not None
             or not isinstance(mf, pyscf_hf.RHF)
             or isinstance(mf, pyscf_hf.KohnShamDFT)
             or not isinstance(getattr(mf, 'with_df', None), DF)
@@ -667,11 +700,17 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
 
     cput1 = log.timer('initialize scf', *cput0)
     # wrapped function for SCF iteration that is implicitly differentiable
+    if getattr(mf, '_sgx_backend', None) is not None:
+        from pyscfad.tools.linear_solver import eager_gmres
+        with eager_gmres():
+            response_solver = gen_gmres()
+    else:
+        response_solver = gen_gmres()
     _scf_wrapped = make_implicit_diff(
         _scf_with_factors,
         config.scf_implicit_diff,
         optimality_cond=_scf_fixed_point,
-        solver=gen_gmres(),
+        solver=response_solver,
         has_aux=True,
         optimality_fun_has_aux=True,
         gen_precond=_gen_precond,
@@ -927,6 +966,13 @@ class SCF(pytree.PytreeNode, pyscf_hf.SCF):
         return dm0
 
     def scf(self, dm0=None, **kwargs):
+        if getattr(self, '_sgx_backend', None) is not None:
+            if config.scf_first_order_custom:
+                raise NotImplementedError('SGX uses standard implicit or unrolled SCF '
+                                          'response, not experimental first-order RHF')
+            if config.scf_df_precond:
+                raise NotImplementedError('The global-DF SCF preconditioner is not '
+                                          'available with integral-direct DF-J/SGX-K')
         self.dump_flags()
         self.build(self.mol)
 

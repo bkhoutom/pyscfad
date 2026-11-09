@@ -25,6 +25,10 @@ faulthandler.enable()
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--scf-jk', choices=('df', 'dfj-sgx'), default='df',
+                        help='SCF and response J/K backend; dfj-sgx avoids global DF factors')
+    parser.add_argument('--sgx-grid-level', type=int, choices=range(8), default=2)
+    parser.add_argument('--sgx-fit-overlap', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--scf-df-precond", action="store_true",
                         help="Enable host SCF response preconditioning with separate total/workspace budgets")
     parser.add_argument("--threads", type=int, required=True,
@@ -72,6 +76,8 @@ def main():
     parser.add_argument("--reference", type=Path,
                         help="reuse a validated deterministic energy/force result")
     args = parser.parse_args()
+    if args.scf_jk == 'dfj-sgx' and args.scf_df_precond:
+        parser.error('--scf-df-precond requires --scf-jk df')
     os.environ['PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE'] = args.fragment_df_mode
     if args.single_pass_w and (args.selection_only or args.reference):
         parser.error('selection-only/reference reuse requires --no-single-pass-w')
@@ -140,6 +146,9 @@ def main():
     if (output / "settings.json").exists():
         previous = json.loads((output / "settings.json").read_text())
         for key, value, old_default in (
+                ('scf_jk', args.scf_jk, 'df'),
+                ('sgx_grid_level', args.sgx_grid_level, 2),
+                ('sgx_fit_overlap', args.sgx_fit_overlap, True),
                 ('single_pass_w', args.single_pass_w, False),
                 ('lis_eigenspace', 'domain', 'global'),
                 ('lis_space', 'domain', 'global'),
@@ -206,7 +215,14 @@ def main():
     refmol = pgto.M(atom=str(xyz), basis=basis, unit="Angstrom",
                      max_memory=args.max_memory_mb, verbose=0)
     ref = pscf.RHF(refmol).density_fit(auxbasis=auxbasis)
-    cderi_path = output / "scf_cderi.h5" if args.df_storage == "outcore" else None
+    if args.scf_jk == 'dfj-sgx':
+        from pyscfad.sgx import sgx_fit
+        ref = sgx_fit(pscf.RHF(refmol), auxbasis=auxbasis,
+                      grid_level=args.sgx_grid_level, fit_ovlp=args.sgx_fit_overlap,
+                      max_memory=args.df_memory_mb)
+        report(f'Integral-direct DF-J / SGX-K (grid {args.sgx_grid_level}); no global SCF DF factors')
+    cderi_path = (output / "scf_cderi.h5"
+                  if args.scf_jk == 'df' and args.df_storage == "outcore" else None)
     df_setup_seconds = None
     if cderi_path is not None:
         # The response primitives require a single packed j3c dataset.
@@ -233,12 +249,19 @@ def main():
     ref.kernel()
     reference_scf_seconds = time.perf_counter() - stage_start
     if not ref.converged:
-        raise RuntimeError("reference DF-RHF failed")
+        raise RuntimeError("reference RHF failed")
     dm0 = np.asarray(ref.make_rdm1())
+    if args.scf_jk == 'dfj-sgx':
+        # The remaining reference checks use only e_tot. Release its separate
+        # metric/grid caches before allocating the differentiable SCF backend.
+        ref.with_df.reset()
     report(f"Reference SCF complete in {reference_scf_seconds:.1f} s")
 
     def build_mf(current):
         mf = scf.RHF(current).density_fit(auxbasis=auxbasis)
+        if args.scf_jk == 'dfj-sgx':
+            mf = sgx_fit(mf, auxbasis=auxbasis, grid_level=args.sgx_grid_level,
+                         fit_ovlp=args.sgx_fit_overlap, max_memory=args.df_memory_mb)
         # This is scratch space, not a ceiling on the whole process RSS.
         # Keep J/K panels useful when retained correlation state exceeds it.
         mf.with_df.jk_workspace_memory = args.df_memory_mb
@@ -258,7 +281,7 @@ def main():
         else:
             mf.kernel(dm0=dm0)
         if not mf.converged:
-            raise RuntimeError("differentiable DF-RHF failed")
+            raise RuntimeError("differentiable RHF failed")
         return mf
 
     expected_groups = 1 if args.boys_grouping == "molecule" else carbons
@@ -364,7 +387,11 @@ def main():
                         omp_dynamic=os.environ.get('OMP_DYNAMIC'),
                         mkl_dynamic=os.environ.get('MKL_DYNAMIC'),
                         shared_df_cache_mode=args.fragment_df_mode,
-                        scf_response_solver="eager_gmres" if cderi_path is not None else "default",
+                        scf_jk=args.scf_jk, sgx_grid_level=args.sgx_grid_level,
+                        sgx_fit_overlap=args.sgx_fit_overlap,
+                        global_scf_df_factors=args.scf_jk == 'df',
+                        scf_response_solver=("eager_gmres" if cderi_path is not None
+                                             or args.scf_jk == 'dfj-sgx' else "default"),
                         scf_jk_workspace_memory_mb=mf.with_df.jk_workspace_memory,
                         scf_df_precond=args.scf_df_precond,
                         scf_precond_total_memory_mb=args.max_memory_mb if args.scf_df_precond else None,
@@ -409,6 +436,9 @@ def main():
         selection.update(static=selected, hf_energy=float(mf.e_tot))
         if reference is not None:
             if (reference["basis"] != args.basis or reference["frozen"] != args.frozen
+                    or reference.get('scf_jk', 'df') != args.scf_jk
+                    or reference.get('sgx_grid_level', 2) != args.sgx_grid_level
+                    or reference.get('sgx_fit_overlap', True) != args.sgx_fit_overlap
                     or reference.get("lis_space", "global") != 'domain'
                     or reference.get("lno_thresh_occ") != args.lno_thresh_occ
                     or reference.get("lno_thresh_vir") != args.lno_thresh_vir
@@ -498,6 +528,8 @@ def main():
                       cc_conv_tol_normt=args.cc_conv_tol_normt,
                       threads=args.threads,
                       scf_df_precond=args.scf_df_precond,
+                      scf_jk=args.scf_jk, sgx_grid_level=args.sgx_grid_level,
+                      sgx_fit_overlap=args.sgx_fit_overlap,
                       df_storage=args.df_storage, df_memory_mb=args.df_memory_mb,
                       df_builder=args.df_builder,
                       thread_policy=os.environ.get('PYSCFAD_BENCHMARK_THREAD_POLICY', 'fixed'),

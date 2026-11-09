@@ -20,6 +20,8 @@ from scipy.sparse.linalg import LinearOperator, eigsh
 from scipy.sparse.linalg import gmres as scipy_gmres
 from jax.tree_util import tree_flatten
 from pyscfad import ops
+from pyscfad.lib import _solver_memory
+from pyscfad.lib._threading import fixed_threads
 from pyscfad.backend._jax.scipy.sparse.linalg import gmres as jax_gmres
 
 
@@ -62,14 +64,20 @@ def gmres(A_or_matvec, b, x0=None, *,
     else:
         A = numpy.array(ops.to_numpy(A_or_matvec))
 
-    if scipy.__version__ < '1.12':
-        u, info = scipy_gmres(A, b.ravel(), x0=x0, tol=tol, atol=atol,
-                              restart=restart, maxiter=maxiter, M=M,
-                              callback=callback, callback_type=callback_type)
-    else:
-        u, info = scipy_gmres(A, b.ravel(), x0=x0, rtol=tol, atol=atol,
-                              restart=restart, maxiter=maxiter, M=M,
-                              callback=callback, callback_type=callback_type)
+    # SciPy promotes non-floating inputs to double. Use the effective dtype
+    # and actual RHS size, independent of molecule/basis or solver defaults.
+    dtype = numpy.result_type(*[d if numpy.dtype(d).char in 'fdFD' else numpy.float64
+                                for d in (A.dtype, b.dtype)])
+    with (fixed_threads(),
+          _solver_memory.reserve_gmres(b.size, dtype, restart, M is not None)):
+        if scipy.__version__ < '1.12':
+            u, info = scipy_gmres(A, b.ravel(), x0=x0, tol=tol, atol=atol,
+                                  restart=restart, maxiter=maxiter, M=M,
+                                  callback=callback, callback_type=callback_type)
+        else:
+            u, info = scipy_gmres(A, b.ravel(), x0=x0, rtol=tol, atol=atol,
+                                  restart=restart, maxiter=maxiter, M=M,
+                                  callback=callback, callback_type=callback_type)
     if info > 0:
         raise RuntimeError(f'scipy gmres failed to converge in {info} iterations.')
     elif info < 0:

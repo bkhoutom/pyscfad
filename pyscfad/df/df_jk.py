@@ -155,6 +155,7 @@ def density_fit(mf, auxbasis=None, with_df=None, only_dfj=False):
     return dfmf
 
 class _DFHF(pytree.PytreeNode, pyscf_df_jk._DFHF):
+    _keys = pyscf_df_jk._DFHF._keys.union({'_sgx_backend'})
     # mo_coeff, mo_energy, e_tot are stateful attributes ``kernel()`` writes
     # onto the SCF object.  If they sit as aux data (i.e. not in
     # ``_dynamic_attr``), the JAX pytree machinery preserves them verbatim
@@ -165,11 +166,26 @@ class _DFHF(pytree.PytreeNode, pyscf_df_jk._DFHF):
     # (``data_for_hash`` equality comparing tracer leaves).
     _dynamic_attr = {'mol', 'with_df', 'mo_coeff', 'mo_energy', 'e_tot'}
 
+    def to_pyscf(self):
+        from pyscfad import util
+        backend = getattr(self, '_sgx_backend', None)
+        if backend is None:
+            return util.to_pyscf(self)
+        from pyscf.scf.hf import RHF
+        from pyscfad.sgx import sgx_fit
+        mol = self.mol.to_pyscf().copy()
+        mol.set_geom_(numpy.asarray(self.mol.atom_coords()), unit='Bohr')
+        native = util.to_pyscf(self, nocopy_names=('mol',), out=RHF(mol))
+        return sgx_fit(native, auxbasis=backend.auxbasis,
+                       grid_level=backend.grid_level, fit_ovlp=backend.fit_ovlp,
+                       max_memory=backend.memory)
+
     def _get_veff_from_occ(self, mo_coeff=None, mo_occ=None, *, factors=None,
                           factor_response=True):
         """Use actual RHF density factors; return None for unsupported modes."""
         from pyscfad.scf.hf import RHF
-        if (not isinstance(self, RHF) or hasattr(self, 'xc')
+        if (getattr(self, '_sgx_backend', None) is not None
+                or not isinstance(self, RHF) or hasattr(self, 'xc')
                 or self.only_dfj or self.direct_scf or self.with_df is None
                 or os.environ.get('PYSCFAD_DF_OCCUPIED_VJP', '1').lower()
                 in ('0', 'false', 'no', 'off')):
@@ -194,6 +210,11 @@ class _DFHF(pytree.PytreeNode, pyscf_df_jk._DFHF):
                omega=None):
         if dm is None:
             dm = self.make_rdm1()
+
+        backend = getattr(self, '_sgx_backend', None)
+        if backend is not None:
+            return backend.get_jk(self.mol if mol is None else mol, dm, hermi,
+                                  with_j, with_k, self.direct_scf_tol, omega)
 
         if not self.with_df:
             return super().get_jk(mol, dm, hermi, with_j, with_k, omega)

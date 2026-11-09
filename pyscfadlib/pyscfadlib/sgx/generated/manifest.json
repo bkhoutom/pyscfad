@@ -1,0 +1,512 @@
+{
+  "upstream": "https://github.com/jesse-dicenso/snk_integral_codegen",
+  "upstream_sha256": {
+    "LICENSE": "b64be6e839009e00f93a083d502a402d1892111a7652d507f8f60296509cdabe",
+    "codegen.py": "ebba4ea06b2be10818246cb37d3894030f946e1c82bb1ce4d4265e032eb14ae5",
+    "codestrings.py": "3fba20ca4324429346c3a815e2d55c2be770e3003f4c4290edd762e94e0f9f30",
+    "multishells.py": "c80e15b59e226002ddce0b415ab184161803287bd961236a4e217aed7b17f92f",
+    "recurrences.py": "89326f51978602f80762add7e05a9f3649f8cf72fc88326515c49e06793496ba"
+  },
+  "kernels": [
+    {
+      "name": "VRR_S_S",
+      "la": 0,
+      "lb": 0,
+      "same": false,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 2984,
+      "generation_seconds": 0.006050854921340942
+    },
+    {
+      "name": "VRR_S_S_SAMECENTER",
+      "la": 0,
+      "lb": 0,
+      "same": true,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 2233,
+      "generation_seconds": 0.006058376282453537
+    },
+    {
+      "name": "VRR_P_S",
+      "la": 1,
+      "lb": 0,
+      "same": false,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 3665,
+      "generation_seconds": 0.07359108701348305
+    },
+    {
+      "name": "VRR_P_S_SAMECENTER",
+      "la": 1,
+      "lb": 0,
+      "same": true,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 2677,
+      "generation_seconds": 0.0028922446072101593
+    },
+    {
+      "name": "VRR_P_P",
+      "la": 1,
+      "lb": 1,
+      "same": false,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 6214,
+      "generation_seconds": 0.1029018834233284
+    },
+    {
+      "name": "HRR_P_P",
+      "la": 1,
+      "lb": 1,
+      "same": false,
+      "kind": "hrr",
+      "nbase": 9,
+      "source_bytes": 7064,
+      "generation_seconds": 0.03442584350705147
+    },
+    {
+      "name": "VRR_P_P_SAMECENTER",
+      "la": 1,
+      "lb": 1,
+      "same": true,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 4127,
+      "generation_seconds": 0.010256141424179077
+    },
+    {
+      "name": "HRR_P_P_SAMECENTER",
+      "la": 1,
+      "lb": 1,
+      "same": true,
+      "kind": "hrr",
+      "nbase": 6,
+      "source_bytes": 4749,
+      "generation_seconds": 0.012182977050542831
+    },
+    {
+      "name": "VRR_D_S",
+      "la": 2,
+      "lb": 0,
+      "same": false,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 5036,
+      "generation_seconds": 0.019792590290308
+    },
+    {
+      "name": "VRR_D_S_SAMECENTER",
+      "la": 2,
+      "lb": 0,
+      "same": true,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 3548,
+      "generation_seconds": 0.005364231765270233
+    },
+    {
+      "name": "VRR_D_P",
+      "la": 2,
+      "lb": 1,
+      "same": false,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 12791,
+      "generation_seconds": 0.14708609506487846
+    },
+    {
+      "name": "HRR_D_P",
+      "la": 2,
+      "lb": 1,
+      "same": false,
+      "kind": "hrr",
+      "nbase": 16,
+      "source_bytes": 11925,
+      "generation_seconds": 0.10975399240851402
+    },
+    {
+      "name": "VRR_D_P_SAMECENTER",
+      "la": 2,
+      "lb": 1,
+      "same": true,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 6214,
+      "generation_seconds": 0.039060406386852264
+    },
+    {
+      "name": "HRR_D_P_SAMECENTER",
+      "la": 2,
+      "lb": 1,
+      "same": true,
+      "kind": "hrr",
+      "nbase": 10,
+      "source_bytes": 6861,
+      "generation_seconds": 0.03878432884812355
+    },
+    {
+      "name": "VRR_D_D",
+      "la": 2,
+      "lb": 2,
+      "same": false,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 30775,
+      "generation_seconds": 0.6575901545584202
+    },
+    {
+      "name": "HRR_D_D",
+      "la": 2,
+      "lb": 2,
+      "same": false,
+      "kind": "hrr",
+      "nbase": 31,
+      "source_bytes": 23282,
+      "generation_seconds": 0.4317929372191429
+    },
+    {
+      "name": "VRR_D_D_SAMECENTER",
+      "la": 2,
+      "lb": 2,
+      "same": true,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 10726,
+      "generation_seconds": 0.13691526651382446
+    },
+    {
+      "name": "HRR_D_D_SAMECENTER",
+      "la": 2,
+      "lb": 2,
+      "same": true,
+      "kind": "hrr",
+      "nbase": 15,
+      "source_bytes": 11207,
+      "generation_seconds": 0.07030364125967026
+    },
+    {
+      "name": "VRR_F_S",
+      "la": 3,
+      "lb": 0,
+      "same": false,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 8070,
+      "generation_seconds": 0.07777019962668419
+    },
+    {
+      "name": "VRR_F_S_SAMECENTER",
+      "la": 3,
+      "lb": 0,
+      "same": true,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 4674,
+      "generation_seconds": 0.023025888949632645
+    },
+    {
+      "name": "VRR_F_P",
+      "la": 3,
+      "lb": 1,
+      "same": false,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 28001,
+      "generation_seconds": 0.5983644612133503
+    },
+    {
+      "name": "HRR_F_P",
+      "la": 3,
+      "lb": 1,
+      "same": false,
+      "kind": "hrr",
+      "nbase": 25,
+      "source_bytes": 20381,
+      "generation_seconds": 0.3595305010676384
+    },
+    {
+      "name": "VRR_F_P_SAMECENTER",
+      "la": 3,
+      "lb": 1,
+      "same": true,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 9928,
+      "generation_seconds": 0.11809321865439415
+    },
+    {
+      "name": "HRR_F_P_SAMECENTER",
+      "la": 3,
+      "lb": 1,
+      "same": true,
+      "kind": "hrr",
+      "nbase": 15,
+      "source_bytes": 10600,
+      "generation_seconds": 0.06532618775963783
+    },
+    {
+      "name": "VRR_F_D",
+      "la": 3,
+      "lb": 2,
+      "same": false,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 72597,
+      "generation_seconds": 2.7473241686820984
+    },
+    {
+      "name": "HRR_F_D",
+      "la": 3,
+      "lb": 2,
+      "same": false,
+      "kind": "hrr",
+      "nbase": 46,
+      "source_bytes": 39896,
+      "generation_seconds": 1.3257560320198536
+    },
+    {
+      "name": "VRR_F_D_SAMECENTER",
+      "la": 3,
+      "lb": 2,
+      "same": true,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 16456,
+      "generation_seconds": 0.39827433601021767
+    },
+    {
+      "name": "HRR_F_D_SAMECENTER",
+      "la": 3,
+      "lb": 2,
+      "same": true,
+      "kind": "hrr",
+      "nbase": 21,
+      "source_bytes": 16687,
+      "generation_seconds": 0.22464429214596748
+    },
+    {
+      "name": "VRR_F_F",
+      "la": 3,
+      "lb": 3,
+      "same": false,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 159447,
+      "generation_seconds": 11.373311124742031
+    },
+    {
+      "name": "HRR_F_F",
+      "la": 3,
+      "lb": 3,
+      "same": false,
+      "kind": "hrr",
+      "nbase": 74,
+      "source_bytes": 71644,
+      "generation_seconds": 4.492825161665678
+    },
+    {
+      "name": "VRR_F_F_SAMECENTER",
+      "la": 3,
+      "lb": 3,
+      "same": true,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 28304,
+      "generation_seconds": 1.1929718106985092
+    },
+    {
+      "name": "HRR_F_F_SAMECENTER",
+      "la": 3,
+      "lb": 3,
+      "same": true,
+      "kind": "hrr",
+      "nbase": 28,
+      "source_bytes": 27650,
+      "generation_seconds": 0.5573524236679077
+    },
+    {
+      "name": "VRR_G_S",
+      "la": 4,
+      "lb": 0,
+      "same": false,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 14093,
+      "generation_seconds": 0.27581242844462395
+    },
+    {
+      "name": "VRR_G_S_SAMECENTER",
+      "la": 4,
+      "lb": 0,
+      "same": true,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 7093,
+      "generation_seconds": 0.06790503859519958
+    },
+    {
+      "name": "VRR_G_P",
+      "la": 4,
+      "lb": 1,
+      "same": false,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 58984,
+      "generation_seconds": 2.179498638957739
+    },
+    {
+      "name": "HRR_G_P",
+      "la": 4,
+      "lb": 1,
+      "same": false,
+      "kind": "hrr",
+      "nbase": 36,
+      "source_bytes": 34480,
+      "generation_seconds": 1.1553057581186295
+    },
+    {
+      "name": "VRR_G_P_SAMECENTER",
+      "la": 4,
+      "lb": 1,
+      "same": true,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 14461,
+      "generation_seconds": 0.327798243612051
+    },
+    {
+      "name": "HRR_G_P_SAMECENTER",
+      "la": 4,
+      "lb": 1,
+      "same": true,
+      "kind": "hrr",
+      "nbase": 21,
+      "source_bytes": 15166,
+      "generation_seconds": 0.19402403756976128
+    },
+    {
+      "name": "VRR_G_D",
+      "la": 4,
+      "lb": 2,
+      "same": false,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 158097,
+      "generation_seconds": 10.779898043721914
+    },
+    {
+      "name": "HRR_G_D",
+      "la": 4,
+      "lb": 2,
+      "same": false,
+      "kind": "hrr",
+      "nbase": 64,
+      "source_bytes": 64944,
+      "generation_seconds": 4.268367204815149
+    },
+    {
+      "name": "VRR_G_D_SAMECENTER",
+      "la": 4,
+      "lb": 2,
+      "same": true,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 26962,
+      "generation_seconds": 1.111233800649643
+    },
+    {
+      "name": "HRR_G_D_SAMECENTER",
+      "la": 4,
+      "lb": 2,
+      "same": true,
+      "kind": "hrr",
+      "nbase": 28,
+      "source_bytes": 26634,
+      "generation_seconds": 0.5890976563096046
+    },
+    {
+      "name": "VRR_G_F",
+      "la": 4,
+      "lb": 3,
+      "same": false,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 347513,
+      "generation_seconds": 47.48413509875536
+    },
+    {
+      "name": "HRR_G_F",
+      "la": 4,
+      "lb": 3,
+      "same": false,
+      "kind": "hrr",
+      "nbase": 100,
+      "source_bytes": 112306,
+      "generation_seconds": 14.275323167443275
+    },
+    {
+      "name": "VRR_G_F_SAMECENTER",
+      "la": 4,
+      "lb": 3,
+      "same": true,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 42718,
+      "generation_seconds": 3.5987370796501637
+    },
+    {
+      "name": "HRR_G_F_SAMECENTER",
+      "la": 4,
+      "lb": 3,
+      "same": true,
+      "kind": "hrr",
+      "nbase": 36,
+      "source_bytes": 40992,
+      "generation_seconds": 1.3761733695864677
+    },
+    {
+      "name": "VRR_G_G",
+      "la": 4,
+      "lb": 4,
+      "same": false,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 653888,
+      "generation_seconds": 187.32395799830556
+    },
+    {
+      "name": "HRR_G_G",
+      "la": 4,
+      "lb": 4,
+      "same": false,
+      "kind": "hrr",
+      "nbase": 145,
+      "source_bytes": 182837,
+      "generation_seconds": 49.63816177472472
+    },
+    {
+      "name": "VRR_G_G_SAMECENTER",
+      "la": 4,
+      "lb": 4,
+      "same": true,
+      "kind": "vrr",
+      "nbase": 0,
+      "source_bytes": 68177,
+      "generation_seconds": 11.072525065392256
+    },
+    {
+      "name": "HRR_G_G_SAMECENTER",
+      "la": 4,
+      "lb": 4,
+      "same": true,
+      "kind": "hrr",
+      "nbase": 45,
+      "source_bytes": 64624,
+      "generation_seconds": 3.048356916755438
+    }
+  ]
+}

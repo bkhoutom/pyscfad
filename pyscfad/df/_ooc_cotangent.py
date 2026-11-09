@@ -26,6 +26,7 @@ from pyscf import lib
 from pyscf.gto.mole import AS_RINV_ORIG_ATOM
 
 from pyscfad.lib import _cotangent_buffer
+from pyscfad.lib._threading import fixed_threads
 from pyscfad.df import _response_memory
 
 _scope = ContextVar('pyscfad_ooc_geometry_scope', default=None)
@@ -248,6 +249,7 @@ class GeometryScope:
                 f'DF response metric pullback ready {time.perf_counter()-started:.2f} s')
         return self.low
 
+    @fixed_threads()
     def finish(self, df_bar):
         """Add deferred geometry to the original DF-input cotangent exactly once."""
         if self.finished:

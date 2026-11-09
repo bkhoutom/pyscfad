@@ -338,14 +338,20 @@ def _global_df_response(state):
     """Share root-owned common-Fock/SCF geometry work and response headroom."""
     from pyscfad.df import _ooc_cotangent
     from pyscfad.lib import _scf_response_cache
+    from pyscfad.lib._threading import fixed_threads
+    from pyscfad.sgx import _shared as sgx_shared
     obj = getattr(state['mf'], 'with_df', None)
-    if obj is None or getattr(obj, '_ooc_geometry_producer', None) is None:
+    roots, shared = [], None
+    with ExitStack() as stack:
+        stack.enter_context(fixed_threads())
+        sgx = stack.enter_context(sgx_shared.producer_scope(state['mf']))
+        if obj is not None and getattr(obj, '_ooc_geometry_producer', None) is not None:
+            roots = stack.enter_context(_scf_response_cache.record_response_caches())
+            stack.enter_context(_scf_response_cache.memory_scope(obj))
+            shared = stack.enter_context(_ooc_cotangent.producer_scope(obj))
         yield
-        return
-    with (_scf_response_cache.record_response_caches() as roots,
-          _scf_response_cache.memory_scope(obj),
-          _ooc_cotangent.producer_scope(obj) as shared):
-        yield
+    if sgx is not None:
+        lib.logger.info(state['mf'], 'Shared SGX SCF reverse: %s', sgx.stats)
     if shared is not None:
         lib.logger.info(state['mf'], 'Shared global SCF DF reverse: %s', shared.stats)
     for receipt in roots:
@@ -545,12 +551,15 @@ def _initialize_scf(mol, build_mf, *, fix_phases=True, combine_df=False,
     if not callable(build_mf):
         raise TypeError("build_mf must be callable")
     from pyscfad.df._ooc_cotangent import capture_producers
+    from pyscfad.sgx import _shared as sgx_shared
     with (capture_producers(enabled=combine_df),
+          sgx_shared.capture_producers(enabled=combine_df),
           config_update("pyscfad_scf_implicit_diff", True),
           config_update("pyscfad_scf_first_order_custom", False)):
         build = (lambda mol_: _fix_restart_mo_phases(build_mf(mol_))) if fix_phases else build_mf
         if not share_scf_data:
-            return jax.vjp(build, mol)
+            mf, pullback = jax.vjp(build, mol)
+            return mf, _sgx_scf_pullback(mf, pullback)
         from pyscfad.scf._response_data import capture
 
         def build_with_data(current):
@@ -561,7 +570,20 @@ def _initialize_scf(mol, build_mf, *, fix_phases=True, combine_df=False,
             return mf, data
 
         (mf, data), pullback = jax.vjp(build_with_data, mol)
-        return mf, _JointSCFPullback(pullback, data)
+        return mf, _sgx_scf_pullback(mf, _JointSCFPullback(pullback, data))
+
+
+def _sgx_scf_pullback(mf, pullback):
+    """Own SGX accumulation when no wider common-Fock reverse owns it."""
+    if getattr(mf, '_sgx_backend', None) is None:
+        return pullback
+    from pyscfad.sgx import _shared
+    def apply(cotangent, data_bar=None):
+        with _shared.producer_scope(mf):
+            return (pullback(cotangent) if data_bar is None
+                    else pullback(cotangent, data_bar))
+    apply.scf_data = getattr(pullback, 'scf_data', None)
+    return apply
 
 
 def _root_owned_scf_response(comm, parallel_scf_jk, *, scope='domain'):
@@ -578,12 +600,12 @@ def _serial_scf_pullback(pullback):
     producer. Standalone/partial VJPs and distributed J/K keep their existing paths.
     """
     from pyscfad.lib import _cotangent_buffer
-    from pyscfad.lib._threading import dense_blas_scope
+    from pyscfad.lib._threading import dense_blas_scope, fixed_threads
 
     def apply(cotangent, data_bar=None):
         shared = (nullcontext() if _cotangent_buffer.is_active()
                   else _cotangent_buffer.reverse_scope())
-        with shared, dense_blas_scope():
+        with shared, dense_blas_scope(), fixed_threads():
             result = (pullback(cotangent) if data_bar is None
                       else pullback(cotangent, data_bar))
             jax.block_until_ready(result)

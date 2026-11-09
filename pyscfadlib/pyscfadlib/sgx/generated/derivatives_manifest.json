@@ -1,0 +1,315 @@
+{
+  "generator": "codegen/generate_derivatives.py",
+  "generator_sha256": "8687665331a0455abd5493753aaf46b23137a1979a6e6ee70abbb5a879e58a92",
+  "components": [
+    "value",
+    "ip1_x",
+    "ip1_y",
+    "ip1_z",
+    "ip2_x",
+    "ip2_y",
+    "ip2_z"
+  ],
+  "kernels": [
+    {
+      "name": "VD_S_S",
+      "la": 0,
+      "lb": 0,
+      "same": false,
+      "recurrence_nodes": 6,
+      "simd_chunks": 1,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 1758
+    },
+    {
+      "name": "VD_S_S_SAMECENTER",
+      "la": 0,
+      "lb": 0,
+      "same": true,
+      "recurrence_nodes": 3,
+      "simd_chunks": 1,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 1382
+    },
+    {
+      "name": "VD_P_S",
+      "la": 1,
+      "lb": 0,
+      "same": false,
+      "recurrence_nodes": 27,
+      "simd_chunks": 1,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 3728
+    },
+    {
+      "name": "VD_P_S_SAMECENTER",
+      "la": 1,
+      "lb": 0,
+      "same": true,
+      "recurrence_nodes": 12,
+      "simd_chunks": 1,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 2557
+    },
+    {
+      "name": "VD_P_P",
+      "la": 1,
+      "lb": 1,
+      "same": false,
+      "recurrence_nodes": 89,
+      "simd_chunks": 1,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 9826
+    },
+    {
+      "name": "VD_P_P_SAMECENTER",
+      "la": 1,
+      "lb": 1,
+      "same": true,
+      "recurrence_nodes": 31,
+      "simd_chunks": 1,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 5669
+    },
+    {
+      "name": "VD_D_S",
+      "la": 2,
+      "lb": 0,
+      "same": false,
+      "recurrence_nodes": 76,
+      "simd_chunks": 1,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 7951
+    },
+    {
+      "name": "VD_D_S_SAMECENTER",
+      "la": 2,
+      "lb": 0,
+      "same": true,
+      "recurrence_nodes": 31,
+      "simd_chunks": 1,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 4655
+    },
+    {
+      "name": "VD_D_P",
+      "la": 2,
+      "lb": 1,
+      "same": false,
+      "recurrence_nodes": 229,
+      "simd_chunks": 1,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 23104
+    },
+    {
+      "name": "VD_D_P_SAMECENTER",
+      "la": 2,
+      "lb": 1,
+      "same": true,
+      "recurrence_nodes": 65,
+      "simd_chunks": 1,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 10757
+    },
+    {
+      "name": "VD_D_D",
+      "la": 2,
+      "lb": 2,
+      "same": false,
+      "recurrence_nodes": 514,
+      "simd_chunks": 1,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 51104
+    },
+    {
+      "name": "VD_D_D_SAMECENTER",
+      "la": 2,
+      "lb": 2,
+      "same": true,
+      "recurrence_nodes": 120,
+      "simd_chunks": 1,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 20536
+    },
+    {
+      "name": "VD_F_S",
+      "la": 3,
+      "lb": 0,
+      "same": false,
+      "recurrence_nodes": 170,
+      "simd_chunks": 1,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 16085
+    },
+    {
+      "name": "VD_F_S_SAMECENTER",
+      "la": 3,
+      "lb": 0,
+      "same": true,
+      "recurrence_nodes": 65,
+      "simd_chunks": 1,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 7992
+    },
+    {
+      "name": "VD_F_P",
+      "la": 3,
+      "lb": 1,
+      "same": false,
+      "recurrence_nodes": 489,
+      "simd_chunks": 1,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 47222
+    },
+    {
+      "name": "VD_F_P_SAMECENTER",
+      "la": 3,
+      "lb": 1,
+      "same": true,
+      "recurrence_nodes": 120,
+      "simd_chunks": 1,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 18390
+    },
+    {
+      "name": "VD_F_D",
+      "la": 3,
+      "lb": 2,
+      "same": false,
+      "recurrence_nodes": 1066,
+      "simd_chunks": 1,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 103892
+    },
+    {
+      "name": "VD_F_D_SAMECENTER",
+      "la": 3,
+      "lb": 2,
+      "same": true,
+      "recurrence_nodes": 203,
+      "simd_chunks": 1,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 34685
+    },
+    {
+      "name": "VD_F_F",
+      "la": 3,
+      "lb": 3,
+      "same": false,
+      "recurrence_nodes": 2627,
+      "simd_chunks": 2,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 243551
+    },
+    {
+      "name": "VD_F_F_SAMECENTER",
+      "la": 3,
+      "lb": 3,
+      "same": true,
+      "recurrence_nodes": 513,
+      "simd_chunks": 2,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 68786
+    },
+    {
+      "name": "VD_G_S",
+      "la": 4,
+      "lb": 0,
+      "same": false,
+      "recurrence_nodes": 330,
+      "simd_chunks": 1,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 29803
+    },
+    {
+      "name": "VD_G_S_SAMECENTER",
+      "la": 4,
+      "lb": 0,
+      "same": true,
+      "recurrence_nodes": 120,
+      "simd_chunks": 1,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 13070
+    },
+    {
+      "name": "VD_G_P",
+      "la": 4,
+      "lb": 1,
+      "same": false,
+      "recurrence_nodes": 923,
+      "simd_chunks": 1,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 87117
+    },
+    {
+      "name": "VD_G_P_SAMECENTER",
+      "la": 4,
+      "lb": 1,
+      "same": true,
+      "recurrence_nodes": 203,
+      "simd_chunks": 1,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 29180
+    },
+    {
+      "name": "VD_G_D",
+      "la": 4,
+      "lb": 2,
+      "same": false,
+      "recurrence_nodes": 2499,
+      "simd_chunks": 2,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 232125
+    },
+    {
+      "name": "VD_G_D_SAMECENTER",
+      "la": 4,
+      "lb": 2,
+      "same": true,
+      "recurrence_nodes": 461,
+      "simd_chunks": 2,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 61836
+    },
+    {
+      "name": "VD_G_F",
+      "la": 4,
+      "lb": 3,
+      "same": false,
+      "recurrence_nodes": 5107,
+      "simd_chunks": 3,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 468942
+    },
+    {
+      "name": "VD_G_F_SAMECENTER",
+      "la": 4,
+      "lb": 3,
+      "same": true,
+      "recurrence_nodes": 932,
+      "simd_chunks": 3,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 114276
+    },
+    {
+      "name": "VD_G_G",
+      "la": 4,
+      "lb": 4,
+      "same": false,
+      "recurrence_nodes": 10374,
+      "simd_chunks": 4,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 938876
+    },
+    {
+      "name": "VD_G_G_SAMECENTER",
+      "la": 4,
+      "lb": 4,
+      "same": true,
+      "recurrence_nodes": 1912,
+      "simd_chunks": 4,
+      "max_pairs_per_loop": 64,
+      "source_bytes": 205958
+    }
+  ]
+}

@@ -154,6 +154,7 @@ endif()
 
 add_subdirectory(np_helper)
 add_subdirectory(gto)
+add_subdirectory(sgx)
 add_subdirectory(vjp)
 add_subdirectory(lapack)
 

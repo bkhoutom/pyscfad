@@ -95,7 +95,14 @@ class DIIS(pyscf_diis.DIIS):
         g = numpy.zeros(nd+1, h.dtype)
         g[0] = 1
 
-        w, v = scipy.linalg.eigh(h)
+        try:
+            w, v = scipy.linalg.eigh(h)
+        except numpy.linalg.LinAlgError:
+            # LAPACK's default MRRR driver can fail on nearly dependent DIIS
+            # vectors even for a finite symmetric matrix. Retry with the
+            # divide-and-conquer driver; propagate a second failure.
+            logger.debug(self, 'Retrying DIIS eigensolve with LAPACK evd.')
+            w, v = scipy.linalg.eigh(h, driver='evd')
         if numpy.any(abs(w)<1e-14):
             logger.debug(self, 'Linear dependence found in DIIS error vectors.')
             idx = abs(w)>1e-14

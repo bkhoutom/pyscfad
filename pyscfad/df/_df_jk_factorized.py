@@ -30,7 +30,7 @@ from pyscf.gto.mole import AS_RINV_ORIG_ATOM
 from pyscfad import numpy as np
 from pyscfad.df import _cderi_vjp
 from pyscfad.df import _jk_memory, _response_memory
-from pyscfad.lib._threading import dense_blas_threads, blas_threads
+from pyscfad.lib._threading import dense_blas_threads, blas_threads, fixed_threads
 
 _FACTOR_PANEL_MEMORY_MB = 256.0
 _SOLVE_MEMORY_MB = 64.0
@@ -103,6 +103,7 @@ def _forward(dfobj, factors, with_j, with_k, factor_response):
     return value, (dfobj, factors, activity)
 
 
+@fixed_threads()
 def _backward(with_j, with_k, factor_response, residual, cotangents, *,
               geometry_activity=(True, True)):
     started = time.perf_counter()
@@ -416,6 +417,7 @@ def _prepare_reverse(with_j, with_k, factor_response, residual, cotangents, T, R
         Rtilde is not None and not isinstance(Rtilde, numpy.ndarray)), Sbar
 
 
+@fixed_threads()
 def contract_geometry(contributions):
     """Contract summed seeds for one shared DF source in a single block pass.
 

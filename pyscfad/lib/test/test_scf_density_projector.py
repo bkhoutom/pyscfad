@@ -5,11 +5,12 @@ import numpy as np
 import pytest
 from scipy.linalg import eigh as scipy_eigh
 from pyscfad.scipy.linalg import eigh
-from pyscfad.scf.hf import _density_from_fock
+from pyscfad.scf.hf import _density_from_fock, _density_from_fock_rhf
 
 
+@pytest.mark.parametrize('compact', [False, True])
 @pytest.mark.parametrize('gap', [0., 2e-12, 2e-9, 2e-7, .1])
-def test_density_projector_joint_fock_overlap_response(gap):
+def test_density_projector_joint_fock_overlap_response(gap, compact):
     rng = np.random.default_rng(191)
     s = rng.normal(size=(6, 6))
     s = s @ s.T + np.eye(6)
@@ -24,7 +25,8 @@ def test_density_projector_joint_fock_overlap_response(gap):
     def density(t):
         ft, st = jnp.asarray(f) + t*df, jnp.asarray(s) + t*ds
         e, v = eigh(ft, st)
-        return _density_from_fock(ft, st, e, v, occupation)
+        return (_density_from_fock_rhf(ft, st, e, v, 3) if compact else
+                _density_from_fock(ft, st, e, v, occupation))
 
     value, tangent = jax.jvp(density, (jnp.asarray(0.),), (jnp.asarray(1.),))
     reverse = jax.grad(lambda t: jnp.sum(density(t) * seed))(jnp.asarray(0.))
@@ -67,3 +69,18 @@ def test_density_response_matches_hermitian_eigh_convention():
     fbar, sbar = reverse(jnp.array([[.2, 1.], [0., .3]]))
     np.testing.assert_array_equal(fbar, fbar.T)
     np.testing.assert_array_equal(sbar, sbar.T)
+
+
+@pytest.mark.parametrize('nocc', [0, 2, 4])
+def test_compact_projector_matches_full_jvp_and_vjp(nocc):
+    rng = np.random.default_rng(2026)
+    c = rng.normal(size=(4, 4))
+    e = jnp.array([-1., -.5, .3, .7])
+    f, s, df, ds, seed = map(jnp.asarray, rng.normal(size=(5, 4, 4)))
+    occupation = jnp.asarray([2.]*nocc+[0.]*(4-nocc))
+    full = lambda a, b: _density_from_fock(a, b, e, c, occupation)
+    compact = lambda a, b: _density_from_fock_rhf(a, b, e, c, nocc)
+    np.testing.assert_allclose(jax.jvp(compact, (f, s), (df, ds)),
+                               jax.jvp(full, (f, s), (df, ds)), atol=2e-13)
+    np.testing.assert_allclose(jax.vjp(compact, f, s)[1](seed),
+                               jax.vjp(full, f, s)[1](seed), atol=2e-13)

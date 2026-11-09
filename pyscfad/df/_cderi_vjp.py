@@ -40,7 +40,7 @@ from pyscfad.ao2mo import _ao2mo
 from pyscfad.df import _int3c_cross_opt
 from pyscfad.df import addons as df_addons
 from pyscfad.tools import resource_profile
-from pyscfad.lib._threading import dense_blas_threads, blas_threads
+from pyscfad.lib._threading import dense_blas_threads, blas_threads, fixed_threads
 from pyscfadlib import libnp_helper_vjp
 try:
     from pyscfadlib import libao2mo_vjp
@@ -1068,6 +1068,7 @@ def nr_e2_cderi_bar_packed_block(mo_coeff, ybar, orbs_slice, pair_positions):
     return out
 
 
+@fixed_threads()
 def cholesky_eri_vjp_from_cderi_source(mol, auxmol, cderi_source, cderi_bar,
                                        max_memory, int3c=None, int2c=None,
                                        aosym='s2ij'):
@@ -1222,6 +1223,7 @@ def _int3c_coordinate_vjp_block(mol, auxmol, ints_bar, *, int3c,
     )
 
 
+@fixed_threads()
 def cholesky_eri_vjp_from_cderi_block_fn(mol, auxmol, cderi_source,
                                          cderi_bar_block_fn, max_memory,
                                          int3c=None, int2c=None,
@@ -2031,6 +2033,7 @@ def _int3c_mo_deriv_coords_vjp(mol, auxmol, mo_coeff, z,
     )
 
 
+@fixed_threads()
 def cholesky_eri_vjp_from_mo_coeff_ybar(mol, auxmol, cderi_source,
                                         mo_coeff, ybar, orbs_slice,
                                         max_memory, int3c=None, int2c=None,

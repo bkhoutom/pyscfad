@@ -7,6 +7,7 @@
 """Bilinear SGX response with shared grids and a cached overlap factorization."""
 import numpy as np
 import scipy.linalg
+import time
 from math import lcm
 from pathlib import Path
 from pyscf import lib
@@ -134,8 +135,8 @@ class SGX(native_sgx.SGX):
         if omega is not None or not self.optk or not self.dfj:
             return super().get_jk(dm, hermi, vhfopt, with_j, with_k,
                                   direct_scf_tol, omega)
-        vj = (super().get_jk(dm, hermi, vhfopt, True, False,
-                             direct_scf_tol)[0] if with_j else None)
+        from . import _dfj
+        vj = _dfj.get_j(self, dm, hermi, direct_scf_tol) if with_j else None
         vk = get_k(self, dm, hermi, direct_scf_tol) if with_k else None
         return vj, vk
 
@@ -320,6 +321,11 @@ def geometry_many(obj, contributions, tol):
     from . import _native
     native_plan = _native.get_plan(data)
     nbins, screen, pairs, loc, block = data.get_loop_data(nset=len(dms), grad=True)
+    started = time.perf_counter()
+    counts_before = native_plan.screening_stats() if native_plan is not None else {}
+    timings = dict(ao_seconds=0., front_contraction_seconds=0.,
+                   integral_contraction_seconds=0., back_contraction_seconds=0.,
+                   geometry_contraction_seconds=0.)
     all_pairs = np.ones_like(pairs)
     all_pairs_active = bool(np.all(pairs))
     proj = data._overlap_correction_matrix
@@ -336,24 +342,36 @@ def geometry_many(obj, contributions, tol):
     batch_grad = (None if batch_with_grad is not None else
                   sgx_jk._gen_k_direct(mol, 's1', tol, data, grad=True))
     eval_name = 'GTOval_cart_deriv1' if mol.cart else 'GTOval_sph_deriv1'
+    setup_seconds = time.perf_counter()-started
     for p, q in lib.prange(0, len(grids.weights), block):
         coords, weights = grids.coords[p:q], grids.weights[p:q]
         mask = screen[p // sgx_jk.BLKSIZE:(q + sgx_jk.BLKSIZE - 1) // sgx_jk.BLKSIZE]
+        tick = time.perf_counter()
         ao4 = mol.eval_gto(eval_name, coords, non0tab=mask)
         ao, dao = ao4[0], ao4[1:4]
+        timings['ao_seconds'] += time.perf_counter()-tick
+        tick = time.perf_counter()
         fg = _front_contract(ao, projected, mask, loc)
         extra = ({'ao_l1': np.sum(np.abs(ao), axis=1)}
                  if native_plan is not None and native_plan.accuracy is not None else {})
+        timings['front_contraction_seconds'] += time.perf_counter()-tick
+        tick = time.perf_counter()
         if batch_with_grad is not None:
             gv, dgv = batch_with_grad(mol, coords, fg, weights, p // sgx_jk.SGX_BLKSIZE, **extra)
         else:
             gv = batch(mol, coords, fg, weights, p // sgx_jk.SGX_BLKSIZE, **extra)
             dgv = batch_grad(mol, coords, fg, weights, p // sgx_jk.SGX_BLKSIZE)
+        timings['integral_contraction_seconds'] += time.perf_counter()-tick
+        tick = time.perf_counter()
         if obj.fit_ovlp:
             _back_contract(ao, gv, weights, mask, loc, vk)
+        timings['back_contraction_seconds'] += time.perf_counter()-tick
+        tick = time.perf_counter()
         _geometry_contract(dao, fg, gv, dgv, projected, weights, mask, loc,
                            atom_ao, xed[p:q], dxed[:, p:q])
+        timings['geometry_contraction_seconds'] += time.perf_counter()-tick
         del ao4, ao, dao, fg, gv, dgv
+    tick = time.perf_counter()
     slices = mol.aoslice_by_atom()
     cmat = None
     if obj.fit_ovlp:
@@ -373,6 +391,8 @@ def geometry_many(obj, contributions, tol):
         cmat = 2 * lib.dot(cmat, proj.T) - cmat
         cmat += cmat.T.copy()
     del vk, projected, dms
+    timings['overlap_response_seconds'] = time.perf_counter()-tick
+    tick = time.perf_counter()
     for p, q, atoms, coords, weights, weights1, mask in scalable_grids_response_cc(grids, block):
         if cmat is not None:
             ao4 = mol.eval_gto(eval_name, coords, non0tab=mask)
@@ -396,4 +416,15 @@ def geometry_many(obj, contributions, tol):
             result[atom] -= motion[:, atoms == atom].sum(axis=1)
     for atom, (_, _, p, q) in enumerate(slices):
         result[atom] += 4 * atom_ao[:, p:q].sum(axis=1)
+    timings['grid_response_seconds'] = time.perf_counter()-tick
+    counts_after = native_plan.screening_stats() if native_plan is not None else {}
+    data._geometry_stats = dict(seed_pairs=len(contributions),
+        grid_points=len(grids.weights), block_points=block,
+        accuracy=(dict(native_plan.accuracy)
+                  if native_plan is not None and native_plan.accuracy is not None else None),
+        grid_plan=dict(data._response_grid_plan),
+        screening_counts={k: v-counts_before[k] for k, v in counts_after.items()},
+        screening_counts_available=(native_plan is not None and native_plan.accuracy is not None),
+        setup_seconds=setup_seconds, **timings,
+        total_seconds=time.perf_counter()-started)
     return .5 * result

@@ -23,12 +23,39 @@ os.environ["PYSCFAD_DLNO_RESOURCE_PROFILE"] = "1"
 faulthandler.enable()
 
 
+_SGX_DEFAULTS = dict(integral_backend='auto', screening='static',
+                     mixed_precision=False, energy_tol='auto',
+                     potential_tol='auto', fp32_multiplier=1e5)
+
+
+def _sgx_tolerance(value):
+    if value == 'auto':
+        return value
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError('SGX tolerance must be auto or finite and positive')
+    return number
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--scf-jk', choices=('df', 'dfj-sgx'), default='df',
                         help='SCF and response J/K backend; dfj-sgx avoids global DF factors')
     parser.add_argument('--sgx-grid-level', type=int, choices=range(8), default=2)
     parser.add_argument('--sgx-fit-overlap', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--sgx-integral-backend', choices=('auto', 'generated', 'libcint'),
+                        default=_SGX_DEFAULTS['integral_backend'])
+    parser.add_argument('--sgx-screening', choices=('static', 'adaptive', 'per_pair'),
+                        default=_SGX_DEFAULTS['screening'])
+    parser.add_argument('--sgx-mixed-precision', action=argparse.BooleanOptionalAction,
+                        default=_SGX_DEFAULTS['mixed_precision'],
+                        help='use mixed precision for forward, response and geometry SGX kernels')
+    parser.add_argument('--sgx-energy-tol', type=_sgx_tolerance,
+                        default=_SGX_DEFAULTS['energy_tol'])
+    parser.add_argument('--sgx-potential-tol', type=_sgx_tolerance,
+                        default=_SGX_DEFAULTS['potential_tol'])
+    parser.add_argument('--sgx-fp32-multiplier', type=float,
+                        default=_SGX_DEFAULTS['fp32_multiplier'])
     parser.add_argument("--scf-df-precond", action="store_true",
                         help="Enable host SCF response preconditioning with separate total/workspace budgets")
     parser.add_argument("--threads", type=int, required=True,
@@ -76,6 +103,13 @@ def main():
     parser.add_argument("--reference", type=Path,
                         help="reuse a validated deterministic energy/force result")
     args = parser.parse_args()
+    sgx_options = {key: getattr(args, 'sgx_' + key) for key in _SGX_DEFAULTS}
+    sgx_settings = {'sgx_' + key: value for key, value in sgx_options.items()}
+    if not math.isfinite(args.sgx_fp32_multiplier) or args.sgx_fp32_multiplier <= 0:
+        parser.error('--sgx-fp32-multiplier must be finite and positive')
+    if (args.sgx_integral_backend == 'libcint'
+            and (args.sgx_screening != 'static' or args.sgx_mixed_precision)):
+        parser.error('adaptive screening and mixed precision require the generated SGX backend')
     if args.scf_jk == 'dfj-sgx' and args.scf_df_precond:
         parser.error('--scf-df-precond requires --scf-jk df')
     os.environ['PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE'] = args.fragment_df_mode
@@ -155,6 +189,9 @@ def main():
                 ('triples_variance_allocation', args.triples_variance_allocation, 'mp2_energy')):
             if previous.get(key, old_default) != value:
                 raise ValueError(f'{key} differs; use a new output directory')
+        for key, value in sgx_options.items():
+            if previous.get('sgx_' + key, _SGX_DEFAULTS[key]) != value:
+                raise ValueError(f'SGX {key} differs; use a new output directory')
         if previous.get('scf_df_precond', False) != args.scf_df_precond:
             raise ValueError('SCF preconditioning differs; use a new output directory')
         if previous.get('triples_integral_transform', 'df') != args.triples_integral_transform:
@@ -219,7 +256,7 @@ def main():
         from pyscfad.sgx import sgx_fit
         ref = sgx_fit(pscf.RHF(refmol), auxbasis=auxbasis,
                       grid_level=args.sgx_grid_level, fit_ovlp=args.sgx_fit_overlap,
-                      max_memory=args.df_memory_mb)
+                      max_memory=args.df_memory_mb, **sgx_options)
         report(f'Integral-direct DF-J / SGX-K (grid {args.sgx_grid_level}); no global SCF DF factors')
     cderi_path = (output / "scf_cderi.h5"
                   if args.scf_jk == 'df' and args.df_storage == "outcore" else None)
@@ -261,7 +298,8 @@ def main():
         mf = scf.RHF(current).density_fit(auxbasis=auxbasis)
         if args.scf_jk == 'dfj-sgx':
             mf = sgx_fit(mf, auxbasis=auxbasis, grid_level=args.sgx_grid_level,
-                         fit_ovlp=args.sgx_fit_overlap, max_memory=args.df_memory_mb)
+                         fit_ovlp=args.sgx_fit_overlap, max_memory=args.df_memory_mb,
+                         **sgx_options)
         # This is scratch space, not a ceiling on the whole process RSS.
         # Keep J/K panels useful when retained correlation state exceeds it.
         mf.with_df.jk_workspace_memory = args.df_memory_mb
@@ -424,6 +462,7 @@ def main():
                         reused_reference=str(args.reference.resolve()) if args.reference else None,
                         setup_seconds=((production_started if production_started is not None
                                         else time.perf_counter())-started))
+        settings.update(sgx_settings)
         save(output / "settings.json", settings)
         report(f"CPU affinity {benchmark_cpus}; all {affinity['runtime_threads']} runtime threads verified")
         if args.single_pass_w:
@@ -439,6 +478,8 @@ def main():
                     or reference.get('scf_jk', 'df') != args.scf_jk
                     or reference.get('sgx_grid_level', 2) != args.sgx_grid_level
                     or reference.get('sgx_fit_overlap', True) != args.sgx_fit_overlap
+                    or any(reference.get('sgx_' + key, _SGX_DEFAULTS[key]) != value
+                           for key, value in sgx_options.items())
                     or reference.get("lis_space", "global") != 'domain'
                     or reference.get("lno_thresh_occ") != args.lno_thresh_occ
                     or reference.get("lno_thresh_vir") != args.lno_thresh_vir
@@ -557,6 +598,7 @@ def main():
                       lno_thresh_occ=args.lno_thresh_occ, lno_thresh_vir=args.lno_thresh_vir,
                       elapsed_seconds=time.perf_counter()-phase,
                       completed_at_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        result.update(sgx_settings)
         result.update(check_worker_affinity(benchmark_cpus))
         save(destination, result)
         report(f"END {label}: {result['total_energy_eh']:.12f} Eh; "

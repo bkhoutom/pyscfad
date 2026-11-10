@@ -96,6 +96,9 @@ def test_complete_scf_merges_geometry_and_reuses_tape(
         assert receipts[-1]['consumers'] >= 3
         assert receipts[-1]['j_integral_passes'] == receipts[-1]['k_integral_passes'] == 1
         assert receipts[-1]['retained_seed_bytes'] == 0
+        assert receipts[-1]['j_geometry_seconds'] > 0
+        assert receipts[-1]['k_geometry_seconds'] > 0
+        assert {batch['kind'] for batch in receipts[-1]['geometry_batches']} == {'j', 'k'}
         # A partial reverse must report and clear pending seeds. The same
         # immutable tape then remains usable with a different output seed.
         with pytest.raises(RuntimeError, match='unconsumed SGX geometry'):
@@ -108,6 +111,26 @@ def test_complete_scf_merges_geometry_and_reuses_tape(
                          if joint_outputs else scf_pull(mf_bar))
         np.testing.assert_allclose(repeated.coords, -.4*values[0][1], atol=3e-9)
     assert _shared._scope.get() is None
+
+
+def test_geometry_screening_receipt_is_per_call_without_resetting_plan(mol):
+    mf = build(mol, integral_backend='generated', screening='per_pair',
+               mixed_precision=True, energy_tol=1e-10, potential_tol=1e-8,
+               fp32_multiplier=1e5)
+    obj = mf._sgx_backend.native(mol, mf.direct_scf_tol)
+    rng = np.random.default_rng(183)
+    dm, bar = _sym(rng.normal(size=(2, mol.nao, mol.nao)))
+    plan = _native.get_plan(obj._pjs_data)
+    before = plan.screening_stats()
+    first = _sgx_grad.geometry_many(obj, [(dm, bar)], mf.direct_scf_tol)
+    receipt = obj._pjs_data._geometry_stats
+    first_counts = receipt['screening_counts']
+    assert receipt['screening_counts_available']
+    assert sum(first_counts[k] for k in ('skipped_tiles', 'fp32_tiles', 'fp64_tiles')) > 0
+    second = _sgx_grad.geometry_many(obj, [(dm, bar)], mf.direct_scf_tol)
+    assert obj._pjs_data._geometry_stats['screening_counts'] == first_counts
+    assert plan.screening_stats() == {k: before[k]+2*v for k, v in first_counts.items()}
+    np.testing.assert_allclose(first, second, atol=2e-13, rtol=2e-13)
 
 
 def test_scope_groups_only_equal_densities_and_ignores_other_geometry(mol):

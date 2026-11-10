@@ -105,7 +105,10 @@ def sgx_fit(mf, auxbasis=None, *, grid_level=2, fit_ovlp=True,
     Reverse-mode derivatives neglect discrete changes in selection, as in
     ordinary screened integral algorithms. Shared geometry calls use the union
     of all density/adjoint requirements and a tighter derivative criterion.
-    Density pullbacks disable density-dependent K skipping and J screening.
+    Density pullbacks disable density-dependent skipping for both J and K,
+    while retaining a fixed Schwarz integral screen for both DF-J passes.
+    DF-J geometry uses separate AO-derivative and auxiliary-derivative
+    Schwarz bounds at the SCF integral tolerance.
     With ``mixed_precision=True``, response K uses the same FP32 classification
     thresholds as forward K; otherwise it uses static FP64. Mixed arithmetic
     remains approximately linear. There is no separate response-precision

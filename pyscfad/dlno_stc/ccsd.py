@@ -89,6 +89,7 @@ class FragmentComponents:
     triples_diagnostics: dict | None = None
     ccsd_method: str = 'deterministic'
     ccsd_diagnostics: dict | None = None
+    auxiliary_compression: dict | None = None
 
     @property
     def e_ccsd_t(self):
@@ -153,16 +154,19 @@ class CCSDComponents:
         return None if error is None else error <= target
 
 
-def _cc_solver_options(cc_solver, stc_cc_controls):
+def _cc_solver_options(cc_solver, stc_cc_controls, lis_aux_svd_tol=None):
     """Validate the optional backend without importing external STC packages."""
+    from ._aux_compress import normalize_tolerance
+    tolerance = normalize_tolerance(lis_aux_svd_tol)
+    options = {} if tolerance is None else {'lis_aux_svd_tol': tolerance}
     if cc_solver not in ('deterministic', 'stc'):
         raise ValueError("cc_solver must be 'deterministic' or 'stc'")
     if cc_solver == 'deterministic':
         if stc_cc_controls is not None:
             raise ValueError("stc_cc_controls requires cc_solver='stc'")
-        return {}
+        return options
     from .stc_ccsd import normalize_controls
-    return dict(cc_solver='stc', stc_cc_controls=normalize_controls(stc_cc_controls))
+    return dict(options, cc_solver='stc', stc_cc_controls=normalize_controls(stc_cc_controls))
 
 
 def _validate_shared_frame_triples(static, ccsd_t, stc_cc_controls):
@@ -584,7 +588,7 @@ def _build_solver_lis(mf, common, static, fragment_index, matrices, frame, repre
 def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
                     verbose_imp, ccsd_t, triples_controls=None, with_grad=False,
                     vvvv_direct=False, cc_solver='deterministic', stc_cc_controls=None,
-                    frame=None, correlation_auxbasis=None):
+                    frame=None, correlation_auxbasis=None, df_compressor=None):
     """Return MP2-LIS, CCSD and triples; stochastic calls also return diagnostics."""
     _validate_shared_frame_triples(static, ccsd_t, stc_cc_controls)
     representative = group.representative_index
@@ -596,13 +600,15 @@ def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
     if not lis.active_occupied_coeff.shape[1] or not lis.active_virtual_coeff.shape[1]:
         zero = np.zeros((), dtype=common.s1e.dtype)
         values = (zero, zero, zero)
-        return ((values, {}) if cc_solver == 'stc' or stochastic or
+        return ((values, {}) if df_compressor is not None or cc_solver == 'stc' or stochastic or
                 (ccsd_t and static.lis_static.smooth_frames is not None) else values)
     metadata = {'fragment_index': int(fragment_index),
                 'extended_primary_domain': numpy.asarray(
                     static.mp2_static.fragments[representative].extended_atoms, dtype=numpy.int32)}
     options = basis_kwargs(correlation_auxbasis)
     options['active_nocc'] = lis.active_occupied_coeff.shape[1]
+    if df_compressor is not None:
+        options['df_compressor'] = df_compressor
     if cc_solver == 'stc':
         from .stc_ccsd import make_solver
         options['amplitude_solver'] = make_solver(stc_cc_controls, fragment_index=fragment_index)
@@ -623,23 +629,32 @@ def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
                 with_grad=with_grad)
     elif stochastic:
         raise ValueError('canonical triples sampling has been removed; rebuild smooth selections')
-    return _impurity_solve_core(
+    result = _impurity_solve_core(
         mf, lis.mo_coeff, lis.fragment_iao_coeff, common.fock, common.s1e,
         frozen=lis.frozen, frag_prescreen=metadata, verbose_imp=verbose_imp,
         ccsd_t=ccsd_t, dcsd=False, profile_info=None,
         vvvv_direct=vvvv_direct, **options)
+    if df_compressor is None:
+        return result
+    if 'amplitude_solver' in options or 'triples_solver' in options:
+        values, diagnostics = result
+    else:
+        values, diagnostics = result, {}
+    return values, diagnostics
 
 
 def _run_group(state, static, group, baseline_controls, matrix_controls, *,
                with_grad, verbose_imp, ccsd_t, triples_controls=None,
                include_baseline=True, fragment_indices=None, vvvv_direct=False,
-               cc_solver='deterministic', stc_cc_controls=None):
+               cc_solver='deterministic', stc_cc_controls=None, lis_aux_svd_tol=None):
     """Optionally join all local DF producer responses for this domain."""
     from pyscfad.lno import _df_shared
     options = dict(with_grad=with_grad, verbose_imp=verbose_imp, ccsd_t=ccsd_t,
                    triples_controls=triples_controls, include_baseline=include_baseline,
                    fragment_indices=fragment_indices, vvvv_direct=vvvv_direct,
                    cc_solver=cc_solver, stc_cc_controls=stc_cc_controls)
+    if lis_aux_svd_tol:
+        options['lis_aux_svd_tol'] = lis_aux_svd_tol
     # Replica averaging scales returned VJP trees. Deferred integral bars in an
     # outer shared scope would escape that scaling, so use ordinary responses.
     replica_precision = cc_solver == 'stc' and _stc_precision.enabled(stc_cc_controls)
@@ -667,7 +682,7 @@ def _run_group(state, static, group, baseline_controls, matrix_controls, *,
 def _run_group_responses(state, static, group, baseline_controls, matrix_controls, *,
                         with_grad, verbose_imp, ccsd_t, triples_controls=None,
                         include_baseline=True, fragment_indices=None, vvvv_direct=False,
-                        cc_solver='deterministic', stc_cc_controls=None):
+                        cc_solver='deterministic', stc_cc_controls=None, lis_aux_svd_tol=None):
     """Complete one owned group's preparation, baseline and physical-fragment responses.
 
     All process-local VJPs and matrix replay records are consumed here. Only
@@ -742,6 +757,11 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
             nonlocal pilot_mf
             solver_options = (dict(cc_solver=cc_solver, stc_cc_controls=configuration)
                               if cc_solver == 'stc' else {})
+            compressor = None
+            if lis_aux_svd_tol:
+                from ._aux_compress import make_compressor
+                compressor = make_compressor(lis_aux_svd_tol)
+                solver_options['df_compressor'] = compressor
             def correction(mf, common, blocks, coeff):
                 current_frame = frame._replace(occupied_coeff=coeff[0], virtual_coeff=coeff[1])
                 values = _solve_fragment(mf, common, fragment_static, index, blocks, group,
@@ -749,7 +769,7 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
                                          triples_controls=local_triples, with_grad=need_grad,
                                          vvvv_direct=vvvv_direct, frame=current_frame, **solver_options,
                                          **basis_kwargs(state.get('correlation_auxbasis')))
-                if cc_solver == 'stc' or (ccsd_t and (
+                if lis_aux_svd_tol or cc_solver == 'stc' or (ccsd_t and (
                         getattr(getattr(fragment_static, 'lis_static', None), 'smooth_frames', None) is not None or
                         triples_controls is not None and triples_controls['mode'] == 'stochastic')):
                     values, diagnostics = values
@@ -770,6 +790,8 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
                             df._lno_local_df_cache = dict(cache)
                     reference = pilot_mf
                 energy, auxiliary = correction(reference, state['common'], matrices, frame_coeff)
+                if compressor is not None:
+                    auxiliary[1]['auxiliary_compression'] = dict(compressor.diagnostics)
                 return energy, auxiliary, None
             with resource_profile.section('stc.cc.correction_forward', frag=index+1):
                 energy, pullback, auxiliary = jax.vjp(
@@ -779,6 +801,8 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
             with resource_profile.section('stc.cc.correction_pullback', frag=index+1):
                 bars = pullback(np.ones_like(energy))
                 jax.block_until_ready(bars)
+            if compressor is not None:
+                auxiliary[1]['auxiliary_compression'] = dict(compressor.diagnostics)
             return energy, auxiliary, bars
         if cc_solver == 'stc' and _stc_precision.enabled(stc_cc_controls):
             nfragments = len(_fragment_indices(static, fragment_indices))
@@ -824,6 +848,7 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
             return value.item() if value.ndim == 0 else value.tolist()
         diagnostics = jax.tree_util.tree_map(diagnostic_value, diagnostics)
         cc_diagnostics = diagnostics.pop('ccsd', None)
+        compression_diagnostics = diagnostics.pop('auxiliary_compression', None)
         if local_triples is not None:
             diagnostics.update({key: local_triples[key] for key in (
                 'target_standard_error', 'fragment_variance_fraction',
@@ -847,7 +872,8 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
                                                             if key.endswith('_seconds')} or None,
                                            triples_diagnostics=diagnostics or None,
                                            ccsd_method=cc_solver,
-                                           ccsd_diagnostics=cc_diagnostics))
+                                           ccsd_diagnostics=cc_diagnostics,
+                                           auxiliary_compression=compression_diagnostics))
         del forward, matrices, evaluate, pilot_mf, energy, values, auxiliary, diagnostics, fragment_static
         release_consumed_inputs(forward_only=not with_grad)
         gc.collect()
@@ -883,7 +909,7 @@ def _run_serial(state, static, baseline, matrix, *, with_grad, include_hf,
                 merge_identical, verbose_imp, ccsd_t, return_components,
                 triples_controls=None, fragment_indices=None, include_baseline=True,
                 checkpoint_dir=None, resume=False, vvvv_direct=False,
-                cc_solver='deterministic', stc_cc_controls=None):
+                cc_solver='deterministic', stc_cc_controls=None, lis_aux_svd_tol=None):
     from ._ccsd_checkpoint import open_checkpoint, restore_progress, save_progress
     groups = build_domain_groups(static.mp2_static, merge_identical=merge_identical)
     allocated = allocate_domain_controls(baseline, len(groups))
@@ -893,6 +919,8 @@ def _run_serial(state, static, baseline, matrix, *, with_grad, include_hf,
                    merge_identical=merge_identical)
     solver_options = (dict(cc_solver=cc_solver, stc_cc_controls=stc_cc_controls)
                       if cc_solver == 'stc' else {})
+    if lis_aux_svd_tol:
+        solver_options['lis_aux_svd_tol'] = lis_aux_svd_tol
     options.update(solver_options)
     checkpoint = open_checkpoint(state, static, groups, checkpoint_dir=checkpoint_dir,
                                   resume=resume, options=options)
@@ -975,11 +1003,17 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
            return_components=False,
            merge_identical=True, comm=None, fragment_indices=None, include_baseline=True,
            checkpoint_dir=None, resume=False, parallel_scf_jk=True, vvvv_direct=False,
-           cc_solver='deterministic', stc_cc_controls=None, correlation_auxbasis=None):
+           cc_solver='deterministic', stc_cc_controls=None, correlation_auxbasis=None,
+           lis_aux_svd_tol=1e-5):
     """Return correlation energy, or total energy with ``include_hf=True``.
 
     ``correlation_auxbasis`` selects local MP2, D/W and CC fitting; HF/Fock
     retain the SCF fit. Use the same basis for selection and execution.
+    ``lis_aux_svd_tol`` compresses only LIS auxiliary factors with the strict
+    squared-singular-value cutoff ``s**2 > tol`` (default ``1e-5``).
+    Pass ``None`` or zero to disable compression.
+    Domain MP2, D/W and orbital selection remain unchanged. Compression
+    diagnostics are included in each fragment's ``auxiliary_compression``.
     ``return_components=True`` returns ``(energy, CCSDComponents)``. With W,
     strong-domain MP2 energy is read directly from its traces, in deterministic
     and stochastic modes, including fragments without a CC correction. Matrix
@@ -1029,7 +1063,7 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
     not bound forces; cap/unmet-target diagnostics remain explicit.
     """
     def initialize():
-        solver_options = _cc_solver_options(cc_solver, stc_cc_controls)
+        solver_options = _cc_solver_options(cc_solver, stc_cc_controls, lis_aux_svd_tol)
         triples = normalize_triples_controls(triples_controls, ccsd_t=ccsd_t)
         if include_hf and not include_baseline:
             raise ValueError('include_hf requires include_baseline=True')
@@ -1074,11 +1108,15 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
                    return_components=False, merge_identical=True, comm=None, build_static=None,
                    fragment_indices=None, include_baseline=True, checkpoint_dir=None, resume=False,
                    parallel_scf_jk=True, vvvv_direct=False,
-                   cc_solver='deterministic', stc_cc_controls=None, correlation_auxbasis=None):
+                   cc_solver='deterministic', stc_cc_controls=None, correlation_auxbasis=None,
+                   lis_aux_svd_tol=1e-5):
     """Return ``(energy, mol_bar)``; ``mol_bar.coords`` is a nuclear gradient.
 
     ``correlation_auxbasis`` follows :func:`kernel`; ``build_static`` inherits
     it on its detached reference. The live SCF DF object remains unchanged.
+    ``lis_aux_svd_tol`` defaults to ``1e-5`` and follows :func:`kernel`,
+    including the response of the retained auxiliary subspace at its fixed rank.
+    Pass ``None`` or zero to disable compression.
     Include HF once with ``include_hf=True``. Append ``CCSDComponents`` with
     ``return_components=True``. A force is the negated coordinate gradient.
     ``build_static(mf)`` may select ranks once on the detached SCF reference.
@@ -1106,7 +1144,7 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
     remains active, including the original fragment projector.
     """
     def initialize():
-        solver_options = _cc_solver_options(cc_solver, stc_cc_controls)
+        solver_options = _cc_solver_options(cc_solver, stc_cc_controls, lis_aux_svd_tol)
         triples = normalize_triples_controls(triples_controls, ccsd_t=ccsd_t)
         driver._coordinate_only(mol)
         if include_hf and not include_baseline:

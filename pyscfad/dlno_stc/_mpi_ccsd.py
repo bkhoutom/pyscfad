@@ -156,8 +156,8 @@ def _run_jobs(initializer, worker_initializer, comm, *, with_grad,
                 vvvv_direct=options['vvvv_direct'],
                 include_baseline=options['include_baseline'],
                 fragment_indices=options['fragment_indices'],
-                **({key: options[key] for key in ('cc_solver', 'stc_cc_controls')}
-                   if options.get('cc_solver') == 'stc' else {})))
+                **{key: options[key] for key in (
+                    'cc_solver', 'stc_cc_controls', 'lis_aux_svd_tol') if key in options}))
             ccsd._clear_jax_caches('after_group', state['energy'], state['mf_bar'],
                                   state['common_bar'], frag=group.representative_index+1)
             gc.collect()

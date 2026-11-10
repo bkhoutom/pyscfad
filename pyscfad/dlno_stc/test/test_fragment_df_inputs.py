@@ -51,8 +51,9 @@ def molecular_case(tmp_path_factory):
 
 @pytest.mark.parametrize('triples_mode,integral_transform',
                          [('stochastic', 'rotate'), ('deterministic', 'df')])
+@pytest.mark.parametrize('auxiliary_tolerance', [None, 1e-4])
 def test_default_half_matches_direct_with_one_integral_pass(
-        molecular_case, monkeypatch, triples_mode, integral_transform):
+        molecular_case, monkeypatch, triples_mode, integral_transform, auxiliary_tolerance):
     case = molecular_case
     controls = dict(mode=triples_mode, integral_transform=integral_transform)
     if triples_mode == 'stochastic':
@@ -76,7 +77,8 @@ def test_default_half_matches_direct_with_one_integral_pass(
             with_grad=True, scf_pullback=case.pullback)
         records = ccsd._run_group(state, static, case.group,
             case.controls, case.controls, with_grad=True, verbose_imp=0,
-            ccsd_t=True, triples_controls=triples, fragment_indices=case.indices)
+            ccsd_t=True, triples_controls=triples, fragment_indices=case.indices,
+            lis_aux_svd_tol=auxiliary_tolerance)
         bars = state['mf_bar'], state['common_bar']
         value, gradient = ccsd.driver._finish(state, with_grad=True, include_hf=False)
         return value, gradient, records, bars
@@ -115,7 +117,12 @@ def test_default_half_matches_direct_with_one_integral_pass(
         numpy.testing.assert_allclose((got.e_mp2_lis, got.e_ccsd, got.e_triples),
             (expected.e_mp2_lis, expected.e_ccsd, expected.e_triples), atol=3e-12, rtol=0)
         assert got.triples_samples == expected.triples_samples
-    accept.record_result('half_df_'+triples_mode, {
+        if auxiliary_tolerance is not None:
+            info = got.auxiliary_compression
+            assert info['retained_naux'] < info['original_naux']
+            assert info['pullback_s'] > 0
+    suffix = '' if auxiliary_tolerance is None else '_aux_svd'
+    accept.record_result('half_df_'+triples_mode+suffix, {
         'energy_Eh': float(value), 'max_gradient_difference':
             float(numpy.max(numpy.abs(gradient.coords-ref_gradient.coords))),
         'receipt': receipts[-1]})

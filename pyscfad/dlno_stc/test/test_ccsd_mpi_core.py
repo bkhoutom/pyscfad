@@ -86,7 +86,8 @@ def test_cc_owners_configure_cache_before_setup_and_keep_serial_options(
         state = dict(mf=mf, common=common, weak_pairs=(),
                      mf_bar=root_bars[0], common_bar=root_bars[1],
                      cc_fragment_indices=(0, 1), cc_triples_controls=triples,
-                     cc_solver_options=dict(cc_solver='stc', stc_cc_controls=stochastic_cc))
+                     cc_solver_options=dict(cc_solver='stc', stc_cc_controls=stochastic_cc,
+                                            lis_aux_svd_tol=1e-6))
         return state, static, {'mode': 'deterministic'}, {'mode': 'deterministic'}
 
     def build_worker(*args):
@@ -104,6 +105,7 @@ def test_cc_owners_configure_cache_before_setup_and_keep_serial_options(
         assert options['vvvv_direct'] is True
         assert options['cc_solver'] == 'stc'
         assert options['stc_cc_controls'] == stochastic_cc
+        assert options['lis_aux_svd_tol'] == 1e-6
         assert options['triples_controls'] == triples
         assert options['fragment_indices'] == (0, 1)
         assert options['with_grad'] is with_grad

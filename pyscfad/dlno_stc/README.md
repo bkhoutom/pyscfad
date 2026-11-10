@@ -16,6 +16,13 @@ membership, and its position is the stable physical fragment ID. Internal
 `DomainGroup` entries merge preparation only when saved supports, candidate
 ordering, retained virtual ranks and PAO anchors are identical.
 
+The CCSD entry points `dlno_stc.ccsd.kernel` and `dlno_stc.ccsd.value_and_grad`
+default to `lis_aux_svd_tol=1e-5`. Each physical fragment compresses its LIS
+auxiliary factors by retaining squared singular values `s**2 > lis_aux_svd_tol`.
+Pass `lis_aux_svd_tol=None` or `0` to disable compression. This applies to all
+physical grouping modes; domain MP2, D/W matrices and orbital selection retain
+their existing auxiliary spaces.
+
 ```python
 from pyscfad import dlno_stc
 static = dlno_stc.build_domain_selections(mf, frozen=4)

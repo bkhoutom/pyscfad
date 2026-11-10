@@ -111,12 +111,15 @@ def run_replicas(evaluate, controls, fragment_index, nfragments, *, with_grad=Fa
     one accumulated cotangent tree and scalar replica data, never VJP tapes.
     """
     pilot_energies, pilot_seeds, pilot_counts = [], [], []
+    pilot_compression, production_compression = [], []
     for replica in range(controls['precision_pilot_replicas']):
         config = replica_controls(controls, fragment_index, 'pilot', replica)
         energy, (_, diagnostic), _ = evaluate(config, False)
         pilot_energies.append(float(energy))
         pilot_seeds.append(_seed_record(config, diagnostic))
         pilot_counts.append(diagnostic.get('ccsd', {}).get('nsamples_forward_production', 0))
+        if 'auxiliary_compression' in diagnostic:
+            pilot_compression.append(diagnostic['auxiliary_compression'])
     plan = production_plan(pilot_energies, controls, nfragments)
     count = plan['production_replicas']
     energies, parts, seeds, replica_diagnostics, triples_diagnostics = [], [], [], [], []
@@ -132,7 +135,10 @@ def run_replicas(evaluate, controls, fragment_index, nfragments, *, with_grad=Fa
             'seed', 'grad_seed', 'converged', 'termination_mode', 'iterations',
             'averaged_count', 'nsamples_forward_production',
             'local_mean_iterate_stderr', 'projected_mean_iterate_stderr_iid') if key in cc})
-        triples_diagnostics.append({key: value for key, value in diagnostic.items() if key != 'ccsd'})
+        triples_diagnostics.append({key: value for key, value in diagnostic.items()
+                                    if key not in ('ccsd', 'auxiliary_compression')})
+        if 'auxiliary_compression' in diagnostic:
+            production_compression.append(diagnostic['auxiliary_compression'])
         if with_grad:
             sum_bars = bars if sum_bars is None else jax.tree.map(lambda a, b: a + b, sum_bars, bars)
             jax.block_until_ready(sum_bars)
@@ -165,6 +171,9 @@ def run_replicas(evaluate, controls, fragment_index, nfragments, *, with_grad=Fa
                                                          for d in replica_diagnostics),
                          nsamples_forward_pilot_replicas=sum(pilot_counts))
     diagnostic = {'ccsd': cc_diagnostic}
+    if pilot_compression or production_compression:
+        diagnostic['auxiliary_compression'] = dict(
+            pilot=pilot_compression, production=production_compression)
     if any(triples_diagnostics):
         diagnostic['replica_triples_diagnostics'] = triples_diagnostics
     mean_bars = None if sum_bars is None else jax.tree.map(lambda value: value / count, sum_bars)

@@ -337,6 +337,10 @@ def _make_df_eris_incore(cc, mo_coeff=None, fockao=None, s1e=None):
         correlation_auxbasis=getattr(cc, 'correlation_auxbasis', None),
     ).reshape(-1, nmo, nmo)
 
+    compressor = getattr(cc, 'df_compressor', None)
+    if compressor is not None:
+        Lpq = compressor(Lpq)
+
     if _USE_CUSTOM_VJP_AO2MO_DF_ERIS:
         # Single custom_vjp boundary hides Loo/Lov/Lvv + matmul outputs from
         # the outer LNO replay's recorded jaxpr.
@@ -487,7 +491,8 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
                          verbose_imp=0, ccsd_t=False, dcsd=False,
                          profile_info=None, profile_pass=None,
                          triples_solver=None, mp2_solver=None, vvvv_direct=False,
-                         amplitude_solver=None, active_nocc=None, correlation_auxbasis=None):
+                         amplitude_solver=None, active_nocc=None, correlation_auxbasis=None,
+                         df_compressor=None):
     '''Numerical core of :func:`impurity_solve`; see that function for docs.
 
     Takes ``fock`` and ``s1e`` directly (rather than the parent ``eris``
@@ -511,6 +516,9 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
 
     ``correlation_auxbasis`` selects the local correlation fit independently
     of the SCF object's JK auxiliary basis and cached DF source.
+
+    ``df_compressor`` optionally reduces the complete LIS auxiliary factors
+    before any MP2, CCSD or triples integral blocks are constructed.
     '''
     log = logger.new_logger(mf)
     if active_nocc is None:
@@ -575,6 +583,7 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
         mcc = RCCSD(mf, mo_coeff=mo_coeff, mo_occ=mo_occ, frozen=frozen)
     mcc.vvvv_direct = vvvv_direct
     mcc.correlation_auxbasis = correlation_auxbasis
+    mcc.df_compressor = df_compressor
     diis_space = int(os.environ.get('PYSCFAD_LNO_CCSD_DIIS_SPACE', '3'))
     if diis_space <= 0:
         mcc.diis = False

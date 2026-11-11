@@ -291,6 +291,8 @@ _build_eris_tensors_from_Lpq.defvjp(
 )
 
 class RCCSD(dfccsd.RCCSD):
+    native_cpu = True
+
     def ao2mo(self, mo_coeff=None, fockao=None, s1e=None):
         return _make_df_eris_incore(self, mo_coeff, fockao, s1e)
 

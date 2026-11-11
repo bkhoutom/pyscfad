@@ -51,6 +51,7 @@ exclude = ["examples", "*test*"]
 include-package-data = true
 
 [tool.setuptools.package-data]
+"pyscfad.cc" = ["cpp/*.cpp", "cpp/CMakeLists.txt"]
 "pyscfad.geomopt" = ["log.ini"]
 "pyscfad.xtb.basis" = ["gfn1.dat"]
 "pyscfad.xtb.data" = ["gfn1-xtb.toml"]

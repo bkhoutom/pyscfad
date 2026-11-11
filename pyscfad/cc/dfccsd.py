@@ -35,9 +35,10 @@ _CCSD_OVVV_BLKSIZE = 32
 
 class RCCSD(ccsd.CCSD):
     _dynamic_attr = {'with_df'}
-    _keys = {'with_df', 'vvvv_direct'}
+    _keys = {'with_df', 'vvvv_direct', 'native_cpu'}
 
     vvvv_direct = False
+    native_cpu = False
 
     def __init__(self, mf, frozen=None, mo_coeff=None, mo_occ=None):
         super().__init__(mf, frozen=frozen, mo_coeff=mo_coeff, mo_occ=mo_occ)
@@ -315,6 +316,11 @@ def _maybe_cache_vvvv(mycc, eris):
     Canonical and LNO ERI builders share this policy and retain the same ERIs.
     """
     eris._vvvv_pair = None
+    from . import _dfccsd_native
+    if _dfccsd_native.enabled(mycc):
+        # The native host solve applies the same memory policy to its own
+        # packed vvvv layout. Avoid retaining a second, JAX-specific cache.
+        return eris
     if mycc.vvvv_direct:
         return eris
     npair = eris.Lvv.shape[-1]
@@ -411,13 +417,19 @@ def _dfccsd_kernel_plain(mycc, eris, t1=None, t2=None):
 
 @custom_vjp
 def _dfccsd_kernel_custom(mycc, eris, t1=None, t2=None):
+    from . import _dfccsd_native
+    if _dfccsd_native.enabled(mycc):
+        return _dfccsd_native.forward(mycc, eris, t1, t2)
     return _dfccsd_kernel_plain(mycc, eris, t1, t2)
 
 
 def _dfccsd_kernel_custom_fwd(mycc, eris, t1=None, t2=None):
-    out = _dfccsd_kernel_plain(mycc, eris, t1, t2)
+    from . import _dfccsd_native
+    native = _dfccsd_native.enabled(mycc)
+    out = (_dfccsd_native.forward(mycc, eris, t1, t2) if native
+           else _dfccsd_kernel_plain(mycc, eris, t1, t2))
     _, _, t1_out, t2_out = out
-    return out, (mycc, eris, t1_out, t2_out)
+    return out, (mycc, eris, t1_out, t2_out, native)
 
 
 def _coerce_eris_tensors_for_bwd(eris):
@@ -449,7 +461,7 @@ def _dfccsd_kernel_custom_bwd(res, cotangent):
     """
     profile_total = resource_profile.start()
     profile_prepare = resource_profile.start()
-    mycc, eris, t1, t2 = res
+    mycc, eris, t1, t2, native = res
     _, bar_e, bar_t1, bar_t2 = cotangent
     eris = _coerce_eris_tensors_for_bwd(eris)
     t1 = np.asarray(t1)
@@ -494,6 +506,16 @@ def _dfccsd_kernel_custom_bwd(res, cotangent):
     bar_t2_val = (
         None if _is_zero_cotangent(bar_t2) else np.asarray(bar_t2)
     )
+
+    if native:
+        from . import _dfccsd_native
+        eris_bar = _dfccsd_native.backward(
+            mycc, eris, t1, t2, np.asarray(bar_e_val),
+            np.zeros_like(t1) if bar_t1_val is None else bar_t1_val,
+            np.zeros_like(t2) if bar_t2_val is None else bar_t2_val)
+        resource_profile.finish('ccsd_bwd.total', profile_total,
+                                nocc=nocc, nvir=nvir, backend='numpy')
+        return None, eris_bar, None, None
 
     profile_lambda = resource_profile.start()
     lambda_converged, lambda_vec, intermediates = ccsd_lambda.solve_response_lambda(

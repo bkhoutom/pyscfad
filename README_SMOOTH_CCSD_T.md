@@ -77,6 +77,81 @@ response path, `conv_tol_normt` is reused as the response-lambda convergence
 tolerance, and `max_cycle` limits both solves. Requesting forces does not
 automatically tighten the forward CCSD criteria.
 
+Deterministic LNO/DLNO fragments now use PySCF's CPU DF-CCSD iterations and
+NumPy/BLAS generalized lambda response by default. Existing local Fock/DF/ERI
+tensors are passed in memory; the PySCF disk-based integral builder is bypassed,
+and iteration intermediates and DIIS remain in RAM. The response includes the
+amplitude source from the projected energy and (T), with the spin metric and
+packed-amplitude conventions converted explicitly. Integral adjoints also use
+NumPy/native kernels. JAX connects these computations to the outer orbital and
+geometry response through the custom derivative boundary.
+
+Native calls temporarily use `pyscf.lib.num_threads()` threads for OpenMP and
+BLAS, restoring the previous limits afterward. They do not depend on XLA's
+threading flags. Both backends honor `vvvv_direct`: the default `False` caches
+the virtual ladder when it fits within 60% of remaining total memory; `True`
+skips that cache and contracts resident DF factors in blocks. Insufficient
+memory also selects the blocked contraction, with no disk spill. The native
+cache uses one packed float64 pair matrix instead of JAX's two. It is built
+once per host solve: forward iterations share it, and backward builds one
+cache shared by lambda and the integral adjoint. The cache is released after
+each host solve, rather than retained on the outer differentiation tape.
+The packed raw `ovvv` integrals (also used for `vvvo` permutations) remain in
+RAM for either flag setting; consumers unpack tiles as needed.
+The lambda implementation also caches its amplitude-dependent `Wvvov` intermediate when
+it fits within 25% of the remaining memory budget, otherwise recomputing tiles
+as needed. This uses `cc.max_memory` (the total process budget inherited from
+SCF, e.g. 900000 MB for the water runs), minus current process memory; it does
+not use the separate `with_df.max_memory` workspace budget. Memory budgets
+remain advisory, not process limits.
+
+An optional C++ virtual-ladder kernel serves both forward and lambda calls
+when the packed cache is available. It gathers directly into GEMM panels,
+with a single OpenMP team assigning disjoint output columns to workers and
+single-thread BLAS within each worker. BLAS comes from SciPy's Cython C API,
+so no additional BLAS library is linked. Temporary panels can use the full
+remaining `cc.max_memory` allowance after reserving the contraction output,
+index table, and any contiguous input copies. There is no fixed panel cap or
+fractional restriction. The kernel targets roughly 1024-wide GEMM panels,
+with enough independent output tiles to occupy the OpenMP team, and shrinks
+them when the available memory requires it. This keeps RSS low while
+avoiding tiny blocks at large virtual dimensions. At 32 threads and ample
+memory, panel storage is about 75 MB for 90 virtuals and 369 MB for 400
+virtuals. The allowance is not an allocation target. Panels are released
+after each contraction. Other CCSD contractions still use the existing
+PySCF/NumPy implementation.
+
+Build it in the active Python environment (requires CMake, pybind11, and an
+OpenMP C++ compiler):
+
+```bash
+cmake -S pyscfad/cc/cpp -B build/ccsd -DCMAKE_BUILD_TYPE=Release \
+  -DPython_EXECUTABLE="$(command -v python)" \
+  -Dpybind11_DIR="$(python -m pybind11 --cmakedir)" \
+  -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="$PWD/pyscfad/cc"
+cmake --build build/ccsd -j 2
+```
+
+The built kernel is enabled by default. Set
+`config.update('pyscfad_dfccsd_cpp', False)` for the previous PySCF ladder.
+If the extension is absent, the panel cannot fit, or `vvvv_direct=True`,
+the existing PySCF path remains available. The profiling script
+`examples/cc/07-profile_native_dfccsd.py` accepts `--cpp`/`--no-cpp` with
+`--ladder auto` for an otherwise identical comparison.
+
+For a reference comparison, set
+`config.update('pyscfad_dfccsd_native', False)` to restore the previous JAX
+fragment implementation. Standalone `pyscfad.cc.dfccsd.RCCSD` keeps its existing
+default; set `mycc.native_cpu = True` to opt in. The native path supports real
+float64 RCCSD energies and first derivatives; higher derivatives require the
+JAX path. DCSD and CC2 are not routed through the native RCCSD adapter.
+
+`examples/cc/06-native_dfccsd_benchmark.py` compares fresh-process forward,
+lambda, and integral-adjoint timings, CPU-time/wall-time utilization, and
+numerical outputs for either backend at a specified physical-core allocation.
+Pass the same `--inputs path.npz` to both runs to compare identical tensors;
+the first run creates the file and subsequent runs reuse it.
+
 | CCSD control | Library default | `smooth_force_compare.py` | `benchmark_lno_w_triples.py` |
 | --- | --- | --- | --- |
 | `conv_tol` / `--cc-conv-tol` (energy change, Eh) | `1e-7` | `1e-10` | `1e-7` |

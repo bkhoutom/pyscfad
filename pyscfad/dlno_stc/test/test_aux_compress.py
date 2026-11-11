@@ -118,7 +118,8 @@ def test_compression_uses_dense_blas_budget_and_restores_baseline(monkeypatch, t
     factorize = np.linalg.svd
 
     def recording_svd(*args, **kwargs):
-        observed.extend(pool['num_threads'] for pool in threadpool_info()
+        observed.extend((pool['num_threads'], pool.get('threading_layer'))
+                        for pool in threadpool_info()
                         if pool['user_api'] == 'blas')
         return factorize(*args, **kwargs)
 
@@ -130,7 +131,10 @@ def test_compression_uses_dense_blas_budget_and_restores_baseline(monkeypatch, t
                 aux.make_compressor(tolerance)(factors)
         else:
             aux.make_compressor(tolerance)(factors)
-        assert observed and set(observed) == {2}
+        # Serial BLAS builds cannot change their thread count. Thread-capable
+        # pools must still honor the requested budget, and all restore below.
+        assert observed and all(count == (1 if layer == 'disabled' else 2)
+                                for count, layer in observed)
         assert {pool['num_threads'] for pool in threadpool_info()
                 if pool['user_api'] == 'blas'} == {1}
 

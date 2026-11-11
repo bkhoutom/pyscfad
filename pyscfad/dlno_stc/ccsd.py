@@ -1035,8 +1035,12 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
     ``fragment_indices`` restricts corrections (default: all saved LIS ranks).
     The complete baseline remains included unless ``include_baseline=False``;
     that option returns only selected CC-minus-MP2-LIS corrections and forbids HF.
-    ``vvvv_direct=False`` caches the DF virtual ladder integrals when
-    memory permits; ``True`` uses the improved uncached contraction.
+    Deterministic fragment RCCSD uses the in-memory PySCF/NumPy CPU path by
+    default. Set ``pyscfad_dfccsd_native=False`` for the JAX reference path;
+    ``vvvv_direct=False`` (default) caches the virtual ladder when it fits
+    within 60% of remaining total memory, for both backends. ``True`` skips
+    that cache and contracts resident DF factors in blocks. Native caches
+    use PySCF's packed layout and live only for each host solve.
     Multi-rank calls distribute complete correlation groups and their
     single-pass LIS selections. Shared preparation uses distributed DF J/K by default.
     Each rank must supply a matching MF skeleton; preceding SCF is caller-owned.

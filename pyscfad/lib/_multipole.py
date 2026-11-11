@@ -5,19 +5,48 @@ kernels contain only differentiable contractions and moment translations.
 """
 
 from functools import partial
+import operator
+import os
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
 
-def pad_endpoint(endpoint, bucket_size=32):
+def resolve_pair_bucket_size(bucket_size=None):
+    """Return a positive padding width (explicit > environment > 128).
+
+    Set ``PYSCFAD_WEAK_PAIR_BUCKET_SIZE`` before a calculation to configure
+    serial and MPI weak-pair kernels together. Keep it fixed while endpoint
+    derivatives are accumulated and replayed.
+    """
+    message = 'weak-pair bucket size must be a positive integer'
+    if bucket_size is None:
+        try:
+            bucket_size = int(os.environ.get('PYSCFAD_WEAK_PAIR_BUCKET_SIZE', '128'))
+        except ValueError:
+            raise ValueError(f'PYSCFAD_WEAK_PAIR_BUCKET_SIZE: {message}') from None
+    if isinstance(bucket_size, (bool, np.bool_)):
+        raise ValueError(message)
+    try:
+        bucket_size = operator.index(bucket_size)
+    except TypeError:
+        raise ValueError(message) from None
+    if bucket_size < 1:
+        raise ValueError(message)
+    return bucket_size
+
+
+def pad_endpoint(endpoint, bucket_size=None):
     """Reuse pair executables across nearby compact virtual-space sizes.
 
     Call outside the compiled pair kernel, once per endpoint. Dummy moments
     vanish and dummy excitation gaps stay positive, so their energy and
     cotangents vanish without changing any physical virtual-space selection.
+    An omitted size uses ``PYSCFAD_WEAK_PAIR_BUCKET_SIZE`` or defaults to 128;
+    an explicit positive integer overrides that setting (1 disables padding).
     """
+    bucket_size = resolve_pair_bucket_size(bucket_size)
     nvir = endpoint[2].shape[0]
     width = bucket_size * ((nvir + bucket_size - 1) // bucket_size)
     if width == nvir:

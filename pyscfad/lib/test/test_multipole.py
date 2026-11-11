@@ -165,10 +165,10 @@ def test_transition_moments_jvp_matches_independent_finite_difference(
         np.testing.assert_allclose(value, reference, rtol=2e-7, atol=3e-10)
 
 
-def _endpoint_records(order):
+def _endpoint_records(order, widths=(2, 3)):
     rng = np.random.default_rng(811)
     records = []
-    for nvir, center in ((2, [0.2, -0.1, 0.4]), (3, [1.3, 2.7, 4.1])):
+    for nvir, center in zip(widths, ([0.2, -0.1, 0.4], [1.3, 2.7, 4.1])):
         records.append((
             np.asarray(center),
             rng.normal(size=(3, nvir)),
@@ -240,3 +240,82 @@ def test_pair_energy_and_endpoint_gradients_match_numpy_finite_difference(order)
         np.testing.assert_allclose(
             ad_directional, fd_directional, rtol=2e-7, atol=2e-11
         )
+
+
+def test_pair_padding_default_and_runtime_override(monkeypatch):
+    from pyscfad.lib import _multipole
+
+    monkeypatch.delenv('PYSCFAD_WEAK_PAIR_BUCKET_SIZE', raising=False)
+    left, right = _endpoint_records(4, widths=(81, 129))
+    assert _multipole.pad_endpoint(left)[2].shape == (128,)
+    assert _multipole.pad_endpoint(right)[2].shape == (256,)
+
+    monkeypatch.setenv('PYSCFAD_WEAK_PAIR_BUCKET_SIZE', '64')
+    assert _multipole.pad_endpoint(left)[2].shape == (128,)
+    assert _multipole.pad_endpoint(right)[2].shape == (192,)
+    assert _multipole.pad_endpoint(left, bucket_size=32)[2].shape == (96,)
+    assert _multipole.pad_endpoint(left, bucket_size=1) is left
+
+
+@pytest.mark.parametrize('value', ['0', '-1', '1.5', '', 'invalid'])
+def test_pair_padding_rejects_invalid_environment(monkeypatch, value):
+    from pyscfad.lib import _multipole
+
+    monkeypatch.setenv('PYSCFAD_WEAK_PAIR_BUCKET_SIZE', value)
+    left, _ = _endpoint_records(2)
+    with pytest.raises(ValueError, match='positive integer'):
+        _multipole.pad_endpoint(left)
+    # An explicit valid argument takes precedence over the environment.
+    assert _multipole.pad_endpoint(left, bucket_size=8)[2].shape == (8,)
+
+
+@pytest.mark.parametrize('value', [0, -1, 1.5, True, np.bool_(True), '64'])
+def test_pair_padding_rejects_invalid_explicit_size(value):
+    from pyscfad.lib import _multipole
+
+    left, _ = _endpoint_records(2)
+    with pytest.raises(ValueError, match='positive integer'):
+        _multipole.pad_endpoint(left, bucket_size=value)
+
+
+@pytest.mark.parametrize('order', [2, 3, 4])
+@pytest.mark.parametrize('bucket_size', [32, 128])
+def test_pair_padding_preserves_energy_and_endpoint_gradients(monkeypatch, order, bucket_size):
+    from pyscfad.lib import _multipole
+
+    monkeypatch.setenv('PYSCFAD_WEAK_PAIR_BUCKET_SIZE', str(bucket_size))
+    records = _endpoint_records(order, widths=(31, 33))
+    padded = tuple(_multipole.pad_endpoint(value) for value in records)
+    energy, bars = _multipole.pair_energy_and_grad(*padded, order)
+    reference, reference_bars = _multipole.pair_energy_and_grad(*records, order)
+    np.testing.assert_allclose(energy, reference, rtol=2e-12, atol=2e-12)
+    for original, extended, bar, reference_bar in zip(records, padded, bars, reference_bars):
+        width = original[2].shape[0]
+        assert extended[0] is original[0]
+        for slot in range(1, 5):
+            if original[slot] is None:
+                assert extended[slot] is None
+            else:
+                np.testing.assert_array_equal(extended[slot][..., :width], original[slot])
+                np.testing.assert_array_equal(extended[slot][..., width:], 1.0 if slot == 2 else 0.0)
+                np.testing.assert_array_equal(bar[slot][..., width:], 0.0)
+        cropped = _multipole.crop_endpoint_cotangent(bar, original)
+        for actual, expected in zip(jax.tree.leaves(cropped), jax.tree.leaves(reference_bar)):
+            np.testing.assert_allclose(actual, expected, rtol=2e-12, atol=2e-12)
+
+
+def test_pair_padding_reuses_compiled_kernels_within_runtime_bucket(monkeypatch):
+    from pyscfad.lib import _multipole
+
+    monkeypatch.setenv('PYSCFAD_WEAK_PAIR_BUCKET_SIZE', '128')
+    cache_sizes = []
+    for widths in ((81, 105), (95, 120), (127, 128)):
+        # Production endpoint builders return JAX arrays, including at exact
+        # bucket boundaries where pad_endpoint returns its input unchanged.
+        records = jax.tree.map(jnp.asarray, _endpoint_records(4, widths))
+        endpoints = tuple(_multipole.pad_endpoint(value) for value in records)
+        for kernel in (_multipole.pair_energy, _multipole.pair_energy_and_grad):
+            jax.block_until_ready(kernel(*endpoints, 4))
+        cache_sizes.append((_multipole.pair_energy._cache_size(),
+                            _multipole.pair_energy_and_grad._cache_size()))
+    assert cache_sizes[0] == cache_sizes[1] == cache_sizes[2]

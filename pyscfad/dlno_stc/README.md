@@ -264,6 +264,15 @@ a custom cache needs `JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0` and
 `JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=-1` to retain all small kernels.
 An unavailable automatic cache warns and allows the calculation to continue.
 
+Weak-pair kernels pad each endpoint's virtual dimension to a multiple of 128
+by default. Set `PYSCFAD_WEAK_PAIR_BUCKET_SIZE` to a positive integer before
+starting a calculation to override this width in both serial and MPI paths,
+for example `export PYSCFAD_WEAK_PAIR_BUCKET_SIZE=64`. Use the same setting on
+every MPI rank and keep it fixed throughout the calculation. Larger buckets
+reduce the number of compiled pair shapes at the cost of more padded work;
+the padding does not change the energy or its response. Explicit
+`pad_endpoint(..., bucket_size=...)` arguments override the environment.
+
 Weak response builds each orbital screen once under `jax.vjp`, retaining the
 returned screen and its orbital-algebra pullback. Compact transition moments
 are shared by all incident pairs. Response replays only AO moments using that

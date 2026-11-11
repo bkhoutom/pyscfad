@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 from scipy.linalg import solve_triangular
 
+from pyscfad.lib._threading import dense_blas_threads
 from pyscfad.tools import resource_profile
 
 
@@ -90,7 +91,8 @@ class AuxiliaryCompressor:
                                     pullback_s=0.)
             return factors, None
 
-        with resource_profile.section('lis_aux_svd_forward', original_naux=naux):
+        with (resource_profile.section('lis_aux_svd_forward', original_naux=naux),
+              dense_blas_threads()):
             array = np.asarray(factors)
             if np.iscomplexobj(array):
                 raise TypeError('auxiliary SVD compression requires real factors')

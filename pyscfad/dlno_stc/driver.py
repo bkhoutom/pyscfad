@@ -377,23 +377,35 @@ def _finish_response(state, energy, mf_bar, *, include_hf):
     return energy, mol_bar
 
 
+@contextmanager
 def _mp2_df_scope(state, atoms=None):
-    """Retain one direct metric/tape, without allocating a half-transform cache."""
+    """Retain the metric/tape and, for domains, the configured H cache."""
     from pyscfad.lno import _df_shared
     mf = state['mf']
     if not hasattr(mf, 'mol'):
-        return nullcontext()
+        yield None
+        return
     basis = state.get('correlation_auxbasis')
+    domain_scope = atoms is not None
     if atoms is None:
         if can_reuse_scf_df(mf, basis):
-            return nullcontext()
+            yield None
+            return
         atoms = numpy.arange(mf.mol.natm, dtype=numpy.int32)
-    return _df_shared.reverse_scope(mf, atoms, **basis_kwargs(basis))
+    with _df_shared.reverse_scope(mf, atoms, **basis_kwargs(basis)) as shared:
+        if domain_scope:
+            from ._df_inputs import configure_cache
+            configure_cache(shared)
+        yield shared
 
 
 def _finish_mp2_df(shared, mf_bar):
     """Consume deferred integral response once, before the final SCF response."""
     if shared is not None:
+        # The coefficient VJP has consumed H. Geometry uses the saved MO
+        # adjoints and coefficient snapshots, so release H before its scratch.
+        if shared.half is not None:
+            shared.half.release_consumed()
         with resource_profile.section('stc.mp2.shared_df_integral_pullback'):
             coords = shared.finish()
             if mf_bar is not None:

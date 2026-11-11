@@ -4,14 +4,12 @@ import gc
 import math
 import jax
 import numpy
-from pyscfad import config_update, numpy as np
+from pyscfad import numpy as np
 from ._restart import (RestartManager, scientific_digest, grouping_payload,
                        validate_grouping_payload)
 from ._selection import DomainSelections, build_domain_groups
 from .domain import rebuild_domain_data
-from .adjoint import (pullback_inputs, add_cotangent, fix_restart_mo_phases,
-                      zero_term_cotangents)
-from ._pairs import weak_pair_energy_and_grad
+from .adjoint import pullback_inputs
 from .exchange import read_input, read_result, write_input, write_result
 from .parallel import run_backend
 from .prepare import prepare_boys_group_inputs
@@ -229,6 +227,7 @@ def load_disk_packet(workdir, fragment_id):
     return inputs, metadata, controls, result
 
 
+@memory_calculation
 def imported_value_and_grad(mol, build_mf, static, packet_loader, *,
                             fragment_ids=None, include_hf=True,
                             include_weak=True, merge_identical=True,
@@ -236,17 +235,18 @@ def imported_value_and_grad(mol, build_mf, static, packet_loader, *,
     """Replay saved grouped three-tensor MP2 bars, then weak/common/SCF response.
 
     Fragment IDs identify exported jobs. Replay consumes effective controls
-    without invoking the total-budget allocator again.
+    without invoking the total-budget allocator again. Initialization and final
+    response use the production driver, including joint SCF overlap/Fock data,
+    shared DF geometry response and consumption of completed response tapes.
     """
     if not isinstance(static, DomainSelections):
         raise TypeError("static must be STC DomainSelections")
     if not callable(packet_loader):
         raise TypeError("packet_loader must be callable")
-    from .driver import (_coordinate_only, _validate_static, _validate_reference,
-                         _mp2_df_scope, _finish_mp2_df)
+    from . import driver
     correlation = basis_kwargs(correlation_auxbasis)
-    _coordinate_only(mol)
-    _validate_static(static)
+    driver._coordinate_only(mol)
+    driver._validate_static(static)
     groups = build_domain_groups(static, merge_identical=merge_identical)
     ids = tuple(range(len(groups))) if fragment_ids is None else tuple(fragment_ids)
     if ((not ids and groups) or len(set(ids)) != len(ids)
@@ -254,18 +254,23 @@ def imported_value_and_grad(mol, build_mf, static, packet_loader, *,
         raise ValueError("fragment_ids contains empty, duplicate or invalid jobs")
     if len(ids) != len(groups) and (include_hf or include_weak):
         raise ValueError("partial import requires include_hf=False and include_weak=False")
-    with (config_update("pyscfad_scf_implicit_diff", True),
-          config_update("pyscfad_scf_first_order_custom", False)):
-        mf, scf_pullback = jax.vjp(lambda m: fix_restart_mo_phases(build_mf(m)), mol)
-    _validate_reference(mf, static, **correlation)
+    mf, scf_pullback = driver._initialize_scf(
+        mol, build_mf, combine_df=True, share_scf_data=True)
+    scf_pullback = driver._serial_scf_pullback(scf_pullback)
+    # Read the first packet once for common initialization. Empty worklists
+    # have no numerical solver controls; the defaults only validate setup.
+    packet = packet_loader(ids[0]) if ids else None
+    initial_controls = packet[2] if packet is not None else driver._driver_controls({})
+    state = driver._initialize(mf, static, initial_controls, with_grad=True,
+                               scf_pullback=scf_pullback, **correlation)
+    # State owns the only reference to the tape when _finish consumes it.
+    del scf_pullback
     identity = _run_identity(mf, static, groups, **correlation)
-    common, common_pullback = jax.vjp(lambda m: rebuild_domain_data(m, static), mf)
-    mf_bar, common_bar = zero_term_cotangents(mf, common)
-    energy = np.zeros((), dtype=common.s1e.dtype)
     run_controls = None
-    for group_id in ids:
+    for position, group_id in enumerate(ids):
         group = groups[group_id]
-        saved, metadata, controls, result = packet_loader(group_id)
+        saved, metadata, controls, result = packet if position == 0 else packet_loader(group_id)
+        packet = None
         _validate_packet_identity(mf, static, group_id, group, saved, metadata, controls, groups,
                                   identity=identity, **correlation)
         control_identity = canonical_json({"controls": controls, "budget": metadata["budget"]})
@@ -273,27 +278,25 @@ def imported_value_and_grad(mol, build_mf, static, packet_loader, *,
             raise ValueError("packet controls or budget differ within one run")
         run_controls = control_identity
         validate_result(result, saved, metadata, controls=controls)
-        with _mp2_df_scope({"mf": mf, "correlation_auxbasis": correlation_auxbasis},
-                           static.fragments[group.representative_index].extended_atoms) as shared:
+        with driver._mp2_df_scope(
+                state, static.fragments[group.representative_index].extended_atoms) as shared:
             bars = pullback_inputs(lambda m, c: prepare_boys_group_inputs(m, c, static, group,
                                                                         **correlation),
-                                   (mf, common), saved, result, replay_atol=1e-9)
-            mf_bar, common_bar = jax.tree_util.tree_map(add_cotangent, (mf_bar, common_bar), bars)
-            mf_bar = _finish_mp2_df(shared, mf_bar)
-        energy += np.asarray(result["energy"])
-        del saved, result, bars
+                                   (mf, state['common']), saved, result, replay_atol=1e-9)
+            driver._add_bars(state, *bars)
+            del bars
+            state['mf_bar'] = driver._finish_mp2_df(shared, state['mf_bar'])
+        state['energy'] += np.asarray(result["energy"])
+        # Portable packets do not require/save the native scalar uncertainty.
+        # Keep unavailable uncertainty explicit rather than reporting zero.
+        state['variance'] += float(result.get('energy_standard_error', numpy.nan)) ** 2
+        jax.block_until_ready((state['energy'], state['mf_bar'], state['common_bar']))
+        del saved, result
         gc.collect()
     if include_weak:
-        weak, bars = weak_pair_energy_and_grad(mf, common, static)
-        energy += weak
-        mf_bar, common_bar = jax.tree_util.tree_map(add_cotangent, (mf_bar, common_bar), bars)
-    common_mf_bar, = common_pullback(common_bar)
-    mf_bar = jax.tree_util.tree_map(add_cotangent, mf_bar, common_mf_bar)
-    if include_hf:
-        hf, pullback = jax.vjp(lambda m: m.e_tot, mf)
-        hf_bar, = pullback(np.ones_like(hf))
-        mf_bar = jax.tree_util.tree_map(add_cotangent, mf_bar, hf_bar)
-        energy += hf
-    mol_bar, = scf_pullback(mf_bar)
-    jax.block_until_ready((energy, mol_bar))
-    return energy, mol_bar
+        weak, bars = driver._weak_energy_and_grad(state, static, state['weak_pairs'])
+        state['energy'] += weak
+        driver._add_bars(state, *bars)
+        del weak, bars
+    return driver._finish(state, with_grad=True, include_hf=include_hf,
+                          uncertainty_label='packet standard error (NaN if unavailable)')

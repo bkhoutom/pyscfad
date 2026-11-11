@@ -14,8 +14,10 @@ from pyscfad.lno import _df_shared
 
 @pytest.mark.parametrize('scope', ['system', 'domain'])
 @pytest.mark.parametrize('with_grad', [False, True])
+@pytest.mark.parametrize('cache_mode', ['direct', 'half'])
 def test_one_metric_and_factorization_per_mp2_group(molecule, monkeypatch,
-                                                  scope, with_grad):
+                                                  scope, with_grad, cache_mode):
+    monkeypatch.setenv('PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE', cache_mode)
     mf = _mf(molecule)
     static = (dlno_stc.build_domain_selections(
         mf, frozen=1, force_full_domains=True, boys_grouping='molecule')
@@ -66,5 +68,10 @@ def test_one_metric_and_factorization_per_mp2_group(molecule, monkeypatch,
     assert len(receipts) == 1
     assert receipts[0]['geometry_passes'] == int(with_grad)
     assert receipts[0]['metric_passes'] == int(with_grad)
-    assert receipts[0]['half_builds'] == 0
+    half = scope == 'domain' and cache_mode == 'half'
+    assert receipts[0]['half_builds'] == int(half)
+    assert receipts[0]['raw_source_passes'] == 1 + int(with_grad and not half)
+    assert receipts[0]['half_pullbacks'] == int(with_grad and half)
+    if with_grad:
+        assert receipts[0]['half_resident_bytes'] == 0
     assert _df_shared._ACTIVE.get() is None

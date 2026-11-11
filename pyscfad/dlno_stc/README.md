@@ -23,6 +23,12 @@ Pass `lis_aux_svd_tol=None` or `0` to disable compression. This applies to all
 physical grouping modes; domain MP2, D/W matrices and orbital selection retain
 their existing auxiliary spaces.
 
+Compression uses NumPy's reduced SVD (`full_matrices=False`). Its NumPy/SciPy
+forward algebra honors `PYSCFAD_DENSE_BLAS_THREADS` through a temporary BLAS
+scope, restoring the
+previous limits on exit. This does not configure JAX/XLA threads or change the
+custom reverse.
+
 ```python
 from pyscfad import dlno_stc
 static = dlno_stc.build_domain_selections(mf, frozen=4)
@@ -82,8 +88,31 @@ Cholesky factor and derivative tape through each preparation/pullback pair,
 including MPI owner jobs and saved-packet replay. Positive definiteness is
 checked by the retained factorization, without a separate validation build.
 Cached system factors use a dimension check to reject rank-reduced fitting
-sources. MP2 keeps its direct integral streaming and does not allocate an H
-cache; the shared integral response finishes before common/Fock/SCF response.
+sources. Domain MP2 now uses the same `half`/`direct` cache setting as CCSD(T),
+including MPI owner jobs and saved-packet replay. The default `half` mode retains
+H through the coefficient pullback, reducing ordinary three-center integral
+generation from two passes to one per energy/gradient group. H is released
+before the deferred geometry contraction. Set
+`PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE=direct` to regenerate integrals with
+lower resident memory. System MP2 retains its existing cached-factor/direct
+streaming policy without an H cache. Local integral response finishes before
+common/Fock/SCF response in both modes.
+
+`mp2.imported_value_and_grad` uses the production driver's single-SCF
+initialization, final overlap/Fock outputs, common response and final SCF
+response scopes. It also shares global DF geometry work and releases completed
+tapes in the same order. Packet identities, effective sampling budgets and
+partial-import HF/weak restrictions are unchanged. The portable packet format
+does not require a scalar standard error; replay logs unavailable uncertainty
+as NaN rather than treating it as zero.
+
+`python examples/dlno_stc/validate_water4_mp2.py --xyz-file water4.xyz --output results/water4`
+compares direct, half and saved-packet gradients with separate JKFIT/RIFIT,
+checks integral-pass receipts, and validates a fixed-selection directional
+finite difference. It defaults to cc-pVDZ and retains results and packets in
+the new output directory. It uses a Boys gradient tolerance of `1e-9` so
+localization convergence error does not dominate the finite difference;
+production defaults are unchanged. Set numerical thread limits before launch.
 
 Nuclear gradients require coordinate-only molecule leaves
 (`mol.build(trace_exp=False, trace_ctr_coeff=False)`). Selections, domains,

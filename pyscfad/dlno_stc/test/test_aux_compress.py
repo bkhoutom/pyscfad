@@ -109,6 +109,32 @@ def test_auxiliary_basis_rotation_preserves_compressed_eris():
                                np.einsum('Lpq,Lrs->pqrs', second, second), atol=3e-14)
 
 
+@pytest.mark.parametrize('tolerance', [.5, 100.])
+def test_compression_uses_dense_blas_budget_and_restores_baseline(monkeypatch, tolerance):
+    from threadpoolctl import threadpool_info, threadpool_limits
+
+    factors = jnp.asarray(example([3., 2., .2, .1]))
+    observed = []
+    factorize = np.linalg.svd
+
+    def recording_svd(*args, **kwargs):
+        observed.extend(pool['num_threads'] for pool in threadpool_info()
+                        if pool['user_api'] == 'blas')
+        return factorize(*args, **kwargs)
+
+    monkeypatch.setenv('PYSCFAD_DENSE_BLAS_THREADS', '2')
+    monkeypatch.setattr(np.linalg, 'svd', recording_svd)
+    with threadpool_limits(limits=1, user_api='blas'):
+        if tolerance > 9.:
+            with pytest.raises(ValueError, match='every auxiliary direction'):
+                aux.make_compressor(tolerance)(factors)
+        else:
+            aux.make_compressor(tolerance)(factors)
+        assert observed and set(observed) == {2}
+        assert {pool['num_threads'] for pool in threadpool_info()
+                if pool['user_api'] == 'blas'} == {1}
+
+
 def test_one_forward_svd_and_no_pullback_factorization(monkeypatch):
     factors = jnp.asarray(example([3., 2., .2, .1]))
     original_svd = np.linalg.svd

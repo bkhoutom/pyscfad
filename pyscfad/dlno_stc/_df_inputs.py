@@ -9,10 +9,11 @@ def cache_mode():
     return mode
 
 
-def configure_cache(scope, static):
-    """Reuse H_ED for every LIS in the group unless direct mode is requested."""
-    from .lis import _validate_lis_space
-    _validate_lis_space(static.lis_static.lis_space)
+def configure_cache(scope, static=None):
+    """Retain H for domain MP2 and optional LIS consumers of the same frame."""
+    if static is not None:
+        from .lis import _validate_lis_space
+        _validate_lis_space(static.lis_static.lis_space)
     mode = cache_mode()
     scope.receipt['cache_mode'] = mode
     if mode == 'half':

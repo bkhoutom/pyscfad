@@ -279,7 +279,8 @@ def imported_value_and_grad(mol, build_mf, static, packet_loader, *,
         run_controls = control_identity
         validate_result(result, saved, metadata, controls=controls)
         with driver._mp2_df_scope(
-                state, static.fragments[group.representative_index].extended_atoms) as shared:
+                state, static.fragments[group.representative_index].extended_atoms,
+                static.fragments[group.representative_index].pao_center_atoms) as shared:
             bars = pullback_inputs(lambda m, c: prepare_boys_group_inputs(m, c, static, group,
                                                                         **correlation),
                                    (mf, state['common']), saved, result, replay_atol=1e-9)

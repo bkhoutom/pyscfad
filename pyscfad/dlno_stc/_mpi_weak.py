@@ -180,9 +180,12 @@ def weak_pair_contribution(mf, common, static, pairs, comm, *, with_grad):
                           for index in indices} if with_grad else None)
         for pair in pairs[rank::size]:
             left, right = pair
+            weight = _pairs.weak_pair_weight(static, left, right)
             if with_grad:
                 value, (left_bar, right_bar) = _pairs.pair_energy_and_grad(
                     endpoints[left], endpoints[right], static.thresholds.multipole_order)
+                left_bar, right_bar = jax.tree_util.tree_map(
+                    lambda x: weight * x, (left_bar, right_bar))
                 endpoint_bars[left] = jax.tree_util.tree_map(
                     add_cotangent, endpoint_bars[left], left_bar)
                 endpoint_bars[right] = jax.tree_util.tree_map(
@@ -191,7 +194,7 @@ def weak_pair_contribution(mf, common, static, pairs, comm, *, with_grad):
             else:
                 value = _pairs._multipole_pair_energy(
                     endpoints[left], endpoints[right], static.thresholds.multipole_order)
-            energy = energy + value
+            energy = energy + weight * value
             diagnostics['n_pairs'] += 1
         jax.block_until_ready((energy, endpoint_bars))
     except Exception as exc:

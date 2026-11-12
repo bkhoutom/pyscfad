@@ -33,7 +33,7 @@ def arguments():
                         help='working-memory budget for disk-backed density fitting in MB')
     parser.add_argument('--matrix-target-batch-size', type=int, default=4,
                         help='W targets sharing MP2 propagation per batch (default: 4; 1 reduces amplitude storage)')
-    parser.add_argument('--pair-energy', type=float, default=1.5e-5, help='strong-pair threshold in Eh')
+    parser.add_argument('--pair-energy', type=float, default=7.5e-6, help='strong-pair threshold in Eh')
     parser.add_argument('--lno-occ', type=float, default=1e-4, help='occupied W cutoff')
     parser.add_argument('--lno-vir', type=float, default=1e-5, help='virtual W cutoff')
     parser.add_argument('--triples-tolerance-meh', type=float, default=0.1,

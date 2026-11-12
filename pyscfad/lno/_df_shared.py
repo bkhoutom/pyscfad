@@ -48,14 +48,13 @@ def _same_domain(left, right):
 
 
 class LocalDFReverse:
-    def __init__(self, mf, atoms, correlation_auxbasis=None):
-        from .df import make_local_mol
-        from pyscfad.df.addons import make_auxmol
+    def __init__(self, mf, atoms, correlation_auxbasis=None, aux_atoms=None):
+        from .df import make_local_mol, make_local_auxmol
         self.atoms = numpy.asarray(atoms, dtype=numpy.int32)
         self.global_natm = mf.mol.natm
         self.mol = make_local_mol(mf.mol, self.atoms)
-        auxbasis = mf.with_df.auxbasis if correlation_auxbasis is None else correlation_auxbasis
-        self.auxmol = make_auxmol(self.mol, auxbasis)
+        self.aux_atoms = numpy.asarray(atoms if aux_atoms is None else aux_atoms, dtype=numpy.int32)
+        self.auxmol = make_local_auxmol(mf, self.aux_atoms, correlation_auxbasis)
         self.max_memory_mb = float(mf.mol.max_memory)
         self.workspace_mb = float(mf.with_df.max_memory)
         self.terms = []
@@ -232,9 +231,9 @@ class LocalDFReverse:
         metric_seed, = self._factor_pullback(self.metric_bar)
         metric_bar, = self._metric_pullback(metric_seed)
         self.receipt['metric_passes'] += 1
-        local = (numpy.asarray(mol_bar.coords) + numpy.asarray(aux_bar.coords)
-                 + numpy.asarray(metric_bar.coords))
-        numpy.add.at(coords, self.atoms, local)
+        numpy.add.at(coords, self.atoms, numpy.asarray(mol_bar.coords))
+        numpy.add.at(coords, self.aux_atoms,
+                     numpy.asarray(aux_bar.coords) + numpy.asarray(metric_bar.coords))
         self.terms.clear()
         self.receipt['adjoint_resident_bytes'] = 0
         self.metric_bar = None
@@ -255,10 +254,11 @@ class LocalDFReverse:
 
 
 @contextmanager
-def reverse_scope(mf, atoms, correlation_auxbasis=None):
+def reverse_scope(mf, atoms, correlation_auxbasis=None, aux_atoms=None):
     if _ACTIVE.get() is not None:
         raise RuntimeError('Nested local DF reverse scopes are unsupported')
-    scope = LocalDFReverse(mf, atoms, correlation_auxbasis=correlation_auxbasis)
+    scope = LocalDFReverse(mf, atoms, correlation_auxbasis=correlation_auxbasis,
+                           aux_atoms=aux_atoms)
     token = _ACTIVE.set(scope)
     try:
         yield scope

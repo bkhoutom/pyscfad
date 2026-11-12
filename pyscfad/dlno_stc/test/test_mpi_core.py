@@ -235,7 +235,8 @@ def test_scheduler_uneven_owners_and_idle_live_bars(monkeypatch):
     mf = MF(jnp.ones((1, 1)), jnp.ones(1), jnp.ones(1)*2, jnp.array(-1.))
     common = Common(jnp.ones((1, 1))*2)
     static = SimpleNamespace(fragments=tuple(
-        SimpleNamespace(extended_atoms=numpy.array([i])) for i in range(2)),
+        SimpleNamespace(extended_atoms=numpy.array([i]),
+                        pao_center_atoms=numpy.array([i+10])) for i in range(2)),
                              frag_lolist=(numpy.array([0]), numpy.array([1])))
     groups = (_selection.DomainGroup((0,), 0, (0,)),
               _selection.DomainGroup((1,), 1, (0,)))
@@ -243,6 +244,11 @@ def test_scheduler_uneven_owners_and_idle_live_bars(monkeypatch):
     monkeypatch.setattr(_mpi, '_reference_signature', lambda mf: {'auxmol': None})
     monkeypatch.setattr(_mpi, '_validate_shared_reference', lambda *args, **kwargs: None)
     monkeypatch.setattr(_mpi, '_build_worker', lambda *args: mf)
+    original_scope = driver._mp2_df_scope
+    def checked_scope(state, atoms, aux_atoms=None):
+        numpy.testing.assert_array_equal(aux_atoms, atoms+10)
+        return original_scope(state, atoms, aux_atoms)
+    monkeypatch.setattr(driver, '_mp2_df_scope', checked_scope)
     captured = {}
     root_bars = None
     allocated = []

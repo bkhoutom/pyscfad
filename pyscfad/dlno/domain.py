@@ -289,9 +289,10 @@ class DLNOThresholds:
     logic of the Nagy domain hierarchy and avoids using a large primary domain
     merely to decide which PAOs are candidates.
 
-    ``pair_energy`` is applied to Nagy's OS-based pair-increment convention
-    (the ``-8`` prefactor of their Eq. (7)), not to the conventional global
-    SCS-MP2 opposite-spin component.
+    ``pair_energy`` uses the -4 unordered distant-pair convention, which
+    approaches the full-spin MP2 pair energy at long range. It is half the
+    printed -8 screening score of Nagy et al. (2018), Eq. 9, so 5e-6 here
+    corresponds to 1e-5 with that score.
 
     The LIS MP2-density path always stores local ``Lov`` in the caller's
     rank-private HDF5 scratch.  Its virtual block width is automatic by default.
@@ -313,10 +314,10 @@ class DLNOThresholds:
     # prevents tiny interfragment tails from becoming unit occupied modes.
     occupied_weight: float = 1e-4
     metric_rank: float = 1e-10
-    # Nagy et al.'s default for the same -8 pair-increment convention.
+    # Updated from 1.5e-5 for the -4 distant-pair threshold convention.
     # Values near 1e-4 are useful loose diagnostics but can benefit from
     # cancellation once the multipole charge distributions overlap.
-    pair_energy: float = 1.5e-5
+    pair_energy: float = 7.5e-6
     near_pair_distance: float = 3.5
     multipole_order: int = 4
     # The MP2 selection-density block width is automatic unless an advanced
@@ -506,14 +507,10 @@ def _exact_global_fragment_pairs(pt, occupied_data, max_memory_mb=256.0):
         weights,
         max_memory_mb=max_memory_mb,
     )
-    # Nagy's Eq. (7) uses an OS-based *pair increment*: the -8 prefactor
-    # includes both occupied-pair orientations and the equivalent restricted
-    # pair-domain bookkeeping.  An unordered standard SCS-OS contribution
-    # from the global two-sided weights carries a -2 prefactor.  Multiply the
-    # latter by four so the diagnostic exact and multipole screening models
-    # use the same threshold convention.  ``directed`` itself remains in the
-    # standard MP2 OS/SS convention for energy diagnostics.
-    screening_os = 4.0 * directed.opposite_spin
+    # Twice conventional OS approaches the full-spin distant-pair energy.
+    # Combining occupied orientations gives the -4 multipole convention.
+    # Keep the unscaled OS/SS decomposition for energy diagnostics.
+    screening_os = 2.0 * directed.opposite_spin
     return directed, _physical_pair_matrix(screening_os)
 
 

@@ -355,7 +355,7 @@ def test_post_topology_timing_is_nonnegative_and_fragment_consistent(
     ))
 
 
-def test_exact_pair_model_uses_nagy_scaled_opposite_spin_increment(
+def test_exact_pair_model_uses_full_spin_distant_pair_normalization(
     separated_water_dimer_mf,
 ):
     topology = build_domain_topology(
@@ -381,12 +381,12 @@ def test_exact_pair_model_uses_nagy_scaled_opposite_spin_increment(
         np.asarray(eris.mo_energy[nocc:]),
         weights,
     )
-    # Nagy's -8 pair-increment convention is four times the standard
-    # unordered SCS-OS contribution carried by this fragment decomposition.
-    expected = 4.0 * (
+    # The -4 distant-pair convention is twice the standard unordered OS
+    # contribution, approaching the full-spin energy at long range.
+    expected = 2.0 * (
         directed.opposite_spin + directed.opposite_spin.T
     )
-    np.fill_diagonal(expected, 4.0 * np.diag(directed.opposite_spin))
+    np.fill_diagonal(expected, 2.0 * np.diag(directed.opposite_spin))
     np.testing.assert_allclose(topology.pair_energy, expected, atol=1e-12)
 
 

@@ -245,3 +245,27 @@ def test_group_replay_rejects_ungrouped_or_missing_metadata():
     for saved in (None, {}, {'static': static, 'groups': groups}):
         with pytest.raises(restart.RestartMismatchError, match='group'):
             restart.validate_grouping_payload(saved, static, groups)
+
+
+def test_old_domain_convention_is_rejected_before_decoding_arrays():
+    from pyscfad.dlno_stc.test.test_domain_grouping import grouping_fixture
+    restart = _restart()
+    encoded = restart._encode_value(grouping_fixture())
+    encoded['fields'] = [pair for pair in encoded['fields'] if pair[0] != 'domain_convention']
+    with pytest.raises(restart.RestartMismatchError, match='domain/physical'):
+        restart._decode_value(encoded, None)
+
+
+def test_minus_eight_domain_checkpoint_requires_reselection(tmp_path):
+    from dataclasses import replace
+    from pyscfad.dlno_stc.test.test_domain_grouping import grouping_fixture
+    restart = _restart()
+    old = replace(grouping_fixture(),
+                  domain_convention='individual-partners-pair8-pcd-aux-v1')
+    manager = _manager(tmp_path)
+    manager.save_static(old)
+    manager.close()
+    manager = _manager(tmp_path, resume=True)
+    with pytest.raises(restart.RestartMismatchError, match='pair normalization'):
+        manager.load_static(expected_type=type(old))
+    manager.close()

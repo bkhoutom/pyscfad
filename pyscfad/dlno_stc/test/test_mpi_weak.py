@@ -59,7 +59,8 @@ class Screen(NamedTuple):
 def _fixture(order):
     mf = Inputs(jnp.array([[0., .1, .2], [.2, .1, -.1], [-.1, .3, .2]]), jnp.array(.7))
     common = Common(jnp.array([.2, .4, .6]))
-    static = SimpleNamespace(thresholds=SimpleNamespace(multipole_order=order))
+    static = SimpleNamespace(thresholds=SimpleNamespace(multipole_order=order),
+                             strong_mask=np.eye(10, dtype=bool))
     pairs = ((2, 5), (2, 9), (5, 9))
 
     def endpoint(m, c, s, index):
@@ -117,6 +118,9 @@ def test_distributed_retained_screen_and_idle_rank(monkeypatch, order, with_grad
     comm = _comm()
     from pyscfad.dlno_stc import _mpi_weak
     (mf, common, static, pairs, endpoint), calls = _install_split_fixture(monkeypatch, order)
+    # One domain already supplies half this unordered pair. Exercise both
+    # distributed energies and endpoint adjoints with the missing half only.
+    static.strong_mask[2, 5] = True
     value, bars = _mpi_weak.weak_pair_contribution(
         mf, common, static, pairs, comm, with_grad=with_grad)
     values = comm.allgather(float(value))
@@ -131,7 +135,8 @@ def test_distributed_retained_screen_and_idle_rank(monkeypatch, order, with_grad
     assert sum(row.get(('screen', i), 0) for row in all_calls for i in (2, 5, 9)) == 3
 
     def direct(m, c):
-        return sum(_pairs._multipole_pair_energy(endpoint(m, c, static, i),
+        return sum((.5 if (i, j) == (2, 5) else 1.) *
+                   _pairs._multipole_pair_energy(endpoint(m, c, static, i),
                    endpoint(m, c, static, j), order) for i, j in pairs)
 
     expected, expected_bars = jax.value_and_grad(direct, argnums=(0, 1))(mf, common)

@@ -58,7 +58,7 @@ def selection(mf):
     from pyscfad.dlno_stc import BoysDomainThresholds, build_domain_selections
 
     return build_domain_selections(
-        mf, frozen=2, thresholds=BoysDomainThresholds(pair_energy=1e-4),
+        mf, frozen=2, thresholds=BoysDomainThresholds(pair_energy=5e-5),
         lo_kwargs=LO_OPTIONS, frag_lolist=tuple((i,) for i in TARGET_ORDER),
     )
 
@@ -255,13 +255,21 @@ def grouped_preparation_and_response(output_dir):
     assert len(pairs) == len(set(pairs)) == 16
     weak_energy = sum(float(weak_pair_energy(mf, common, static, i, j)) for i, j in pairs)
     assert abs(weak_energy) > 1e-10
-    np.testing.assert_allclose(weak_energy, -3.42607799968241e-7, atol=1e-15, rtol=0)
+    # Compare independent scalar NumPy contractions in the current selected
+    # frame; the historical baseline uses different domain membership.
+    from pyscfad.dlno.multipole_numpy import multipole_pair_energy
+    from pyscfad.dlno_stc._pairs import build_weak_endpoint, weak_pair_weight
+    endpoints = {i: jax.tree_util.tree_map(np.asarray, build_weak_endpoint(mf, common, static, i))
+                 for i in sorted({i for pair in pairs for i in pair})}
+    reference = sum(weak_pair_weight(static, i, j) * multipole_pair_energy(
+        endpoints[i], endpoints[j], static.thresholds.multipole_order) for i, j in pairs)
+    np.testing.assert_allclose(weak_energy, reference, atol=1e-15, rtol=0)
     np.testing.assert_allclose(grouped_energy, correlation_energy(mf, static, groups), atol=1e-10, rtol=0)
     baseline_path = (Path(__file__).resolve().parents[4] / 'TEST_general/simplify_domain/phase2'
                      / 'runs/run-20261011T212042Z-ZL3Py3/results/coordinate_response.json')
     baseline = json.loads(baseline_path.read_text()) if baseline_path.exists() else None
     baseline_comparison = {'available': baseline is not None}
-    if baseline is not None:
+    if baseline is not None and baseline.get('domain_convention') == static.domain_convention:
         np.testing.assert_allclose(grouped_energy, baseline['correlation_energy_Eh'], atol=1e-9, rtol=0)
         np.testing.assert_allclose(grouped_gradient, baseline['gradient_Eh_per_bohr'], atol=1e-6, rtol=0)
         np.testing.assert_allclose(-grouped_gradient, baseline['force_Eh_per_bohr'], atol=1e-6, rtol=0)
@@ -281,6 +289,7 @@ def grouped_preparation_and_response(output_dir):
                     'replay_cotangent_max_abs': replay_residual,
                     'weak_unordered_pairs': [list(pair) for pair in pairs],
                     'weak_energy_Eh': weak_energy, 'weak_pair_prefactor': -4,
+                    'domain_convention': static.domain_convention,
                     'phase2_baseline_comparison': baseline_comparison})
     _write_grouped_result(output_dir, 'grouped_molecular_response', summary)
     return summary

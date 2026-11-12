@@ -354,16 +354,18 @@ def main():
             mp2_domains.append(dict(fragment=index, target_orbitals=list(members),
                 primary_atoms=fragment.primary_atoms.tolist(),
                 extended_atoms=fragment.extended_atoms.tolist(),
+                pao_center_atoms=fragment.pao_center_atoms.tolist(),
                 nao=len(fragment.extended_ao_indices),
                 nocc=len(fragment.strong_occ_metric_keep),
                 nvir=len(fragment.virtual_anchor_columns)))
         domain_report = dict(force_full_domains=force_full_domains,
             thresholds=asdict(domains.thresholds), pair_energy_model=domains.pair_energy_model,
+            domain_convention=domains.domain_convention,
             physical_fragments=expected_groups, molecular_nao=mol.nao,
             total_active_occ=len(domains.active_occ_indices),
             total_active_vir=len(domains.active_vir_indices),
             full_ao_domains=sum(d['nao'] == mol.nao for d in mp2_domains),
-            weak_orbital_pairs=int(np.count_nonzero(np.triu(~domains.strong_mask, 1))),
+            weak_orbital_pairs=int(np.count_nonzero(np.triu(~(domains.strong_mask & domains.strong_mask.T), 1))),
             fragments=mp2_domains)
         save(output / "domain_selection.json", domain_report)
         report(f"MP2 domain selection: force_full_domains={force_full_domains}; "

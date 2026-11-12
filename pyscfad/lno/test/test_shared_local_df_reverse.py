@@ -227,7 +227,7 @@ def test_owner_adds_shared_geometry_once_and_preserves_other_bars(monkeypatch):
     mol, coeff = _problem(4)
     expected, reference = jax.value_and_grad(lambda m: _energy(m, coeff))(mol)
     static = SimpleNamespace(mp2_static=SimpleNamespace(
-        fragments=[SimpleNamespace(extended_atoms=ATOMS)]))
+        fragments=[SimpleNamespace(extended_atoms=ATOMS, pao_center_atoms=ATOMS)]))
     group = SimpleNamespace(representative_index=0)
     initial = .123
     state = dict(mf=_mf(mol))
@@ -250,7 +250,7 @@ def test_stc_replica_mean_scales_integral_response_with_shared_optimization_enab
     controls = dict(energy_tolerance=1e4, seed=17, precision_pilot_replicas=2,
                     precision_min_replicas=2, precision_max_replicas=2)
     static = SimpleNamespace(mp2_static=SimpleNamespace(
-        fragments=[SimpleNamespace(extended_atoms=ATOMS)]))
+        fragments=[SimpleNamespace(extended_atoms=ATOMS, pao_center_atoms=ATOMS)]))
     group = SimpleNamespace(representative_index=0)
     state = dict(mf=_mf(mol))
     def weight(config):

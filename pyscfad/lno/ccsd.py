@@ -335,7 +335,7 @@ def _make_df_eris_incore(cc, mo_coeff=None, fockao=None, s1e=None):
         mo = mo[ao_index_by_atom(cc.mol, atmlst)]
     Lpq = lno_df.transform_df_to_mo(
         cc._scf, mo, ijslice, aosym='s2', mosym='s1', atmlst=atmlst, s1e=s1e,
-        coeff_is_local=local,
+        coeff_is_local=local, aux_atmlst=getattr(cc, "_aux_atmlst", None),
         correlation_auxbasis=getattr(cc, 'correlation_auxbasis', None),
     ).reshape(-1, nmo, nmo)
 
@@ -593,6 +593,7 @@ def _impurity_solve_core(mf, mo_coeff, lo_coeff, fock, s1e, frozen=None,
         mcc.incore_complete = True
         mcc.diis_space = diis_space
     mcc._domain_atmlst = None if frag_prescreen is None else frag_prescreen.get('extended_primary_domain')
+    mcc._aux_atmlst = None if frag_prescreen is None else frag_prescreen.get('auxiliary_domain')
     mcc._domain_orbitals = active_nocc is not None
     mcc.e_hf = mf.e_tot  #avoid MP2 recompute e_hf
     mcc.profile_pass = profile_pass

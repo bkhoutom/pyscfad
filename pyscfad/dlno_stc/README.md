@@ -16,6 +16,29 @@ membership, and its position is the stable physical fragment ID. Internal
 `DomainGroup` entries merge preparation only when saved supports, candidate
 ordering, retained virtual ranks and PAO anchors are identical.
 
+Domain construction has one convention: a physical fragment includes its own
+targets and the individual occupied orbitals strong with any target; it does
+not include other members of a partner's physical group. `strong_mask[i, j]`
+records directed domain membership and need not be symmetric. A missing
+endpoint contributes half the unordered multipole pair energy to weak
+completion, so pairs present in just one domain receive a half-weight correction.
+Screening and weak completion both use the -4 distant-pair MP2 prefactor.
+This is half the printed -8 score of Nagy et al. (2018), Eq. 9: a 1e-5
+cutoff in that convention corresponds to 5e-6 here. The API default
+changes from 1.5e-5 to 7.5e-6, and exact-pair screening now uses twice
+the conventional OS contribution. The existing multipole kernel already
+used -4, so its unweighted energies are unchanged; the lower cutoff and
+directed completion weights can change the selected domains and weak sum.
+Old -8 selections and correlation restart packets must be rebuilt; SCF
+checkpoints remain reusable.
+
+Domain MP2/W and LIS CCSD use auxiliary functions centered on the PCD (the
+union of compact BP supports), while the orbital AO representation remains
+on the ED. Forward, retained H tensors, metric response and three-center
+coordinate response all use these separate supports. There is no ED-auxiliary
+or whole-partner-group compatibility switch. Rebuild old domain/LIS selections
+and correlation packets after this change; saved SCF orbitals remain usable.
+
 The CCSD entry points `dlno_stc.ccsd.kernel` and `dlno_stc.ccsd.value_and_grad`
 default to `lis_aux_svd_tol=1e-5`. Each physical fragment compresses its LIS
 auxiliary factors by retaining squared singular values `s**2 > lis_aux_svd_tol`.

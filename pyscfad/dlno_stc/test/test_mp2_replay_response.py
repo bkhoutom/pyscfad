@@ -77,7 +77,7 @@ def test_replay_reuses_final_scf_data_and_closes_shared_response(
     assert _ooc_cotangent._scope.get() is None
 
 
-def test_partial_replays_sum_to_complete_strong_response(boys_water_dimer, tmp_path):
+def test_partial_replays_sum_to_complete_strong_response(boys_water_dimer, tmp_path, monkeypatch):
     from pyscfad.dlno_stc.test.test_finite_workflow import build_mf
     mf, _, static = boys_water_dimer
     controls = dict(_controls(), energy_tolerance=3e-4)
@@ -92,6 +92,16 @@ def test_partial_replays_sum_to_complete_strong_response(boys_water_dimer, tmp_p
         return mp2.load_disk_packet(tmp_path, index)
 
     options = dict(include_hf=False, include_weak=False)
+    original_scope = driver._mp2_df_scope
+    scopes = []
+    def checked_scope(state, atoms, aux_atoms=None):
+        assert aux_atoms is not None
+        assert any(np.array_equal(atoms, fragment.extended_atoms)
+                   and np.array_equal(aux_atoms, fragment.pao_center_atoms)
+                   for fragment in static.fragments)
+        scopes.append(1)
+        return original_scope(state, atoms, aux_atoms)
+    monkeypatch.setattr(driver, '_mp2_df_scope', checked_scope)
     complete = mp2.imported_value_and_grad(mf.mol, build_mf, static, load, **options)
     assert reads == list(range(len(rows)))
     partitions = ((0,), tuple(range(1, len(rows))))
@@ -104,3 +114,4 @@ def test_partial_replays_sum_to_complete_strong_response(boys_water_dimer, tmp_p
     np.testing.assert_allclose(sum(value for value, _ in partials), complete[0], atol=1e-11, rtol=0)
     np.testing.assert_allclose(sum(np.asarray(bar.coords) for _, bar in partials),
                                complete[1].coords, atol=2e-8, rtol=0)
+    assert scopes

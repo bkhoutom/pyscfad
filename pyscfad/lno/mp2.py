@@ -47,7 +47,8 @@ def _make_df_eris_incore(cc, mo_coeff=None, fockao=None):
     ijslice = (0, nocc, nocc, nmo)
     atmlst = getattr(cc, '_domain_atmlst', None)
     Lov = lno_df.transform_df_to_mo(
-        cc._scf, mo, ijslice, aosym='s2', mosym='s1', atmlst=atmlst
+        cc._scf, mo, ijslice, aosym='s2', mosym='s1', atmlst=atmlst,
+        aux_atmlst=getattr(cc, '_aux_atmlst', None)
     )
 
     eris.ovov = np.dot(Lov.T, Lov).reshape(nocc,nvir,nocc,nvir)
@@ -80,6 +81,7 @@ def impurity_solve(mf, mo_coeff, lo_coeff, eris=None, frozen=None,
     # solve impurity problem
     mcc = RCCSD(mf, mo_coeff=mo_coeff, frozen=frozen)
     mcc._domain_atmlst = None if frag_prescreen is None else frag_prescreen.get('extended_primary_domain')
+    mcc._aux_atmlst = None if frag_prescreen is None else frag_prescreen.get('auxiliary_domain')
     mcc.e_hf = mf.e_tot  #avoid MP2 recompute e_hf
     total_start = time.perf_counter()
     phase_start = time.perf_counter()

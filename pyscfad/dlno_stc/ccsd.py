@@ -29,7 +29,7 @@ from .domain import build_boys_ed_frame
 from .protocol import validate_full_result, validate_input_cotangents
 
 
-CC_SELECTIONS_SCHEMA_VERSION = 10
+CC_SELECTIONS_SCHEMA_VERSION = 12
 
 
 def _clear_jax_caches(stage, *live_results, **metadata):
@@ -604,7 +604,9 @@ def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
                 (ccsd_t and static.lis_static.smooth_frames is not None) else values)
     metadata = {'fragment_index': int(fragment_index),
                 'extended_primary_domain': numpy.asarray(
-                    static.mp2_static.fragments[representative].extended_atoms, dtype=numpy.int32)}
+                    static.mp2_static.fragments[representative].extended_atoms, dtype=numpy.int32),
+                'auxiliary_domain': numpy.asarray(
+                    static.mp2_static.fragments[representative].pao_center_atoms, dtype=numpy.int32)}
     options = basis_kwargs(correlation_auxbasis)
     options['active_nocc'] = lis.active_occupied_coeff.shape[1]
     if df_compressor is not None:
@@ -663,7 +665,9 @@ def _run_group(state, static, group, baseline_controls, matrix_controls, *,
                                     matrix_controls, **options)
     atoms = static.mp2_static.fragments[group.representative_index].extended_atoms
     with _df_shared.reverse_scope(
-            state['mf'], atoms, **basis_kwargs(state.get('correlation_auxbasis'))) as shared:
+            state['mf'], atoms,
+            aux_atoms=static.mp2_static.fragments[group.representative_index].pao_center_atoms,
+            **basis_kwargs(state.get('correlation_auxbasis'))) as shared:
         if state.get('common') is not None:
             from ._df_inputs import configure_cache
             configure_cache(shared, static)

@@ -527,10 +527,9 @@ class MP2Timing:
 class FragmentDomainResult:
     """MP2 contribution and dimensions for one fragment ED.
 
-    ``weak_multipole_opposite_spin`` follows the OS-based pair-increment
-    convention of Nagy et al., including the pair-orientation prefactor in
-    their Eq. (7).  It is not the conventional SCS-MP2 OS component resolved
-    from a global canonical energy expression.
+    ``weak_multipole_opposite_spin`` is a historical field name for the
+    total distant-pair estimate with the -4 prefactor. It is not the
+    conventional SCS-MP2 OS component.
     """
 
     fragment_index: int
@@ -554,8 +553,8 @@ class MP2Result:
     """Summed strong-plus-weak DLNO-MP2 result.
 
     ``e_strong_os`` and ``e_strong_ss`` are conventional MP2 spin components.
-    ``e_weak_multipole_os`` instead carries Nagy's OS-based distant-pair
-    increment convention; it approximates the omitted total distant-pair
+    ``e_weak_multipole_os`` uses the -4 distant-pair
+    normalization; it approximates the omitted total distant-pair
     contribution and should not be interpreted as an SCS-OS diagnostic.
     """
 

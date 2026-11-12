@@ -62,6 +62,12 @@ def make_local_mol(mol, atmlst):
     return fake_mol
 
 
+def make_local_auxmol(mf, atmlst, correlation_auxbasis=None):
+    """Build a differentiable auxiliary molecule on explicitly selected centers."""
+    auxbasis = mf.with_df.auxbasis if correlation_auxbasis is None else correlation_auxbasis
+    return df_addons.make_auxmol(make_local_mol(mf.mol, atmlst), auxbasis)
+
+
 def get_local_df(mf, atmlst):
     atmlst = tuple(map(int, numpy.asarray(atmlst).ravel()))
     cache = getattr(mf.with_df, '_lno_local_df_cache', None)
@@ -128,7 +134,7 @@ def build_local_Lov_h5(
 
 
 def transform_df_to_mo(mf, mo_coeff, orbs_slice, aosym='s2', mosym='s1', atmlst=None,
-                       s1e=None, coeff_is_local=False, correlation_auxbasis=None):
+                       s1e=None, coeff_is_local=False, correlation_auxbasis=None, aux_atmlst=None):
     """Transform with the domain's AO and auxiliary bases when atoms are given.
 
     The fitting space is independent of the parent's DF storage policy.
@@ -144,6 +150,8 @@ def transform_df_to_mo(mf, mo_coeff, orbs_slice, aosym='s2', mosym='s1', atmlst=
     changing the parent's JK fit. With no domain it uses all atoms directly.
     """
     atmlst = _local_domain_atmlst(mf, atmlst)
+    if aux_atmlst is not None and (atmlst is None or aosym != 's2' or mosym != 's1'):
+        raise ValueError('Separate auxiliary centers require local aosym=s2, mosym=s1')
     if correlation_auxbasis is not None:
         if aosym != 's2' or mosym != 's1':
             raise NotImplementedError('Separate correlation fitting requires aosym=s2, mosym=s1')
@@ -165,8 +173,8 @@ def transform_df_to_mo(mf, mo_coeff, orbs_slice, aosym='s2', mosym='s1', atmlst=
             mo_coeff = lno_tools.project_mo(mo_coeff, s21, s22)
         if aosym == 's2' and mosym == 's1':
             local_mol = make_local_mol(mf.mol, atmlst)
-            auxbasis = mf.with_df.auxbasis if correlation_auxbasis is None else correlation_auxbasis
-            auxmol = df_addons.make_auxmol(local_mol, auxbasis)
+            auxmol = make_local_auxmol(
+                mf, atmlst if aux_atmlst is None else aux_atmlst, correlation_auxbasis)
             # Direct MO transformation avoids caching an AO-pair CDERI for
             # every fragment. Respect both total memory and the DF workspace.
             max_memory = min(
@@ -217,7 +225,7 @@ def transform_df_to_mo(mf, mo_coeff, orbs_slice, aosym='s2', mosym='s1', atmlst=
 
 
 def get_local_Lov(mf, mo_coeff_local, nocc, atmlst,
-                  integral_direct=None, correlation_auxbasis=None):
+                  integral_direct=None, correlation_auxbasis=None, aux_atmlst=None):
     """Transform a local-domain CDERI using local AO coefficients directly.
 
     ``get_Lov(..., atmlst=...)`` accepts full-molecule AO coefficients and
@@ -248,12 +256,12 @@ def get_local_Lov(mf, mo_coeff_local, nocc, atmlst,
         integral_direct = bool(getattr(
             mf.with_df, '_lno_local_lov_integral_direct', False
         ))
-    if correlation_auxbasis is not None:
+    if correlation_auxbasis is not None or aux_atmlst is not None:
         integral_direct = True
     if integral_direct:
         fake_mol = make_local_mol(mf.mol, atmlst)
-        auxbasis = mf.with_df.auxbasis if correlation_auxbasis is None else correlation_auxbasis
-        auxmol = df_addons.make_auxmol(fake_mol, auxbasis)
+        auxmol = make_local_auxmol(
+            mf, atmlst if aux_atmlst is None else aux_atmlst, correlation_auxbasis)
         if nocc == 0 or nocc == nmo:
             return np.zeros(
                 (auxmol.nao, nocc, nmo - nocc), dtype=mo_coeff_local.dtype
@@ -273,7 +281,7 @@ def get_local_Lov(mf, mo_coeff_local, nocc, atmlst,
                 (0, nocc, nocc, nmo),
             )
         except ImportError as err:
-            if correlation_auxbasis is not None:
+            if correlation_auxbasis is not None or aux_atmlst is not None:
                 raise
             # PySCF exposes the shell-direct DF transformation through a
             # private helper whose availability is not guaranteed across the

@@ -56,24 +56,33 @@ def test_atom_strong_graph_uses_any_member_and_exact_weak_complement():
     orbital = np.eye(5, dtype=bool)
     orbital[0, 1] = orbital[1, 0] = True
     groups = (np.array([2, 0]), np.array([4, 1]), np.array([3]))
-    effective = _selection._expand_group_strong_mask(orbital, groups)
-    expected = np.ones((5, 5), dtype=bool)
-    expected[3, :] = expected[:, 3] = False
-    expected[3, 3] = True
+    effective = _selection._group_domain_mask(orbital, groups)
+    expected = np.array([[1, 1, 1, 0, 0],
+                         [1, 1, 0, 0, 1],
+                         [1, 1, 1, 0, 0],
+                         [0, 0, 0, 1, 0],
+                         [1, 1, 0, 0, 1]], dtype=bool)
     np.testing.assert_array_equal(effective, expected)
-    np.testing.assert_array_equal(effective, effective.T)
+    assert not np.array_equal(effective, effective.T)
     assert np.all(effective[orbital])
     static = replace(grouping_fixture(), strong_mask=effective,
                      fragments=grouping_fixture().fragments[:5])
-    assert _pairs.weak_pair_indices(static) == ((0, 3), (1, 3), (2, 3), (3, 4))
+    assert _pairs.weak_pair_indices(static) == ((0, 3), (0, 4), (1, 2), (1, 3), (2, 3), (2, 4), (3, 4))
+    assert _pairs.weak_pair_weight(static, 0, 4) == .5
+    assert _pairs.weak_pair_weight(static, 1, 2) == .5
+    assert _pairs.weak_pair_weight(static, 2, 4) == 1.
+    # Each unordered pair has exactly two endpoint shares after completion.
+    for i in range(5):
+        for j in range(i):
+            assert .5 * (int(effective[i, j]) + int(effective[j, i])) + _pairs.weak_pair_weight(static, i, j) == 1
     singletons = tuple(np.array([i]) for i in range(5))
     np.testing.assert_array_equal(
-        _selection._expand_group_strong_mask(orbital, singletons), orbital)
+        _selection._group_domain_mask(orbital, singletons), orbital)
     for invalid in ((np.array([0, 1]), np.array([1, 2, 3, 4])),
                     (np.array([0, 1]), np.array([2, 3])),
                     (np.array([0, 1]), np.array([2, 3, 2**32]))):
         with pytest.raises(ValueError, match="partition|indices"):
-            _selection._expand_group_strong_mask(orbital, invalid)
+            _selection._group_domain_mask(orbital, invalid)
 
 
 def _assert_saved_selection_equal(left, right):
@@ -143,14 +152,14 @@ def test_atom_public_builder_shares_strong_frames_and_preserves_endpoints(
     assert tuple(int(group[0]) for group in combined.frag_lolist) == labels
     _assert_saved_selection_equal(combined.compact_bp_domain,
                                   baseline_permuted.compact_bp_domain)
-    expected_graph = _selection._expand_group_strong_mask(
+    expected_graph = _selection._group_domain_mask(
         captured["orbital_graph"], expected_physical)
     np.testing.assert_array_equal(combined.strong_mask, expected_graph)
     for saved, screened in zip((combined.pair_energy, combined.weak_pair_energy,
                                 combined.forced_strong_mask), captured["pair_estimates"]):
         np.testing.assert_array_equal(saved, screened)
     expected_weak = tuple((i, j) for i in range(8) for j in range(i + 1, 8)
-                          if not expected_graph[i, j])
+                          if not (expected_graph[i, j] and expected_graph[j, i]))
     assert _pairs.weak_pair_indices(combined) == expected_weak
     assert expected_weak  # This integration fixture also exercises surviving weak pairs.
     common = domain.rebuild_domain_data(mf, combined)
@@ -205,3 +214,13 @@ def test_atom_merged_and_unmerged_molecular_response_agree(boys_water_dimer):
     assert np.isfinite(merged_grad).all() and np.isfinite(unmerged_grad).all()
     np.testing.assert_allclose(merged_energy, unmerged_energy, atol=1e-10, rtol=0)
     np.testing.assert_allclose(merged_grad, unmerged_grad, atol=1e-7, rtol=0)
+
+
+def test_old_domain_convention_requires_reselection():
+    from pyscfad.dlno_stc import driver
+    static = grouping_fixture()
+    object.__delattr__(static, 'domain_convention')
+    with pytest.raises(ValueError, match='domain convention'):
+        driver._validate_static(static)
+    with pytest.raises(ValueError, match='domain convention'):
+        _selection.build_domain_groups(static)

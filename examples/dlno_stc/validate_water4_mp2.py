@@ -26,9 +26,9 @@ def main():
     parser.add_argument('--correlation-auxbasis', default='cc-pvdz-ri')
     parser.add_argument('--threads', type=int, default=2)
     parser.add_argument('--max-memory', type=float, default=10000)
-    parser.add_argument('--pair-energy', type=float, default=1e-4)
+    parser.add_argument('--pair-energy', type=float, default=5e-5)
     parser.add_argument('--boys-grad-tol', type=float, default=1e-9)
-    parser.add_argument('--fd-step', type=float, default=1e-4, help='Bohr')
+    parser.add_argument('--fd-step', type=float, default=5e-5, help='Bohr')
     args = parser.parse_args()
     if args.threads < 1 or args.fd_step <= 0:
         parser.error('threads and fd-step must be positive')
@@ -84,7 +84,7 @@ def main():
         groups = dlno_stc.build_domain_groups(static)
         report['groups'] = [dict(targets=list(g.target_indices),
             nao=len(static.fragments[g.representative_index].extended_ao_indices)) for g in groups]
-        report['weak_pairs'] = int(np.count_nonzero(np.triu(~static.strong_mask, 1)))
+        report['weak_pairs'] = int(np.count_nonzero(np.triu(~(static.strong_mask & static.strong_mask.T), 1)))
         receipts = []
         finish = _df_shared.LocalDFReverse.finish
         def observed(scope):

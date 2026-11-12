@@ -469,7 +469,8 @@ def _run_domain_jobs(initializer, worker_initializer, static, controls, comm, *,
                    'target_indices': tuple(group.target_indices),
                    'fragment_indices': tuple(group.fragment_indices), 'replica_count': 1}
             group_start = time.perf_counter()
-            with driver._mp2_df_scope(state, static.fragments[group_id].extended_atoms) as shared:
+            with driver._mp2_df_scope(state, static.fragments[group_id].extended_atoms,
+                                      static.fragments[group_id].pao_center_atoms) as shared:
                 with _timed_section('stc.domain.prepare', totals, 'prepare'):
                     stage_start = time.perf_counter()
                     prepared = driver._prepare(state, static, group, controls, with_grad)

@@ -420,12 +420,12 @@ def _decode_value(node, reader):
             raise RestartCorruptionError("malformed dataclass fields")
         names = tuple(pair[0] for pair in fields)
         required_grouping = {
-            "DomainSelections": {"boys_grouping", "physical_groups"},
+            "DomainSelections": {"boys_grouping", "physical_groups", "domain_convention"},
             "CCSDSelections": {"schema_version", "mp2_fragment_energies"},
         }.get(cls.__name__, set())
         if not required_grouping.issubset(names):
             raise RestartMismatchError(
-                f"legacy {cls.__name__} checkpoint lacks physical fragment metadata. "
+                f"legacy {cls.__name__} checkpoint lacks current domain/physical fragment metadata. "
                 "Rebuild selections and checkpoints; migration is unsupported."
             )
         compatible = (tuple(name for name in expected if name != 'correlation_basis_identity')
@@ -438,6 +438,13 @@ def _decode_value(node, reader):
             name: _decode_value(value, reader)
             for name, value in fields
         }
+        if (cls.__name__ == "DomainSelections" and
+                kwargs["domain_convention"] !=
+                "individual-partners-pair4-pcd-aux-v2"):
+            raise RestartMismatchError(
+                "Domain pair normalization is incompatible. Rebuild selections "
+                "and checkpoints; migration is unsupported."
+            )
         if cls.__name__ == "CCSDSelections":
             from .ccsd import CC_SELECTIONS_SCHEMA_VERSION
             if kwargs["schema_version"] != CC_SELECTIONS_SCHEMA_VERSION:

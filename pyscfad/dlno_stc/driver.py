@@ -66,6 +66,8 @@ def _root_call(comm, rank, function, phase):
 def _validate_static(static):
     if not isinstance(static, DomainSelections):
         raise TypeError("static must be DomainSelections")
+    if vars(static).get('domain_convention') != 'individual-partners-pair4-pcd-aux-v2':
+        raise ValueError('incompatible domain convention; rebuild domain selections')
     if static.frozen is None:
         raise ValueError("STC requires an explicit frozen-space setting")
     nocc = len(static.active_occ_indices)
@@ -74,9 +76,8 @@ def _validate_static(static):
         raise ValueError("Boys targets must form a complete singleton partition")
     groups = validate_boys_target_groups(static.frag_lolist, nocc)
     mask = numpy.asarray(static.strong_mask, dtype=bool)
-    if (mask.shape != (nocc, nocc) or not numpy.array_equal(mask, mask.T)
-            or not numpy.diag(mask).all()):
-        raise ValueError("strong_mask must be symmetric with every target self-strong")
+    if mask.shape != (nocc, nocc) or not numpy.diag(mask).all():
+        raise ValueError("strong_mask must contain every target in its own domain")
     for index, fragment in enumerate(static.fragments):
         if not numpy.array_equal(fragment.iao_indices, groups[index]):
             raise ValueError("fragment target does not match the singleton partition")
@@ -378,7 +379,7 @@ def _finish_response(state, energy, mf_bar, *, include_hf):
 
 
 @contextmanager
-def _mp2_df_scope(state, atoms=None):
+def _mp2_df_scope(state, atoms=None, aux_atoms=None):
     """Retain the metric/tape and, for domains, the configured H cache."""
     from pyscfad.lno import _df_shared
     mf = state['mf']
@@ -392,7 +393,7 @@ def _mp2_df_scope(state, atoms=None):
             yield None
             return
         atoms = numpy.arange(mf.mol.natm, dtype=numpy.int32)
-    with _df_shared.reverse_scope(mf, atoms, **basis_kwargs(basis)) as shared:
+    with _df_shared.reverse_scope(mf, atoms, aux_atoms=aux_atoms, **basis_kwargs(basis)) as shared:
         if domain_scope:
             from ._df_inputs import configure_cache
             configure_cache(shared)
@@ -432,7 +433,8 @@ def _run_domain(initializer, static, controls, comm, *, with_grad, include_hf=Fa
         fragment_id = group.representative_index
         with ExitStack() as resources:
             shared = _root_call(comm, rank, lambda: resources.enter_context(
-                _mp2_df_scope(state, static.fragments[fragment_id].extended_atoms)),
+                _mp2_df_scope(state, static.fragments[fragment_id].extended_atoms,
+                              static.fragments[fragment_id].pao_center_atoms)),
                 f"group {fragment_id} DF setup")
             with resource_profile.section('stc.domain.prepare'):
                 prepared = _root_call(comm, rank,

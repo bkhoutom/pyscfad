@@ -228,7 +228,13 @@ def endpoint_matches_reference(endpoint, reference, *, rtol=1e-9, atol=1e-9):
 
 @partial(jax.jit, static_argnums=(2,))
 def pair_energy(left, right, order):
-    """Contract precomputed multipoles for one ordered orbital pair."""
+    """Unordered distant-pair MP2 estimate: -4 sum((ai|bj)^2 / gap).
+
+    Screening and weak completion share the conventional full-spin
+    long-range normalization. This is half the printed score in Eq. 9 of
+    Nagy et al. (2018); halve that convention's screening cutoff as well.
+    Domain completion assigns half this value to each missing endpoint.
+    """
     Ri, mu_ai, e_ai, theta_ai, omega_ai = left
     Rj, mu_bj, e_bj, theta_bj, omega_bj = right
 

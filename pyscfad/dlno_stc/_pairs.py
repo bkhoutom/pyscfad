@@ -1,4 +1,4 @@
-"""Weightless Boys multipole screening and weak-pair response.
+"""Boys multipole screening and directed weak-pair completion.
 
 Moment translation, Cartesian response contractions, and pair kernels are
 shared through ``pyscfad.lib._multipole``. Fixed primary-screen reconstruction
@@ -8,6 +8,7 @@ module is imported by this implementation.
 """
 import gc
 from collections import Counter
+from types import SimpleNamespace
 from functools import partial
 from typing import NamedTuple
 
@@ -334,13 +335,13 @@ def _validate_weak_pair(static, left_index, right_index):
     left, right = sorted((left, right))
     if not (0 <= left < len(static.fragments) and 0 <= right < len(static.fragments)):
         raise IndexError("weak-pair fragment index is out of range")
-    if bool(static.strong_mask[left, right]):
+    if weak_pair_weight(static, left, right) == 0:
         raise ValueError(f"fragment pair ({left}, {right}) is classified strong")
     return left, right
 
 
 def weak_screen_pair_energy(mf, left, right, static, left_index, right_index):
-    """Evaluate one unordered weak pair, with the native -4 prefactor."""
+    """Evaluate the missing directed shares of one unordered -4 pair."""
     # Preserve endpoint identity when accepting a reversed pair.
     if int(left_index) > int(right_index):
         left, right = right, left
@@ -350,7 +351,8 @@ def weak_screen_pair_energy(mf, left, right, static, left_index, right_index):
     order = static.thresholds.multipole_order
     lhs = _multipole_orbital_data(mf.mol, left, static.fragments[left_index].primary_atoms, order)
     rhs = _multipole_orbital_data(mf.mol, right, static.fragments[right_index].primary_atoms, order)
-    return jnp.real(_multipole_pair_energy(pad_endpoint(lhs), pad_endpoint(rhs), order))
+    return weak_pair_weight(static, left_index, right_index) * jnp.real(
+        _multipole_pair_energy(pad_endpoint(lhs), pad_endpoint(rhs), order))
 
 
 def build_weak_endpoint(mf, common, static, fragment_index):
@@ -419,18 +421,28 @@ def _replay_weak_endpoint(mf, linearization, static, fragment_index, *,
 def weak_pair_energy(mf, common, static, left_index, right_index):
     """Evaluate one pair using the same endpoint boundary as the full sum."""
     left_index, right_index = _validate_weak_pair(static, left_index, right_index)
-    return jnp.real(_multipole_pair_energy(
+    return weak_pair_weight(static, left_index, right_index) * jnp.real(_multipole_pair_energy(
         pad_endpoint(build_weak_endpoint(mf, common, static, left_index)),
         pad_endpoint(build_weak_endpoint(mf, common, static, right_index)),
         static.thresholds.multipole_order,
     ))
 
 
+def weak_pair_weight(static, left, right):
+    """Missing endpoint shares: zero, half, or one unordered pair energy.
+
+    A grouped target may include a partner without the reciprocal domain
+    including that target. Each included direction is already in domain MP2.
+    """
+    return 0.5 * (int(not static.strong_mask[left, right])
+                  + int(not static.strong_mask[right, left]))
+
+
 def weak_pair_indices(static):
-    """List each weak fragment pair exactly once in fragment order."""
+    """List pairs with at least one missing domain contribution, once each."""
     return tuple((left, right) for left in range(len(static.fragments))
                  for right in range(left + 1, len(static.fragments))
-                 if not bool(static.strong_mask[left, right]))
+                 if weak_pair_weight(static, left, right) > 0)
 
 
 def _weak_endpoints(mf, common, static, pairs):
@@ -486,7 +498,7 @@ def weak_pair_energy_sum(mf, common, static, *, pairs=None):
     with resource_profile.section('stc.cc.weak_forward', pairs=len(pairs)):
         energy = jnp.zeros((), dtype=common.s1e.dtype)
         for left, right in pairs:
-            energy += _multipole_pair_energy(
+            energy += weak_pair_weight(static, left, right) * _multipole_pair_energy(
                 endpoints[left], endpoints[right], static.thresholds.multipole_order)
         if resource_profile.enabled():
             jax.block_until_ready(energy)
@@ -600,6 +612,10 @@ def weak_pair_energy_and_grad(mf, common, static, *, pairs=None,
             for left, right in pairs:
                 value, (left_bar, right_bar) = pair_energy_and_grad(
                     endpoints[left], endpoints[right], static.thresholds.multipole_order)
+                weight = weak_pair_weight(static, left, right)
+                value = weight * value
+                left_bar, right_bar = jax.tree_util.tree_map(
+                    lambda x: weight * x, (left_bar, right_bar))
                 endpoint_bars[left] = jax.tree_util.tree_map(add_cotangent, endpoint_bars[left], left_bar)
                 endpoint_bars[right] = jax.tree_util.tree_map(add_cotangent, endpoint_bars[right], right_bar)
                 energy += value
@@ -639,7 +655,7 @@ def _exact_boys_pair_scores(mf, common, static, *, correlation_auxbasis=None):
     """Concrete exact classification through two labelled occupied contractions.
 
     Project amplitudes only after canonical denominators have been applied.
-    This is the native exact screening convention (four times directed OS,
+    This is the native exact screening convention (twice directed OS,
     then combine orientations), without constructing occupied weight matrices.
     One virtual pair is held at a time.
     """
@@ -669,76 +685,46 @@ def _exact_boys_pair_scores(mf, common, static, *, correlation_auxbasis=None):
             target_integrals = rotation.T @ integrals @ rotation
             target_amplitudes = rotation.T @ (integrals / denominator) @ rotation
             directed += target_integrals * target_amplitudes
-    directed *= 4
+    directed *= 2
     physical = directed + directed.T
     np.fill_diagonal(physical, np.diag(directed))
     return physical
 
 
 def _screen_pair_response(endpoints, static, forced, exact_scores, response):
-    """Classify and differentiate pairs once, keeping one group's temporary bars.
-
-    Atom grouping promotes a whole group pair when any member is strong.
-    Accumulate provisional bars only for that group pair, discarding them if
-    a later member promotes it. Completed weak groups contribute to one compact
-    bar per endpoint; no per-pair response tapes or bars survive the group.
-    """
+    """Classify orbital pairs, then differentiate only missing domain shares."""
     from .adjoint import add_cotangent
+    from ._selection import _group_domain_mask
     nfrag = len(endpoints)
-    groups = (static.physical_groups if getattr(static, 'boys_grouping', 'singleton') == 'atom'
-              else tuple((i,) for i in range(nfrag)))
-    if sorted(i for group in groups for i in group) != list(range(nfrag)):
-        raise ValueError('screening response requires a complete disjoint physical-group partition')
     weak = np.zeros((nfrag, nfrag))
-    retained, accumulated = [], {}
+    order = static.thresholds.multipole_order
+    for left in range(nfrag):
+        for right in range(left):
+            if forced[left, right]:
+                continue
+            value = float(_multipole_pair_energy(endpoints[left], endpoints[right], order))
+            if not np.isfinite(value):
+                raise RuntimeError(f'nonfinite Boys screening pair estimate for targets {left}, {right}')
+            weak[left, right] = weak[right, left] = value
+    scores = weak if exact_scores is None else exact_scores
+    mask = (np.abs(scores) > static.thresholds.pair_energy) | forced
+    if getattr(static, 'boys_grouping', 'singleton') == 'atom':
+        mask = _group_domain_mask(mask, static.physical_groups)
+    selected = SimpleNamespace(strong_mask=mask, fragments=static.fragments)
+    pairs = weak_pair_indices(selected)
+    accumulated = {}
     energy = jnp.zeros(())
-    order, threshold = static.thresholds.multipole_order, static.thresholds.pair_energy
     with resource_profile.section('stc.domain.screen_pair_value_and_grad'):
-        for group_index, left_group in enumerate(groups):
-            for right_index, right_group in enumerate(groups[:group_index + 1]):
-                pairs = sorted({tuple(sorted((i, j)))
-                                for i in left_group for j in right_group if i != j})
-                strong = (group_index == right_index or any(forced[i, j] for i, j in pairs)
-                          or (exact_scores is not None and
-                              any(abs(exact_scores[i, j]) > threshold for i, j in pairs)))
-                group_bars, group_pairs = {}, []
-                group_energy = jnp.zeros(())
-                for left, right in pairs:
-                    if forced[left, right]:
-                        continue
-                    if strong:
-                        value = _multipole_pair_energy(endpoints[left], endpoints[right], order)
-                        pair_bars = None
-                    else:
-                        value, pair_bars = pair_energy_and_grad(
-                            endpoints[left], endpoints[right], order)
-                    score = float(value)
-                    if not np.isfinite(score):
-                        raise RuntimeError(f'nonfinite Boys screening pair estimate for targets {left}, {right}')
-                    weak[left, right] = weak[right, left] = score
-                    if exact_scores is None and abs(score) > threshold:
-                        strong = True
-                    if strong:
-                        group_bars.clear()
-                        group_pairs.clear()
-                        group_energy = jnp.zeros(())
-                    else:
-                        for index, bar in zip((left, right), pair_bars):
-                            group_bars[index] = (bar if index not in group_bars else
-                                jax.tree_util.tree_map(add_cotangent, group_bars[index], bar))
-                        group_pairs.append((left, right))
-                        group_energy += value
-                    del pair_bars
-                if not strong:
-                    retained.extend(group_pairs)
-                    energy += group_energy
-                    for index, bar in group_bars.items():
-                        accumulated[index] = (bar if index not in accumulated else
-                            jax.tree_util.tree_map(add_cotangent, accumulated[index], bar))
-                # Bound asynchronous dispatch as well as Python ownership.
-                jax.block_until_ready((energy, accumulated))
-    response.update(pairs=tuple(sorted(retained)), energy=jnp.real(energy),
-                    endpoint_bars=accumulated)
+        for left, right in pairs:
+            weight = weak_pair_weight(selected, left, right)
+            value, bars = pair_energy_and_grad(endpoints[left], endpoints[right], order)
+            energy += weight * value
+            for index, bar in zip((left, right), bars):
+                bar = jax.tree_util.tree_map(lambda x: weight * x, bar)
+                accumulated[index] = (bar if index not in accumulated else
+                    jax.tree_util.tree_map(add_cotangent, accumulated[index], bar))
+            jax.block_until_ready((energy, accumulated))
+    response.update(pairs=pairs, energy=jnp.real(energy), endpoint_bars=accumulated)
     return weak
 
 

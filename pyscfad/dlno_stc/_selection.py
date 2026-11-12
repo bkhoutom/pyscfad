@@ -36,7 +36,7 @@ class BoysDomainThresholds:
     domain_pao: float = 1e-4
     ed_pao: float = 0.995
     metric_rank: float = 1e-10
-    pair_energy: float = 1.5e-5
+    pair_energy: float = 7.5e-6
     near_pair_distance: float = 3.5
     multipole_order: int = 4
 
@@ -103,7 +103,7 @@ class DomainSelections:
     ao2pao_map: numpy.ndarray
     frag_lolist: tuple[numpy.ndarray, ...]
     frag_atmlist: tuple[numpy.ndarray | None, ...]
-    strong_mask: numpy.ndarray
+    strong_mask: numpy.ndarray  # directed target-to-domain membership after grouping
     fragments: tuple[FragmentDomainSelection, ...]
     lo_type: str = "boys"
     lo_kwargs: dict | None = None
@@ -121,6 +121,7 @@ class DomainSelections:
     boys_grouping: str = "singleton"
     physical_groups: tuple[tuple[int, ...], ...] = ()
     correlation_basis_identity: str | None = None
+    domain_convention: str = "individual-partners-pair4-pcd-aux-v2"
 
     def __post_init__(self):
         # Synthetic new selections retain the historical singleton default.
@@ -134,6 +135,8 @@ def _physical_groups(static):
     """Return the saved physical partition in orbital-record coordinates."""
     if isinstance(static, DomainSelections) and not {'boys_grouping', 'physical_groups'} <= vars(static).keys():
         raise ValueError("incompatible domain selections; rebuild domains to save physical fragment grouping")
+    if isinstance(static, DomainSelections) and vars(static).get('domain_convention') != 'individual-partners-pair4-pcd-aux-v2':
+        raise ValueError("incompatible domain convention; rebuild domain selections")
     groups = getattr(static, "physical_groups", ())
     mode = getattr(static, "boys_grouping", "singleton")
     if mode not in ("singleton", "atom", "molecule"):
@@ -231,7 +234,7 @@ def _strong_preparation_key(static, fragment, index, labels):
     The Boys frame projects all ordered partners, applies metric Cholesky,
     and replays the retained PAO subspace in its saved parent-anchor gauge.
     None of those continuous operations uses the central singleton target.
-    ``extended_atoms`` also determines the local auxiliary support in DF.
+    ``pao_center_atoms`` determines the local auxiliary support in DF.
     Reference orbitals, frozen spaces and DF setup are shared by ``static``.
     """
     partners = _grouping_indices(fragment.strong_fragments, len(labels),
@@ -281,6 +284,8 @@ def build_domain_groups(static, *, merge_identical=True) -> tuple[DomainGroup, .
     """
     if not isinstance(static, DomainSelections) or static.lo_type != "boys":
         raise TypeError("static must be STC Boys DomainSelections")
+    if vars(static).get('domain_convention') != 'individual-partners-pair4-pcd-aux-v2':
+        raise ValueError("incompatible domain convention; rebuild domain selections")
     singletons = _validate_boys_target_groups(static.frag_lolist, len(static.active_occ_indices))
     if len(static.fragments) != len(singletons):
         raise ValueError("Boys targets require a complete singleton partition")
@@ -635,8 +640,12 @@ def _boys_atom_groups(mol, targets, singleton_groups):
                                dtype=numpy.int32) for group in columns)
 
 
-def _expand_group_strong_mask(orbital_mask, groups):
-    """Lift any-member adjacency to complete physical-group blocks."""
+def _group_domain_mask(orbital_mask, groups):
+    """Union individual partners over targets, without promoting partner groups.
+
+    Rows are directed domain membership, not a symmetric pair classification.
+    All target members share one row and include their own complete group.
+    """
     orbital_mask = numpy.asarray(orbital_mask, dtype=bool)
     if orbital_mask.ndim != 2 or orbital_mask.shape[0] != orbital_mask.shape[1]:
         raise ValueError("Boys strong graph must be square")
@@ -648,11 +657,10 @@ def _expand_group_strong_mask(orbital_mask, groups):
         raise ValueError("Boys physical groups require a disjoint complete partition")
     orbital_mask = orbital_mask | orbital_mask.T
     effective = numpy.zeros_like(orbital_mask)
-    for left, members_left in enumerate(groups):
-        for right, members_right in enumerate(groups):
-            block = numpy.ix_(members_left, members_right)
-            if left == right or numpy.any(orbital_mask[block]):
-                effective[block] = True
+    for members in groups:
+        partners = numpy.any(orbital_mask[list(members)], axis=0)
+        partners[list(members)] = True
+        effective[list(members)] = partners
     return effective
 
 
@@ -860,7 +868,7 @@ def build_domain_selections(
             '_products_preparation': response.products_preparation}
            if response is not None else {'_products': products}))
     if boys_grouping == "atom":
-        strong = _expand_group_strong_mask(strong, physical_groups)
+        strong = _group_domain_mask(strong, physical_groups)
     if response is not None:
         response.complete_weak(static, strong, endpoints, pair_response)
     fragments = list(static.fragments)

@@ -483,9 +483,9 @@ def test_domain_collects_once_after_complete_weak_response(monkeypatch, with_gra
 
 @pytest.mark.parametrize('order', [2, 3, 4])
 @pytest.mark.parametrize('grouped, promote', [(False, False), (True, False), (True, True)])
-def test_screening_pair_value_and_response_are_evaluated_once(monkeypatch, order, grouped, promote):
-    """Reuse scalar pair work too, discarding bars of promoted atom-group pairs."""
-    from pyscfad.dlno_stc._selection import _expand_group_strong_mask
+def test_screening_pair_response_reuses_weighted_missing_shares(monkeypatch, order, grouped, promote):
+    """Reuse weighted response after classification of individual partners."""
+    from pyscfad.dlno_stc._selection import _group_domain_mask
     mf, common, static, endpoint = _screening_fixture(order)
     _install_split(monkeypatch, endpoint)
     static.boys_grouping = 'atom' if grouped else 'singleton'
@@ -511,17 +511,18 @@ def test_screening_pair_value_and_response_are_evaluated_once(monkeypatch, order
     prepared, pair_response = {}, {}
     _, weak, _, strong = _pairs.screen_pairs(
         mf, common, static, prepared_endpoints=prepared, _pair_response=pair_response)
-    static.strong_mask = (_expand_group_strong_mask(strong, static.physical_groups)
+    static.strong_mask = (_group_domain_mask(strong, static.physical_groups)
                           if grouped else strong)
     pairs = _pairs.weak_pair_indices(static)
     assert pair_response['pairs'] == tuple(sorted(pairs))
-    assert calls == Counter(primal_only=1 if grouped else 0,
-                            value_and_grad=2 if grouped else 3)
+    assert calls == Counter(primal_only=3, value_and_grad=len(pairs))
     if promote:
-        assert pairs == () and pair_response['endpoint_bars'] == {}
+        assert pairs == ((0, 2),)
+        assert _pairs.weak_pair_weight(static, 0, 2) == .5
 
     def direct(m, c):
-        return sum((primal(endpoint(m, c, static, i), endpoint(m, c, static, j), order)
+        return sum((_pairs.weak_pair_weight(static, i, j) * primal(
+                    endpoint(m, c, static, i), endpoint(m, c, static, j), order)
                     for i, j in pairs), jnp.zeros(()))
 
     expected, expected_bars = jax.value_and_grad(direct, argnums=(0, 1))(mf, common)
@@ -534,7 +535,7 @@ def test_screening_pair_value_and_response_are_evaluated_once(monkeypatch, order
     actual, actual_bars = _pairs.weak_pair_energy_and_grad(
         mf, common, static, prepared_endpoints=prepared, _prepared_pairs=pair_response)
     assert prepared == {} and pair_response == {}
-    np.testing.assert_allclose(actual, sum(weak[i, j] for i, j in pairs), atol=1e-14, rtol=2e-12)
+    np.testing.assert_allclose(actual, sum(_pairs.weak_pair_weight(static, i, j) * weak[i, j] for i, j in pairs), atol=1e-14, rtol=2e-12)
     np.testing.assert_allclose(actual, expected, atol=1e-14, rtol=2e-12)
     for got, want in zip(jax.tree_util.tree_leaves(actual_bars), jax.tree_util.tree_leaves(expected_bars)):
         np.testing.assert_allclose(got, want, atol=1e-13, rtol=2e-11)
@@ -561,19 +562,21 @@ def test_joint_screening_uses_exact_scores_for_classification(monkeypatch, corre
     np.testing.assert_allclose(response['energy'], weak[0, 2]+weak[1, 2], atol=1e-14)
 
 
-def test_forced_group_discards_all_pair_response_before_contraction(monkeypatch):
+def test_forced_partner_does_not_promote_its_other_group_members(monkeypatch):
     mf, common, static, endpoint = _screening_fixture(2)
     _install_split(monkeypatch, endpoint)
     static.boys_grouping, static.physical_groups = 'atom', ((0, 1), (2, 3))
-
-    def forbidden(*args):
-        raise AssertionError('a forced-strong group does not need pair gradients')
-
-    monkeypatch.setattr(_pairs, 'pair_energy_and_grad', forbidden)
     response = {}
-    _pairs.screen_pairs(mf, common, static, prepared_endpoints={}, _pair_response=response)
-    assert response['pairs'] == () and response['endpoint_bars'] == {}
-    assert float(response['energy']) == 0
+    _, weak, _, raw = _pairs.screen_pairs(
+        mf, common, static, prepared_endpoints={}, _pair_response=response)
+    from pyscfad.dlno_stc._selection import _group_domain_mask
+    static.strong_mask = _group_domain_mask(raw, static.physical_groups)
+    # Endpoint 3 is forced strong, but its group partner 2 is not promoted.
+    assert response['pairs'] == ((0, 2), (1, 2))
+    assert set(response['endpoint_bars']) == {0, 1, 2}
+    assert _pairs.weak_pair_weight(static, 0, 2) == .5
+    assert _pairs.weak_pair_weight(static, 1, 2) == .5
+    np.testing.assert_allclose(response['energy'], .5*(weak[0, 2]+weak[1, 2]), atol=1e-14)
 
 
 @pytest.mark.parametrize('options', [{'model': 'all'}, {'force_full_domains': True}])
@@ -584,3 +587,25 @@ def test_joint_screening_clears_stale_pair_response_for_all_strong(monkeypatch, 
     _pairs.screen_pairs(mf, common, static, prepared_endpoints={}, _pair_response=response, **options)
     assert response['pairs'] == () and response['endpoint_bars'] == {}
     assert float(response['energy']) == 0
+
+
+@pytest.mark.parametrize('order', [2, 3, 4])
+def test_asymmetric_weak_completion_forward_and_pullback(monkeypatch, order):
+    mf, common, static, endpoint = _fixture(order)
+    static.strong_mask[0, 1] = True  # one endpoint supplied by domain MP2
+    static.strong_mask[1, 2] = static.strong_mask[2, 1] = True
+    _install_split(monkeypatch, endpoint)
+    monkeypatch.setattr(_pairs, 'build_weak_endpoint', endpoint)
+    def reference(m, c):
+        return (.5 * _pairs._multipole_pair_energy(
+                    endpoint(m, c, static, 0), endpoint(m, c, static, 1), order)
+                + _pairs._multipole_pair_energy(
+                    endpoint(m, c, static, 0), endpoint(m, c, static, 2), order))
+    expected, expected_bars = jax.value_and_grad(reference, (0, 1))(mf, common)
+    forward = _pairs.weak_pair_energy_sum(mf, common, static)
+    single = sum(_pairs.weak_pair_energy(mf, common, static, i, j)
+                 for i, j in _pairs.weak_pair_indices(static))
+    value, bars = _pairs.weak_pair_energy_and_grad(mf, common, static)
+    np.testing.assert_allclose([forward, single, value], expected, atol=1e-14)
+    for got, want in zip(jax.tree_util.tree_leaves(bars), jax.tree_util.tree_leaves(expected_bars)):
+        np.testing.assert_allclose(got, want, atol=1e-13, rtol=2e-11)

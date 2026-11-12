@@ -17,7 +17,7 @@ def main():
     parser.add_argument('--energy-tolerance', type=float, default=.0003)
     parser.add_argument('--production-samples', type=int)
     parser.add_argument('--seed', type=int, default=713)
-    parser.add_argument('--pair-energy', type=float, default=1e-4)
+    parser.add_argument('--pair-energy', type=float, default=5e-5)
     parser.add_argument('--unmerged', action='store_true')
     parser.add_argument('--mpi', action='store_true', help='distribute domains over MPI ranks')
     parser.add_argument('--parallel-scf-jk', action=argparse.BooleanOptionalAction,

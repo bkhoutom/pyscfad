@@ -27,14 +27,15 @@ def _scf_fock_block(coeff, energies, overlap, indices, local_coeff):
     return 0.5 * (block + block.T)
 
 
-def _project_inputs(mf, fock, occupied_coeff, virtual_coeff, atoms, *, group=None,
+def _project_inputs(mf, fock, occupied_coeff, virtual_coeff, atoms, *, aux_atoms, group=None,
                     correlation_auxbasis=None):
     """Use one occupied/virtual frame for both Fock blocks and DF factors."""
     co, cv = occupied_coeff, virtual_coeff
     nocc, nvir = co.shape[1], cv.shape[1]
     coeff = np.concatenate((co, cv), axis=1)
     B = lno_df.get_local_Lov(
-        mf, coeff, nocc, atoms, integral_direct=True, **basis_kwargs(correlation_auxbasis),
+        mf, coeff, nocc, atoms, integral_direct=True, aux_atmlst=aux_atoms,
+        **basis_kwargs(correlation_auxbasis),
     )
     foo, fvv = response('stc.domain.input_pullback.local_fock_blocks',
                         lambda f, o, v: (_symmetric_fock_block(f, o),
@@ -68,6 +69,7 @@ def prepare_inputs(mf, common, static, fragment_index, *, return_frame=False,
     inputs = _project_inputs(
         mf, common.fock[numpy.ix_(ao, ao)], frame.occupied_coeff,
         frame.virtual_coeff, frame.extended_atoms, group=fragment_index,
+        aux_atoms=static.fragments[fragment_index].pao_center_atoms,
         **basis_kwargs(correlation_auxbasis),
     )
     if return_frame:

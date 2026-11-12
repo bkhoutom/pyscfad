@@ -267,6 +267,72 @@ def _origin_zero_moments(fake_mol, order):
     return overlap, r, rr, rrr
 
 
+def _native_weak_moments_supported(mf):
+    """The shell contraction supplies concrete, real coordinate response only."""
+    from pyscfad.gto import Mole
+    mol = getattr(mf, 'mol', None)
+    if (not isinstance(mol, Mole) or mol.coords is None
+            or any(getattr(mol, name, None) is not None
+                   for name in ('exp', 'ctr_coeff', 'r0'))
+            or any(isinstance(leaf, jax.core.Tracer)
+                   for leaf in jax.tree_util.tree_leaves(mf))
+            or mol.coords.dtype != np.float64):
+        return False
+    # GTOint2c_r0_vjp reserves CACHESIZE=144000 doubles for shell output.
+    # Bound the largest supported moment (octupole), including contractions;
+    # unusual large shells must use the general rule instead of overrunning C.
+    largest_shell = int(np.max(np.diff(mol.ao_loc_nr()), initial=0))
+    return 0 < largest_shell and 3 * 27 * largest_shell ** 2 <= 144000
+
+
+def _origin_zero_moments_vjp(mf, atoms, order):
+    """Replay raw values, deferring coordinate derivatives until contraction.
+
+    Only the small submolecule coordinate map is linearized on the native
+    path. The incoming weights combine all endpoints on this support before
+    the C driver generates each bra shell block and contracts W + W.T. No
+    full bra/ket derivative arrays are constructed or retained. General AD
+    and basis-parameter response continue to use the original integral JVPs.
+    """
+    def evaluate(current):
+        return _origin_zero_moments(
+            _fake_mol_with_traced_centers(current.mol, atoms), order)
+
+    if not _native_weak_moments_supported(mf):
+        return jax.vjp(evaluate, mf)
+
+    fake_mol, scatter = jax.vjp(
+        lambda current: _fake_mol_with_traced_centers(current.mol, atoms), mf)
+    raw = _origin_zero_moments(fake_mol, order)
+
+    def pullback(raw_bar):
+        # A concrete reference can still receive traced seeds when a caller
+        # differentiates this linear map. Build the general tape only then.
+        if any(isinstance(leaf, jax.core.Tracer)
+               or getattr(leaf, 'dtype', None) != np.float64
+               for leaf in jax.tree_util.tree_leaves(raw_bar)):
+            _, fallback = jax.vjp(evaluate, mf)
+            return fallback(raw_bar)
+
+        from pyscfad.gto._moleintor_vjp import _int1e_r0_deriv
+        coords_bar = np.zeros((fake_mol.natm, 3), dtype=np.float64)
+        names = ('int1e_ovlp', 'int1e_r', 'int1e_rr', 'int1e_rrr')
+        with fake_mol.with_common_origin((0.0, 0.0, 0.0)):
+            for rank, (name, weight) in enumerate(zip(names, raw_bar)):
+                if weight is not None:
+                    # hermi=1 folds both AO legs itself; do not symmetrize
+                    # the weights again. The native driver supplies the
+                    # nuclear-coordinate minus sign and reduces to atoms.
+                    coords_bar += _int1e_r0_deriv(
+                        fake_mol._add_suffix(name + '_dr10'), None,
+                        3 ** rank, 1, fake_mol, weight)
+        mol_bar = fake_mol.copy(deep=False)
+        mol_bar.coords = jnp.asarray(coords_bar)
+        return scatter(mol_bar)
+
+    return raw, pullback
+
+
 def _multipole_orbital_data(mol, screen, atoms, order, *, ao_moments=None):
     """Build the one Boys endpoint using translated raw transition moments."""
     if order not in (2, 3, 4):
@@ -413,6 +479,22 @@ def _replay_weak_endpoint(mf, linearization, static, fragment_index, *,
     if isinstance(screen_pullback, _SharedPAOPullback):
         linearization = (screen, lambda bar: (_apply_weak_screen_pullback(
             screen_pullback, bar, shared_pao_bars, shared_product_bars),))
+    if _native_weak_moments_supported(mf):
+        atoms = static.fragments[fragment_index].primary_atoms
+        raw, raw_pullback = _origin_zero_moments_vjp(
+            mf, atoms, max(1, static.thresholds.multipole_order - 1))
+        endpoint, moment_pullback = jax.vjp(
+            lambda saved, operators: _weak_endpoint_from_screen(
+                mf, saved, static, fragment_index, ao_moments=operators),
+            screen, raw)
+
+        def pullback(endpoint_bar):
+            screen_bar, raw_bar = moment_pullback(endpoint_bar)
+            common_bar, = linearization[1](screen_bar)
+            mf_bar, = raw_pullback(raw_bar)
+            return mf_bar, common_bar
+
+        return endpoint, pullback
     return replay_endpoint(
         partial(_weak_endpoint_from_screen, static=static, fragment_index=fragment_index),
         mf, linearization)
@@ -515,10 +597,7 @@ def _grouped_weak_pullback(mf, static, endpoints, originals, linearizations,
         supports.setdefault(atoms, []).append(index)
     order = static.thresholds.multipole_order
     for atoms, indices in supports.items():
-        raw, raw_pullback = jax.vjp(
-            lambda current: _origin_zero_moments(
-                _fake_mol_with_traced_centers(current.mol, atoms), max(1, order - 1)),
-            mf)
+        raw, raw_pullback = _origin_zero_moments_vjp(mf, atoms, max(1, order - 1))
         raw_bar = jax.tree_util.tree_map(jnp.zeros_like, raw)
         for index in indices:
             endpoint_bar = endpoint_bars.pop(index)

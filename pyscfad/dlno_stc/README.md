@@ -316,6 +316,18 @@ of the current endpoint is through those raw AO moments; sharing their response
 does not freeze integral or orbital derivatives. No screening threshold or
 weak-energy formula changes.
 
+For concrete, real coordinate-only response, the raw AO-moment pullback uses
+the native shell contraction. It generates each bra derivative shell block
+only when the accumulated moment weights are available, contracts it with
+`W + W.T`, and reduces directly into atomic gradients. Separate ket integral
+evaluations and full AO derivative arrays are avoided. Overlap, dipole,
+quadrupole, and octupole operators retain the fixed zero origin; orbital
+response and moment translation remain unchanged. The original JAX rules
+remain available for forward/higher-order AD, active basis parameters, and
+shells exceeding the native scratch capacity. This requires no input option
+and is independent of the weak-pair shape bucket size. Raw moment values are
+still replayed once per support to limit retained memory.
+
 PAO preprojection is also shared across compatible weak endpoints. Concrete
 rank selection reuses the parent/support/representation algebra within that
 selection call. Differentiable screening shares the same algebra only for

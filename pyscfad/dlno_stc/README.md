@@ -1045,32 +1045,45 @@ are outside this sampling SE. A molecular energy target does not control force
 variance.
 
 The adapter uses the already prepared retained LIS factors and Fock matrix.
-`localize=True` chooses a private PySCF Boys frame within its occupied and
-virtual spans; `False` keeps their supplied frame. This private gauge is fixed
+`localize=True` initializes a private occupied/virtual frame with PySCF Boys,
+then `df_rotations=True` (the default) jointly rotates occupied, virtual and
+retained auxiliary indices with the upstream DFAll objective
+`sum_x (sum_ia abs(Lov[x,i,a]))**2`. Optimization uses the already compressed
+LIS `Lov`, never a rebuilt whole-molecule AO DF tensor. The same auxiliary
+rotation is applied to `Loo`, `Lov` and `Lvv`; it preserves the retained rank
+and reconstructed integrals. `df_rotation_tol=5e-3` sets the dimensionless
+relative-cost stopping threshold used upstream. Set `df_rotations=False`
+for the previous Boys-only frame, or `localize=False` to keep all supplied
+orbital and auxiliary frames. This private gauge is fixed
 in reverse mode. Tensor transformations, physical domain/LIS preparation,
 projector response and SCF response remain differentiable. Semicanonical
 Fock denominators are constructed in the private frame. The external adjoint
 acts on differentiable **averaged amplitudes**, which by default stay in the
-shared private Boys frame for projected fragment energy and smooth triples. The
+shared private DF frame for projected fragment energy and smooth triples. The
 external total-energy-only orbital cotangent filter is not applied. Stable
 physical fragment IDs receive distinct reproducible sampling streams;
 changing MPI ownership does not change the intended fragment seed.
 
-Selecting `cc_solver="stc"` defaults to `localize=True` and
-`shared_local_frame=True`; no extra frame flags are needed. The shared frame
-retains the averaged amplitudes in the private Boys frame and evaluates both
+Selecting `cc_solver="stc"` defaults to `localize=True`, `df_rotations=True`
+and `shared_local_frame=True`; no extra frame flags are needed. The shared frame
+retains the averaged amplitudes in the private DF frame and evaluates both
 the projected CCSD energy and smooth (T) in that same frame, using the rotated
 DF factors, full Fock matrix and physical projector `prjlo @ Q_occ`. There is
 no final amplitude backrotation, including for diagnostics. The original LIS
 MP2 subtraction is unchanged. With `localize=False` the shared frame is the
-incoming LIS frame, without an additional Boys rotation.
+incoming LIS frame, without additional private rotations.
 
-The occupied/virtual rotations are computed once per fragment solve and held
-fixed through its CCSD, triples and saved adjoint evaluation. The rotated
-physical projector remains differentiable; fixing the private rotation does
+The occupied/virtual/auxiliary rotations are computed once per physical LIS
+evaluation and shared across precision pilots and production replicas, CCSD,
+triples and saved adjoint evaluations. Only numerical rotation matrices are
+cached; each replica transforms its live physical tensors and retains its
+own response. Existing physical LIS/DF/SVD preparation still runs per replica.
+The rotated physical projector remains differentiable; fixing the private rotation does
 not freeze domain/LIS, integral or SCF response. No numerical frame is cached
 across fragments or geometries. This is the same fixed-private-gauge response
-convention as the original STC adapter, not an additional Boys response solve.
+convention as the original STC adapter. No separate DF-localization response
+equation or differentiation through its optimizer is needed. The physical
+Boys/domain and retained auxiliary-subspace responses remain active.
 
 Shared-frame triples requires `smooth=True` and supports deterministic and
 stochastic triples, with either `integral_transform="df"` or `"rotate"`.
@@ -1086,7 +1099,8 @@ Finite stochastic (T) samples need not be identical in different frames even
 though the deterministic functional is rotation invariant.
 
 Supported local controls include `target_error` (or `target_error_mEh`), optional `error_tol` (or `error_tol_mEh`), `max_cycle`,
-`average`, `seed`, `localize`, `shared_local_frame`; `diis_space` (`None` disables it, otherwise at
+`average`, `seed`, `localize`, `df_rotations`, `df_rotation_tol`,
+`shared_local_frame`; `diis_space` (`None` disables it, otherwise at
 least two), `diis_shift`, `init_damp`; `gamma`, `batch_size`, `tail_batch_size`,
 `nrun`, `init_nsamples`, `std_tol`, `max_nsamples_var`, `min_nsamples`;
 `sampled_terms`, `share_tables`, `iid_root`, `unroll`, `flat`, `sampler`,

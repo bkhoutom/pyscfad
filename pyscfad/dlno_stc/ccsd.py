@@ -588,7 +588,8 @@ def _build_solver_lis(mf, common, static, fragment_index, matrices, frame, repre
 def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
                     verbose_imp, ccsd_t, triples_controls=None, with_grad=False,
                     vvvv_direct=False, cc_solver='deterministic', stc_cc_controls=None,
-                    frame=None, correlation_auxbasis=None, df_compressor=None):
+                    frame=None, correlation_auxbasis=None, df_compressor=None,
+                    sampling_frame=None):
     """Return MP2-LIS, CCSD and triples; stochastic calls also return diagnostics."""
     _validate_shared_frame_triples(static, ccsd_t, stc_cc_controls)
     representative = group.representative_index
@@ -613,7 +614,9 @@ def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
         options['df_compressor'] = df_compressor
     if cc_solver == 'stc':
         from .stc_ccsd import make_solver
-        options['amplitude_solver'] = make_solver(stc_cc_controls, fragment_index=fragment_index)
+        sampling_options = {} if sampling_frame is None else {'sampling_frame': sampling_frame}
+        options['amplitude_solver'] = make_solver(
+            stc_cc_controls, fragment_index=fragment_index, **sampling_options)
     if static.lis_static.smooth_frames is not None:
         from .smooth import noncanonical_mp2
         from .smooth_triples import make_solver
@@ -756,10 +759,18 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
                            if getattr(static, 'deferred_selection', None) is not None else static)
         _clear_jax_caches('before_correction', matrices, frame_coeff, frag=index+1)
         local_triples = _fragment_triples_controls(triples_controls, index)
+        sampling_frame = None
+        if cc_solver == 'stc':
+            from .stc_ccsd import SamplingFrame
+            # Share only numerical gauge rotations across this LIS's replicas.
+            # Physical factors and their responses remain live in each VJP;
+            # neither another fragment nor another geometry inherits the cache.
+            sampling_frame = SamplingFrame()
         pilot_mf = None
         def evaluate(configuration, need_grad):
             nonlocal pilot_mf
-            solver_options = (dict(cc_solver=cc_solver, stc_cc_controls=configuration)
+            solver_options = (dict(cc_solver=cc_solver, stc_cc_controls=configuration,
+                                   sampling_frame=sampling_frame)
                               if cc_solver == 'stc' else {})
             compressor = None
             if lis_aux_svd_tol:
@@ -1055,9 +1066,11 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
     amplitude solver; ``stc_cc_controls`` contains its sampling/localization
     settings (unsuffixed energy fields: Hartree; explicit ``*_mEh`` aliases:
     millihartree). All other stages retain their independent controls.
-    STC defaults to ``localize=True, shared_local_frame=True``: differentiable
+    STC defaults to ``localize=True, df_rotations=True, shared_local_frame=True``: differentiable
     averaged amplitudes, projected CCSD energy and smooth triples use one fixed
-    private Boys frame with consistently transformed integrals and projector.
+    private joint DF frame with consistently transformed integrals and projector.
+    ``df_rotations=False`` restores Boys-only localization; ``localize=False``
+    keeps the supplied orbital and auxiliary frames.
     Triples then requires a smooth selection. ``shared_local_frame=False``
     restores amplitude backrotation to the original LIS basis. Fragment CC
     diagnostics are separate from triples and baseline uncertainty. The default

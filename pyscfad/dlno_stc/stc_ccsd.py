@@ -2,7 +2,8 @@
 
 Only the private sampling frame is localized. By default the callback keeps
 traced averaged amplitudes, integrals and the physical projector in one shared
-Boys frame for projected CCSD and smooth triples. ``shared_local_frame=False``
+joint occupied/virtual/auxiliary DF frame for projected CCSD and smooth triples.
+``shared_local_frame=False``
 restores amplitude backrotation to the incoming LIS frame. STC's total-energy
 orbital cotangent filter is never used: a projected fragment functional need
 not have that invariance.
@@ -10,6 +11,8 @@ not have that invariance.
 from collections.abc import Mapping
 from functools import cached_property
 import copy
+import contextlib
+import io
 import math
 import numbers
 from types import SimpleNamespace
@@ -22,7 +25,7 @@ from pyscfad import lib
 
 
 _DEFAULTS = dict(
-    localize=True, shared_local_frame=True,
+    localize=True, df_rotations=True, df_rotation_tol=5e-3, shared_local_frame=True,
     target_error=4e-4, error_tol=None, max_cycle=50, average=4,
     seed=0, diis_space=4, diis_shift=4., init_damp=None, gamma=.5,
     batch_size=1 << 20, tail_batch_size=None, nrun=8, init_nsamples=10000,
@@ -40,6 +43,8 @@ _MEH_ALIASES = {name + '_mEh': name for name in (
 _PRECISION_CONTROLS = frozenset((
     'energy_tolerance', 'precision_pilot_replicas',
     'precision_min_replicas', 'precision_max_replicas'))
+_FRAME_CONTROLS = frozenset(('localize', 'df_rotations', 'df_rotation_tol',
+                             'shared_local_frame'))
 
 
 def normalize_controls(controls):
@@ -93,7 +98,7 @@ def normalize_controls(controls):
             raise ValueError(f'{name} must fit in an unsigned 32-bit integer')
         out[name] = int(value)
     for name in {'target_error', 'error_tol', 'grad_target_error', 'diis_shift',
-                 'init_damp', 'gamma', 'energy_tolerance'}:
+                 'init_damp', 'gamma', 'energy_tolerance', 'df_rotation_tol'}:
         value = out[name]
         if value is None and name in {'error_tol', 'grad_target_error', 'diis_shift', 'init_damp', 'energy_tolerance'}:
             continue
@@ -101,12 +106,14 @@ def normalize_controls(controls):
             raise TypeError(f'{name} must be finite and real')
         if name in {'target_error', 'error_tol', 'grad_target_error', 'energy_tolerance'} and value <= 0:
             raise ValueError(f'{name} must be positive (Hartree)')
+        if name == 'df_rotation_tol' and value <= 0:
+            raise ValueError('df_rotation_tol must be positive (dimensionless)')
         if name == 'diis_shift' and value < 0:
             raise ValueError('diis_shift must be nonnegative')
         if name in {'gamma', 'init_damp'} and not 0 <= value <= 1:
             raise ValueError(f'{name} must be between zero and one')
         out[name] = float(value)
-    for name in {'localize', 'shared_local_frame', 'share_tables', 'iid_root', 'block_store_P', 'unroll', 'flat'}:
+    for name in {'localize', 'df_rotations', 'shared_local_frame', 'share_tables', 'iid_root', 'block_store_P', 'unroll', 'flat'}:
         if out[name] is None and name in {'unroll', 'flat'}:
             continue
         if not isinstance(out[name], bool):
@@ -235,18 +242,64 @@ def _working_rotations(mcc, eris, localize):
     return rotation(coeff[:, :no]), rotation(coeff[:, no:])
 
 
-def _make_local_eris(mcc, eris, qo, qv, rccsd):
+def _sampling_rotations(mcc, eris, config):
+    """Optimize a numerical gauge inside the *retained* LIS spaces.
+
+    The upstream public wrapper reads molecular AO DF factors; its low-level
+    DFAll entry point instead accepts exactly the compressed LIS Lov we need.
+    Only the gauge is stopped, never the physical tensor transformed by it.
+    """
+    qo, qv = _working_rotations(mcc, eris, config['localize'])
+    qa = jnp.eye(eris.Lov.shape[0], dtype=eris.Lov.dtype)
+    if config['localize'] and config['df_rotations']:
+        from stc_cc_jax.lo import _df_rotations
+        from pyscfad.lib._threading import dense_blas_threads
+        lov = numpy.asarray(jax.lax.stop_gradient(eris.Lov))
+        if not numpy.isfinite(lov).all():
+            raise ValueError('DF rotations require finite LIS factors')
+        # DFAll's relative-cost stopping rule is undefined for zero factors.
+        if numpy.any(lov):
+            rov = numpy.einsum('xia,iI,aA->IAx', lov, numpy.asarray(qo),
+                               numpy.asarray(qv), optimize=True)
+            with dense_blas_threads(), contextlib.redirect_stdout(io.StringIO()):
+                uo, uv, ua = _df_rotations(rov, config['df_rotation_tol'])
+            qo, qv, qa = qo @ jnp.asarray(uo), qv @ jnp.asarray(uv), jnp.asarray(ua)
+    return tuple(jax.lax.stop_gradient(rotation) for rotation in (qo, qv, qa))
+
+
+class SamplingFrame:
+    """Numerical rotations owned by one physical LIS evaluation.
+
+    The driver shares this object only across pilots/replicas with identical
+    preparation inputs, and discards it before the next fragment or geometry.
+    Never save live ERIs or a response tape here: each replica transforms its
+    own differentiable inputs. The upstream amplitude VJP reuses those ERIs.
+    """
+    def __init__(self):
+        self._rotations = None
+
+    def rotations(self, mcc, eris, config):
+        if self._rotations is None:
+            self._rotations = _sampling_rotations(mcc, eris, config)
+        return self._rotations
+
+
+def _make_local_eris(mcc, eris, qo, qv, rccsd, *, qa=None):
     """Transform the prepared domain-aware DF factors; never rebuild AO ERIs."""
     from pyscfad.scipy.linalg import eigh
     no, nv = eris.Lov.shape[1:]
     local = rccsd._LocalDFERIs()
     local.mol, local.nocc, local.nvir = mcc.mol, no, nv
     local.naux = eris.Lov.shape[0]
-    local.Uaux = None
+    local.Uaux = None  # already applied below; do not rotate twice upstream
     full_vv = lib.unpack_tril(eris.Lvv) if eris.Lvv.ndim == 2 else eris.Lvv
     local.Loo = jnp.einsum('xij,iI,jJ->xIJ', eris.Loo, qo, qo)
     local.Lov = jnp.einsum('xia,iI,aA->xIA', eris.Lov, qo, qv)
     local.Lvv = jnp.einsum('xab,aA,bB->xAB', full_vv, qv, qv)
+    if qa is not None:
+        local.Loo = jnp.einsum('xY,xIJ->YIJ', qa, local.Loo)
+        local.Lov = jnp.einsum('xY,xIA->YIA', qa, local.Lov)
+        local.Lvv = jnp.einsum('xY,xAB->YAB', qa, local.Lvv)
     q = jnp.zeros((no + nv, no + nv)).at[:no, :no].set(qo).at[no:, no:].set(qv)
     local.mo_coeff = jax.lax.stop_gradient(jnp.asarray(eris.mo_coeff) @ q)
     local.fock = q.T @ eris.fock @ q
@@ -291,7 +344,7 @@ class _SharedFrameERIs:
             self.nocc, self.nvir, -1)
 
 
-def make_solver(controls, fragment_index=0):
+def make_solver(controls, fragment_index=0, *, sampling_frame=None):
     """Create an independent fragment callback; optional STC imports are lazy."""
     config = normalize_controls(controls)
     if isinstance(fragment_index, bool) or not isinstance(fragment_index, numbers.Integral) or fragment_index < 0:
@@ -309,10 +362,14 @@ def make_solver(controls, fragment_index=0):
             raise ImportError('STC CCSD requires the optional stc_cc_jax package and its dependencies; '
                               'install stc-cc-jax in the active environment before selecting cc_solver="stc"') from exc
         from pyscfad.lno.ccsd import ccsd_fragment_energy, FragmentAmplitudeResult
-        qo, qv = _working_rotations(mcc, eris, config['localize'])
-        local = _make_local_eris(mcc, eris, qo, qv, rccsd)
+        # A directly used callback is safe to call with new physical inputs;
+        # only the replica driver supplies an evaluation-scoped shared frame.
+        frame = SamplingFrame() if sampling_frame is None else sampling_frame
+        qo, qv, qa = frame.rotations(mcc, eris, config)
+        use_aux = config['localize'] and config['df_rotations']
+        local = _make_local_eris(mcc, eris, qo, qv, rccsd, qa=qa if use_aux else None)
         stc_config = {k: v for k, v in config.items()
-                      if k not in {'localize', 'shared_local_frame'} and k not in _PRECISION_CONTROLS}
+                      if k not in _FRAME_CONTROLS and k not in _PRECISION_CONTROLS}
         stc_config.update(seed=seed, grad_seed=grad_seed, semicanonical=True,
                           mo_response_no_oo_vv_rotation=False)
         cc = rccsd.RCCSD(mcc._scf, frozen=mcc.frozen, mo_coeff=mcc.mo_coeff, **stc_config)
@@ -354,7 +411,8 @@ def make_solver(controls, fragment_index=0):
             backend='stc', fragment_index=int(fragment_index), seed=seed,
             grad_seed=seed if grad_seed is None else grad_seed,
             localize=config['localize'],
-            localization_method='Boys' if config['localize'] else 'identity',
+            localization_method=('Boys+DF' if use_aux else 'Boys') if config['localize'] else 'identity',
+            auxiliary_localized=use_aux, sampling_naux=int(local.naux),
             shared_local_frame=shared,
             energy_frame='stc_local' if shared else 'lis',
             controls=copy.deepcopy(config), converged=bool(result[0]),

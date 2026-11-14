@@ -3,6 +3,27 @@
 See the [root-owned DF/SCF optimization guide](../../README_SERIAL_DF_SCF.md) for
 shared-buffer activation, preconditioning, thread settings and staged OOC use.
 
+Serial MP2 returns unused host heap pages after selection/initialization, after
+each completed domain, and before SCF response. It first synchronizes the live
+results and collects dead objects. On Linux with glibc it then calls
+`malloc_trim(0)`; platforms/allocators without this function skip trimming.
+Live arrays, saved pullbacks and compiled JAX kernels are retained. Set
+`PYSCFAD_STC_TRIM_MEMORY=0` to disable trimming for performance comparisons;
+returning pages may add allocation/page-fault overhead in subsequent stages.
+System MP2 also trims after its input pullback and before SCF response.
+
+JAX compilation-cache clearing is **off by default**. For serial domain MP2,
+`PYSCFAD_STC_CLEAR_JAX_CACHES=1` additionally clears those caches once after
+selection/initialization, before domain preparation. It does not clear them
+between domains. Later uses of cleared kernels must recompile, so this option
+trades runtime for lower residency. CCSD keeps its existing opt-in cache-clearing
+boundaries and now uses the same heap-trimming helper there. Persistent on-disk
+compilation-cache files are not deleted.
+
+Integral workspace continues to use the existing automatic budget based on
+`max_memory`, current residency and the DF workspace allowance. Heap cleanup
+does not introduce an additional integral-workspace cap.
+
 STC owns Boys selection, exact-frame grouping, weak-pair correction, restart
 serialization, three-tensor preparation and molecular response. Production
 modules and examples do not import native DLNO. Saved orbital records and

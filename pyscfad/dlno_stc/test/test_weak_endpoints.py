@@ -453,7 +453,10 @@ def test_domain_collects_once_after_complete_weak_response(monkeypatch, with_gra
         return value
 
     def collect():
-        collections.append(screen_calls.copy())
+        # Initialization may collect before any weak endpoint exists. Count
+        # collections during endpoint work to reject per-pair/tape retention.
+        if screen_calls:
+            collections.append(screen_calls.copy())
         assert all(value() is None for value in compact_values)
         assert all(value() is None for value in orbital_pullbacks)
 

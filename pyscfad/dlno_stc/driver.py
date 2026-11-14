@@ -32,6 +32,7 @@ from ._pairs import weak_pair_energy_and_grad, weak_pair_energy_sum, weak_pair_i
 
 from . import backend
 from ._memory import memory_calculation
+from ._cleanup import release_memory as _release_memory
 from ._workflow import check_system_memory, check_domain_memory, allocate_domain_controls
 from .adjoint import apply_full_pullback, apply_selected_pullback
 from .controls import DEFAULT_ENERGY_TOLERANCE, default_laplace_grid
@@ -330,7 +331,8 @@ def _finish(state, *, with_grad, include_hf,
         # Consume the common frame before allocating the SCF-response workspace.
         del common_pullback, common_bar
         state.pop("common", None)
-        gc.collect()
+        _release_memory('before_scf_response', energy, mf_bar,
+                        state.get('_scf_data_bar'))
         return _finish_response(state, energy, mf_bar, include_hf=include_hf)
 
 
@@ -420,6 +422,11 @@ def _run_domain(initializer, static, controls, comm, *, with_grad, include_hf=Fa
     rank = 0 if comm is None else comm.Get_rank()
     with resource_profile.section('stc.domain.initialize'):
         state = _root_call(comm, rank, initializer, "initial preparation")
+    # Selection endpoint tapes have been consumed; common/SCF VJPs stay live.
+    # Compilation-cache clearing is opt-in here, never between domain groups.
+    _root_call(comm, rank, lambda: _release_memory(
+        'after_selection', state['common'], state['mf_bar'], state['common_bar'],
+        state['energy'], clear_caches=True), "selection memory cleanup")
     if rank == 0 and static is None:
         static = state["static"]
     groups = _root_call(comm, rank,
@@ -463,7 +470,9 @@ def _run_domain(initializer, static, controls, comm, *, with_grad, include_hf=Fa
             with resource_profile.section('stc.domain.input_pullback'):
                 _root_call(comm, rank, apply_group, f"group {fragment_id} pullback")
         del prepared, result, apply_group
-        gc.collect()
+        _root_call(comm, rank, lambda: _release_memory(
+            'after_domain', state['energy'], state['mf_bar'], state['common_bar'],
+            fragment_id=fragment_id), f"group {fragment_id} memory cleanup")
     if pairs:
         def apply_weak():
             if with_grad:
@@ -771,7 +780,8 @@ def _run_system(initializer, controls, comm, *, with_grad, include_hf=False):
             with resource_profile.section('stc.system.input_pullback'):
                 _root_call(comm, rank, apply_system, "system pullback")
         del prepared, result, apply_system
-        gc.collect()
+        _root_call(comm, rank, lambda: _release_memory(
+            'after_system', state['energy'], state['mf_bar']), "system memory cleanup")
     with resource_profile.section('stc.system.response'):
         return _root_call(comm, rank, lambda: _finish(state, with_grad=with_grad,
                                                     include_hf=include_hf), "final response")

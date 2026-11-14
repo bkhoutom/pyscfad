@@ -17,6 +17,7 @@ from pyscfad.lno.ccsd import _impurity_solve_core
 from . import backend, driver, _stc_precision
 from ._profile import response as profile_response
 from ._memory import memory_calculation
+from ._cleanup import release_memory as _release_memory
 from ._selection import (DomainSelections, _physical_groups, _strong_preparation_key,
                          build_domain_groups)
 from ._workflow import allocate_domain_controls
@@ -41,10 +42,8 @@ def _clear_jax_caches(stage, *live_results, **metadata):
     if os.environ.get('PYSCFAD_STC_CLEAR_JAX_CACHES', '0').lower() not in (
             '1', 'true', 'yes', 'on'):
         return
-    with resource_profile.section('stc.cc.clear_jax_caches', stage=stage, **metadata):
-        jax.block_until_ready(live_results)
-        jax.clear_caches()
-        gc.collect()
+    _release_memory(stage, *live_results, clear_caches=True,
+                    profile_prefix='stc.cc', **metadata)
 
 
 @dataclass(frozen=True)

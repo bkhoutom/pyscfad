@@ -7,6 +7,12 @@ no inverse exponential is formed. Matrix-function derivatives retain the full
 Fock and physical-projector response, including degenerate spectra.
 The DF path constructs raw integral blocks once per fragment; rotate reuses
 cached CCSD integral blocks. Both use the same stable native numerator.
+Deterministic evaluation caches the undressed, spin-adapted selected numerator
+across the quadrature. Full external dressing and cyclic-only pair contractions
+are on the other side; the cached numerator is differentiated once after all
+points. Occupied-block batching bounds the cache without truncating excitations.
+Semicanonical virtual factors use scalar axis scaling with a full matrix-function
+Fock pullback. Genuinely noncanonical virtual blocks retain dense transforms.
 """
 import importlib
 import os
@@ -103,12 +109,159 @@ def _dressing_cache_bytes(max_memory):
     return int(available)
 
 
+def _run_deterministic(inputs, nodes, weights, *, with_grad, max_memory,
+                       rotate, trace_exponent):
+    """Reuse S B W at t=0; cyclic-only right contractions carry all dressing.
+
+    For the fully pair-symmetric left numerator K, exchanging the two
+    unselected occupied/virtual pairs identifies the two cosets of S3:
+        sum K * B(Y_q) = 2 sum K * C3(Y_q).
+    The sum here includes both ordered unselected occupied indices. The
+    native cache stores one triangular representative and visits both
+    orientations. This identity never moves the physical fragment operator.
+    """
+    native = importlib.import_module('pyscfad.dlno_stc._stc_mp2')
+    started = time.perf_counter()
+    inputs = tuple(np.asarray(x, dtype=np.float64) for x in inputs)
+    no, nv = inputs[0].shape
+    ns = inputs[8].shape[1]
+    total_blocks = ns * no * (no + 1) // 2
+    block_bytes = nv**3 * 8 * (2 if with_grad else 1)
+    # Reserve half the current headroom for numerator values/cotangents.
+    # At least one indivisible virtual cube is required for this backend.
+    budget = int(max(0., float(max_memory) - current_memory()[0]) * .5e6)
+    cap = os.environ.get('PYSCFAD_TRIPLES_NUMERATOR_CACHE_MB')
+    if cap is not None:
+        cap = float(cap)
+        if not np.isfinite(cap) or cap < 0:
+            raise ValueError('PYSCFAD_TRIPLES_NUMERATOR_CACHE_MB must be finite and nonnegative')
+        budget = min(budget, int(cap * 1024**2))
+    batch_size = min(total_blocks, max(1, budget // block_bytes))
+    phase = time.perf_counter()
+    dresser = native.StableTriplesDressing(inputs, full_external=True)
+    prepare_seconds = time.perf_counter() - phase
+    production_seconds = pullback_seconds = native_seconds = 0.
+    point_energies = np.zeros(len(nodes))
+    bars = tuple(np.zeros_like(x) for x in inputs) if with_grad else None
+    memory = dict(resident_tensor_bytes=0, proposal_bytes=0, reverse_buffer_bytes=0,
+                  deterministic_workspace_bytes=0)
+    setup_threads = sampling_threads = evaluated_blocks = 0
+    numerator_cache_peak = dressing_cache_peak = batches = 0
+
+    def account(result):
+        nonlocal native_seconds, setup_threads, sampling_threads, evaluated_blocks
+        native_seconds += result.get('sampling_seconds', 0.)
+        setup_threads = max(setup_threads, result.get('setup_threads', 0))
+        sampling_threads = max(sampling_threads, result.get('sampling_threads', 0))
+        evaluated_blocks += result.get('deterministic_blocks', 0)
+        for name in memory:
+            memory[name] = max(memory[name], result.get(name, 0))
+
+    def reverse(node, result):
+        nonlocal pullback_seconds, dressing_cache_peak
+        phase = time.perf_counter()
+        transformed = result.pop('cotangents')
+        contribution = dresser.pullback(float(node), transformed,
+            cache_limit_bytes=_dressing_cache_bytes(max_memory))
+        for a, b in zip(bars, contribution):
+            np.add(a, b, out=a)
+        dressing_cache_peak = max(dressing_cache_peak, dresser.peak_cache_bytes)
+        pullback_seconds += time.perf_counter() - phase
+
+    for first in range(0, total_blocks, batch_size):
+        batches += 1
+        phase = time.perf_counter()
+        values = dresser.prepare(0.)
+        prepare_seconds += time.perf_counter() - phase
+        phase = time.perf_counter()
+        cache = native.TriplesQuadratureCache(values, first=first,
+            count=min(batch_size, total_blocks-first), with_grad=with_grad)
+        del values
+        build_seconds = time.perf_counter() - phase
+        production_seconds += build_seconds
+        native_seconds += build_seconds
+        evaluated_blocks += min(batch_size, total_blocks-first)
+        numerator_cache_peak = max(numerator_cache_peak, cache.cache_bytes)
+        for i, (node, weight) in enumerate(zip(nodes, weights)):
+            phase = time.perf_counter()
+            values = dresser.prepare(float(node), cache_limit_bytes=(
+                _dressing_cache_bytes(max_memory) if with_grad else 0))
+            dressing_cache_peak = max(dressing_cache_peak, dresser.cache_bytes)
+            prepare_seconds += time.perf_counter() - phase
+            phase = time.perf_counter()
+            result = cache.step(values, float(weight))
+            del values
+            production_seconds += time.perf_counter() - phase
+            point_energies[i] += result['energy']
+            account(result)
+            if with_grad:
+                reverse(node, result)
+        if with_grad:
+            phase = time.perf_counter()
+            values = dresser.prepare(0., cache_limit_bytes=_dressing_cache_bytes(max_memory))
+            prepare_seconds += time.perf_counter() - phase
+            phase = time.perf_counter()
+            result = cache.finish(values)
+            del values
+            production_seconds += time.perf_counter() - phase
+            account(result)
+            reverse(0., result)
+        del cache
+
+    elapsed = time.perf_counter() - started
+    count = len(nodes)
+    zeros = np.zeros(count)
+    ints = np.zeros(count, dtype=np.int64)
+    fractions = point_variance_fractions(inputs[6], inputs[7], nodes, weights,
+                                         exponent=trace_exponent)
+    diagnostics = dict(standard_error=0., samples=0, pilot_samples=0,
+        laplace_points=count, sampling_seconds=native_seconds,
+        smooth_triples_seconds=elapsed, laplace_prepare_seconds=prepare_seconds,
+        pilot_seconds=0., pilot_reverse_seconds=0., production_seconds=production_seconds,
+        laplace_pullback_seconds=pullback_seconds,
+        overhead_seconds=elapsed-prepare_seconds-production_seconds-pullback_seconds,
+        probability_setup_seconds=0., amplitude_packing_seconds=0., vjp_reverse_seconds=0.,
+        projection_setup_seconds=0., vjp_grouping_seconds=0., vjp_accumulation_seconds=0.,
+        vjp_finalize_seconds=0., packing_blas_threads=0, sampling_blas_threads=0,
+        finalize_blas_threads=0, **memory, setup_threads=setup_threads,
+        sampling_threads=sampling_threads, target_standard_error=0.,
+        trace_exponent=trace_exponent, adaptive=False, point_preparation_reused=False,
+        asymmetric_dressing=True, stable_dressing=True, native_dressing=True,
+        deterministic_blocks=evaluated_blocks, quadrature_reused_blocks=total_blocks,
+        single_pair_symmetrization=True, one_sided_dressing=True,
+        numerator_cache_batches=batches, numerator_cache_peak_bytes=numerator_cache_peak,
+        diagonal_virtual_points=sum(dresser.virtual_diagonal_at(float(t)) for t in nodes),
+        rotated_integrals=rotate, dressing_cache_peak_bytes=dressing_cache_peak,
+        dressing_cache_hits=dresser.cache_hits, dressing_cache_rebuilds=dresser.cache_rebuilds,
+        target_met=True, laplace_nodes=np.asarray(nodes), laplace_weights=np.asarray(weights),
+        point_variance_fractions=fractions, point_variance_targets=zeros,
+        point_pilot_samples=ints, point_pilot_standard_errors=zeros,
+        initial_production_samples=0, adaptive_samples=0,
+        point_initial_production_samples=ints, point_initial_weighted_standard_errors=zeros,
+        point_adaptive_samples=ints, point_production_samples=ints,
+        point_weighted_energies=point_energies, point_weighted_variances=zeros)
+    resource_profile.checkpoint('stc.triples.native_timings',
+        timings={k: v for k, v in diagnostics.items() if k.endswith('_seconds')},
+        with_grad=with_grad)
+    return (jnp.asarray(point_energies.sum()),
+            jax.tree_util.tree_map(jnp.asarray, diagnostics)), bars
+
+
 def make_solver(controls, grid, *, with_grad):
     nodes, weights, _ = grid
     removed = {'dressing', 'dressing_backend', 'adaptive'} & controls.keys()
     if removed:
         raise ValueError('removed triples options: ' + ', '.join(sorted(removed)))
     stochastic = controls['mode'] == 'stochastic'
+    if not stochastic and not getattr(importlib.import_module(
+            'pyscfad.dlno_stc._stc_mp2'), 'TRIPLES_DETERMINISTIC_BLOCKS', False):
+        raise RuntimeError('Rebuild the STC native extension for deterministic block Laplace triples')
+    if not getattr(importlib.import_module('pyscfad.dlno_stc._stc_mp2'),
+                   'TRIPLES_DIAGONAL_VIRTUAL_DRESSING', False):
+        raise RuntimeError('Rebuild the STC native extension for diagonal virtual Laplace dressing')
+    if not stochastic and not getattr(importlib.import_module(
+            'pyscfad.dlno_stc._stc_mp2'), 'TRIPLES_QUADRATURE_REUSE', False):
+        raise RuntimeError('Rebuild the STC native extension for quadrature-reused Laplace triples')
     rotate = _triples_integral_transform(controls) == 'rotate'
     native_options = {}
     trace_exponent = _finite_control('trace_exponent',
@@ -120,6 +273,9 @@ def make_solver(controls, grid, *, with_grad):
     max_memory = 0.
 
     def run(inputs):
+        if not stochastic:
+            return _run_deterministic(inputs, nodes, weights, with_grad=with_grad,
+                max_memory=max_memory, rotate=rotate, trace_exponent=trace_exponent)
         started = time.perf_counter()
         count = len(nodes)
         pilot_count = controls.get('pilot_samples', 10000)
@@ -132,6 +288,7 @@ def make_solver(controls, grid, *, with_grad):
         allocation = np.zeros(count, dtype=np.int64)
         phase = time.perf_counter()
         dresser = _make_dresser(inputs, integral_inputs=rotate)
+        diagonal_virtual_points = sum(dresser.virtual_diagonal_at(float(node)) for node in nodes)
         prepare = dresser.prepare
         prepare_seconds, pilot_seconds = time.perf_counter() - phase, 0.
         pilot_reverse_seconds = 0.
@@ -169,7 +326,9 @@ def make_solver(controls, grid, *, with_grad):
             'amplitude_packing_seconds', 'vjp_reverse_seconds', 'projection_setup_seconds',
             'vjp_grouping_seconds', 'vjp_accumulation_seconds', 'vjp_finalize_seconds')}
         native_memory = {name: 0 for name in ('resident_tensor_bytes', 'proposal_bytes',
-                                             'reverse_buffer_bytes')}
+                                             'reverse_buffer_bytes',
+                                             'deterministic_workspace_bytes')}
+        deterministic_blocks = 0
         native_blas_threads = {name: 0 for name in ('packing_blas_threads',
                               'sampling_blas_threads', 'finalize_blas_threads')}
         setup_threads, sampling_threads = 0, 0
@@ -228,6 +387,7 @@ def make_solver(controls, grid, *, with_grad):
             point_samples.append(int(result['samples']))
             initial_errors.append(abs(weight) * result.get('pilot_standard_error', result['standard_error']))
             samples += int(result['samples'])
+            deterministic_blocks += int(result.get('deterministic_blocks', 0))
             native_seconds += result.get('sampling_seconds', 0.)
             for name in native_timings:
                 native_timings[name] += result.get(name, 0.)
@@ -272,6 +432,8 @@ def make_solver(controls, grid, *, with_grad):
             asymmetric_dressing=True,
             stable_dressing=True,
             native_dressing=True,
+            deterministic_blocks=deterministic_blocks,
+            diagonal_virtual_points=diagonal_virtual_points,
             rotated_integrals=rotate,
             dressing_cache_peak_bytes=dressing_cache_peak_bytes,
             dressing_cache_hits=dresser.cache_hits,

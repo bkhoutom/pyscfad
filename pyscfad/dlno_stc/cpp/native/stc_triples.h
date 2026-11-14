@@ -37,6 +37,8 @@ public:
         double vjp_grouping_seconds;
         double vjp_accumulation_seconds;
         double vjp_finalize_seconds;
+        size_t deterministic_blocks;
+        size_t deterministic_workspace_bytes;
     };
     // Discarded pilot with its own RNG stream; shares tensors and proposal
     // tables with production. nsamples is the minimum production count.
@@ -64,6 +66,18 @@ public:
         size_t no, nv, ns;
         std::vector<arma::vec> tensors;
     };
+
+    // Bounded batch of spin-adapted, undressed selected numerator blocks.
+    struct quadrature_cache {
+        size_t no=0,nv=0,ns=0,first=0;
+        bool gradient=false,finished=false;
+        std::vector<arma::vec> values,bars;
+    };
+    static triples_result quadrature_build(const triples_prepared&,quadrature_cache&,
+        size_t first,size_t count,bool gradient);
+    static triples_result quadrature_step(const triples_prepared&,quadrature_cache&,
+        double weight,triples_vjp*);
+    static triples_result quadrature_finish(const triples_prepared&,quadrature_cache&,triples_vjp*);
 
     // Denominator-free Laplace numerator, contracted directly over a small
     // selected space: sum_s (A^T L)_s (R^T Z)_s, with the physical -1/3 factor.

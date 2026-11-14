@@ -56,17 +56,136 @@ def evaluate(inputs, node, cache=0, samples=0):
     return result, bars
 
 
-@pytest.mark.parametrize('selected', [2, 3])
+@pytest.mark.parametrize('selected', [1, 2, 3])
 @pytest.mark.parametrize('node', [0., .37, 3.17])
 @pytest.mark.parametrize('spectrum', ['ordinary', 'degenerate', 'wide'])
 def test_energy_and_all_responses_against_six_index_reference(selected, node, spectrum):
     inputs = fixture(selected, wide=spectrum=='wide', degenerate=spectrum=='degenerate')
     expected, expected_bars = jax.value_and_grad(reference)(tuple(map(jnp.asarray, inputs)), node)
     result, bars = evaluate(inputs, node, cache=2**24)
+    assert result['deterministic_blocks'] == selected * (3 * 4 // 2)
+    assert result['samples'] == 0 and result['standard_error'] == 0.
+    assert result['proposal_bytes'] == 0 and result['vjp_grouping_seconds'] == 0.
     np.testing.assert_allclose(result['energy'], expected, rtol=3e-10, atol=3e-13)
     for i, (got, want) in enumerate(zip(bars, expected_bars)):
         assert np.isfinite(got).all()
         np.testing.assert_allclose(got, want, rtol=2e-9, atol=2e-12, err_msg=f'input {i}')
+
+
+def test_deterministic_prepared_independent_tensor_directions():
+    """Check every prepared input, without relying on dressing identities."""
+    rng = np.random.default_rng(592)
+    engine = native.StableTriplesDressing(fixture(selected=1))
+    values = tuple(rng.normal(scale=.1, size=x.shape) for x in engine.prepare(.37))
+    result = native.triples_prepared_energy_vjp(values, nsamples=0)
+    energy = native.triples_prepared_energy(values, nsamples=0, seed=2026)
+    assert result['energy'] == energy['energy']
+    assert result['deterministic_workspace_bytes'] > 0
+    assert energy['reverse_buffer_bytes'] == 0
+    step = 1e-5
+    for index, value in enumerate(values):
+        direction = rng.normal(size=value.shape)
+        plus, minus = list(values), list(values)
+        plus[index] = value + step*direction
+        minus[index] = value - step*direction
+        fd = (native.triples_prepared_energy(tuple(plus), nsamples=0)['energy']
+              - native.triples_prepared_energy(tuple(minus), nsamples=0)['energy'])/(2*step)
+        np.testing.assert_allclose(np.sum(result['cotangents'][index]*direction), fd,
+                                   rtol=2e-8, atol=2e-10, err_msg=f'prepared input {index}')
+
+
+def test_selected_occupied_partitions_add_to_full_energy_and_response():
+    inputs = fixture(selected=3)
+    full, full_bars = evaluate(inputs, .37)
+    parts = []
+    for columns in (slice(0, 1), slice(1, 3)):
+        partial = inputs[:-1] + (inputs[-1][:, columns],)
+        parts.append(evaluate(partial, .37))
+    np.testing.assert_allclose(sum(x[0]['energy'] for x in parts), full['energy'],
+                               rtol=2e-12, atol=2e-14)
+    for i in range(8):
+        np.testing.assert_allclose(sum(x[1][i] for x in parts), full_bars[i],
+                                   rtol=2e-12, atol=2e-14)
+    np.testing.assert_allclose(np.concatenate([x[1][8] for x in parts], axis=1),
+                               full_bars[8], rtol=2e-12, atol=2e-14)
+
+
+def test_smooth_deterministic_requires_rebuilt_extension(monkeypatch):
+    from pyscfad.dlno_stc.smooth_triples import make_solver
+    monkeypatch.delattr(native, 'TRIPLES_DETERMINISTIC_BLOCKS')
+    with pytest.raises(RuntimeError, match='Rebuild the STC native extension'):
+        make_solver({'mode': 'deterministic'}, ([.3], [1.], {}), with_grad=False)
+
+
+def test_smooth_requires_diagonal_virtual_extension(monkeypatch):
+    from pyscfad.dlno_stc.smooth_triples import make_solver
+    monkeypatch.delattr(native, 'TRIPLES_DIAGONAL_VIRTUAL_DRESSING')
+    with pytest.raises(RuntimeError, match='Rebuild the STC native extension'):
+        make_solver({'mode': 'deterministic'}, ([.3], [1.], {}), with_grad=False)
+
+
+@pytest.mark.parametrize('spectrum', ['ordinary', 'degenerate', 'wide'])
+@pytest.mark.parametrize('node', [0., .37, 3.17])
+@pytest.mark.parametrize('cache', [0, 2**24])
+def test_diagonal_virtual_energy_and_full_response(spectrum, node, cache):
+    inputs = list(fixture(selected=2))
+    # Deliberately unsorted: scalar factors must stay in the tensor's basis.
+    values = dict(ordinary=[1.1, .3, 1.6, .7], degenerate=[.8]*4,
+                  wide=[5., .23, 85., 1.2])[spectrum]
+    inputs[7] = np.diag(values)
+    engine = native.StableTriplesDressing(tuple(inputs))
+    assert engine.virtual_diagonal_at(node)
+    expected, expected_bars = jax.value_and_grad(reference)(tuple(map(jnp.asarray, inputs)), node)
+    result = native.triples_prepared_energy_vjp(
+        engine.prepare(node, cache_limit_bytes=cache), nsamples=0)
+    bars = engine.pullback(node, result['cotangents'])
+    np.testing.assert_allclose(result['energy'], expected, rtol=3e-10, atol=3e-13)
+    for i, (got, want) in enumerate(zip(bars, expected_bars)):
+        np.testing.assert_allclose(got, want, rtol=2e-9, atol=2e-12, err_msg=f'input {i}')
+    if node:
+        # A diagonal primal must not discard off-diagonal Fock derivatives.
+        offdiag = bars[7] - np.diag(np.diag(bars[7]))
+        assert np.linalg.norm(offdiag) > 1e-12
+
+
+@pytest.mark.parametrize('degenerate', [False, True])
+def test_diagonal_virtual_fock_finite_difference_crosses_dense_branch(degenerate):
+    inputs = list(fixture(selected=1))
+    inputs[7] = np.diag([.8]*4 if degenerate else [.3, .7, 1.1, 1.6])
+    node = .37
+    _, bars = evaluate(tuple(inputs), node)
+    direction = np.zeros((4, 4)); direction[0, 1] = direction[1, 0] = 1.
+    step = 1e-5
+    energies = []
+    for sign in (-1, 1):
+        displaced = list(inputs)
+        displaced[7] = inputs[7] + sign*step*direction
+        engine = native.StableTriplesDressing(tuple(displaced))
+        assert not engine.virtual_diagonal_at(node)
+        energies.append(native.triples_prepared_energy(engine.prepare(node), nsamples=0)['energy'])
+    np.testing.assert_allclose(np.sum(bars[7]*direction), (energies[1]-energies[0])/(2*step),
+                               rtol=2e-7, atol=1e-11)
+
+
+def test_roundoff_virtual_residual_is_bounded_per_node():
+    inputs = list(fixture(selected=2))
+    inputs[7] = np.diag([.3, .7, 1.1, 1.6])
+    inputs[7][0, 1] = inputs[7][1, 0] = 1e-14
+    engine = native.StableTriplesDressing(tuple(inputs))
+    assert engine.virtual_diagonal_at(.37)
+    assert not engine.virtual_diagonal_at(3.17)
+    expected, expected_bars = jax.value_and_grad(reference)(tuple(map(jnp.asarray, inputs)), .37)
+    actual, bars = evaluate(tuple(inputs), .37, cache=2**24)
+    np.testing.assert_allclose(actual['energy'], expected, rtol=3e-12, atol=3e-14)
+    for got, want in zip(bars, expected_bars):
+        np.testing.assert_allclose(got, want, rtol=3e-11, atol=3e-13)
+    # Basis choice must not depend on an arbitrary common energy shift.
+    shifted = list(inputs)
+    shifted[6] = inputs[6] + 1000*np.eye(3)
+    shifted[7] = inputs[7] + 1000*np.eye(4)
+    shifted_engine = native.StableTriplesDressing(tuple(shifted))
+    for node in (.37, 3.17):
+        assert shifted_engine.virtual_diagonal_at(node) == engine.virtual_diagonal_at(node)
 
 
 def test_broad_spectrum_off_diagonal_fock_finite_differences_and_cache():
@@ -132,3 +251,29 @@ def test_stochastic_energy_and_fock_response_against_exact():
     se = draws.std(axis=0, ddof=1)/np.sqrt(len(draws))
     assert np.all(np.abs(draws.mean(axis=0)-expected) < 6*se + 1e-13)
     assert abs(draws[:,0].mean()-expected[0]) < 6*np.linalg.norm(errors)/len(errors)
+
+
+def test_parallel_deterministic_matches_serial_for_independent_inputs():
+    """Slab accumulation must preserve every independently varied cotangent."""
+    import ctypes
+    runtime = ctypes.CDLL(native.__file__)
+    get_threads = runtime.omp_get_max_threads
+    get_threads.restype = ctypes.c_int
+    set_threads = runtime.omp_set_num_threads
+    set_threads.argtypes = [ctypes.c_int]
+    original = get_threads()
+    rng = np.random.default_rng(809)
+    engine = native.StableTriplesDressing(fixture(selected=2))
+    values = tuple(rng.normal(scale=.1, size=x.shape) for x in engine.prepare(.37))
+    try:
+        set_threads(1)
+        serial = native.triples_prepared_energy_vjp(values, nsamples=0)
+        set_threads(4)
+        for _ in range(3):
+            parallel = native.triples_prepared_energy_vjp(values, nsamples=0)
+            assert parallel['energy'] == serial['energy']
+            for got, want in zip(parallel['cotangents'], serial['cotangents']):
+                np.testing.assert_allclose(got, want, rtol=2e-12, atol=2e-14)
+        assert 1 <= parallel['sampling_threads'] <= 4
+    finally:
+        set_threads(original)

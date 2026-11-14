@@ -7,6 +7,7 @@
 #include <omp.h>
 #include <cstring>
 #include <memory>
+#include <limits>
 #include <cmath>
 #include <dlfcn.h>
 
@@ -310,7 +311,9 @@ public:
 } // namespace
 void bind_triples_dressing(py::module_& module) {
     py::class_<StableDressing>(module,"StableTriplesDressing")
-        .def(py::init<py::tuple>())
+        .def(py::init<py::tuple,bool>(),py::arg("inputs"),py::kw_only(),py::arg("full_external")=false)
+        .def("virtual_diagonal_at",&StableDressing::virtual_diagonal_at,py::arg("node"),
+             "Whether this node uses scalar virtual dressing within a roundoff-sized primal error bound.")
         .def("prepare",&StableDressing::prepare,py::arg("node"),py::arg("cache_limit_bytes")=0)
         .def("pullback",&StableDressing::pullback,py::arg("node"),py::arg("cotangents"),py::arg("cache_limit_bytes")=0)
         .def("clear_cache",&StableDressing::clear_cache)

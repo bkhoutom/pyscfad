@@ -136,7 +136,8 @@ def test_native_integral_input_contract(name, invalid):
 
 @pytest.mark.parametrize('mode', ['deterministic', 'fixed', 'adaptive'])
 @pytest.mark.parametrize('whole', [False, True])
-def test_solver_energy_and_full_response_match_factor_path(mode, whole, monkeypatch):
+@pytest.mark.parametrize('canonical_virtual', [False, True])
+def test_solver_energy_and_full_response_match_factor_path(mode, whole, canonical_virtual, monkeypatch):
     native_calls = []
     native = smooth_triples._native
 
@@ -150,6 +151,8 @@ def test_solver_energy_and_full_response_match_factor_path(mode, whole, monkeypa
     no, nv = x['t1'].shape
     foo = rng.normal(scale=.02, size=(no, no)); foo = (foo+foo.T)/2+np.diag(x.pop('eocc'))
     fvv = rng.normal(scale=.02, size=(nv, nv)); fvv = (fvv+fvv.T)/2+np.diag(x.pop('evir'))
+    if canonical_virtual:
+        fvv = np.diag(np.diag(fvv))
     x.update(foo=jnp.asarray(foo), fvv=jnp.asarray(fvv),
              fov=jnp.asarray(rng.normal(scale=.03, size=(no, nv))))
     if whole:
@@ -189,6 +192,8 @@ def test_solver_energy_and_full_response_match_factor_path(mode, whole, monkeypa
         np.testing.assert_allclose(diagnostics['standard_error'], reference_diag['standard_error'],
                                    rtol=2e-11, atol=2e-14)
         assert diagnostics['samples'] == reference_diag['samples']
+        assert diagnostics['diagonal_virtual_points'] == (len(grid[0]) if canonical_virtual else 0)
+        assert reference_diag['diagonal_virtual_points'] == diagnostics['diagonal_virtual_points']
         assert diagnostics['rotated_integrals']
         assert not reference_diag['rotated_integrals']
         assert diagnostics['stable_dressing'] and reference_diag['stable_dressing']

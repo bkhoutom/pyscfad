@@ -102,6 +102,23 @@ differences, including degenerate spectra. It differentiates the simplified
 expression, so canceled internal factors do not introduce unstable derivative
 cancellations.
 
+The smooth LIS anchors are semicanonical when first selected. Transport with
+reused anchors does not recanonicalize them, so later evaluations can have
+non-diagonal Fock blocks. At each node, the dresser uses scalar virtual factors
+`exp(-tau (epsilon_a - mu))` whenever `tau ||Fvv - diag(Fvv)||_inf` is at most
+32 float64 machine epsilons (using the symmetric Fock block). Here `tau=t/2`
+for the shared half-dressing path and `tau=t` for the deterministic quadrature
+reuse path. This bounds the
+absolute operator error in the virtual exponential at roundoff level, without
+an energy-scale-dependent cutoff. Exactly diagonal blocks also avoid the
+virtual eigensolve. Noncanonical nodes use the original dense matrix transform.
+The same scalar scaling is used for tensor cotangents and tape reconstruction.
+The matrix cotangent remains **full**, and its divided-difference pullback
+retains off-diagonal virtual Fock derivatives, including at degeneracies.
+`diagonal_virtual_points` reports how many quadrature nodes used this path.
+The optimization is automatic for both smooth triples modes and requires the
+rebuilt native extension with `TRIPLES_DIAGONAL_VIRTUAL_DRESSING` support.
+
 `StableTriplesDressing(inputs)` takes nine arrays:
 `t1, t2, ovvv, ovoo, ovov, fov, Foo, Fvv, U`. It prepares eight base tensors
 (including three T2 forms) and eighteen smaller projected tensors. Relative to
@@ -110,9 +127,46 @@ requires no additional full ovvv copy or six-index triples tensor. Only the
 current quadrature node retains a reverse tape, bounded by available memory;
 otherwise the dresser recomputes intermediate transforms during reverse.
 
-The production entry points are `triples_prepared_energy` and
-`triples_prepared_energy_vjp`. With `nsamples=0` they enumerate a small exact
-reference. Positive counts use selected-space sampling with proposal tables
+The single-point entry points are `triples_prepared_energy` and
+`triples_prepared_energy_vjp`. With `nsamples=0` they contract deterministic
+blocks, one selected occupied orbital and two remaining occupied indices at a
+time. Each virtual cube is assembled with matrix multiplications; its spin
+permutations are virtual permutations of the same cube. Matrix adjoints return
+cotangents to the prepared tensors before the existing dressing pullback.
+For this single-point algorithm with `nS` selected occupied orbitals, the leading numerator cost over the grid is
+`O(nq nS no^2 nv^4 + nq nS no^3 nv^3)`, with `O(nv^3 + no nv^2)`
+working storage in addition to the prepared tensors and their cotangents.
+No full occupied triples tensor or reverse sampling-event list is formed.
+Occupied blocks use triangular symmetry. They run in parallel with one BLAS
+thread per worker when supported local MKL or pthread OpenBLAS thread control
+is available; otherwise the block loop is serial. Workers share the cotangent
+bank with slab locks. Worker scratch is bounded by an 8 GiB estimate, with at
+least one worker. `deterministic_workspace_bytes` reports aggregate worker
+scratch, excluding prepared tensors, their cotangents, and the numerator cache.
+
+The production smooth deterministic solver additionally reuses the undressed,
+spin-adapted selected numerator across all Laplace nodes. The other side uses
+full external dressing and three cyclic pair permutations, visiting both
+ordered orientations of each cached triangular occupied block. Its cache
+cotangent is accumulated over the grid and reversed once per batch. This
+preserves the physical fragment operator and dense Fock response.
+
+The cache receives at most half the current `max_memory` headroom, optionally
+capped by `PYSCFAD_TRIPLES_NUMERATOR_CACHE_MB` in MiB. At least one virtual cube
+(and its cotangent for gradients) is required. Smaller budgets cause batching
+and repeated dressing, without discarding contributions. Diagnostics include
+`numerator_cache_batches`, `numerator_cache_peak_bytes`, and
+`quadrature_reused_blocks`; `deterministic_blocks` counts the evaluated block
+operations, including cache construction and reverse work.
+
+This preserves the existing asymmetric physical fragment partition. Only
+the quadrature approximates the denominator; `samples` and `standard_error`
+remain zero. It requires rebuilding the STC extension, and its native version
+changes the correlation checkpoint identity. The ordinary semicanonical
+triples path is unchanged. Smooth frames retain full occupied and virtual
+Fock matrices; the new contraction does not assume they are diagonal.
+
+Positive counts use selected-space sampling with proposal tables
 built from the stable factors. The VJP uses the same draws as the energy.
 Individual seeded realizations change because the proposal factors changed;
 the deterministic energy and full derivative are preserved. The older
@@ -278,7 +332,7 @@ on workers. The comparison runners below use one process.
 
 | Key | Default | Meaning / allowed values |
 | --- | --- | --- |
-| `mode` | `"deterministic"` | `deterministic` or `stochastic`. With smooth selections, deterministic means exact numerator enumeration on the fitted Laplace grid, not exact integration of the denominator. |
+| `mode` | `"deterministic"` | `deterministic` or `stochastic`. With smooth selections, deterministic means block contraction of the complete selected-space numerator on the fitted Laplace grid, not exact integration of the denominator. |
 | `integral_transform` | `"df"` | `df` contracts raw DF factors into three integral blocks once per fragment; `rotate` reuses cached CCSD `ovvv`, `ovoo`, and `ovov`. Both apply the same stable dressing and support deterministic and stochastic modes. |
 | `nsamples` | Required in stochastic mode | Integer ≥ 2. Nominal production samples per S in fixed-count mode. Still required with a positive tolerance; it does not cap adaptive production. |
 | `global_seed` | `71` | Nonnegative integer smaller than `2**64`. |
@@ -290,7 +344,7 @@ on workers. The comparison runners below use one process.
 
 The last seven keys are sampling controls and are rejected with deterministic
 mode. High-level stochastic `nsamples=0` is invalid: use deterministic mode for
-enumeration. The `nsamples=0` convention belongs only to the native entry points.
+contraction. The `nsamples=0` convention belongs only to the native entry points.
 
 For example, `triples_controls={"mode": "deterministic", "integral_transform": "rotate"}`
 selects cached-integral rotation. Add `"integral_transform": "rotate"` to a
@@ -416,7 +470,7 @@ is the general geometry runner, including C5H6, C6H14, and square H4.
 | `--triples-trace-exponent` | `5.0` | Triples trace-model exponent. |
 | `--triples-budget-energy` | `mp2` | `mp2` uses selection proxies; `ccsd` uses fragment energies from the deterministic reference. |
 | `--seeds` | `71 72 73` | One stochastic calculation per seed; an empty list skips stochastic runs. |
-| `--smooth-deterministic` | Off | Also enumerate smooth deterministic triples; expensive beyond small systems. |
+| `--smooth-deterministic` | Off | Also compute smooth deterministic Laplace triples using selected-occupied block contractions. |
 | `--reference` | None | Reuse a compatible deterministic result JSON instead of computing it. |
 | `--sampling-fragment` | None | Zero-based S correction only, without the full baseline/HF or full-force comparison; requires `--reference` or `--fragment-deterministic`. |
 | `--fragment-deterministic` | Off | Compute a conventional deterministic reference for `--sampling-fragment`. |
@@ -464,8 +518,8 @@ Molecule grouping retains one full molecular domain. Actual selected MP2
 domain sizes and all cutoffs are written to `domain_selection.json`.
 The runner fixes `matrix_kind="W"`, `thresh_occ=1e-4`, and
 `thresh_vir=1e-5`. `conventional` requires
-`--deterministic-only`; `smooth` deterministic enumeration is principally a
-small-system check. Required target/seed arguments are still parsed for
+`--deterministic-only`; smooth deterministic triples use the selected-occupied
+block algorithm described above. Required target/seed arguments are still parsed for
 selection-only and deterministic-only invocations.
 
 ### Settings shared by the runners

@@ -3,6 +3,7 @@
 #include "triples_block_sampler.h"
 #include "scoped_openblas_threads.h"
 #include <array>
+#include <algorithm>
 #include <exception>
 #include <limits>
 #include <map>
@@ -10,6 +11,8 @@
 #include <tuple>
 #include <omp.h>
 #include <cstring>
+#include <mutex>
+#include <dlfcn.h>
 
 namespace libgmbpt { namespace qchem { namespace {
 
@@ -178,8 +181,32 @@ struct moments {
 };
 struct record { index6 x; double a,z; };
 
+#include "triples_deterministic.inc"
+#include "triples_quadrature.inc"
+
 }} // namespace qchem anonymous
 namespace qchem {
+
+stc_triples::triples_result stc_triples::quadrature_build(const triples_prepared& input,
+        quadrature_cache& cache,size_t first,size_t count,bool gradient) {
+    const size_t total=input.ns*input.no*(input.no+1)/2;
+    if(!count || first>=total || count>total-first) throw std::invalid_argument("quadrature cache: invalid batch");
+    cache=quadrature_cache();cache.no=input.no;cache.nv=input.nv;cache.ns=input.ns;
+    cache.first=first;cache.gradient=gradient;cache.values.resize(count);
+    if(gradient) cache.bars.resize(count);
+    return quadrature_kernel(input,cache,0,0.,nullptr);
+}
+stc_triples::triples_result stc_triples::quadrature_step(const triples_prepared& input,
+        quadrature_cache& cache,double weight,triples_vjp* vjp) {
+    if(!std::isfinite(weight) || bool(vjp)!=cache.gradient)
+        throw std::invalid_argument("quadrature cache: invalid weight or derivative mode");
+    return quadrature_kernel(input,cache,1,weight,vjp);
+}
+stc_triples::triples_result stc_triples::quadrature_finish(const triples_prepared& input,
+        quadrature_cache& cache,triples_vjp* vjp) {
+    if(!cache.gradient || !vjp) throw std::invalid_argument("quadrature cache: reverse was not enabled");
+    auto result=quadrature_kernel(input,cache,2,0.,vjp);cache.finished=true;return result;
+}
 
 stc_triples::triples_result stc_triples::asymmetric_triples(
     const arma::field<arma::vec>& t1,const arma::field<arma::mat>& t2,
@@ -313,6 +340,28 @@ stc_triples::triples_result stc_triples::asymmetric_triples(
                      {{i,a,j,b}},{{k,c,0,0}},{{k,c,0,0}},{{i,j,a,b}}}};
         return op;
     };
+    if(exact && prepared) {
+        const double start=omp_get_wtime();
+        {
+            detail::scoped_openblas_threads blas_scope(dense_blas_threads);
+            result.sampling_blas_threads=detail::observed_blas_threads();
+            triples_deterministic_blocks(bank,describe,no,nv,ns,gradient,cotangent,result);
+        }
+        if(vjp) {
+            const double finalize=omp_get_wtime();
+            *vjp=triples_vjp();
+            vjp->occupied_left.zeros(no,ns); vjp->occupied_right.zeros(no,ns);
+            for(auto& b:bank) {
+                if(!gradient) b.bar.zeros(b.value.n_elem);
+                vjp->prepared.push_back(std::move(b.bar));
+            }
+            result.finalize_blas_threads=detail::observed_blas_threads();
+            result.vjp_finalize_seconds=omp_get_wtime()-finalize;
+            result.vjp_reverse_seconds+=result.vjp_finalize_seconds;
+        }
+        result.sampling_seconds=omp_get_wtime()-start;
+        return result;
+    }
     auto wq=[&](const operations& op,bool probability) {
         std::array<double,2> out{{0.,0.}};
         const double* g=bank[op.ids[0]].value.memptr()+bank[op.ids[0]].offset(op.indices[0]);

@@ -16,13 +16,17 @@ The [STC guide](pyscfad/dlno_stc/README.md) covers MP2, D/W matrices, and native
 | Selection / triples setting | Behavior |
 | --- | --- |
 | `smooth=True` (default), `ccsd_t=False` (default) | Anchored full-LIS CCSD, without triples. |
-| `smooth=True`, `ccsd_t=True`, `triples_controls=None` or `{"mode": "deterministic"}` | Deterministic enumeration of native asymmetric Laplace triples on the fitted grid. Useful as a small-system reference; enumeration is expensive. |
+| `smooth=True`, `ccsd_t=True`, `triples_controls=None` or `{"mode": "deterministic"}` | Deterministic native asymmetric Laplace triples on the fitted grid. Selected-occupied virtual blocks use GEMMs for energy and gradients. |
 | `smooth=True`, `ccsd_t=True`, `{"mode": "stochastic", ...}` | Native asymmetric Laplace triples with selected-space sampling; energy and gradient use the same production draws. |
 | `smooth=False`, deterministic triples | Conventional semicanonical reference with direct denominators. Stochastic triples are rejected. |
 
 The smooth path always uses one complete occupied frame and one complete
 virtual frame **within the retained LIS**. This does not disable LIS truncation.
 Native dressing and asymmetric sampling are fixed choices in the current code.
+Semicanonical virtual blocks automatically use scalar Laplace scaling while
+retaining full off-diagonal Fock derivatives. Noncanonical blocks use dense
+dressing; `diagonal_virtual_points` reports the number of nodes using scaling.
+Rebuild the native extension to enable this optimization.
 Canonical stochastic triples, equal dressing, JAX production dressing,
 clustered Fock frames, and explicit-S frames are no longer supported modes.
 

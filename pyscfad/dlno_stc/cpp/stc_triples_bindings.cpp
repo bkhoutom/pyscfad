@@ -9,6 +9,7 @@
 #include <limits>
 #include <string>
 #include <vector>
+#include <memory>
 
 namespace py = pybind11;
 namespace {
@@ -258,6 +259,8 @@ py::dict asymmetric(py::handle t1_value, py::handle t2_value,
     out["resident_tensor_bytes"]=result.resident_tensor_bytes;
     out["proposal_bytes"]=result.proposal_bytes;
     out["reverse_buffer_bytes"]=result.reverse_buffer_bytes;
+    out["deterministic_blocks"]=result.deterministic_blocks;
+    out["deterministic_workspace_bytes"]=result.deterministic_workspace_bytes;
     out["vjp_grouping_seconds"]=result.vjp_grouping_seconds;
     out["vjp_accumulation_seconds"]=result.vjp_accumulation_seconds;
     out["vjp_finalize_seconds"]=result.vjp_finalize_seconds;
@@ -311,6 +314,53 @@ py::dict asymmetric(py::handle t1_value, py::handle t2_value,
     }
     return out;
 }
+// Retain any contiguous conversions until the released-GIL native call ends.
+struct PreparedInput {
+    Triples::triples_prepared value;
+    std::vector<py::array_t<double,py::array::c_style>> owners;
+    explicit PreparedInput(py::tuple values) {
+        if(values.size()!=26) throw py::value_error("stable triples: expected 26 tensors");
+        InputArray t1(values[0],"t1",2), selected(values[8],"selected ovvv",4);
+        if(t1.size(0)<=0 || t1.size(1)<=0 || selected.size(0)<=0 || selected.size(0)>t1.size(0))
+            throw py::value_error("stable triples: invalid dimensions");
+        value.no=size_t(t1.size(0));value.nv=size_t(t1.size(1));value.ns=size_t(selected.size(0));
+        const libgmbpt::qchem::triples_layout layout(value.no,value.nv,value.ns);
+        owners.reserve(values.size());value.tensors.reserve(values.size());
+        for(size_t i=0;i<values.size();++i) {
+            const auto& spec=layout.tensors[i];InputArray input(values[i],"prepared tensor",int(spec.rank));
+            for(size_t d=0;d<spec.rank;++d) if(input.size(d)!=py::ssize_t(spec.dims[d]))
+                throw py::value_error("stable triples: inconsistent tensor shape");
+            owners.push_back(py::array_t<double,py::array::c_style>::ensure(values[i]));
+            const auto& a=owners.back();
+            if(!a) throw py::value_error("stable triples: invalid array");
+            for(py::ssize_t j=0;j<a.size();++j) if(!std::isfinite(a.data()[j]))
+                throw py::value_error("stable triples: nonfinite tensor");
+            value.tensors.emplace_back(const_cast<double*>(a.data()),size_t(a.size()),false,true);
+        }
+    }
+};
+py::dict cache_result(const Triples::triples_result& result,const Triples::triples_vjp* bars,
+        const Triples::quadrature_cache& cache) {
+    py::dict out;
+    out["energy"]=result.energy;out["sampling_seconds"]=result.sampling_seconds;
+    out["sampling_threads"]=result.sampling_threads;out["setup_threads"]=result.setup_threads;
+    out["resident_tensor_bytes"]=result.resident_tensor_bytes;
+    out["reverse_buffer_bytes"]=result.reverse_buffer_bytes;
+    out["deterministic_blocks"]=result.deterministic_blocks;
+    out["deterministic_workspace_bytes"]=result.deterministic_workspace_bytes;
+    if(bars) {
+        const libgmbpt::qchem::triples_layout layout(cache.no,cache.nv,cache.ns);
+        py::tuple values(layout.tensors.size());
+        for(size_t i=0;i<layout.tensors.size();++i) {
+            const auto& spec=layout.tensors[i];
+            py::array_t<double> a(std::vector<py::ssize_t>(spec.dims.begin(),spec.dims.begin()+spec.rank));
+            std::memcpy(a.mutable_data(),bars->prepared[i].memptr(),bars->prepared[i].n_elem*sizeof(double));
+            values[i]=std::move(a);
+        }
+        out["cotangents"]=std::move(values);
+    }
+    return out;
+}
 }  // namespace
 
 namespace pyscfad { namespace dlno_stc {
@@ -322,9 +372,36 @@ void bind_triples(py::module_& module) {
 #else
     module.attr("TRIPLES_OPENBLAS_THREAD_CONTROL")=false;
 #endif
-    // Immutable identity covers the extended native numerical sources and binding.
+    module.attr("TRIPLES_DETERMINISTIC_BLOCKS")=true;
+    module.attr("TRIPLES_DIAGONAL_VIRTUAL_DRESSING")=true;
+    // Bump the native checkpoint identity when the numerical algorithm changes.
     module.attr("TRIPLES_VERSION")=
-        "stc_triples:stable-external-legs:sha256:0c5032626d8138b6bb727a4a92c35f7daf443389fb40560832943e705bcb6e89";
+        "stc_triples:stable-external-legs:deterministic-blocks-v3:quadrature-reuse-v1:diagonal-virtual-v1";
+    module.attr("TRIPLES_QUADRATURE_REUSE")=true;
+    py::class_<Triples::quadrature_cache>(module,"TriplesQuadratureCache")
+        .def(py::init([](py::tuple values,py::handle first,py::handle count,bool with_grad) {
+            PreparedInput input(values);
+            auto cache=std::make_unique<Triples::quadrature_cache>();
+            const auto begin=unsigned_integer(first,"first"),length=unsigned_integer(count,"count");
+            { py::gil_scoped_release release;
+              Triples::quadrature_build(input.value,*cache,size_t(begin),size_t(length),with_grad); }
+            return cache;
+        }),py::arg("tensors"),py::kw_only(),py::arg("first"),py::arg("count"),py::arg("with_grad")=false)
+        .def_property_readonly("cache_bytes",[](const Triples::quadrature_cache& cache) {
+            size_t n=0;for(const auto& v:cache.values)n+=v.n_elem*sizeof(double);
+            for(const auto& v:cache.bars)n+=v.n_elem*sizeof(double);return n;
+        })
+        .def("step",[](Triples::quadrature_cache& cache,py::tuple values,double weight) {
+            PreparedInput input(values);Triples::triples_vjp bars;Triples::triples_result result;
+            { py::gil_scoped_release release;
+              result=Triples::quadrature_step(input.value,cache,weight,cache.gradient ? &bars : nullptr); }
+            return cache_result(result,cache.gradient ? &bars : nullptr,cache);
+        },py::arg("tensors"),py::arg("weight"))
+        .def("finish",[](Triples::quadrature_cache& cache,py::tuple values) {
+            PreparedInput input(values);Triples::triples_vjp bars;Triples::triples_result result;
+            { py::gil_scoped_release release;result=Triples::quadrature_finish(input.value,cache,&bars); }
+            return cache_result(result,&bars,cache);
+        },py::arg("tensors"));
     for (bool vjp : {false,true}) {
         module.def(vjp ? "triples_prepared_energy_vjp" : "triples_prepared_energy",
             [vjp](py::tuple tensors,py::handle nsamples,py::handle seed,
@@ -337,7 +414,8 @@ void bind_triples(py::module_& module) {
                     placeholder,placeholder,nsamples,seed,target,py::none(),vjp,pilot,true,tensors);
             },py::arg("tensors"),py::arg("nsamples"),py::arg("seed")=71,
               py::arg("target_standard_error")=0.,py::kw_only(),py::arg("pilot")=py::none(),
-              "Stable Laplace numerator with undressed internal legs and direct physical projections.");
+              "Stable Laplace numerator with undressed internal legs and direct physical projections. "
+              "nsamples=0 uses deterministic selected-occupied block GEMMs, including their VJP.");
         module.def(vjp ? "triples_asymmetric_energy_vjp" : "triples_asymmetric_energy",
             [vjp](py::handle t1,py::handle t2,py::handle Bvo,py::handle Boo,
                   py::handle Bvv,py::handle L,py::object R,py::handle nsamples,

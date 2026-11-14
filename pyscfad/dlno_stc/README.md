@@ -1230,3 +1230,50 @@ Python sources and native binaries, including editable source changes and
 the native extension selected at runtime. Changed implementation identity
 rejects resume. Checkpoints must use the current CC selection schema;
 serial progress checkpoints remain unavailable for multi-rank execution.
+
+The single-point smooth deterministic Laplace triples kernel evaluates occupied blocks with
+`k <= j`, with weight two for `j != k`. This follows from simultaneous
+occupied/virtual pair permutation symmetry of the complete numerator; it
+also holds for independent prepared tensors and their full cotangents.
+Blocks run in parallel with one BLAS thread per worker when MKL local thread
+control or the supported pthread OpenBLAS control is available. Unknown
+BLAS providers retain serial blocks. Virtual permutations are specialized
+outside their inner loops. Cotangent workers share one bank, with locks on
+occupied slabs rather than private copies of all input cotangents.
+Worker count is bounded by an 8 GiB scratch estimate (at least one worker);
+input and cotangent residency are additional. `deterministic_blocks` counts
+actually evaluated triangular blocks, and `deterministic_workspace_bytes`
+is the aggregate scratch estimate over workers. For this parallel kernel,
+`vjp_accumulation_seconds` and `vjp_reverse_seconds` report summed worker
+reverse times, not elapsed wall time; use the outer kernel timing for elapsed
+time. The optimization retains the full asymmetric fragment projection and
+all Fock-matrix responses.
+
+
+The smooth deterministic solver now reuses the undressed spin-adapted
+selected numerator across the entire Laplace grid. All external matrix
+exponentials are applied to the other numerator at full time, while its
+selected occupied leg retains `U.T @ exp(t*Foo)`. Thus the physical fragment
+operator and full Fock response are preserved, with no inverse exponentials
+or additional local approximations. This is valid for dense noncanonical
+Fock matrices as well as diagonal virtual blocks.
+
+Only three cyclic pair permutations are contracted on the point-dependent
+side, with a factor of two from exchanging the two unselected occupied and
+virtual legs. Both ordered occupied-pair orientations are visited, sharing
+one triangular cached numerator. This removes the second full pair/spin
+symmetrization without commuting the fragment operator through permutations.
+For derivatives, each point contributes to the cache cotangent; its spin
+operation and six numerator contractions are reversed once after the grid.
+The point-dependent raw terms retain both singles and Fov contributions.
+
+The numerator cache uses at most half current `max_memory` headroom, subject
+to an optional `PYSCFAD_TRIPLES_NUMERATOR_CACHE_MB` cap (MiB). At least one
+virtual cube, and its cotangent when differentiating, is required. Smaller
+budgets split the occupied blocks into batches and repeat dressing across
+batches; they do not discard contributions. The cache limit is additional
+to the input, prepared-tensor, and worker-scratch allocations. Diagnostics
+report `numerator_cache_batches`, `numerator_cache_peak_bytes`, and
+`quadrature_reused_blocks`. The single-point `triples_prepared_energy[_vjp]`
+API remains available as an independent reference; stochastic evaluation
+continues to use the shared half-dressing path.

@@ -40,9 +40,11 @@ def test_replay_reuses_final_scf_data_and_closes_shared_response(
         mf = build(molecule)
         static = dlno_stc.build_domain_selections(mf, frozen=1,
             force_full_domains=True, boys_grouping='molecule', correlation_auxbasis=RIFIT)
+        assert static.ed_selection_pending
         packet_dir = tmp_path / 'packets'
         rows = mp2.export_run(mf, static, packet_dir, controls=controls,
                               correlation_auxbasis=RIFIT)
+        assert static.ed_selection_pending  # Export preserves the caller's plan.
         for row in rows:
             folder = packet_dir / f"fragment_{row['fragment_id']:04d}"
             mp2.solve_request(folder / 'input.h5', folder / 'result.h5', backend.solve)

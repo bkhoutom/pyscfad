@@ -8,7 +8,7 @@ python_bin="${PYTHON_BIN:-$repo_root/.venv/bin/python}"
 mpi_exec="${MPIEXEC:-mpiexec}"
 
 # Configure all numerical runtimes before Python/JAX/BLAS are imported.
-export OMP_NUM_THREADS="$threads" OMP_THREAD_LIMIT="$threads" OMP_DYNAMIC=FALSE
+export OMP_NUM_THREADS="$threads" OMP_THREAD_LIMIT="$threads"
 export OMP_MAX_ACTIVE_LEVELS=1
 export OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 export VECLIB_MAXIMUM_THREADS=1 PYSCFAD_DENSE_BLAS_THREADS="$threads"

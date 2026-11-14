@@ -11,6 +11,7 @@ import os
 import jax
 import jax.numpy as jnp
 import numpy as np
+from ._cartesian_moments import cartesian_components
 
 
 def resolve_pair_bucket_size(bucket_size=None):
@@ -84,6 +85,17 @@ def coordinate_moment_jvp(bra, ket, coords_t, ao_owner):
     )
 
 
+@jax.jit
+def symmetric_coordinate_moment_jvp(bra, coords_t, ao_owner):
+    """Reuse bra derivatives for real multiplicative symmetric AO moments.
+
+    The derivative axis stays independent of the packed operator axis.
+    Contract before transposing, avoiding a second AO derivative tensor.
+    """
+    half = jnp.einsum('ux,xpuv->puv', coords_t[ao_owner], bra)
+    return half + half.swapaxes(-1, -2)
+
+
 @partial(jax.jit, static_argnums=(6,))
 def transition_moments(occupied, virtual, overlap, dipole, second, third, order):
     """Contract AO moments for a rectangular batch of occupied modes.
@@ -91,7 +103,9 @@ def transition_moments(occupied, virtual, overlap, dipole, second, third, order)
     ``occupied`` has shape ``(nao, nmode)``. ``virtual`` is either one shared
     ``(nao, nvir)`` space or a ``(nmode, nao, nvir)`` batch. The returned center,
     dipole, quadrupole, and octupole arrays have mode as their leading axis;
-    moments above the requested order are ``None``.
+    moments above the requested order are ``None``. Second/third AO moments
+    can instead have shape ``(6/10, nao, nao)``. Only these unique components
+    are contracted; their small transition tensors are expanded afterwards.
     """
     if virtual.ndim == 2:
         overlap_transition_expr = 'ua,uv,vi->ia'
@@ -116,12 +130,13 @@ def transition_moments(occupied, virtual, overlap, dipole, second, third, order)
     transition_quadrupole = None
     transition_octupole = None
     if order > 2:
-        raw_second = jnp.einsum(
-            quadrupole_transition_expr,
-            virtual.conj(),
-            second,
-            occupied,
-        )
+        if second.ndim == 3:
+            raw_second = jnp.einsum(dipole_transition_expr, virtual.conj(), second, occupied)
+            raw_second = raw_second[:, cartesian_components(2)[1], :].reshape(
+                occupied.shape[1], 3, 3, -1)
+        else:
+            raw_second = jnp.einsum(
+                quadrupole_transition_expr, virtual.conj(), second, occupied)
         translated_second = raw_second
         translated_second = translated_second - jnp.einsum(
             'ix,iya->ixya', center, transition_dipole
@@ -142,12 +157,13 @@ def transition_moments(occupied, virtual, overlap, dipole, second, third, order)
         )
 
     if order > 3:
-        raw_third = jnp.einsum(
-            octupole_transition_expr,
-            virtual.conj(),
-            third,
-            occupied,
-        )
+        if third.ndim == 3:
+            raw_third = jnp.einsum(dipole_transition_expr, virtual.conj(), third, occupied)
+            raw_third = raw_third[:, cartesian_components(3)[1], :].reshape(
+                occupied.shape[1], 3, 3, 3, -1)
+        else:
+            raw_third = jnp.einsum(
+                octupole_transition_expr, virtual.conj(), third, occupied)
         translated_third = raw_third
         translated_third = translated_third - jnp.einsum(
             'ix,iyza->ixyza', center, raw_second

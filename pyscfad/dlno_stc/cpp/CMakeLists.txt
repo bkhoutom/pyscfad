@@ -24,6 +24,13 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(test_w_eigenbasis test_w_eigenbasis.cpp)
+    target_compile_features(test_w_eigenbasis PRIVATE cxx_std_14)
+    target_include_directories(test_w_eigenbasis PRIVATE ${ARMADILLO_INCLUDE_DIRS})
+    target_link_libraries(test_w_eigenbasis PRIVATE ${ARMADILLO_LIBRARIES} OpenMP::OpenMP_CXX)
+    add_test(NAME w_eigenbasis COMMAND test_w_eigenbasis)
+    set_tests_properties(w_eigenbasis PROPERTIES
+        ENVIRONMENT "OMP_THREAD_LIMIT=4;OPENBLAS_NUM_THREADS=1;MKL_NUM_THREADS=1")
     add_executable(test_sampling_allocation test_sampling_allocation.cpp)
     target_compile_features(test_sampling_allocation PRIVATE cxx_std_14)
     target_include_directories(test_sampling_allocation PRIVATE ${ARMADILLO_INCLUDE_DIRS})

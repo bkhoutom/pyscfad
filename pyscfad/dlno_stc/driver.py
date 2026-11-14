@@ -265,6 +265,10 @@ def _prepare(state, static, group, controls, with_grad, *, return_frame=False):
     ``(input_bars, (occupied_bar, virtual_bar))``. Static frame metadata never
     enters the differentiable output tree.
     """
+    if static.fragments[group.representative_index].strong_virtual is None and static.ed_selection_pending:
+        return _prepare_planned_domain(state, static, group, controls, with_grad,
+                                       return_frame=return_frame)
+    state['_prepared_domain_static'] = static
     memory_controls = ({"mode": "deterministic",
                         "target_batch_size": controls.get("target_batch_size", 1),
                         "threads": controls.get("threads")}
@@ -294,6 +298,57 @@ def _prepare(state, static, group, controls, with_grad, *, return_frame=False):
             inputs, pullback = jax.vjp(prepare, state["mf"], state["common"])
         else:
             inputs, pullback = prepare(state["mf"], state["common"]), None
+    jax.block_until_ready(inputs)
+    if return_frame:
+        return inputs, backend.host_inputs(inputs), pullback, frame
+    return inputs, backend.host_inputs(inputs), pullback
+
+
+def _prepare_planned_domain(state, static, group, controls, with_grad, *, return_frame=False):
+    """Select one ED, check its actual size, then project without frame replay."""
+    from ._ed_selection import select_boys_ed_frame, resolve_group
+    from .prepare import _project_inputs
+    index = group.representative_index
+    def select(common):
+        frame, labels = select_boys_ed_frame(common, static, index)
+        return (frame.occupied_coeff, frame.virtual_coeff), (frame, labels)
+    with resource_profile.section('stc.domain.select_ed', group=index):
+        if with_grad:
+            coefficients, frame_pullback, (frame, labels) = jax.vjp(
+                select, state['common'], has_aux=True)
+        else:
+            coefficients, (frame, labels) = select(state['common'])
+    resolved = resolve_group(static, group, labels)
+    state['_prepared_domain_static'] = resolved
+    lib.logger.info(state['mf'], 'STC domain %d prepared: AO %d; occupied %d; virtual %d',
+                    index, len(frame.extended_ao_indices), coefficients[0].shape[1],
+                    coefficients[1].shape[1])
+    memory_controls = ({'mode': 'deterministic',
+                        'target_batch_size': controls.get('target_batch_size', 1),
+                        'threads': controls.get('threads')}
+                       if controls.get('mode', 'deterministic') == 'deterministic' else {})
+    check_domain_memory(state['mf'], resolved, index, with_grad=with_grad,
+                        virtual_block_size=controls.get('virtual_block_size', 16),
+                        **memory_controls, **basis_kwargs(state.get('correlation_auxbasis')))
+    ao, atoms = frame.extended_ao_indices, frame.extended_atoms
+    def project(mf, common, co, cv):
+        return _project_inputs(mf, common.fock[numpy.ix_(ao, ao)], co, cv, atoms,
+                               aux_atoms=labels.pao_center_atoms, group=index,
+                               **basis_kwargs(state.get('correlation_auxbasis')))
+    with warnings.catch_warnings():
+        warnings.filterwarnings('error', message='integral-direct local Lov is unavailable.*',
+                                category=RuntimeWarning)
+        if with_grad:
+            inputs, input_pullback = jax.vjp(project, state['mf'], state['common'], *coefficients)
+            def pullback(seed):
+                packet_bar, extra = seed if return_frame else (seed, None)
+                mf_bar, common_bar, co_bar, cv_bar = input_pullback(packet_bar)
+                if extra is not None:
+                    co_bar, cv_bar = co_bar + extra[0], cv_bar + extra[1]
+                frame_bar, = frame_pullback((co_bar, cv_bar))
+                return mf_bar, jax.tree_util.tree_map(_add_cotangent, common_bar, frame_bar)
+        else:
+            inputs, pullback = project(state['mf'], state['common'], *coefficients), None
     jax.block_until_ready(inputs)
     if return_frame:
         return inputs, backend.host_inputs(inputs), pullback, frame

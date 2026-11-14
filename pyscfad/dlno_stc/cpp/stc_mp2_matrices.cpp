@@ -34,17 +34,18 @@ using NativeKernel = libgmbpt::qchem::stc_mp2_kernel;
 namespace {
 
 constexpr const char* matrix_kernel_version =
-    "src_code_rdm_v2:427459d9b91fc70f:standalone-1";
+    "src_code_rdm_v2:427459d9b91fc70f:standalone-4-w-dynamic-teams";
 
-// OpenMP ICVs belong to this calling thread. Forward and replay use the saved
-// explicit count for stochastic replay. Deterministic kernels respect the
-// caller's dynamic-team policy. Previous settings are restored on return.
+// OpenMP ICVs belong to this calling thread. Deterministic W construction may
+// shrink teams within the explicit budget; other calls retain fixed teams.
+// Restore the caller's policy before returning to subsequent stages (CCSD).
+// MKL's independent dynamic adjustment is left untouched.
 struct ThreadScope {
     int previous = omp_get_max_threads();
     int dynamic = omp_get_dynamic();
 
-    explicit ThreadScope(int threads, bool fixed_replay = false) {
-        if (fixed_replay) omp_set_dynamic(0);
+    explicit ThreadScope(int threads, bool dynamic_teams = false) {
+        omp_set_dynamic(dynamic_teams ? 1 : 0);
         omp_set_num_threads(threads);
     }
 
@@ -391,10 +392,14 @@ MatrixTimings deterministic_timings(const density::deterministic_result& result)
             {"propagation_virtual_seconds", result.propagation_virtual_seconds},
             {"spin_seconds", result.spin_seconds},
             {"occupied_density_seconds", result.occupied_density_seconds},
+            {"bare_gram_worker_seconds", result.bare_gram_worker_seconds},
+            {"occupied_w_worker_seconds", result.occupied_w_worker_seconds},
+            {"virtual_w_worker_seconds", result.virtual_w_worker_seconds},
             {"virtual_energy_seconds", result.virtual_energy_seconds}};
 }
 
 struct MatrixOutput {
+    bool openmp_dynamic = false;
     double energy = 0, energy_se = 0;
     double occupied_frobenius_se = 0, virtual_frobenius_se = 0;
     bool occupied_target_met = true, virtual_target_met = true;
@@ -403,11 +408,11 @@ struct MatrixOutput {
     MatrixTimings timings;
 };
 
-MatrixOutput deterministic_forward(const Inputs& inputs, const MatrixReplay& replay) {
+MatrixOutput deterministic_forward(Inputs& inputs, const MatrixReplay& replay) {
     const bool density_output = replay.kind == "D";
     auto result = density_output ? density::selected_deterministic_mp2_forward(
         inputs.foo, inputs.fvv, inputs.B, replay.beta, replay.weights,
-        replay.targets, replay.threads) : density::selected_deterministic_mp2_w_forward(
+        replay.targets, replay.threads) : density::selected_deterministic_mp2_w_forward_consume(
         inputs.foo, inputs.fvv, inputs.B, replay.beta, replay.weights,
         replay.targets, replay.threads);
     MatrixOutput output;
@@ -516,6 +521,7 @@ py::dict matrix_result(const MatrixOutput& output,
     diagnostics["global_seed"] = replay->seed;
     diagnostics["native_seed"] = native_seed(replay->seed);
     diagnostics["threads"] = replay->threads;
+    diagnostics["openmp_dynamic"] = output.openmp_dynamic;
     diagnostics["native_version"] = replay->native_version;
     py::dict effective_options;
     effective_options["occupied"] = replay->stochastic
@@ -559,7 +565,8 @@ py::dict solve_matrices(py::handle foo, py::handle fvv, py::handle b,
     MatrixOutput output;
     {
         py::gil_scoped_release release;
-        ThreadScope team(settings.replay->threads, settings.replay->stochastic);
+        ThreadScope team(settings.replay->threads,
+                         kind == "W" && !settings.replay->stochastic);
         const double started = omp_get_wtime();
         if (!settings.replay->stochastic) {
             output = deterministic_forward(inputs, *settings.replay);
@@ -569,11 +576,12 @@ py::dict solve_matrices(py::handle foo, py::handle fvv, py::handle b,
             output = stochastic_w_forward(inputs, settings);
         }
         output.timings["native_total_seconds"] = omp_get_wtime() - started;
+        output.openmp_dynamic = omp_get_dynamic() != 0;
     }
     return matrix_result(output, settings.replay);
 }
 
-Result replay_pullback(const Inputs& inputs, const MatrixReplay& replay,
+Result replay_pullback(Inputs& inputs, const MatrixReplay& replay,
                        double energy_bar, const arma::mat& occupied_bar,
                        const arma::mat& virtual_bar, MatrixTimings& timings) {
     Result bars;
@@ -581,7 +589,7 @@ Result replay_pullback(const Inputs& inputs, const MatrixReplay& replay,
         auto result = replay.kind == "D" ? density::selected_deterministic_mp2_vjp(
             inputs.foo, inputs.fvv, inputs.B, replay.beta, replay.weights,
             replay.targets, replay.threads, energy_bar, occupied_bar, virtual_bar)
-            : density::selected_deterministic_mp2_w_vjp(
+            : density::selected_deterministic_mp2_w_vjp_consume(
             inputs.foo, inputs.fvv, inputs.B, replay.beta, replay.weights,
             replay.targets, replay.threads, energy_bar, occupied_bar, virtual_bar);
         timings = deterministic_timings(result);
@@ -634,7 +642,7 @@ std::pair<py::dict, MatrixTimings> pullback_matrices(py::handle foo, py::handle 
     MatrixTimings timings;
     {
         py::gil_scoped_release release;
-        ThreadScope team(replay.threads, replay.stochastic);
+        ThreadScope team(replay.threads);
         const double started = omp_get_wtime();
         bars = replay_pullback(inputs, replay, energy_bar, occupied_seed, virtual_seed, timings);
         timings["native_total_seconds"] = omp_get_wtime() - started;

@@ -15,11 +15,12 @@ _FIXED_THREADS = ContextVar('pyscfad_fixed_threads', default=None)
 
 @contextmanager
 def fixed_threads():
-    """Use the current PySCF thread count without dynamic team shrinking.
+    """Use the current PySCF thread count with fixed OpenMP teams.
 
     Intended for eager J/K, response solves and final integral pullbacks.
     Read the configured count at entry, rather than imposing a CPU budget.
-    Restore OpenMP/BLAS limits and OpenMP/MKL dynamic flags on every exit.
+    Leave MKL dynamic adjustment to its runtime/caller setting, as in Q-Chem.
+    Restore OpenMP/BLAS limits and the OpenMP dynamic flag on every exit.
     Inner kernel-specific BLAS limits (e.g. one BLAS thread inside OpenMP)
     remain effective. Competing policies in concurrent Python calls are
     unsupported, as with the other process-wide thread helpers.
@@ -36,12 +37,9 @@ def fixed_threads():
         with controller.limit(limits=count):
             try:
                 for pool in controller.lib_controllers:
-                    names = (('omp_get_dynamic', 'omp_set_dynamic')
-                             if pool.user_api == 'openmp' else
-                             ('MKL_Get_Dynamic', 'MKL_Set_Dynamic')
-                             if pool.internal_api == 'mkl' else None)
-                    if names is None:
+                    if pool.user_api != 'openmp':
                         continue
+                    names = ('omp_get_dynamic', 'omp_set_dynamic')
                     get = getattr(pool.dynlib, names[0], None)
                     set_ = getattr(pool.dynlib, names[1], None)
                     if get is not None and set_ is not None:

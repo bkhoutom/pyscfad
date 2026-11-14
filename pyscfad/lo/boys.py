@@ -174,7 +174,7 @@ class Boys(pyscf_boys.Boys):
             hx = numpy.dot(x.T, g0.T).conj()
             hx += numpy.einsum('xip,xi->pi', dip, numpy.einsum('qi,xiq->xi', x, dip)) * 2
             hx -= numpy.einsum('xpp,xip->pi', dip,
-                              numpy.dot(dip.reshape(-1, norb), x).reshape(3, norb, norb)) * 2
+                              numpy.dot(dip.reshape(-1, norb), x).reshape(dip.shape[0], norb, norb)) * 2
             hx -= numpy.einsum('xip,xp->pi', dip, numpy.einsum('qp,xpq->xp', x, dip)) * 2
             return -self.pack_uniq_var(hx-hx.conj().T) * 2
 
@@ -409,12 +409,13 @@ def _stabilize_boys(loc, u, sorted_idx, *, max_saddle_escapes=3):
 def _boys(x, mol, mo_coeff, *,
           init_guess=None,
           conv_tol=None, conv_tol_grad=None, max_cycle=None,
-          max_saddle_escapes=3):
+          max_saddle_escapes=3, _localizer_factory=None):
     if (not isinstance(max_saddle_escapes, (int, numpy.integer))
             or max_saddle_escapes < 0):
         raise ValueError('max_saddle_escapes must be a nonnegative integer')
     mo_coeff = numpy.array(mo_coeff, dtype=mo_coeff.dtype, order='C')
-    loc = Boys(mol, mo_coeff=mo_coeff)
+    factory = Boys if _localizer_factory is None else _localizer_factory
+    loc = factory(mol, mo_coeff=mo_coeff)
     if init_guess is not None:
         loc.init_guess = init_guess
     if conv_tol is not None:

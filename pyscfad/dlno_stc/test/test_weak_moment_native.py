@@ -37,10 +37,16 @@ def _dense_coordinate_reference(mol, atoms, seeds):
             if seed is None:
                 continue
             ncomp, nao = 3**rank, local.nao
-            weight = np.asarray(seed).reshape(ncomp, nao, nao)
+            # Select independent operator components directly in the dense
+            # reference, retaining both AO derivative legs.
+            from itertools import combinations_with_replacement
+            indices = [sum(axis * 3**(rank-k-1) for k, axis in enumerate(axes))
+                       for axes in combinations_with_replacement(range(3), rank)]
+            weight = np.asarray(seed).reshape(len(indices), nao, nao)
             bra = -np.asarray(local.intor(name + '_dr10')).reshape(3, ncomp, nao, nao)
             ket = -np.asarray(local.intor(name + '_dr01')).reshape(
                 ncomp, 3, nao, nao).transpose(1, 0, 2, 3)
+            bra, ket = bra[:, indices], ket[:, indices]
             for atom, (_, _, p0, p1) in zip(atoms, local.aoslice_by_atom()):
                 result[atom] += np.einsum('puv,xpuv->x', weight[:, p0:p1], bra[:, :, p0:p1])
                 result[atom] += np.einsum('puv,xpuv->x', weight[:, :, p0:p1], ket[:, :, :, p0:p1])

@@ -20,12 +20,15 @@ from pyscfad.lno.tools import fake_mol_by_atom, project_mo
 from pyscfad.tools import resource_profile
 from pyscfad.lib._compilation_cache import configure_compilation_cache
 from pyscfad.lib._multipole import (
-    coordinate_moment_jvp, endpoint_matches_reference,
+    symmetric_coordinate_moment_jvp, endpoint_matches_reference,
     pad_endpoint, crop_endpoint_cotangent,
     pair_energy as _multipole_pair_energy,
     pair_energy_and_grad, transition_moments,
 )
+from pyscfad.lib._cartesian_moments import cartesian_components
 from pyscfad.lib._weak_endpoint import prepare_endpoint, replay_endpoint
+
+_MOMENT_SLAB_BYTES = 32 * 1024**2
 
 
 class WeakScreen(NamedTuple):
@@ -163,43 +166,74 @@ def _fake_mol_with_traced_centers(mol, atmlst):
     return fake_mol
 
 
-def _raw_cartesian_moment_impl(fake_mol, rank):
-    """Evaluate an AO Cartesian moment about the fixed global origin."""
+def _packed_moment_integral(fake_mol, rank, *, bra_derivative=False):
+    """Pack shell-row slabs before retaining AO operators or their response.
+
+    Libcint still evaluates its standard component set within each slab.
+    The full redundant AO tensor is never allocated: higher-rank slabs are
+    limited to 32 MiB (or one shell), and only unique components leave this function.
+    Keeping the ordinary intor calls also preserves basis-parameter AD.
+    """
     nao = fake_mol.nao
-    intor = {2: 'int1e_rr', 3: 'int1e_rrr'}[rank]
+    intor = {0: 'int1e_ovlp', 1: 'int1e_r', 2: 'int1e_rr', 3: 'int1e_rrr'}[rank]
+    indices, _ = cartesian_components(rank)
+    ncart = 3**rank
+    if bra_derivative:
+        intor += '_dr10'
+        indices = (np.arange(3)[:, None] * ncart + indices).ravel()
+        ncart *= 3
+    # Overlap and dipoles have no redundant Cartesian components. Avoid
+    # packing copies and repeated slab calls, especially for order two.
+    if rank <= 1:
+        with fake_mol.with_common_origin((0.0, 0.0, 0.0)):
+            return jnp.asarray(fake_mol.intor(intor)).reshape(ncart, nao, nao)
+    ao_loc = fake_mol.ao_loc_nr()
+    rows = max(1, _MOMENT_SLAB_BYTES // max(8 * ncart * nao, 1))
+    packed = None
+    traced_blocks = []
     with fake_mol.with_common_origin((0.0, 0.0, 0.0)):
-        moment = jnp.asarray(fake_mol.intor(intor))
-    return moment.reshape((3,) * rank + (nao, nao))
+        start = 0
+        while start < fake_mol.nbas:
+            end = max(start + 1, int(np.searchsorted(ao_loc, ao_loc[start] + rows, side='right') - 1))
+            end = min(end, fake_mol.nbas)
+            p0, p1 = ao_loc[start], ao_loc[end]
+            block = fake_mol.intor(intor, shls_slice=(start, end, 0, fake_mol.nbas))
+            block = block.reshape(ncart, p1 - p0, nao)
+            if isinstance(block, jax.core.Tracer):
+                traced_blocks.append(block[indices])
+            else:
+                if packed is None:
+                    packed = np.empty((len(indices), nao, nao), dtype=block.dtype)
+                packed[:, p0:p1] = np.asarray(block)[indices]
+            del block
+            start = end
+    if traced_blocks:
+        return jnp.concatenate(traced_blocks, axis=1)
+    if packed is None:
+        packed = np.empty((len(indices), nao, nao))
+    return jnp.asarray(packed)
+
+
+def _raw_cartesian_moment_impl(fake_mol, rank):
+    """Unique Cartesian AO moments about the fixed global origin."""
+    return _packed_moment_integral(fake_mol, rank)
 
 
 def _raw_cartesian_moment_coordinate_jvp(fake_mol, coords_t, rank):
-    """Coordinate JVP with the Cartesian operator axes kept in order.
-
-    For ``int1e_rr[_r]_dr01`` libcint places the ket derivative axis after
-    the two or three Cartesian operator axes.  The generic two-centre
-    integral JVP treats it as the leading axis, which is only correct for a
-    scalar operator.  Keep the reordering local to the multipole operators
-    until the general integral rule supports arbitrary Cartesian rank.
-    """
+    """Packed coordinate JVP, using ket = bra transposed in AO indices."""
     nao = fake_mol.nao
-    intor = {2: 'int1e_rr', 3: 'int1e_rrr'}[rank]
-    ncart = 3 ** rank
-    with fake_mol.with_common_origin((0.0, 0.0, 0.0)):
-        bra = -jnp.asarray(fake_mol.intor(f'{intor}_dr10'))
-        ket = -jnp.asarray(fake_mol.intor(f'{intor}_dr01'))
-    bra = bra.reshape(3, ncart, nao, nao)
-    ket = ket.reshape(ncart, 3, nao, nao).transpose(1, 0, 2, 3)
+    bra = -_packed_moment_integral(fake_mol, rank, bra_derivative=True)
+    bra = bra.reshape(3, len(cartesian_components(rank)[0]), nao, nao)
 
     ao_owner = np.empty(nao, dtype=np.int32)
     for atom, (_, _, p0, p1) in enumerate(fake_mol.aoslice_by_atom()):
         ao_owner[p0:p1] = atom
-    tangent = coordinate_moment_jvp(bra, ket, coords_t, ao_owner)
-    return tangent.reshape((3,) * rank + (nao, nao))
+    return symmetric_coordinate_moment_jvp(bra, coords_t, ao_owner)
 
 
 @partial(jax.custom_jvp, nondiff_argnums=(1,))
 def _raw_cartesian_moment(fake_mol, rank):
-    """Cartesian moment with a rank-aware nuclear-coordinate JVP."""
+    """Packed Cartesian moment with a rank-aware nuclear-coordinate JVP."""
     return _raw_cartesian_moment_impl(fake_mol, rank)
 
 
@@ -245,8 +279,6 @@ def _origin_zero_moments(fake_mol, order):
     """
     nao = fake_mol.nao
     with fake_mol.with_common_origin((0.0, 0.0, 0.0)):
-        overlap = jnp.asarray(fake_mol.intor('int1e_ovlp')).reshape(nao, nao)
-        r = jnp.asarray(fake_mol.intor('int1e_r')).reshape(3, nao, nao)
         rr = None
         rrr = None
         # A plain PySCF Mole is not a registered JAX pytree, so it cannot be
@@ -260,6 +292,8 @@ def _origin_zero_moments(fake_mol, order):
             for name in ('coords', 'exp', 'ctr_coeff', 'r0')
         ):
             moment = _raw_cartesian_moment_impl
+        overlap = moment(fake_mol, 0).reshape(nao, nao)
+        r = moment(fake_mol, 1)
         if order >= 2:
             rr = moment(fake_mol, 2)
         if order >= 3:
@@ -320,6 +354,15 @@ def _origin_zero_moments_vjp(mf, atoms, order):
         with fake_mol.with_common_origin((0.0, 0.0, 0.0)):
             for rank, (name, weight) in enumerate(zip(names, raw_bar)):
                 if weight is not None:
+                    if rank >= 2:
+                        # The forward keeps one representative per symmetric
+                        # Cartesian component. Scatter its adjoint once into
+                        # libcint's full layout; replicating permutations would
+                        # overcount mixed components. This buffer is temporary.
+                        packed = np.asarray(weight)
+                        weight = np.zeros((3 ** rank, fake_mol.nao, fake_mol.nao),
+                                          dtype=packed.dtype)
+                        weight[cartesian_components(rank)[0]] = packed
                     # hermi=1 folds both AO legs itself; do not symmetrize
                     # the weights again. The native driver supplies the
                     # nuclear-coordinate minus sign and reduces to atoms.
@@ -359,7 +402,7 @@ def _multipole_orbital_data(mol, screen, atoms, order, *, ao_moments=None):
 def build_weak_multipole_screen(common, static, fragment_index, *, _pao_preprojection=None,
                                 _occupied_projection_rhs=None):
     """Replay saved primary supports/ranks with a normalized current target."""
-    from .domain import (_fixed_metric_orthonormalize, _fixed_semicanonicalize,
+    from .domain import (_fixed_metric_orthonormalize,
                          _rebuild_selected_pao_space)
     fragment = static.fragments[int(fragment_index)]
     if fragment.weak_virtual is None:
@@ -380,13 +423,20 @@ def build_weak_multipole_screen(common, static, fragment_index, *, _pao_preproje
             or len(keep) != 1):
         raise RuntimeError("Boys screening target rank changed; rebuild domains")
     occupied = occupied[:, keep] / jnp.sqrt(norm2[keep])[None, :]
-    occupied_energy = jnp.real(jnp.einsum('ui,uv,vi->i', occupied.conj(), fock, occupied))
     span = _fixed_metric_orthonormalize(occupied, overlap, fragment.weak_occ_span_metric_keep)
     virtual = _rebuild_selected_pao_space(
         common, fragment.weak_virtual, ao, span,
         boys_metric_threshold=static.thresholds.metric_rank,
         preprojection=_pao_preprojection,
     )
+    return _finish_weak_screen(occupied, virtual, fock, fragment_index)
+
+
+def _finish_weak_screen(occupied, virtual, fock, fragment_index):
+    """Semicanonicalize an already selected or replayed primary space."""
+    from .domain import _fixed_semicanonicalize
+    occupied = jnp.asarray(occupied)
+    occupied_energy = jnp.real(jnp.einsum('ui,uv,vi->i', occupied.conj(), fock, occupied))
     virtual_energy, virtual = _fixed_semicanonicalize(virtual, fock)
     gaps = np.asarray(jax.device_get(jax.lax.stop_gradient(virtual_energy[:, None] - occupied_energy)))
     if not np.isfinite(gaps).all() or np.any(gaps <= 0):
@@ -809,7 +859,8 @@ def _screen_pair_response(endpoints, static, forced, exact_scores, response):
 
 def screen_pairs(mf, common, static, model='multipole', force_full_domains=False,
                  *, prepared_endpoints=None, _products_preparation=None, _products=None,
-                 _pair_response=None, correlation_auxbasis=None):
+                 _pair_response=None, correlation_auxbasis=None, _reference_endpoints=None,
+                 _primary_preparations=None):
     """Concrete Boys pair classification on provisional primary selections.
 
     When supplied, ``prepared_endpoints`` is cleared and filled with each
@@ -818,10 +869,18 @@ def screen_pairs(mf, common, static, model='multipole', force_full_domains=False
     :func:`weak_pair_energy_and_grad` after the final strong mask is known.
     Private product inputs belong to the same reference: a preparation carries
     its ambient pullback; plain products serve forward-only selection.
+    ``_reference_endpoints`` reuses compact endpoints built from that same
+    forward selection's primary spaces. It must not replace response replay.
+    ``_primary_preparations`` transfers the live primary orbital reverse rules
+    constructed during selection, avoiding a second numerical space build.
     ``_pair_response`` receives the final weak energy and compact endpoint bars
     from the same pair evaluations used for classification.
     """
     model = str(model).lower().replace('_', '-')
+    if _reference_endpoints is not None and prepared_endpoints is not None:
+        raise ValueError('reference endpoints cannot replace response replay')
+    if _primary_preparations is not None and prepared_endpoints is None:
+        raise ValueError('primary response preparations require prepared endpoints')
     if model not in ('multipole', 'multipole-os', 'os-multipole', 'exact', 'all', 'all-strong'):
         raise ValueError(f"unsupported Boys pair energy model {model!r}")
     if prepared_endpoints is not None:
@@ -836,7 +895,11 @@ def screen_pairs(mf, common, static, model='multipole', force_full_domains=False
         return (np.zeros((nfrag, nfrag)), np.zeros((nfrag, nfrag)),
                 np.ones((nfrag, nfrag), dtype=bool), np.ones((nfrag, nfrag), dtype=bool))
     order = static.thresholds.multipole_order
-    if prepared_endpoints is None:
+    if _reference_endpoints is not None:
+        if set(_reference_endpoints) != set(range(nfrag)):
+            raise ValueError('reference endpoints must cover every fragment')
+        endpoints = [_reference_endpoints[index] for index in range(nfrag)]
+    elif prepared_endpoints is None:
         endpoints = [None] * nfrag
         products = _products if _products_preparation is None else _products_preparation[0]
         for index, screen in _forward_weak_screens(common, static, range(nfrag), products=products):
@@ -861,6 +924,14 @@ def screen_pairs(mf, common, static, model='multipole', force_full_domains=False
             fake_mol = _fake_mol_with_traced_centers(mf.mol, atoms)
             ao_moments = _origin_zero_moments(fake_mol, max(1, order - 1))
             for index in indices:
+                if _primary_preparations is not None and index in _primary_preparations:
+                    linearization = _primary_preparations.pop(index)
+                    endpoint = _weak_endpoint_from_screen(
+                        mf, linearization[0], static, index, ao_moments=ao_moments)
+                    prepared_endpoints[index] = endpoint, linearization
+                    endpoints[index] = pad_endpoint(endpoint)
+                    del endpoint, linearization
+                    continue
                 fragment = static.fragments[index]
                 key = _weak_pao_preprojection_key(fragment)
                 preparation = {}

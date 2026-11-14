@@ -69,6 +69,8 @@ def boys_water_dimer():
     mf.kernel()
     static = build_domain_selections(mf, frozen=2)
     common = domain.rebuild_domain_data(mf, static)
+    from pyscfad.dlno_stc import materialize_domain_selections
+    static = materialize_domain_selections(mf, static, common=common)
     return mf, common, static
 
 

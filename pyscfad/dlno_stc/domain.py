@@ -57,7 +57,9 @@ def select_system_boys_reference(mf, active_occ_indices, *, lo_kwargs=None):
     # standard derived gradient tolerance, and its localization response solve.
     options = {"init_guess": "atomic", "conv_tol": 1e-10,
                "gmres_options": {"restart": 120, "maxiter": 100}, **options}
-    localized = _build_boys_targets(mf.mol, occupied, options)
+    localized = (_build_boys_targets(mf.mol, occupied, options, fock=build_scf_data(mf)[1])
+                 if options.get('method') == 'lambda_boys' else
+                 _build_boys_targets(mf.mol, occupied, options))
     return SystemBoysReference(
         numpy.array(_host_array(localized), copy=True),
         numpy.array(_host_array(mf.mol.atom_coords()), copy=True),
@@ -252,7 +254,7 @@ def _polar_rotation_jvp(primals, tangents):
 
 
 # Boys replay and metric operations originated in dlno/dlno_base.py.
-def _rebuild_boys_targets(mf, occupied, static, *, _stationary=False):
+def _rebuild_boys_targets(mf, occupied, static, *, _stationary=False, fock=None):
     """Replay a saved Boys branch with the existing implicit-response wrapper.
 
     Differentiate the reference alignment, including the moving AO overlap.
@@ -278,6 +280,9 @@ def _rebuild_boys_targets(mf, occupied, static, *, _stationary=False):
     if singular.min() < 0.5:
         raise ValueError("Boys reference no longer spans the current occupied space; rebuild selections")
     options = dict(static.lo_kwargs or {})
+    lambda_mode = options.get('method') == 'lambda_boys'
+    if lambda_mode and fock is None:
+        fock = build_scf_data(mf)[1]
     # Rebase the optimizer at the reference-aligned occupied frame. Solving
     # for the small remaining rotation avoids nearly singular exponential
     # coordinates for a large canonical-to-local rotation. The polar factor
@@ -296,6 +301,11 @@ def _rebuild_boys_targets(mf, occupied, static, *, _stationary=False):
         if _stationary:
             from pyscfad.lo.boys import _boys_at_stationary_frame, BoysStationarityError
             try:
+                if lambda_mode:
+                    from pyscfad.lo.lambda_boys import at_stationary_frame
+                    return at_stationary_frame(mol, coeff, fock, **{
+                        key: options[key] for key in
+                        ('lambda_', 'conv_tol', 'conv_tol_grad', 'symmetry', 'gmres_options') if key in options})
                 return _boys_at_stationary_frame(mol, coeff, **{
                     key: options[key] for key in
                     ('conv_tol', 'conv_tol_grad', 'symmetry', 'gmres_options') if key in options})
@@ -303,7 +313,8 @@ def _rebuild_boys_targets(mf, occupied, static, *, _stationary=False):
                 # Only an uncertified root falls back to refinement. Keep
                 # response-solver and gauge failures visible to the caller.
                 pass
-        return _build_boys_targets(mol, coeff, options)
+        return (_build_boys_targets(mol, coeff, options, fock=fock) if lambda_mode else
+                _build_boys_targets(mol, coeff, options))
 
     localized = response(parent + '.boys_response_total', localize,
                          mf.mol, occupied @ _polar_rotation(projection))
@@ -419,9 +430,8 @@ def _rebuild_selected_pao_preprojection(
     support_ao = selection.support_ao_indices
     tmp = overlap_pao[numpy.ix_(support_ao, product_columns)] @ transform
     support_metric = s1e[numpy.ix_(support_ao, support_ao)]
-    projected_overlap = tmp.T.conj() @ np.linalg.solve(
-        support_metric, tmp
-    )
+    projected = np.linalg.solve(support_metric, tmp)
+    projected_overlap = tmp.T.conj() @ projected
     projected_overlap = 0.5 * (
         projected_overlap + projected_overlap.T.conj()
     )
@@ -436,6 +446,9 @@ def _rebuild_selected_pao_preprojection(
     if _all_columns(representation_ao, s1e.shape[0]):
         # The full-basis projection is identity, with no cancelling solve.
         return common.pao_coeff[:, columns] @ (transform @ rotation)
+    if numpy.array_equal(support_ao, representation_ao):
+        # Reuse the live solve, preserving its overlap/PAO response.
+        return projected @ rotation
     rhs = (overlap_pao[numpy.ix_(representation_ao, product_columns)] @ transform) @ rotation
     return np.linalg.solve(s1e[numpy.ix_(representation_ao, representation_ao)], rhs)
 
@@ -525,7 +538,9 @@ def _build_selection_reference(
     occupied, virtual = coeff[:, active_occ], coeff[:, active_vir]
     reference = SimpleNamespace(target_reference_coeff=reference_coeff,
                                 target_reference_coords=reference_coords, lo_kwargs=lo_kwargs)
-    targets = _rebuild_boys_targets(mf, occupied, reference, _stationary=True)
+    targets = (_rebuild_boys_targets(mf, occupied, reference, _stationary=True, fock=fock)
+               if (lo_kwargs or {}).get('method') == 'lambda_boys' else
+               _rebuild_boys_targets(mf, occupied, reference, _stationary=True))
     out = coeff[:, projected_out]
     raw = np.eye(overlap.shape[0], dtype=coeff.dtype) - out @ (out.T.conj() @ overlap)
     overlap_raw = overlap @ raw
@@ -555,7 +570,9 @@ def rebuild_domain_data(mf, static, *, scf_data=None):
     overlap, fock = build_scf_data(mf) if scf_data is None else scf_data
     mo_coeff, mo_energy = np.asarray(mf.mo_coeff), np.asarray(mf.mo_energy)
     occupied, virtual = (mo_coeff[:, indices] for indices in (static.active_occ_indices, static.active_vir_indices))
-    targets = (_rebuild_boys_targets(mf, occupied, static)
+    targets = ((_rebuild_boys_targets(mf, occupied, static, fock=fock)
+                if (static.lo_kwargs or {}).get('method') == 'lambda_boys' else
+                _rebuild_boys_targets(mf, occupied, static))
                if occupied.shape[1] else occupied)
     projected_out = mo_coeff[:, static.pao_projected_out_indices]
     pao = response('stc.domain.common_pullback.pao',
@@ -588,6 +605,11 @@ def build_boys_ed_frame(common, static, fragment_index, *, virtual_anchor_column
     if not isinstance(static, DomainSelections) or static.lo_type != "boys":
         raise TypeError("static must be STC Boys DomainSelections")
     fragment_index, fragment, ao, atoms = _fragment_support(static, fragment_index)
+    if fragment.strong_virtual is None and static.ed_selection_pending:
+        from ._ed_selection import select_boys_ed_frame
+        if virtual_anchor_columns is not None:
+            raise ValueError('pending ED selection cannot override virtual anchors')
+        return select_boys_ed_frame(common, static, fragment_index)[0]
     partners = numpy.asarray(fragment.strong_fragments)
     if (partners.ndim != 1 or partners.dtype.kind not in "iu" or len(set(partners.tolist())) != partners.size
             or numpy.any(partners < 0) or numpy.any(partners >= len(static.fragments))):

@@ -55,12 +55,16 @@ def molecule():
 
 
 def selection(mf):
-    from pyscfad.dlno_stc import BoysDomainThresholds, build_domain_selections
+    from pyscfad.dlno_stc import (BoysDomainThresholds, build_domain_selections,
+                                  materialize_domain_selections)
 
-    return build_domain_selections(
+    plan = build_domain_selections(
         mf, frozen=2, thresholds=BoysDomainThresholds(pair_energy=5e-5),
         lo_kwargs=LO_OPTIONS, frag_lolist=tuple((i,) for i in TARGET_ORDER),
     )
+    # These acceptance oracles perturb an explicitly fixed selection and
+    # report every saved rank/anchor, rather than running the lazy driver.
+    return materialize_domain_selections(mf, plan)
 
 
 def controls():

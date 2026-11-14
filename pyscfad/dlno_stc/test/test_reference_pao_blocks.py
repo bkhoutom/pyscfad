@@ -73,6 +73,7 @@ def _expanded_reference(
 
 @pytest.mark.parametrize('changed', [
     {}, {'parent_atoms': [1]}, {'support_atoms': [1]},
+    {'representation_atoms': [0]}, {'support_atoms': [0, 1]},
     {'representation_atoms': [1, 0]}, {'completeness_threshold': 2.},
     {'overlap_threshold': 2.},
 ])
@@ -92,8 +93,11 @@ def test_local_blocks_match_expanded_ao_algebra_without_global_coefficients(chan
         numpy.testing.assert_array_equal(x, y)
     # LAPACK eigenvector phases may change with the equivalent contraction
     # order. Compare the same retained columns after their independent signs.
-    signs = numpy.sign(numpy.sum(got[-1].conj() * want[-1], axis=0))
-    numpy.testing.assert_allclose(got[-1] * signs, want[-1], rtol=2e-11, atol=2e-12)
+    if len(got[1]) < args[0].nao:
+        signs = numpy.sign(numpy.sum(got[-1].conj() * want[-1], axis=0))
+        numpy.testing.assert_allclose(got[-1] * signs, want[-1], rtol=2e-11, atol=2e-12)
+    # Full support gives an identity projected metric: its degenerate
+    # eigenvectors may rotate, so only the retained subspace is defined.
     numpy.testing.assert_allclose(got[-1] @ got[-1].T.conj(),
                                   want[-1] @ want[-1].T.conj(), rtol=2e-11, atol=2e-12)
 

@@ -1,5 +1,5 @@
 Source: TEST_general/dlno_stc_test/stc_mp2_native/src_code_rdm_v2
-Native version: src_code_rdm_v2:427459d9b91fc70f:standalone-1
+Native version: src_code_rdm_v2:427459d9b91fc70f:standalone-2-w-eigenbasis
 Combined supplied directory SHA256 (sorted name + NUL + file bytes): 427459d9b91fc70fd4fc3ffed3dbb73b21201593ec3c81fcdee8f2ed89a2e21c
 
 SHA256 of all supplied v2 files:
@@ -21,10 +21,10 @@ d377011211bfdb11aa8d8222b93678e80673eeff55dd9bf07bbdb91285414de1  stc_mp2_stocha
 a775c22096afc21290c5a5dd2d172b4f924de384a4f6419bb854b116f493dbf8  stc_mp2_stochastic_w.h
 
 SHA256 of adapted native source files:
-ae028b5a2bcb1676ee00ec134da8d3be3ffb8c575abee3fbcf3bc6f44f155803  stc_mp2_deterministic_d_w.h
-776b9bf10a007596bfefbea82155f573e4c92e4f8282d1fc9d1717349149e0ca  stc_mp2_deterministic_energy.h
+9ed661020d90291075d05cdcecaaca199f9e0cf9f9a8f1088c489faf43fa7fa0  stc_mp2_deterministic_d_w.h
+4fa99037612d2a7bd55ad72c1fab584465625ea18b30f41fe39b77fb8267bfbd  stc_mp2_deterministic_energy.h
 1414da61595bc0674be42479f354881f2f6e1ad0e84e3e3d6a1dac9170923bbd  stc_mp2_gradient_numerical.cpp
-f174fde96e48f492698d842d7707609f3d55570b0864173230b9e8d6779db0f4  stc_mp2_kernel_helpers.h
+6c4f3eea0e1c1aed1c398a2a34bb5d86be29c7c9aaae10bc157934b1ba80dd8a  stc_mp2_kernel_helpers.h
 473f021ea697de2dbbf5536d344a627afe33c8916731696bfcc8faf9edb918da  stc_mp2_kernel_numerical.cpp
 20a5a520d3f4b748a67735faa36f104620d2cb6f2546ce6517e327dd91851410  stc_mp2_kernel_qchem.h
 fd2f3013608ec3293dfea4f42084ad264b61fd28eb6cf11fb7a0507f1357dfe9  stc_mp2_selected_energy.h
@@ -32,9 +32,21 @@ fd2f3013608ec3293dfea4f42084ad264b61fd28eb6cf11fb7a0507f1357dfe9  stc_mp2_select
 1179608573466fc102196263118a47093a349554f1c01342bbc2425cbd4159b8  stc_mp2_stochastic_density.h
 a775c22096afc21290c5a5dd2d172b4f924de384a4f6419bb854b116f493dbf8  stc_mp2_stochastic_w.h
 
-Standalone adaptations (same as preserved Part 1):
-- Five public numerical headers are byte-identical to v2: deterministic_energy,
-  deterministic_d_w, stochastic_w, selected_energy, selected_energy_density.
+Standalone adaptations:
+- Three public numerical headers are byte-identical to v2: stochastic_w,
+  selected_energy, selected_energy_density.
+- deterministic_energy shares propagated factors and reverse accumulation
+  across selected targets with a bounded bare-Gram cache.
+- deterministic_d_w uses a virtual eigenbasis for W, two spin-adapted virtual
+  products and their adjoint, and rotates outputs/cotangents back once. The
+  original W path remains available internally for numerical validation.
+  The pullback releases primal amplitudes after seeding, releases dead adjoint/DF
+  caches after propagation, and reuses C for the final DF-gradient rotation.
+  The adapter consumes its private DF input with an in-place panel rotation;
+  const-input C++ callers retain the copying path.
+- kernel_helpers optionally retains virtual eigenbasis factors and diagonal
+  propagators; its Frechet pullback retains off-diagonal Fock derivatives and
+  uses stable divided differences at repeated eigenvalues.
 - kernel_qchem.h omits Q-Chem basis include/setup, uses standalone array
   construction and explicit seed/domain tau. Original v1/v2 headers identical.
 - kernel_numerical.cpp retains source from estimate_n_sample to namespace
@@ -47,7 +59,9 @@ Standalone adaptations (same as preserved Part 1):
   without QCHEM_SAMPLE_THREADS. V2 spectral getters retained verbatim.
 - stochastic_density uses dense cotangent buffers, independent of
   QCHEM_STC_SPARSE_COTANGENT. All other numerical source text retained.
-No contractions, signs, prefactors, allocation, RNG, or replay rules changed.
+W contraction ordering and workspace allocation are optimized; its finite-grid
+functional, signs and prefactors are unchanged. RNG and sampling rules are unchanged.
+The native replay version is advanced to identify the optimized implementation.
 Energy pilot counts 100000/1000000 and minimum production 10000 retained.
 Native seed maps uint64 to unsigned by low32 XOR high32.
 

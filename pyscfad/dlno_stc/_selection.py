@@ -122,6 +122,8 @@ class DomainSelections:
     physical_groups: tuple[tuple[int, ...], ...] = ()
     correlation_basis_identity: str | None = None
     domain_convention: str = "individual-partners-pair4-pcd-aux-v2"
+    ed_selection_pending: bool = False
+    ao_atom_slices: object = None
 
     def __post_init__(self):
         # Synthetic new selections retain the historical singleton default.
@@ -257,6 +259,10 @@ def _strong_preparation_key(static, fragment, index, labels):
         _grouping_indices(fragment.pao_center_atoms, natm, "PAO center atoms"),
     )
     selection = fragment.strong_virtual
+    if selection is None and getattr(static, 'ed_selection_pending', False):
+        if fragment.virtual_anchor_columns is not None:
+            raise ValueError('pending ED selection cannot contain virtual anchors')
+        return ('pending', partners, candidates, keep, supports), candidates, slot
     if not isinstance(selection, FixedPAOSubspaceSelection):
         raise ValueError(f"Boys domain {index} must retain its strong PAO selection")
     parent = _grouping_indices(selection.parent_columns,
@@ -402,15 +408,23 @@ def _reference_pao_preprojection(
                  / numpy.sqrt(numpy.real(gram_e[canonical_keep]))[None, :])
     tmp = overlap_pao[numpy.ix_(support_ao, product_columns)] @ transform
     support_metric = overlap[numpy.ix_(support_ao, support_ao)]
-    projected_overlap = tmp.T.conj() @ numpy.linalg.solve(support_metric, tmp)
+    projected = numpy.linalg.solve(support_metric, tmp)
+    projected_overlap = tmp.T.conj() @ projected
     _, overlap_v, overlap_keep = _eigh_keep_numpy(projected_overlap, overlap_threshold)
     transform = transform @ overlap_v[:, overlap_keep]
     if not overlap_keep.size:
         return (parent_columns, support_ao, representation_ao, canonical_keep,
                 overlap_keep, empty, numpy.zeros((representation_ao.size, 0), dtype=gram.dtype))
-    rhs = overlap_pao[numpy.ix_(representation_ao, product_columns)] @ transform
-    local_metric = overlap[numpy.ix_(representation_ao, representation_ao)]
-    candidate = numpy.linalg.solve(local_metric, rhs)
+    if numpy.array_equal(support_ao, representation_ao):
+        # ED support and representation coincide. Rotate the projection that
+        # was already solved above instead of solving the same metric again.
+        rotation = overlap_v[:, overlap_keep]
+        rhs = tmp @ rotation
+        candidate = projected @ rotation
+    else:
+        rhs = overlap_pao[numpy.ix_(representation_ao, product_columns)] @ transform
+        local_metric = overlap[numpy.ix_(representation_ao, representation_ao)]
+        candidate = numpy.linalg.solve(local_metric, rhs)
     completeness = numpy.real(numpy.sum(candidate.conj() * rhs, axis=0))
     completeness_keep = numpy.where(completeness > completeness_threshold)[0].astype(numpy.int32)
     return (parent_columns, support_ao, representation_ao, canonical_keep,
@@ -595,15 +609,29 @@ def _resolve_boys_options(lo_kwargs):
     if not isinstance(lo_kwargs, Mapping):
         raise TypeError("lo_kwargs must be a mapping or None")
     allowed = {"init_guess", "conv_tol", "conv_tol_grad", "max_cycle", "symmetry", "gmres_options",
-               "max_saddle_escapes"}
+               "max_saddle_escapes", "method", "lambda_"}
     unknown = set(lo_kwargs) - allowed
     if unknown:
         raise ValueError(f"unsupported boys localization options: {sorted(unknown)}")
+    method = lo_kwargs.get('method', 'boys')
+    if method not in ('boys', 'lambda_boys'):
+        raise ValueError('localization method must be boys or lambda_boys')
+    if 'lambda_' in lo_kwargs:
+        if method != 'lambda_boys':
+            raise ValueError('lambda_ requires method=lambda_boys')
+        from pyscfad.lo.lambda_boys import _weight
+        _weight(lo_kwargs['lambda_'])
     return deepcopy(dict(sorted(lo_kwargs.items())))
 
 
-def _build_boys_targets(mol, occupied, lo_kwargs):
-    return boys(mol, occupied, **_resolve_boys_options(lo_kwargs))
+def _build_boys_targets(mol, occupied, lo_kwargs, *, fock=None):
+    options = _resolve_boys_options(lo_kwargs)
+    if options.pop('method', 'boys') == 'lambda_boys':
+        from pyscfad.lo.lambda_boys import lambda_boys
+        if fock is None:
+            raise ValueError('lambda-Boys requires the current AO Fock')
+        return lambda_boys(mol, occupied, fock, **options)
+    return boys(mol, occupied, **options)
 
 
 def _validate_boys_target_groups(frag_lolist, nocc):
@@ -705,17 +733,20 @@ def build_domain_selections(
     frag_lolist=None, pair_energy_model="multipole", force_full_domains=False,
     boys_grouping="singleton", correlation_auxbasis=None,
 ):
-    """Select Boys domains, occupied labels, virtual ranks and fixed anchors.
+    """Select the global pair graph and lightweight fragment domain plans.
 
     Fragment order is independent of global Boys column order. Thresholds,
-    ranks, graph and pivots are chosen only from concrete reference data.
+    graph are chosen from concrete reference data. ED ranks and QR anchors
+    are finalized from the current reference when each fragment is prepared.
     ``boys_grouping="atom"`` shares strong frames within Löwdin atom groups;
     weak screens and target records remain individual occupied orbitals.
     ``boys_grouping="molecule"`` automatically uses full molecular domains
     and puts every active occupied target in one physical fragment.
     """
     from .domain import DomainData, TargetOccupiedData, build_scf_data
-    from ._pairs import screen_pairs, _WeakScreenProducts
+    from ._pairs import (screen_pairs, _WeakScreenProducts, _finish_weak_screen,
+                         _multipole_orbital_data, _origin_zero_moments,
+                         _fake_mol_with_traced_centers, pad_endpoint)
     from ._df_basis import basis_kwargs, basis_identity, selection_auxbasis
 
     correlation_auxbasis = selection_auxbasis(mf, correlation_auxbasis)
@@ -754,7 +785,10 @@ def build_domain_selections(
     occupied, virtual = (_host_array(mf.mo_coeff)[:, indices] for indices in (active_occ, active_vir))
     if not active_occ.size or not active_vir.size:
         raise ValueError("Boys domains require active occupied and virtual spaces")
-    targets = _host_array(_build_boys_targets(mol, occupied, options) if target_coeff is None else target_coeff)
+    targets = _host_array((_build_boys_targets(mol, occupied, options, fock=fock)
+                          if options.get('method') == 'lambda_boys' else
+                          _build_boys_targets(mol, occupied, options))
+                         if target_coeff is None else target_coeff)
     if numpy.iscomplexobj(targets):
         raise NotImplementedError("Boys targets must be real")
     if (targets.shape != occupied.shape or not numpy.isfinite(targets).all()
@@ -815,9 +849,41 @@ def build_domain_selections(
                 primary_bp[i], primary[i] = common_bp, common_primary
         primary_bp, primary = tuple(primary_bp), tuple(primary)
     empty = numpy.zeros(0, dtype=numpy.int32)
-    fragments = []
+    fragments = [None] * nfrag
+    reuse_primary = (response is None and not force_full_domains
+                     and thresholds.pair_energy > 0 and model not in ('all', 'all-strong'))
+    prepare_primary_response = (response is not None and not force_full_domains
+                               and thresholds.pair_energy > 0
+                               and model not in ('all', 'all-strong'))
+    primary_preparations = {} if prepare_primary_response else None
+    reference_endpoints = dict.fromkeys(range(nfrag)) if reuse_primary else None
+    # Visit equal supports together so only one set of raw AO moments and its
+    # preprojections remain live. Fragment IDs and pair ordering stay unchanged.
+    primary_supports = {}
+    for i, atoms in enumerate(primary):
+        primary_supports.setdefault(tuple(int(a) for a in atoms), []).append(i)
+    primary_order = [i for indices in primary_supports.values() for i in indices]
+    last_support = ao_moments = None
     pao_preprojections = {}
-    for i, group in enumerate(groups):
+    for i in primary_order:
+        group = groups[i]
+        support = tuple(int(a) for a in primary[i])
+        if support != last_support:
+            ao_moments = None
+            pao_preprojections.clear()
+            last_support = support
+        if prepare_primary_response:
+            from ._primary_response import prepare_primary
+            ao, norm_keep, span_keep, weak_virtual, preparation = prepare_primary(
+                common, response.products_preparation, mol, ao2pao, thresholds,
+                i, primary_bp[i], primary[i], pao_preprojections)
+            if preparation is not None:
+                primary_preparations[i] = preparation
+            fragments[i] = FragmentDomainSelection(
+                i, group.copy(), None, empty, empty, empty, empty, empty, None,
+                primary[i], ao, primary_bp[i], norm_keep, span_keep, weak_virtual, -1)
+            del preparation
+            continue
         ao = tools.ao_index_by_atom(mol, primary[i]).astype(numpy.int32)
         s22 = overlap[numpy.ix_(ao, ao)]
         raw_occ = numpy.linalg.solve(s22, overlap_targets[numpy.ix_(ao, group)])
@@ -836,9 +902,20 @@ def build_domain_selections(
             )
             if not weak_coeff.shape[1]:
                 weak_virtual = None
-        fragments.append(FragmentDomainSelection(i, group.copy(), None, empty, empty, empty, empty, empty,
-                        None, primary[i], ao, primary_bp[i], norm_keep, span_keep, weak_virtual, -1))
-    del pao_preprojections
+            elif reuse_primary:
+                if ao_moments is None:
+                    ao_moments = _origin_zero_moments(
+                        _fake_mol_with_traced_centers(mol, support),
+                        max(1, thresholds.multipole_order - 1))
+                screen = _finish_weak_screen(
+                    normalized, weak_coeff, fock[numpy.ix_(ao, ao)], i)
+                reference_endpoints[i] = pad_endpoint(_multipole_orbital_data(
+                    mol, screen, support, thresholds.multipole_order, ao_moments=ao_moments))
+                del screen
+            del weak_coeff
+        fragments[i] = FragmentDomainSelection(i, group.copy(), None, empty, empty, empty, empty, empty,
+                        None, primary[i], ao, primary_bp[i], norm_keep, span_keep, weak_virtual, -1)
+    del pao_preprojections, ao_moments
     if common is None:
         common = DomainData(overlap, fock, occupied, virtual,
                             _host_array(mf.mo_energy)[active_occ], _host_array(mf.mo_energy)[active_vir], targets,
@@ -865,60 +942,37 @@ def build_domain_selections(
         **basis_kwargs(correlation_auxbasis),
         **({'prepared_endpoints': endpoints,
             '_pair_response': pair_response,
-            '_products_preparation': response.products_preparation}
-           if response is not None else {'_products': products}))
+            '_products_preparation': response.products_preparation,
+            '_primary_preparations': primary_preparations}
+           if response is not None else {'_products': products,
+                                        '_reference_endpoints': reference_endpoints}))
+    del reference_endpoints
+    if primary_preparations is not None:
+        primary_preparations.clear()
     if boys_grouping == "atom":
         strong = _group_domain_mask(strong, physical_groups)
     if response is not None:
         response.complete_weak(static, strong, endpoints, pair_response)
     fragments = list(static.fragments)
-    strong_frames = {}
     for members in physical_groups:
         i = int(members[0])
         partners = numpy.flatnonzero(strong[i]).astype(numpy.int32)
-        if numpy.count_nonzero(partners == i) != 1:
-            raise RuntimeError(f"Boys domain {i} must include its target exactly once")
         centers = _union_index_lists([compact[p] for p in partners])
         atoms = _union_index_lists([tight[p] for p in partners])
-        # Ordered partners and supports determine the complete strong frame;
-        # the central target slot and weak records do not enter its build.
-        frame_key = tuple(
-            tuple(int(index) for index in indices)
-            for indices in (partners, centers, atoms)
-        )
-        if frame_key not in strong_frames:
-            ao = tools.ao_index_by_atom(mol, atoms).astype(numpy.int32)
-            s22 = overlap[numpy.ix_(ao, ao)]
-            candidate_columns = numpy.concatenate([groups[p] for p in partners])
-            projected = numpy.linalg.solve(
-                s22, overlap_targets[numpy.ix_(ao, candidate_columns)])
-            occupied_local, keep = _reference_metric_space(projected, s22, thresholds.metric_rank)
-            if keep.size != partners.size:
-                raise RuntimeError(f"Boys domain {i} loses occupied target/partner labels; rebuild domains with tighter support")
-            selection, coeff = _reference_pao_overlap_selection(
-                mol, pao_coeff, ao2pao, overlap, parent_atoms=centers, support_atoms=atoms, representation_atoms=atoms,
-                completeness_threshold=thresholds.ed_pao, overlap_threshold=thresholds.domain_pao,
-                occupied_for_projection=occupied_local, metric_threshold=thresholds.metric_rank,
-                pao_products=pao_products,
-            )
-            if not coeff.shape[1]:
-                raise RuntimeError(f"Boys domain {i} has no retained virtual space; rebuild domains")
-            anchors = _select_virtual_anchor_columns(
-                coeff, overlap[ao], pao_coeff, selection.parent_columns,
-            )
-            strong_frames[frame_key] = ao, keep, selection, anchors
-        ao, keep, selection, anchors = strong_frames[frame_key]
+        ao = tools.ao_index_by_atom(mol, atoms).astype(numpy.int32)
         for member in members:
             member = int(member)
             slots = numpy.flatnonzero(partners == member)
             if slots.size != 1:
                 raise RuntimeError(f"Boys domain {member} must include its target exactly once")
-            fragments[member] = replace(fragments[member], strong_fragments=partners,
-                                       extended_atoms=atoms, extended_ao_indices=ao,
-                                       pao_center_atoms=centers, strong_occ_metric_keep=keep,
-                                       strong_virtual=selection, target_index=int(slots[0]),
-                                       virtual_anchor_columns=anchors)
-    static = replace(static, fragments=tuple(fragments), strong_mask=strong, pair_energy=pair,
+            fragments[member] = replace(
+                fragments[member], strong_fragments=partners, extended_atoms=atoms,
+                extended_ao_indices=ao, pao_center_atoms=centers,
+                strong_occ_metric_keep=numpy.arange(len(partners), dtype=numpy.int32),
+                strong_virtual=None, target_index=int(slots[0]), virtual_anchor_columns=None)
+    static = replace(static, fragments=tuple(fragments), ed_selection_pending=True,
+                     ao_atom_slices=mol.aoslice_by_atom()[:, 2:].copy(),
+                     strong_mask=strong, pair_energy=pair,
                      weak_pair_energy=weak_pair, forced_strong_mask=forced)
     if response is not None:
         response.bind(static)

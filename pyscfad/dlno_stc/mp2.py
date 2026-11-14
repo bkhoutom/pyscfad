@@ -154,6 +154,11 @@ def export_run(mf, static, workdir, *, controls, reporter=None, merge_identical=
     correlation = basis_kwargs(correlation_auxbasis)
     _validate_reference(mf, static, **correlation)
     controls = _driver_controls(controls, scope="domain")
+    # Portable packets need a complete immutable metadata identity before
+    # writing any requests. Ordinary in-process calculations remain streamed.
+    if static.ed_selection_pending:
+        from ._ed_selection import materialize_domain_selections
+        static = materialize_domain_selections(mf, static)
     groups = build_domain_groups(static, merge_identical=merge_identical)
     effective = allocate_domain_controls(controls, len(groups))
     budget = _budget(controls, effective, static, groups)
@@ -263,6 +268,14 @@ def imported_value_and_grad(mol, build_mf, static, packet_loader, *,
     initial_controls = packet[2] if packet is not None else driver._driver_controls({})
     state = driver._initialize(mf, static, initial_controls, with_grad=True,
                                scf_pullback=scf_pullback, **correlation)
+    if static.ed_selection_pending:
+        # Export resolves a fresh ED plan before recording packet identity.
+        # Accept the caller's original plan on import as well, using the
+        # already-built common reference and validating the resolved identity.
+        from ._ed_selection import materialize_domain_selections
+        static = materialize_domain_selections(mf, static, common=state['common'])
+        state['static'] = static
+        groups = build_domain_groups(static, merge_identical=merge_identical)
     # State owns the only reference to the tape when _finish consumes it.
     del scf_pullback
     identity = _run_identity(mf, static, groups, **correlation)

@@ -281,6 +281,12 @@ def _encode_value(value, writer=None, *, require_registered_dataclass=True):
                     require_registered_dataclass=require_registered_dataclass,
                 )]
                 for field in dataclasses.fields(value)
+                # Preserve the digest of fully selected checkpoints written
+                # before deferred ED plans existed. Their default plan fields
+                # carry no additional scientific data.
+                if not (type(value).__name__ == 'DomainSelections' and (
+                    (field.name == 'ed_selection_pending' and not value.ed_selection_pending)
+                    or (field.name == 'ao_atom_slices' and value.ao_atom_slices is None)))
                 # Preserve pre-override checkpoint bytes/digests for None.
                 if not (type(value).__name__ in ('DomainSelections', 'CCSDSelections')
                         and field.name == 'correlation_basis_identity'
@@ -428,9 +434,11 @@ def _decode_value(node, reader):
                 f"legacy {cls.__name__} checkpoint lacks current domain/physical fragment metadata. "
                 "Rebuild selections and checkpoints; migration is unsupported."
             )
-        compatible = (tuple(name for name in expected if name != 'correlation_basis_identity')
-                      if cls.__name__ in ('DomainSelections', 'CCSDSelections') else expected)
-        if names not in (expected, compatible):
+        optional = ({'correlation_basis_identity', 'ed_selection_pending', 'ao_atom_slices'}
+                    if cls.__name__ == 'DomainSelections' else
+                    {'correlation_basis_identity'} if cls.__name__ == 'CCSDSelections' else set())
+        compatible = tuple(name for name in expected if name in names or name not in optional)
+        if names != compatible:
             raise RestartCorruptionError(
                 f"dataclass {tag} fields changed: {names} != {expected}"
             )

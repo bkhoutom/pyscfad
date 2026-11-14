@@ -270,11 +270,17 @@ def estimate_matrix_memory(naux, nocc, nvir, ntarget, controls, *, matrix_kind,
         breakdown['total_bytes'] = breakdown['output_buffers']
         return breakdown
     # Selected amplitudes, reverse amplitudes, and single-target spin/Gram
-    # cubes. W's seed additionally needs bare and adjoint Gram cubes.
+    # cubes. Deterministic W uses no spin-amplitude cube in either pass.
     if settings['mode'] == 'deterministic':
-        extra = (4 if matrix_kind == 'W' else 2) if with_grad else 1
+        extra = ((3 if with_grad else 0) if matrix_kind == 'W'
+                 else (2 if with_grad else 1))
+        # W rotates the adapter's private input DF in place and reuses C for
+        # its final gradient rotation. Neither rotation adds a full factor.
         breakdown['amplitude_buffers'] = ((2 if with_grad else 1) * batch + extra) * single_amplitude
-        breakdown['scratch'] = 8 * threads * (6 * nvir * nvir + 2 * naux * nvir)
+        # Occupied W batches up to four spin-Gram columns per worker for
+        # GEMM reuse. Reserve this panel in addition to existing scratch.
+        panel = min(4, max(1, nocc // threads)) if matrix_kind == 'W' else 0
+        breakdown['scratch'] = 8 * threads * ((6 + panel) * nvir * nvir + 2 * naux * nvir)
     else:
         points = min(len(settings['laplace_roots']), settings['resident_points']) if matrix_kind == 'D' else 2
         ngroup = ((naux + settings['auxiliary_group_size'] - 1) // settings['auxiliary_group_size']

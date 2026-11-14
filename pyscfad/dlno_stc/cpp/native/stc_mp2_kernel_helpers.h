@@ -266,6 +266,12 @@ struct reverse_propagation_timing {
 // arrays. A shared shift bounds both exponentials in a gapped SCF.
 class propagator {
     const arma::mat& bare_;
+    // Optional computational frame for deterministic W. This is a fixed change
+    // of coordinates in the pullback, not a differentiated eigendecomposition.
+    bool virtual_eigenbasis_;
+    arma::mat eigenbasis_bare_;
+    arma::mat* consumable_bare_;
+    std::vector<arma::vec> virtual_scales_;
     size_t no_, nv_;
     int threads_;
     arma::vec occupied_eigenvalues_, virtual_eigenvalues_, beta_;
@@ -284,15 +290,8 @@ class propagator {
         }
         return answer;
     }
-    static arma::mat exponential_vjp(const arma::vec& eigenvalues,
-            const arma::mat& eigenvectors,const arma::mat& eigenvectors_t,
-            double coefficient,double shift,const arma::mat& adjoint,int threads) {
-        const arma::mat symmetric=0.5*(adjoint+adjoint.t());
-        const bool parallel=threads>1 && eigenvalues.n_elem>=512;
-        const arma::mat eigen_adjoint=parallel
-            ? multiply_panels(multiply_panels(eigenvectors_t,symmetric,threads),
-                eigenvectors,threads)
-            : eigenvectors_t*symmetric*eigenvectors;
+    static arma::mat exponential_divided(const arma::vec& eigenvalues,
+            double coefficient,double shift,const arma::mat& eigen_adjoint) {
         arma::mat divided(eigenvalues.n_elem,eigenvalues.n_elem);
         for (size_t p=0;p<eigenvalues.n_elem;++p) {
             for (size_t q=0;q<eigenvalues.n_elem;++q) {
@@ -303,18 +302,73 @@ class propagator {
                     *(gap==0 ? 1.0 : -std::expm1(-gap)/gap);
             }
         }
+        return divided % eigen_adjoint;
+    }
+    static arma::mat exponential_vjp(const arma::vec& eigenvalues,
+            const arma::mat& eigenvectors,const arma::mat& eigenvectors_t,
+            double coefficient,double shift,const arma::mat& adjoint,int threads) {
+        const arma::mat symmetric=0.5*(adjoint+adjoint.t());
+        const bool parallel=threads>1 && eigenvalues.n_elem>=512;
+        const arma::mat eigen_adjoint=parallel
+            ? multiply_panels(multiply_panels(eigenvectors_t,symmetric,threads),
+                eigenvectors,threads)
+            : eigenvectors_t*symmetric*eigenvectors;
+        const arma::mat divided=exponential_divided(eigenvalues,coefficient,shift,eigen_adjoint);
         const arma::mat result=parallel
             ? multiply_panels(multiply_panels(eigenvectors,
-                divided%eigen_adjoint,threads),eigenvectors_t,threads)
-            : eigenvectors*(divided%eigen_adjoint)*eigenvectors_t;
+                divided,threads),eigenvectors_t,threads)
+            : eigenvectors*divided*eigenvectors_t;
         return 0.5*(result+result.t());
     }
 public:
+    const arma::mat& factors() const {
+        if (consumable_bare_) return *consumable_bare_;
+        return virtual_eigenbasis_ ? eigenbasis_bare_ : bare_;
+    }
+    arma::mat virtual_frame(const arma::mat& matrix,bool to_eigenbasis) const {
+        if (!virtual_eigenbasis_) return matrix;
+        const auto& left=to_eigenbasis ? virtual_eigenvectors_t_ : virtual_eigenvectors_;
+        const auto& right=to_eigenbasis ? virtual_eigenvectors_ : virtual_eigenvectors_t_;
+        const arma::mat rotated=multiply_panels(multiply_panels(left,matrix,threads_),right,threads_);
+        return 0.5*(rotated+rotated.t());
+    }
+    // Each task reads and writes disjoint rows across one complete virtual
+    // block. Materializing only that panel makes in-place rotation safe and
+    // retains the allocation for both the input DF and final pullback scratch.
+    void rotate_factors(const arma::mat& input,arma::mat& result,bool to_eigenbasis) const {
+        result.set_size(input.n_rows,input.n_cols);
+        const auto& rotation=to_eigenbasis ? virtual_eigenvectors_ : virtual_eigenvectors_t_;
+        const size_t rows=std::max(size_t(1),size_t(8*1024*1024)/(8*nv_));
+        const size_t panels=(input.n_rows+rows-1)/rows;
+        #pragma omp parallel for num_threads(threads_) schedule(static)
+        for (size_t task=0;task<no_*panels;++task) {
+            const size_t i=task/panels,first=(task%panels)*rows;
+            const size_t last=std::min(size_t(input.n_rows),first+rows)-1;
+            const arma::mat block(const_cast<double*>(input.colptr(i*nv_)),input.n_rows,nv_,false,true);
+            arma::mat output(result.colptr(i*nv_),input.n_rows,nv_,false,true);
+            const arma::mat rotated=block.rows(first,last)*rotation;
+            output.rows(first,last)=rotated;
+        }
+    }
+    arma::mat rotate_factors(const arma::mat& input,bool to_eigenbasis) const {
+        arma::mat result;
+        rotate_factors(input,result,to_eigenbasis);
+        return result;
+    }
+    void release_eigenbasis_factors() {
+        if (consumable_bare_) consumable_bare_->reset();
+        else eigenbasis_bare_.reset();
+    }
     const arma::vec& occupied_spectrum() const { return occupied_eigenvalues_; }
     const arma::vec& virtual_spectrum() const { return virtual_eigenvalues_; }
     propagator(const arma::mat& fo, const arma::mat& fv, const arma::mat& bare,
-               const arma::vec& beta, int threads): bare_(bare), no_(fo.n_rows),
+               const arma::vec& beta, int threads, bool virtual_eigenbasis=false,
+               arma::mat* consumable_bare=nullptr):
+               bare_(bare), virtual_eigenbasis_(virtual_eigenbasis),
+               consumable_bare_(consumable_bare), no_(fo.n_rows),
                nv_(fv.n_rows), threads_(threads), beta_(beta) {
+        if (consumable_bare_ && (!virtual_eigenbasis_ || consumable_bare_!=&bare_))
+            throw std::invalid_argument("Consumable DF must be the W input buffer");
         if (!arma::eig_sym(occupied_eigenvalues_,occupied_eigenvectors_,fo) ||
             !arma::eig_sym(virtual_eigenvalues_,virtual_eigenvectors_,fv) ||
             virtual_eigenvalues_.min()<=occupied_eigenvalues_.max())
@@ -322,10 +376,14 @@ public:
         occupied_eigenvectors_t_=occupied_eigenvectors_.t();
         virtual_eigenvectors_t_=virtual_eigenvectors_.t();
         shift_=(occupied_eigenvalues_.max()+virtual_eigenvalues_.min())/2;
+        if (consumable_bare_) rotate_factors(*consumable_bare_,*consumable_bare_,true);
+        else if (virtual_eigenbasis_) eigenbasis_bare_=rotate_factors(bare_,true);
         for (double t : beta) {
             occupied_.push_back(occupied_eigenvectors_*
                 arma::diagmat(arma::exp(t*(occupied_eigenvalues_-shift_)))*occupied_eigenvectors_.t());
-            virtuals_.push_back(virtual_eigenvectors_*
+            if (virtual_eigenbasis_)
+                virtual_scales_.push_back(arma::exp(-t*(virtual_eigenvalues_-shift_)));
+            else virtuals_.push_back(virtual_eigenvectors_*
                 arma::diagmat(arma::exp(-t*(virtual_eigenvalues_-shift_)))*virtual_eigenvectors_.t());
         }
     }
@@ -334,7 +392,7 @@ public:
         c.set_size(bare_.n_rows,bare_.n_cols);
         if (timing) timing->allocation_seconds=omp_get_wtime()-start;
         start=omp_get_wtime();
-        const arma::mat input(const_cast<double*>(bare_.memptr()),bare_.n_rows*nv_,no_,false,true);
+        const arma::mat input(const_cast<double*>(factors().memptr()),bare_.n_rows*nv_,no_,false,true);
         arma::mat view(c.memptr(), c.n_rows*nv_, no_, false, true);
         // Read B and write the occupied-rotated C directly: no full B->C copy.
         // Each worker owns disjoint rows and about 2 MiB per packed/result panel.
@@ -349,6 +407,13 @@ public:
     }
     void rotate_virtual(size_t point, arma::mat& c, propagation_timing* timing=nullptr) const {
         double start=omp_get_wtime();
+        if (virtual_eigenbasis_) {
+            #pragma omp parallel for num_threads(threads_) schedule(static)
+            for (size_t col=0;col<c.n_cols;++col)
+                c.col(col)*=virtual_scales_[point](col%nv_);
+            if (timing) timing->virtual_seconds=omp_get_wtime()-start;
+            return;
+        }
         // About 8 MiB per packed/result panel per worker. Larger GEMMs amortize
         // packing the virtual rotation; at 32 threads the two panels use <=512 MiB.
         const size_t rows=std::max(size_t(1),size_t(8*1024*1024)/(8*nv_));
@@ -402,7 +467,9 @@ public:
                 // The occupied-only factor is no longer needed after its Gram
                 // contribution. Reuse it for the rotated cotangent, leaving
                 // gamma untouched (and potentially sparse in physical memory).
-                d=g*virtuals_[point];
+                if (virtual_eigenbasis_) {
+                    for (size_t a=0;a<nv_;++a) d.col(a)=g.col(a)*virtual_scales_[point](a);
+                } else d=g*virtuals_[point];
                 if (timing) local_rotate+=omp_get_wtime()-rotate_tick;
             }
             #pragma omp critical
@@ -416,7 +483,7 @@ public:
             timing->virtual_gram_seconds+=virtual_gram/double(threads_);
             timing->virtual_rotate_seconds+=virtual_rotate/double(threads_);
         }
-        const arma::mat input(const_cast<double*>(bare_.memptr()),bare_.n_rows*nv_,no_,false,true);
+        const arma::mat input(const_cast<double*>(factors().memptr()),bare_.n_rows*nv_,no_,false,true);
         arma::mat gflat(scratch.memptr(),bare_.n_rows*nv_,no_,false,true);
         arma::mat bflat(bar_b.memptr(),bare_.n_rows*nv_,no_,false,true);
         arma::mat h_occupied(no_,no_,arma::fill::zeros);
@@ -450,7 +517,12 @@ public:
         phase=omp_get_wtime();
         bar_fo+=exponential_vjp(occupied_eigenvalues_,occupied_eigenvectors_,
             occupied_eigenvectors_t_,beta_(point),shift_,h_occupied,threads_);
-        bar_fv+=exponential_vjp(virtual_eigenvalues_,virtual_eigenvectors_,
+        // Keep all off-diagonal derivatives, including within degenerate
+        // eigenspaces. Only the primal exponential is diagonal in this frame.
+        if (virtual_eigenbasis_)
+            bar_fv+=exponential_divided(virtual_eigenvalues_,-beta_(point),shift_,
+                0.5*(h_virtual+h_virtual.t()));
+        else bar_fv+=exponential_vjp(virtual_eigenvalues_,virtual_eigenvectors_,
             virtual_eigenvectors_t_,-beta_(point),shift_,h_virtual,threads_);
         if (timing) timing->fock_adjoint_seconds+=omp_get_wtime()-phase;
     }

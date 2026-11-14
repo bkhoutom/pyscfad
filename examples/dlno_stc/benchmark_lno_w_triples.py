@@ -357,8 +357,10 @@ def main():
                 pao_center_atoms=fragment.pao_center_atoms.tolist(),
                 nao=len(fragment.extended_ao_indices),
                 nocc=len(fragment.strong_occ_metric_keep),
-                nvir=len(fragment.virtual_anchor_columns)))
+                nvir=(None if fragment.virtual_anchor_columns is None else
+                      len(fragment.virtual_anchor_columns))))
         domain_report = dict(force_full_domains=force_full_domains,
+            ed_selection_pending=domains.ed_selection_pending,
             thresholds=asdict(domains.thresholds), pair_energy_model=domains.pair_energy_model,
             domain_convention=domains.domain_convention,
             physical_fragments=expected_groups, molecular_nao=mol.nao,
@@ -423,7 +425,6 @@ def main():
                         max_memory_mb=args.max_memory_mb, cc_conv_tol=args.cc_conv_tol,
                         df_storage=args.df_storage, df_memory_mb=args.df_memory_mb,
                         df_builder=args.df_builder,
-                        thread_policy=os.environ.get('PYSCFAD_BENCHMARK_THREAD_POLICY', 'fixed'),
                         omp_dynamic=os.environ.get('OMP_DYNAMIC'),
                         mkl_dynamic=os.environ.get('MKL_DYNAMIC'),
                         shared_df_cache_mode=args.fragment_df_mode,
@@ -575,7 +576,6 @@ def main():
                       sgx_fit_overlap=args.sgx_fit_overlap,
                       df_storage=args.df_storage, df_memory_mb=args.df_memory_mb,
                       df_builder=args.df_builder,
-                      thread_policy=os.environ.get('PYSCFAD_BENCHMARK_THREAD_POLICY', 'fixed'),
                       omp_dynamic=os.environ.get('OMP_DYNAMIC'),
                       mkl_dynamic=os.environ.get('MKL_DYNAMIC'),
                       shared_df_cache_mode=args.fragment_df_mode,

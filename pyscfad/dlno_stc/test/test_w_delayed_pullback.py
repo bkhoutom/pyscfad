@@ -12,6 +12,21 @@ def grid():
     return {key: value for key, value in energy_grid().items() if key != 'virtual_block_size'}
 
 
+def test_w_consumes_only_native_df_copy_and_replay_remains_reusable():
+    native()
+    x = full_fixture()
+    original = x['B'].copy()
+    x['B'].flags.writeable = False
+    seeds = dict(energy_bar=.7, occupied_bar=np.eye(2), virtual_bar=np.eye(3)*.4)
+    forward = backend.solve_matrices(x, dict(target_indices=(0, 1)),
+                                     dict(grid(), threads=2), matrix_kind='W')
+    first = backend.pullback_matrices(x, forward, **seeds)
+    second = backend.pullback_matrices(x, forward, **seeds)
+    np.testing.assert_array_equal(x['B'], original)
+    for name in first:
+        np.testing.assert_allclose(first[name], second[name], rtol=2e-12, atol=2e-13)
+
+
 @pytest.mark.parametrize('matrix_kind', ['D', 'W'])
 def test_default_matrix_call_shares_all_fragment_targets(matrix_kind):
     native()

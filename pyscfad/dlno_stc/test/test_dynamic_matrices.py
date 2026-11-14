@@ -1,13 +1,15 @@
 """Dynamic OpenMP teams preserve deterministic W and its complete pullback."""
 import ctypes
 import numpy as np
+import pytest
 from pyscfad.dlno_stc import backend
 from pyscfad.dlno_stc.test.test_backend import native
 from pyscfad.dlno_stc.test.test_full_kernel import full_fixture
 from pyscfad.dlno_stc.test.test_w_delayed_pullback import grid
 
 
-def test_dynamic_w_matches_fixed_team_energy_matrices_and_pullback():
+@pytest.mark.parametrize('kind', ['D', 'W'])
+def test_matrix_team_policy_and_caller_restoration(kind):
     native()
     omp = ctypes.CDLL('libgomp.so.1')
     previous = omp.omp_get_dynamic()
@@ -18,7 +20,10 @@ def test_dynamic_w_matches_fixed_team_energy_matrices_and_pullback():
         for dynamic in (0, 1):
             omp.omp_set_dynamic(dynamic)
             forward = backend.solve_matrices(x, dict(target_indices=(0,1)),
-                dict(grid(), threads=4), matrix_kind='W')
+                dict(grid(), threads=4), matrix_kind=kind)
+            assert all(batch['openmp_dynamic'] == (kind == 'W')
+                       for batch in forward['diagnostics']['batches'])
+            assert omp.omp_get_dynamic() == dynamic
             reverse = backend.pullback_matrices(x, forward, **seeds)
             assert omp.omp_get_dynamic() == dynamic
             results.append((forward,reverse))

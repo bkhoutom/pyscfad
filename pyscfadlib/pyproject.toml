@@ -28,6 +28,7 @@ classifiers = [
 dependencies = [
     "nanobind",
     "jax",
+    "scipy",
 ]
 
 [project.urls]

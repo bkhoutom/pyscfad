@@ -84,15 +84,18 @@ def choose_balanced_cpus(allowed, count):
 
 
 def configure_cpu_workload(count):
-    """All subsequently created threads/children inherit this CPU affinity."""
+    """Set CPU/thread budgets without changing runtime dynamic-team settings.
+
+    All subsequently created threads/children inherit this CPU affinity.
+    OpenMP/MKL dynamic adjustment is left to the runtime or caller environment.
+    """
     if count < 1:
         raise ValueError("threads must be positive")
     allowed = set(os.sched_getaffinity(0))
     requested = os.environ.get("PYSCFAD_BENCHMARK_CPU_LIST")
     policy = os.environ.get('PYSCFAD_BENCHMARK_CPU_POLICY', 'compact')
-    thread_policy = os.environ.get('PYSCFAD_BENCHMARK_THREAD_POLICY', 'fixed')
-    if policy not in ('compact', 'balanced') or thread_policy not in ('fixed', 'auto'):
-        raise ValueError('CPU policy must be compact/balanced; thread policy fixed/auto')
+    if policy not in ('compact', 'balanced'):
+        raise ValueError('CPU policy must be compact/balanced')
     choose = choose_balanced_cpus if policy == 'balanced' else choose_cpus
     cpus = ([int(value) for value in requested.split(",")]
             if requested else choose(allowed, count))
@@ -106,9 +109,6 @@ def configure_cpu_workload(count):
                  "TF_NUM_INTRAOP_THREADS"):
         os.environ[name] = str(count)
     os.environ["TF_NUM_INTEROP_THREADS"] = "1"
-    dynamic = 'TRUE' if thread_policy == 'auto' else 'FALSE'
-    os.environ["OMP_DYNAMIC"] = dynamic
-    os.environ["MKL_DYNAMIC"] = dynamic
     os.environ["OMP_MAX_ACTIVE_LEVELS"] = "1"
     # Retain the inherited mask; do not let an OpenMP placement policy widen it
     # or bind the Python main thread to a single CPU before JAX initializes.

@@ -73,7 +73,6 @@ def main():
     for name in ('OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'NUMEXPR_NUM_THREADS',
                  'VECLIB_MAXIMUM_THREADS'):
         os.environ[name] = '1'
-    os.environ['OMP_DYNAMIC'] = 'FALSE'
     os.environ['OMP_MAX_ACTIVE_LEVELS'] = '1'
     for name, value in (
             ('JAX_CPU_ENABLE_ASYNC_DISPATCH', 'false'),
@@ -246,7 +245,8 @@ def calculate(args):
             domain_sizes.append(dict(fragment=index, targets=len(members),
                 nao=len(fragment.extended_ao_indices),
                 nocc=len(fragment.strong_occ_metric_keep),
-                nvir=len(fragment.virtual_anchor_columns)))
+                nvir=(None if fragment.virtual_anchor_columns is None else
+                      len(fragment.virtual_anchor_columns))))
         (output / 'domain_sizes.json').write_text(json.dumps(domain_sizes, indent=2) + '\n')
         print('MP2 domain sizes: ' + json.dumps(domain_sizes), flush=True)
         return ccsd.build_static_selections(

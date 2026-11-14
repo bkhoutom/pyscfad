@@ -378,6 +378,7 @@ def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_v
             continue
         inputs, host, _, frame = driver._prepare(
             state, mp2_static, group, baseline, False, return_frame=True)
+        mp2_static = state.pop('_prepared_domain_static', mp2_static)
         for index, targets in corrections:
             if index not in indices:
                 continue
@@ -702,6 +703,9 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
         inputs, host, prepare_pullback, frame = driver._prepare(
             state, static.mp2_static, group, baseline_controls, with_grad,
             return_frame=True)
+    domains = state.pop('_prepared_domain_static', static.mp2_static)
+    if domains is not static.mp2_static:
+        static = replace(static, lis_static=replace(static.lis_static, mp2_static=domains))
     frame_coeff = (frame.occupied_coeff, frame.virtual_coeff)
     frame_bars = tuple(np.zeros_like(coeff) for coeff in frame_coeff) if with_grad else None
     metadata = {'fragment_id': group.representative_index,

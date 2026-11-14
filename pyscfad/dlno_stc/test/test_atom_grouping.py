@@ -116,6 +116,7 @@ def test_atom_public_builder_shares_strong_frames_and_preserves_endpoints(
         mf, frozen=2, target_coeff=targets, frag_lolist=singleton_groups,
         boys_grouping="singleton")
     _assert_saved_selection_equal(baseline_permuted, explicit_singleton)
+    explicit_singleton = dlno_stc.materialize_domain_selections(mf, explicit_singleton)
     # The pinned singleton dimer retains four local occupieds/two virtuals per ED.
     assert all(fragment.strong_occ_metric_keep.size == 4
                and fragment.strong_virtual.metric_keep.size == 2
@@ -143,6 +144,8 @@ def test_atom_public_builder_shares_strong_frames_and_preserves_endpoints(
         mf, frozen=2, target_coeff=targets, frag_lolist=singleton_groups,
         boys_grouping="atom")
     jobs = dlno_stc.build_domain_groups(combined)
+    assert len(pivoted_frames) == 0
+    combined = dlno_stc.materialize_domain_selections(mf, combined)
     assert len(pivoted_frames) == len(jobs)
 
     def reject_replayed_virtual_anchor_pivoting(*args, **kwargs):

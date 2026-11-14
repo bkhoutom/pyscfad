@@ -5,26 +5,6 @@
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/api/ffi.h"
 
-extern "C" {
-void ssygvd_(int* itype, char* jobz, char* uplo, int* n, float* a,
-             int* lda, float* b, int* ldb, float* w, float* work, int* lwork,
-             int* iwork, int* liwork, int* info);
-
-void dsygvd_(int* itype, char* jobz, char* uplo, int* n, double* a,
-             int* lda, double* b, int* ldb, double* w, double* work, int* lwork,
-             int* iwork, int* liwork, int* info);
-
-void chegvd_(int* itype, char* jobz, char* uplo, int* n, float _Complex* a,
-             int* lda, float _Complex* b, int* ldb, float* w, float _Complex* work,
-             int* lwork, float* rwork, int* lrwork, int* iwork, int* liwork,
-             int* info);
-
-void zhegvd_(int* itype, char* jobz, char* uplo, int* n, double _Complex* a,
-             int* lda, double _Complex* b, int* ldb, double* w, double _Complex* work,
-             int* lwork, double* rwork, int* lrwork, int* iwork, int* liwork,
-             int* info);
-}
-
 namespace pyscfad {
 
 template <typename KernelType>

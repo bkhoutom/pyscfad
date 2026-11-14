@@ -16,7 +16,14 @@ __all__ = [
     "kernel", "value_and_grad",
     "BoysDomainThresholds", "DomainSelections", "build_domain_selections",
     "DomainGroup", "build_domain_groups",
+    "materialize_domain_selections",
 ]
+
+
+def materialize_domain_selections(mf, static, *, common=None):
+    """Resolve all ED labels for inspection; calculations prepare one at a time."""
+    from ._ed_selection import materialize_domain_selections as materialize
+    return materialize(mf, static, common=common)
 
 
 def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,

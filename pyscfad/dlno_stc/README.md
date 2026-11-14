@@ -53,6 +53,18 @@ directed completion weights can change the selected domains and weak sum.
 Old -8 selections and correlation restart packets must be rebuilt; SCF
 checkpoints remain reusable.
 
+For lambda-Boys localization, pass
+`lo_kwargs={"method": "lambda_boys", "lambda_": 100.0}` to domain selection.
+The objective is the sum of orbital spreads plus
+`lambda_ * sum(i != j, abs(F[i,j])**2)` in the active occupied space. Both
+off-diagonal orientations are counted; lambda defaults to 100 for this mode
+(bohr²/Eh² when spreads and Fock elements use atomic units). Ordinary Boys
+remains the default method. The current AO Fock is passed explicitly through
+the localization response, including stationary-frame reuse, so geometry and
+SCF response differentiate the same penalized objective as the forward solve.
+Rebuild orbital/domain selections when changing the method or lambda; their
+localization options are included in restart metadata.
+
 Domain MP2/W and LIS CCSD use auxiliary functions centered on the PCD (the
 union of compact BP supports), while the orbital AO representation remains
 on the ED. Forward, retained H tensors, metric response and three-center
@@ -83,6 +95,16 @@ energy, gradient = dlno_stc.value_and_grad(
     include_hf=True,
 )
 ```
+
+`build_domain_selections` returns the pair graph and a lightweight ED plan.
+The MP2 and CCSD(T) fragment loops select each ED's virtual ranks and QR
+anchors just before preparing its tensors. The selected numerical frame and
+its derivative are used immediately, then released with that fragment.
+`strong_virtual` and `virtual_anchor_columns` are therefore unset on a fresh
+plan. For an explicit inspection of all ranks, call
+`dlno_stc.materialize_domain_selections(mf, static)` and use its returned
+selection. Portable packet export resolves all labels for its immutable
+checkpoint identity; ordinary in-process calculations do not need this step.
 
 For gradients, ``build_static`` selects domains from the result of one SCF
 performed under ``jax.vjp``. The driver retains that SCF pullback for the final
@@ -169,6 +191,24 @@ Weak corrections
 retain the original singleton topology. `scope="system"` retains the complete
 active-space energy and system sampling policy. Its independent controls and
 canonical specialization remain available through the low-level full solver.
+
+Multipole screening and weak-pair response use Cartesian operator symmetry
+at every supported order. Orders 2, 3, and 4 retain respectively 4, 10, and
+20 AO moment matrices (including overlap), instead of 4, 13, and 40.
+Quadrupoles use six unique components and octupoles ten; only the small
+transition moments are expanded to their full Cartesian layout after AO
+contraction. For real multiplicative operators, the ket nuclear derivative
+is the AO transpose of the bra derivative. The response contracts one packed
+bra tensor and obtains the ket contribution by transposition, including at
+order 2. Cartesian derivative axes are not symmetrized with operator axes.
+For quadrupoles and octupoles, libcint evaluates its standard components in
+shell-row slabs of at most 32 MiB (or one indivisible shell), packed immediately. This bounds
+redundant temporary storage without introducing different integral kernels.
+The native weak-moment pullback temporarily scatters packed weights into
+libcint's component layout, assigning each mixed component once. The full
+AO derivative tensors are still generated and contracted shell by shell.
+Multipole terms, normalization, pair thresholds, and domain selection rules
+are unchanged.
 
 Local-DF stripes use the smaller of `mf.with_df.max_memory` and half the
 remaining process allowance under `mf.mol.max_memory`, after reserving outputs
@@ -475,6 +515,21 @@ For `matrix_kind="W"`, the CCSD driver uses the energy returned by W
 construction for the strong-domain MP2 term. It does not run a separate MP2
 energy/gradient solver. With the current normalization,
 `E = (trace(Wo) + trace(Wv))/2`; deterministically both traces equal E.
+Deterministic W rotates the DF factors into the virtual Fock eigenbasis once,
+applies the virtual Laplace exponentials by column scaling, and rotates virtual
+W back to the input frame. The selected occupied indices and supplied Laplace
+grid are unchanged. Virtual W uses two spin-adapted matrix products followed
+by symmetrization. Its pullback differentiates the full matrix exponential in
+that fixed computational frame, including off-diagonal Fock perturbations;
+stable divided differences handle repeated virtual eigenvalues without
+eigenvector derivatives. Input cotangents are rotated back once at the end.
+The standalone adapter rotates its private DF input copy in place using row
+panels, preserving the caller's Python array for replay. The pullback releases
+primal amplitudes after seeding and reuses the finished propagation buffer for
+the final DF-gradient rotation. Neither rotation adds a full DF factor to the
+matrix memory estimate. Const-input C++ callers retain a copying entry point.
+The CMake `w_eigenbasis` test compares both passes with the original dense
+propagator/four-product path and checks finite differences at degeneracies.
 Stochastic E and W use the same production samples, with covariance included
 in the reported MP2 energy SE. After the LIS CCSD(T) response, one matrix
 pullback combines `energy_bar=1` with the occupied/virtual W cotangents. Direct
@@ -844,6 +899,19 @@ The optional extension links Armadillo and OpenMP; it requires no Q-Chem or MPI
 library. Imports do not compile or download anything. Examples include the
 small disk workflow, finite `water_tetramer.py`, and unchanged system-scope
 `water_tetramer_full.py`.
+
+Deterministic W forward calls enable dynamic OpenMP teams with `threads` as
+the maximum budget. Other matrix calls and pullbacks use fixed teams. Every
+call restores the caller's thread policy before subsequent stages such as
+CCSD, and leaves MKL dynamic adjustment unchanged. Forward diagnostics record
+`openmp_dynamic`; existing OpenMP thread limits still apply.
+Deterministic occupied W uses small batches
+of partner columns for matrix multiplication instead of separate matrix-vector
+calls. The per-worker batch is at most four virtual-pair columns, and the
+memory estimate includes this workspace. No additional full Gram cube is kept.
+The diagnostic counters `bare_gram_worker_seconds`, `occupied_w_worker_seconds`,
+and `virtual_w_worker_seconds` sum elapsed time across workers; they are not
+wall times and must not be added to `contraction_seconds`.
 
 Scoped BLAS threading for the triples DF contractions is optional and disabled
 by default. To enable it, add these options to the CMake configure command:

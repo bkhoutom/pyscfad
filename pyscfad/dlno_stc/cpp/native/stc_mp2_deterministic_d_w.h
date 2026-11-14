@@ -16,6 +16,10 @@ struct deterministic_result {
     double seed_seconds=0;
     double reverse_factor_seconds=0, amplitude_vjp_seconds=0, propagator_vjp_seconds=0;
     double spin_seconds=0, occupied_density_seconds=0, virtual_energy_seconds=0;
+    // Sum of worker elapsed times inside the contraction region, not wall
+    // times to add to contraction_seconds. These separate bandwidth-heavy
+    // occupied W from bare Gram and virtual matrix products.
+    double bare_gram_worker_seconds=0, occupied_w_worker_seconds=0, virtual_w_worker_seconds=0;
     size_t reverse_factor_rebuilds=0;
 };
 
@@ -42,7 +46,8 @@ inline deterministic_result evaluate_deterministic(const arma::mat& fo, const ar
         const std::vector<size_t>& group, int threads,
         const deterministic_cotangent_seed* seed=nullptr,
         bool energy_matrices=false, bool primal_outputs=true,
-        const deterministic_w_cotangent_seed* w_seed=nullptr) {
+        const deterministic_w_cotangent_seed* w_seed=nullptr,
+        bool optimize_w=true, arma::mat* consumable_bare=nullptr) {
     const size_t no=fo.n_rows, nv=fv.n_rows, np=bare.n_rows;
     if (!no || !nv || !np || fo.n_cols!=no || fv.n_cols!=nv ||
         bare.n_cols!=no*nv || beta.is_empty() || beta.n_elem!=weights.n_elem ||
@@ -68,7 +73,10 @@ inline deterministic_result evaluate_deterministic(const arma::mat& fo, const ar
     if (!primal_outputs && !energy_matrices && !seed && !w_seed)
         throw std::invalid_argument("Deterministic MP2 pass requires output or cotangent");
     const double start=omp_get_wtime();
-    propagator dress(fo,fv,bare,beta,threads);
+    // Retain the original D path and an unoptimized W reference for validation.
+    const bool eigenbasis=optimize_w && !seed && !primal_outputs && (energy_matrices || w_seed);
+    propagator dress(fo,fv,bare,beta,threads,eigenbasis,consumable_bare);
+    const arma::mat& factors=dress.factors();
     std::vector<arma::cube> amplitudes(group.size());
     for (auto& t:amplitudes) t.zeros(nv,nv,no);
     deterministic_result out;
@@ -107,7 +115,7 @@ inline deterministic_result evaluate_deterministic(const arma::mat& fo, const ar
         if (w_seed) {
             w_wo=0.5*(w_seed->occupied+w_seed->occupied.t());
             w_wo.diag()+=w_seed->energy;
-            w_wv=0.5*(w_seed->virtuals+w_seed->virtuals.t());
+            w_wv=dress.virtual_frame(0.5*(w_seed->virtuals+w_seed->virtuals.t()),true);
             w_occupied_active=arma::accu(arma::abs(w_wo))!=0.;
             w_virtual_active=arma::accu(arma::abs(w_wv))!=0.;
         }
@@ -152,12 +160,15 @@ inline deterministic_result evaluate_deterministic(const arma::mat& fo, const ar
         const arma::cube& t=amplitudes[s];
         arma::mat flat(const_cast<double*>(t.memptr()),nv*nv,no,false,true);
         double tick=omp_get_wtime();
-        arma::cube spins(nv,nv,no);
-        #pragma omp parallel for num_threads(threads) schedule(static)
-        for (size_t k=0;k<no;++k) {
-            arma::mat transpose=t.slice(k);
-            arma::inplace_trans(transpose);
-            spins.slice(k)=2*t.slice(k)-transpose;
+        arma::cube spins;
+        if (!eigenbasis) {
+            spins.set_size(nv,nv,no);
+            #pragma omp parallel for num_threads(threads) schedule(static)
+            for (size_t k=0;k<no;++k) {
+                arma::mat transpose=t.slice(k);
+                arma::inplace_trans(transpose);
+                spins.slice(k)=2*t.slice(k)-transpose;
+            }
         }
         out.spin_seconds+=omp_get_wtime()-tick;
         if (primal_outputs) {
@@ -172,9 +183,14 @@ inline deterministic_result evaluate_deterministic(const arma::mat& fo, const ar
             out.occupied_density_seconds+=omp_get_wtime()-tick;
         }
         tick=omp_get_wtime();
-        arma::mat bi(const_cast<double*>(bare.colptr(group[s]*nv)),np,nv,false,true);
+        arma::mat bi(const_cast<double*>(factors.colptr(group[s]*nv)),np,nv,false,true);
         arma::cube bare_grams;
         if (w_seed) bare_grams.set_size(nv,nv,no);
+        // Several partner columns per GEMM reuse the large amplitude matrix
+        // instead of rereading it for every GEMV. Keep at least one task per
+        // requested worker and cap additional storage at four nv*nv columns.
+        const size_t partner_panel=energy_matrices
+            ? std::max(size_t(1),std::min(size_t(4),no/size_t(threads))) : 1;
         #pragma omp parallel num_threads(threads)
         {
             arma::mat local;
@@ -184,29 +200,40 @@ inline deterministic_result evaluate_deterministic(const arma::mat& fo, const ar
             arma::mat local_bi;
             if (energy_active) local_bi.zeros(np,nv);
             double local_energy=0;
+            double gram_seconds=0,occupied_seconds=0,virtual_seconds=0;
+            arma::mat occupied_panel;
+            if (energy_matrices) occupied_panel.set_size(nv*nv,partner_panel);
             #pragma omp for schedule(static)
-            for (size_t j=0;j<no;++j) {
+            for (size_t first=0;first<no;first+=partner_panel) {
+              const size_t last=std::min(no,first+partner_panel);
+              for (size_t j=first;j<last;++j) {
                 const arma::mat& tj=t.slice(j);
-                const arma::mat& spin=spins.slice(j);
+                const arma::mat& spin=eigenbasis ? tj : spins.slice(j);
                 if (primal_outputs)
                     local+=0.5*(tj*spin.t()+tj.t()*spin);
                 if (primal_outputs || energy_matrices || energy_active || w_seed) {
-                    arma::mat bj(const_cast<double*>(bare.colptr(j*nv)),np,nv,false,true);
+                    arma::mat bj(const_cast<double*>(factors.colptr(j*nv)),np,nv,false,true);
+                    const double gram_tick=omp_get_wtime();
                     const arma::mat g=bi.t()*bj;
                     const arma::mat spin_g=2*g-g.t();
+                    gram_seconds+=omp_get_wtime()-gram_tick;
                     if (w_seed) bare_grams.slice(j)=g;
                     if (primal_outputs) local_energy+=arma::accu(tj%spin_g);
                     if (energy_matrices) {
-                        // Different partner j values own disjoint output columns.
-                        // Stream the contraction without another nv*nv*no cube.
                         const arma::vec spin_column(const_cast<double*>(spin_g.memptr()),
                                                     nv*nv,false,true);
-                        out.energy_occupied.col(j)+=flat.t()*spin_column;
+                        occupied_panel.col(j-first)=spin_column;
                         // Polarize the quadratic virtual density in t and g.
                         // This treats the two amplitude positions equally and
                         // reduces to D_vv when g=t.
-                        local_energy_virtuals+=0.25*(tj*spin_g.t()+tj.t()*spin_g
+                        // The other two products provide the transpose after
+                        // spin expansion; symmetrize only after accumulation.
+                        const double virtual_tick=omp_get_wtime();
+                        if (eigenbasis)
+                            local_energy_virtuals+=0.5*(tj*spin_g.t()+tj.t()*spin_g);
+                        else local_energy_virtuals+=0.25*(tj*spin_g.t()+tj.t()*spin_g
                                                          +g*spin.t()+g.t()*spin);
+                        virtual_seconds+=omp_get_wtime()-virtual_tick;
                     }
                     if (energy_active) {
                         arma::mat& bar_tj=bar_amplitudes[s].slice(j);
@@ -225,11 +252,22 @@ inline deterministic_result evaluate_deterministic(const arma::mat& fo, const ar
                         bar_tj+=direct+2*bar_spin-bar_spin.t();
                     }
                 }
+              }
+              if (energy_matrices) {
+                  const double occupied_tick=omp_get_wtime();
+                  // Each task owns disjoint partner/output columns.
+                  out.energy_occupied.cols(first,last-1)+=
+                      flat.t()*occupied_panel.cols(0,last-first-1);
+                  occupied_seconds+=omp_get_wtime()-occupied_tick;
+              }
             }
             #pragma omp critical
             {
                 if (primal_outputs) { out.virtuals+=local; out.energy+=local_energy; }
                 if (energy_matrices) out.energy_virtuals+=local_energy_virtuals;
+                out.bare_gram_worker_seconds+=gram_seconds;
+                out.occupied_w_worker_seconds+=occupied_seconds;
+                out.virtual_w_worker_seconds+=virtual_seconds;
                 if (energy_active)
                     out.bar_b.cols(group[s]*nv,group[s]*nv+nv-1)+=local_bi;
             }
@@ -261,20 +299,26 @@ inline deterministic_result evaluate_deterministic(const arma::mat& fo, const ar
                 for (size_t j=0;j<no;++j) {
                     const arma::mat& tj=t.slice(j);
                     const arma::mat& g=bare_grams.slice(j);
-                    const arma::mat& spin=spins.slice(j);
+                    const arma::mat& spin=eigenbasis ? tj : spins.slice(j);
                     const arma::mat& spin_g=spin_grams.slice(j);
                     arma::mat& bar_t=bar_amplitudes[s].slice(j);
                     arma::mat bar_spin_g=bar_spin_grams.slice(j);
                     arma::mat bar_g=2*bar_spin_g-bar_spin_g.t();
                     if (w_virtual_active) {
-                        const arma::mat bar_spin_t=.25*(w_wv*g+g*w_wv);
-                        bar_t+=.25*(w_wv*spin_g+spin_g*w_wv)
-                               +2*bar_spin_t-bar_spin_t.t();
-                        bar_spin_g=.25*(w_wv*tj+tj*w_wv);
-                        bar_g+=.25*(w_wv*spin+spin*w_wv)
-                               +2*bar_spin_g-bar_spin_g.t();
+                        if (eigenbasis) {
+                            bar_t+=.5*(w_wv*spin_g+spin_g*w_wv);
+                            bar_spin_g=.5*(w_wv*tj+tj*w_wv);
+                            bar_g+=2*bar_spin_g-bar_spin_g.t();
+                        } else {
+                            const arma::mat bar_spin_t=.25*(w_wv*g+g*w_wv);
+                            bar_t+=.25*(w_wv*spin_g+spin_g*w_wv)
+                                   +2*bar_spin_t-bar_spin_t.t();
+                            bar_spin_g=.25*(w_wv*tj+tj*w_wv);
+                            bar_g+=.25*(w_wv*spin+spin*w_wv)
+                                   +2*bar_spin_g-bar_spin_g.t();
+                        }
                     }
-                    const arma::mat bj(const_cast<double*>(bare.colptr(j*nv)),np,nv,false,true);
+                    const arma::mat bj(const_cast<double*>(factors.colptr(j*nv)),np,nv,false,true);
                     arma::mat bar_bj(out.bar_b.colptr(j*nv),np,nv,false,true);
                     bar_bj+=bi*bar_g;
                     local_bi+=bj*bar_g.t();
@@ -292,6 +336,7 @@ inline deterministic_result evaluate_deterministic(const arma::mat& fo, const ar
     if (energy_matrices) {
         out.energy_occupied=0.5*(out.energy_occupied+out.energy_occupied.t());
         out.energy_virtuals=0.5*(out.energy_virtuals+out.energy_virtuals.t());
+        if (eigenbasis) out.energy_virtuals=dress.virtual_frame(out.energy_virtuals,false);
         if (!primal_outputs) out.energy=arma::trace(out.energy_occupied);
     }
     out.contraction_seconds=omp_get_wtime()-contraction_start;
@@ -299,6 +344,9 @@ inline deterministic_result evaluate_deterministic(const arma::mat& fo, const ar
     if (!seed && !w_seed) return out;
 
     const double reverse_start=omp_get_wtime();
+    // W seeding has consumed all primal amplitudes. Only their adjoints are
+    // used by the Laplace reverse pass; release the cubes before allocating G.
+    if (eigenbasis) amplitudes.clear();
     // Reuse the factor-sized cotangent across all points. The first selected
     // orbital writes every block, so no full-array zero pass is needed.
     arma::mat gamma(np,no*nv);
@@ -332,6 +380,18 @@ inline deterministic_result evaluate_deterministic(const arma::mat& fo, const ar
         tick=omp_get_wtime();
         dress.backpropagate(l,c,gamma,out.bar_fo,out.bar_fv,out.bar_b);
         out.propagator_vjp_seconds+=omp_get_wtime()-tick;
+    }
+    if (eigenbasis) {
+        // The Frechet pullback differentiates the full F_v in a fixed frame.
+        // Propagation is finished: retain only C as the destination for the
+        // final DF rotation, rather than allocating another full factor.
+        bar_amplitudes.clear();
+        gamma.reset();
+        dress.release_eigenbasis_factors();
+        out.bar_fv=dress.virtual_frame(out.bar_fv,false);
+        dress.rotate_factors(out.bar_b,c,false);
+        out.bar_b.swap(c);
+        c.reset();
     }
     out.reverse_seconds=omp_get_wtime()-reverse_start;
     out.seconds+=out.reverse_seconds;
@@ -392,6 +452,27 @@ inline deterministic_result selected_deterministic_mp2_w_vjp(
     const deterministic_w_cotangent_seed seed{bar_energy,bar_occupied,bar_virtuals};
     return evaluate_deterministic(fo,fv,bare,beta,weights,group,threads,
                                   nullptr,false,false,&seed);
+}
+
+// The standalone adapter owns a private DF copy. Consume it in place rather
+// than retaining a second full factor. Forward leaves it rotated; reverse
+// releases it after propagation. Const-input callers retain the APIs above.
+inline deterministic_result selected_deterministic_mp2_w_forward_consume(
+        const arma::mat& fo,const arma::mat& fv,arma::mat& bare,
+        const arma::vec& beta,const arma::vec& weights,
+        const std::vector<size_t>& group,int threads) {
+    return evaluate_deterministic(fo,fv,bare,beta,weights,group,threads,
+                                  nullptr,true,false,nullptr,true,&bare);
+}
+
+inline deterministic_result selected_deterministic_mp2_w_vjp_consume(
+        const arma::mat& fo,const arma::mat& fv,arma::mat& bare,
+        const arma::vec& beta,const arma::vec& weights,
+        const std::vector<size_t>& group,int threads,
+        double bar_energy,const arma::mat& bar_occupied,const arma::mat& bar_virtuals) {
+    const deterministic_w_cotangent_seed seed{bar_energy,bar_occupied,bar_virtuals};
+    return evaluate_deterministic(fo,fv,bare,beta,weights,group,threads,
+                                  nullptr,false,false,&seed,true,&bare);
 }
 
 // Preserve the single-index calls for existing callers.

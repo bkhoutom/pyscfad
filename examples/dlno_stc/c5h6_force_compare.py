@@ -18,7 +18,6 @@ for variable in ("OMP_NUM_THREADS", "OMP_THREAD_LIMIT", "MKL_NUM_THREADS",
                  "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS",
                  "PYSCFAD_DENSE_BLAS_THREADS"):
     os.environ[variable] = "32"
-os.environ["OMP_DYNAMIC"] = "FALSE"
 
 
 def main():

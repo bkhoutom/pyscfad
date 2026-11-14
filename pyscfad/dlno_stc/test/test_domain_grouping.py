@@ -169,7 +169,10 @@ def test_strong_selection_and_qr_run_once_per_unique_frame(
         boys_grouping=boys_grouping,
     )
     assert len(dlno_stc.build_domain_groups(static)) == 1
-    assert len(strong_selections) == len(qr_calls) == 1
+    assert len(strong_selections) == len(qr_calls) == 0
+    static = dlno_stc.materialize_domain_selections(mf, static)
+    assert len(strong_selections) == 0  # No second detached/reference build.
+    assert len(qr_calls) == 1
     anchors = static.fragments[0].virtual_anchor_columns
     assert isinstance(anchors, tuple)
     for fragment in static.fragments:

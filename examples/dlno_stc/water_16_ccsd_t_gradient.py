@@ -252,7 +252,7 @@ def calculate(args):
         return ccsd.build_static_selections(
             mf, domains, matrix_kind='W', thresh_occ=args.lno_occ, thresh_vir=args.lno_vir,
             baseline_controls=baseline, matrix_controls=matrix, smooth=True,
-            smooth_laplace_points=10, single_pass=True, merge_identical=True)
+            single_pass=True, merge_identical=True)
 
     energy, mol_bar, components = ccsd.value_and_grad(
         mol, build_mf, build_static=build_static, baseline_controls=baseline,

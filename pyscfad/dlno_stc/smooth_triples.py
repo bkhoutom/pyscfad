@@ -32,11 +32,11 @@ NAMES = ('t1', 't2', 'Bvo', 'Boo', 'Bvv', 'fov')
 INTEGRAL_NAMES = ('t1', 't2', 'ovvv', 'ovoo', 'ovov', 'fov')
 
 
-def make_grid(eocc, evir, *, points=10):
+def make_grid(eocc, evir, *, points=6):
     """Positive fitted triples quadrature, fixed during differentiation.
 
     Both 1/D and 1/D^2 enter the fit. Their measured errors are reported
-    separately from stochastic uncertainty; the default is ten points.
+    separately from stochastic uncertainty; the default is six points.
     """
     from .controls import _integer_control
     from .laplace import fit_grid

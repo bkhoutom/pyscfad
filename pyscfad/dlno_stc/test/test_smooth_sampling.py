@@ -10,7 +10,8 @@ from pyscfad.dlno_stc import smooth_triples as triples
 
 
 def test_ten_point_grid_covers_c6h14_triples_denominators():
-    nodes, weights, diagnostics = triples.make_grid(np.array([-.9, -.3]), np.array([.33, 3.263333333]))
+    nodes, weights, diagnostics = triples.make_grid(
+        np.array([-.9, -.3]), np.array([.33, 3.263333333]), points=10)
     assert len(nodes) == len(weights) == diagnostics['points'] == 10
     assert np.all(nodes > 0) and np.all(weights > 0)
     assert diagnostics['max_relative_energy_error'] < 1e-7

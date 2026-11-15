@@ -136,7 +136,7 @@ The defaults are:
   molecular triples energy standard error of 0.1 mEh, allocated by occupied
   fragment count. The target concerns stochastic energy uncertainty; it does
   not bound gradient uncertainty or errors from domains, LNOs or quadratures.
-- The branch's fixed six-point MP2 Laplace grid and ten-point smooth triples
+- The branch's fixed six-point MP2 Laplace grid and six-point smooth triples
   grid. The discrete domain and LNO selections and quadrature are held fixed
   during nuclear response. Test convergence with tighter settings or independent
   seeds as appropriate for the intended accuracy.

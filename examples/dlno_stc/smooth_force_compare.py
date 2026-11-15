@@ -32,7 +32,7 @@ def main():
                         help='total (T) energy SE target in mEh; zero uses fixed counts')
     parser.add_argument('--triples-pilot-samples', type=int, default=10000,
                         help='independent pilot samples per triples Laplace point')
-    parser.add_argument('--triples-laplace-points', type=int, default=10)
+    parser.add_argument('--triples-laplace-points', type=int, default=6)
     parser.add_argument('--triples-trace-exponent', type=float, default=5.0,
                         help='exponent in the smooth triples point-variance trace model')
     parser.add_argument('--triples-budget-energy', choices=('mp2', 'ccsd'), default='mp2',

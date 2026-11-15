@@ -376,7 +376,7 @@ void bind_triples(py::module_& module) {
     module.attr("TRIPLES_DIAGONAL_VIRTUAL_DRESSING")=true;
     // Bump the native checkpoint identity when the numerical algorithm changes.
     module.attr("TRIPLES_VERSION")=
-        "stc_triples:stable-external-legs:deterministic-blocks-v3:quadrature-reuse-v1:diagonal-virtual-v1";
+        "stc_triples:stable-external-legs:deterministic-blocks-v3:quadrature-reuse-v1:diagonal-virtual-v1:shared-dressing-v3";
     module.attr("TRIPLES_QUADRATURE_REUSE")=true;
     py::class_<Triples::quadrature_cache>(module,"TriplesQuadratureCache")
         .def(py::init([](py::tuple values,py::handle first,py::handle count,bool with_grad) {

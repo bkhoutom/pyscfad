@@ -23,7 +23,8 @@ Array stable_scale_axis(const Array& input,size_t axis,const arma::mat& matrix) 
     return output;
 }
 
-Array stable_transform(const Array& input,size_t axis,const arma::mat& matrix) {
+Array stable_transform(const Array& input,size_t axis,const arma::mat& matrix,
+                       bool optimized) {
     Shape dims=shape(input);
     const size_t ni=size_t(dims[axis]),no=matrix.n_rows;
     if(matrix.n_cols!=ni) throw py::value_error("stable triples: inconsistent transform");
@@ -32,10 +33,26 @@ Array stable_transform(const Array& input,size_t axis,const arma::mat& matrix) {
     size_t inner=1;
     for(size_t d=axis+1;d<size_t(input.ndim());++d) inner*=size_t(input.shape(d));
     const size_t rows=size_t(input.size())/ni;
+    if(optimized && (inner==1 || inner==rows)) {
+        // Boundary axes are already contiguous matrices in one orientation.
+        // Views avoid both packing buffers and the element-sized memcpy runs
+        // of a last-axis gather. One BLAS call owns its configured thread team.
+        py::gil_scoped_release release;
+        if(inner==1) {
+            const arma::mat source(const_cast<double*>(input.data()),ni,rows,false,true);
+            arma::mat target(output.mutable_data(),no,rows,false,true);
+            target=matrix*source;
+        } else {
+            const arma::mat source(const_cast<double*>(input.data()),rows,ni,false,true);
+            arma::mat target(output.mutable_data(),rows,no,false,true);
+            target=source*matrix.t();
+        }
+        return output;
+    }
     const size_t panel=std::max(size_t(1),size_t(2*1024*1024)/(sizeof(double)*std::max(ni,no)));
     std::exception_ptr error;
     py::gil_scoped_release release;
-    #pragma omp parallel
+    #pragma omp parallel if(!optimized || parallel_panels(no>=16))
     {
         LocalBlas local_blas;
         arma::mat packed,result;
@@ -44,7 +61,7 @@ Array stable_transform(const Array& input,size_t axis,const arma::mat& matrix) {
             try {
                 const size_t count=std::min(panel,rows-first);
                 gather(input.data(),packed,ni,inner,first,count);
-                multiply(packed,matrix,result,bool(local_blas.setter));
+                multiply(packed,matrix,result,optimized || bool(local_blas.setter));
                 scatter(output.mutable_data(),result,no,inner,first,count);
             } catch(...) {
                 #pragma omp critical(stable_triples_error)
@@ -56,17 +73,34 @@ Array stable_transform(const Array& input,size_t axis,const arma::mat& matrix) {
     return output;
 }
 
-arma::mat stable_matrix_bar(const Array& raw,const Array& bar,size_t axis) {
+arma::mat stable_matrix_bar(const Array& raw,const Array& bar,size_t axis,
+                            bool optimized) {
     const size_t ni=size_t(raw.shape(axis)),no=size_t(bar.shape(axis));
     size_t inner=1;
     for(size_t d=axis+1;d<size_t(raw.ndim());++d) inner*=size_t(raw.shape(d));
     const size_t rows=size_t(raw.size())/ni;
+    if(optimized && (inner==1 || inner==rows)) {
+        // Full rectangular matrix bars are required even for diagonal
+        // propagators. These views have the same orientation as the forward.
+        arma::mat result;
+        py::gil_scoped_release release;
+        if(inner==1) {
+            const arma::mat source(const_cast<double*>(raw.data()),ni,rows,false,true);
+            const arma::mat adjoint(const_cast<double*>(bar.data()),no,rows,false,true);
+            result=adjoint*source.t();
+        } else {
+            const arma::mat source(const_cast<double*>(raw.data()),rows,ni,false,true);
+            const arma::mat adjoint(const_cast<double*>(bar.data()),rows,no,false,true);
+            result=adjoint.t()*source;
+        }
+        return result;
+    }
     const size_t panel=std::max(size_t(1),size_t(2*1024*1024)/(sizeof(double)*std::max(ni,no)));
     std::vector<arma::mat> local(static_cast<size_t>(omp_get_max_threads()));
     for(auto& gram:local) gram.zeros(no,ni);
     std::exception_ptr error;
     py::gil_scoped_release release;
-    #pragma omp parallel
+    #pragma omp parallel if(!optimized || parallel_panels(std::min(no,ni)>=16))
     {
         LocalBlas local_blas;
         arma::mat source,adjoint;
@@ -77,7 +111,7 @@ arma::mat stable_matrix_bar(const Array& raw,const Array& bar,size_t axis) {
                 const size_t count=std::min(panel,rows-first);
                 gather(raw.data(),source,ni,inner,first,count);
                 gather(bar.data(),adjoint,no,inner,first,count);
-                if(local_blas.setter && std::min(no,ni)>=16) gram+=adjoint.t()*source;
+                if((optimized || local_blas.setter) && std::min(no,ni)>=16) gram+=adjoint.t()*source;
                 else for(size_t i=0;i<no;++i) for(size_t j=0;j<ni;++j) {
                     const double* a=adjoint.colptr(i); const double* b=source.colptr(j);
                     double sum=0.;
@@ -108,24 +142,32 @@ class StableDressing {
     std::vector<libgmbpt::qchem::triples_tensor_spec> specs_;
     std::vector<std::vector<Axis>> plans_;
     std::vector<std::vector<Array>> prefixes_;
+    std::vector<Array> graph_prefixes_;
+    bool graph_cached_=false;
     size_t tape_bytes_=0,cached_bytes_=0,peak_bytes_=0,hits_=0,rebuilds_=0;
     double external_time(double node) const { return full_external_ ? node : node/2; }
     std::vector<arma::mat> matrices(double node,bool diagonal_virtual) const {
         if(!std::isfinite(node) || node<0) throw py::value_error("stable triples: node must be finite and nonnegative");
         // The common energy shift cancels in every sampled product. Both
         // ordinary exponentials and O^2 are bounded by one for a positive gap.
+        if(full_external_ && node==0.)
+            return {arma::eye(u_.n_rows,u_.n_rows),
+                    arma::eye(virtual_diagonal_.n_elem,virtual_diagonal_.n_elem),u_.t()};
         arma::mat v;
         if(diagonal_virtual) v=arma::diagmat(arma::exp((-external_time(node))*(virtual_diagonal_-shift_)));
         else v=exponential(virtual_,-external_time(node),shift_);
-        return {exponential(occupied_,external_time(node),shift_),std::move(v),
-                u_.t(),u_.t()*exponential(occupied_,node,shift_)};
+        std::vector<arma::mat> result={exponential(occupied_,external_time(node),shift_),
+                                       std::move(v),u_.t()};
+        if(!full_external_) result.emplace_back(u_.t()*exponential(occupied_,node,shift_));
+        return result;
     }
     Array transform(const Array& input,const Axis& axis,const arma::mat& matrix,
                     bool diagonal_virtual) const {
         return diagonal_virtual && axis.matrix==1
             ? stable_scale_axis(input,axis.axis,matrix)
-            : stable_transform(input,axis.axis,matrix);
+            : stable_transform(input,axis.axis,matrix,full_external_);
     }
+#include "stc_triples_graph.inc"
 public:
     explicit StableDressing(py::tuple inputs,bool full_external=false):full_external_(full_external) {
         if(inputs.size()!=9) throw py::value_error("stable triples: expected nine integral inputs");
@@ -181,7 +223,9 @@ public:
             plans_.push_back(std::move(plan));
         }
     }
-    void clear_cache() { prefixes_.clear(); cached_bytes_=0; }
+    void clear_cache() {
+        prefixes_.clear(); graph_prefixes_.clear(); graph_cached_=false; cached_bytes_=0;
+    }
     size_t cache_bytes() const { return cached_bytes_; }
     size_t cache_hits() const { return hits_; }
     size_t peak_cache_bytes() const { return peak_bytes_; }
@@ -198,6 +242,7 @@ public:
         return external_time(node)*virtual_offdiag_norm_<=32*std::numeric_limits<double>::epsilon();
     }
     py::tuple prepare(double node,size_t cache_limit_bytes=0) {
+        if(full_external_) return graph_prepare(node,cache_limit_bytes);
         clear_cache();
         const bool diagonal_virtual=virtual_diagonal_at(node);
         const auto mats=matrices(node,diagonal_virtual);
@@ -220,6 +265,7 @@ public:
         return out;
     }
     py::tuple pullback(double node,py::tuple cotangents,size_t cache_limit_bytes=0) {
+        if(full_external_) return graph_pullback(node,cotangents,cache_limit_bytes);
         if(cotangents.size()!=specs_.size()) { clear_cache(); throw py::value_error("stable triples: invalid cotangent count"); }
         if((prefixes_.empty() || cached_node_!=node) && cache_limit_bytes>0 && tape_bytes_<=cache_limit_bytes) {
             prepare(node,cache_limit_bytes); ++rebuilds_;
@@ -249,7 +295,7 @@ public:
                     raw=transform(raw,a,mats[a.matrix],diagonal_virtual);
                 }
                 const auto a=plans_[i][k];
-                mbars[a.matrix]+=stable_matrix_bar(raw,bar,a.axis);
+                mbars[a.matrix]+=stable_matrix_bar(raw,bar,a.axis,false);
                 bar=transform(bar,a,mats[a.matrix].t(),diagonal_virtual);
             }
             auto sum=out[spec.source].cast<Array>();

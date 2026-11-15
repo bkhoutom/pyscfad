@@ -17,19 +17,25 @@ using Array=py::array_t<double,py::array::c_style|py::array::forcecast>;
 using Shape=std::vector<py::ssize_t>;
 struct Axis { size_t axis, matrix; };
 
-// Large panels may use BLAS, with one BLAS worker per OpenMP worker. On a
-// backend without a local thread control, use the SIMD panel loop instead.
+// MKL can confine BLAS to one worker locally. The full-external dresser lets
+// other vendors own the GEMM thread team with serialized outer panels.
+// Legacy and half-external dressing retain their parallel SIMD fallback.
+// Never change a process-global BLAS thread setting while callers are active.
 struct LocalBlas {
     using Setter=int(*)(int);
     Setter setter;
     int previous=0;
-    LocalBlas() {
+    static Setter local_setter() {
         static auto fn=reinterpret_cast<Setter>(dlsym(RTLD_DEFAULT,"MKL_Set_Num_Threads_Local"));
-        setter=fn;
+        return fn;
+    }
+    LocalBlas() {
+        setter=local_setter();
         if(setter) previous=setter(1);
     }
     ~LocalBlas() { if(setter) setter(previous); }
 };
+bool parallel_panels(bool dense) { return !dense || LocalBlas::local_setter(); }
 Shape shape(const Array& a) { return Shape(a.shape(),a.shape()+a.ndim()); }
 Array copy(const Array& a) {
     Array result(shape(a));

@@ -299,7 +299,7 @@ def _bar_norm(*trees):
 def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_vir,
                             baseline_controls, matrix_controls,
                             internal_rank_threshold=1e-6, merge_identical=True, fragment_indices=None,
-                            smooth=True, smooth_laplace_points=10, single_pass=True,
+                            smooth=True, smooth_laplace_points=6, single_pass=True,
                             lis_space='domain', correlation_auxbasis=None):
     """Select physical-fragment LIS ranks from explicit D or W cutoffs and controls.
 
@@ -315,7 +315,7 @@ def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_v
     D/W subspace and AO overlap response are retained; there are no internal
     Fock cluster projectors. Ranks, anchors and quadratures are held fixed
     during differentiation.
-    ``smooth_laplace_points`` defaults to ten fitted points per LIS.
+    ``smooth_laplace_points`` defaults to six fitted points per LIS.
     The two-pass path saves MP2 fragment proxies for optional triples variance
     allocation. ``variance_allocation='occupied_count'`` needs no proxies.
     By default (``single_pass=True``), return a plan without preparing domains or W.

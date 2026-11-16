@@ -41,14 +41,15 @@ def test_reuse_against_original_full_functional(selected, spectrum, with_grad):
             np.testing.assert_allclose(a, b, rtol=2e-10, atol=2e-12, err_msg=f'input {i}')
 
 
-def test_forced_batching_and_weighted_reverse(monkeypatch):
+def test_bounded_worker_cache_and_weighted_reverse(monkeypatch):
     inputs = fixture(selected=2)
     nodes, weights = [.1, .4], [.8, -.2]
     monkeypatch.setenv('PYSCFAD_TRIPLES_NUMERATOR_CACHE_MB', '0')
     (actual, diag), bars = _run_deterministic(inputs, nodes, weights,
         with_grad=True, max_memory=4000., rotate=True, trace_exponent=5.)
     expected, expected_bars = original(inputs, nodes, weights, True)
-    assert diag['numerator_cache_batches'] == 12
+    assert diag['streaming_quartic_memory']
+    assert diag['numerator_cache_peak_bytes'] <= 2 * inputs[0].shape[1]**3 * 8
     np.testing.assert_allclose(actual, expected, rtol=2e-11, atol=2e-13)
     for a, b in zip(bars, expected_bars):
         np.testing.assert_allclose(a, b, rtol=2e-10, atol=2e-12)

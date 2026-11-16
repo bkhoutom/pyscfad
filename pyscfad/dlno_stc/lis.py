@@ -104,6 +104,7 @@ class FragmentLIS:
     n_internal_vir: int
     n_lno_occ: int
     n_lno_vir: int
+    original_occupied_coeff: object = None
 
     @property
     def orbfrag(self):
@@ -278,6 +279,7 @@ def _build_domain_lis(mf, common, static, index, frame, occupied, virtual):
     internal = _domain_targets(common, static.mp2_static, index, frame)
     frames = None if static.smooth_frames is None else static.smooth_frames[index]
     parents, rotations, coefficients = [], [], []
+    original_occupied = None
     for spin, (parent, density, target, keep, full) in enumerate((
             (frame.occupied_coeff, occupied, internal, selection.occupied_lno_keep,
              selection.full_occupied_space),
@@ -285,7 +287,17 @@ def _build_domain_lis(mf, common, static, index, frame, occupied, virtual):
              selection.virtual_lno_keep, selection.full_virtual_space))):
         embedded = np.zeros((common.s1e.shape[0], parent.shape[1]), dtype=parent.dtype)
         embedded = embedded.at[frame.extended_ao_indices].set(parent)
-        if full:
+        split_occupied = (spin == 0 and frames is not None
+                          and getattr(frames[spin], 'n_internal', 0) > 0)
+        if full and split_occupied:
+            from .smooth import orthonormalize
+            anchor = np.asarray(frames[spin].anchor)[:, target.shape[1]:]
+            external = embedded.T.conj() @ common.s1e @ anchor
+            external = _external_map(external, target)
+            if external.shape[1]:
+                external = orthonormalize(external, np.eye(external.shape[0]))
+            rotation = np.concatenate((target, external), axis=1)
+        elif full:
             rotation = np.eye(parent.shape[1], dtype=parent.dtype)
         else:
             mapping = np.eye(parent.shape[1], dtype=parent.dtype)
@@ -298,9 +310,11 @@ def _build_domain_lis(mf, common, static, index, frame, occupied, virtual):
             rotation = _mapped_density_space(density, mapping, target, keep,
                 embedded, common.s1e, None if frames is None else frames[spin])
         coeff = embedded @ rotation
+        if spin == 0:
+            original_occupied = coeff
         if frames is None:
             coeff = _semicanonical_space(coeff, common.fock)
-        else:
+        elif not split_occupied:
             from .smooth import rebuild_frame
             coeff = rebuild_frame(coeff, common.s1e, frames[spin])
         parents.append(embedded)
@@ -317,7 +331,8 @@ def _build_domain_lis(mf, common, static, index, frame, occupied, virtual):
         density_occupied_ed=occupied, density_virtual_ed=virtual,
         density_occupied_active=None, density_virtual_active=None,
         domain=frame, n_internal_occ=internal.shape[1], n_internal_vir=0,
-        n_lno_occ=co.shape[1]-internal.shape[1], n_lno_vir=cv.shape[1])
+        n_lno_occ=co.shape[1]-internal.shape[1], n_lno_vir=cv.shape[1],
+        original_occupied_coeff=original_occupied)
 
 
 def _compact_mapped_density(mapping, density, columns=None):
@@ -368,6 +383,22 @@ def _mapped_density_space(density, mapping, internal, keep, coeff, overlap, anch
         return np.concatenate((internal, mapping @ external), axis=1)
     from ._retained_space import retained_projector
     projected_anchor = coeff.T.conj() @ overlap @ np.asarray(anchor.anchor)
+    if getattr(anchor, 'n_internal', 0):
+        if anchor.n_internal != internal.shape[1]:
+            raise ValueError('occupied frame target rank does not match the LIS')
+        # Keep the physical targets themselves, including their response.
+        # Only the external LNO span is transported against a fixed AO anchor;
+        # retained internal degeneracies never require eigenvector response.
+        if not len(keep):
+            return internal
+        external_anchor = projected_anchor[:, anchor.n_internal:]
+        retained = retained_projector(tuple(int(i) for i in keep))(density)
+        external = mapping @ (retained @ (mapping.T.conj() @ external_anchor))
+        external = _external_map(external, internal)
+        metric = _hermitize(external.T.conj() @ external)
+        low = np.linalg.cholesky(metric)
+        external = solve_triangular(low, external.T.conj(), lower=True).T.conj()
+        return np.concatenate((internal, external), axis=1)
     candidate = internal @ (internal.T.conj() @ projected_anchor)
     if len(keep):
         retained = retained_projector(tuple(int(i) for i in keep))(density)

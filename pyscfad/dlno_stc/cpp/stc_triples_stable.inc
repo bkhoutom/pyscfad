@@ -23,6 +23,39 @@ Array stable_scale_axis(const Array& input,size_t axis,const arma::mat& matrix) 
     return output;
 }
 
+// In the original occupied LIS, U^T=[I_S,0]. Copy its selected rows and
+// scatter their cotangents instead of multiplying by a dense projector.
+// The independent matrix cotangent is still evaluated in full below.
+Array stable_selected_axis(const Array& input,size_t axis,size_t no,size_t ns,
+                           bool adjoint) {
+    Shape dims=shape(input);
+    const size_t ni=adjoint ? ns : no,nout=adjoint ? no : ns;
+    if(size_t(dims[axis])!=ni)
+        throw py::value_error("stable triples: inconsistent selected occupied axis");
+    dims[axis]=py::ssize_t(nout);
+    Array output(dims);
+    size_t inner=1;
+    for(size_t d=axis+1;d<size_t(input.ndim());++d) inner*=size_t(input.shape(d));
+    const size_t outer=size_t(input.size())/(ni*inner);
+    const double* source=input.data();double* dest=output.mutable_data();
+    py::gil_scoped_release release;
+    if(adjoint) {
+        #pragma omp parallel for simd schedule(static) if(output.size()>=32768)
+        for(py::ssize_t i=0;i<output.size();++i) dest[i]=0.;
+    }
+    // Split a long boundary-axis copy too; occupied selection otherwise
+    // exposes only one or two loop iterations for a large ovvv tensor.
+    constexpr size_t panel=262144;
+    const size_t selected=ns*inner,panels=(selected+panel-1)/panel;
+    #pragma omp parallel for schedule(static) if(outer*selected>=32768)
+    for(size_t task=0;task<outer*panels;++task) {
+        const size_t block=task/panels,first=(task%panels)*panel;
+        std::copy_n(source+block*ni*inner+first,std::min(panel,selected-first),
+                    dest+block*nout*inner+first);
+    }
+    return output;
+}
+
 Array stable_transform(const Array& input,size_t axis,const arma::mat& matrix,
                        bool optimized) {
     Shape dims=shape(input);
@@ -138,7 +171,7 @@ class StableDressing {
     double virtual_offdiag_norm_=0.;
     arma::mat u_;
     double shift_=0.,cached_node_=0.;
-    bool full_external_=false;
+    bool full_external_=false,selected_occupied_frame_=false;
     std::vector<libgmbpt::qchem::triples_tensor_spec> specs_;
     std::vector<std::vector<Axis>> plans_;
     std::vector<std::vector<Array>> prefixes_;
@@ -163,6 +196,9 @@ class StableDressing {
     }
     Array transform(const Array& input,const Axis& axis,const arma::mat& matrix,
                     bool diagonal_virtual) const {
+        if(axis.matrix==2 && selected_occupied_frame_)
+            return stable_selected_axis(input,axis.axis,u_.n_rows,u_.n_cols,
+                                        matrix.n_rows==u_.n_rows);
         return diagonal_virtual && axis.matrix==1
             ? stable_scale_axis(input,axis.axis,matrix)
             : stable_transform(input,axis.axis,matrix,full_external_);
@@ -206,6 +242,14 @@ public:
         u_.set_size(size_t(no),size_t(ns));
         for(size_t i=0;i<size_t(no);++i) for(size_t s=0;s<size_t(ns);++s)
             u_(i,s)=inputs_[8].data()[i*size_t(ns)+s];
+        double selector_error=0.;
+        for(size_t i=0;i<size_t(no);++i) {
+            double row=0.;
+            for(size_t s=0;s<size_t(ns);++s)
+                row+=std::abs(u_(i,s)-double(i==s));
+            selector_error=std::max(selector_error,row);
+        }
+        selected_occupied_frame_=selector_error<=32*std::numeric_limits<double>::epsilon();
         specs_=libgmbpt::qchem::triples_layout(size_t(no),size_t(nv),size_t(ns)).tensors;
         for(const auto& spec:specs_) {
             std::vector<Axis> plan;
@@ -230,6 +274,7 @@ public:
     size_t cache_hits() const { return hits_; }
     size_t peak_cache_bytes() const { return peak_bytes_; }
     size_t cache_rebuilds() const { return rebuilds_; }
+    bool selected_occupied_frame() const { return selected_occupied_frame_; }
     bool virtual_diagonal_at(double node) const {
         if(!std::isfinite(node) || node<0)
             throw py::value_error("stable triples: node must be finite and nonnegative");

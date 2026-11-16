@@ -86,8 +86,19 @@ production counts; a positive SE target extends the production stream.
 Historical imported-source hashes are archived in
 results/triples_cleanup_20261030/before/pyscfad/dlno_stc/cpp/native/SOURCE_MANIFEST.txt.
 SHA256 of current retained triples sources:
-531cb52dad2aab5cde497a8788e43ff213ce1f8c9669cf2b3f3cc859bbd2b402  stc_triples.h
-a9efa5c79fc57914266c8873ab0c029213ea6b95705a2f2da32d200c78902a75  stc_triples_asymmetric.C
+75ddcb359eae2aec9ec2f66ab2005d8cd4d290d1b98f188f0982cbac888933f0  stc_triples.h
+45c3d1aa7ae6d24d74014fdb8e374b4da283133592cfe0423aeda0fb685fb243  stc_triples_asymmetric.C
 3cb84a2fd873ab706d3b67b9f0f9f3119981d22a9ca291535075dd78072f7a96  triples_block_sampler.h
-edea10c4bc3ab8be0567f6555c2cd36c84d6aec9990968a8d4e08cd1c1cc3541  triples_deterministic.inc
-c6bb94936d4307c45329be4b2e2b08a516f14a8fc376da3c6fa0337f217b026c  triples_quadrature.inc
+55cfe3c2cd7a2bde993e701b23d2ec823a3ce3c5e490aedf8fc9097108bde643  triples_deterministic.inc
+c589c6df02f2de1febf7a5f97014ab3572844fc5d39af3c765c4a7fcb94c28f8  triples_quadrature.inc
+e0a4038571127961c6a1cbf8e9743756427d85229998eea77fd371cebd94fbac  triples_one_permutation.inc
+6ecf1cc9c1ac440c635c81d9f90ec27ad27a38cdbdd62189a5e82bb0fd91195e  triples_grouped_adjoint.inc
+e7fbd244cb09a74d1ff33e10ced86ef036c61ebc40ba9398269c03612dc1da87  triples_streaming.inc
+
+Streaming triples: at most 128 numerator/cotangent blocks, independent of domain
+size; shared rank-four prepared banks; one-permutation connected left numerator.
+Grouped adjoints own output tiles and concatenate large GEMM reductions in
+bounded panels. Pair permutations go into cotangent packing, eliminating the
+rank-four packed GV bar. The retained-cache reference remains capped at 64
+blocks. Full domain caches are rejected. Mathematical functional and all
+independent prepared-input derivatives are unchanged.

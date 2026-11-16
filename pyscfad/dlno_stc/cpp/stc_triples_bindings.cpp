@@ -361,6 +361,19 @@ py::dict cache_result(const Triples::triples_result& result,const Triples::tripl
     }
     return out;
 }
+py::tuple owned_prepared_bars(Triples::triples_vjp& bars,const libgmbpt::qchem::triples_layout& layout) {
+    py::tuple out(layout.tensors.size());
+    for(size_t i=0;i<layout.tensors.size();++i) {
+        const auto& spec=layout.tensors[i];
+        auto owner=std::make_unique<arma::vec>(std::move(bars.prepared[i]));
+        auto* ptr=owner.get();
+        py::capsule lifetime(ptr,[](void* p) {delete static_cast<arma::vec*>(p);});
+        owner.release();
+        out[i]=py::array_t<double>(std::vector<py::ssize_t>(spec.dims.begin(),spec.dims.begin()+spec.rank),
+                                  ptr->memptr(),lifetime);
+    }
+    return out;
+}
 }  // namespace
 
 namespace pyscfad { namespace dlno_stc {
@@ -376,8 +389,60 @@ void bind_triples(py::module_& module) {
     module.attr("TRIPLES_DIAGONAL_VIRTUAL_DRESSING")=true;
     // Bump the native checkpoint identity when the numerical algorithm changes.
     module.attr("TRIPLES_VERSION")=
-        "stc_triples:stable-external-legs:deterministic-blocks-v3:quadrature-reuse-v1:diagonal-virtual-v1:shared-dressing-v3";
+        "stc_triples:stable-external-legs:deterministic-blocks-v3:quadrature-reuse-v1:diagonal-virtual-v1:shared-dressing-v3:fused-cubes-v1:direct-L-v1:dynamic-blocks-v1:reverse-memory-v3:fused-singles-adjoint-v1:original-lis-occupied-v1:returned-bars-reserve-v1:streaming-quartic-memory-v1:one-permutation-left-v1:grouped-adjoint-128-v1";
     module.attr("TRIPLES_QUADRATURE_REUSE")=true;
+    module.attr("TRIPLES_QUADRATURE_STREAMING")=true;
+    module.attr("TRIPLES_GROUPED_ADJOINT")=true;
+    module.attr("TRIPLES_MAX_STREAMING_BLOCKS")=Triples::maximum_streaming_blocks;
+    module.attr("TRIPLES_MAX_CACHED_BLOCKS")=Triples::maximum_cached_blocks;
+    module.def("triples_quadrature_stream",[](py::tuple left,py::sequence points,
+            py::sequence weight_values,bool with_grad,py::handle workspace_limit,py::handle block_batch_size) {
+        PreparedInput zero(left);
+        std::vector<std::unique_ptr<PreparedInput>> inputs;
+        std::vector<const Triples::triples_prepared*> prepared;
+        std::vector<double> weights,energies;
+        if(points.size()!=weight_values.size() || !points.size())
+            throw py::value_error("streaming triples: inconsistent quadrature points");
+        for(size_t q=0;q<size_t(points.size());++q) {
+            inputs.push_back(std::make_unique<PreparedInput>(points[q].cast<py::tuple>()));
+            prepared.push_back(&inputs.back()->value);
+            weights.push_back(weight_values[q].cast<double>());
+        }
+        const auto budget=unsigned_integer(workspace_limit,"workspace_limit_bytes");
+        const auto batch=unsigned_integer(block_batch_size,"block_batch_size");
+        Triples::triples_result result;std::vector<Triples::triples_vjp> bars;
+        { py::gil_scoped_release release;
+          result=Triples::quadrature_stream(zero.value,prepared,weights,size_t(budget),size_t(batch),energies,
+                                           with_grad ? &bars : nullptr); }
+        Triples::quadrature_cache shape;shape.no=zero.value.no;shape.nv=zero.value.nv;shape.ns=zero.value.ns;
+        auto out=cache_result(result,nullptr,shape);
+        py::array_t<double> energy(energies.size());
+        std::copy(energies.begin(),energies.end(),energy.mutable_data());
+        out["point_energies"]=std::move(energy);
+        out["numerator_cache_peak_bytes"]=result.numerator_cache_peak_bytes;
+        out["rank_four_packing_bytes"]=result.rank_four_packing_bytes;
+        out["left_build_worker_seconds"]=result.left_build_worker_seconds;
+        out["right_worker_seconds"]=result.right_worker_seconds;
+        out["left_reverse_worker_seconds"]=result.left_reverse_worker_seconds;
+        out["left_build_wall_seconds"]=result.left_build_wall_seconds;
+        out["right_wall_seconds"]=result.right_wall_seconds;
+        out["left_reverse_wall_seconds"]=result.left_reverse_wall_seconds;
+        out["occupied_block_batch_size"]=result.occupied_block_batch_size;
+        out["occupied_block_batches"]=result.occupied_block_batches;
+        out["grouped_adjoint_groups"]=result.grouped_adjoint_groups;
+        out["grouped_adjoint_max_terms"]=result.grouped_adjoint_max_terms;
+        out["grouped_adjoint_gemm_calls"]=result.grouped_adjoint_gemm_calls;
+        out["grouped_adjoint_max_reduction"]=result.grouped_adjoint_max_reduction;
+        if(with_grad) {
+            const libgmbpt::qchem::triples_layout layout(shape.no,shape.nv,shape.ns);
+            py::tuple values(bars.size());
+            for(size_t q=0;q<bars.size();++q) values[q]=owned_prepared_bars(bars[q],layout);
+            out["cotangents"]=std::move(values);
+        }
+        return out;
+    },py::arg("left"),py::arg("points"),py::arg("weights"),py::kw_only(),
+       py::arg("with_grad")=false,py::arg("workspace_limit_bytes")=size_t(16)*1024*1024*1024,
+       py::arg("block_batch_size")=Triples::maximum_streaming_blocks);
     py::class_<Triples::quadrature_cache>(module,"TriplesQuadratureCache")
         .def(py::init([](py::tuple values,py::handle first,py::handle count,bool with_grad) {
             PreparedInput input(values);

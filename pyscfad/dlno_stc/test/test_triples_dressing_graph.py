@@ -104,3 +104,36 @@ def test_shared_tape_rebuild_and_wrong_node_are_equivalent_to_replay():
     assert dresser.cache_bytes == 0
     for actual_bar, expected_bar in zip(actual, expected):
         np.testing.assert_allclose(actual_bar, expected_bar, rtol=2e-12, atol=2e-13)
+
+
+@pytest.mark.parametrize('node', [0., .37])
+@pytest.mark.parametrize('selected', [1, 2, 3])
+def test_original_lis_selection_keeps_full_projector_and_fock_pullbacks(node, selected):
+    """Slicing U=[I_S,0] must still return its dense independent cotangent."""
+    inputs = list(fixture(selected=selected))
+    inputs[8] = np.eye(3)[:, :selected]
+    inputs = tuple(inputs)
+    shift = .5*(np.linalg.eigvalsh(inputs[6]).max()
+                + np.linalg.eigvalsh(inputs[7]).min())
+    expected, reverse = jax.vjp(lambda x: independent_dressing(x, node, shift),
+                                tuple(map(jnp.asarray, inputs)))
+    rng = np.random.default_rng(991)
+    cotangents = tuple(rng.normal(size=x.shape) for x in expected)
+    engine = native.StableTriplesDressing(inputs, full_external=True)
+    assert engine.selected_occupied_frame
+    actual = engine.prepare(node, cache_limit_bytes=2**24)
+    bars = engine.pullback(node, cotangents, cache_limit_bytes=2**24)
+    want_bars, = reverse(tuple(map(jnp.asarray, cotangents)))
+    for got, want in zip(actual, expected):
+        np.testing.assert_allclose(got, want, rtol=2e-12, atol=2e-13)
+    for got, want in zip(bars, want_bars):
+        np.testing.assert_allclose(got, want, rtol=3e-11, atol=3e-12)
+    if selected < 3:
+        assert np.linalg.norm(bars[8][selected:]) > .1
+
+
+def test_selected_frame_fast_path_rejects_a_physical_off_block_component():
+    inputs = list(fixture(selected=1))
+    inputs[8] = np.eye(3)[:, :1]
+    inputs[8][2, 0] = 1e-10
+    assert not native.StableTriplesDressing(tuple(inputs), full_external=True).selected_occupied_frame

@@ -326,7 +326,8 @@ void bind_triples_dressing(py::module_& module) {
         .def_property_readonly("cache_bytes",&StableDressing::cache_bytes)
         .def_property_readonly("cache_hits",&StableDressing::cache_hits)
         .def_property_readonly("peak_cache_bytes",&StableDressing::peak_cache_bytes)
-        .def_property_readonly("cache_rebuilds",&StableDressing::cache_rebuilds);
+        .def_property_readonly("cache_rebuilds",&StableDressing::cache_rebuilds)
+        .def_property_readonly("selected_occupied_frame",&StableDressing::selected_occupied_frame);
     py::class_<Dressing>(module,"TriplesDressing")
         .def(py::init<py::tuple,bool>(), py::arg("inputs"),
              py::kw_only(),py::arg("integral_inputs")=false)

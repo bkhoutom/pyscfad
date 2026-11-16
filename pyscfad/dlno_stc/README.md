@@ -958,6 +958,15 @@ Fragment weights use the normalized domain targets. The global SCF AO Fock
 is projected into the LIS, including occupied-virtual entries. SCF, Boys/PAO,
 ED, D/W and retained-space responses remain differentiated. Smooth frames
 and deterministic or stochastic triples use this same domain definition.
+New smooth selections retain the original occupied LIS order: physical
+fragment targets first, followed by their retained external LNO complement.
+Only that external span is transported against a fixed AO anchor; the target,
+overlap and retained-density responses remain differentiable. The virtual
+frame keeps its existing semicanonical anchor. The occupied Fock propagator
+remains a full matrix, including target/environment coupling. In this occupied
+frame, native triples selects target rows by copying and scatters their
+cotangents; it still evaluates the full independent fragment-projector
+cotangent. Existing smooth anchors remain readable in their saved ordering.
 Global-space LIS checkpoints are rejected and must be rebuilt. Selection
 schema 10 remains valid for existing domain-space checkpoints.
 
@@ -1231,14 +1240,14 @@ the native extension selected at runtime. Changed implementation identity
 rejects resume. Checkpoints must use the current CC selection schema;
 serial progress checkpoints remain unavailable for multi-rank execution.
 
-The single-point smooth deterministic Laplace triples kernel evaluates occupied blocks with
+The independent single-point prepared-input deterministic reference evaluates occupied blocks with
 `k <= j`, with weight two for `j != k`. This follows from simultaneous
 occupied/virtual pair permutation symmetry of the complete numerator; it
 also holds for independent prepared tensors and their full cotangents.
 Blocks run in parallel with one BLAS thread per worker when MKL local thread
 control or the supported pthread OpenBLAS control is available. Unknown
 BLAS providers retain serial blocks. Virtual permutations are specialized
-outside their inner loops. Cotangent workers share one bank, with locks on
+outside their inner loops. Cotangent workers share a bank per prepared node, with locks on
 occupied slabs rather than private copies of all input cotangents.
 Worker count is bounded by an 8 GiB scratch estimate (at least one worker);
 input and cotangent residency are additional. `deterministic_blocks` counts
@@ -1250,8 +1259,15 @@ time. The optimization retains the full asymmetric fragment projection and
 all Fock-matrix responses.
 
 
-The smooth deterministic solver now reuses the undressed spin-adapted
-selected numerator across the entire Laplace grid. All external matrix
+Smooth triples use four fitted Laplace points by default
+(`smooth_laplace_points=4`). Each nonempty LIS gets its own positive nodes
+and weights, fitted to the inverse first and second powers of denominators
+over the bounds from that LIS's occupied and virtual Fock spectra. The
+resolved grid is stored with the LIS selection and held fixed during
+response calculations. This is separate from the MP2 baseline/D/W grid.
+
+The smooth deterministic solver reuses the undressed spin-adapted
+selected numerator across the Laplace grid within each occupied block. All external matrix
 exponentials are applied to the other numerator at full time, while its
 selected occupied leg retains `U.T @ exp(t*Foo)`. Thus the physical fragment
 operator and full Fock response are preserved, with no inverse exponentials
@@ -1263,17 +1279,91 @@ side, with a factor of two from exchanging the two unselected occupied and
 virtual legs. Both ordered occupied-pair orientations are visited, sharing
 one triangular cached numerator. This removes the second full pair/spin
 symmetrization without commuting the fragment operator through permutations.
-For derivatives, each point contributes to the cache cotangent; its spin
-operation and six numerator contractions are reversed once after the grid.
+For derivatives, each point contributes to the block's cotangent; its spin
+operation and numerator contractions are reversed immediately after the grid.
 The point-dependent raw terms retain both singles and Fov contributions.
 
-The numerator cache uses at most half current `max_memory` headroom, subject
-to an optional `PYSCFAD_TRIPLES_NUMERATOR_CACHE_MB` cap (MiB). At least one
-virtual cube, and its cotangent when differentiating, is required. Smaller
-budgets split the occupied blocks into batches and repeat dressing across
-batches; they do not discard contributions. The cache limit is additional
-to the input, prepared-tensor, and worker-scratch allocations. Diagnostics
-report `numerator_cache_batches`, `numerator_cache_peak_bytes`, and
-`quadrature_reused_blocks`. The single-point `triples_prepared_energy[_vjp]`
-API remains available as an independent reference; stochastic evaluation
-continues to use the shared half-dressing path.
+The native kernel retains at most 128 numerator cubes and, when
+differentiating, their cotangents. This hard cap is independent of orbital
+dimensions; there is no domain-wide `nS*nocc**2*nvir**3` cache. All shared
+prepared tensors, packed operands and cotangents have at most four orbital
+indices. Nodes are prepared once per point group and reused across every
+occupied block; their accumulated cotangents are pulled back once after the
+native call. If `max_memory` cannot hold all prepared nodes and their bars,
+the grid is split into point groups, recomputing the left numerator once per
+group. This changes neither the quadrature nor the selected functional.
+
+`PYSCFAD_TRIPLES_NUMERATOR_CACHE_MB` can reduce the occupied batch below
+128 blocks. At least one indivisible virtual cube, and its cotangent when
+differentiating, is required. Native `block_batch_size` accepts 1 through 128.
+A combined cache/scratch budget of at most 16 GiB also limits batch and
+worker counts; input and shared prepared tensors/cotangents are additional.
+`numerator_cache_peak_bytes` reports K/K-bar storage and
+`occupied_block_batch_size`/`occupied_block_batches` report actual batching;
+`quadrature_point_batches` (also retained as `numerator_cache_batches` for
+compatibility) counts point groups. `streaming_quartic_memory` identifies this
+backend. The legacy `TriplesQuadratureCache` reference rejects requests above
+64 blocks regardless of available memory, preventing an unbounded fifth-order
+allocation. The single-point `triples_prepared_energy[_vjp]` API remains an
+independent reference; stochastic evaluation uses the shared half-dressing path.
+
+The left numerator groups all twelve connected GEMMs into `abc` and `bac`
+output orderings. Matrix transposes put the singleton virtual index first or
+last; one full-cube permutation combines the results. A shared rank-four pack
+of the two external GV axes replaces repeated cube permutations without
+assuming integral or amplitude symmetry. After the right contractions, the
+reverse reuses K and K-bar storage for the main and exchanged cotangent
+orderings. Contributions are grouped by destination slab and assigned to
+exclusive output owners, eliminating left-adjoint locks. The large GV and
+T2O adjoints concatenate occupied contributions along the GEMM reduction
+axis, with output tiles of 256 virtual pairs and reduction panels of at
+most 4096. Smaller T2V and GO adjoints accumulate directly into their owned
+outputs. Virtual pair permutations are absorbed in cotangent packing, so
+no packed rank-four GV cotangent or final transpose is needed.
+`grouped_adjoint_*` diagnostics report group sizes and GEMM reduction widths.
+`left_build_worker_seconds`, `right_worker_seconds`, and
+`left_reverse_worker_seconds` sum worker elapsed times. Their corresponding
+`*_wall_seconds` fields measure disjoint batch stages including load imbalance
+and barriers; initialization and dressing are outside these three stages.
+
+Energy evaluation folds the direct singles/Fock outer products and weighted cyclic
+permutation into its dot product; with derivatives, the same pass also writes
+the numerator cotangent. The cache cotangent receives the composed scaled
+permutation directly. These fused passes avoid temporary rank-one matrices and
+zero/permute/scale contribution cubes, preserving the physical fragment
+functional and its full derivatives. Rebuild the native extension after updating.
+
+The quadrature kernel contracts the singles/Fock outer products directly in
+its energy and reusable-numerator cotangent passes. It never adds an L cube to
+the connected numerator. The two unselected-index orientations use composed
+permutation indices without an exchanged cache copy. Each OpenMP worker reuses
+its numerator, occupied-operand, and matrix-adjoint scratch across blocks;
+occupied blocks use dynamic work scheduling (`schedule(dynamic,1)`), allowing
+workers to take another block when equal-FLOP blocks finish at different times.
+Gradient-buffer first-touch zeroing retains `schedule(static,1)`. OpenMP
+team adjustment and MKL dynamic adjustment remain caller-controlled. BLAS uses
+one local thread per occupied-block worker.
+
+The smooth solver's default DF path now reuses each materialized `ovvv`,
+`ovoo`, and `ovov` block in its current ERI frame. It constructs only missing
+blocks, once before the quadrature loop, and preserves their derivatives.
+Cache discovery does not invoke lazy integral properties. The explicit
+`integral_transform='rotate'` mode continues to require all three blocks.
+
+Reverse tensor-bank construction reserves its complete descriptor array before
+creating views, avoiding Armadillo deep copies during `std::vector` growth.
+Adjoint locks distinguish the occupied pair for T2/T2V, ovoo and ovov tiles;
+full occupied slabs retain slab locks where contractions update the whole slab.
+
+On Linux `PYSCFAD_TRIPLES_HUGEPAGES=1` enables a best-effort `MADV_HUGEPAGE` hint for
+large owned cache, cotangent and worker buffers before first touch. This affects
+only private process mappings and does not change the host THP configuration.
+Unsupported or rejected hints fall back to ordinary pages. Hints are disabled
+by default; set the environment variable before process startup.
+
+The quadrature reverse pass initializes shared cotangent buffers in parallel
+before any block updates, so first-touch placement is distributed across the
+active team. It computes all four singles/Fock adjoints during the existing
+weighted-numerator pass and commits only their small vectors/matrices. The
+connected adjoints reuse the occupied operands packed by the immediately
+preceding forward GEMMs. No extra numerator or derivative approximation is used.

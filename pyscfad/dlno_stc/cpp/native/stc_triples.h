@@ -39,6 +39,15 @@ public:
         double vjp_finalize_seconds;
         size_t deterministic_blocks;
         size_t deterministic_workspace_bytes;
+        size_t numerator_cache_peak_bytes;
+        size_t rank_four_packing_bytes;
+        double left_build_worker_seconds;
+        double right_worker_seconds;
+        double left_reverse_worker_seconds;
+        double left_build_wall_seconds,right_wall_seconds,left_reverse_wall_seconds;
+        size_t occupied_block_batch_size,occupied_block_batches;
+        size_t grouped_adjoint_groups,grouped_adjoint_max_terms;
+        size_t grouped_adjoint_gemm_calls,grouped_adjoint_max_reduction;
     };
     // Discarded pilot with its own RNG stream; shares tensors and proposal
     // tables with production. nsamples is the minimum production count.
@@ -78,6 +87,11 @@ public:
     static triples_result quadrature_step(const triples_prepared&,quadrature_cache&,
         double weight,triples_vjp*);
     static triples_result quadrature_finish(const triples_prepared&,quadrature_cache&,triples_vjp*);
+    static constexpr size_t maximum_cached_blocks=64;
+    static constexpr size_t maximum_streaming_blocks=128;
+    static triples_result quadrature_stream(const triples_prepared&,
+        const std::vector<const triples_prepared*>&,const std::vector<double>&,
+        size_t workspace_limit,size_t block_batch_size,std::vector<double>&,std::vector<triples_vjp>*);
 
     // Denominator-free Laplace numerator, contracted directly over a small
     // selected space: sum_s (A^T L)_s (R^T Z)_s, with the physical -1/3 factor.

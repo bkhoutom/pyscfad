@@ -3,6 +3,7 @@
 #include "triples_block_sampler.h"
 #include "scoped_openblas_threads.h"
 #include <array>
+#include <atomic>
 #include <algorithm>
 #include <exception>
 #include <limits>
@@ -13,6 +14,11 @@
 #include <cstring>
 #include <mutex>
 #include <dlfcn.h>
+#include <cstdlib>
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace libgmbpt { namespace qchem { namespace {
 
@@ -21,6 +27,28 @@ using index6 = std::array<size_t,6>;
 
 const size_t permutations[6][3]={{0,1,2},{1,2,0},{2,0,1},{0,2,1},{1,0,2},{2,1,0}};
 const double spin_weights[6]={4,1,1,-2,-2,-2};
+
+// Process-private allocation hint only; never alters host THP policy.
+// Ignore unsupported/failed hints and retain ordinary-page correctness.
+void triples_large_page_hint(double* data,size_t length) {
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    static const bool enabled=[] {
+        const char* flag=std::getenv("PYSCFAD_TRIPLES_HUGEPAGES");
+        return flag && std::strcmp(flag,"0")!=0;
+    }();
+    const size_t bytes=length*sizeof(double);
+    if(!enabled || bytes<size_t(4)*1024*1024) return;
+    static const size_t page=size_t(sysconf(_SC_PAGESIZE));
+    const uintptr_t begin=reinterpret_cast<uintptr_t>(data);
+    // Leave allocation boundary pages untouched: they may contain allocator
+    // metadata or another allocation. Huge pages form in aligned interiors.
+    const uintptr_t first=(begin+page-1)/page*page;
+    const uintptr_t last=(begin+bytes)/page*page;
+    if(last>first) (void)madvise(reinterpret_cast<void*>(first),last-first,MADV_HUGEPAGE);
+#else
+    (void)data;(void)length;
+#endif
+}
 
 struct tensor {
     int kind;
@@ -35,7 +63,9 @@ struct tensor {
         }
         if(values) value=arma::vec(const_cast<double*>(values),length,false,true);
         else value.zeros(length);
-        if(gradient) bar.zeros(length);
+        if(gradient) {
+            bar.set_size(length);triples_large_page_hint(bar.memptr(),length);bar.zeros();
+        }
     }
     size_t offset(const index4& x) const {
         return ((x[0]*dims[1]+x[1])*dims[2]+x[2])*dims[3]+x[3];
@@ -183,6 +213,7 @@ struct record { index6 x; double a,z; };
 
 #include "triples_deterministic.inc"
 #include "triples_quadrature.inc"
+#include "triples_streaming.inc"
 
 }} // namespace qchem anonymous
 namespace qchem {
@@ -191,6 +222,8 @@ stc_triples::triples_result stc_triples::quadrature_build(const triples_prepared
         quadrature_cache& cache,size_t first,size_t count,bool gradient) {
     const size_t total=input.ns*input.no*(input.no+1)/2;
     if(!count || first>=total || count>total-first) throw std::invalid_argument("quadrature cache: invalid batch");
+    if(count>maximum_cached_blocks)
+        throw std::invalid_argument("quadrature cache: at most 64 blocks; use streaming triples for a full domain");
     cache=quadrature_cache();cache.no=input.no;cache.nv=input.nv;cache.ns=input.ns;
     cache.first=first;cache.gradient=gradient;cache.values.resize(count);
     if(gradient) cache.bars.resize(count);
@@ -206,6 +239,12 @@ stc_triples::triples_result stc_triples::quadrature_finish(const triples_prepare
         quadrature_cache& cache,triples_vjp* vjp) {
     if(!cache.gradient || !vjp) throw std::invalid_argument("quadrature cache: reverse was not enabled");
     auto result=quadrature_kernel(input,cache,2,0.,vjp);cache.finished=true;return result;
+}
+
+stc_triples::triples_result stc_triples::quadrature_stream(const triples_prepared& left,
+        const std::vector<const triples_prepared*>& points,const std::vector<double>& weights,
+        size_t workspace_limit,size_t block_batch_size,std::vector<double>& energies,std::vector<triples_vjp>* bars) {
+    return triples_stream_kernel(left,points,weights,workspace_limit,block_batch_size,energies,bars);
 }
 
 stc_triples::triples_result stc_triples::asymmetric_triples(

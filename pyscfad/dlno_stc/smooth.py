@@ -20,6 +20,7 @@ def orthonormalize(candidate, overlap):
 @dataclass(frozen=True)
 class AnchoredFrame:
     anchor: np.ndarray
+    n_internal: int = 0
 
 
 def select_frame(coeff, fock):
@@ -27,6 +28,27 @@ def select_frame(coeff, fock):
     coeff, fock = np.asarray(coeff), np.asarray(fock)
     _, rotation = np.linalg.eigh(coeff.T @ fock @ coeff)
     return AnchoredFrame(coeff @ rotation)
+
+
+def select_occupied_frame(coeff, targets, overlap):
+    """Retain the original target-plus-external occupied LIS ordering.
+
+    Truncated LIS columns already have this ordering. Only a keep-all ED
+    basis needs a complement chosen here, outside differentiation. Subsequent
+    builds transport its external anchor through the retained-space projector.
+    """
+    coeff, targets, overlap = map(np.asarray, (coeff, targets, overlap))
+    ns = targets.shape[1]
+    if not np.allclose(coeff[:, :ns], targets, rtol=0., atol=1e-12):
+        import scipy.linalg
+        external = coeff - targets @ (targets.T @ overlap @ coeff)
+        _, _, pivots = scipy.linalg.qr(external, mode='economic', pivoting=True)
+        external = external[:, pivots[:coeff.shape[1]-ns]]
+        if external.shape[1]:
+            low = np.linalg.cholesky(external.T @ overlap @ external)
+            external = scipy.linalg.solve_triangular(low, external.T, lower=True).T
+        coeff = np.concatenate((targets, external), axis=1)
+    return AnchoredFrame(coeff, n_internal=ns)
 
 
 def rebuild_frame(coeff, overlap, frame):

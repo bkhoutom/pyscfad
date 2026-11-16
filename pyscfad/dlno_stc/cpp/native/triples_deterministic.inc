@@ -10,17 +10,19 @@
 // Compile-time permutations avoid dynamic index selection in the innermost
 // loop. The adjoint gathers through the inverse permutation, rather than
 // scattering into strided output.
+template<size_t P> size_t triples_permuted_index(size_t a,size_t b,size_t c,size_t n) {
+    if constexpr(P==0) return (a*n+b)*n+c;
+    if constexpr(P==1) return (b*n+c)*n+a;
+    if constexpr(P==2) return (c*n+a)*n+b;
+    if constexpr(P==3) return (a*n+c)*n+b;
+    if constexpr(P==4) return (b*n+a)*n+c;
+    return (c*n+b)*n+a;
+}
 template<size_t P> void triples_permute_impl(double* out,const double* raw,size_t n) {
     for(size_t a=0;a<n;++a) for(size_t b=0;b<n;++b) {
         double* dst=out+(a*n+b)*n;
         for(size_t c=0;c<n;++c) {
-            size_t source;
-            if constexpr(P==0) source=(a*n+b)*n+c;
-            if constexpr(P==1) source=(b*n+c)*n+a;
-            if constexpr(P==2) source=(c*n+a)*n+b;
-            if constexpr(P==3) source=(a*n+c)*n+b;
-            if constexpr(P==4) source=(b*n+a)*n+c;
-            if constexpr(P==5) source=(c*n+b)*n+a;
+            const size_t source=triples_permuted_index<P>(a,b,c,n);
             dst[c]+=raw[source];
         }
     }
@@ -35,17 +37,23 @@ void triples_permute_add(arma::vec& out,const arma::vec& raw,size_t n,size_t p,
 #undef TRIPLES_PERM
     }
 }
-arma::vec triples_spin(const arma::vec& input,size_t n) {
-    arma::vec out(input.n_elem,arma::fill::none);
+void triples_spin_into(arma::vec& out,const arma::vec& input,size_t n) {
+    out.set_size(input.n_elem);
     const double* x=input.memptr();
     for(size_t a=0;a<n;++a) for(size_t b=0;b<n;++b) for(size_t c=0;c<n;++c)
         out[(a*n+b)*n+c]=4*x[(a*n+b)*n+c]+x[(b*n+c)*n+a]+x[(c*n+a)*n+b]
             -2*(x[(a*n+c)*n+b]+x[(b*n+a)*n+c]+x[(c*n+b)*n+a]);
+}
+arma::vec triples_spin(const arma::vec& input,size_t n) {
+    arma::vec out;
+    triples_spin_into(out,input,n);
     return out;
 }
 
 // Cotangents share one bank. Locks protect disjoint occupied slabs; no
 // worker has a private copy of the (potentially very large) tensor bank.
+// Pair-resolved tensors lock the occupied pair actually updated by a block;
+// independent j slices must not contend on a common i-only lock.
 struct triples_bar_locks {
     std::vector<size_t> starts;
     std::unique_ptr<std::mutex[]> locks;
@@ -53,21 +61,47 @@ struct triples_bar_locks {
         size_t count=0;
         for(const auto& t:bank) {
             starts.push_back(count);
-            count+=t.kind==T2O ? t.dims[1] : t.dims[0];
+            count+=t.kind==T2O ? t.dims[1]
+                : (t.kind==T2 || t.kind==T2V) ? t.dims[0]*t.dims[1]
+                : (t.kind==GO || t.kind==GG) ? t.dims[0]*t.dims[2]
+                : t.dims[0];
         }
         locks.reset(new std::mutex[count]);
     }
     std::mutex& at(const operations& op,size_t item,const tensor& t) {
-        return locks[starts[op.ids[item]]+op.indices[item][t.kind==T2O ? 1 : 0]];
+        const auto& x=op.indices[item];
+        const size_t slab=t.kind==T2O ? x[1]
+            : (t.kind==T2 || t.kind==T2V) ? x[0]*t.dims[1]+x[1]
+            : (t.kind==GO || t.kind==GG) ? x[0]*t.dims[2]+x[2] : x[0];
+        return locks[starts[op.ids[item]]+slab];
     }
 };
 
+// Reused by an occupied-block worker. Matrix adjoints keep their separate
+// shapes, avoiding a large delta allocation followed by a smaller resize.
+struct triples_raw_workspace {
+    arma::mat h,u,gb,tb,hb,ub;
+    arma::vec one_bar,fov_bar,two_bar,integral_bar;
+    void prepare(size_t no,size_t nv,bool gradient) {
+        h.set_size(no,nv);u.set_size(nv*nv,no);
+        triples_large_page_hint(u.memptr(),u.n_elem);
+        if(gradient) {
+            gb.set_size(nv,nv*nv);tb.set_size(nv,nv);
+            hb.set_size(no,nv);ub.set_size(nv*nv,no);
+            triples_large_page_hint(gb.memptr(),gb.n_elem);
+            triples_large_page_hint(ub.memptr(),ub.n_elem);
+            one_bar.set_size(nv);fov_bar.set_size(nv);
+            two_bar.set_size(nv*nv);integral_bar.set_size(nv*nv);
+        }
+    }
+};
 // Twelve GEMMs per side (six virtual and six occupied contractions), plus
 // the disconnected outer products on the right. Reverse uses their matrix
 // adjoints and accumulates directly into the prepared tensor cotangents.
 void triples_raw_block(std::vector<tensor>& bank,const operations& op,
                        size_t no,size_t nv,bool singles,arma::vec& raw,
-                       const arma::vec* raw_bar=nullptr,triples_bar_locks* locks=nullptr) {
+                       const arma::vec* raw_bar=nullptr,triples_bar_locks* locks=nullptr,
+                       triples_raw_workspace* workspace=nullptr,bool reuse_packed=false) {
     auto& gv=bank[op.ids[0]]; auto& tv=bank[op.ids[1]];
     auto& go=bank[op.ids[2]]; auto& to=bank[op.ids[3]];
     const size_t ng=gv.offset(op.indices[0]),nt=tv.offset(op.indices[1]);
@@ -75,11 +109,16 @@ void triples_raw_block(std::vector<tensor>& bank,const operations& op,
     const size_t go_step=go.dims[2]*go.dims[3],to_step=to.dims[1]*nv*nv;
     arma::mat g(gv.value.memptr()+ng,nv,nv*nv,false,true);
     arma::mat t(tv.value.memptr()+nt,nv,nv,false,true);
-    arma::mat h(no,nv),u(nv*nv,no);
-    for(size_t a=0;a<nv;++a)
-        std::copy_n(go.value.memptr()+ngo+a*go_step,no,h.colptr(a));
-    for(size_t m=0;m<no;++m)
-        std::copy_n(to.value.memptr()+nto+m*to_step,nv*nv,u.colptr(m));
+    triples_raw_workspace local;
+    auto& work=workspace ? *workspace : local;
+    auto& h=work.h;auto& u=work.u;
+    h.set_size(no,nv);u.set_size(nv*nv,no);
+    if(!reuse_packed) {
+        for(size_t a=0;a<nv;++a)
+            std::copy_n(go.value.memptr()+ngo+a*go_step,no,h.colptr(a));
+        for(size_t m=0;m<no;++m)
+            std::copy_n(to.value.memptr()+nto+m*to_step,nv*nv,u.colptr(m));
+    }
     if(!raw_bar) {
         raw.set_size(nv*nv*nv);
         arma::mat abc(raw.memptr(),nv,nv*nv,false,true);
@@ -91,11 +130,12 @@ void triples_raw_block(std::vector<tensor>& bank,const operations& op,
         arma::mat bca(const_cast<double*>(raw_bar->memptr()),nv*nv,nv,false,true);
         arma::mat gb(gv.bar.memptr()+ng,nv,nv*nv,false,true);
         arma::mat tb(tv.bar.memptr()+nt,nv,nv,false,true);
-        arma::mat delta=t*abc;
-        { std::lock_guard<std::mutex> guard(locks->at(op,0,gv)); gb+=delta; }
-        delta=g*abc.t();
-        { std::lock_guard<std::mutex> guard(locks->at(op,1,tv)); tb+=delta; }
-        arma::mat hb=-u.t()*bca,ub=-bca*h.t();
+        work.gb=t*abc;
+        { std::lock_guard<std::mutex> guard(locks->at(op,0,gv)); gb+=work.gb; }
+        work.tb=g*abc.t();
+        { std::lock_guard<std::mutex> guard(locks->at(op,1,tv)); tb+=work.tb; }
+        work.hb=-u.t()*bca;work.ub=-bca*h.t();
+        const auto& hb=work.hb;const auto& ub=work.ub;
         { std::lock_guard<std::mutex> guard(locks->at(op,2,go));
           for(size_t a=0;a<nv;++a) for(size_t m=0;m<no;++m)
             go.bar[ngo+a*go_step+m]+=hb(m,a); }
@@ -117,7 +157,15 @@ void triples_raw_block(std::vector<tensor>& bank,const operations& op,
     arma::vec two(t2.value.memptr()+n2,nv*nv,false,true);
     if(!raw_bar) {
         arma::mat abc(raw.memptr(),nv,nv*nv,false,true);
-        abc+=.5*(one*integral.t()+f*two.t());
+        // Materializing two rank-one matrices costs several full cube passes.
+        // Keep c contiguous and stream the existing numerator exactly once.
+        double* dest=raw.memptr();
+        for(size_t ab=0;ab<nv*nv;++ab) {
+            const double gvalue=integral[ab],tvalue=two[ab];
+            #pragma omp simd
+            for(size_t c=0;c<nv;++c)
+                dest[ab*nv+c]+=.5*(one[c]*gvalue+f[c]*tvalue);
+        }
     } else {
         arma::mat abc(const_cast<double*>(raw_bar->memptr()),nv,nv*nv,false,true);
         arma::vec onebar(t1.bar.memptr()+n1,nv,false,true);
@@ -182,7 +230,7 @@ void triples_deterministic_blocks(std::vector<tensor>& bank,Describe describe,
         triples_local_blas local_blas(workers>1 ? mkl_setter : nullptr);
         #pragma omp single
         result.sampling_threads=omp_get_num_threads();
-        #pragma omp for schedule(dynamic,1)
+        #pragma omp for schedule(static,1)
         for(size_t block=0;block<blocks.size();++block) {
             try {
                 const auto indices=blocks[block];

@@ -40,7 +40,7 @@ These are library defaults, not the overrides in the run scripts below.
 | `force_full_domains` | `False` | Full extended domains when enabled; `"molecule"` enables this automatically. This is separate from LIS eigenvalue cutoffs. |
 | `matrix_kind`, `thresh_occ`, `thresh_vir` | Required | Choose D or W and its occupied/virtual absolute-eigenvalue cutoffs; zero keeps the full corresponding space. |
 | `internal_rank_threshold` | `1e-6` | Numerical rank threshold when completing the LIS to the full MO layout; all original S orbitals remain retained. |
-| `smooth` / `smooth_laplace_points` | `True` / `6` | Anchored frames and a positive fitted triples grid per LIS. |
+| `smooth` / `smooth_laplace_points` | `True` / `4` | Anchored frames and a positive fitted triples grid per LIS. |
 | `ccsd_t` / `triples_controls` | `False` / `None` | Enable triples explicitly; omitted controls then mean deterministic. |
 | `triples_controls.mode` | `"deterministic"` | `"stochastic"` enables sampling. |
 | `integral_transform` | `"df"` | `"rotate"` directly rotates cached CCSD `ovvv`, `ovoo`, and `ovov` at each Laplace point; available for either smooth triples mode. |
@@ -198,7 +198,7 @@ python examples/dlno_stc/smooth_force_compare.py \
   --xyz-file examples/dlno_stc/c5h6_force_compare.xyz \
   --basis cc-pvdz --frozen 5 --boys-grouping molecule \
   --lno-thresh-occ 0 --lno-thresh-vir 0 \
-  --threads 32 --triples-laplace-points 6 \
+  --threads 32 --triples-laplace-points 4 \
   --triples-pilot-samples 10000 --triples-energy-tolerance-mha 0.05 \
   --triples-trace-exponent 5.0 --seeds 71 \
   --output-dir results/c5h6_smooth_current
@@ -211,7 +211,7 @@ python examples/dlno_stc/smooth_force_compare.py \
   --xyz-file examples/dlno_stc/c6h14.xyz \
   --basis 'def2-SV(P)' --frozen 6 --boys-grouping atom \
   --lno-thresh-occ 1e-4 --lno-thresh-vir 1e-5 \
-  --threads 32 --triples-laplace-points 6 \
+  --threads 32 --triples-laplace-points 4 \
   --triples-pilot-samples 10000 --triples-energy-tolerance-mha 0.05 \
   --triples-trace-exponent 5.0 --seeds 71 \
   --output-dir results/c6h14_smooth_current

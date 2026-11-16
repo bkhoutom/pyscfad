@@ -185,7 +185,7 @@ from pyscfad.dlno_stc import ccsd
 static = ccsd.build_static_selections(
     mf, domains, matrix_kind="W", thresh_occ=1e-4, thresh_vir=1e-5,
     baseline_controls=baseline, matrix_controls=matrix,
-    smooth_laplace_points=6,
+    smooth_laplace_points=4,
 )
 triples = dict(
     mode="stochastic", nsamples=10000, pilot_samples=10000,
@@ -218,7 +218,7 @@ point meets its allocated SE. The pilot and production share prepared tensors
 and proposal tables; pilot draws are excluded from production statistics and
 forces. Zero or omitted energy tolerance selects a fixed production budget.
 
-The fitted triples grid uses six positive points by default, fitting both inverse
+The fitted triples grid uses four positive points by default, fitting both inverse
 first and second powers of denominators. Grid diagnostics report energy and
 derivative approximation errors separately from stochastic SE. Point count,
 seeds, sample counts, tolerances and trace exponents remain configurable.
@@ -276,7 +276,7 @@ See the [domain and MP2 guide](../../../pyscfad/dlno_stc/README.md) for their de
 | `fragment_indices` | `None` | Select all physical fragments; otherwise select only the listed zero-based S indices. |
 | `single_pass` | `True` | Select LIS from each production W without a prepass, including MPI domain owners. Set `False` for D matrices or concrete selections, anchors and grids before production. |
 | `smooth` | `True` | Full occupied/virtual anchored frames. `False` retains the conventional deterministic reference. |
-| `smooth_laplace_points` | `6` | Positive integer; fit a separate positive triples quadrature for each nonempty LIS. Used with `smooth=True`. |
+| `smooth_laplace_points` | `4` | Positive integer; fit a separate positive triples quadrature for each nonempty LIS. Used with `smooth=True`. |
 
 The baseline and matrix dictionaries must match the scientific settings used to
 build selections. D/W matrices can independently use `mode="deterministic"`
@@ -466,7 +466,7 @@ is the general geometry runner, including C5H6, C6H14, and square H4.
 | `--triples-energy-tolerance-mha` | `0.05` | Total requested `(T)` SE in mEh; zero selects fixed counts. |
 | `--samples` | `16446469` | Nominal production draws per S when tolerance is zero. |
 | `--triples-pilot-samples` | `10000` | Independent pilot draws per point per S. |
-| `--triples-laplace-points` | `6` | Fitted triples point count. |
+| `--triples-laplace-points` | `4` | Fitted triples point count. |
 | `--triples-trace-exponent` | `5.0` | Triples trace-model exponent. |
 | `--triples-budget-energy` | `mp2` | `mp2` uses selection proxies; `ccsd` uses fragment energies from the deterministic reference. |
 | `--seeds` | `71 72 73` | One stochastic calculation per seed; an empty list skips stochastic runs. |
@@ -505,7 +505,7 @@ comparison runner above for other molecules.
 | `--cc-conv-tol-normt` | `1e-5` | Forward amplitude and backward response update-norm threshold. |
 | `--triples-method` | `smooth` | `smooth` or deterministic-only `conventional`. |
 | `--triples-integral-transform` | `df` | `df` or `rotate`; `rotate` requires `--triples-method smooth`. |
-| `--smooth-laplace-points` | `6` | Fitted triples points per LIS. |
+| `--smooth-laplace-points` | `4` | Fitted triples points per LIS. |
 | `--smooth-trace-exponent` | `5.0` | Trace-model exponent. |
 | `--selection-only` | Off | Stop after selections and settings output. |
 | `--deterministic-only` | Off | Compute only the deterministic reference for the selected method. |

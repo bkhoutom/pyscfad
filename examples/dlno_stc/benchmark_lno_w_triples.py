@@ -90,7 +90,7 @@ def main():
                         default="smooth")
     parser.add_argument("--triples-integral-transform", choices=("df", "rotate"),
                         default="df", help="dress DF factors or rotate cached CCSD integrals")
-    parser.add_argument("--smooth-laplace-points", type=int, default=6)
+    parser.add_argument("--smooth-laplace-points", type=int, default=4)
     parser.add_argument("--smooth-trace-exponent", type=float, default=5.)
     parser.add_argument("--selection-only", action="store_true")
     parser.add_argument("--single-pass-w", action=argparse.BooleanOptionalAction, default=True,

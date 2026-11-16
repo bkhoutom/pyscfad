@@ -85,13 +85,13 @@ def test_block_frame_preserves_full_matrix_response():
     np.testing.assert_allclose(derivative, reference, atol=1e-12)
 
 
-def inputs_and_reference():
+def inputs_and_reference(**grid_options):
     x = {k: jnp.asarray(v) for k, v in triples_fixture().items()}
     x['U'] = jnp.eye(2)
     x['fov'] = jnp.array([[.03, -.02, .01], [-.04, .05, -.06]])
     foo, fvv = jnp.diag(x['eocc']), jnp.diag(x['evir'])
     frames = (AnchoredFrame(np.eye(2)), AnchoredFrame(np.eye(3)))
-    grid = make_grid(x['eocc'], x['evir'])
+    grid = make_grid(x['eocc'], x['evir'], **grid_options)
     return x, foo, fvv, frames, grid
 
 
@@ -117,7 +117,8 @@ def canonical_reference(x, foo, fvv):
 
 
 def test_deterministic_laplace_energy_and_all_cotangents():
-    x, foo, fvv, frames, grid = inputs_and_reference()
+    # Resolve quadrature error below the strict canonical-reference tolerance.
+    x, foo, fvv, frames, grid = inputs_and_reference(points=6)
     # Off-diagonal Fock tests the noncanonical equation, not just diagonal scaling.
     foo = foo.at[0, 1].set(.02).at[1, 0].set(.02)
     fvv = fvv.at[0, 1].set(.03).at[1, 0].set(.03)
@@ -169,7 +170,8 @@ def test_existing_deterministic_triples_vjp_reference():
 
 def test_partial_target_laplace_all_responses():
     """Noncommuting fragment projector, off-diagonal Fock and nonzero Fov."""
-    x, foo, fvv, frames, grid = inputs_and_reference()
+    # Resolve quadrature error below the strict canonical-reference tolerance.
+    x, foo, fvv, frames, grid = inputs_and_reference(points=6)
     x['U'] = jnp.array([[.6], [-.8]])
     foo = foo.at[0, 1].set(.02).at[1, 0].set(.02)
     fvv = fvv.at[0, 1].set(.03).at[1, 0].set(.03)

@@ -5,12 +5,13 @@ legs are left undressed, using separate T2 forms for virtual and occupied
 contractions. Physical projections are built directly with U.T and U.T O^2;
 no inverse exponential is formed. Matrix-function derivatives retain the full
 Fock and physical-projector response, including degenerate spectra.
-The DF path constructs raw integral blocks once per fragment; rotate reuses
-cached CCSD integral blocks. Both use the same stable native numerator.
-Deterministic evaluation caches the undressed, spin-adapted selected numerator
-across the quadrature. Full external dressing and cyclic-only pair contractions
-are on the other side; the cached numerator is differentiated once after all
-points. Occupied-block batching bounds the cache without truncating excitations.
+The DF path reuses available cached CCSD integral blocks and constructs only
+missing blocks once per fragment; rotate requires all three cached blocks.
+Both use the same stable native numerator.
+Deterministic evaluation carries one occupied block per worker through the
+quadrature and immediately differentiates its left numerator. Shared prepared
+tensors and cotangents have at most four orbital indices. Full external dressing
+and cyclic-only pair contractions preserve the asymmetric selected functional.
 Semicanonical virtual factors use scalar axis scaling with a full matrix-function
 Fock pullback. Genuinely noncanonical virtual blocks retain dense transforms.
 """
@@ -32,11 +33,11 @@ NAMES = ('t1', 't2', 'Bvo', 'Boo', 'Bvv', 'fov')
 INTEGRAL_NAMES = ('t1', 't2', 'ovvv', 'ovoo', 'ovov', 'fov')
 
 
-def make_grid(eocc, evir, *, points=6):
+def make_grid(eocc, evir, *, points=4):
     """Positive fitted triples quadrature, fixed during differentiation.
 
     Both 1/D and 1/D^2 enter the fit. Their measured errors are reported
-    separately from stochastic uncertainty; the default is six points.
+    separately from stochastic uncertainty; the default is four points.
     """
     from .controls import _integer_control
     from .laplace import fit_grid
@@ -111,14 +112,16 @@ def _dressing_cache_bytes(max_memory):
 
 def _run_deterministic(inputs, nodes, weights, *, with_grad, max_memory,
                        rotate, trace_exponent):
-    """Reuse S B W at t=0; cyclic-only right contractions carry all dressing.
+    """Stream S B W at t=0; cyclic-only right contractions carry all dressing.
 
     For the fully pair-symmetric left numerator K, exchanging the two
     unselected occupied/virtual pairs identifies the two cosets of S3:
         sum K * B(Y_q) = 2 sum K * C3(Y_q).
     The sum here includes both ordered unselected occupied indices. The
-    native cache stores one triangular representative and visits both
-    orientations. This identity never moves the physical fragment operator.
+    native batch holds at most 128 triangular representatives and visits both
+    orientations. Its left adjoints are grouped by destination. This identity never moves the physical fragment operator.
+    Prepared tensors and their bars are reused across all occupied blocks;
+    each node is pulled back once per point group, never once per block.
     """
     native = importlib.import_module('pyscfad.dlno_stc._stc_mp2')
     started = time.perf_counter()
@@ -127,16 +130,14 @@ def _run_deterministic(inputs, nodes, weights, *, with_grad, max_memory,
     ns = inputs[8].shape[1]
     total_blocks = ns * no * (no + 1) // 2
     block_bytes = nv**3 * 8 * (2 if with_grad else 1)
-    # Reserve half the current headroom for numerator values/cotangents.
-    # At least one indivisible virtual cube is required for this backend.
-    budget = int(max(0., float(max_memory) - current_memory()[0]) * .5e6)
+    # The cache has a hard 128-block ceiling independent of domain size.
+    # A smaller byte cap can reduce it, with one block as the minimum.
     cap = os.environ.get('PYSCFAD_TRIPLES_NUMERATOR_CACHE_MB')
     if cap is not None:
         cap = float(cap)
         if not np.isfinite(cap) or cap < 0:
             raise ValueError('PYSCFAD_TRIPLES_NUMERATOR_CACHE_MB must be finite and nonnegative')
-        budget = min(budget, int(cap * 1024**2))
-    batch_size = min(total_blocks, max(1, budget // block_bytes))
+        cap = int(cap * 1024**2)
     phase = time.perf_counter()
     dresser = native.StableTriplesDressing(inputs, full_external=True)
     prepare_seconds = time.perf_counter() - phase
@@ -147,6 +148,14 @@ def _run_deterministic(inputs, nodes, weights, *, with_grad, max_memory,
                   deterministic_workspace_bytes=0)
     setup_threads = sampling_threads = evaluated_blocks = 0
     numerator_cache_peak = dressing_cache_peak = batches = 0
+    packing_peak = 0
+    worker_seconds = dict(left_build_worker_seconds=0., right_worker_seconds=0.,
+                          left_reverse_worker_seconds=0., left_build_wall_seconds=0.,
+                          right_wall_seconds=0., left_reverse_wall_seconds=0.)
+
+    group_diagnostics = dict(occupied_block_batch_size=0, occupied_block_batches=0,
+        grouped_adjoint_groups=0, grouped_adjoint_max_terms=0,
+        grouped_adjoint_gemm_calls=0, grouped_adjoint_max_reduction=0)
 
     def account(result):
         nonlocal native_seconds, setup_threads, sampling_threads, evaluated_blocks
@@ -157,10 +166,9 @@ def _run_deterministic(inputs, nodes, weights, *, with_grad, max_memory,
         for name in memory:
             memory[name] = max(memory[name], result.get(name, 0))
 
-    def reverse(node, result):
+    def reverse(node, transformed):
         nonlocal pullback_seconds, dressing_cache_peak
         phase = time.perf_counter()
-        transformed = result.pop('cotangents')
         contribution = dresser.pullback(float(node), transformed,
             cache_limit_bytes=_dressing_cache_bytes(max_memory))
         for a, b in zip(bars, contribution):
@@ -168,45 +176,58 @@ def _run_deterministic(inputs, nodes, weights, *, with_grad, max_memory,
         dressing_cache_peak = max(dressing_cache_peak, dresser.peak_cache_bytes)
         pullback_seconds += time.perf_counter() - phase
 
-    for first in range(0, total_blocks, batch_size):
+    phase = time.perf_counter()
+    prepared_zero = dresser.prepare(0.)
+    prepare_seconds += time.perf_counter() - phase
+    prepared_bytes = sum(x.nbytes for x in prepared_zero)
+    packed_left_bytes = sum(prepared_zero[i].nbytes for i in (2, 8))
+    scratch_per_worker = (8*nv**3 + 6*no*nv**2 + 8*nv**2)*8
+    if with_grad:
+        scratch_per_worker += (2*max(no, nv, 256)*4096 + max(no, nv)*max(nv, 256))*8
+    desired_batch = min(128, total_blocks)
+    if cap is not None:
+        desired_batch = min(desired_batch, max(1, cap//block_bytes))
+    first = 0
+    while first < len(nodes):
         batches += 1
+        available = max(0., float(max_memory) - current_memory()[0])*1e6
+        shared_left = packed_left_bytes + (prepared_bytes if with_grad else 0)
+        per_point = prepared_bytes * (2 if with_grad else 1)
+        group_size = min(len(nodes)-first, max(1, int(
+            (available-shared_left-scratch_per_worker-desired_batch*block_bytes)/max(1, per_point))))
+        last = first + group_size
+        scratch_budget = max(scratch_per_worker, int(available-shared_left-group_size*per_point))
+        scratch_budget = min(16*1024**3, scratch_budget)
         phase = time.perf_counter()
-        values = dresser.prepare(0.)
+        prepared_points = [dresser.prepare(float(node)) for node in nodes[first:last]]
         prepare_seconds += time.perf_counter() - phase
         phase = time.perf_counter()
-        cache = native.TriplesQuadratureCache(values, first=first,
-            count=min(batch_size, total_blocks-first), with_grad=with_grad)
-        del values
-        build_seconds = time.perf_counter() - phase
-        production_seconds += build_seconds
-        native_seconds += build_seconds
-        evaluated_blocks += min(batch_size, total_blocks-first)
-        numerator_cache_peak = max(numerator_cache_peak, cache.cache_bytes)
-        for i, (node, weight) in enumerate(zip(nodes, weights)):
-            phase = time.perf_counter()
-            values = dresser.prepare(float(node), cache_limit_bytes=(
-                _dressing_cache_bytes(max_memory) if with_grad else 0))
-            dressing_cache_peak = max(dressing_cache_peak, dresser.cache_bytes)
-            prepare_seconds += time.perf_counter() - phase
-            phase = time.perf_counter()
-            result = cache.step(values, float(weight))
-            del values
-            production_seconds += time.perf_counter() - phase
-            point_energies[i] += result['energy']
-            account(result)
-            if with_grad:
-                reverse(node, result)
+        result = native.triples_quadrature_stream(prepared_zero, prepared_points,
+            list(map(float, weights[first:last])), with_grad=with_grad,
+            workspace_limit_bytes=scratch_budget, block_batch_size=desired_batch)
+        production_seconds += time.perf_counter() - phase
+        del prepared_points
+        point_energies[first:last] += result['point_energies']
+        account(result)
+        numerator_cache_peak = max(numerator_cache_peak, result['numerator_cache_peak_bytes'])
+        packing_peak = max(packing_peak, result['rank_four_packing_bytes'])
+        for key in worker_seconds:
+            worker_seconds[key] += result[key]
+        for key in group_diagnostics:
+            if key in ('occupied_block_batch_size', 'grouped_adjoint_max_terms',
+                       'grouped_adjoint_max_reduction'):
+                group_diagnostics[key] = max(group_diagnostics[key], result[key])
+            else:
+                group_diagnostics[key] += result[key]
         if with_grad:
-            phase = time.perf_counter()
-            values = dresser.prepare(0., cache_limit_bytes=_dressing_cache_bytes(max_memory))
-            prepare_seconds += time.perf_counter() - phase
-            phase = time.perf_counter()
-            result = cache.finish(values)
-            del values
-            production_seconds += time.perf_counter() - phase
-            account(result)
-            reverse(0., result)
-        del cache
+            cotangents = list(result.pop('cotangents'))
+            for local, node in enumerate([0., *nodes[first:last]]):
+                transformed = cotangents[local]
+                cotangents[local] = None
+                reverse(float(node), transformed)
+                del transformed
+        first = last
+    del prepared_zero
 
     elapsed = time.perf_counter() - started
     count = len(nodes)
@@ -225,13 +246,17 @@ def _run_deterministic(inputs, nodes, weights, *, with_grad, max_memory,
         vjp_finalize_seconds=0., packing_blas_threads=0, sampling_blas_threads=0,
         finalize_blas_threads=0, **memory, setup_threads=setup_threads,
         sampling_threads=sampling_threads, target_standard_error=0.,
-        trace_exponent=trace_exponent, adaptive=False, point_preparation_reused=False,
+        trace_exponent=trace_exponent, adaptive=False, point_preparation_reused=True,
         asymmetric_dressing=True, stable_dressing=True, native_dressing=True,
         deterministic_blocks=evaluated_blocks, quadrature_reused_blocks=total_blocks,
         single_pair_symmetrization=True, one_sided_dressing=True,
         numerator_cache_batches=batches, numerator_cache_peak_bytes=numerator_cache_peak,
+        streaming_quartic_memory=True, quadrature_point_batches=batches,
+        one_permutation_left=True, grouped_left_adjoint=True,
+        rank_four_packing_bytes=packing_peak, **worker_seconds, **group_diagnostics,
         diagonal_virtual_points=sum(dresser.virtual_diagonal_at(float(t)) for t in nodes),
-        rotated_integrals=rotate, dressing_cache_peak_bytes=dressing_cache_peak,
+        rotated_integrals=rotate, selected_occupied_frame=dresser.selected_occupied_frame,
+        dressing_cache_peak_bytes=dressing_cache_peak,
         dressing_cache_hits=dresser.cache_hits, dressing_cache_rebuilds=dresser.cache_rebuilds,
         target_met=True, laplace_nodes=np.asarray(nodes), laplace_weights=np.asarray(weights),
         point_variance_fractions=fractions, point_variance_targets=zeros,
@@ -245,6 +270,33 @@ def _run_deterministic(inputs, nodes, weights, *, with_grad, max_memory,
         with_grad=with_grad)
     return (jnp.asarray(point_energies.sum()),
             jax.tree_util.tree_map(jnp.asarray, diagnostics)), bars
+
+
+def _integral_blocks(eris, no, nv, *, require_cached):
+    """Reuse materialized integrals in the current ERI frame, including AD.
+
+    Inspect storage directly in the DF fallback path: probing a lazy property
+    must not build a block just to decide whether it was already cached.
+    """
+    names = ('ovvv', 'ovoo', 'ovov')
+    if require_cached:
+        blocks = [getattr(eris, name, None) for name in names]
+        if any(value is None for value in blocks):
+            raise ValueError('integral_transform=rotate requires cached ovvv, ovoo and ovov')
+    else:
+        stored = getattr(eris, '__dict__', {})
+        blocks = [stored.get(name) for name in names]
+    if blocks[0] is not None:
+        blocks[0] = lib.unpack_tril(blocks[0].reshape(no * nv, -1)).reshape(no, nv, nv, nv)
+    if any(value is None for value in blocks):
+        bvo = eris.Lov
+        if blocks[0] is None:
+            blocks[0] = jnp.einsum('Pia,Pbc->iabc', bvo, lib.unpack_tril(eris.Lvv))
+        if blocks[1] is None:
+            blocks[1] = jnp.einsum('Pia,Pjk->iajk', bvo, eris.Loo)
+        if blocks[2] is None:
+            blocks[2] = jnp.einsum('Pia,Pjb->iajb', bvo, bvo)
+    return tuple(blocks)
 
 
 def make_solver(controls, grid, *, with_grad):
@@ -262,6 +314,12 @@ def make_solver(controls, grid, *, with_grad):
     if not stochastic and not getattr(importlib.import_module(
             'pyscfad.dlno_stc._stc_mp2'), 'TRIPLES_QUADRATURE_REUSE', False):
         raise RuntimeError('Rebuild the STC native extension for quadrature-reused Laplace triples')
+    if not stochastic and not getattr(importlib.import_module(
+            'pyscfad.dlno_stc._stc_mp2'), 'TRIPLES_QUADRATURE_STREAMING', False):
+        raise RuntimeError('Rebuild the STC native extension for streaming Laplace triples')
+    if not stochastic and not getattr(importlib.import_module(
+            'pyscfad.dlno_stc._stc_mp2'), 'TRIPLES_GROUPED_ADJOINT', False):
+        raise RuntimeError('Rebuild the STC native extension for grouped Laplace triples adjoints')
     rotate = _triples_integral_transform(controls) == 'rotate'
     native_options = {}
     trace_exponent = _finite_control('trace_exponent',
@@ -486,19 +544,9 @@ def make_solver(controls, grid, *, with_grad):
         # The identity frame projector and the physical fragment target are
         # different objects. A partial S retains U and its full response.
         u = jnp.eye(no, dtype=t1.dtype) if prjlo.shape == (no, no) else prjlo.T
-        if rotate:
-            if any(getattr(eris, name, None) is None for name in ('ovvv', 'ovoo', 'ovov')):
-                raise ValueError('integral_transform=rotate requires cached ovvv, ovoo and ovov')
-            nv = t1.shape[1]
-            ovvv = lib.unpack_tril(eris.ovvv.reshape(no * nv, -1)).reshape(no, nv, nv, nv)
-            tensors = (ovvv, eris.ovoo, eris.ovov)
-        else:
-            bvo, boo, bvv = eris.Lov, eris.Loo, lib.unpack_tril(eris.Lvv)
-            # Contract once, before the node loop. AD returns the accumulated
-            # integral cotangents to the original DF factors once as well.
-            tensors = (jnp.einsum('Pia,Pbc->iabc', bvo, bvv),
-                       jnp.einsum('Pia,Pjk->iajk', bvo, boo),
-                       jnp.einsum('Pia,Pjb->iajb', bvo, bvo))
+        # Cached tensors retain the same physical integral response as DF
+        # construction. Missing blocks are contracted once, outside quadrature.
+        tensors = _integral_blocks(eris, no, t1.shape[1], require_cached=rotate)
         inputs = (t1, t2, *tensors,
                   eris.fock[:no, no:], eris.fock[:no, :no], eris.fock[no:, no:], u)
         energy, diagnostics = evaluate(*inputs) if with_grad else run(inputs)[0]

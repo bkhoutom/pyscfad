@@ -115,7 +115,7 @@ def correlation_value_and_grad(mol, static, groups=None):
     )
     from pyscfad.dlno_stc.domain import rebuild_domain_data
     from pyscfad.dlno_stc.prepare import prepare_inputs
-    from pyscfad.dlno_stc._pairs import weak_pair_energy, weak_pair_indices
+    from pyscfad.dlno_stc._pairs import weak_pair_energy_and_grad, weak_pair_indices
 
     with (config_update("pyscfad_scf_implicit_diff", True),
           config_update("pyscfad_scf_first_order_custom", False)):
@@ -132,14 +132,11 @@ def correlation_value_and_grad(mol, static, groups=None):
         common_bar = jax.tree_util.tree_map(add_cotangent, common_bar, right)
         del pullback, result
     for i, j in weak_pair_indices(static):
-        value, pullback = jax.vjp(
-            lambda x, c: weak_pair_energy(x, c, static, i, j), mf, common,
-        )
+        value, (left, right) = weak_pair_energy_and_grad(
+            mf, common, static, pairs=((i, j),))
         energy += float(value)
-        left, right = pullback(jax.numpy.ones_like(value))
         mf_bar = jax.tree_util.tree_map(add_cotangent, mf_bar, left)
         common_bar = jax.tree_util.tree_map(add_cotangent, common_bar, right)
-        del pullback
     (from_common,) = common_pullback(common_bar)
     mf_bar = jax.tree_util.tree_map(add_cotangent, mf_bar, from_common)
     (mol_bar,) = scf_pullback(mf_bar)

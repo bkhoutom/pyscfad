@@ -20,16 +20,20 @@ The new [launcher](run_water_16_bulk_sgx.sh) uses the exact archived geometry
 in [water_16_bulk.xyz](water_16_bulk.xyz), whose SHA256 is
 `6696d451e230da0b4cdeed720ab0944a7ec2081011886420291f3bb989e3926f`.
 This bulk-carved cluster differs from the minimized `water_16.xyz` below.
-The [domain input](water_16_bulk_thresholds.json) preserves every recorded
-domain threshold except the requested change to `pair_energy=5e-6` Eh:
+The [domain input](water_16_bulk_thresholds.json) keeps the recorded numeric
+domain thresholds except the change to `pair_energy=5e-6` Eh:
 
 | Domain parameter | Archived run | New example | Current library default |
 | --- | --- | --- | --- |
 | `pair_energy` (Eh) | `1.5e-5` | `5e-6` | `5e-6` |
-| `pao_norm` | `1e-4` | `1e-4` | `1e-2` |
+| `pao_norm` | `1e-4` (norm) | `1e-4` (squared norm) | `1e-4` (squared norm) |
 | `bp_occ`, `bp_primary`, `bp_ed` | `0.985`, `0.999`, `0.9998` | Same | Same |
 | `bp_pao`, `domain_pao`, `ed_pao` | `0.98`, `1e-4`, `0.995` | Same | Same |
 | `metric_rank`, `near_pair_distance`, `multipole_order` | `1e-10`, `3.5` bohr, `4` | Same | Same |
+
+The archive used a norm-based parent PAO cutoff. The current example uses
+`pao_norm=1e-4` directly as a squared-norm cutoff; reproducing the old
+`1e-4` norm cutoff would instead require `pao_norm=1e-8`.
 
 The current `ed_pao_rank=1e-6` is also explicit in the input; the old run
 predates that independent option. The public CC builder has **no implicit

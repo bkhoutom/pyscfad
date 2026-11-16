@@ -11,6 +11,11 @@ Fock response. “Full frame” means the complete retained LIS; it does not dis
 LNO truncation or physical fragment weighting. Standalone domain MP2 uses its
 scalar energy solver without constructing W.
 
+Parent PAOs use the squared-overlap-norm cutoff `p.T @ S @ p > pao_norm`,
+with default `pao_norm=1e-4`. This matches the former `1e-2` norm default.
+Square other old norm cutoffs to preserve their physical selection, and
+rebuild saved selections/checkpoints from the previous convention.
+
 ## Energy and shared W response
 
 For physical fragment S, the correlation energy is

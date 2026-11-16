@@ -47,6 +47,14 @@ labels; production reconstructs continuous orbitals and their responses.
 `merge_identical=True` shares preparation among identical domains while each
 physical fragment retains its own target projector and CC correction.
 
+The parent PAO cutoff `pao_norm` applies to its squared overlap norm:
+retain a raw PAO `p` when `p.T @ S @ p > pao_norm`. The default `1e-4`
+preserves the physical cutoff of the previous `1e-2` norm default. Retained
+PAOs are normalized by the square root of their squared norm. To reproduce
+another old explicit norm cutoff, square its value. Saved selections and
+checkpoints using the old convention must be rebuilt; restart algorithm ABI
+6 rejects them.
+
 ## Calculation interface
 
 This small deterministic example runs all four workflows. `build_static`
@@ -250,7 +258,8 @@ the correlation solvers use deterministic or stochastic evaluation.
 | --- | --- | --- |
 | `bp_occ`, `bp_primary`, `bp_ed` | `0.985`, `0.999`, `0.9998` | Occupied BP completeness thresholds. |
 | `bp_pao` | `0.98` | PAO BP completeness. |
-| `pao_norm`, `domain_pao` | `1e-2`, `1e-4` | PAO norm and domain screening. |
+| `pao_norm` | `1e-4` | Strict cutoff on the parent PAO squared overlap norm. |
+| `domain_pao` | `1e-4` | Domain PAO screening. |
 | `ed_pao`, `ed_pao_rank` | `0.995`, `1e-6` | ED PAO completeness and normalized local Gram rank cutoff. |
 | `metric_rank` | `1e-10` | Occupied metric rank cutoff. |
 | `pair_energy` | `5e-6` Eh | Strong-pair energy threshold. |

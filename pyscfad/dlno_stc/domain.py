@@ -480,7 +480,7 @@ def _build_selection_reference(
 ):
     """Build one live common frame and auxiliary products for initial selection.
 
-    Discrete parent labels come from detached norms. Only retained columns
+    Discrete parent labels come from detached squared S norms. Only retained columns
     enter square roots, so discarded zero PAOs cannot poison the response.
     Auxiliary products need their separate ambient common-data pullback when
     used by weak screening; they are not differentiated through ``has_aux``.
@@ -501,8 +501,7 @@ def _build_selection_reference(
     host_norm2 = _host_array(jax.lax.stop_gradient(norm2))
     if not numpy.isfinite(host_norm2).all():
         raise ValueError('initial PAO norms must be finite')
-    parent_columns = numpy.flatnonzero(
-        numpy.sqrt(numpy.maximum(host_norm2, 0.)) > pao_norm).astype(numpy.int32)
+    parent_columns = numpy.flatnonzero(host_norm2 > pao_norm).astype(numpy.int32)
     norms = np.sqrt(norm2[parent_columns])
     pao = raw[:, parent_columns] / norms[None, :]
     overlap_pao = overlap_raw[:, parent_columns] / norms[None, :]

@@ -29,6 +29,7 @@ _PAO_ORTH_THRESHOLD = 1e-6
 class BoysDomainThresholds:
     """Boys BP/PAO, local ED rank, and pair-screen cutoffs.
 
+    ``pao_norm`` is the strict lower cutoff on a parent PAO's squared S norm.
     ED completeness uses squared individual projected norms with the fixed
     1e-4 margin: ``max(0, ed_pao - 1e-4)``. ``ed_pao_rank`` is the final
     normalized local Gram cutoff, independent of occupied ``metric_rank``.
@@ -38,7 +39,7 @@ class BoysDomainThresholds:
     bp_primary: float = 0.999
     bp_ed: float = 0.9998
     bp_pao: float = 0.98
-    pao_norm: float = 1e-2
+    pao_norm: float = 1e-4
     domain_pao: float = 1e-4
     ed_pao: float = 0.995
     metric_rank: float = 1e-10
@@ -146,7 +147,7 @@ class DomainSelections:
     boys_grouping: str = "singleton"
     physical_groups: tuple[tuple[int, ...], ...] = ()
     correlation_basis_identity: str | None = None
-    domain_convention: str = "individual-partners-pair4-pcd-aux-v2"
+    domain_convention: str = "individual-partners-pair4-pcd-aux-pao-norm2-v3"
     ed_selection_pending: bool = False
     ao_atom_slices: object = None
     mp2_grid: tuple | None = None
@@ -173,7 +174,7 @@ def _physical_groups(static):
     """Return the saved physical partition in orbital-record coordinates."""
     if isinstance(static, DomainSelections) and not {'boys_grouping', 'physical_groups'} <= vars(static).keys():
         raise ValueError("incompatible domain selections; rebuild domains to save physical fragment grouping")
-    if isinstance(static, DomainSelections) and vars(static).get('domain_convention') != 'individual-partners-pair4-pcd-aux-v2':
+    if isinstance(static, DomainSelections) and vars(static).get('domain_convention') != 'individual-partners-pair4-pcd-aux-pao-norm2-v3':
         raise ValueError("incompatible domain convention; rebuild domain selections")
     groups = getattr(static, "physical_groups", ())
     mode = _normalize_boys_grouping(getattr(static, "boys_grouping", "singleton"))
@@ -331,7 +332,7 @@ def build_domain_groups(static, *, merge_identical=True) -> tuple[DomainGroup, .
     """
     if not isinstance(static, DomainSelections) or static.lo_type != "boys":
         raise TypeError("static must be STC Boys DomainSelections")
-    if vars(static).get('domain_convention') != 'individual-partners-pair4-pcd-aux-v2':
+    if vars(static).get('domain_convention') != 'individual-partners-pair4-pcd-aux-pao-norm2-v3':
         raise ValueError("incompatible domain convention; rebuild domain selections")
     singletons = _validate_boys_target_groups(static.frag_lolist, len(static.active_occ_indices))
     if len(static.fragments) != len(singletons):
@@ -891,9 +892,9 @@ def build_domain_selections(
     else:
         out = _host_array(mf.mo_coeff)[:, projected_out]
         raw_pao = numpy.eye(mol.nao) - out @ (out.T @ overlap)
-        norms = numpy.sqrt(numpy.einsum("ui,uv,vi->i", raw_pao, overlap, raw_pao))
-        pao_parent = numpy.where(norms > thresholds.pao_norm)[0].astype(numpy.int32)
-        pao_coeff = raw_pao[:, pao_parent] / norms[pao_parent]
+        norm2 = numpy.einsum("ui,uv,vi->i", raw_pao, overlap, raw_pao)
+        pao_parent = numpy.where(norm2 > thresholds.pao_norm)[0].astype(numpy.int32)
+        pao_coeff = raw_pao[:, pao_parent] / numpy.sqrt(norm2[pao_parent])
         pao_products = _reference_pao_products(pao_coeff, overlap)
         overlap_targets = overlap @ targets
         products = _WeakScreenProducts(pao_products, tuple(overlap_targets[:, group] for group in groups))

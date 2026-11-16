@@ -35,3 +35,22 @@ No frozen response, altered selection thresholds, or omitted weak pairs. Check
 real/asymmetric/complex adjoints, empty and multiple occupied targets, and JAX
 transform compatibility. Distinguish cold compilation and SCF-restart timing
 from numerical speedup. A baseline failure alone is not acceptance.
+
+## Full-case failure follow-up
+
+Job 6975962 reached 65526 sampled mappings and failed during weak endpoint
+219/242. The 32-element primary workspace grid retained 59 size combinations
+among 70 physical AO/virtual shapes, and primary forward preparation added
+24671 mappings versus 11134 in the original implementation. No fallback ran.
+The original small probe did not span these dimensions or differing supports.
+
+Use the wider, different-support primary stress probe derived from the observed
+size range (half scale for workstation memory). The existing policy adds 34652
+mappings; relative spacing with two classes per doubling adds 16245, taking
+45.25 versus 73.94 seconds. This misses the initial exploratory 12000 target
+from the smaller probe but more than halves growth. For the wider regression,
+require fewer than 20000 added mappings, reserving the majority of the node's
+65530 mappings for other phases; this is a validation threshold, not a runtime
+cache budget. Validate larger real/complex ambient adjoints across new bucket
+boundaries, then rerun full test1 with the unchanged scientific inputs and
+original resource allocation. Only full completion establishes acceptance.

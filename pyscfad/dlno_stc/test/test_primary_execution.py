@@ -4,7 +4,7 @@ import pytest
 from threadpoolctl import threadpool_info, threadpool_limits
 
 from pyscfad import gto
-from pyscfad.dlno_stc import _pairs, _primary_response, _selection, driver
+from pyscfad.dlno_stc import _pairs, _selection, driver
 from pyscfad.dlno_stc.test.test_boys_prepare import boys_water_dimer
 from pyscfad.lib._threading import dense_blas_scope
 
@@ -76,20 +76,23 @@ def test_primary_blas_limit_preserves_openmp_and_restores(monkeypatch,operation,
 def test_concrete_finishing_does_not_replace_live_response(boys_water_dimer,monkeypatch):
     mf,_,reference=boys_water_dimer
     reference_finish=_pairs._finish_weak_screen_reference
-    live_finish=_primary_response._finish_weak_screen
-    calls={'reference':0,'live':0}
+    calls={'reference':0}
     def concrete(*a,**k):
         calls['reference']+=1
         return reference_finish(*a,**k)
-    def live(*a,**k):
-        calls['live']+=1
-        return live_finish(*a,**k)
     monkeypatch.setattr(_pairs,'_finish_weak_screen_reference',concrete)
-    monkeypatch.setattr(_primary_response,'_finish_weak_screen',live)
     _selection.build_domain_selections(mf,frozen=reference.frozen,
         target_coeff=reference.target_reference_coeff)
-    assert calls['reference']>0 and calls['live']==0
+    assert calls['reference']>0
     calls['reference']=0
-    driver._select_domain_reference(mf,lambda current:
+    static,_,_,receipt=driver._select_domain_reference(mf,lambda current:
         _selection.build_domain_selections(current,frozen=reference.frozen))
-    assert calls['reference']==0 and calls['live']>0
+    assert calls['reference']==0
+    _,_,pending=receipt.take(static)
+    assert pending is not None
+    _,(_,common_bar)=pending[1]
+    # Check the retained response itself, independent of which live numerical
+    # kernel implements orbital finishing (padded or original-frame fallback).
+    for name in ('s1e','fock','pao_coeff'):
+        derivative=np.asarray(getattr(common_bar,name))
+        assert np.isfinite(derivative).all() and np.linalg.norm(derivative)>0

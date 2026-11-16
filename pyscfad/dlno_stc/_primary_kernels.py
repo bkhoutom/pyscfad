@@ -19,7 +19,13 @@ _BLOCK = 32
 
 
 def _size(length):
-    return ((length + _BLOCK - 1) // _BLOCK) * _BLOCK
+    # Two size classes per doubling above the small 32-element grid. A fixed
+    # spacing leaves almost every large molecular domain in a different class,
+    # multiplying compiled forward/reverse kernels across their input axes.
+    # Relative spacing bounds this growth while limiting padding to <50% per
+    # axis for dimensions above 64. Physical ranks are still selected outside.
+    block = max(_BLOCK, 1 << max(0, (int(length) - 1).bit_length() - 2))
+    return ((length + block - 1) // block) * block
 
 
 def pad_indices(indices, size=None):

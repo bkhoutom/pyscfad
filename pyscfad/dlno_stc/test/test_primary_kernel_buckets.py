@@ -13,6 +13,7 @@ from pyscfad.dlno_stc._selection import BoysDomainThresholds
 @pytest.mark.parametrize('rows,columns,deficient,complex_values', [
     (7, 1, False, False), (9, 4, False, True), (35, 17, False, False),
     (35, 17, True, True), (67, 35, True, False),
+    (193, 97, False, False), (259, 129, True, True),
 ])
 def test_bucketed_target_matches_unpadded_space_and_response(rows, columns, deficient, complex_values):
     rng = np.random.default_rng(717)
@@ -86,30 +87,30 @@ def test_bucket_padding_does_not_create_physical_rank(zero_occupied, zero_virtua
         np.testing.assert_array_equal(got, want)
 
 
-@pytest.mark.parametrize('different_support,deficient,complex_values', [
-    (False, False, False), (True, False, True), (True, True, False),
+@pytest.mark.parametrize('different_support,deficient,complex_values,n', [
+    (False, False, False, 43), (True, False, True, 43), (True, True, False, 43),
+    (True, False, False, 211),
 ])
 def test_bucketed_projection_matches_independent_product_response(
-        different_support, deficient, complex_values):
+        different_support, deficient, complex_values, n):
     rng = np.random.default_rng(301)
 
     def random(shape):
         value = rng.normal(size=shape)
         return value + .1j * rng.normal(size=shape) if complex_values else value
 
-    n = 43
     root = np.eye(n) + .005 * random((n, n))
     overlap = root.T.conj() @ root
-    pao = random((n, 35)) / np.sqrt(n)
+    pao = random((n, n-8)) / np.sqrt(n)
     if deficient:
         pao[:, 0] *= 1e-5
     # Reverse these products as independent ambient inputs, as required by
     # the shared PAO product tape. Do not assume their physical symmetry here.
     product = overlap @ pao
     gram = pao.T.conj() @ product
-    columns = rng.permutation(35).astype(np.int32)
-    support = np.arange(37, dtype=np.int32)
-    ao = np.arange(41, dtype=np.int32) if different_support else support[::-1].copy()
+    columns = rng.permutation(n-8).astype(np.int32)
+    support = np.arange(n-6, dtype=np.int32)
+    ao = np.arange(n-2, dtype=np.int32) if different_support else support[::-1].copy()
     if not different_support:
         support = ao.copy()
     thresholds = BoysDomainThresholds(domain_pao=.01, bp_pao=.05)

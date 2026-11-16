@@ -15,7 +15,7 @@ def adaptive(**kwargs):
 
 
 def test_full_adaptive_uses_collaborator_pilot_and_production_minimum():
-    out = native().solve_full(*scalar_inputs(), adaptive(), with_grad=True)
+    out = native()._solve_full_reference(*scalar_inputs(), adaptive(), with_grad=True)
     rows = out['diagnostics']['residuals']
     assert len(rows) == 2
     assert all(row['pilot_samples'] == 100000 for row in rows)
@@ -30,7 +30,7 @@ def test_full_point_budgets_follow_trace_model(shift):
     controls = adaptive()
     controls.update(laplace_roots=[0., np.log(2.)/1.4], laplace_weights=[1., 1.])
     foo, fvv, B = scalar_inputs(zero=True)
-    out = native().solve_full(foo+shift, fvv+shift, B, controls)
+    out = native()._solve_full_reference(foo+shift, fvv+shift, B, controls)
     # trace product=exp(-beta); model scores are 1 and 1/2.
     # The variance budget .3^2 therefore splits as .06 and .03.
     targets = out['diagnostics'].get('point_variance_targets')
@@ -43,7 +43,7 @@ def test_adaptive_production_can_exceed_one_million_draws():
     B = np.array([[[1., 2.]]])
     controls = adaptive(pilot_samples=4096, global_seed=7, uniform_mixture=1.)
     controls['energy_tolerance'] = .04
-    out = native().solve_full(foo, fvv, B, controls)
+    out = native()._solve_full_reference(foo, fvv, B, controls)
     rows = out['diagnostics']['residuals']
     assert max(row['production_samples'] for row in rows) > 1000000
     assert out['diagnostics']['actual_sample_count'] == sum(row['production_samples'] for row in rows)
@@ -61,7 +61,7 @@ def test_difficult_full_pilots_refine_with_independent_streams():
     controls = adaptive(pilot_samples=64, global_seed=7, uniform_mixture=1.,
                         min_production_samples=2, max_production_samples=64)
     controls['energy_tolerance'] = .01
-    out = native().solve_full(foo, fvv, B, controls)
+    out = native()._solve_full_reference(foo, fvv, B, controls)
     rows = out['diagnostics']['residuals']
     assert all(row['pilot_samples'] == 1000000 for row in rows)
     assert all(row['production_samples'] == 64 for row in rows)
@@ -82,7 +82,7 @@ def test_unrepresentable_adaptive_budget_raises_instead_of_truncating(scope):
     error = OverflowError if scope == 'full' else RuntimeError
     with pytest.raises(error, match='sampling budget'):
         if scope == 'full':
-            native().solve_full(foo, fvv, B, controls, np.array([0, 1, 2]))
+            native()._solve_full_reference(foo, fvv, B, controls, np.array([0, 1, 2]))
         else:
             # Selected sampling retains the source cutoff and support policy.
             controls.pop('virtual_keep_fraction')

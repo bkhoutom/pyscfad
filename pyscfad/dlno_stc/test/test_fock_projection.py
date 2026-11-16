@@ -1,4 +1,5 @@
 """Prepared symmetric Fock blocks retain the complete projection response."""
+from pyscfad.dlno_stc.test import system_reference
 
 from types import SimpleNamespace
 
@@ -57,7 +58,7 @@ def projection(request, monkeypatch):
             with_df=SimpleNamespace(_cderi=object() if request.param else None),
             get_fock=lambda: fock_,
         )
-        return prepare.prepare_system_inputs(
+        return system_reference.prepare_system_inputs(
             mf, occupied, virtual, boys_reference=boys_reference,
             virtual_anchor_columns=virtual_anchor_columns,
         )

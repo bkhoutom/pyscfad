@@ -201,7 +201,7 @@ def test_screening_response_releases_unused_endpoint_tapes(monkeypatch, empty_gr
             np.testing.assert_array_equal(leaf, np.zeros_like(leaf))
 
 
-@pytest.mark.parametrize('options', [{'model': 'all'}, {'force_full_domains': True}])
+@pytest.mark.parametrize('options', [{'model': 'all'}, {'full_domain': True}])
 def test_all_strong_screening_discards_stale_preparations(monkeypatch, options):
     mf, common, static, endpoint = _screening_fixture(2)
     calls = Counter()
@@ -471,8 +471,8 @@ def test_domain_collects_once_after_complete_weak_response(monkeypatch, with_gra
     monkeypatch.setattr(driver, '_finish', lambda state, **k:
                         (state['energy'], (state['mf_bar'], state['common_bar'])))
     monkeypatch.setattr(_pairs.gc, 'collect', collect)
-    actual, actual_bars = driver._run_domain(
-        initialize, static, {}, None, with_grad=with_grad)
+    actual, actual_bars = driver._run_serial(
+        initialize, static, {}, with_grad=with_grad)
     np.testing.assert_allclose(actual, expected, rtol=2e-12, atol=1e-14)
     if with_grad:
         for got, want in zip(jax.tree_util.tree_leaves(actual_bars),
@@ -582,7 +582,7 @@ def test_forced_partner_does_not_promote_its_other_group_members(monkeypatch):
     np.testing.assert_allclose(response['energy'], .5*(weak[0, 2]+weak[1, 2]), atol=1e-14)
 
 
-@pytest.mark.parametrize('options', [{'model': 'all'}, {'force_full_domains': True}])
+@pytest.mark.parametrize('options', [{'model': 'all'}, {'full_domain': True}])
 def test_joint_screening_clears_stale_pair_response_for_all_strong(monkeypatch, options):
     mf, common, static, endpoint = _screening_fixture(2)
     _install_split(monkeypatch, endpoint)

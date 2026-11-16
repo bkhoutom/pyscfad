@@ -107,7 +107,6 @@ def test_cc_owners_configure_cache_before_setup_and_keep_serial_options(
         assert options['stc_cc_controls'] == stochastic_cc
         assert options['lis_aux_svd_tol'] == 1e-6
         assert options['triples_controls'] == triples
-        assert options['fragment_indices'] == (0, 1)
         assert options['with_grad'] is with_grad
         owned[name] = group.representative_index
         state['energy'] += group.representative_index + 1.
@@ -140,7 +139,7 @@ def test_cc_owners_configure_cache_before_setup_and_keep_serial_options(
                 initialize, lambda canonical: mf, world.communicator(rank),
                 with_grad=with_grad, include_hf=False, merge_identical=True,
                 verbose_imp=0, ccsd_t=True, return_components=True,
-                include_baseline=True, fragment_indices=None, scf_service=None,
+                  scf_service=None,
                 vvvv_direct=True)
         except Exception as exc:
             return exc
@@ -150,7 +149,7 @@ def test_cc_owners_configure_cache_before_setup_and_keep_serial_options(
     if clear_failure is not None:
         assert all(isinstance(result, RuntimeError) for result in results), results
         assert all('synthetic cache cleanup failure' in str(result) for result in results)
-        assert not weak
+        assert weak == ([] if clear_failure == 'initialization' else ['rank-0'])
         if clear_failure == 'initialization':
             assert not owned
             assert all(value == ['initialization'] for value in stages.values())

@@ -33,7 +33,7 @@ def reference(x, controls):
 
 
 def solve(x, controls=None, **kwargs):
-    return native().solve_full(*(x[k] for k in KEYS), grid() if controls is None else controls,
+    return native()._solve_full_reference(*(x[k] for k in KEYS), grid() if controls is None else controls,
                                **kwargs)
 
 

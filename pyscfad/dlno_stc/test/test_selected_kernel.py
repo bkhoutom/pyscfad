@@ -171,3 +171,33 @@ def test_selected_scalar_coincident_roles_and_zero_proposal_support():
     assert zero['diagnostics']['actual_sample_count'] == 0
     for key in KEYS:
         np.testing.assert_array_equal(zero['cotangents'][key], np.zeros_like(x[key]))
+
+
+@pytest.mark.parametrize('mode', ['deterministic', 'stochastic'])
+@pytest.mark.parametrize('with_grad', [False, True])
+def test_full_is_one_fragment_with_identical_sampling_and_response(mode, with_grad):
+    x = full_fixture()
+    settings = dict(grid(), mode=mode, global_seed=91)
+    if mode == 'stochastic':
+        settings.update(production_samples=512, min_production_samples=2,
+                        system_workload_cutoff=2.)
+    targets = tuple(range(x['foo'].shape[0]))
+    full = native().solve_full(*(x[k] for k in KEYS), settings, with_grad=with_grad)
+    selected = native().solve_selected(*(x[k] for k in KEYS), targets,
+                                       settings, with_grad=with_grad)
+    assert full['energy'] == selected['energy']
+    assert full['energy_standard_error'] == selected['energy_standard_error']
+    assert full['diagnostics']['target_indices'] == list(targets)
+    if mode == 'stochastic':
+        assert full['diagnostics'] == selected['diagnostics']
+    if with_grad:
+        for key in KEYS:
+            if mode == 'stochastic':
+                np.testing.assert_array_equal(full['cotangents'][key], selected['cotangents'][key])
+            else:
+                # Parallel adjoint reductions can differ in their final bits
+                # between calls to the same deterministic implementation.
+                np.testing.assert_allclose(full['cotangents'][key], selected['cotangents'][key],
+                                           rtol=2e-14, atol=2e-15)
+    else:
+        assert 'cotangents' not in full

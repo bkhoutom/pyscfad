@@ -36,23 +36,28 @@ def test_high_level_budget_reaches_solver_without_mutating_caller(monkeypatch, s
                  occupied=[0], virtual=[1], energy=np.float64(0), variance=0.,
                  mf_bar=None, common_bar=None, mf=SimpleNamespace(verbose=0), common=None)
     monkeypatch.setattr(driver, '_initialize', lambda *a, **k: state)
-    monkeypatch.setattr(driver, '_initialize_system', lambda *a, **k: state)
+    monkeypatch.setattr(driver, '_empty_reference', lambda *a, **k: None)
     monkeypatch.setattr(driver, '_prepare', lambda *a, **k: (None, {}, None))
-    monkeypatch.setattr(driver, '_prepare_system', lambda *a, **k: (None, {}, None))
     monkeypatch.setattr(driver, 'weak_pair_energy_sum', lambda *a, **k: np.float64(-.25))
     from pyscfad.dlno_stc import DomainGroup
     monkeypatch.setattr(driver, 'build_domain_groups', lambda *a, **k:
-        (DomainGroup((0,), 0, (0,)), DomainGroup((1,), 1, (0,))))
+        ((DomainGroup((0,), 0, (0,)), DomainGroup((1,), 1, (0,)))
+         if scope == 'domain' else (DomainGroup((0, 1), 0, (0, 1)),)))
     monkeypatch.setattr(driver, '_finish', lambda s, **k: s['energy'])
     received = []
-    def solver(inputs, metadata, solve_controls, backend, **kwargs):
+    def solver(inputs, metadata, solve_controls, **kwargs):
         received.append(solve_controls.copy())
         return {'energy': np.float64(-1), 'energy_standard_error': 0.}
-    monkeypatch.setattr(driver, 'run_backend', solver)
-    static = SimpleNamespace(
+    monkeypatch.setattr(driver.backend, 'solve', solver)
+    from pyscfad.dlno_stc.controls import default_laplace_grid
+    static = SimpleNamespace(mp2_grid=default_laplace_grid(),
         fragments=tuple(SimpleNamespace(extended_atoms=np.array([i]),
                                         pao_center_atoms=np.array([i])) for i in range(2)),
         frag_lolist=((0,), (1,)))
+    state['static'] = static
+    if scope == 'system':
+        state['weak_pairs'] = ()
+    monkeypatch.setattr(driver, 'build_domain_selections', lambda *a, **k: static)
     value = driver.kernel(None, static if scope == 'domain' else None, scope=scope, controls=controls)
     assert value == (-2.25 if scope == 'domain' else -1.)
     assert len(received) == (2 if scope == 'domain' else 1)

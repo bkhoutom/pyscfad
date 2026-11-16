@@ -1,5 +1,5 @@
-#include "stc_mp2_helpers.h"
-#include "stc_mp2_matrices.h"
+#include "../stc_mp2_helpers.h"
+#include "../stc_mp2_matrices.h"
 #include <algorithm>
 #include <numeric>
 

@@ -1,4 +1,4 @@
-#include "stc_mp2_helpers.h"
+#include "../stc_mp2_helpers.h"
 #include <array>
 #include <chrono>
 #include <iterator>

@@ -47,7 +47,7 @@ def test_one_metric_and_factorization_per_mp2_group(molecule, monkeypatch,
     monkeypatch.setenv('PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE', cache_mode)
     mf = _mf(molecule)
     static = (dlno_stc.build_domain_selections(
-        mf, frozen=1, force_full_domains=True, boys_grouping='molecule')
+        mf, frozen=1, full_domain=True, boys_grouping='molecule')
         if scope == 'domain' else None)
     expected = _independent_mp2_total(molecule)
     aux = pyscf_df.addons.make_auxmol(molecule.to_pyscf(), RIFIT)
@@ -95,7 +95,7 @@ def test_one_metric_and_factorization_per_mp2_group(molecule, monkeypatch,
     assert len(receipts) == 1
     assert receipts[0]['geometry_passes'] == int(with_grad)
     assert receipts[0]['metric_passes'] == int(with_grad)
-    half = scope == 'domain' and cache_mode == 'half'
+    half = cache_mode == 'half'
     assert receipts[0]['half_builds'] == int(half)
     assert receipts[0]['raw_source_passes'] == 1 + int(with_grad and not half)
     assert receipts[0]['half_pullbacks'] == int(with_grad and half)

@@ -131,7 +131,7 @@ def test_selection_builds_products_once_and_projects_targets_from_local_rhs(boys
     monkeypatch.setattr(tools, 'project_mo', forbidden)
     selected = selection.build_domain_selections(
         mf, frozen=reference.frozen, target_coeff=reference.target_reference_coeff,
-        force_full_domains=True, pair_energy_model='all-strong', boys_grouping='atom')
+        full_domain=True, pair_energy_model='all-strong', boys_grouping='atom')
     assert len(selected.fragments) == len(reference.fragments)
     assert len(calls) == 1
 

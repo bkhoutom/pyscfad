@@ -1,4 +1,5 @@
 """Final SCF matrices share their original tape with domain correlation."""
+from pyscfad.dlno_stc.test._cc_options import cc_options
 
 from collections import Counter
 from functools import partial
@@ -152,14 +153,13 @@ def test_public_ccsd_t_joint_scf_matches_separate_scf_data(molecular_case, monke
             mf.kernel()
         return mf
 
-    static = ccsd.build_static_selections(case.mf, case.domains, matrix_kind='W',
-        thresh_occ=1e-4, thresh_vir=3e-5, baseline_controls=case.controls,
-        matrix_controls=case.controls, single_pass=True, lis_space='domain')
+    static = ccsd.build_static_selections(case.mf, case.domains,
+        thresh_occ=1e-4, thresh_vir=3e-5, **cc_options(case.controls, case.controls),)
 
     def evaluate():
         return ccsd.value_and_grad(case.mf.mol, build, static,
-            baseline_controls=case.controls, matrix_controls=case.controls,
-            fragment_indices=case.indices[:1], include_baseline=True, include_hf=True,
+            **cc_options(case.controls, case.controls),
+              include_hf=True,
             ccsd_t=True, return_components=True,
             triples_controls=dict(mode='stochastic', integral_transform='rotate',
                 nsamples=16, pilot_samples=16, energy_tolerance=1e-3, global_seed=71))

@@ -1,4 +1,5 @@
 """Auxiliary compression at the LIS solver and public driver boundaries."""
+from pyscfad.dlno_stc.test._cc_options import cc_options
 import jax
 import numpy as np
 import pytest
@@ -89,7 +90,7 @@ def test_domain_correction_reports_completed_compression(molecular_case, monkeyp
     monkeypatch.setattr(np.linalg, 'svd', counted)
     records = ccsd._run_group(state, case.static, case.group,
         case.controls, case.controls, with_grad=True, verbose_imp=0,
-        ccsd_t=False, include_baseline=False, fragment_indices=case.indices,
+        ccsd_t=False,
         lis_aux_svd_tol=1e-4)
     assert len(calls) == len(records) == len(case.indices)
     value, gradient = ccsd.driver._finish(state, with_grad=True, include_hf=False)
@@ -105,8 +106,8 @@ def test_restart_rejects_different_compression(molecular_case, tmp_path):
     """An existing CC energy cannot be resumed with another integral model."""
     from pyscfad.dlno_stc._restart import RestartMismatchError
     case = molecular_case
-    options = dict(baseline_controls=case.controls, matrix_controls=case.controls,
-        include_baseline=False, fragment_indices=case.indices,
+    options = dict(**cc_options(case.controls, case.controls),
+
         checkpoint_dir=tmp_path, lis_aux_svd_tol=1e-4)
     reference = ccsd.kernel(case.mf, case.static, **options)
     resumed = ccsd.kernel(case.mf, case.static, resume=True, **options)

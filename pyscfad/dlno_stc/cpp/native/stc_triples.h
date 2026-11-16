@@ -2,6 +2,7 @@
 #define LIBGMBPT_QCHEM_STC_TRIPLES_H
 
 #include <armadillo>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -12,6 +13,18 @@ namespace libgmbpt { namespace qchem {
 // The full occupied and virtual Fock response is handled by the dresser.
 class stc_triples {
 public:
+    // Elapsed worker times overlap across workers; only point wall times are
+    // additive wall-clock stages. Fine-grained profiling is explicitly opt-in.
+    struct right_profile {
+        enum phase { pack, forward_virtual, forward_occupied, contract,
+            ket_bar, reverse_gv, reverse_tv, reverse_go, reverse_to, phase_count };
+        std::array<double,phase_count> seconds{};
+        // GV, T2V, GO, T2O, T1, FOV, T2, GG, in that order.
+        std::array<double,8> lock_wait{},store{};
+        std::array<size_t,8> lock_calls{};
+        double worker_seconds=0.,cpu_seconds=0.,barrier_seconds=0.;
+        size_t blocks=0,minor_faults=0,major_faults=0,voluntary_switches=0,involuntary_switches=0;
+    };
     struct triples_result {
         double energy;
         double standard_error;
@@ -48,6 +61,10 @@ public:
         size_t occupied_block_batch_size,occupied_block_batches;
         size_t grouped_adjoint_groups,grouped_adjoint_max_terms;
         size_t grouped_adjoint_gemm_calls,grouped_adjoint_max_reduction;
+        bool right_profile_enabled=false;
+        std::vector<double> point_right_wall_seconds;
+        std::vector<std::vector<double>> point_right_batch_wall_seconds;
+        std::vector<right_profile> point_right_profiles;
     };
     // Discarded pilot with its own RNG stream; shares tensors and proposal
     // tables with production. nsamples is the minimum production count.
@@ -91,7 +108,8 @@ public:
     static constexpr size_t maximum_streaming_blocks=128;
     static triples_result quadrature_stream(const triples_prepared&,
         const std::vector<const triples_prepared*>&,const std::vector<double>&,
-        size_t workspace_limit,size_t block_batch_size,std::vector<double>&,std::vector<triples_vjp>*);
+        size_t workspace_limit,size_t block_batch_size,std::vector<double>&,std::vector<triples_vjp>*,
+        bool profile_right=false);
 
     // Denominator-free Laplace numerator, contracted directly over a small
     // selected space: sum_s (A^T L)_s (R^T Z)_s, with the physical -1/3 factor.

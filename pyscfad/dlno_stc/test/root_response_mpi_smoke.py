@@ -1,4 +1,5 @@
 """Numerical regression for optimized root-owned response with MPI owners."""
+from pyscfad.dlno_stc.test._cc_options import cc_options
 import argparse
 from contextlib import ExitStack
 import json
@@ -50,13 +51,12 @@ def run(method, output):
 
     def select(mf):
         domains = dlno_stc.build_domain_selections(
-            mf, frozen=1, force_full_domains=True,
+            mf, frozen=1, full_domain=True,
             lo_kwargs=dict(conv_tol=1e-12, conv_tol_grad=1e-9))
         if method == 'mp2':
             return domains
-        return ccsd.build_static_selections(mf, domains, matrix_kind='W',
-            thresh_occ=1e-5, thresh_vir=1e-5, baseline_controls=controls,
-            matrix_controls=controls, single_pass=True)
+        return ccsd.build_static_selections(mf, domains,
+            thresh_occ=1e-5, thresh_vir=1e-5, **cc_options(controls, controls),)
 
     finish = _ooc_cotangent.GeometryScope.finish
     receipts = []
@@ -82,8 +82,8 @@ def run(method, output):
             if method == 'mp2':
                 result = dlno_stc.value_and_grad(mol, build, controls=controls, **options)
             else:
-                result = ccsd.value_and_grad(mol, build, baseline_controls=controls,
-                                             matrix_controls=controls, **options)
+                result = ccsd.value_and_grad(mol, build, **cc_options(controls, controls),
+                                              **options)
             jax.block_until_ready(result)
         assert _ooc_cotangent._scope.get() is None
         assert _scf_response_cache._current.get() is None

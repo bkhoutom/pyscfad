@@ -1,6 +1,6 @@
 """Physical Boys-fragment CCSD(T) corrections with shared W energy.
 
-Discrete domains and LIS ranks are fixed. Native D/W chooses each LIS in its
+Discrete domains and LIS ranks are fixed. Native W chooses each LIS in its
 STC frame. The solver uses normalized domain projections of the original
 physical Boys targets.
 """
@@ -19,18 +19,17 @@ from ._profile import response as profile_response
 from ._memory import memory_calculation
 from ._cleanup import release_memory as _release_memory
 from ._selection import (DomainSelections, _physical_groups, _strong_preparation_key,
-                         build_domain_groups)
-from ._workflow import allocate_domain_controls
+                         build_domain_groups, physical_fragments_in_group as _group_cc_fragments)
 from ._df_basis import (basis_kwargs, basis_identity, selection_auxbasis,
                         validate_selection_basis)
 from .adjoint import apply_input_pullback
 from .controls import (normalize_matrix_controls, normalize_triples_controls,
                        DEFAULT_TRIPLES_TRACE_EXPONENT)
 from .domain import build_boys_ed_frame
-from .protocol import validate_full_result, validate_input_cotangents
+from .protocol import validate_input_cotangents
 
 
-CC_SELECTIONS_SCHEMA_VERSION = 13
+CC_SELECTIONS_SCHEMA_VERSION = 18
 
 
 def _clear_jax_caches(stage, *live_results, **metadata):
@@ -53,16 +52,14 @@ class CCSDSelections:
     controls_identity: tuple
     schema_version: int = CC_SELECTIONS_SCHEMA_VERSION
     mp2_fragment_energies: tuple | None = None
-    deferred_selection: dict | None = None
+    selection_options: dict | None = None
     correlation_basis_identity: str | None = None
+    mp2_grid: tuple | None = None
+    mp2_grid_diagnostics: dict | None = None
 
     @property
     def mp2_static(self):
         return self.lis_static.mp2_static
-
-    @property
-    def matrix_kind(self):
-        return self.lis_static.matrix_kind
 
     @property
     def fragments(self):
@@ -168,26 +165,23 @@ def _cc_solver_options(cc_solver, stc_cc_controls, lis_aux_svd_tol=None):
     return dict(options, cc_solver='stc', stc_cc_controls=normalize_controls(stc_cc_controls))
 
 
-def _validate_shared_frame_triples(static, ccsd_t, stc_cc_controls):
-    """A local amplitude frame needs full-Fock rather than diagonal triples."""
-    if not ccsd_t or not (stc_cc_controls or {}).get('shared_local_frame', False):
-        return
-    deferred = getattr(static, 'deferred_selection', None)
-    smooth = (deferred['smooth'] if deferred is not None else
-              static.lis_static.smooth_frames is not None)
-    if not smooth:
-        raise ValueError('shared_local_frame with (T) requires smooth=True full-Fock triples; '
-                         'set shared_local_frame=False to backrotate to the incoming LIS frame')
-
-
-def _normalize_controls(baseline_controls, matrix_controls, matrix_kind):
-    baseline = driver._driver_controls(baseline_controls, scope='domain')
+def _normalize_controls(baseline_controls, matrix_controls, mp2_grid=None):
+    """Resolve one MP2/W quadrature, independently of the fitted triples grid."""
+    from .controls import resolve_mp2_grid
+    grid = resolve_mp2_grid(mp2_grid)
+    def with_grid(controls):
+        if controls is None:
+            controls = {}
+        if not isinstance(controls, dict):
+            raise TypeError('controls must be a dictionary')
+        if {'laplace_roots', 'laplace_weights'} & controls.keys():
+            raise ValueError('CC MP2/W quadrature belongs in mp2_grid=(roots, weights), '
+                             'not baseline_controls or matrix_controls')
+        return dict(controls, **grid)
+    baseline = driver._driver_controls(with_grid(baseline_controls))
     baseline.setdefault('mode', 'deterministic')
     baseline.setdefault('global_seed', 0)
-    matrix = normalize_matrix_controls(matrix_controls, matrix_kind)
-    if matrix_kind == 'W' and any(not numpy.array_equal(baseline[key], matrix[key])
-                                 for key in ('laplace_roots', 'laplace_weights')):
-        raise ValueError('W supplies the MP2 energy; baseline and matrix Laplace grids must match')
+    matrix = normalize_matrix_controls(with_grid(matrix_controls))
     return baseline, matrix
 
 
@@ -202,78 +196,34 @@ def _scientific_identity(baseline, matrix):
         if isinstance(value, (list, tuple, numpy.ndarray)):
             return tuple(freeze(item) for item in value)
         return value.item() if isinstance(value, numpy.generic) else value
-    return freeze(baseline), freeze(matrix)
+    grid_keys = {'laplace_roots', 'laplace_weights'}
+    return (freeze({key: baseline[key] for key in grid_keys}),
+            freeze({key: value for key, value in baseline.items() if key not in grid_keys}),
+            freeze({key: value for key, value in matrix.items() if key not in grid_keys}))
 
 
-def _validate_run(static, baseline_controls, matrix_controls, matrix_kind):
+def _validate_run(static, baseline_controls, matrix_controls, mp2_grid=None):
     if not isinstance(static, CCSDSelections):
         raise TypeError('static must be CCSDSelections from build_static_selections')
     if vars(static).get('schema_version') != CC_SELECTIONS_SCHEMA_VERSION:
         raise ValueError('incompatible CC selection schema; rebuild domain-space LIS selections')
-    from .lis import _validate_lis_space
-    _validate_lis_space(static.lis_static.lis_space)
-    for fragment in static.fragments:
-        if fragment is not None:
-            _validate_lis_space(fragment.lis_space)
-    kind = static.matrix_kind if matrix_kind is None else matrix_kind
-    if kind != static.matrix_kind:
-        raise ValueError('matrix_kind differs from the saved LIS selection')
-    baseline, matrix = _normalize_controls(baseline_controls, matrix_controls, kind)
+    if static.lis_static.smooth_frames is None or static.lis_static.triples_grid is None:
+        raise ValueError('only smooth LIS treatment is supported; rebuild smooth selections')
+    if static.mp2_grid is None:
+        raise ValueError('CC selections have no saved MP2 grid; rebuild selections')
+    baseline, matrix = _normalize_controls(
+        baseline_controls, matrix_controls, static.mp2_grid if mp2_grid is None else mp2_grid)
+    if static.selection_options is None and any(f is None for f in static.fragments):
+        raise ValueError('CC selections must include every physical fragment; rebuild selections')
     if _scientific_identity(baseline, matrix) != static.controls_identity:
         raise ValueError('scientific controls differ from the saved LIS selection')
     return baseline, matrix
 
 
-def _fragment_indices(static, indices, *, selecting=False):
-    fragments = (_physical_groups(static) if selecting and isinstance(static, DomainSelections)
-                 else static.fragments)
-    deferred = getattr(static, 'deferred_selection', None)
-    available = (tuple(deferred['indices']) if deferred is not None else
-                 tuple(i for i, fragment in enumerate(fragments)
-                       if selecting or fragment is not None))
-    if indices is None:
-        return available
-    indices = tuple(indices)
-    if any(isinstance(i, (bool, numpy.bool_)) or not isinstance(i, (int, numpy.integer))
-           for i in indices):
-        raise TypeError('fragment_indices must contain integers')
-    if len(set(indices)) != len(indices) or any(i not in available for i in indices):
-        raise ValueError('fragment_indices must be unique available LIS selections')
-    return tuple(int(i) for i in indices)
+def _all_fragment_indices(static):
+    """Every physical fragment contributes one CC correction."""
+    return tuple(range(len(static.fragments)))
 
-
-def _group_cc_fragments(static, group):
-    """Map physical IDs to target slots in their first member's preparation job.
-
-    Preparation merging affects ownership only. Every physical member must
-    have exactly the representative's ordered strong frame, even when the
-    preparation jobs themselves are left unmerged.
-    """
-    domains = static.mp2_static if hasattr(static, 'mp2_static') else static
-    if not isinstance(domains, DomainSelections):
-        raise TypeError('physical CC grouping requires STC Boys DomainSelections')
-    physical = _physical_groups(domains)
-    owned = [(index, members) for index, members in enumerate(physical)
-             if members[0] in group.fragment_indices]
-    if not owned:
-        return ()
-    labels = tuple(int(columns[0]) for columns in domains.frag_lolist)
-    representative = group.representative_index
-    frame_key, _, _ = _strong_preparation_key(
-        domains, domains.fragments[representative], representative, labels)
-    partners = tuple(int(i) for i in domains.fragments[representative].strong_fragments)
-    result = []
-    for index, members in owned:
-        targets = []
-        for member in members:
-            key, _, _ = _strong_preparation_key(domains, domains.fragments[member], member, labels)
-            if key != frame_key or partners.count(member) != 1:
-                raise ValueError(f'physical CC fragment {index} has incompatible preparation frames; rebuild domains')
-            targets.append(partners.index(member))
-        if len(set(targets)) != len(members):
-            raise ValueError(f'physical CC fragment {index} must map each target exactly once')
-        result.append((index, tuple(targets)))
-    return tuple(result)
 
 
 def _fragment_dimensions(static, index):
@@ -296,35 +246,31 @@ def _bar_norm(*trees):
     return float(np.sqrt(sum(squares)))
 
 
-def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_vir,
-                            baseline_controls, matrix_controls,
-                            internal_rank_threshold=1e-6, merge_identical=True, fragment_indices=None,
-                            smooth=True, smooth_laplace_points=4, single_pass=True,
-                            lis_space='domain', correlation_auxbasis=None):
-    """Select physical-fragment LIS ranks from explicit D or W cutoffs and controls.
+def build_static_selections(mf, mp2_static, *, thresh_occ, thresh_vir,
+                            baseline_controls=None, matrix_controls=None, mp2_grid=None,
+                            internal_rank_threshold=1e-6, merge_identical=True,
+                            triples_laplace_points=4,
+                            correlation_auxbasis=None):
+    """Record physical-fragment LIS cutoffs and controls for the W pipeline.
 
-    Use the run's ``correlation_auxbasis`` for D/W factors. ``None`` uses the
+    Use the run's ``correlation_auxbasis`` for W factors. ``None`` uses the
     SCF fit, or inherits the fit inside a driver-owned selection callback.
-    ``mp2_static`` is a concrete Boys ``DomainSelections``. D and W use
-    separately supplied absolute-eigenvalue cutoffs, with no conversion.
-    ``fragment_indices`` selects only those LIS ranks; unselected entries
-    remain absent while all domain metadata is retained.
+    ``mp2_static`` is a concrete Boys ``DomainSelections``. Absolute W
+    eigenvalue cutoffs select the occupied and virtual spaces.
 
     Smooth anchored frames with full occupied and virtual Fock matrices are
-    the default. Set ``smooth=False`` only for a deterministic semicanonical reference.
-    D/W subspace and AO overlap response are retained; there are no internal
+    the only supported treatment.
+    W subspace and AO overlap response are retained; there are no internal
     Fock cluster projectors. Ranks, anchors and quadratures are held fixed
     during differentiation.
-    ``smooth_laplace_points`` defaults to four fitted points per LIS.
-    The two-pass path saves MP2 fragment proxies for optional triples variance
-    allocation. ``variance_allocation='occupied_count'`` needs no proxies.
-    By default (``single_pass=True``), return a plan without preparing domains or W.
-    Each production fragment selects its discrete LIS labels from its
-    own W result, then uses that same result in the complete pullback. This
-    path uses occupied-count triples budgets and retains only one domain's
-    preparation tape at a time on each group owner, including MPI workers.
-    Set ``single_pass=False`` for D matrices or concrete LIS selections,
-    anchors and grids before production.
+    ``mp2_grid=(roots, weights)`` overrides the global fitted MP2/W grid
+    saved by domain selection. ``None`` reuses that saved grid. Control dictionaries contain no
+    quadrature keys. ``triples_laplace_points`` independently fits four points
+    per LIS by default, using triple-excitation denominators.
+    This function records selection settings without building W. Each fragment
+    builds W once in production, selects its LIS and fits its independent (T)
+    grid, then consumes the same W in CCSD(T) and the combined pullback.
+    Discrete labels and both grids remain fixed during that fragment's response.
     Occupied and virtual LNO eigenproblems always
     use compact extended-domain coordinates, preserving the projected target
     occupied span and all domain-frame/target-projector responses.
@@ -339,132 +285,91 @@ def build_static_selections(mf, mp2_static, *, matrix_kind, thresh_occ, thresh_v
     validate_selection_basis(mf, mp2_static, correlation_auxbasis)
     identity = (None if correlation_auxbasis is None else
                 basis_identity(mf, correlation_auxbasis))
-    from .lis import LISSelections, _validate_thresholds, _validate_lis_space
-    _validate_lis_space(lis_space)
-    if not isinstance(smooth, (bool, numpy.bool_)):
-        raise TypeError('smooth must be a boolean')
-    if not isinstance(single_pass, (bool, numpy.bool_)):
-        raise TypeError('single_pass must be a boolean')
+    from .lis import LISSelections, _validate_thresholds
     _validate_thresholds(thresh_occ, thresh_vir, internal_rank_threshold)
-    if single_pass and matrix_kind != 'W':
-        raise ValueError('single-pass LIS selection requires W')
-    baseline, matrix = _normalize_controls(baseline_controls, matrix_controls, matrix_kind)
-    indices = _fragment_indices(mp2_static, fragment_indices, selecting=True)
+    if mp2_grid is None:
+        saved_grid = getattr(mp2_static, 'mp2_grid', None)
+        grid_diagnostics = getattr(mp2_static, 'mp2_grid_diagnostics', None)
+        if saved_grid is None:
+            raise ValueError('domain selections have no saved MP2 grid; rebuild selections')
+    else:
+        from .laplace import select_mp2_grid
+        spectrum = numpy.asarray(jax.lax.stop_gradient(mf.mo_energy))
+        saved_grid, grid_diagnostics = select_mp2_grid(
+            spectrum[mp2_static.active_occ_indices], spectrum[mp2_static.active_vir_indices],
+            grid=mp2_grid)
+    baseline, matrix = _normalize_controls(baseline_controls, matrix_controls, saved_grid)
+    saved_grid = (baseline['laplace_roots'].copy(), baseline['laplace_weights'].copy())
+    indices = tuple(range(len(_physical_groups(mp2_static))))
     physical = _physical_groups(mp2_static)
     selections = [None] * len(physical)
     frames, grids = [None] * len(physical), [None] * len(physical)
-    mp2_energies = [0.] * len(physical)
-    if single_pass:
-        lis = LISSelections(mp2_static, matrix_kind, thresh_occ, thresh_vir,
-            internal_rank_threshold, tuple(selections),
-            tuple(frames) if smooth else None, tuple(grids) if smooth else None,
-            lis_space=lis_space)
-        return CCSDSelections(lis, _scientific_identity(baseline, matrix),
-            deferred_selection=dict(indices=tuple(indices), smooth=bool(smooth),
-                smooth_laplace_points=smooth_laplace_points),
-            correlation_basis_identity=identity)
-    state = driver._initialize(mf, mp2_static, baseline, with_grad=False,
-                               **basis_kwargs(correlation_auxbasis))
-    groups = build_domain_groups(mp2_static, merge_identical=merge_identical)
-    driver.lib.logger.info(mf, 'STC CC physical fragments %d; Boys grouping %s; preparation groups %d',
-                           len(physical), mp2_static.boys_grouping, len(groups))
-    for index, members in enumerate(physical):
-        targets = tuple(int(mp2_static.frag_lolist[member][0]) for member in members)
-        driver.lib.logger.info(mf, 'STC CC fragment %d; orbital records %s; targets %s; n_F=%d',
-                               index, members, targets, len(members))
-    for group in groups:
-        corrections = _group_cc_fragments(mp2_static, group)
-        if not any(index in indices for index, _ in corrections):
-            continue
-        inputs, host, _, frame = driver._prepare(
-            state, mp2_static, group, baseline, False, return_frame=True)
-        mp2_static = state.pop('_prepared_domain_static', mp2_static)
-        for index, targets in corrections:
-            if index not in indices:
-                continue
-            forward = backend.solve_matrices(host, {'fragment_id': index, 'target_indices': targets},
-                                             matrix, matrix_kind=matrix_kind)
-            mp2_energies[index] = float(forward['energy'])
-            selections[index], frames[index], grids[index] = _select_fragment_lis(
-                mf, state['common'], mp2_static, index, group, frame, forward,
-                matrix_kind=matrix_kind, thresh_occ=thresh_occ, thresh_vir=thresh_vir,
-                internal_rank_threshold=internal_rank_threshold, smooth=smooth,
-                smooth_laplace_points=smooth_laplace_points, lis_space=lis_space)
-            del forward
-        del inputs, host, frame
-        gc.collect()
-    lis = LISSelections(mp2_static=mp2_static, matrix_kind=matrix_kind,
-                        thresh_occ=thresh_occ, thresh_vir=thresh_vir,
-                        internal_rank_threshold=internal_rank_threshold,
-                        fragments=tuple(selections),
-                        smooth_frames=tuple(frames) if smooth else None,
-                        smooth_grid=tuple(grids) if smooth else None, lis_space=lis_space)
-    static = CCSDSelections(lis, _scientific_identity(baseline, matrix),
-                            mp2_fragment_energies=tuple(mp2_energies),
-                            correlation_basis_identity=identity)
-    for index in indices:
-        driver.lib.logger.info(mf, 'STC CC fragment %d; LIS occupied %d; LIS virtual %d',
-                               index, *_fragment_dimensions(static, index))
-    return static
+    lis = LISSelections(mp2_static, thresh_occ, thresh_vir,
+        internal_rank_threshold, tuple(selections),
+        tuple(frames), tuple(grids))
+    return CCSDSelections(lis, _scientific_identity(baseline, matrix),
+        selection_options=dict(indices=tuple(indices),
+            triples_laplace_points=triples_laplace_points),
+        correlation_basis_identity=identity,
+        mp2_grid=saved_grid, mp2_grid_diagnostics=grid_diagnostics)
 
 
 def _select_fragment_lis(mf, common, domains, index, group, frame, forward, *,
-                         matrix_kind, thresh_occ, thresh_vir, internal_rank_threshold,
-                         smooth, smooth_laplace_points, lis_space='domain'):
+                         thresh_occ, thresh_vir, internal_rank_threshold,
+                         triples_laplace_points):
     """Choose concrete labels/anchors from existing inputs; never build W here."""
     from .lis import LISSelections, build_fragment_lis_selection, build_fragment_lis
     matrices = {name: np.asarray(forward[name]) for name in ('occupied', 'virtual')}
     with resource_profile.section('stc.lis.select_ranks', frag=index+1):
         selection = build_fragment_lis_selection(
-            mf, domains, index, matrices=matrices, matrix_kind=matrix_kind,
+            mf, domains, index, matrices=matrices,
             common=common, frame=frame, frame_fragment_index=group.representative_index,
             thresh_occ=thresh_occ, thresh_vir=thresh_vir,
-            internal_rank_threshold=internal_rank_threshold, lis_space=lis_space)
+            internal_rank_threshold=internal_rank_threshold)
     frames = grid = None
-    if smooth:
-        from .smooth import select_frame, select_occupied_frame
-        from .smooth_triples import make_grid
-        selections = [None] * len(_physical_groups(domains))
-        selections[index] = selection
-        partial_lis = LISSelections(domains, matrix_kind, thresh_occ, thresh_vir,
-                                   internal_rank_threshold, tuple(selections), lis_space=lis_space)
-        with resource_profile.section('stc.lis.select_frame', frag=index+1):
-            selected = build_fragment_lis(mf, common, partial_lis, index,
-                matrices=matrices, frame=frame, frame_fragment_index=group.representative_index)
-            coefficients = (selected.active_occupied_coeff, selected.active_virtual_coeff)
-            jax.block_until_ready(coefficients)
-            if all(coeff.shape[1] for coeff in coefficients):
-                frames = (select_occupied_frame(selected.original_occupied_coeff,
-                              selected.fragment_iao_coeff, common.s1e),
-                          select_frame(coefficients[1], common.fock))
-                spectra = [numpy.linalg.eigvalsh(item.anchor.T @
-                    numpy.asarray(common.fock) @ item.anchor) for item in frames]
-        if frames is not None:
-            with resource_profile.section('stc.lis.fit_grid', frag=index+1):
-                grid = make_grid(*spectra, points=smooth_laplace_points)
+    from .smooth import select_frame, select_occupied_frame
+    from .smooth_triples import make_grid
+    selections = [None] * len(_physical_groups(domains))
+    selections[index] = selection
+    partial_lis = LISSelections(domains, thresh_occ, thresh_vir,
+                               internal_rank_threshold, tuple(selections))
+    with resource_profile.section('stc.lis.select_frame', frag=index+1):
+        selected = build_fragment_lis(mf, common, partial_lis, index,
+            matrices=matrices, frame=frame, frame_fragment_index=group.representative_index)
+        coefficients = (selected.active_occupied_coeff, selected.active_virtual_coeff)
+        jax.block_until_ready(coefficients)
+        if all(coeff.shape[1] for coeff in coefficients):
+            frames = (select_occupied_frame(selected.original_occupied_coeff,
+                          selected.fragment_iao_coeff, common.s1e),
+                      select_frame(coefficients[1], common.fock))
+            spectra = [numpy.linalg.eigvalsh(item.anchor.T @
+                numpy.asarray(common.fock) @ item.anchor) for item in frames]
+    if frames is not None:
+        with resource_profile.section('stc.lis.fit_grid', frag=index+1):
+            grid = make_grid(*spectra, points=triples_laplace_points)
     return selection, frames, grid
 
 
 def _select_current_fragment(state, static, index, group, frame, forward):
     """Create this fragment's immutable selection while its input VJP is live."""
-    options = static.deferred_selection
+    if static.fragments[index] is not None:
+        return static
+    options = static.selection_options
     with resource_profile.section('stc.cc.lis_selection', frag=index+1):
         selection, frames, grid = _select_fragment_lis(
             state['mf'], state['common'], static.mp2_static, index, group, frame, forward,
-            matrix_kind=static.matrix_kind, thresh_occ=static.lis_static.thresh_occ,
+             thresh_occ=static.lis_static.thresh_occ,
             thresh_vir=static.lis_static.thresh_vir,
             internal_rank_threshold=static.lis_static.internal_rank_threshold,
-            lis_space=static.lis_static.lis_space,
-            **{key: options[key] for key in
-               ('smooth', 'smooth_laplace_points')})
+
+            triples_laplace_points=options['triples_laplace_points'])
     fragments = list(static.fragments)
     fragments[index] = selection
     lis = replace(static.lis_static, fragments=tuple(fragments))
-    if options['smooth']:
-        all_frames, all_grids = list(lis.smooth_frames), list(lis.smooth_grid)
-        all_frames[index], all_grids[index] = frames, grid
-        lis = replace(lis, smooth_frames=tuple(all_frames), smooth_grid=tuple(all_grids))
-    return replace(static, lis_static=lis, deferred_selection=None)
+    all_frames, all_grids = list(lis.smooth_frames), list(lis.triples_grid)
+    all_frames[index], all_grids[index] = frames, grid
+    lis = replace(lis, smooth_frames=tuple(all_frames), triples_grid=tuple(all_grids))
+    return replace(static, lis_static=lis, selection_options=None)
 
 
 def _allocate_triples_controls(controls, nfragments, *, static=None, indices=None):
@@ -480,10 +385,10 @@ def _allocate_triples_controls(controls, nfragments, *, static=None, indices=Non
         controls.setdefault('trace_exponent', DEFAULT_TRIPLES_TRACE_EXPONENT)
     if controls is None or 'energy_tolerance' not in controls:
         return controls
-    deferred = getattr(static, 'deferred_selection', None)
-    allocation = controls.get('variance_allocation', 'occupied_count' if deferred else 'mp2_energy')
-    if deferred and allocation != 'occupied_count':
-        raise ValueError('single-pass W requires occupied_count variance allocation')
+    plan = getattr(static, 'selection_options', None)
+    allocation = controls.get('variance_allocation', 'occupied_count' if plan else 'mp2_energy')
+    if plan and allocation != 'occupied_count':
+        raise ValueError('the W pipeline requires occupied_count variance allocation')
     if allocation == 'occupied_count':
         if static is None or 'fragment_energies' in controls:
             raise ValueError('occupied_count allocation requires domains and no energy proxies')
@@ -593,7 +498,6 @@ def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
                     frame=None, correlation_auxbasis=None, df_compressor=None,
                     sampling_frame=None):
     """Return MP2-LIS, CCSD and triples; stochastic calls also return diagnostics."""
-    _validate_shared_frame_triples(static, ccsd_t, stc_cc_controls)
     representative = group.representative_index
     if frame is None:
         frame = build_boys_ed_frame(common, static.mp2_static, representative)
@@ -604,7 +508,7 @@ def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
         zero = np.zeros((), dtype=common.s1e.dtype)
         values = (zero, zero, zero)
         return ((values, {}) if df_compressor is not None or cc_solver == 'stc' or stochastic or
-                (ccsd_t and static.lis_static.smooth_frames is not None) else values)
+                ccsd_t else values)
     metadata = {'fragment_index': int(fragment_index),
                 'extended_primary_domain': numpy.asarray(
                     static.mp2_static.fragments[representative].extended_atoms, dtype=numpy.int32),
@@ -619,23 +523,20 @@ def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
         sampling_options = {} if sampling_frame is None else {'sampling_frame': sampling_frame}
         options['amplitude_solver'] = make_solver(
             stc_cc_controls, fragment_index=fragment_index, **sampling_options)
-    if static.lis_static.smooth_frames is not None:
-        from .smooth import noncanonical_mp2
-        from .smooth_triples import make_solver
-        options['mp2_solver'] = noncanonical_mp2
-        if resource_profile.enabled():
-            options['mp2_solver'] = lambda eris, projection: profile_response(
-                'solver.mp2_reference_pullback', noncanonical_mp2, eris, projection,
-                frag=fragment_index+1)
-        if ccsd_t:
-            local_controls = dict(triples_controls)
-            local_controls['global_seed'] = _triples_fragment_seed(
-                local_controls.get('global_seed', 71), fragment_index)
-            options['triples_solver'] = make_solver(local_controls,
-                static.lis_static.smooth_grid[fragment_index],
-                with_grad=with_grad)
-    elif stochastic:
-        raise ValueError('canonical triples sampling has been removed; rebuild smooth selections')
+    from .smooth import noncanonical_mp2
+    from .smooth_triples import make_solver
+    options['mp2_solver'] = noncanonical_mp2
+    if resource_profile.enabled():
+        options['mp2_solver'] = lambda eris, projection: profile_response(
+            'solver.mp2_reference_pullback', noncanonical_mp2, eris, projection,
+            frag=fragment_index+1)
+    if ccsd_t:
+        local_controls = dict(triples_controls)
+        local_controls['global_seed'] = _triples_fragment_seed(
+            local_controls.get('global_seed', 71), fragment_index)
+        options['triples_solver'] = make_solver(local_controls,
+            static.lis_static.triples_grid[fragment_index],
+            with_grad=with_grad)
     result = _impurity_solve_core(
         mf, lis.mo_coeff, lis.fragment_iao_coeff, common.fock, common.s1e,
         frozen=lis.frozen, frag_prescreen=metadata, verbose_imp=verbose_imp,
@@ -652,13 +553,13 @@ def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
 
 def _run_group(state, static, group, baseline_controls, matrix_controls, *,
                with_grad, verbose_imp, ccsd_t, triples_controls=None,
-               include_baseline=True, fragment_indices=None, vvvv_direct=False,
+               vvvv_direct=False,
                cc_solver='deterministic', stc_cc_controls=None, lis_aux_svd_tol=None):
     """Optionally join all local DF producer responses for this domain."""
     from pyscfad.lno import _df_shared
     options = dict(with_grad=with_grad, verbose_imp=verbose_imp, ccsd_t=ccsd_t,
-                   triples_controls=triples_controls, include_baseline=include_baseline,
-                   fragment_indices=fragment_indices, vvvv_direct=vvvv_direct,
+                   triples_controls=triples_controls,
+                   vvvv_direct=vvvv_direct,
                    cc_solver=cc_solver, stc_cc_controls=stc_cc_controls)
     if lis_aux_svd_tol:
         options['lis_aux_svd_tol'] = lis_aux_svd_tol
@@ -670,12 +571,12 @@ def _run_group(state, static, group, baseline_controls, matrix_controls, *,
                                     matrix_controls, **options)
     atoms = static.mp2_static.fragments[group.representative_index].extended_atoms
     with _df_shared.reverse_scope(
-            state['mf'], atoms,
+            state['mf'], atoms, with_grad=with_grad,
             aux_atoms=static.mp2_static.fragments[group.representative_index].pao_center_atoms,
             **basis_kwargs(state.get('correlation_auxbasis'))) as shared:
         if state.get('common') is not None:
             from ._df_inputs import configure_cache
-            configure_cache(shared, static)
+            configure_cache(shared)
         records = _run_group_responses(state, static, group, baseline_controls,
                                        matrix_controls, **options)
         with resource_profile.section('stc.cc.shared_df_integral_pullback',
@@ -690,7 +591,7 @@ def _run_group(state, static, group, baseline_controls, matrix_controls, *,
 
 def _run_group_responses(state, static, group, baseline_controls, matrix_controls, *,
                         with_grad, verbose_imp, ccsd_t, triples_controls=None,
-                        include_baseline=True, fragment_indices=None, vvvv_direct=False,
+                        vvvv_direct=False,
                         cc_solver='deterministic', stc_cc_controls=None, lis_aux_svd_tol=None):
     """Complete one owned group's preparation, baseline and physical-fragment responses.
 
@@ -710,58 +611,18 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
         static = replace(static, lis_static=replace(static.lis_static, mp2_static=domains))
     frame_coeff = (frame.occupied_coeff, frame.virtual_coeff)
     frame_bars = tuple(np.zeros_like(coeff) for coeff in frame_coeff) if with_grad else None
-    metadata = {'fragment_id': group.representative_index,
-                'target_indices': tuple(group.target_indices)}
     input_bars = None
-    baseline_from_w = include_baseline and static.matrix_kind == 'W'
-    if include_baseline and not baseline_from_w:
-        with resource_profile.section('stc.cc.baseline'):
-            baseline = backend.solve(host, metadata, baseline_controls, with_grad=with_grad)
-        state['energy'] = state['energy'] + baseline['energy']
-        state['baseline_energy'] = state.get('baseline_energy', 0.) + float(baseline['energy'])
-        state['variance'] += float(baseline['energy_standard_error']) ** 2
-        if with_grad:
-            validate_full_result(baseline, inputs)
-            input_bars = {name: numpy.array(value, dtype=numpy.float64, copy=True)
-                          for name, value in baseline['cotangents'].items()}
-        del baseline
     records = []
     for index, targets in _group_cc_fragments(static, group):
-        correct_fragment = fragment_indices is None or index in fragment_indices
-        if not correct_fragment and not baseline_from_w:
-            continue
         with resource_profile.section('stc.cc.matrix_forward', frag=index+1):
             forward = backend.solve_matrices(
                 host, {'fragment_id': index, 'target_indices': targets},
-                matrix_controls, matrix_kind=static.matrix_kind)
-        if baseline_from_w:
-            # W already supplies the deterministic or sampled MP2 energy.
-            # Seed its derivative only after downstream LIS bars are known.
-            state['energy'] = state['energy'] + forward['energy']
-            state['baseline_energy'] = state.get('baseline_energy', 0.) + float(forward['energy'])
-            state['variance'] += float(forward['diagnostics']['energy_standard_error']) ** 2
-        if not correct_fragment:
-            # Restricting CC corrections must still retain the complete MP2
-            # baseline, including physical fragments without a selected LIS.
-            if with_grad:
-                with resource_profile.section('stc.cc.matrix_pullback', frag=index+1):
-                    bars = backend.pullback_matrices(
-                        host, forward, energy_bar=1.,
-                        occupied_bar=numpy.zeros_like(host['foo']),
-                        virtual_bar=numpy.zeros_like(host['fvv']))
-                validate_input_cotangents(bars, inputs)
-                if input_bars is None:
-                    input_bars = {name: numpy.array(value, dtype=numpy.float64, copy=True)
-                                  for name, value in bars.items()}
-                else:
-                    for name in inputs:
-                        input_bars[name] += bars[name]
-                del bars
-            del forward
-            continue
+                matrix_controls)
+        state['energy'] = state['energy'] + forward['energy']
+        state['baseline_energy'] = state.get('baseline_energy', 0.) + float(forward['energy'])
+        state['variance'] += float(forward['diagnostics']['energy_standard_error']) ** 2
         matrices = {name: np.asarray(forward[name]) for name in ('occupied', 'virtual')}
-        fragment_static = (_select_current_fragment(state, static, index, group, frame, forward)
-                           if getattr(static, 'deferred_selection', None) is not None else static)
+        fragment_static = _select_current_fragment(state, static, index, group, frame, forward)
         _clear_jax_caches('before_correction', matrices, frame_coeff, frag=index+1)
         local_triples = _fragment_triples_controls(triples_controls, index)
         sampling_frame = None
@@ -789,9 +650,7 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
                                          triples_controls=local_triples, with_grad=need_grad,
                                          vvvv_direct=vvvv_direct, frame=current_frame, **solver_options,
                                          **basis_kwargs(state.get('correlation_auxbasis')))
-                if lis_aux_svd_tol or cc_solver == 'stc' or (ccsd_t and (
-                        getattr(getattr(fragment_static, 'lis_static', None), 'smooth_frames', None) is not None or
-                        triples_controls is not None and triples_controls['mode'] == 'stochastic')):
+                if lis_aux_svd_tol or cc_solver == 'stc' or ccsd_t:
                     values, diagnostics = values
                 else:
                     diagnostics = {}
@@ -825,7 +684,7 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
                 auxiliary[1]['auxiliary_compression'] = dict(compressor.diagnostics)
             return energy, auxiliary, bars
         if cc_solver == 'stc' and _stc_precision.enabled(stc_cc_controls):
-            nfragments = len(_fragment_indices(static, fragment_indices))
+            nfragments = len(_all_fragment_indices(static))
             energy, auxiliary, correction_bars = _stc_precision.run_replicas(
                 evaluate, stc_cc_controls, index, nfragments, with_grad=with_grad)
         else:
@@ -847,7 +706,7 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
                               frag=index+1)
             with resource_profile.section('stc.cc.matrix_pullback', frag=index+1):
                 bars = backend.pullback_matrices(
-                    host, forward, energy_bar=float(baseline_from_w), occupied_bar=matrix_bars['occupied'],
+                    host, forward, energy_bar=1., occupied_bar=matrix_bars['occupied'],
                     virtual_bar=matrix_bars['virtual'])
             validate_input_cotangents(bars, inputs)
             if input_bars is None:
@@ -927,15 +786,14 @@ def _run_weak(state, static, *, with_grad, pairs=None):
 
 def _run_serial(state, static, baseline, matrix, *, with_grad, include_hf,
                 merge_identical, verbose_imp, ccsd_t, return_components,
-                triples_controls=None, fragment_indices=None, include_baseline=True,
+                triples_controls=None,
                 checkpoint_dir=None, resume=False, vvvv_direct=False,
                 cc_solver='deterministic', stc_cc_controls=None, lis_aux_svd_tol=None):
     from ._ccsd_checkpoint import open_checkpoint, restore_progress, save_progress
     groups = build_domain_groups(static.mp2_static, merge_identical=merge_identical)
-    allocated = allocate_domain_controls(baseline, len(groups))
     options = dict(with_grad=with_grad, include_hf=include_hf, ccsd_t=ccsd_t,
                    triples_controls=triples_controls, vvvv_direct=vvvv_direct,
-                   include_baseline=include_baseline, fragment_indices=fragment_indices,
+
                    merge_identical=merge_identical)
     solver_options = (dict(cc_solver=cc_solver, stc_cc_controls=stc_cc_controls)
                       if cc_solver == 'stc' else {})
@@ -946,29 +804,25 @@ def _run_serial(state, static, baseline, matrix, *, with_grad, include_hf,
                                   resume=resume, options=options)
     try:
         start, weak_done, records = restore_progress(checkpoint, state, with_grad=with_grad)
-        if weak_done or not include_baseline:
+        if weak_done:
             state.pop('_prepared_weak', None)
         if not 0 <= start <= len(groups):
             raise ValueError('CC checkpoint progress is outside the saved group worklist')
+        if not weak_done:
+            _run_weak(state, static, with_grad=with_grad)
+            save_progress(checkpoint, state, records, start, True, with_grad=with_grad)
         for position in range(start, len(groups)):
             group = groups[position]
-            corrections = _group_cc_fragments(static, group)
-            if include_baseline or any(fragment_indices is None or index in fragment_indices
-                                       for index, _ in corrections):
-                records.extend(_run_group(
-                    state, static, group, allocated, matrix, with_grad=with_grad,
-                    verbose_imp=verbose_imp, ccsd_t=ccsd_t,
-                    triples_controls=triples_controls, vvvv_direct=vvvv_direct,
-                    include_baseline=include_baseline, fragment_indices=fragment_indices,
-                    **solver_options))
-                _clear_jax_caches('after_group', state['energy'], state['mf_bar'],
-                                  state['common_bar'], frag=group.representative_index+1)
-            save_progress(checkpoint, state, records, position + 1, False, with_grad=with_grad)
+            records.extend(_run_group(
+                state, static, group, baseline, matrix, with_grad=with_grad,
+                verbose_imp=verbose_imp, ccsd_t=ccsd_t,
+                triples_controls=triples_controls, vvvv_direct=vvvv_direct,
+
+                **solver_options))
+            _clear_jax_caches('after_group', state['energy'], state['mf_bar'],
+                              state['common_bar'], frag=group.representative_index+1)
+            save_progress(checkpoint, state, records, position + 1, True, with_grad=with_grad)
             gc.collect()
-        if not weak_done:
-            if include_baseline:
-                _run_weak(state, static, with_grad=with_grad)
-            save_progress(checkpoint, state, records, len(groups), True, with_grad=with_grad)
         return _finish(state, static, records, with_grad=with_grad, include_hf=include_hf,
                        return_components=return_components)
     finally:
@@ -979,7 +833,7 @@ def _run_serial(state, static, baseline, matrix, *, with_grad, include_hf,
 def _finish(state, static, records, *, with_grad, include_hf, return_components):
     components = CCSDComponents(state.get('baseline_energy', 0.), state.get('weak_energy', 0.),
                                 tuple(sorted(records, key=lambda item: item.fragment_index)),
-                                static.matrix_kind, state['variance'] ** .5)
+                                'W', state['variance'] ** .5)
     if components.stc_standard_error is not None:
         driver.lib.logger.info(state['mf'],
             'STC final selected-correction empirical SE %.6g mEh; target %.6g mEh; met %s',
@@ -1010,7 +864,6 @@ def _run(initializer, worker_initializer, comm, *, checkpoint_dir, resume,
         raise TypeError('vvvv_direct must be a bool')
     state, static, baseline, matrix = initializer()
     _clear_jax_caches('initialization', state.get('mf'), state.get('common'))
-    options['fragment_indices'] = state.pop('cc_fragment_indices')
     options['triples_controls'] = state.pop('cc_triples_controls')
     options.update(state.pop('cc_solver_options', {}))
     return _run_serial(state, static, baseline, matrix,
@@ -1018,43 +871,43 @@ def _run(initializer, worker_initializer, comm, *, checkpoint_dir, resume,
 
 
 @memory_calculation
-def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
+def kernel(mf, static, *, baseline_controls=None, matrix_controls=None, mp2_grid=None,
            ccsd_t=False, triples_controls=None, verbose_imp=0, include_hf=False,
            return_components=False,
-           merge_identical=True, comm=None, fragment_indices=None, include_baseline=True,
+           merge_identical=True, comm=None,
            checkpoint_dir=None, resume=False, parallel_scf_jk=True, vvvv_direct=False,
            cc_solver='deterministic', stc_cc_controls=None, correlation_auxbasis=None,
            lis_aux_svd_tol=1e-5):
     """Return correlation energy, or total energy with ``include_hf=True``.
 
-    ``correlation_auxbasis`` selects local MP2, D/W and CC fitting; HF/Fock
+    ``correlation_auxbasis`` selects local MP2, W and CC fitting; HF/Fock
     retain the SCF fit. Use the same basis for selection and execution.
     ``lis_aux_svd_tol`` compresses only LIS auxiliary factors with the strict
     squared-singular-value cutoff ``s**2 > tol`` (default ``1e-5``).
     Pass ``None`` or zero to disable compression.
-    Domain MP2, D/W and orbital selection remain unchanged. Compression
+    Domain MP2, W and orbital selection remain unchanged. Compression
     diagnostics are included in each fragment's ``auxiliary_compression``.
     ``return_components=True`` returns ``(energy, CCSDComponents)``. With W,
     strong-domain MP2 energy is read directly from its traces, in deterministic
-    and stochastic modes, including fragments without a CC correction. Matrix
+    and stochastic modes. Matrix
     controls set its precision; there is no separate strong-domain MP2 solve.
-    Baseline and matrix Laplace grids must match. D retains a separate MP2
-    solver. The MP2 baseline includes weak completion in either case.
+    ``mp2_grid=(roots, weights)`` supplies MP2/W quadrature and must match
+    selection. ``None`` reuses the grid saved in the selections. The separately fitted
+    (T) grids come from the saved selections. The MP2 baseline includes weak
+    completion.
     With ``ccsd_t=True``, omitted ``triples_controls`` preserves deterministic
     triples; stochastic mode requires integer ``nsamples >= 2``. A positive
     ``energy_tolerance`` targets the total triples energy SE in Hartree and
     divides variance according to ``variance_allocation``. ``occupied_count``
     uses each physical fragment's occupied targets divided by all active
-    occupied orbitals (including for subset calculations); it is required by
-    single-pass selection. The legacy ``mp2_energy`` allocation uses saved
+    occupied orbitals; it is required by
+    the W pipeline. The legacy ``mp2_energy`` allocation uses saved
     absolute MP2 fragment energies; ``fragment_energies`` overrides those
     proxies. In the smooth path, ``pilot_samples`` defaults to 10000 per
-    point and determines independent production counts. In the conventional
-    path it overrides the pilot count otherwise supplied by ``nsamples``.
+    point and determines independent production counts.
     Omitted/zero tolerance uses fixed production counts.
-    ``fragment_indices`` restricts corrections (default: all saved LIS ranks).
-    The complete baseline remains included unless ``include_baseline=False``;
-    that option returns only selected CC-minus-MP2-LIS corrections and forbids HF.
+    Every physical fragment contributes a correction; the complete MP2 baseline
+    and weak completion are always included.
     Deterministic fragment RCCSD uses the in-memory PySCF/NumPy CPU path by
     default. Set ``pyscfad_dfccsd_native=False`` for the JAX reference path;
     ``vvvv_direct=False`` (default) caches the virtual ladder when it fits
@@ -1062,7 +915,7 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
     that cache and contracts resident DF factors in blocks. Native caches
     use PySCF's packed layout and live only for each host solve.
     Multi-rank calls distribute complete correlation groups and their
-    single-pass LIS selections. Shared preparation uses distributed DF J/K by default.
+    fragment-local LIS selections. Shared preparation uses distributed DF J/K by default.
     Each rank must supply a matching MF skeleton; preceding SCF is caller-owned.
     ``parallel_scf_jk=True`` also distributes common-preparation DF J/K work. Serial and
     single-rank calls keep their existing behavior.
@@ -1091,11 +944,8 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
     def initialize():
         solver_options = _cc_solver_options(cc_solver, stc_cc_controls, lis_aux_svd_tol)
         triples = normalize_triples_controls(triples_controls, ccsd_t=ccsd_t)
-        if include_hf and not include_baseline:
-            raise ValueError('include_hf requires include_baseline=True')
-        baseline, matrix = _validate_run(static, baseline_controls, matrix_controls, matrix_kind)
-        _validate_shared_frame_triples(static, ccsd_t, solver_options.get('stc_cc_controls'))
-        indices = _fragment_indices(static, fragment_indices)
+        baseline, matrix = _validate_run(static, baseline_controls, matrix_controls, mp2_grid)
+        indices = _all_fragment_indices(static)
         _stc_precision.validate_stages(solver_options.get('stc_cc_controls'), baseline, matrix, triples)
         _stc_precision.validate_seed_independence(solver_options.get('stc_cc_controls'), indices)
         triples = _allocate_triples_controls(triples, len(indices), static=static, indices=indices)
@@ -1104,7 +954,6 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
         validate_selection_basis(mf, static, correlation_auxbasis)
         state = driver._initialize(mf, static.mp2_static, baseline, with_grad=False,
                                    **basis_kwargs(correlation_auxbasis))
-        state['cc_fragment_indices'] = indices
         state['cc_triples_controls'] = triples
         if solver_options:
             state['cc_solver_options'] = solver_options
@@ -1122,17 +971,17 @@ def kernel(mf, static, *, baseline_controls, matrix_controls, matrix_kind=None,
                 merge_identical=merge_identical, verbose_imp=verbose_imp,
                 ccsd_t=ccsd_t, return_components=return_components,
                 vvvv_direct=vvvv_direct,
-                fragment_indices=fragment_indices, include_baseline=include_baseline,
+
                 checkpoint_dir=checkpoint_dir, resume=resume,
                 parallel_scf_jk=parallel_scf_jk, scf_worker_initializer=lambda: mf)
 
 
 @memory_calculation
-def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_controls,
-                   matrix_kind=None, ccsd_t=False, triples_controls=None,
+def value_and_grad(mol, build_mf, static=None, *, baseline_controls=None, matrix_controls=None,
+                   mp2_grid=None, ccsd_t=False, triples_controls=None,
                    verbose_imp=0, include_hf=False,
                    return_components=False, merge_identical=True, comm=None, build_static=None,
-                   fragment_indices=None, include_baseline=True, checkpoint_dir=None, resume=False,
+                   checkpoint_dir=None, resume=False,
                    parallel_scf_jk=True, vvvv_direct=False,
                    cc_solver='deterministic', stc_cc_controls=None, correlation_auxbasis=None,
                    lis_aux_svd_tol=1e-5):
@@ -1146,13 +995,12 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
     Include HF once with ``include_hf=True``. Append ``CCSDComponents`` with
     ``return_components=True``. A force is the negated coordinate gradient.
     ``build_static(mf)`` may select ranks once on the detached SCF reference.
-    Subset and ``include_baseline`` semantics match :func:`kernel`; even a
-    correction-only subset closes common-data and implicit SCF response once.
+    Common-data and implicit SCF response are accumulated once.
     ``triples_controls`` has the same independent sampling semantics as in
     :func:`kernel`; the reported triples SE estimates energy uncertainty only.
     ``vvvv_direct`` has the memory/performance semantics of :func:`kernel`.
-    Multi-rank calls distribute complete correlation groups, including deferred
-    single-pass LIS selection. The default ``parallel_scf_jk=True``
+    Multi-rank calls distribute complete correlation groups, including fragment-local
+    fragment-local LIS selection. The default ``parallel_scf_jk=True``
     also distributes DF J/K work in SCF, common
     preparation and their coordinate pullbacks. Worker ``build_mf`` must accept
     ``mo_coeff_init``, ``mo_energy_init``, ``mo_occ_init`` and ``e_tot_init``,
@@ -1173,8 +1021,6 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
         solver_options = _cc_solver_options(cc_solver, stc_cc_controls, lis_aux_svd_tol)
         triples = normalize_triples_controls(triples_controls, ccsd_t=ccsd_t)
         driver._coordinate_only(mol)
-        if include_hf and not include_baseline:
-            raise ValueError('include_hf requires include_baseline=True')
         prechecked_indices = None
         if build_static is not None:
             if static is not None:
@@ -1182,11 +1028,10 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
             if not callable(build_static):
                 raise TypeError('build_static must be callable')
         else:
-            early_baseline, early_matrix = _validate_run(static, baseline_controls, matrix_controls, matrix_kind)
-            _validate_shared_frame_triples(static, ccsd_t, solver_options.get('stc_cc_controls'))
+            early_baseline, early_matrix = _validate_run(static, baseline_controls, matrix_controls, mp2_grid)
             _stc_precision.validate_stages(solver_options.get('stc_cc_controls'), early_baseline, early_matrix, triples)
             if _stc_precision.enabled(solver_options.get('stc_cc_controls')):
-                prechecked_indices = _fragment_indices(static, fragment_indices)
+                prechecked_indices = _all_fragment_indices(static)
                 _stc_precision.validate_seed_independence(solver_options['stc_cc_controls'], prechecked_indices)
         local_response = driver._root_owned_scf_response(comm, parallel_scf_jk)
         with resource_profile.section('stc.domain.scf'):
@@ -1201,13 +1046,12 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
         scf_data_pullback = prepared_domain = None
         if build_static is not None:
             selected, scf_data, scf_data_pullback, prepared_domain = driver._select_domain_reference(
-                mf, build_static, reuse_weak=include_baseline and not resume,
+                mf, build_static, reuse_weak=not resume,
                 scf_data=scf_data,
                 **basis_kwargs(correlation_auxbasis))
         validate_selection_basis(mf, selected, correlation_auxbasis)
-        baseline, matrix = _validate_run(selected, baseline_controls, matrix_controls, matrix_kind)
-        _validate_shared_frame_triples(selected, ccsd_t, solver_options.get('stc_cc_controls'))
-        indices = (_fragment_indices(selected, fragment_indices)
+        baseline, matrix = _validate_run(selected, baseline_controls, matrix_controls, mp2_grid)
+        indices = (_all_fragment_indices(selected)
                    if prechecked_indices is None else prechecked_indices)
         _stc_precision.validate_stages(solver_options.get('stc_cc_controls'), baseline, matrix, triples)
         if build_static is not None:
@@ -1218,7 +1062,6 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
                                    scf_data_pullback=scf_data_pullback,
                                    prepared_domain=prepared_domain,
                                    **basis_kwargs(correlation_auxbasis))
-        state['cc_fragment_indices'] = indices
         state['cc_triples_controls'] = triples
         if solver_options:
             state['cc_solver_options'] = solver_options
@@ -1241,7 +1084,7 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls, matrix_cont
                 merge_identical=merge_identical, verbose_imp=verbose_imp,
                 ccsd_t=ccsd_t, return_components=return_components,
                 vvvv_direct=vvvv_direct,
-                fragment_indices=fragment_indices, include_baseline=include_baseline,
+
                 checkpoint_dir=checkpoint_dir, resume=resume,
                 parallel_scf_jk=parallel_scf_jk,
                 scf_worker_initializer=initialize_scf_worker)

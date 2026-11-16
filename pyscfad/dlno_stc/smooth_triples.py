@@ -41,7 +41,7 @@ def make_grid(eocc, evir, *, points=4):
     """
     from .controls import _integer_control
     from .laplace import fit_grid
-    points = _integer_control('smooth_laplace_points', points)
+    points = _integer_control('triples_laplace_points', points)
     lo = 3 * float(np.min(evir) - np.max(eocc))
     hi = 3 * float(np.max(evir) - np.min(eocc))
     if lo <= 0:
@@ -125,6 +125,16 @@ def _run_deterministic(inputs, nodes, weights, *, with_grad, max_memory,
     """
     native = importlib.import_module('pyscfad.dlno_stc._stc_mp2')
     started = time.perf_counter()
+    profile_right = os.environ.get('PYSCFAD_TRIPLES_PROFILE_RIGHT', '0') == '1'
+    has_point_timers = getattr(native, 'TRIPLES_RIGHT_PROFILE', False)
+    if profile_right and not has_point_timers:
+        raise RuntimeError('Rebuild the STC native extension for right-side profiling')
+    point_right_wall = np.zeros(len(nodes))
+    point_prepare = np.zeros(len(nodes))
+    point_pullback = np.zeros(len(nodes))
+    point_right_profiles = [None] * len(nodes)
+    point_right_batches = [[] for _ in nodes]
+    left_pullback_seconds = 0.
     inputs = tuple(np.asarray(x, dtype=np.float64) for x in inputs)
     no, nv = inputs[0].shape
     ns = inputs[8].shape[1]
@@ -178,7 +188,8 @@ def _run_deterministic(inputs, nodes, weights, *, with_grad, max_memory,
 
     phase = time.perf_counter()
     prepared_zero = dresser.prepare(0.)
-    prepare_seconds += time.perf_counter() - phase
+    left_prepare_seconds = time.perf_counter() - phase
+    prepare_seconds += left_prepare_seconds
     prepared_bytes = sum(x.nbytes for x in prepared_zero)
     packed_left_bytes = sum(prepared_zero[i].nbytes for i in (2, 8))
     scratch_per_worker = (8*nv**3 + 6*no*nv**2 + 8*nv**2)*8
@@ -199,12 +210,17 @@ def _run_deterministic(inputs, nodes, weights, *, with_grad, max_memory,
         scratch_budget = max(scratch_per_worker, int(available-shared_left-group_size*per_point))
         scratch_budget = min(16*1024**3, scratch_budget)
         phase = time.perf_counter()
-        prepared_points = [dresser.prepare(float(node)) for node in nodes[first:last]]
-        prepare_seconds += time.perf_counter() - phase
+        prepared_points = []
+        for q in range(first, last):
+            phase = time.perf_counter()
+            prepared_points.append(dresser.prepare(float(nodes[q])))
+            point_prepare[q] = time.perf_counter() - phase
+        prepare_seconds += sum(point_prepare[first:last])
         phase = time.perf_counter()
         result = native.triples_quadrature_stream(prepared_zero, prepared_points,
             list(map(float, weights[first:last])), with_grad=with_grad,
-            workspace_limit_bytes=scratch_budget, block_batch_size=desired_batch)
+            workspace_limit_bytes=scratch_budget, block_batch_size=desired_batch,
+            **({'profile_right': profile_right} if has_point_timers else {}))
         production_seconds += time.perf_counter() - phase
         del prepared_points
         point_energies[first:last] += result['point_energies']
@@ -213,6 +229,10 @@ def _run_deterministic(inputs, nodes, weights, *, with_grad, max_memory,
         packing_peak = max(packing_peak, result['rank_four_packing_bytes'])
         for key in worker_seconds:
             worker_seconds[key] += result[key]
+        if has_point_timers:
+            point_right_wall[first:last] = result['point_right_wall_seconds']
+            point_right_profiles[first:last] = result['point_right_profiles']
+            point_right_batches[first:last] = result['point_right_batch_wall_seconds']
         for key in group_diagnostics:
             if key in ('occupied_block_batch_size', 'grouped_adjoint_max_terms',
                        'grouped_adjoint_max_reduction'):
@@ -224,7 +244,12 @@ def _run_deterministic(inputs, nodes, weights, *, with_grad, max_memory,
             for local, node in enumerate([0., *nodes[first:last]]):
                 transformed = cotangents[local]
                 cotangents[local] = None
+                before = pullback_seconds
                 reverse(float(node), transformed)
+                if local == 0:
+                    left_pullback_seconds += pullback_seconds - before
+                else:
+                    point_pullback[first+local-1] += pullback_seconds - before
                 del transformed
         first = last
     del prepared_zero
@@ -236,6 +261,10 @@ def _run_deterministic(inputs, nodes, weights, *, with_grad, max_memory,
     fractions = point_variance_fractions(inputs[6], inputs[7], nodes, weights,
                                          exponent=trace_exponent)
     diagnostics = dict(standard_error=0., samples=0, pilot_samples=0,
+        right_profile_enabled=profile_right, point_right_wall_seconds=point_right_wall,
+        point_right_profiles=point_right_profiles, point_right_batch_wall_seconds=point_right_batches,
+        point_prepare_seconds=point_prepare, point_pullback_seconds=point_pullback,
+        left_prepare_seconds=left_prepare_seconds, left_pullback_seconds=left_pullback_seconds,
         laplace_points=count, sampling_seconds=native_seconds,
         smooth_triples_seconds=elapsed, laplace_prepare_seconds=prepare_seconds,
         pilot_seconds=0., pilot_reverse_seconds=0., production_seconds=production_seconds,

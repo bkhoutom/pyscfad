@@ -234,7 +234,7 @@ def test_scheduler_uneven_owners_and_idle_live_bars(monkeypatch):
 
     mf = MF(jnp.ones((1, 1)), jnp.ones(1), jnp.ones(1)*2, jnp.array(-1.))
     common = Common(jnp.ones((1, 1))*2)
-    static = SimpleNamespace(fragments=tuple(
+    static = SimpleNamespace(mp2_grid=(numpy.array([.1]), numpy.array([.7])), fragments=tuple(
         SimpleNamespace(extended_atoms=numpy.array([i]),
                         pao_center_atoms=numpy.array([i+10])) for i in range(2)),
                              frag_lolist=(numpy.array([0]), numpy.array([1])))
@@ -269,16 +269,15 @@ def test_scheduler_uneven_owners_and_idle_live_bars(monkeypatch):
 
     def prepare(state, selected, group, controls, with_grad):
         if threading.current_thread().name == 'rank-0':
-            assert state['mf_bar'] is root_bars[0]
-            assert state['common_bar'] is root_bars[1]
+            numpy.testing.assert_array_equal(state['mf_bar'].mo_coeff, root_bars[0].mo_coeff)
+            numpy.testing.assert_array_equal(state['common_bar'].s1e, root_bars[1].s1e)
         def fn(m, c):
             return {'foo': m.mo_coeff * (group.representative_index+1) + c.s1e,
                     'fvv': jnp.ones((1, 1)), 'B': jnp.ones((1, 1, 1))}
         inputs, pullback = jax.vjp(fn, state['mf'], state['common'])
         return inputs, jax.tree_util.tree_map(numpy.asarray, inputs), pullback
 
-    def solve(inputs, metadata, controls, *, comm, with_grad):
-        assert comm is None
+    def solve(inputs, metadata, controls, *, with_grad):
         assert controls['energy_tolerance'] == pytest.approx(.003 / numpy.sqrt(2))
         return {'energy': float(inputs['foo'].sum()), 'energy_standard_error': .1,
                 'cotangents': {name: numpy.ones_like(value) for name, value in inputs.items()}}
@@ -387,7 +386,7 @@ def test_scheduler_zero_global_work_finishes_response_once(monkeypatch, with_gra
         lambda coordinate: MF(jnp.ones((1, 1)), jnp.ones(1), jnp.zeros(1),
                               -2. + coordinate[0]), jnp.zeros(1))
     common, common_pullback = jax.vjp(lambda current: Common(current.mo_coeff*0 + 1), mf)
-    static = SimpleNamespace(fragments=(), frag_lolist=())
+    static = SimpleNamespace(mp2_grid=(numpy.array([.1]), numpy.array([.7])), fragments=(), frag_lolist=())
     calls = {'initialize': 0, 'common': 0, 'scf': 0, 'prepare': 0, 'backend': 0}
     live_bars = {}
     monkeypatch.setattr(_selection, 'build_domain_groups', lambda *args, **kwargs: ())

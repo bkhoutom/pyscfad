@@ -149,6 +149,8 @@ class DomainSelections:
     domain_convention: str = "individual-partners-pair4-pcd-aux-v2"
     ed_selection_pending: bool = False
     ao_atom_slices: object = None
+    mp2_grid: tuple | None = None
+    mp2_grid_diagnostics: dict | None = None
 
     def __post_init__(self):
         # Synthetic new selections retain the historical singleton default.
@@ -781,8 +783,9 @@ def _validate_reference(mf, frozen):
 @dense_blas_scope()
 def build_domain_selections(
     mf, *, frozen, thresholds=None, lo_kwargs=None, target_coeff=None,
-    frag_lolist=None, pair_energy_model="multipole", force_full_domains=False,
-    boys_grouping="singleton", correlation_auxbasis=None,
+    frag_lolist=None, pair_energy_model="multipole",
+    boys_grouping="singleton", correlation_auxbasis=None, scope="domain", full_domain=False,
+    mp2_laplace_points=6, mp2_grid=None,
 ):
     """Select the global pair graph and lightweight fragment domain plans.
 
@@ -793,6 +796,13 @@ def build_domain_selections(
     weak screens and target records remain individual occupied orbitals.
     ``boys_grouping="molecule"`` automatically uses full molecular domains
     and puts every active occupied target in one physical fragment.
+    ``scope="system"`` selects that same single molecular fragment.
+    ``full_domain=True`` expands every fragment's domains to the full system
+    without changing its targets or physical grouping.
+    Fit one global MP2/W quadrature from the full active canonical spectrum
+    and save it for all domains. ``mp2_laplace_points`` defaults to six;
+    ``mp2_grid=(roots, weights)`` saves an explicit override. Neither changes
+    the independently fitted per-fragment triples grids.
     """
     from .domain import DomainData, TargetOccupiedData, build_scf_data
     from ._pairs import (screen_pairs, _WeakScreenProducts, _finish_weak_screen_reference,
@@ -801,13 +811,21 @@ def build_domain_selections(
     from ._df_basis import basis_kwargs, basis_identity, selection_auxbasis
 
     correlation_auxbasis = selection_auxbasis(mf, correlation_auxbasis)
+    from .controls import _integer_control
+    mp2_laplace_points = _integer_control('mp2_laplace_points', mp2_laplace_points)
 
     thresholds = BoysDomainThresholds() if thresholds is None else thresholds
     if not isinstance(thresholds, BoysDomainThresholds):
         raise TypeError("thresholds must be BoysDomainThresholds")
     if boys_grouping not in ("singleton", "atom", "molecule"):
         raise ValueError("boys_grouping must be 'singleton', 'atom' or 'molecule'")
-    force_full_domains = force_full_domains or boys_grouping == "molecule"
+    if scope not in ("domain", "system"):
+        raise ValueError("scope must be domain or system")
+    if not isinstance(full_domain, (bool, numpy.bool_)):
+        raise TypeError("full_domain must be a boolean")
+    if scope == "system":
+        boys_grouping = "molecule"
+    full_domain = full_domain or boys_grouping == "molecule"
     _validate_reference(mf, frozen)
     options = _resolve_boys_options(lo_kwargs)
     model = str(pair_energy_model).lower().replace("_", "-")
@@ -836,6 +854,10 @@ def build_domain_selections(
     occupied, virtual = (_host_array(mf.mo_coeff)[:, indices] for indices in (active_occ, active_vir))
     if not active_occ.size or not active_vir.size:
         raise ValueError("Boys domains require active occupied and virtual spaces")
+    from .laplace import select_mp2_grid
+    spectrum = _host_array(mf.mo_energy)
+    selected_grid, grid_diagnostics = select_mp2_grid(
+        spectrum[active_occ], spectrum[active_vir], grid=mp2_grid, points=mp2_laplace_points)
     targets = _host_array((_build_boys_targets(mol, occupied, options, fock=fock)
                           if options.get('method') == 'lambda_boys' else
                           _build_boys_targets(mol, occupied, options))
@@ -888,8 +910,9 @@ def build_domain_selections(
     pao_bp = get_bp_domain(mol, pao_coeff, overlap, bp_thr=thresholds.bp_pao)
     primary = get_primary_domain(mol, primary_bp, pao_bp, ao2pao)
     nfrag = len(groups)
-    if force_full_domains:
+    if full_domain:
         compact, primary_bp, tight, primary = [tuple(numpy.arange(mol.natm, dtype=numpy.int32) for _ in groups) for _ in range(4)]
+        pao_bp = tuple(numpy.arange(mol.natm, dtype=numpy.int32) for _ in range(pao_parent.size))
     if boys_grouping == "atom":
         # Each orbital keeps its own weak target on the group's common support.
         # Compact lists stay individual for the existing near-distance forcing.
@@ -902,9 +925,9 @@ def build_domain_selections(
         primary_bp, primary = tuple(primary_bp), tuple(primary)
     empty = numpy.zeros(0, dtype=numpy.int32)
     fragments = [None] * nfrag
-    reuse_primary = (response is None and not force_full_domains
+    reuse_primary = (response is None and not full_domain
                      and thresholds.pair_energy > 0 and model not in ('all', 'all-strong'))
-    prepare_primary_response = (response is not None and not force_full_domains
+    prepare_primary_response = (response is not None and not full_domain
                                and thresholds.pair_energy > 0
                                and model not in ('all', 'all-strong'))
     primary_preparations = {} if prepare_primary_response else None
@@ -978,6 +1001,7 @@ def build_domain_selections(
                               compact_bp_domain=compact, primary_bp_domain=primary_bp, tight_bp_domain=tight,
                               pao_bp_domain=pao_bp, primary_domain=primary, pair_energy_model=model,
                               boys_grouping=boys_grouping,
+                              mp2_grid=selected_grid, mp2_grid_diagnostics=grid_diagnostics,
                               physical_groups=tuple(tuple(int(i) for i in members)
                                                     for members in physical_groups),
                               correlation_basis_identity=(basis_identity(mf, correlation_auxbasis)
@@ -990,7 +1014,7 @@ def build_domain_selections(
         endpoints = {}
         pair_response = {}
     pair, weak_pair, forced, strong = screen_pairs(
-        screening_mf, common, static, model=model, force_full_domains=force_full_domains,
+        screening_mf, common, static, model=model, full_domain=full_domain,
         **basis_kwargs(correlation_auxbasis),
         **({'prepared_endpoints': endpoints,
             '_pair_response': pair_response,
@@ -1032,3 +1056,37 @@ def build_domain_selections(
         from ._energy_preparation import remember
         remember(mf, static, common, verify_stationary=target_coeff is not None)
     return static
+
+
+def physical_fragments_in_group(static, group):
+    """Map physical IDs to target slots in their first member's preparation job.
+
+    Preparation merging affects ownership only. Every physical member must
+    have exactly the representative's ordered strong frame, even when the
+    preparation jobs themselves are left unmerged.
+    """
+    domains = static.mp2_static if hasattr(static, 'mp2_static') else static
+    if not isinstance(domains, DomainSelections):
+        raise TypeError('physical grouping requires STC Boys DomainSelections')
+    physical = _physical_groups(domains)
+    owned = [(index, members) for index, members in enumerate(physical)
+             if members[0] in group.fragment_indices]
+    if not owned:
+        return ()
+    labels = tuple(int(columns[0]) for columns in domains.frag_lolist)
+    representative = group.representative_index
+    frame_key, _, _ = _strong_preparation_key(
+        domains, domains.fragments[representative], representative, labels)
+    partners = tuple(int(i) for i in domains.fragments[representative].strong_fragments)
+    result = []
+    for index, members in owned:
+        targets = []
+        for member in members:
+            key, _, _ = _strong_preparation_key(domains, domains.fragments[member], member, labels)
+            if key != frame_key or partners.count(member) != 1:
+                raise ValueError(f'physical fragment {index} has incompatible preparation frames; rebuild domains')
+            targets.append(partners.index(member))
+        if len(set(targets)) != len(members):
+            raise ValueError(f'physical fragment {index} must map each target exactly once')
+        result.append((index, tuple(targets)))
+    return tuple(result)

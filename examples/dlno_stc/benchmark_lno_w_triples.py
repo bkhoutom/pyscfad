@@ -1,4 +1,4 @@
-"""Resumable smooth or conventional LNO(W)-CCSD(T) energy/force benchmark.
+"""Resumable smooth LNO(W)-CCSD(T) energy/force benchmark.
 
 The serial queue runs one realization per process with deterministic domain/LIS
 selection. Fresh calculations share one differentiable SCF between selection
@@ -64,8 +64,8 @@ def main():
     parser.add_argument("--basis", required=True)
     parser.add_argument("--frozen", type=int, required=True)
     parser.add_argument("--boys-grouping", choices=("molecule", "atom"), required=True)
-    parser.add_argument("--targets-meh", type=float, nargs="+", required=True)
-    parser.add_argument("--seeds", type=int, nargs="+", required=True)
+    parser.add_argument("--targets-meh", type=float, nargs="+", default=[])
+    parser.add_argument("--seeds", type=int, nargs="+", default=[])
     parser.add_argument("--job-indices", type=int, nargs="+",
                         help="run these zero-based stochastic jobs from the full target/seed grid")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -86,22 +86,19 @@ def main():
                         help="occupied W-eigenvalue cutoff for LIS selection")
     parser.add_argument("--lno-thresh-vir", type=float, default=1e-5,
                         help="virtual W-eigenvalue cutoff for LIS selection")
-    parser.add_argument("--triples-method", choices=("conventional", "smooth"),
+    parser.add_argument("--triples-method", choices=("smooth",),
                         default="smooth")
     parser.add_argument("--triples-integral-transform", choices=("df", "rotate"),
                         default="df", help="dress DF factors or rotate cached CCSD integrals")
-    parser.add_argument("--smooth-laplace-points", type=int, default=4)
+    parser.add_argument("--triples-laplace-points", type=int, default=4)
     parser.add_argument("--smooth-trace-exponent", type=float, default=5.)
-    parser.add_argument("--selection-only", action="store_true")
-    parser.add_argument("--single-pass-w", action=argparse.BooleanOptionalAction, default=True,
-                        help="select each LIS from its production W, preserving the same pullback")
     parser.add_argument("--triples-variance-allocation", choices=("occupied_count", "mp2_energy"),
                         default="occupied_count")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--deterministic-only", action="store_true")
     mode.add_argument("--stochastic-only", action="store_true")
-    parser.add_argument("--reference", type=Path,
-                        help="reuse a validated deterministic energy/force result")
+    mode.add_argument("--compare-solvers", action="store_true",
+                      help="run the deterministic reference and requested stochastic jobs")
     args = parser.parse_args()
     sgx_options = {key: getattr(args, 'sgx_' + key) for key in _SGX_DEFAULTS}
     sgx_settings = {'sgx_' + key: value for key, value in sgx_options.items()}
@@ -113,10 +110,8 @@ def main():
     if args.scf_jk == 'dfj-sgx' and args.scf_df_precond:
         parser.error('--scf-df-precond requires --scf-jk df')
     os.environ['PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE'] = args.fragment_df_mode
-    if args.single_pass_w and (args.selection_only or args.reference):
-        parser.error('selection-only/reference reuse requires --no-single-pass-w')
-    if args.single_pass_w and args.triples_variance_allocation != 'occupied_count':
-        parser.error('single-pass W requires occupied_count variance allocation')
+    if args.triples_variance_allocation != 'occupied_count':
+        parser.error('W pipeline requires occupied_count variance allocation')
     if args.threads < 1:
         parser.error("--threads must be positive")
     benchmark_cpus = configure_cpu_workload(args.threads)
@@ -126,13 +121,10 @@ def main():
     if not all(math.isfinite(x) and x >= 0
                for x in (args.lno_thresh_occ, args.lno_thresh_vir)):
         parser.error("LIS cutoffs must be finite and nonnegative")
-    if args.deterministic_only and args.reference:
-        parser.error("--deterministic-only computes a new reference; omit --reference")
-    if args.triples_method == "conventional" and not args.deterministic_only:
-        parser.error("conventional is a deterministic reference only; use smooth for sampling")
-    if args.triples_method != "smooth" and args.triples_integral_transform == "rotate":
-        parser.error("--triples-integral-transform rotate requires --triples-method smooth")
-    frame_mode = "full" if args.triples_method == "smooth" else None
+    args.deterministic_only = not (args.stochastic_only or args.compare_solvers)
+    if not args.deterministic_only and (not args.targets_meh or not args.seeds):
+        parser.error("stochastic jobs require --targets-meh and --seeds")
+    frame_mode = "full"
     if not math.isfinite(args.df_memory_mb) or args.df_memory_mb <= 0:
         parser.error("DF memory budget must be finite and positive")
     if args.df_builder == 'direct' and args.df_storage != 'outcore':
@@ -153,7 +145,6 @@ def main():
     from pyscf import gto as pgto, scf as pscf
     from pyscfad import gto, scf, dlno_stc
     from pyscfad.dlno_stc import ccsd
-    from pyscfad.dlno_stc.laplace import make_laplace_grid
     from pyscfad.lno.ccsd import RCCSD
     from pyscfad.tools.linear_solver import eager_gmres
 
@@ -166,7 +157,7 @@ def main():
 
     # Molecule grouping intentionally defines a single full molecular domain
     # (C5H6). Atom-grouped alkanes use the physical domain/pair cutoffs.
-    force_full_domains = args.boys_grouping == "molecule"
+    full_domain = args.boys_grouping == "molecule"
     domain_thresholds = dlno_stc.BoysDomainThresholds()
     snapshot_root = os.environ.get("LNO_BENCHMARK_SOURCE_ROOT")
     if snapshot_root and not Path(pyscfad.__file__).resolve().is_relative_to(Path(snapshot_root).resolve()):
@@ -183,7 +174,6 @@ def main():
                 ('scf_jk', args.scf_jk, 'df'),
                 ('sgx_grid_level', args.sgx_grid_level, 2),
                 ('sgx_fit_overlap', args.sgx_fit_overlap, True),
-                ('single_pass_w', args.single_pass_w, False),
                 ('lis_eigenspace', 'domain', 'global'),
                 ('lis_space', 'domain', 'global'),
                 ('triples_variance_allocation', args.triples_variance_allocation, 'mp2_energy')):
@@ -202,7 +192,7 @@ def main():
                          lno_thresh_occ=args.lno_thresh_occ,
                          lno_thresh_vir=args.lno_thresh_vir,
                          triples_mode=args.triples_method,
-                         force_full_domains=force_full_domains,
+                         full_domain=full_domain,
                          cpu_affinity=benchmark_cpus, threads=args.threads)
         if previous.get("smooth_frame_mode", "clustered") != frame_mode:
             raise ValueError("smooth frame mode differs from existing results; use a new output directory")
@@ -329,7 +319,6 @@ def main():
     selection, settings = {}, {}
     initial_ad_scf_seconds = 0.0
     production_started = None
-    reference = json.loads(args.reference.read_text()) if args.reference else None
 
     def build_static(mf):
         """Share production SCF; later realizations reuse the same fixed labels."""
@@ -339,7 +328,7 @@ def main():
             return selection['static']
         stage_start = time.perf_counter()
         domains = dlno_stc.build_domain_selections(
-            mf, frozen=args.frozen, force_full_domains=force_full_domains,
+            mf, frozen=args.frozen, full_domain=full_domain,
             thresholds=domain_thresholds,
             boys_grouping=args.boys_grouping,
             lo_kwargs=dict(init_guess="atomic", conv_tol=1e-10,
@@ -359,7 +348,7 @@ def main():
                 nocc=len(fragment.strong_occ_metric_keep),
                 nvir=(None if fragment.virtual_anchor_columns is None else
                       len(fragment.virtual_anchor_columns))))
-        domain_report = dict(force_full_domains=force_full_domains,
+        domain_report = dict(full_domain=full_domain,
             ed_selection_pending=domains.ed_selection_pending,
             thresholds=asdict(domains.thresholds), pair_energy_model=domains.pair_energy_model,
             domain_convention=domains.domain_convention,
@@ -370,54 +359,40 @@ def main():
             weak_orbital_pairs=int(np.count_nonzero(np.triu(~(domains.strong_mask & domains.strong_mask.T), 1))),
             fragments=mp2_domains)
         save(output / "domain_selection.json", domain_report)
-        report(f"MP2 domain selection: force_full_domains={force_full_domains}; "
+        report(f"MP2 domain selection: full_domain={full_domain}; "
                f"{domain_report['full_ao_domains']}/{expected_groups} domains span all AOs; "
                f"(AO, occ, vir)={[(d['nao'], d['nocc'], d['nvir']) for d in mp2_domains]}")
-        energies = np.asarray(mf.mo_energy)
-        roots, weights, diagnostics = make_laplace_grid(
-            energies[domains.active_occ_indices], energies[domains.active_vir_indices],
-            kind="fitted", points=6, lambda_gradient=.1)
-        grid = dict(laplace_roots=roots, laplace_weights=weights)
-        # These dictionaries are shared with value_and_grad. Its callback runs
-        # before control validation, so selection and production use this exact grid.
-        baseline.update(grid)
-        matrix.update(grid)
+        roots, weights = domains.mp2_grid
+        diagnostics = domains.mp2_grid_diagnostics
         selection_start = time.perf_counter()
         report(f"Configuring W-LIS selection: occupied cutoff={args.lno_thresh_occ:g}, "
                f"virtual cutoff={args.lno_thresh_vir:g}")
-        selection_options = dict(matrix_kind="W", thresh_occ=args.lno_thresh_occ,
-                                 lis_space="domain",
+        selection_options = dict( thresh_occ=args.lno_thresh_occ,
+
                                  thresh_vir=args.lno_thresh_vir,
                                  baseline_controls=baseline, matrix_controls=matrix,
                                  merge_identical=True)
         selected = ccsd.build_static_selections(
-            mf, domains, smooth=args.triples_method == "smooth",
-            smooth_laplace_points=args.smooth_laplace_points,
-            single_pass=args.single_pass_w,
+            mf, domains,
+            triples_laplace_points=args.triples_laplace_points,
             **selection_options)
         selection_seconds = time.perf_counter() - selection_start
         dimensions = [ccsd._fragment_dimensions(selected, i) for i in range(expected_groups)]
         frame_blocks = []
-        if args.triples_method == "smooth" and not args.single_pass_w:
-            for dims, frames in zip(dimensions, selected.lis_static.smooth_frames):
-                blocks = dict(occupied=[frames[0].anchor.shape[1]],
-                              virtual=[frames[1].anchor.shape[1]])
-                if blocks != dict(occupied=[dims[0]], virtual=[dims[1]]):
-                    raise RuntimeError(f"full-Fock frame dimensions disagree: {blocks}")
-                frame_blocks.append(blocks)
         affinity = check_worker_affinity(benchmark_cpus)
+        settings["lis_space"] = "domain"  # Fixed scientific identity for saved references.
         settings.update(geometry=str(xyz), elements=elements, basis=args.basis,
                         auxbasis=auxbasis or "auto", frozen=args.frozen, boys_grouping=args.boys_grouping,
-                        force_full_domains=force_full_domains, physical_fragments=expected_groups,
+                        full_domain=full_domain, physical_fragments=expected_groups,
                         domain_thresholds=asdict(domains.thresholds), mp2_domains=mp2_domains,
                         mp2_energy_source="w_matrix_trace", mp2_response="joint_energy_w_pullback",
                         pair_energy_model=domains.pair_energy_model,
                         lno_thresh_occ=args.lno_thresh_occ, lno_thresh_vir=args.lno_thresh_vir,
-                        single_pass_w=args.single_pass_w,
-                        lis_space="domain",
+
+
                         lis_eigenspace='domain',
                         triples_variance_allocation=args.triples_variance_allocation,
-                        selection_timer_scope='plan_only' if args.single_pass_w else 'complete_prepass',
+                        selection_timer_scope='plan_only',
                         fragment_occupied_counts=[len(members) for members in domains.physical_groups],
                         total_active_occupied=len(domains.active_occ_indices),
                         nao=mol.nao, lis_dimensions=dimensions, threads=args.threads,
@@ -453,72 +428,34 @@ def main():
                         jax_compilation_cache_dir=jax.config.jax_compilation_cache_dir,
                         code_snapshot_sha256=os.environ.get("LNO_BENCHMARK_SNAPSHOT_SHA256"),
                         source_package_path=str(Path(pyscfad.__file__).resolve()),
-                        smooth_laplace_points=(args.smooth_laplace_points
-                                               if args.triples_method == "smooth" else None),
-                        smooth_trace_exponent=(args.smooth_trace_exponent
-                                               if args.triples_method == "smooth" else None),
+                        triples_laplace_points=args.triples_laplace_points,
+                        smooth_trace_exponent=args.smooth_trace_exponent,
                         selection_seconds=selection_seconds,
                         preselection_setup_seconds=selection_start-started,
                         mp2_laplace_grid=dict(roots=roots.tolist(), weights=weights.tolist(),
                                               diagnostics=diagnostics),
                         reference_hf_energy_eh=float(ref.e_tot),
-                        reused_reference=str(args.reference.resolve()) if args.reference else None,
                         setup_seconds=((production_started if production_started is not None
                                         else time.perf_counter())-started))
         settings.update(sgx_settings)
         save(output / "settings.json", settings)
         report(f"CPU affinity {benchmark_cpus}; all {affinity['runtime_threads']} runtime threads verified")
-        if args.single_pass_w:
-            report(f"Planned {expected_groups} fragments: one W build and shared input pullback; "
-                   "LIS ranks/anchors will be selected within each production fragment")
-        else:
-            report(f"Selected {expected_groups} W-LIS fragments; dimensions {dimensions}")
+        report(f"Planned {expected_groups} fragments: one W build and shared input pullback; "
+               "LIS ranks/anchors will be selected within each production fragment")
         report(f"Smooth frame blocks {frame_blocks}; persistent JAX cache enabled: "
                f"{bool(jax.config.jax_enable_compilation_cache)}")
         selection.update(static=selected, hf_energy=float(mf.e_tot))
-        if reference is not None:
-            if (reference["basis"] != args.basis or reference["frozen"] != args.frozen
-                    or reference.get('scf_jk', 'df') != args.scf_jk
-                    or reference.get('sgx_grid_level', 2) != args.sgx_grid_level
-                    or reference.get('sgx_fit_overlap', True) != args.sgx_fit_overlap
-                    or any(reference.get('sgx_' + key, _SGX_DEFAULTS[key]) != value
-                           for key, value in sgx_options.items())
-                    or reference.get("lis_space", "global") != 'domain'
-                    or reference.get("lno_thresh_occ") != args.lno_thresh_occ
-                    or reference.get("lno_thresh_vir") != args.lno_thresh_vir
-                    or reference.get("force_full_domains", True) != force_full_domains
-                    or (not force_full_domains and reference.get("mp2_domains") != settings["mp2_domains"])
-                    or abs(reference["hf_energy"] - selection["hf_energy"]) > 1e-8
-                    or np.asarray(reference["force_eh_per_bohr"]).shape != (mol.natm, 3)
-                    or [(f["nocc_lis"], f["nvir_lis"])
-                        for f in reference["components"]["fragments"]] != settings["lis_dimensions"]):
-                raise ValueError("saved deterministic reference does not match this W-LIS")
-            save(output / "deterministic.json", reference)
-            report("Validated and reused deterministic reference")
         return selected
 
-    # This diagnostic ends after selection and has no production calculation.
-    # Every energy/force calculation below uses the production SCF callback,
-    # including validation of a saved deterministic reference.
-    if args.selection_only:
-        stage_start = time.perf_counter()
-        mf = build_mf(mol)
-        jax.block_until_ready(mf)
-        initial_ad_scf_seconds = time.perf_counter() - stage_start
-        report(f"Initial differentiable SCF complete in {initial_ad_scf_seconds:.1f} s")
-        build_static(mf)
-        del mf
-    if args.selection_only:
-        return
     options = dict(baseline_controls=baseline, matrix_controls=matrix,
-                   matrix_kind="W", ccsd_t=True, include_hf=True,
+                    ccsd_t=True, include_hf=True,
                    return_components=True, merge_identical=True)
 
     deterministic_controls = dict(mode="deterministic")
     if args.triples_integral_transform == "rotate":
         deterministic_controls['integral_transform'] = 'rotate'
     jobs = []
-    if reference is None and not args.stochastic_only:
+    if not args.stochastic_only:
         jobs.append(("deterministic", deterministic_controls))
     for target_index, target in enumerate(args.targets_meh):
         for seed_index, seed in enumerate(args.seeds):
@@ -532,8 +469,7 @@ def main():
                             pilot_samples=args.pilot_samples,
                             global_seed=seed, energy_tolerance=target / 1000,
                             variance_allocation=args.triples_variance_allocation)
-            if args.triples_method == "smooth":
-                controls.update(trace_exponent=args.smooth_trace_exponent)
+            controls.update(trace_exponent=args.smooth_trace_exponent)
             if args.triples_integral_transform == "rotate":
                 controls['integral_transform'] = 'rotate'
             jobs.append((label, controls))
@@ -558,12 +494,10 @@ def main():
         fragments = asdict(components)["fragments"]
         if len(fragments) != expected_groups:
             raise RuntimeError(f"{label} returned {len(fragments)} fragments")
-        if args.single_pass_w:
-            dimensions = [(f['nocc_lis'], f['nvir_lis']) for f in fragments]
-            frame_blocks = ([dict(occupied=[no], virtual=[nv]) for no, nv in dimensions]
-                            if args.triples_method == 'smooth' else [])
-            settings.update(lis_dimensions=dimensions, smooth_frame_blocks=frame_blocks)
-            save(output / 'settings.json', settings)
+        dimensions = [(f['nocc_lis'], f['nvir_lis']) for f in fragments]
+        frame_blocks = [dict(occupied=[no], virtual=[nv]) for no, nv in dimensions]
+        settings.update(lis_dimensions=dimensions, smooth_frame_blocks=frame_blocks)
+        save(output / 'settings.json', settings)
         result = dict(label=label, controls=controls, total_energy_eh=float(energy),
                       force_eh_per_bohr=force.tolist(), components=asdict(components),
                       geometry=str(xyz), basis=args.basis, frozen=args.frozen,
@@ -579,14 +513,14 @@ def main():
                       omp_dynamic=os.environ.get('OMP_DYNAMIC'),
                       mkl_dynamic=os.environ.get('MKL_DYNAMIC'),
                       shared_df_cache_mode=args.fragment_df_mode,
-                      force_full_domains=force_full_domains,
+                      full_domain=full_domain,
                       domain_thresholds=settings["domain_thresholds"],
                       mp2_domains=settings["mp2_domains"],
                       mp2_energy_source="w_matrix_trace", mp2_response="joint_energy_w_pullback",
                       triples_mode=args.triples_method,
                       triples_integral_transform=args.triples_integral_transform,
-                      single_pass_w=args.single_pass_w,
-                      lis_space="domain",
+
+
                       lis_eigenspace='domain',
                       triples_variance_allocation=args.triples_variance_allocation,
                       smooth_frame_mode=frame_mode,

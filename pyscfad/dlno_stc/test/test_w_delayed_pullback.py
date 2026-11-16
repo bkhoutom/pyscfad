@@ -19,7 +19,7 @@ def test_w_consumes_only_native_df_copy_and_replay_remains_reusable():
     x['B'].flags.writeable = False
     seeds = dict(energy_bar=.7, occupied_bar=np.eye(2), virtual_bar=np.eye(3)*.4)
     forward = backend.solve_matrices(x, dict(target_indices=(0, 1)),
-                                     dict(grid(), threads=2), matrix_kind='W')
+                                     dict(grid(), threads=2))
     first = backend.pullback_matrices(x, forward, **seeds)
     second = backend.pullback_matrices(x, forward, **seeds)
     np.testing.assert_array_equal(x['B'], original)
@@ -27,14 +27,13 @@ def test_w_consumes_only_native_df_copy_and_replay_remains_reusable():
         np.testing.assert_allclose(first[name], second[name], rtol=2e-12, atol=2e-13)
 
 
-@pytest.mark.parametrize('matrix_kind', ['D', 'W'])
+@pytest.mark.parametrize('matrix_kind', ['W'])
 def test_default_matrix_call_shares_all_fragment_targets(matrix_kind):
     native()
     x = full_fixture()
     metadata = dict(fragment_id=7, target_indices=(0, 1))
-    shared = backend.solve_matrices(x, metadata, grid(), matrix_kind=matrix_kind)
-    split = backend.solve_matrices(x, metadata, dict(grid(), target_batch_size=1),
-                                   matrix_kind=matrix_kind)
+    shared = backend.solve_matrices(x, metadata, grid())
+    split = backend.solve_matrices(x, metadata, dict(grid(), target_batch_size=1))
     assert shared['diagnostics']['batch_count'] == 1
     assert split['diagnostics']['batch_count'] == 2
     assert tuple(shared['replay'].batches) and 'cotangents' not in shared
@@ -45,9 +44,8 @@ def test_default_matrix_call_shares_all_fragment_targets(matrix_kind):
     b = backend.pullback_matrices(x, split, **seeds)
     for key in x:
         np.testing.assert_allclose(a[key], b[key], rtol=2e-11, atol=2e-12)
-    all_memory = estimate_matrix_memory(4, 2, 3, 2, grid(), matrix_kind=matrix_kind)
-    one_memory = estimate_matrix_memory(4, 2, 3, 2, dict(grid(), target_batch_size=1),
-                                         matrix_kind=matrix_kind)
+    all_memory = estimate_matrix_memory(4, 2, 3, 2, grid())
+    one_memory = estimate_matrix_memory(4, 2, 3, 2, dict(grid(), target_batch_size=1))
     assert all_memory['amplitude_buffers'] > one_memory['amplitude_buffers']
 
 
@@ -64,7 +62,7 @@ def test_four_target_w_batches_preserve_values_and_all_input_cotangents():
     for batch_size in (1, 2, 4):
         forward = backend.solve_matrices(
             x, dict(target_indices=(0, 1, 2, 3)),
-            dict(grid(), target_batch_size=batch_size, threads=2), matrix_kind='W')
+            dict(grid(), target_batch_size=batch_size, threads=2))
         bars = backend.pullback_matrices(x, forward, **seeds)
         assert forward['diagnostics']['batch_count'] == 4 // batch_size
         outputs.append((forward, bars))
@@ -76,7 +74,7 @@ def test_four_target_w_batches_preserve_values_and_all_input_cotangents():
             np.testing.assert_allclose(bars[name], reference_bars[name], rtol=2e-11, atol=2e-12)
 
 
-@pytest.mark.parametrize('matrix_kind', ['D', 'W'])
+@pytest.mark.parametrize('matrix_kind', ['W'])
 def test_native_matrix_timing_receipts_preserve_cotangents(matrix_kind, monkeypatch):
     extension = native()
     if not hasattr(extension, 'pullback_matrices_with_timings'):
@@ -94,8 +92,7 @@ def test_native_matrix_timing_receipts_preserve_cotangents(matrix_kind, monkeypa
 
     monkeypatch.setattr(extension, 'pullback_matrices_with_timings', timed)
     with backend.resource_profile.capture_events(events.append):
-        forward = backend.solve_matrices(x, metadata, dict(grid(), target_batch_size=1),
-                                         matrix_kind=matrix_kind)
+        forward = backend.solve_matrices(x, metadata, dict(grid(), target_batch_size=1))
         bars = backend.pullback_matrices(x, forward, **seeds)
     assert set(bars) == set(x)
     forward_timings = forward['diagnostics']['native_timings']
@@ -141,8 +138,7 @@ def test_stochastic_w_delayed_energy_seed_uses_the_saved_w_sample():
     controls = dict(grid(), mode='stochastic', threads=2, global_seed=71,
                     matrix_tolerance=.03, pair_pilot_samples=32, min_samples=32,
                     domain_tau=10., virtual_domain_tau=10.)
-    forward = backend.solve_matrices(x, dict(target_indices=(0, 1)), controls,
-                                     matrix_kind='W')
+    forward = backend.solve_matrices(x, dict(target_indices=(0, 1)), controls)
     assert forward['diagnostics']['batch_count'] == 1
     assert forward['diagnostics']['production_draws'] > 0
     assert 'cotangents' not in forward
@@ -164,9 +160,12 @@ def test_stochastic_w_delayed_energy_seed_uses_the_saved_w_sample():
         np.testing.assert_allclose(energy[key], trace[key], rtol=2e-11, atol=2e-12)
 
 
-def test_w_energy_requires_matching_baseline_and_matrix_quadratures():
+def test_w_energy_uses_one_shared_mp2_quadrature():
     from pyscfad.dlno_stc import ccsd
-    baseline = dict(laplace_roots=[.1], laplace_weights=[.5])
-    matrix = dict(laplace_roots=[.2], laplace_weights=[.5])
-    with pytest.raises(ValueError, match='Laplace grids must match'):
-        ccsd._normalize_controls(baseline, matrix, 'W')
+    baseline, matrix = ccsd._normalize_controls({}, {}, ([.1, .2], [.5, .6]))
+    for key in ('laplace_roots', 'laplace_weights'):
+        np.testing.assert_array_equal(baseline[key], matrix[key])
+    with pytest.raises(ValueError, match='mp2_grid'):
+        ccsd._normalize_controls({'laplace_roots': [.1], 'laplace_weights': [.5]}, {})
+    with pytest.raises(ValueError, match='mp2_grid'):
+        ccsd._normalize_controls({}, {'laplace_roots': [.1], 'laplace_weights': [.5]})

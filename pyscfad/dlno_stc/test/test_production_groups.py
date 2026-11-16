@@ -63,15 +63,15 @@ def test_direct_sixteen_targets_four_groups_budget(monkeypatch):
         return state['energy']
     monkeypatch.setattr(driver, '_finish', finish)
     captured = []
-    def capture(inputs, metadata, controls, backend, **kwargs):
+    def capture(inputs, metadata, controls, **kwargs):
         captured.append((metadata, controls.copy()))
         return dict(energy=np.float64(-len(metadata['target_indices'])),
                     energy_standard_error=controls['energy_tolerance'])
-    monkeypatch.setattr(driver, 'run_backend', capture)
+    monkeypatch.setattr(driver.backend, 'solve', capture)
     controls = dict(mode='stochastic', energy_tolerance=.0003, production_samples=32)
     for merge, count, tolerance in ((True, 4, 1.5e-4), (False, 16, 7.5e-5)):
         captured.clear()
-        value = driver._run_domain(initialize, static, controls, None,
+        value = driver._run_serial(initialize, static, controls,
                                    with_grad=False, merge_identical=merge)
         assert value == -16.25
         assert len(captured) == count

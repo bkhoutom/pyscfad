@@ -45,8 +45,6 @@ __all__ = [
     "RestartManager",
     "df_source_fingerprint",
     "scientific_digest",
-    "grouping_payload",
-    "validate_grouping_payload",
 ]
 
 
@@ -55,7 +53,6 @@ _FORMAT_VERSION = 1
 # Invalidate cotangents when the selected three-input Boys equations change.
 _ALGORITHM_ABI = 5
 _EQUATION_ID = "boys-selected-three-input-v1"
-_GROUPING_CONVENTION = "boys_exact_domain_groups_v3"
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 # Tests may monkeypatch this callable.  It is invoked after a temporary HDF5
@@ -476,37 +473,6 @@ def scientific_digest(value):
         value, writer=None, require_registered_dataclass=True
     )
     return _sha256_bytes(_canonical_json(encoded).encode("utf8"))
-
-
-def grouping_payload(static, groups):
-    """Fingerprint preparation work and saved physical-fragment selections.
-
-    The selections retain grouping mode, physical membership, occupied labels,
-    supports, PAO ranks, reference frames and anchors; typed groups separately
-    retain preparation membership and target slots. Old schemas require rebuild.
-    """
-    payload = {
-        "convention": _GROUPING_CONVENTION,
-        "metadata": {"static": static, "groups": tuple(groups)},
-    }
-    return {**payload, "fingerprint": scientific_digest(payload)}
-
-
-def validate_grouping_payload(saved, static, groups):
-    """Reject missing or incompatible metadata before replaying a group."""
-    if (not isinstance(saved, dict)
-            or saved.get("convention") != _GROUPING_CONVENTION):
-        raise RestartMismatchError(
-            "checkpoint has missing or incompatible group metadata"
-        )
-    expected = grouping_payload(static, groups)
-    payload = {"convention": saved["convention"], "metadata": saved.get("metadata")}
-    try:
-        digest = scientific_digest(payload)
-    except RestartSerializationError as err:
-        raise RestartMismatchError("checkpoint has incompatible group metadata") from err
-    if saved.get("fingerprint") != digest or digest != expected["fingerprint"]:
-        raise RestartMismatchError("checkpoint group selections or worklist differ")
 
 
 def _stream_array_hash(array, *, target_bytes=8 * 1024**2):

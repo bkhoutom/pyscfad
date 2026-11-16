@@ -1,4 +1,4 @@
-"""Numerical single-pass owner-local CC selection and collective validation."""
+"""Numerical fragment pipeline owner-local CC selection and collective validation."""
 import json
 import os
 import shutil
@@ -12,17 +12,17 @@ from pyscfad.dlno_stc.test.test_domain_mpi import SOURCE_ROOT
 
 
 def launch(tmp_path, *, ranks=3, serial=False, gradient=False,
-           include_baseline=False, invalid=False, parallel_scf_jk=False):
+            invalid=False, parallel_scf_jk=False):
     pytest.importorskip('mpi4py')
     pytest.importorskip('pyscfad.dlno_stc._stc_mp2')
     launcher = shutil.which('mpiexec')
     if launcher is None:
         pytest.skip('mpiexec is unavailable')
-    output = tmp_path / f'single-pass-{serial}-{gradient}-{include_baseline}-{invalid}-{parallel_scf_jk}.json'
-    command = [sys.executable, '-m', 'pyscfad.dlno_stc.test.ccsd_single_pass_mpi_smoke',
+    output = tmp_path / f'fragment pipeline-{serial}-{gradient}-{invalid}-{parallel_scf_jk}.json'
+    command = [sys.executable, '-m', 'pyscfad.dlno_stc.test.ccsd_pipeline_mpi_smoke',
                '--output', str(output)]
     for option, enabled in (('serial', serial), ('gradient', gradient),
-                           ('include-baseline', include_baseline), ('invalid', invalid),
+                           ('invalid', invalid),
                            ('parallel-scf-jk', parallel_scf_jk)):
         if enabled:
             command.append('--' + option)
@@ -41,7 +41,7 @@ def launch(tmp_path, *, ranks=3, serial=False, gradient=False,
         result = subprocess.run(command, cwd=SOURCE_ROOT, env=env,
                                 capture_output=True, text=True, timeout=300)
     except subprocess.TimeoutExpired as exc:
-        pytest.fail(f'single-pass CC MPI hung beyond 300s: {exc.stdout!r} {exc.stderr!r}')
+        pytest.fail(f'fragment pipeline CC MPI hung beyond 300s: {exc.stdout!r} {exc.stderr!r}')
     output.with_suffix('.log').write_text(result.stdout + '\n' + result.stderr)
     assert result.returncode == 0, result.stdout + '\n' + result.stderr
     return json.loads(output.read_text())
@@ -59,22 +59,21 @@ def compare(actual, reference, *, gradient=False):
 
 
 @pytest.mark.parametrize('parallel_scf_jk', [False, True])
-def test_single_pass_mpi_partial_cc_keeps_full_baseline(tmp_path, parallel_scf_jk):
-    # Run MPI first so the unsupported-single-pass guard is the initial failure.
-    actual = launch(tmp_path, ranks=2, include_baseline=True, parallel_scf_jk=parallel_scf_jk)
-    reference = launch(tmp_path, serial=True, include_baseline=True)
+def test_pipeline_mpi_all_cc_keeps_full_baseline(tmp_path, parallel_scf_jk):
+    actual = launch(tmp_path, ranks=2, parallel_scf_jk=parallel_scf_jk)
+    reference = launch(tmp_path, serial=True, )
     compare(actual, reference)
     assert abs(actual['weak']) > 1e-10
 
 
-def test_single_pass_mpi_gradient_subset_and_empty_owner(tmp_path):
+def test_pipeline_mpi_gradient_and_empty_owner(tmp_path):
     actual = launch(tmp_path, gradient=True)
     reference = launch(tmp_path, serial=True, gradient=True)
     compare(actual, reference, gradient=True)
-    assert actual['baseline'] == actual['weak'] == 0.
+    assert abs(actual['baseline']) > 0. and abs(actual['weak']) > 0.
     assert actual['observations'][2]['groups'] == []
 
 
-def test_single_pass_mpi_rejects_stale_schema_scientific_controls_and_proxy_budgets(tmp_path):
+def test_pipeline_mpi_rejects_stale_schema_scientific_controls_and_proxy_budgets(tmp_path):
     result = launch(tmp_path, ranks=2, invalid=True)
     assert all(not row['groups'] for row in result['observations'])

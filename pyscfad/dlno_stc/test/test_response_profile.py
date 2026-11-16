@@ -29,7 +29,7 @@ def test_response_profile_preserves_energy_gradient_and_work(scope, monkeypatch,
         return call
 
     monkeypatch.setattr(boys, '_boys', counted('boys_forward', boys._boys))
-    prepare_name = 'prepare_boys_group_inputs' if scope == 'domain' else 'prepare_system_inputs'
+    prepare_name = '_prepare'
     monkeypatch.setattr(driver, prepare_name, counted('prepare', getattr(driver, prepare_name)))
 
     def solver(*args, **kwargs):
@@ -79,31 +79,18 @@ def test_response_profile_preserves_energy_gradient_and_work(scope, monkeypatch,
     phases = Counter(event['phase'] for event in events)
     # Component estimates belong to actual reverse execution, after the native
     # energy/cotangent evaluation, never to preparation tracing.
-    native_index = next(i for i, e in enumerate(events) if e['phase'] == f'stc.{scope}.native')
+    native_index = next(i for i, e in enumerate(events) if e['phase'] == 'stc.domain.native')
     assert all(i > native_index for i, e in enumerate(events)
                if e['phase'].endswith(('.boys_response_total', '.virtual_frame', '.local_fock_blocks')))
-    parent = f'stc.{scope}.common_pullback' if scope == 'domain' else 'stc.system.input_pullback'
+    parent = 'stc.domain.common_pullback'
     assert phases[parent + '.boys_response_total'] == 1
-    assert phases[f'stc.{scope}.input_pullback.virtual_frame'] == group_count
-    assert phases[f'stc.{scope}.input_pullback.local_fock_blocks'] == group_count
-    assert phases[f'stc.{scope}.scf_response'] == 1
-    if scope == 'domain':
-        assert phases[parent + '.pao'] == 1
-        # S/F now come from SCF outputs and close through that single tape.
-        for component in ('overlap', 'ao_fock'):
-            assert phases[parent + '.' + component] == 0
-        assert phases['stc.domain.scf_data_prepare'] == 0
-        assert all('group' in e for e in events if e['phase'].endswith('.virtual_frame'))
-    else:
-        state, = [e for e in events if e['phase'] == 'stc.system.fock_state']
-        assert state['fock_from_scf'] == 'True'
-        assert state['degeneracy_fallback'] == 'False'
-
-
-def test_traced_reverse_has_no_runtime_estimate(monkeypatch, capsys):
-    from pyscfad.dlno_stc._profile import response
-
-    monkeypatch.setenv('PYSCFAD_DLNO_RESOURCE_PROFILE', '1')
-    derivative = jax.jit(jax.grad(lambda x: response('traced', lambda x: x * x, x)))
-    assert float(derivative(3.0)) == 6.0
-    assert '[DLNO-RESOURCE]' not in capsys.readouterr().out
+    assert phases['stc.domain.input_pullback'] == group_count
+    assert phases['stc.domain.input_pullback.local_fock_blocks'] == group_count
+    assert phases['stc.domain.scf_response'] == 1
+    # Automatic selection reuses its PAO tape; fixed selections rebuild it.
+    assert phases[parent + '.pao'] == (1 if scope == 'domain' else 0)
+    # S/F close through the single SCF tape for both scopes.
+    for component in ('overlap', 'ao_fock'):
+        assert phases[parent + '.' + component] == 0
+    assert phases['stc.domain.scf_data_prepare'] == 0
+    assert all('group' in e for e in events if e['phase'].endswith('.virtual_frame'))

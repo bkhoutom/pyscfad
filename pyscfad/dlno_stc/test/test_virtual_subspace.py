@@ -1,4 +1,5 @@
 """Saved QR anchors remove internal virtual-gauge response, without freezing it."""
+from pyscfad.dlno_stc.test import system_reference
 
 from types import SimpleNamespace
 
@@ -98,7 +99,7 @@ def test_saved_anchor_replay_is_invariant_to_internal_rotations_and_keeps_respon
 def test_real_boys_replay_uses_saved_anchors_without_qr(reference, monkeypatch):
     static = dlno_stc.build_domain_selections(
         reference, frozen=1, target_coeff=reference.mo_coeff[:, 1:5],
-        force_full_domains=True,
+        full_domain=True,
     )
     common = domain.rebuild_domain_data(reference, static)
     static = dlno_stc.materialize_domain_selections(reference, static, common=common)
@@ -132,11 +133,11 @@ def test_real_boys_replay_uses_saved_anchors_without_qr(reference, monkeypatch):
 
 def test_system_saved_anchors_replay_without_qr(reference, monkeypatch):
     occupied, virtual = np.arange(1, 5), np.array([6, 5])
-    frame = domain.build_system_local_frame(reference, occupied, virtual)
+    frame = system_reference.build_system_local_frame(reference, occupied, virtual)
     def forbidden_qr(*args, **kwargs):
         raise AssertionError("system preparation must reuse saved QR pivots")
     monkeypatch.setattr(domain.scipy_linalg, "qr", forbidden_qr)
-    _, pullback = jax.vjp(lambda mf: domain.build_system_local_frame(
+    _, pullback = jax.vjp(lambda mf: system_reference.build_system_local_frame(
         mf, occupied, virtual, boys_reference=frame.boys_reference,
         virtual_anchor_columns=frame.virtual_anchor_columns).virtual_coeff, reference)
     bar, = pullback(jnp.asarray(np.random.default_rng(4).normal(size=frame.virtual_coeff.shape)))

@@ -9,11 +9,8 @@ def cache_mode(*, default='half'):
     return mode
 
 
-def configure_cache(scope, static=None, *, default='half'):
+def configure_cache(scope, *, default='half'):
     """Choose the forward cache, preserving explicit user configuration."""
-    if static is not None:
-        from .lis import _validate_lis_space
-        _validate_lis_space(static.lis_static.lis_space)
     mode = cache_mode(default=default)
     scope.receipt['cache_mode'] = mode
     if mode == 'half':

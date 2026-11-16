@@ -22,14 +22,14 @@ def test_replica_sampling_frame_is_shared_and_expires(group_case, monkeypatch, w
 
     def fragment(*args, **options):
         seen.append((args[3], options.get('sampling_frame'), options['with_grad']))
-        values = original(*args, **options)
+        values, _ = original(*args, **options)
         return values, {'ccsd': {'seed': options['stc_cc_controls']['seed']}}
 
     monkeypatch.setattr(ccsd, '_solve_fragment', fragment)
     controls = dict(seed=71, energy_tolerance=1e3, precision_pilot_replicas=2,
                     precision_min_replicas=2, precision_max_replicas=2)
     for mf in (.2, .3):
-        group_case.run(matrix_kind='W', with_grad=with_grad, mf=mf,
+        group_case.run( with_grad=with_grad, mf=mf,
                        cc_solver='stc', stc_cc_controls=controls)
     assert len(created) == 4
     assert len(seen) == 16

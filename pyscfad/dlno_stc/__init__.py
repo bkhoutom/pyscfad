@@ -1,18 +1,13 @@
-"""Local input and cotangent exchange for external domain MP2 solvers.
+"""Domain MP2 energies and forces, with fragment DLNO-CCSD/CCSD(T) in ``ccsd``.
 
 Importing this package does not import MPI or an external solver.
 """
 
-from .protocol import (check_replay, request_fingerprint, validate_inputs,
-                       validate_result)
-from .exchange import read_input, read_result, write_input, write_result
 from ._df_basis import basis_kwargs
 from ._selection import (BoysDomainThresholds, DomainGroup, DomainSelections,
                          build_domain_groups, build_domain_selections)
 
 __all__ = [
-    "check_replay", "request_fingerprint", "validate_inputs", "validate_result",
-    "read_input", "read_result", "write_input", "write_result",
     "kernel", "value_and_grad",
     "BoysDomainThresholds", "DomainSelections", "build_domain_selections",
     "DomainGroup", "build_domain_groups",
@@ -34,6 +29,8 @@ def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
     ``correlation_auxbasis=None`` preserves the existing SCF fitting workflow.
     An explicit basis changes local correlation factors only; HF/Fock keep
     using ``mf.with_df`` and its existing storage policy.
+    ``scope="system"`` selects one full-system fragment and uses the domain
+    executor. For explicit fragment/domain options use ``build_domain_selections``.
     """
     from .driver import kernel as domain_kernel
     return domain_kernel(mf, static, scope=scope, frozen=frozen,

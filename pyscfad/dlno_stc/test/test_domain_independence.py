@@ -24,11 +24,11 @@ def isolated_smoke(output_dir):
     import numpy as np
     from pyscfad.dlno_stc.test import _boys_acceptance as accept
     from pyscfad.dlno_stc import _restart, _stc_mp2, build_domain_groups
-    from pyscfad.dlno_stc.adjoint import (
-        apply_full_pullback, apply_selected_pullback, pullback_inputs,
-    )
-    from pyscfad.dlno_stc.domain import build_system_local_frame, rebuild_domain_data
-    from pyscfad.dlno_stc.prepare import prepare_boys_group_inputs, prepare_system_inputs
+    from pyscfad.dlno_stc.adjoint import apply_selected_pullback
+    from pyscfad.dlno_stc.domain import rebuild_domain_data
+    from pyscfad.dlno_stc.test.system_reference import build_system_local_frame
+    from pyscfad.dlno_stc.prepare import prepare_boys_group_inputs
+    from pyscfad.dlno_stc.test.system_reference import prepare_system_inputs
     from pyscfad.dlno_stc._pairs import screen_pairs, weak_pair_energy, weak_pair_indices
 
     mf = accept.build_mf(accept.molecule())
@@ -42,13 +42,6 @@ def isolated_smoke(output_dir):
     result = accept.selected_result(packet, static, group.representative_index,
                                     target_indices=group.target_indices)
     mf_bar, common_bar = apply_selected_pullback(pullback, packet, result)
-    replay = pullback_inputs(
-        lambda x, c: prepare_boys_group_inputs(x, c, static, group), (mf, common),
-        packet, dict(result, metadata={"cotangent_seed": 1.0}),
-    )
-    for actual, expected in zip(jax.tree_util.tree_leaves(replay),
-                                jax.tree_util.tree_leaves((mf_bar, common_bar))):
-        np.testing.assert_array_equal(actual, expected)
     common_mf_bar, = common_pullback(common_bar)
     assert np.isfinite(np.asarray(common_mf_bar.mo_coeff)).all()
     exact_scores, _, _, _ = screen_pairs(mf, common, static, model="exact")
@@ -80,7 +73,7 @@ def isolated_smoke(output_dir):
         *(np.ascontiguousarray(system[name]) for name in ("foo", "fvv", "B")),
         accept.controls(), with_grad=True,
     )
-    system_bar, = apply_full_pullback(system_pullback, system, system_result)
+    system_bar, = apply_selected_pullback(system_pullback, system, system_result)
     assert np.isfinite(np.asarray(system_bar.mo_coeff)).all()
 
     output_dir = Path(output_dir)
@@ -88,15 +81,12 @@ def isolated_smoke(output_dir):
     manager = _restart.RestartManager(
         output_dir / "checkpoint", method="boys-selected",
         scientific_payload={"frozen": 2, "equation": "boys_target_laplace_mp2_v1",
-                            "grouping": _restart.grouping_payload(static, groups)},
+                            "static": static, "groups": groups},
     )
     saved = {"static": static, "groups": groups}
     digest = manager.save_static(saved)
     restored = manager.load_static(expected_type=dict)
     assert restored["groups"] == groups
-    _restart.validate_grouping_payload(
-        _restart.grouping_payload(restored["static"], restored["groups"]), static, groups,
-    )
     assert _restart.scientific_digest(restored) == digest
     trees = {"mf_bar": mf_bar, "common_bar": common_bar, "packet": packet}
     manager.save_record("response", trees=trees, scalars={"energy": result["energy"]})
@@ -107,24 +97,11 @@ def isolated_smoke(output_dir):
     manager.close()
     # Exercise complete supported production entry points while the blocker is active.
     from pyscfad import dlno_stc
-    from pyscfad.dlno_stc import backend, mp2
     controls = dict(accept.controls(), energy_tolerance=.0003)
     direct, direct_bar = dlno_stc.value_and_grad(
         mf.mol, accept.build_mf, static, controls=controls)
     np.testing.assert_allclose(dlno_stc.kernel(mf, static, controls=controls), direct,
                                atol=1e-10, rtol=0)
-    workdir = output_dir / "production-exchange"
-    rows = mp2.export_run(mf, static, workdir, controls=controls)
-    assert len(rows) == len(groups)
-    restored_static = mp2.load_static_from_run(mf, workdir, frozen=2, controls=controls)
-    for group_id in range(len(groups)):
-        folder = workdir / f"fragment_{group_id:04d}"
-        mp2.solve_request(folder / "input.h5", folder / "result.h5", backend.solve)
-    imported, imported_bar = mp2.imported_value_and_grad(
-        mf.mol, accept.build_mf, restored_static,
-        lambda i: mp2.load_disk_packet(workdir, i), include_hf=False)
-    np.testing.assert_allclose(imported, direct, atol=1e-10, rtol=0)
-    np.testing.assert_allclose(imported_bar.coords, direct_bar.coords, atol=1e-8, rtol=0)
     system_energy, system_mol_bar = dlno_stc.value_and_grad(
         mf.mol, accept.build_mf, scope="system", frozen=2,
         controls=controls, lo_kwargs=accept.LO_OPTIONS)
@@ -137,7 +114,6 @@ def isolated_smoke(output_dir):
     summary = {
         "status": "passed", "native_import_attempts": attempted,
         "production_domain_energy_Eh": float(direct),
-        "production_disk_energy_Eh": float(imported),
         "production_system_energy_Eh": float(system_energy),
         "strong_domain_job_count": len(static.fragments),
         "solver_group_count": len(groups),
@@ -151,9 +127,9 @@ def isolated_smoke(output_dir):
         "selected_energy_Eh": float(result["energy"]),
         "system_energy_Eh": float(system_result["energy"]),
         "weak_pair_energy_Eh": float(weak), "static_digest": digest,
-        "checks": ["production direct/domain gradient", "production export/solve/restart/replay",
+        "checks": ["production direct/domain gradient",
                    "production system energy/gradient", "selection", "exact pair classification", "common rebuild/VJP", "grouped finite preparation/VJP",
-                   "grouped selected solver", "grouped strict disk replay", "weak energy/VJP",
+                   "grouped selected solver",  "weak energy/VJP",
                    "system preparation/VJP", "typed groups/static and cotangent checkpoint"],
     }
     (output_dir / "independence_results.json").write_text(json.dumps(summary, indent=2) + "\n")

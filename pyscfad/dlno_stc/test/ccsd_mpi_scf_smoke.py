@@ -1,4 +1,5 @@
 """Real CC MPI SCF acceptance and paired prepared-water4 timing entry point."""
+from pyscfad.dlno_stc.test._cc_options import cc_options
 import argparse
 from contextlib import ExitStack
 import hashlib
@@ -104,9 +105,9 @@ def run(mode, output, *, fixture='small', fixture_dir=None, threads=1, vvvv_dire
         def build_static(mf):
             state['selecting'] = True
             try:
-                return ccsd.build_static_selections(mf, accept.selection(mf), smooth=False, matrix_kind='W',
+                return ccsd.build_static_selections(mf, accept.selection(mf),
                     thresh_occ=1e-5, thresh_vir=1e-5,
-                    baseline_controls=baseline, matrix_controls=matrix, single_pass=False)
+                    **cc_options(baseline, matrix))
             finally:
                 state['selecting'] = False
 
@@ -251,7 +252,7 @@ def run(mode, output, *, fixture='small', fixture_dir=None, threads=1, vvvv_dire
                         'response-failure': 'root final-response failure',
                         'invalid-option': 'parallel_scf_jk must be a bool'}.get(mode)
     failed = False
-    options = dict(baseline_controls=baseline, matrix_controls=matrix, ccsd_t=True,
+    options = dict(**cc_options(baseline, matrix), ccsd_t=True,
                    include_hf=True, vvvv_direct=vvvv_direct,
                    comm=None if mode == 'serial' else comm)
     if mode not in ('default', 'serial'):

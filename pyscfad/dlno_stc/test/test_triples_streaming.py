@@ -127,3 +127,48 @@ def test_grouped_adjoint_partial_output_tile():
     for result, reference in zip(actual['cotangents'], [expected_left, expected_right]):
         for got, want in zip(result, reference['cotangents']):
             np.testing.assert_allclose(got, want, rtol=2e-11, atol=2e-13)
+
+
+@pytest.mark.parametrize('with_grad', [False, True])
+def test_point_profile_accounting_and_unchanged_response(with_grad):
+    dresser = native.StableTriplesDressing(fixture(2), full_external=True)
+    left = dresser.prepare(0.)
+    points = [dresser.prepare(x) for x in (.1, .4)]
+    kwargs = dict(with_grad=with_grad, block_batch_size=5)
+    reference = native.triples_quadrature_stream(left, points, [.7, .3], **kwargs)
+    result = native.triples_quadrature_stream(left, points, [.7, .3], profile_right=True, **kwargs)
+    np.testing.assert_allclose(result['point_energies'], reference['point_energies'], rtol=2e-12, atol=2e-14)
+    if with_grad:
+        for got, want in zip(result['cotangents'], reference['cotangents']):
+            for a, b in zip(got, want):
+                np.testing.assert_allclose(a, b, rtol=2e-11, atol=2e-13)
+    wall = result['point_right_wall_seconds']
+    np.testing.assert_allclose(sum(wall), result['right_wall_seconds'], rtol=1e-12)
+    np.testing.assert_allclose(sum(p['worker_seconds'] for p in result['point_right_profiles']),
+                               result['right_worker_seconds'], rtol=1e-12)
+    for q, p in enumerate(result['point_right_profiles']):
+        assert p['blocks'] == 12
+        assert len(result['point_right_batch_wall_seconds'][q]) == 3
+        np.testing.assert_allclose(sum(result['point_right_batch_wall_seconds'][q]), wall[q])
+        accounted = sum(p['phase_worker_seconds'].values()) + sum(p['lock_wait_worker_seconds'].values())
+        accounted += sum(p['store_worker_seconds'].values())
+        assert 0. <= accounted <= p['worker_seconds'] * (1. + 1e-10)
+        assert all(v >= 0 for v in p['phase_worker_seconds'].values())
+        assert all(v == (54 if with_grad else 0) for v in p['lock_calls'].values())
+        if not with_grad:
+            assert p['phase_worker_seconds']['ket_bar'] == 0.
+            assert all(v == 0. for k, v in p['phase_worker_seconds'].items() if k.startswith('reverse_'))
+
+
+@pytest.mark.parametrize('memory', [0., 4000.])
+def test_python_point_profile_group_mapping(monkeypatch, memory):
+    monkeypatch.setenv('PYSCFAD_TRIPLES_PROFILE_RIGHT', '1')
+    (_, d), _ = _run_deterministic(fixture(2), [.1, .4, .7], [.8, -.2, .3],
+                                  with_grad=True, max_memory=memory, rotate=True, trace_exponent=5.)
+    assert d['right_profile_enabled']
+    assert d['quadrature_point_batches'] == (3 if memory == 0 else 1)
+    assert len(d['point_right_profiles']) == 3
+    np.testing.assert_allclose(sum(d['point_right_wall_seconds']), d['right_wall_seconds'])
+    np.testing.assert_allclose(sum(d['point_pullback_seconds']) + d['left_pullback_seconds'],
+                               d['laplace_pullback_seconds'])
+    assert all(p['blocks'] == 12 for p in d['point_right_profiles'])

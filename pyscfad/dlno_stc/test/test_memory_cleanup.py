@@ -97,7 +97,7 @@ def test_unavailable_heap_trimming_is_harmless(monkeypatch, platform, loader_err
 def test_mp2_stage_cleanup_preserves_energy_and_full_response(
         boys_water_dimer, monkeypatch):
     from pyscfad.dlno_stc import driver, build_domain_groups, build_domain_selections, _cleanup
-    from .test_finite_workflow import build_mf
+    from ._boys_acceptance import build_mf
 
     mf, _, static = boys_water_dimer
     controls = dict(mode='deterministic', laplace_roots=[.2, .8],

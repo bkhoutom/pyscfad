@@ -1,171 +1,67 @@
-"""Optional in-memory STC solver and complete independent MPI replicas."""
-
+"""In-memory domain MP2 and W solvers with explicit host cotangents."""
 import importlib
 import math
 from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field
-
 import numpy as np
 from pyscfad.tools import resource_profile
 from pyscfad.lib._threading import blas_threads
-
-from .protocol import (
-    ARRAY_NAMES, validate_full_inputs, validate_full_result,
-    matrix_request_fingerprint, validate_matrix_result, validate_input_cotangents,
-)
+from .protocol import (ARRAY_NAMES, validate_full_inputs, validate_full_result,
+    matrix_request_fingerprint, validate_matrix_result, validate_input_cotangents)
 
 
-def _scope_boundary(scope):
-    if scope in ("domain", "system"):
-        return ARRAY_NAMES, validate_full_inputs, validate_full_result
-    raise ValueError("scope must be domain or system")
-
-
-def host_inputs(inputs, *, scope="domain"):
+def host_inputs(inputs):
     """Transfer each preparation output once, retaining its float64 dtype."""
-    names, validate, _ = _scope_boundary(scope)
-    if not isinstance(inputs, dict) or set(inputs) != set(names):
-        raise ValueError("inputs must contain exactly " + ", ".join(names))
-    arrays = {key: np.ascontiguousarray(inputs[key]) for key in names}
-    validate(arrays)
+    if not isinstance(inputs, dict) or set(inputs) != set(ARRAY_NAMES):
+        raise ValueError("inputs must contain exactly " + ", ".join(ARRAY_NAMES))
+    arrays = {key: np.ascontiguousarray(inputs[key]) for key in ARRAY_NAMES}
+    validate_full_inputs(arrays)
     return arrays
 
 
-def _replica_seed(global_seed, fragment_id, rank):
+def _stream_seed(global_seed, fragment_id, stream=0):
     for name, value in (("global_seed", global_seed), ("fragment_id", fragment_id)):
         if (not isinstance(value, (int, np.integer))
                 or isinstance(value, (bool, np.bool_)) or value < 0):
             raise ValueError(f"{name} must be a nonnegative integer")
-    state = np.random.SeedSequence([int(global_seed), int(fragment_id), int(rank)])
+    # Preserve the serial sample stream; MPI rank never changes a fragment's seed.
+    state = np.random.SeedSequence([int(global_seed), int(fragment_id), int(stream)])
     return int(state.generate_state(1, dtype=np.uint64)[0])
 
 
-def _solve_local(inputs, metadata, controls, *, with_grad, aux_offsets, scope="domain"):
+def _solve_local(inputs, metadata, controls, *, with_grad, aux_offsets):
     try:
         extension = importlib.import_module("pyscfad.dlno_stc._stc_mp2")
     except ImportError as exc:
-        raise ImportError(
-            "STC-MP2 extension is unavailable; build pyscfad/dlno_stc/cpp "
-            "with CMake as described in pyscfad/dlno_stc/README.md"
-        ) from exc
-    names, _, _ = _scope_boundary(scope)
-    solver = extension.solve_selected if scope == "domain" else extension.solve_full
-    arguments = (tuple(metadata["target_indices"]), controls) if scope == "domain" else (controls,)
-    # The deterministic forward kernel already distributes work with OpenMP.
-    # Nested BLAS teams dominate the small local contractions. Discover the
-    # extension's libraries before applying the temporary limit.
+        raise ImportError("STC-MP2 extension is unavailable; build pyscfad/dlno_stc/cpp "
+                          "with CMake as described in pyscfad/dlno_stc/README.md") from exc
     serial_blas = not with_grad and controls.get('mode', 'deterministic') == 'deterministic'
     with blas_threads(1) if serial_blas else nullcontext():
-        return solver(
-            *(inputs[key] for key in names), *arguments,
-            aux_offsets=aux_offsets, with_grad=with_grad,
-        )
+        return extension.solve_selected(*(inputs[key] for key in ARRAY_NAMES),
+            tuple(metadata['target_indices']), controls, aux_offsets=aux_offsets,
+            with_grad=with_grad)
 
 
-def solve(inputs, metadata, controls, *, comm=None, with_grad=True, aux_offsets=None,
-          scope="domain"):
-    """Average full energy/bar replicas; only communicator root returns data.
-
-    Local import, conversion, numerical, and result-validation errors are
-    collected before any numeric reductions, so every rank raises together.
-    MPI transport failures remain the calling application's responsibility.
-    A single-rank communicator needs no reductions and follows the serial path.
-    """
-    if comm is not None and comm.Get_size() == 1:
-        comm = None
-    rank = 0 if comm is None else comm.Get_rank()
-    size = 1 if comm is None else comm.Get_size()
-    try:
-        if not isinstance(metadata, dict) or not isinstance(controls, dict):
-            raise ValueError("metadata and controls must be dictionaries")
-        names, _, validate = _scope_boundary(scope)
-        arrays = host_inputs(inputs, scope=scope)
-        if aux_offsets is None:
-            group_size = controls.get("auxiliary_group_size", 32)
-            if (not isinstance(group_size, (int, np.integer))
-                    or isinstance(group_size, (bool, np.bool_)) or group_size <= 0):
-                raise ValueError("auxiliary_group_size must be a positive integer")
-            naux = arrays["B"].shape[0]
-            aux_offsets = np.asarray([*range(0, naux, int(group_size)), naux],
-                                     dtype=np.int64)
-        requested_seed = controls.get("global_seed", 0)
-        effective_seed = _replica_seed(requested_seed, metadata.get("fragment_id", 0), rank)
-        settings = dict(controls, global_seed=effective_seed)
-        scope_options = {} if scope == "domain" else {"scope": scope}
-        local = _solve_local(arrays, metadata, settings,
-                             with_grad=with_grad, aux_offsets=aux_offsets, **scope_options)
-        validate(local, arrays, with_grad=with_grad)
-        local_energy = np.asarray(local["energy"], dtype=np.float64).reshape(())
-        local_variance = np.asarray(float(local["energy_standard_error"]) ** 2,
-                                    dtype=np.float64).reshape(())
-        if not np.isfinite(local_variance):
-            raise ValueError("replica energy variance overflowed")
-        bars = ({key: np.ascontiguousarray(local["cotangents"][key])
-                 for key in names} if with_grad else {})
-        diagnostics = dict(local.get("diagnostics", {}))
-        error = None
-    except Exception as exc:
-        if comm is None:
-            raise
-        error = f"rank {rank}: {type(exc).__name__}: {exc}"
-
-    if comm is not None:
-        failures = [message for message in comm.allgather(error) if message is not None]
-        if failures:
-            raise RuntimeError("STC replica failed: " + "; ".join(failures))
-        from mpi4py import MPI
-
-        # Root's local arrays become the receive buffers, avoiding a second
-        # complete bar_B allocation solely for replica reduction.
-        for value in (local_energy, local_variance, *bars.values()):
-            if rank == 0:
-                comm.Reduce(MPI.IN_PLACE, value, op=MPI.SUM, root=0)
-            else:
-                comm.Reduce(value, None, op=MPI.SUM, root=0)
-        replica_diagnostics = comm.gather(diagnostics, root=0)
-        replica_seeds = comm.gather(effective_seed, root=0)
-        if rank != 0:
-            return None
-    else:
-        replica_diagnostics, replica_seeds = [diagnostics], [effective_seed]
-
-    result = {
-        "energy": np.float64(local_energy / size),
-        "energy_standard_error": np.float64(math.sqrt(float(local_variance)) / size),
-        "metadata": {
-            "energy_kind": ("boys_target_laplace_mp2_v1" if scope == "domain"
-                            else "full_laplace_mp2_v1"), "cotangent_seed": 1.0,
-            "target_indices": metadata.get("target_indices"),
-            "fragment_id": int(metadata.get("fragment_id", 0)),
-            "replica_count": size, "global_seed": int(requested_seed),
-            "derivative_convention": "fixed_sample",
-        },
-        "diagnostics": {"target_indices": metadata.get("target_indices"),
-                        "energy_tolerance": controls.get("energy_tolerance"),
-                        "sampling_mode": ("fixed_count" if "production_samples" in controls
-                                          else controls.get("mode", "deterministic")),
-                        "replica_seeds": replica_seeds,
-                        "replicas": replica_diagnostics},
-    }
-    if "request_fingerprint" in metadata:
-        result["metadata"] = dict(metadata, **{
-            "cotangent_seed": 1.0, "backend": "stc_selected", "backend_version": "1",
-            "actual_sample_count": sum(int(d.get("actual_sample_count", 0))
-                                       for d in replica_diagnostics),
-            "derivative_convention": "fixed_sample",
-            "seed_replay": {"global_seed": int(requested_seed),
-                            "replica_seeds": replica_seeds},
-            "replica_count": size,
-        })
-    for name in ("frame_convention", "global_target_orbitals", "candidate_order",
-                 "virtual_anchor_parent_columns", "grouping_fingerprint", "budget"):
-        if name in metadata:
-            result["metadata"][name] = metadata[name]
-    if with_grad:
-        for value in bars.values():
-            value /= size
-        result["cotangents"] = bars
+def solve(inputs, metadata, controls, *, with_grad=True, aux_offsets=None):
+    """Solve one fragment locally; the driver distributes complete groups."""
+    if not isinstance(metadata, dict) or not isinstance(controls, dict):
+        raise ValueError("metadata and controls must be dictionaries")
+    arrays = host_inputs(inputs)
+    if aux_offsets is None:
+        group_size = controls.get('auxiliary_group_size', 32)
+        if (not isinstance(group_size, (int, np.integer))
+                or isinstance(group_size, (bool, np.bool_)) or group_size <= 0):
+            raise ValueError('auxiliary_group_size must be a positive integer')
+        naux = arrays['B'].shape[0]
+        aux_offsets = np.asarray([*range(0, naux, int(group_size)), naux], dtype=np.int64)
+    seed = _stream_seed(controls.get('global_seed', 0), metadata.get('fragment_id', 0))
+    result = _solve_local(arrays, metadata, dict(controls, global_seed=seed),
+                          with_grad=with_grad, aux_offsets=aux_offsets)
+    validate_full_result(result, arrays, with_grad=with_grad)
+    result['metadata'] = dict(result.get('metadata', {}), **metadata,
+                              global_seed=int(controls.get('global_seed', 0)),
+                              effective_seed=seed, cotangent_seed=1.0)
     return result
 
 
@@ -225,7 +121,7 @@ def _matrix_batch_controls(settings, batch_count, seed):
     return local
 
 
-def _check_matrix_memory(inputs, ntarget, settings, matrix_kind, offsets, *,
+def _check_matrix_memory(inputs, ntarget, settings, offsets, *,
                          stage="forward", warned=None):
     """Check each staged call against current residency before tensor copies."""
     from ._memory import observe_memory
@@ -233,7 +129,7 @@ def _check_matrix_memory(inputs, ntarget, settings, matrix_kind, offsets, *,
 
     naux, nocc, nvir = inputs["B"].shape
     estimate = estimate_matrix_memory(naux, nocc, nvir, ntarget, settings,
-                                      matrix_kind=matrix_kind, with_grad=True,
+                                       with_grad=True,
                                       auxiliary_group_count=len(offsets)-1)
     observation = observe_memory()
     resident_mb = observation.rss_mb
@@ -250,31 +146,32 @@ def _check_matrix_memory(inputs, ntarget, settings, matrix_kind, offsets, *,
         for name in names)
     forecast = estimate if peak_bytes is None else {"total_bytes": peak_bytes}
     check_solver_memory(forecast, settings.get("memory_limit_mb"),
-                        stage=f"matrix {matrix_kind} {stage}",
+                        stage=f"matrix W {stage}",
                         estimate_kind="workspace" if peak_bytes is None else "peak",
                         unavoidable_bytes=unavoidable_bytes, warned=warned,
                         observation=observation)
     return estimate, resident_mb, peak_bytes
 
 
-def solve_matrices(inputs, metadata, controls, *, matrix_kind="D", aux_offsets=None):
-    """Return native E and D/W blocks, with a delayed arbitrary-seed reverse.
+def solve_matrices(inputs, metadata, controls, *, aux_offsets=None):
+    """Return native E and W blocks, with a delayed arbitrary-seed reverse.
 
     Blocks are sums over selected targets in exactly the input frame. W's
     sampling allocation controls matrix error. Its native energy is the half
     sum of occupied and virtual traces, with their covariance included in SE.
-    This host call is deliberately separate from the energy-only MPI solver.
+    CCSD/(T) consumes this forward result for its MP2 baseline and LIS response.
+    Standalone MP2 uses the scalar solve interface instead.
     """
     from .controls import normalize_matrix_controls
 
-    settings = normalize_matrix_controls(controls, matrix_kind)
+    settings = normalize_matrix_controls(controls)
     validate_full_inputs(inputs)
     naux, nocc, nvir = inputs["B"].shape
     targets = _matrix_targets(metadata, nocc)
     offsets = _matrix_aux_offsets(naux, aux_offsets, settings["auxiliary_group_size"])
     memory_warned = set()
     estimate, resident_mb, peak_bytes = _check_matrix_memory(
-        inputs, len(targets), settings, matrix_kind, offsets, warned=memory_warned)
+        inputs, len(targets), settings, offsets, warned=memory_warned)
     # Check before making host/layout copies or entering the native allocator.
     arrays = host_inputs(inputs)
     saved_metadata = deepcopy(metadata)
@@ -283,7 +180,7 @@ def solve_matrices(inputs, metadata, controls, *, matrix_kind="D", aux_offsets=N
     target_batches = [targets[first:first+size] for first in range(0, len(targets), size)]
     if not naux or not nvir:
         target_batches = []
-    seeds = [_replica_seed(settings["global_seed"], metadata.get("fragment_id", 0), batch)
+    seeds = [_stream_seed(settings["global_seed"], metadata.get("fragment_id", 0), batch)
              for batch in range(len(target_batches))]
     saved_metadata["effective_seeds"] = seeds
     extension = (importlib.import_module("pyscfad.dlno_stc._stc_mp2")
@@ -292,7 +189,7 @@ def solve_matrices(inputs, metadata, controls, *, matrix_kind="D", aux_offsets=N
     saved_metadata["native_version"] = native_version
     saved_metadata["native_options"] = []
     result = {"energy": np.float64(0.), "occupied": np.zeros((nocc, nocc)),
-              "virtual": np.zeros((nvir, nvir)), "matrix_kind": matrix_kind,
+              "virtual": np.zeros((nvir, nvir)), "matrix_kind": "W",
               "metadata": saved_metadata, "controls": deepcopy(settings)}
     plans, batch_diagnostics = [], []
     native_timings = {}
@@ -303,7 +200,7 @@ def solve_matrices(inputs, metadata, controls, *, matrix_kind="D", aux_offsets=N
         native_controls = _matrix_batch_controls(settings, len(target_batches), seed)
         local = extension.solve_matrices(*(arrays[key] for key in ARRAY_NAMES),
                                          targets_in_batch, native_controls,
-                                         matrix_kind=matrix_kind, aux_offsets=offsets)
+                                          aux_offsets=offsets)
         validate_matrix_result(local, arrays)
         for name in ("energy", "occupied", "virtual"):
             result[name] += local[name]
@@ -325,7 +222,7 @@ def solve_matrices(inputs, metadata, controls, *, matrix_kind="D", aux_offsets=N
         batch_diagnostics.append(diagnostics)
         plans.append(local["replay"])
     diagnostics = {
-        "mode": settings["mode"], "matrix_kind": matrix_kind,
+        "mode": settings["mode"], "matrix_kind": "W",
         "batch_count": len(plans), "batch_seeds": seeds,
         "batches": batch_diagnostics, "production_draws": production_draws,
         "memory_estimate_bytes": estimate, "current_rss_mb": resident_mb,
@@ -346,7 +243,7 @@ def solve_matrices(inputs, metadata, controls, *, matrix_kind="D", aux_offsets=N
             frag=metadata.get('fragment_id', 0) + 1, timings=native_timings)
     # Fingerprint resolved source defaults as well as the requested controls.
     fingerprint = matrix_request_fingerprint(arrays, saved_metadata, settings,
-                                             matrix_kind, offsets)
+                                             offsets)
     result["replay"] = _MatrixReplay(fingerprint, offsets, tuple(plans), native_version,
                                      memory_warned)
     validate_matrix_result(result, arrays)
@@ -362,7 +259,7 @@ def pullback_matrices(inputs, forward, *, energy_bar, occupied_bar, virtual_bar)
         raise ValueError("matrix replay must come from solve_matrices in this process")
     fingerprint = matrix_request_fingerprint(
         inputs, forward["metadata"], forward["controls"],
-        forward["matrix_kind"], replay.aux_offsets)
+        replay.aux_offsets)
     if fingerprint != replay.fingerprint:
         raise ValueError("matrix replay fingerprint changed: inputs, frame or controls differ")
     extension = (importlib.import_module("pyscfad.dlno_stc._stc_mp2")
@@ -371,7 +268,7 @@ def pullback_matrices(inputs, forward, *, energy_bar, occupied_bar, virtual_bar)
         raise ValueError("matrix replay native version differs from the loaded extension")
     # Downstream work may have allocated memory since the forward call.
     _check_matrix_memory(inputs, len(forward["metadata"]["target_indices"]),
-                         forward["controls"], forward["matrix_kind"], replay.aux_offsets,
+                         forward["controls"], replay.aux_offsets,
                          stage="reverse", warned=replay.memory_warned)
     seed = np.asarray(energy_bar)
     if seed.shape != () or not np.isfinite(seed):

@@ -153,7 +153,7 @@ def acceptance(comm, *, serial=False, sampled=False, adaptive=False):
         for gid, record in enumerate(records):
             assert record['owner'] == gid % comm.size
             assert record['tolerance'] == settings['energy_tolerance'] / np.sqrt(2)
-            expected_seed = backend._replica_seed(713, record['fragment_id'], 0)
+            expected_seed = backend._stream_seed(713, record['fragment_id'], 0)
             assert record['seed'] == expected_seed, record
             assert np.isfinite(record['energy'])
             assert set(record['bars']) == {'foo', 'fvv', 'B'}

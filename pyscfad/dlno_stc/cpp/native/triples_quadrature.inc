@@ -50,7 +50,7 @@ template<size_t P> void quadrature_coordinates(size_t a,size_t b,size_t c,
 template<size_t P,bool Gradient>
 double quadrature_right_impl(arma::vec& raw_bar,arma::vec* cache_bar,
         const arma::vec& raw,const arma::vec& ket,const quadrature_singles& l,
-        size_t n,double factor,triples_raw_workspace& workspace) {
+        size_t n,double factor,triples_raw_workspace& workspace,triples_right_profile* profile) {
     const double* r=raw.memptr();const double* k=ket.memptr();
     double *one_bar=nullptr,*fov_bar=nullptr,*two_bar=nullptr,*integral_bar=nullptr;
     if constexpr(Gradient) {
@@ -60,6 +60,8 @@ double quadrature_right_impl(arma::vec& raw_bar,arma::vec* cache_bar,
     }
     double* rb=Gradient ? raw_bar.memptr() : nullptr;
     double energy=0.;
+    {
+    triples_profile_scope timer(triples_profile_phase(profile,triples_right_profile::contract));
     for(size_t a=0;a<n;++a) for(size_t b=0;b<n;++b) {
         const size_t offset=(a*n+b)*n;
         const double g=l.integral[a*l.stride+b],t=l.two[a*n+b];
@@ -80,7 +82,9 @@ double quadrature_right_impl(arma::vec& raw_bar,arma::vec* cache_bar,
             two_bar[a*n+b]=two_sum;integral_bar[a*n+b]=integral_sum;
         }
     }
+    }
     if constexpr(Gradient) {
+        triples_profile_scope timer(triples_profile_phase(profile,triples_right_profile::ket_bar));
         constexpr size_t inverse=P==1 ? 2 : P==2 ? 1 : P;
         double* kb=cache_bar->memptr();
         for(size_t a=0;a<n;++a) for(size_t b=0;b<n;++b) {
@@ -97,13 +101,13 @@ double quadrature_right_impl(arma::vec& raw_bar,arma::vec* cache_bar,
 double quadrature_right(arma::vec& raw_bar,arma::vec* cache_bar,const arma::vec& raw,
         const arma::vec& ket,const std::vector<tensor>& bank,const operations& op,
         size_t n,size_t p,bool swap,double factor,bool gradient,
-        triples_raw_workspace& workspace) {
+        triples_raw_workspace& workspace,triples_right_profile* profile=nullptr) {
     const quadrature_singles singles(bank,op);
     const size_t ordinary[3]={0,2,1},exchanged[3]={3,5,4};
     const size_t permutation=swap ? exchanged[p] : ordinary[p];
 #define QUADRATURE_RIGHT(P) case P: return gradient \
-    ? quadrature_right_impl<P,true>(raw_bar,cache_bar,raw,ket,singles,n,factor,workspace) \
-    : quadrature_right_impl<P,false>(raw_bar,nullptr,raw,ket,singles,n,factor,workspace);
+    ? quadrature_right_impl<P,true>(raw_bar,cache_bar,raw,ket,singles,n,factor,workspace,profile) \
+    : quadrature_right_impl<P,false>(raw_bar,nullptr,raw,ket,singles,n,factor,workspace,profile);
     switch(permutation) {QUADRATURE_RIGHT(0) QUADRATURE_RIGHT(1) QUADRATURE_RIGHT(2)
                          QUADRATURE_RIGHT(3) QUADRATURE_RIGHT(4) QUADRATURE_RIGHT(5)}
 #undef QUADRATURE_RIGHT
@@ -112,18 +116,19 @@ double quadrature_right(arma::vec& raw_bar,arma::vec* cache_bar,const arma::vec&
 // The four disconnected adjoints were reduced during the weighted energy
 // pass. Commit only their small vectors/matrices, under the exact tile locks.
 void quadrature_singles_store(std::vector<tensor>& bank,const operations& op,
-        size_t n,const triples_raw_workspace& w,triples_bar_locks& locks) {
+        size_t n,const triples_raw_workspace& w,triples_bar_locks& locks,
+        triples_right_profile* profile=nullptr) {
     auto& t1=bank[op.ids[5]];auto& fv=bank[op.ids[6]];
     auto& t2=bank[op.ids[7]];auto& gg=bank[op.ids[4]];
     const size_t n1=t1.offset(op.indices[5]),nf=fv.offset(op.indices[6]);
     const size_t n2=t2.offset(op.indices[7]),ng=gg.offset(op.indices[4]);
-    {std::lock_guard<std::mutex> guard(locks.at(op,5,t1));
+    {triples_profile_lock guard(locks.at(op,5,t1),profile,4);
      arma::vec out(t1.bar.memptr()+n1,n,false,true);out+=w.one_bar;}
-    {std::lock_guard<std::mutex> guard(locks.at(op,6,fv));
+    {triples_profile_lock guard(locks.at(op,6,fv),profile,5);
      arma::vec out(fv.bar.memptr()+nf,n,false,true);out+=w.fov_bar;}
-    {std::lock_guard<std::mutex> guard(locks.at(op,7,t2));
+    {triples_profile_lock guard(locks.at(op,7,t2),profile,6);
      arma::vec out(t2.bar.memptr()+n2,n*n,false,true);out+=w.two_bar;}
-    {std::lock_guard<std::mutex> guard(locks.at(op,4,gg));
+    {triples_profile_lock guard(locks.at(op,4,gg),profile,7);
      const size_t stride=gg.dims[2]*gg.dims[3];
      for(size_t a=0;a<n;++a) for(size_t b=0;b<n;++b)
          gg.bar[ng+a*stride+b]+=w.integral_bar[a*n+b];}

@@ -1,4 +1,5 @@
 """Domain-only LNO eigenproblems, compared to independent global projectors."""
+from pyscfad.dlno_stc.test._cc_options import cc_options
 from dataclasses import replace
 import jax
 import jax.numpy as jnp
@@ -70,21 +71,20 @@ def test_zero_cutoffs_keep_all_without_density_eigenproblem(molecular_group, mon
     monkeypatch.setattr(lis, '_compact_mapped_density', forbidden)
     index = case.indices[0]
     selected = lis.build_fragment_lis_selection(case.mf, case.static.mp2_static, index,
-        common=common, frame=frame, matrices=matrices, matrix_kind='W',
+        common=common, frame=frame, matrices=matrices,
         thresh_occ=0., thresh_vir=0.)
     fragments = list(case.static.fragments); fragments[index] = selected
-    static = lis.LISSelections(case.static.mp2_static, 'W', 0., 0., 1e-6, tuple(fragments))
+    static = lis.LISSelections(case.static.mp2_static, 0., 0., 1e-6, tuple(fragments))
     value = lis.build_fragment_lis(case.mf, common, static, index,
         matrices=matrices, frame=frame)
     np.testing.assert_allclose(value.occupied_projector, np.eye(frame.occupied_coeff.shape[1]), atol=1e-14)
     np.testing.assert_allclose(value.virtual_projector, np.eye(frame.virtual_coeff.shape[1]), atol=1e-14)
-    assert value.density_occupied_active is value.density_virtual_active is None
     with pytest.raises(TypeError, match='virtual_eigenspace'):
-        ccsd.build_static_selections(None, None, matrix_kind='W', thresh_occ=1e-4,
+        ccsd.build_static_selections(None, None, thresh_occ=1e-4,
             thresh_vir=3e-5, baseline_controls={}, matrix_controls={}, virtual_eigenspace='global')
     with pytest.raises(ValueError, match='schema'):
         ccsd.kernel(case.mf, replace(case.static, schema_version=8),
-                    baseline_controls=case.controls, matrix_controls=case.controls)
+                    **cc_options(case.controls, case.controls))
 
 
 def test_molecular_domain_only_matches_global_oracle(molecular_group, monkeypatch):
@@ -102,14 +102,13 @@ def test_molecular_domain_only_matches_global_oracle(molecular_group, monkeypatc
                            eigenproblem=compact.shape[0], occupied=columns is not None))
         return basis, compact
 
-    options = dict(baseline_controls=case.controls, matrix_controls=case.controls,
-        ccsd_t=True, fragment_indices=case.indices, include_baseline=False,
+    options = dict(**cc_options(case.controls, case.controls),
+        ccsd_t=True,
         return_components=True, triples_controls=dict(mode='stochastic', nsamples=16,
             pilot_samples=16, global_seed=71, integral_transform='rotate'))
-    def select(mf, single_pass=False):
-        return ccsd.build_static_selections(mf, case.static.mp2_static, matrix_kind='W',
-            thresh_occ=1e-4, thresh_vir=3e-5, baseline_controls=case.controls,
-            matrix_controls=case.controls, fragment_indices=case.indices, single_pass=single_pass)
+    def select(mf):
+        return ccsd.build_static_selections(mf, case.static.mp2_static,
+            thresh_occ=1e-4, thresh_vir=3e-5, **cc_options(case.controls, case.controls))
 
     with (config_update('pyscfad_scf_implicit_diff', True),
           config_update('pyscfad_scf_first_order_custom', False)):
@@ -119,7 +118,7 @@ def test_molecular_domain_only_matches_global_oracle(molecular_group, monkeypatc
                 build_static=select, **options)
         monkeypatch.setattr(lis, '_compact_mapped_density', counted_domain)
         actual = ccsd.value_and_grad(case.mf.mol, accept.build_mf,
-            build_static=lambda mf: select(mf, single_pass=True), **options)
+            build_static=lambda mf: select(mf), **options)
     assert shapes and all(x['eigenproblem'] <= x['domain'] for x in shapes)
     assert any(x['occupied'] and x['eigenproblem'] < x['parent'] for x in shapes)
     np.testing.assert_allclose(actual[0], reference[0], atol=3e-11, rtol=0)

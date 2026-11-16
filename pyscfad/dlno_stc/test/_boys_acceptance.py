@@ -177,7 +177,6 @@ def grouped_preparation_and_response(output_dir):
     import csv
     from collections import Counter
     from pyscfad.dlno_stc.prepare import prepare_inputs, prepare_boys_group_inputs
-    from pyscfad.dlno_stc.adjoint import apply_selected_pullback, pullback_inputs
     from pyscfad.dlno_stc._pairs import weak_pair_energy, weak_pair_indices
 
     mf, static, common, groups = _grouped_case()
@@ -234,24 +233,6 @@ def grouped_preparation_and_response(output_dir):
     assert all(tuple(g.target_indices) == (0, 1, 2, 3) for g in groups)
     assert all(len(static.fragments[g.representative_index].extended_ao_indices) < mf.mol.nao
                for g in groups)
-    replay_residual = 0.0
-    for group in groups:
-        def prepare(x, c):
-            return prepare_boys_group_inputs(x, c, static, group)
-        packet, pullback = jax.vjp(prepare, mf, common)
-        result = selected_result(packet, static, group.representative_index,
-                                 target_indices=group.target_indices)
-        direct = apply_selected_pullback(pullback, packet, result)
-        replay = pullback_inputs(prepare, (mf, common), packet,
-                                 dict(result, metadata={'cotangent_seed': 1.0}))
-        for actual, expected in zip(jax.tree_util.tree_leaves(replay),
-                                    jax.tree_util.tree_leaves(direct)):
-            if actual.dtype == jax.dtypes.float0:
-                np.testing.assert_array_equal(actual, expected)
-            else:
-                np.testing.assert_allclose(actual, expected, atol=1e-11, rtol=1e-11)
-                if actual.size:
-                    replay_residual = max(replay_residual, float(np.max(np.abs(actual - expected))))
     singleton_energy, singleton_gradient, grouped_energy, grouped_gradient = _grouped_response()
     np.testing.assert_allclose(grouped_energy, singleton_energy, atol=1e-9, rtol=0)
     np.testing.assert_allclose(grouped_gradient, singleton_gradient, atol=1e-6, rtol=0)
@@ -290,7 +271,6 @@ def grouped_preparation_and_response(output_dir):
                     'grouped_force_Eh_per_bohr': (-grouped_gradient).tolist(),
                     'gradient_delta_Eh_per_bohr': (grouped_gradient - singleton_gradient).tolist(),
                     'gradient_max_abs_Eh_per_bohr': float(np.max(np.abs(grouped_gradient - singleton_gradient))),
-                    'replay_cotangent_max_abs': replay_residual,
                     'weak_unordered_pairs': [list(pair) for pair in pairs],
                     'weak_energy_Eh': weak_energy, 'weak_pair_prefactor': -4,
                     'domain_convention': static.domain_convention,

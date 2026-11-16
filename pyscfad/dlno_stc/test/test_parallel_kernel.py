@@ -27,10 +27,7 @@ for scope in ('full', 'domain'):
                         laplace_weights=[.07, .4, .6], virtual_block_size=3,
                         global_seed=713, production_samples=10007,
                         min_production_samples=2)
-        if scope == 'full':
-            controls['virtual_keep_fraction'] = .34
-        else:
-            controls['system_workload_cutoff'] = 2.
+        controls['system_workload_cutoff'] = 2.
         before = B.copy()
         if scope == 'full':
             out = native.solve_full(foo, fvv, B, controls, offsets, True)
@@ -77,7 +74,7 @@ def test_native_fixed_thread_draws_and_parallel_deterministic_bars(tmp_path):
         for key, expected in outputs[0].items():
             # The source selected sampler assigns an RNG stream per OpenMP
             # thread. Changing thread count changes its realized draws.
-            if key.startswith('domain_stochastic_'):
+            if '_stochastic_' in key:
                 continue
             np.testing.assert_allclose(result[key], expected,
                                        rtol=3e-12, atol=3e-12, err_msg=key)

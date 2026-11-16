@@ -1,4 +1,4 @@
-"""Compare domain MP2 direct/half/replay gradients and a fixed-selection FD.
+"""Compare domain MP2 direct/half gradients and a fixed-selection FD.
 
 Set OpenMP/BLAS thread limits before launching Python. Example::
 
@@ -36,7 +36,6 @@ def main():
     import jax
     import numpy as np
     from pyscfad import config, df, dlno_stc, gto, scf
-    from pyscfad.dlno_stc import backend, mp2
     from pyscfad.lno import _df_shared
     from pyscfad.tools import linear_solver
 
@@ -109,18 +108,8 @@ def main():
                 with patch.dict(os.environ, {'PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE': mode}):
                     measure(mode, lambda: dlno_stc.value_and_grad(
                         mol, build, static, controls=controls, include_hf=True, **correlation))
-            packets = args.output / 'packets'
-            rows = mp2.export_run(mf, static, packets, controls=controls, **correlation)
-            for row in rows:
-                folder = packets / f"fragment_{row['fragment_id']:04d}"
-                mp2.solve_request(folder / 'input.h5', folder / 'result.h5', backend.solve)
-            with patch.dict(os.environ, {'PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE': 'half'}):
-                measure('replay', lambda: mp2.imported_value_and_grad(
-                    mol, build, static, lambda index: mp2.load_disk_packet(packets, index),
-                    include_hf=True, **correlation))
-
         report['comparisons'] = {}
-        for name in ('half', 'replay'):
+        for name in ('half',):
             de = abs(values[name][0] - values['direct'][0])
             dg = float(np.max(np.abs(values[name][1] - values['direct'][1])))
             report['comparisons'][name] = dict(energy_error=de, gradient_max_error=dg)
@@ -142,11 +131,11 @@ def main():
         np.savez(args.output / 'gradients.npz', **arrays)
         (args.output / 'results.json').write_text(json.dumps(report, indent=2) + '\n')
 
-        for name in ('half', 'replay'):
+        for name in ('half',):
             np.testing.assert_allclose(values[name][0], values['direct'][0], atol=1e-9, rtol=0)
             np.testing.assert_allclose(values[name][1], values['direct'][1], atol=2e-7, rtol=0)
         np.testing.assert_allclose(analytic, finite, atol=2e-6, rtol=0)
-        for name in ('direct', 'half', 'replay'):
+        for name in ('direct', 'half'):
             for receipt in report['runs'][name]['df_receipts']:
                 assert receipt['raw_source_passes'] == (2 if name == 'direct' else 1)
                 assert receipt['metric_builds'] == receipt['cholesky_builds'] == 1

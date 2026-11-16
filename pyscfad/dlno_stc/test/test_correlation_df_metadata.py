@@ -38,7 +38,7 @@ def test_restart_rejects_changed_correlation_fit_with_identical_jk(reference, tm
         RestartManager(tmp_path, resume=True, method='test', scientific_payload=changed)
 
 
-@pytest.mark.parametrize('guard', ['packet', 'domain', 'system'])
+@pytest.mark.parametrize('guard', ['domain'])
 def test_memory_uses_correlation_dimension_without_replacing_jk(reference, monkeypatch, guard):
     from pyscfad.lno import _df_direct
     # Bypass unrelated native scratch forecasts; retain real molecule/basis sizes.
@@ -51,16 +51,10 @@ def test_memory_uses_correlation_dimension_without_replacing_jk(reference, monke
     corr_auxmol = pyscf_df.addons.make_auxmol(reference.mol.to_pyscf(), 'def2-svp-jkfit')
     assert corr_auxmol.nao != jk_auxmol.nao
     def estimate(**kwargs):
-        if guard == 'packet':
-            return _workflow.check_memory(reference, 1, 1, **kwargs)
-        if guard == 'domain':
-            return _workflow.check_domain_memory(reference, static, 0, with_grad=False, **kwargs)
-        return _workflow.check_system_memory(reference, 1, 1, with_grad=False, **kwargs)
+        return _workflow.check_domain_memory(reference, static, 0, with_grad=False, **kwargs)
     inherited = estimate()
     explicit = estimate(correlation_auxbasis='def2-svp-jkfit')
     assert (explicit > inherited) == (corr_auxmol.nao > jk_auxmol.nao)
-    if guard == 'packet':
-        assert explicit == 64 * corr_auxmol.nao / 1e6
     assert reference.with_df.auxmol is jk_auxmol
     assert reference.with_df.auxbasis == 'weigend'
 
@@ -77,25 +71,6 @@ def test_mpi_correlation_config_is_installed_and_mismatch_rejected(reference):
         _mpi._install_correlation_config(state, {'correlation_auxbasis': 'weigend'})
 
 
-def test_packet_replay_rejects_changed_correlation_fit(reference):
-    from pyscfad.dlno_stc import mp2
-    from pyscfad.dlno_stc._selection import build_domain_groups
-    from pyscfad.dlno_stc.test.test_domain_grouping import grouping_fixture
-    static = grouping_fixture()
-    groups = build_domain_groups(static)
-    group = groups[0]
-    budget = dict(total_tolerance=None, original_target_count=len(static.fragments),
-                  group_count=len(groups), effective_tolerance=None)
-    inputs = {'foo': np.zeros((2, 2)), 'fvv': np.zeros((1, 1)), 'B': np.zeros((3, 2, 1))}
-    metadata = mp2._packet_metadata(reference, static, 0, group, inputs, groups, budget,
-                                   correlation_auxbasis='def2-svp-jkfit')
-    assert metadata['auxiliary_order']['auxbasis'] == 'def2-svp-jkfit'
-    assert metadata['correlation_auxbasis'] == 'def2-svp-jkfit'
-    mp2._validate_packet_identity(reference, static, 0, group, inputs, metadata, {}, groups,
-                                  correlation_auxbasis='def2-svp-jkfit')
-    with pytest.raises(ValueError, match='auxiliary_order|molecular_fingerprint|correlation_auxbasis'):
-        mp2._validate_packet_identity(reference, static, 0, group, inputs, metadata, {}, groups,
-                                      correlation_auxbasis='weigend')
 
 
 def test_cc_mpi_owners_use_root_correlation_setting(reference, monkeypatch):
@@ -139,7 +114,7 @@ def test_cc_mpi_owners_use_root_correlation_setting(reference, monkeypatch):
     def owner(rank):
         return _mpi_ccsd._run_jobs(initialize, None, world.communicator(rank), with_grad=False,
             include_hf=False, merge_identical=True, verbose_imp=0, ccsd_t=False,
-            return_components=False, include_baseline=True, fragment_indices=None,
+            return_components=False,
             scf_service=None, vvvv_direct=False)
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         result = list(pool.map(owner, range(2)))

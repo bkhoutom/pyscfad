@@ -68,12 +68,18 @@ def run(args, comm):
     timings = {"df_setup_seconds": time.perf_counter() - started}
     dm0 = None
 
-    def build_mf(current_mol):
+    def build_mf(current_mol, *, mo_coeff_init=None, mo_energy_init=None,
+                 mo_occ_init=None, e_tot_init=None):
         mf = scf.RHF(current_mol).density_fit(auxbasis=args.auxbasis)
         mf.with_df.max_memory = args.max_memory
         mf.with_df.attach_outcore_cderi(str(cderi))
         mf.conv_tol, mf.conv_tol_grad = 1e-9, 1e-8
         mf.chkfile = None
+        if mo_coeff_init is not None:
+            mf.mo_coeff, mf.mo_energy = mo_coeff_init, mo_energy_init
+            mf.mo_occ, mf.e_tot = mo_occ_init, e_tot_init
+            mf.converged = True
+            return mf
         mf.kernel(dm0=dm0)
         if not mf.converged:
             raise RuntimeError("DF-RHF did not converge")

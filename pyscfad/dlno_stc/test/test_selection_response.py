@@ -179,14 +179,12 @@ def test_changed_selection_reference_disables_reuse(changed):
     assert not receipt.matches_reference(reference)
 
 
-@pytest.mark.parametrize('include_baseline, resume, expected_reuse', [
-    (True, False, True),
-    (True, True, False),
-    (False, False, False),
-    (False, True, False),
+@pytest.mark.parametrize('resume, expected_reuse', [
+    (False, True),
+    (True, False),
 ])
 def test_public_ccsd_selection_reuses_weak_only_for_fresh_baseline(
-        monkeypatch, tmp_path, include_baseline, resume, expected_reuse):
+        monkeypatch, tmp_path, resume, expected_reuse):
     """A resumed checkpoint must decide whether weak work is needed first."""
     from pyscfad.dlno_stc import ccsd
 
@@ -213,7 +211,6 @@ def test_public_ccsd_selection_reuses_weak_only_for_fresh_baseline(
         raise SelectionReached
 
     def run(initialize, *args, **options):
-        assert options['include_baseline'] is include_baseline
         assert options['resume'] is resume
         return initialize()
 
@@ -223,7 +220,7 @@ def test_public_ccsd_selection_reuses_weak_only_for_fresh_baseline(
     with pytest.raises(SelectionReached):
         ccsd.value_and_grad(
             mol, build_mf, build_static=lambda reference: None,
-            baseline_controls={}, matrix_controls={}, include_baseline=include_baseline,
+            baseline_controls={}, matrix_controls={},
             resume=resume, checkpoint_dir=tmp_path / 'checkpoint')
     assert calls == [expected_reuse]
 

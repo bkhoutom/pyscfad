@@ -1,4 +1,5 @@
 """Whole-system preparation, public options, and restricted DF response."""
+from pyscfad.dlno_stc.test import system_reference
 
 import jax
 import numpy as np
@@ -55,7 +56,7 @@ def test_system_canonical_shortcut_cannot_bypass_local_sampling_frame():
 def test_full_boundary_retains_three_arrays_and_validates_bars():
     inputs = {"foo": np.array([[-1.0]]), "fvv": np.array([[1.0]]),
               "B": np.ones((2, 1, 1))}
-    host = backend.host_inputs(inputs, scope="system")
+    host = backend.host_inputs(inputs)
     result = {"energy": np.float64(-1), "energy_standard_error": np.float64(0),
               "diagnostics": {}, "cotangents": {key: value.copy() for key, value in host.items()}}
     protocol.validate_full_result(result, host)
@@ -63,7 +64,7 @@ def test_full_boundary_retains_three_arrays_and_validates_bars():
     with pytest.raises(ValueError, match="cotangents"):
         protocol.validate_full_result(result, host)
     with pytest.raises(ValueError, match="float64"):
-        backend.host_inputs(dict(inputs, B=inputs["B"].astype(np.float32)), scope="system")
+        backend.host_inputs(dict(inputs, B=inputs["B"].astype(np.float32)))
 
 
 @pytest.mark.parametrize("frozen", [True, -1, 6, [True], [-1], [7], [0, 0], [0.5]])
@@ -76,7 +77,7 @@ def test_system_preparation_preserves_active_spaces_without_mutating_mf(molecule
     mf = _mf(molecule)
     before = jax.tree_util.tree_structure(mf)
     original_coeff = np.asarray(mf.mo_coeff).copy()
-    arrays = prepare.prepare_system_inputs(mf, np.array([1, 2, 3, 4]), np.array([5, 6]))
+    arrays = system_reference.prepare_system_inputs(mf, np.array([1, 2, 3, 4]), np.array([5, 6]))
     assert set(arrays) == {"foo", "fvv", "B"}
     assert arrays["B"].shape[1:] == (4, 2)
     for key, selected in (("foo", slice(1, 5)), ("fvv", slice(5, 7))):
@@ -104,8 +105,8 @@ def test_scf_fock_projection_requires_real_finite_matching_energies(molecule, en
 def test_empty_active_spaces_add_hf_once_without_fitting_or_backend(molecule, monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError("zero-work system must skip fitting and backend")
-    monkeypatch.setattr(driver, "prepare_system_inputs", forbidden)
-    monkeypatch.setattr(driver, "run_backend", forbidden)
+    monkeypatch.setattr(driver, "prepare_boys_group_inputs", forbidden)
+    monkeypatch.setattr(driver.backend, "solve", forbidden)
     for frozen in (5, [0, 1, 2, 3, 4], [5, 6]):
         assert float(dlno_stc.kernel(_mf(molecule), scope="system", frozen=frozen,
                                     controls=_controls())) == 0
@@ -124,16 +125,7 @@ def test_empty_active_spaces_add_hf_once_without_fitting_or_backend(molecule, mo
 
 def test_system_matches_native_dfmp2_with_frozen_and_coordinate_response(molecule, monkeypatch):
     from pyscfad.dlno_stc.adjoint import fix_restart_mo_phases as _fix_restart_mo_phases
-    from pyscfad.dlno_stc import exchange
     from pyscfad.mp import dfmp2
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("system scope reached domain construction or STC disk exchange")
-    monkeypatch.setattr(driver, "rebuild_domain_data", forbidden)
-    monkeypatch.setattr(driver, "prepare_boys_group_inputs", forbidden)
-    monkeypatch.setattr(driver, "weak_pair_indices", forbidden)
-    for name in ("read_input", "read_result", "write_input", "write_result"):
-        monkeypatch.setattr(exchange, name, forbidden)
 
     controls = _controls()
     with (config_update("pyscfad_scf_implicit_diff", True),
@@ -183,14 +175,30 @@ def test_system_matches_native_dfmp2_with_frozen_and_coordinate_response(molecul
                                atol=1e-6, rtol=0)
 
 
-def test_system_rejects_nonpositive_fitting_metric_before_transform(molecule):
-    from pyscfad.df import addons
-
+def test_system_uses_same_domain_path_as_molecular_fragment(molecule, monkeypatch):
     mf = _mf(molecule)
-    # Cached preparation must validate the auxiliary molecule it actually
-    # uses, rather than a regenerated molecule from the original auxbasis.
-    bad_basis = {symbol: [[0, [1.0, 1.0]], [0, [1.0, 1.0]]]
-                 for symbol in ("O", "H")}
-    mf.with_df.auxmol = addons.make_auxmol(mf.mol, bad_basis)
-    with pytest.raises(NotImplementedError, match="positive.definite"):
-        dlno_stc.kernel(mf, scope="system", frozen=1, controls=_controls())
+    static = dlno_stc.build_domain_selections(mf, frozen=1, scope="system")
+    assert static.physical_groups == (tuple(range(4)),)
+    seen = []
+    def forbidden_w(*args, **kwargs):
+        raise AssertionError('standalone MP2 must not compute W or its pullback')
+    monkeypatch.setattr(backend, 'solve_matrices', forbidden_w)
+    monkeypatch.setattr(backend, 'pullback_matrices', forbidden_w)
+    solve = backend.solve
+
+    def selected_solve(inputs, metadata, controls, **kwargs):
+        assert kwargs.get("scope", "domain") == "domain"
+        assert metadata["target_indices"] == (0, 1, 2, 3)
+        seen.append(kwargs["with_grad"])
+        return solve(inputs, metadata, controls, **kwargs)
+
+    monkeypatch.setattr(backend, "solve", selected_solve)
+    explicit = dlno_stc.kernel(mf, static, controls=_controls())
+    automatic = dlno_stc.kernel(mf, scope="system", frozen=1, controls=_controls())
+    energy, bar = dlno_stc.value_and_grad(
+        molecule, _mf, scope="system", frozen=1, controls=_controls())
+    expected, expected_bar = dlno_stc.value_and_grad(
+        molecule, _mf, static, controls=_controls())
+    np.testing.assert_allclose([automatic, energy, expected], explicit, atol=2e-10, rtol=0)
+    np.testing.assert_allclose(bar.coords, expected_bar.coords, atol=2e-8, rtol=0)
+    assert seen == [False, False, True, True]

@@ -1,7 +1,7 @@
-"""Physical retained/discarded D/W subspace response for truncated LIS ranks.
+"""Physical retained/discarded W subspace response for truncated LIS ranks.
 
 This is independent of the internal orbital gauge: full-Fock smooth frames have
-no Fock cluster projectors, but a truncated LIS must still follow its D/W space.
+no Fock cluster projectors, but a truncated LIS must still follow its W space.
 """
 from functools import lru_cache
 

@@ -884,7 +884,7 @@ def _screen_pair_response(endpoints, static, forced, exact_scores, response):
     return weak
 
 
-def screen_pairs(mf, common, static, model='multipole', force_full_domains=False,
+def screen_pairs(mf, common, static, model='multipole', full_domain=False,
                  *, prepared_endpoints=None, _products_preparation=None, _products=None,
                  _pair_response=None, correlation_auxbasis=None, _reference_endpoints=None,
                  _primary_preparations=None):
@@ -918,7 +918,7 @@ def screen_pairs(mf, common, static, model='multipole', force_full_domains=False
         _pair_response.clear()
         _pair_response.update(pairs=(), energy=jnp.zeros(()), endpoint_bars={})
     nfrag = len(static.fragments)
-    if force_full_domains or static.thresholds.pair_energy <= 0 or model in ('all', 'all-strong'):
+    if full_domain or static.thresholds.pair_energy <= 0 or model in ('all', 'all-strong'):
         return (np.zeros((nfrag, nfrag)), np.zeros((nfrag, nfrag)),
                 np.ones((nfrag, nfrag), dtype=bool), np.ones((nfrag, nfrag), dtype=bool))
     order = static.thresholds.multipole_order

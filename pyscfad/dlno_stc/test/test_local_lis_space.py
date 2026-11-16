@@ -1,4 +1,5 @@
 """Domain LIS selection, target weights, and independent coordinate checks."""
+from pyscfad.dlno_stc.test._cc_options import cc_options
 from dataclasses import replace
 
 import jax
@@ -23,7 +24,7 @@ def test_domain_lis_reaches_optional_amplitude_solver(molecular_case, monkeypatc
     index = case.indices[0]
     targets = dict(ccsd._group_cc_fragments(case.static, case.group))[index]
     forward = ccsd.backend.solve_matrices(host,
-        {'fragment_id': index, 'target_indices': targets}, case.controls, matrix_kind='W')
+        {'fragment_id': index, 'target_indices': targets}, case.controls)
     static = ccsd._select_current_fragment(state, case.static, index, case.group, frame, forward)
     matrices = {name: jnp.asarray(forward[name]) for name in ('occupied', 'virtual')}
     selected = lis.build_fragment_lis(case.mf, state['common'], static.lis_static,
@@ -56,7 +57,7 @@ def test_domain_lis_reaches_optional_amplitude_solver(molecular_case, monkeypatc
     np.testing.assert_allclose(actual, expected, atol=1e-12, rtol=0)
 
 
-@pytest.mark.parametrize('kind', ['D', 'W'])
+@pytest.mark.parametrize('kind', ['W'])
 @pytest.mark.parametrize('cutoff', [.45, 0., 1e-30])
 def test_domain_selection_keeps_targets_and_stays_in_ed(molecular_case, monkeypatch, kind, cutoff):
     case = molecular_case
@@ -71,12 +72,12 @@ def test_domain_selection_keeps_targets_and_stays_in_ed(molecular_case, monkeypa
     assert not hasattr(lis, '_domain_maps')
     index = case.indices[0]
     selected = lis.build_fragment_lis_selection(case.mf, case.domains, index,
-        common=common, frame=frame, matrices=matrices, matrix_kind=kind,
-        thresh_occ=cutoff, thresh_vir=cutoff, lis_space='domain')
+        common=common, frame=frame, matrices=matrices,
+        thresh_occ=cutoff, thresh_vir=cutoff)
     fragments = [None]*len(case.static.fragments)
     fragments[index] = selected
-    static = lis.LISSelections(case.domains, kind, cutoff, cutoff, 1e-6,
-                               tuple(fragments), lis_space='domain')
+    static = lis.LISSelections(case.domains, cutoff, cutoff, 1e-6,
+                               tuple(fragments))
     value = lis.build_fragment_lis(case.mf, common, static, index, matrices=matrices, frame=frame)
     co, cv = value.active_occupied_coeff, value.active_virtual_coeff
     overlap = common.s1e
@@ -84,7 +85,7 @@ def test_domain_selection_keeps_targets_and_stays_in_ed(molecular_case, monkeypa
     np.testing.assert_allclose(all_coeff.T@overlap@all_coeff, np.eye(all_coeff.shape[1]), atol=2e-12)
     outside = np.setdiff1d(np.arange(case.mf.mol.nao), frame.extended_ao_indices)
     np.testing.assert_array_equal(all_coeff[outside], 0.)
-    anchor = value.fragment_occupied_anchor
+    anchor = value.fragment_iao_coeff
     projection = anchor.T@overlap@co
     np.testing.assert_allclose(anchor.T@overlap@anchor, np.eye(anchor.shape[1]), atol=2e-12)
     np.testing.assert_allclose(projection@projection.T, np.eye(anchor.shape[1]), atol=2e-12)
@@ -98,7 +99,7 @@ def test_domain_selection_keeps_targets_and_stays_in_ed(molecular_case, monkeypa
         assert co.shape[1] <= no
     cc_static = replace(case.static, lis_static=static)
     assert ccsd._fragment_dimensions(cc_static, index) == (co.shape[1], cv.shape[1])
-    with pytest.raises(ValueError, match="Only lis_space='domain'"):
+    with pytest.raises(TypeError, match="lis_space"):
         lis.build_fragment_lis(case.mf, common, replace(static, lis_space='global'), index,
                               matrices=matrices, frame=frame)
 
@@ -111,18 +112,18 @@ def test_domain_gradient_finite_difference_and_forward_one_pass(molecular_case, 
     from pyscfad.lno.ccsd import RCCSD
     monkeypatch.setattr(RCCSD, 'conv_tol', 1e-11)
     monkeypatch.setattr(RCCSD, 'conv_tol_normt', 1e-9)
-    static = ccsd.build_static_selections(case.mf, case.domains, matrix_kind='W',
-        thresh_occ=1e-4, thresh_vir=3e-5, baseline_controls=case.controls,
-        matrix_controls=case.controls, lis_space='domain', fragment_indices=case.indices,
-        single_pass=False)
+    static = ccsd.build_static_selections(case.mf, case.domains,
+        thresh_occ=1e-4, thresh_vir=3e-5, **cc_options(case.controls, case.controls),)
+    from pyscfad.dlno_stc.test._saved_selection import save_from_run
+    static = save_from_run(case.mf, static)
     receipts = []
     close = _df_shared.LocalDFReverse.close
     def closed(scope):
         receipts.append(dict(scope.receipt))
         close(scope)
     monkeypatch.setattr(_df_shared.LocalDFReverse, 'close', closed)
-    options = dict(baseline_controls=case.controls, matrix_controls=case.controls,
-        fragment_indices=case.indices, include_baseline=False, ccsd_t=True,
+    options = dict(**cc_options(case.controls, case.controls),
+          ccsd_t=True,
         triples_controls=dict(mode='deterministic', integral_transform='rotate'))
     with (config_update('pyscfad_scf_implicit_diff', True),
           config_update('pyscfad_scf_first_order_custom', False)):
@@ -138,26 +139,25 @@ def test_domain_gradient_finite_difference_and_forward_one_pass(molecular_case, 
             energies.append(float(ccsd.kernel(accept.build_mf(mol), static, **options)))
     finite_difference = (energies[0]-energies[1])/(2*step)
     np.testing.assert_allclose(gradient.coords[1, 1], finite_difference, atol=2e-7, rtol=3e-4)
-    assert len(receipts) == 3
+    groups = len(ccsd.build_domain_groups(case.domains))
+    assert len(receipts) == 3*groups
     assert all(r['raw_source_passes'] == r['raw_integral_builds'] == r['half_builds'] == 1
                for r in receipts)
     assert all(r['half_rotations'] == len(case.indices) for r in receipts)
-    assert receipts[0]['half_pullbacks'] == 1+len(case.indices)
-    assert all(r['half_pullbacks'] == 0 for r in receipts[1:])
+    assert all(r['half_pullbacks'] == 1+len(case.indices) for r in receipts[:groups])
+    assert all(r['half_pullbacks'] == 0 for r in receipts[groups:])
     accept.record_result('domain_finite_difference', dict(energy=float(value),
         analytic=float(gradient.coords[1, 1]), finite_difference=finite_difference,
         receipts=receipts))
 
 
-def test_density_selection_conventional_triples_and_restart(molecular_case, monkeypatch, tmp_path):
-    """The D prepass and semicanonical solver use the same domain-only layout."""
+def test_smooth_selection_triples_and_restart(molecular_case, monkeypatch, tmp_path):
+    """Concrete W selections preserve smooth frames through restart."""
     from pyscfad.dlno_stc._restart import RestartManager
     case = molecular_case
     monkeypatch.setenv('PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE', 'half')
-    static = ccsd.build_static_selections(case.mf, case.domains, matrix_kind='D',
-        thresh_occ=1e-4, thresh_vir=3e-5, baseline_controls=case.controls,
-        matrix_controls=case.controls, lis_space='domain', smooth=False,
-        fragment_indices=case.indices, single_pass=False)
+    static = ccsd.build_static_selections(case.mf, case.domains,
+        thresh_occ=1e-4, thresh_vir=3e-5, **cc_options(case.controls, case.controls),)
     manager = RestartManager(tmp_path, resume=False, method='domain-lis-test',
                              scientific_payload={'lis_space': 'domain'})
     try:
@@ -170,12 +170,10 @@ def test_density_selection_conventional_triples_and_restart(molecular_case, monk
         restored = manager.load_static(expected_type=type(static))
     finally:
         manager.close()
-    assert restored.lis_static.lis_space == 'domain'
-    assert all(restored.fragments[i].lis_space == 'domain' for i in case.indices)
     state = ccsd.driver._initialize(case.mf, case.domains, case.controls, with_grad=False)
     records = ccsd._run_group(state, restored, case.group, case.controls, case.controls,
-        with_grad=False, verbose_imp=0, ccsd_t=True, include_baseline=False,
-        fragment_indices=case.indices,
+        with_grad=False, verbose_imp=0, ccsd_t=True,
+
         triples_controls=ccsd.normalize_triples_controls(None, ccsd_t=True))
     assert len(records) == len(case.indices)
     assert all(np.isfinite([row.e_ccsd, row.e_mp2_lis, row.e_triples]).all() for row in records)

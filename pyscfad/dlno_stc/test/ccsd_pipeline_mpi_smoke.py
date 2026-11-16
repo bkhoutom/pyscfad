@@ -1,4 +1,5 @@
 """Small single-pass CC owner jobs, including workers with no assigned domain."""
+from pyscfad.dlno_stc.test._cc_options import cc_options
 import argparse
 from contextlib import ExitStack
 from dataclasses import replace
@@ -7,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 
-def run(output, *, serial=False, gradient=False, include_baseline=False,
+def run(output, *, serial=False, gradient=False,
         invalid=False, parallel_scf_jk=False):
     import jax
     import numpy as np
@@ -25,7 +26,7 @@ def run(output, *, serial=False, gradient=False, include_baseline=False,
     # This is the explicit test budget; production memory policy is unchanged.
     mol.max_memory = 8000
     controls = dict(accept.controls(), threads=1)
-    selected = (0, 2)  # One physical fragment in each of the two finite domains.
+    selected = tuple(range(8))
     observations = dict(groups=[], selected=[], forward=[], reverse=[], scf=0,
                         skeleton=0, service_forward=0, local_df=[])
     active_group = None
@@ -37,9 +38,8 @@ def run(output, *, serial=False, gradient=False, include_baseline=False,
 
     def build_static(mf):
         plan = ccsd.build_static_selections(
-            mf, accept.selection(mf), matrix_kind='W', thresh_occ=1e-4,
-            thresh_vir=3e-5, baseline_controls=controls, matrix_controls=controls,
-            fragment_indices=selected, single_pass=True)
+            mf, accept.selection(mf), thresh_occ=1e-4,
+            thresh_vir=3e-5, **cc_options(controls, controls),)
         assert all(item is None for item in plan.fragments)
         assert plan.mp2_fragment_energies is None
         plans.append(plan)
@@ -49,7 +49,7 @@ def run(output, *, serial=False, gradient=False, include_baseline=False,
     def group(state, static, current, *args, **kwargs):
         nonlocal active_group
         assert mpi_df_jk.get_active_executor() is None
-        assert static.deferred_selection is not None
+        assert static.selection_options is not None
         assert all(item is None for item in static.fragments)
         active_group = current.representative_index
         observations['groups'].append(active_group)
@@ -63,7 +63,7 @@ def run(output, *, serial=False, gradient=False, include_baseline=False,
         assert active_group == current.representative_index
         observations['selected'].append(index)
         concrete = original_select(state, static, index, current, *args)
-        assert concrete.deferred_selection is None
+        assert concrete.selection_options is None
         assert concrete.fragments[index] is not None
         assert all(item is None for i, item in enumerate(concrete.fragments) if i != index)
         assert concrete.controls_identity == static.controls_identity
@@ -94,9 +94,9 @@ def run(output, *, serial=False, gradient=False, include_baseline=False,
         assert active_group is not None
         observations['local_df'].append(dict(group=active_group, **scope.receipt))
 
-    options = dict(baseline_controls=controls, matrix_controls=controls,
-                   ccsd_t=True, fragment_indices=selected,
-                   include_baseline=include_baseline, return_components=True,
+    options = dict(**cc_options(controls, controls),
+                   ccsd_t=True,
+                    return_components=True,
                    triples_controls=dict(mode='stochastic', nsamples=16,
                        pilot_samples=16, global_seed=71, integral_transform='rotate',
                        variance_allocation='occupied_count', energy_tolerance=1e-3),
@@ -126,13 +126,13 @@ def run(output, *, serial=False, gradient=False, include_baseline=False,
                 cases = (
                     ('schema', 'incompatible CC selection schema'),
                     ('controls', 'scientific controls differ'),
-                    ('triples', 'single-pass W requires occupied_count'),
+                    ('triples', 'the W pipeline requires occupied_count'),
                 )
                 for kind, expected in cases:
                     current = replace(static, schema_version=-1) if rank == 0 and kind == 'schema' else static
                     settings = dict(options)
                     if kind == 'controls':
-                        settings['matrix_controls'] = dict(controls, global_seed=99)
+                        settings['matrix_controls'] = dict(options['matrix_controls'], global_seed=99)
                     if kind == 'triples':
                         settings['triples_controls'] = dict(options['triples_controls'], variance_allocation='mp2_energy')
                     try:
@@ -157,7 +157,7 @@ def run(output, *, serial=False, gradient=False, include_baseline=False,
             assert all(row['skeleton'] == 1 + int(service_enabled) for row in gathered[1:])
         if not invalid:
             assert all((row['service_forward'] > 0) == service_enabled for row in gathered)
-            expected_forward = list(range(8)) if include_baseline else list(selected)
+            expected_forward = list(selected)
             assert sorted(i for row in gathered for i in row['forward']) == expected_forward
             assert sorted(i for row in gathered for i in row['selected']) == list(selected)
             assert sorted(i for row in gathered for i in row['reverse']) == (expected_forward if gradient else [])
@@ -170,14 +170,14 @@ def run(output, *, serial=False, gradient=False, include_baseline=False,
                 assert receipt['cache_mode'] == 'half'
                 assert receipt['raw_source_passes'] == receipt['half_builds'] == 1
                 assert receipt['metric_builds'] == receipt['cholesky_builds'] == 1
-                assert receipt['half_rotations'] == 1
+                assert receipt['half_rotations'] == 4
                 assert receipt['geometry_passes'] == receipt['metric_passes'] == int(gradient)
                 assert receipt['half_resident_bytes'] == 0
             if comm.size > 2:
                 assert all(not row['groups'] and not row['selected'] and not row['forward']
                            for row in gathered[2:])
             if comm.size > 1:
-                assert gathered[1]['selected'] == [2]
+                assert gathered[1]['selected'] == [2, 3, 6, 7]
             if gradient:
                 energy, bar, components = result
                 values['gradient'] = np.asarray(bar.coords).tolist()
@@ -212,7 +212,6 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--serial', action='store_true')
     parser.add_argument('--gradient', action='store_true')
-    parser.add_argument('--include-baseline', action='store_true')
     parser.add_argument('--invalid', action='store_true')
     parser.add_argument('--parallel-scf-jk', action='store_true')
     args = parser.parse_args()

@@ -1,4 +1,5 @@
 """The complete serial reverse merges global DF seeds at their producer."""
+from pyscfad.dlno_stc.test._cc_options import cc_options
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -136,9 +137,8 @@ def test_public_w_ccsd_stochastic_triples_combines_global_response(
         with eager_gmres():
             mf.kernel()
         return mf
-    static = ccsd.build_static_selections(case.mf, case.domains, matrix_kind='W',
-        thresh_occ=1e-4, thresh_vir=3e-5, baseline_controls=case.controls,
-        matrix_controls=case.controls, single_pass=True, lis_space='domain')
+    static = ccsd.build_static_selections(case.mf, case.domains,
+        thresh_occ=1e-4, thresh_vir=3e-5, **cc_options(case.controls, case.controls),)
     receipts = []
     finish = _ooc_cotangent.GeometryScope.finish
     def finished(scope, bar):
@@ -150,8 +150,8 @@ def test_public_w_ccsd_stochastic_triples_combines_global_response(
     for enabled in ('0', '1'):
         monkeypatch.setenv('PYSCFAD_STC_COMBINE_SCF_DF', enabled)
         results.append(ccsd.value_and_grad(case.mf.mol, build, static,
-            baseline_controls=case.controls, matrix_controls=case.controls,
-            fragment_indices=case.indices[:1], include_baseline=False,
+            **cc_options(case.controls, case.controls),
+
             ccsd_t=True, return_components=True,
             triples_controls=dict(mode='stochastic', integral_transform='rotate',
                 nsamples=16, pilot_samples=16, energy_tolerance=1e-3, global_seed=71)))

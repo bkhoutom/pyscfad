@@ -5,7 +5,7 @@ find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)
 find_package(Armadillo REQUIRED)
 find_package(OpenMP REQUIRED COMPONENTS CXX)
-pybind11_add_module(_stc_mp2 NO_EXTRAS bindings.cpp stc_mp2_kernel.cpp stc_mp2_gradient.cpp stc_mp2_full.cpp stc_mp2_selected.cpp stc_mp2_matrices.cpp
+pybind11_add_module(_stc_mp2 NO_EXTRAS bindings.cpp stc_mp2_gradient.cpp stc_mp2_selected.cpp stc_mp2_matrices.cpp
     native/stc_mp2_kernel_numerical.cpp native/stc_mp2_gradient_numerical.cpp
     stc_triples_bindings.cpp stc_triples_dressing.cpp native/stc_triples_asymmetric.C)
 target_compile_features(_stc_mp2 PRIVATE cxx_std_14)
@@ -24,6 +24,9 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+    # Keep an independent full-system oracle out of production builds.
+    target_sources(_stc_mp2 PRIVATE test_reference/stc_mp2_kernel.cpp test_reference/stc_mp2_full.cpp)
+    target_compile_definitions(_stc_mp2 PRIVATE PYSCFAD_STC_TEST_REFERENCE=1)
     add_executable(test_w_eigenbasis test_w_eigenbasis.cpp)
     target_compile_features(test_w_eigenbasis PRIVATE cxx_std_14)
     target_include_directories(test_w_eigenbasis PRIVATE ${ARMADILLO_INCLUDE_DIRS})

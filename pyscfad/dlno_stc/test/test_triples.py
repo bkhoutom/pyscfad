@@ -1,4 +1,5 @@
 """Triples controls/checkpoints and independent deterministic LNO references."""
+from pyscfad.dlno_stc.test._cc_options import cc_options
 import importlib
 import inspect
 import os
@@ -167,7 +168,7 @@ def test_component_triples_uncertainty_is_separate_from_baseline():
     assert f.triples_standard_error == 0. and f.triples_samples == 0
     assert f.triples_timings is None
     rows = (replace(f, triples_standard_error=.03), replace(f, fragment_index=1, triples_standard_error=.04))
-    report = ccsd.CCSDComponents(-5., 0., rows, 'D', .8)
+    report = ccsd.CCSDComponents(-5., 0., rows, 'W', .8)
     assert report.triples_standard_error == pytest.approx(.05)
     assert report.baseline_standard_error == .8
     assert report.e_corr == pytest.approx(-7.2)
@@ -183,11 +184,11 @@ def checkpoint_reference():
     mol = gto.Mole(atom='O 0 0 0; H .1 -.75 .57; H 0 .8 .61', basis='sto-3g', verbose=0)
     mol.build(trace_exp=False, trace_ctr_coeff=False)
     mf = build_mf(mol)
-    domain = build_domain_selections(mf, frozen=1, force_full_domains=True,
+    domain = build_domain_selections(mf, frozen=1, full_domain=True,
         lo_kwargs={'conv_tol': 1e-12, 'conv_tol_grad': 1e-9})
     settings = {'mode': 'deterministic', 'threads': 1}
-    static = ccsd.build_static_selections(mf, domain, smooth=False, matrix_kind='D', thresh_occ=0., thresh_vir=0.,
-        baseline_controls=settings, matrix_controls=settings, single_pass=False)
+    static = ccsd.build_static_selections(mf, domain, thresh_occ=0., thresh_vir=0.,
+        **cc_options(settings, settings))
     return mf, static
 
 
@@ -234,7 +235,7 @@ def test_group_carries_triples_diagnostics_through_response(monkeypatch, with_gr
     x = full_fixture()
     base = ccsd.driver._driver_controls({'mode': 'deterministic', 'threads': 1})
     group = SimpleNamespace(representative_index=0, fragment_indices=(0,), target_indices=(0,))
-    static = SimpleNamespace(mp2_static=SimpleNamespace(frag_lolist=((0,),), fragments=(None,)), matrix_kind='D')
+    static = SimpleNamespace(mp2_static=SimpleNamespace(frag_lolist=((0,),), fragments=(None,)))
     settings = {'mode': 'stochastic', 'nsamples': 2, 'global_seed': 71}
     def prepare(mf, common):
         return {k: jnp.asarray(v) * (1 + .07 * mf + .03 * common) for k, v in x.items()}
@@ -263,7 +264,7 @@ def test_group_carries_triples_diagnostics_through_response(monkeypatch, with_gr
                  variance=0., mf_bar=jnp.zeros(()), common_bar=jnp.zeros(()))
     records = ccsd._run_group(state, static, group, base, {'mode':'deterministic', 'threads':1},
         with_grad=with_grad, verbose_imp=0, ccsd_t=True, triples_controls=settings,
-        include_baseline=False, fragment_indices=(0,))
+        )
     row, = records
     assert row.triples_method == 'stochastic'
     assert row.triples_standard_error == .003 and row.triples_samples == 2
@@ -280,13 +281,12 @@ def test_group_carries_triples_diagnostics_through_response(monkeypatch, with_gr
         assert abs(float(state['mf_bar'])) > 0. and abs(float(state['common_bar'])) > 0.
 
 
-def test_deterministic_default_resume_accepts_explicit_mode_without_new_native(tmp_path, monkeypatch, checkpoint_reference):
+def test_deterministic_default_resume_accepts_explicit_mode(tmp_path, checkpoint_reference):
     from pyscfad.dlno_stc import _stc_mp2
     mf, static = checkpoint_reference
-    monkeypatch.delattr(_stc_mp2, 'TRIPLES_VERSION', raising=False)
     settings = {'mode': 'deterministic', 'threads': 1}
-    options = dict(baseline_controls=settings, matrix_controls=settings, ccsd_t=True,
-                   fragment_indices=(0,), include_baseline=False, return_components=True,
+    options = dict(**cc_options(settings, settings), ccsd_t=True,
+                     return_components=True,
                    checkpoint_dir=tmp_path)
     default = ccsd.kernel(mf, static, **options)
     explicit = ccsd.kernel(mf, static, triples_controls={'mode':'deterministic'}, resume=True, **options)
@@ -374,7 +374,7 @@ def test_cc_checkpoint_rejects_changed_ladder_mode(tmp_path, checkpoint_referenc
     from pyscfad.dlno_stc._restart import RestartMismatchError
     mf, static = checkpoint_reference
     controls = {'mode': 'deterministic', 'threads': 1}
-    options = dict(baseline_controls=controls, matrix_controls=controls,
+    options = dict(**cc_options(controls, controls),
                    checkpoint_dir=tmp_path, ccsd_t=False)
     energy = ccsd.kernel(mf, static, vvvv_direct=False, **options)
     assert np.isfinite(energy)

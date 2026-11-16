@@ -81,11 +81,10 @@ def test_empty_virtual_and_empty_occupied_cases():
 
 
 def test_serial_sampled_backend_adds_deterministic_term_once():
-    from pyscfad.dlno_stc.parallel import run_backend
     from pyscfad.dlno_stc.test.reference import sampled_backend
     x = packet()
     controls = {"global_seed": 19, "sample_blocks": 7}
-    result = run_backend(x, metadata(), controls, sampled_backend)
+    result = sampled_backend(x, metadata(), controls)
     coefficients = [1.0 + 0.25 * np.sin(19 + block) for block in range(7)]
     factor = 0.125 + np.mean(coefficients)
     assert result["energy"] == pytest.approx(factor * quadratic_energy(x))
@@ -94,11 +93,6 @@ def test_serial_sampled_backend_adds_deterministic_term_once():
     assert result["metadata"]["actual_sample_count"] == 7
 
 
-def test_serial_preflight_rejects_zero_total_samples():
-    from pyscfad.dlno_stc.parallel import run_backend
-    from pyscfad.dlno_stc.test.reference import sampled_backend
-    with pytest.raises(ValueError, match="sample_blocks"):
-        run_backend(packet(), metadata(), {"sample_blocks": 0}, sampled_backend)
 
 
 def test_nondiagonal_target_matches_independent_linear_amplitude_solve():

@@ -4,6 +4,25 @@
 #include "triples_one_permutation.inc"
 #include "triples_grouped_adjoint.inc"
 
+struct triples_thread_usage {
+#if defined(__linux__)
+    rusage usage{};
+    explicit triples_thread_usage(bool enabled) {if(enabled) getrusage(RUSAGE_THREAD,&usage);}
+    void accumulate(const triples_thread_usage& start,triples_right_profile& out) const {
+        auto seconds=[](timeval t) {return double(t.tv_sec)+double(t.tv_usec)*1e-6;};
+        out.cpu_seconds+=seconds(usage.ru_utime)+seconds(usage.ru_stime)
+            -seconds(start.usage.ru_utime)-seconds(start.usage.ru_stime);
+        out.minor_faults+=usage.ru_minflt-start.usage.ru_minflt;
+        out.major_faults+=usage.ru_majflt-start.usage.ru_majflt;
+        out.voluntary_switches+=usage.ru_nvcsw-start.usage.ru_nvcsw;
+        out.involuntary_switches+=usage.ru_nivcsw-start.usage.ru_nivcsw;
+    }
+#else
+    explicit triples_thread_usage(bool) {}
+    void accumulate(const triples_thread_usage&,triples_right_profile&) const {}
+#endif
+};
+
 struct triples_stream_bank {
     std::vector<tensor> tensors;
     std::unique_ptr<triples_bar_locks> locks;
@@ -22,7 +41,8 @@ struct triples_stream_bank {
 stc_triples::triples_result triples_stream_kernel(const stc_triples::triples_prepared& left,
         const std::vector<const stc_triples::triples_prepared*>& points,
         const std::vector<double>& weights,size_t workspace_limit,size_t requested_batch,
-        std::vector<double>& point_energies,std::vector<stc_triples::triples_vjp>* vjps) {
+        std::vector<double>& point_energies,std::vector<stc_triples::triples_vjp>* vjps,
+        bool profile_right) {
     const double started=omp_get_wtime();
     const bool gradient=vjps!=nullptr;
     const size_t no=left.no,nv=left.nv,ns=left.ns,cube=nv*nv*nv;
@@ -67,6 +87,12 @@ stc_triples::triples_result triples_stream_kernel(const stc_triples::triples_pre
     if(!mkl) workers=1;
 #endif
     stc_triples::triples_result result{};
+    result.right_profile_enabled=profile_right;
+    result.point_right_wall_seconds.resize(points.size(),0.);
+    result.point_right_batch_wall_seconds.resize(points.size());
+    result.point_right_profiles.resize(points.size());
+    std::vector<std::vector<triples_right_profile>> point_profiles(
+        size_t(workers),std::vector<triples_right_profile>(points.size()));
     std::vector<double> energies(blocks.size()*points.size());
     std::vector<std::array<double,3>> worker_times(size_t(workers),{0.,0.,0.});
     std::vector<arma::vec> ket(batch_size),ket_bar(gradient ? batch_size : 0);
@@ -74,7 +100,7 @@ stc_triples::triples_result triples_stream_kernel(const stc_triples::triples_pre
     for(auto& value:ket_bar) value.set_size(cube);
     triples_adjoint_plan plan;
     std::vector<size_t> calls(size_t(workers),0),reductions(size_t(workers),0);
-    double stage_start=0.;
+    double stage_start=0.,point_start=0.;
     std::exception_ptr failure;std::mutex error_lock;std::atomic<bool> failed{false};
     auto record_failure=[&]() {
         std::lock_guard<std::mutex> guard(error_lock);
@@ -119,7 +145,12 @@ stc_triples::triples_result triples_stream_kernel(const stc_triples::triples_pre
             #pragma omp single
             {result.left_build_wall_seconds+=omp_get_wtime()-stage_start;stage_start=omp_get_wtime();}
             for(size_t q=0;q<points.size();++q) {
-                #pragma omp for schedule(dynamic,1)
+                #pragma omp single
+                point_start=omp_get_wtime();
+                auto& point_profile=point_profiles[worker][q];
+                auto* profile=profile_right ? &point_profile : nullptr;
+                const triples_thread_usage usage_start(profile_right);
+                #pragma omp for schedule(dynamic,1) nowait
                 for(size_t index=0;index<count;++index) {
                     if(failed) continue;
                     try {
@@ -134,22 +165,37 @@ stc_triples::triples_result triples_stream_kernel(const stc_triples::triples_pre
                             if(swap) std::swap(oriented.x[1],oriented.x[2]);
                             for(size_t p=0;p<3;++p) {
                                 const auto op=quadrature_describe(layout,permute(oriented,p,true),1);
-                                triples_raw_block(bank,op,no,nv,false,raw,nullptr,nullptr,&workspace);
+                                triples_raw_block(bank,op,no,nv,false,raw,nullptr,nullptr,&workspace,false,profile);
                                 energy+=quadrature_right(tmp,gradient ? &ket_bar[index] : nullptr,raw,ket[index],
-                                    bank,op,nv,p,bool(swap),factor,gradient,workspace);
+                                    bank,op,nv,p,bool(swap),factor,gradient,workspace,profile);
                                 if(gradient) {
-                                    quadrature_singles_store(bank,op,nv,workspace,locks);
-                                    triples_raw_block(bank,op,no,nv,false,raw,&tmp,&locks,&workspace,true);
+                                    quadrature_singles_store(bank,op,nv,workspace,locks,profile);
+                                    triples_raw_block(bank,op,no,nv,false,raw,&tmp,&locks,&workspace,true,profile);
                                 }
                             }
                         }
                         energies[(first+index)*points.size()+q]=energy;
-                        times[1]+=omp_get_wtime()-tick;
+                        const double elapsed=omp_get_wtime()-tick;
+                        times[1]+=elapsed;point_profile.worker_seconds+=elapsed;
+                        ++point_profile.blocks;
                     } catch(...) {record_failure();}
+                }
+                const double barrier_start=profile_right ? omp_get_wtime() : 0.;
+                #pragma omp barrier
+                if(profile_right) {
+                    point_profile.barrier_seconds+=omp_get_wtime()-barrier_start;
+                    triples_thread_usage(true).accumulate(usage_start,point_profile);
+                }
+                #pragma omp single
+                {
+                    const double elapsed=omp_get_wtime()-point_start;
+                    result.point_right_wall_seconds[q]+=elapsed;
+                    result.point_right_batch_wall_seconds[q].push_back(elapsed);
+                    result.right_wall_seconds+=elapsed;
                 }
             }
             #pragma omp single
-            {result.right_wall_seconds+=omp_get_wtime()-stage_start;stage_start=omp_get_wtime();}
+            stage_start=omp_get_wtime();
             if(gradient) {
                 // K is dead after the last point. Reuse its storage for the
                 // main cotangent and K-bar storage for the alternate order.
@@ -204,6 +250,17 @@ stc_triples::triples_result triples_stream_kernel(const stc_triples::triples_pre
     for(const auto& t:worker_times) {
         result.left_build_worker_seconds+=t[0];result.right_worker_seconds+=t[1];
         result.left_reverse_worker_seconds+=t[2];
+    }
+    for(const auto& worker:point_profiles) for(size_t q=0;q<points.size();++q) {
+        const auto& src=worker[q];auto& dst=result.point_right_profiles[q];
+        dst.worker_seconds+=src.worker_seconds;dst.cpu_seconds+=src.cpu_seconds;
+        dst.barrier_seconds+=src.barrier_seconds;dst.blocks+=src.blocks;
+        dst.minor_faults+=src.minor_faults;dst.major_faults+=src.major_faults;
+        dst.voluntary_switches+=src.voluntary_switches;dst.involuntary_switches+=src.involuntary_switches;
+        for(size_t i=0;i<src.seconds.size();++i) dst.seconds[i]+=src.seconds[i];
+        for(size_t i=0;i<8;++i) {
+            dst.lock_wait[i]+=src.lock_wait[i];dst.store[i]+=src.store[i];dst.lock_calls[i]+=src.lock_calls[i];
+        }
     }
     result.deterministic_blocks=blocks.size();
     result.deterministic_workspace_bytes=workspace*size_t(result.sampling_threads);

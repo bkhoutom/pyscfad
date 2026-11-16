@@ -48,7 +48,6 @@ class FragmentLISSelection:
     full_occupied_space: bool
     full_virtual_space: bool
     occupied_map_columns: numpy.ndarray
-    lis_space: str = 'domain'
     parent_dimensions: tuple | None = None
 
 
@@ -58,21 +57,18 @@ class LISSelections:
 
     ``mp2_static`` holds :class:`DomainSelections`; its historical field name
     is part of the checkpoint format. Zero occupied or virtual LNO thresholds
-    retain the full corresponding ED parent space. ``lis_space`` records the
-    domain-only definition for checkpoint validation.
-    ``smooth_frames`` and ``smooth_grid``, when present, are tuples indexed
+    retain the full corresponding ED parent space.
+    ``smooth_frames`` and ``triples_grid``, when present, are tuples indexed
     by physical fragment. Empty or unselected fragments have None entries.
     """
 
     mp2_static: DomainSelections
-    matrix_kind: str
     thresh_occ: float
     thresh_vir: float
     internal_rank_threshold: float
     fragments: tuple[FragmentLISSelection, ...]
     smooth_frames: object = None
-    smooth_grid: object = None
-    lis_space: str = 'domain'
+    triples_grid: object = None
 
 
 @dataclass(frozen=True)
@@ -82,17 +78,15 @@ class FragmentLIS:
     All ``*_coeff`` arrays have global AO rows, with zeros outside the ED.
     ``mo_coeff`` contains LIS occupied then virtual columns; ``frozen`` is
     empty. The solver receives the explicit occupied LIS count. Projectors
-    and D/W blocks use the separately orthonormal ED coordinates. The virtual
+    and W blocks use the separately orthonormal ED coordinates. The virtual
     projector records LNO selection before occupied-LIS removal; final virtual
     coefficients additionally include that removal and normalization.
-    ``density_*_active`` are None; no global active-space density is formed.
-    Both target fields contain the normalized domain projection of the
+    The target field contains the normalized domain projection of the
     physical Boys block used for the fragment energy partition.
     """
 
     mo_coeff: object
     frozen: numpy.ndarray
-    fragment_occupied_anchor: object
     fragment_iao_coeff: object
     active_occupied_coeff: object
     active_virtual_coeff: object
@@ -100,32 +94,12 @@ class FragmentLIS:
     virtual_projector: object
     density_occupied_ed: object
     density_virtual_ed: object
-    density_occupied_active: object
-    density_virtual_active: object
     domain: BoysEDFrame
     n_internal_occ: int
     n_internal_vir: int
     n_lno_occ: int
     n_lno_vir: int
     original_occupied_coeff: object = None
-
-    @property
-    def orbfrag(self):
-        """Compatibility alias for the complete impurity MO layout."""
-
-        return self.mo_coeff
-
-    @property
-    def frzfrag(self):
-        """Compatibility alias for the impurity frozen indices."""
-
-        return self.frozen
-
-    @property
-    def orbfragloc(self):
-        """Normalized domain target block used by the fragment interface."""
-
-        return self.fragment_iao_coeff
 
 
 def _physical_target_block(common, static, fragment_index):
@@ -187,14 +161,6 @@ def _fixed_density_space(density, internal, keep, full_space):
     return np.concatenate((internal, lno), axis=1)
 
 
-def _semicanonical_space(coeff, fock):
-    """Diagonalize the Fock matrix within a possibly empty AO-space block."""
-
-    if coeff.shape[1] == 0:
-        return coeff
-    return lno_base.semicanonicalize(fock, coeff)[1]
-
-
 def _orthogonalize_lis_virtual(virtual, occupied, overlap):
     """Restore CC occupied/virtual orthogonality with a live metric response.
 
@@ -210,12 +176,6 @@ def _orthogonalize_lis_virtual(virtual, occupied, overlap):
     if not numpy.isfinite(pivots).all() or numpy.any(pivots ** 2 <= 1e-10):
         raise RuntimeError('LIS virtual projection loses rank; rebuild domain/LIS selections')
     return solve_triangular(chol, projected.T.conj(), lower=True).T.conj()
-
-
-def _validate_kind(matrix_kind):
-    if matrix_kind not in ('D', 'W'):
-        raise ValueError("matrix_kind must be 'D' or 'W'")
-    return matrix_kind
 
 
 def _validate_thresholds(thresh_occ, thresh_vir, internal_rank_threshold):
@@ -267,12 +227,6 @@ def _frame_and_matrices(common, static, index, frame, matrices):
             raise ValueError(f'matrices {name} block must have shape {(nspace, nspace)}')
         blocks.append(block)
     return frame, blocks[0], blocks[1]
-
-
-def _validate_lis_space(lis_space):
-    if lis_space != 'domain':
-        raise ValueError("Only lis_space='domain' is supported; rebuild domain-space LIS selections")
-    return lis_space
 
 
 def _domain_targets(common, domains, index, frame):
@@ -334,9 +288,9 @@ def _build_domain_lis(mf, common, static, index, frame, occupied, virtual):
             original_occupied = coeff
         else:
             coeff = _orthogonalize_lis_virtual(coeff, coefficients[0], common.s1e)
-        if frames is None:
-            coeff = _semicanonical_space(coeff, common.fock)
-        elif not split_occupied:
+        # With no anchors yet, return the physical LIS for concrete frame
+        # selection. Production transports the saved smooth anchors.
+        if frames is not None and not split_occupied:
             from .smooth import rebuild_frame
             coeff = rebuild_frame(coeff, common.s1e, frames[spin])
         parents.append(embedded)
@@ -346,12 +300,11 @@ def _build_domain_lis(mf, common, static, index, frame, occupied, virtual):
     co, cv = coefficients
     return FragmentLIS(
         mo_coeff=np.concatenate((co, cv), axis=1), frozen=numpy.zeros(0, dtype=numpy.int32),
-        fragment_occupied_anchor=anchor, fragment_iao_coeff=anchor,
+        fragment_iao_coeff=anchor,
         active_occupied_coeff=co, active_virtual_coeff=cv,
         occupied_projector=_hermitize(rotations[0] @ rotations[0].T.conj()),
         virtual_projector=_hermitize(rotations[1] @ rotations[1].T.conj()),
         density_occupied_ed=occupied, density_virtual_ed=virtual,
-        density_occupied_active=None, density_virtual_active=None,
         domain=frame, n_internal_occ=internal.shape[1], n_internal_vir=0,
         n_lno_occ=co.shape[1]-internal.shape[1], n_lno_vir=cv.shape[1],
         original_occupied_coeff=original_occupied)
@@ -433,11 +386,11 @@ def _mapped_density_space(density, mapping, internal, keep, coeff, overlap, anch
 
 
 def build_fragment_lis_selection(
-    mf, mp2_static, fragment_index, *, matrices, matrix_kind, common=None,
+    mf, mp2_static, fragment_index, *, matrices, common=None,
     frame=None, frame_fragment_index=None, thresh_occ=1e-4, thresh_vir=1e-5,
-    internal_rank_threshold=LIS_INTERNAL_RANK_THRESHOLD, lis_space='domain',
+    internal_rank_threshold=LIS_INTERNAL_RANK_THRESHOLD,
 ):
-    """Save target rank and LNO eigenvector labels from one supplied D/W pair.
+    """Save target rank and LNO eigenvector labels from one supplied W pair.
 
     This concrete reference step runs outside AD. A zero threshold selects
     the full corresponding ED parent manifold; otherwise the strict
@@ -445,8 +398,6 @@ def build_fragment_lis_selection(
     W examples should always set its occupied and virtual cutoffs explicitly.
     No density or native matrix provider is invoked by this function.
     """
-    _validate_kind(matrix_kind)
-    _validate_lis_space(lis_space)
     _validate_thresholds(thresh_occ, thresh_vir, internal_rank_threshold)
     index = _fragment_index(mp2_static, fragment_index)
     if common is None:
@@ -468,23 +419,19 @@ def build_fragment_lis_selection(
                                    thresh_vir, full_vir)
     return FragmentLISSelection(index, numpy.arange(internal.shape[1], dtype=numpy.int32),
         numpy.zeros(0, dtype=numpy.int32), occ_keep, vir_keep, full_occ, full_vir,
-        columns, lis_space='domain',
+        columns,
         parent_dimensions=(occupied.shape[0], virtual.shape[0]))
 
 
 def build_fragment_lis(mf, common, static, fragment_index, *, matrices,
-                       matrix_kind=None, frame=None, frame_fragment_index=None):
-    """Replay fixed LIS labels with current D/W blocks and the matching ED frame.
+                       frame=None, frame_fragment_index=None):
+    """Replay fixed LIS labels with current W blocks and the matching ED frame.
 
     The output contains only the domain LIS and its normalized target block.
-    D/W blocks, ED orbitals, target overlaps and retained orbitals respond to AD.
+    W blocks, ED orbitals, target overlaps and retained orbitals respond to AD.
     """
     if not isinstance(static, LISSelections):
         raise TypeError('static must be LISSelections')
-    kind = _validate_kind(static.matrix_kind)
-    _validate_lis_space(static.lis_space)
-    if matrix_kind is not None and _validate_kind(matrix_kind) != kind:
-        raise ValueError('matrix_kind does not match the saved LIS selections')
     _validate_thresholds(static.thresh_occ, static.thresh_vir, static.internal_rank_threshold)
     index = _fragment_index(static.mp2_static, fragment_index)
     selection = static.fragments[index]
@@ -492,7 +439,6 @@ def build_fragment_lis(mf, common, static, fragment_index, *, matrices,
         raise ValueError('obsolete LIS selection; rebuild domain-space selections')
     if selection.fragment_index != index:
         raise ValueError('fragment selection order is inconsistent')
-    _validate_lis_space(selection.lis_space)
     representative = (_physical_groups(static.mp2_static)[index][0] if frame_fragment_index is None
                       else frame_fragment_index)
     frame, occupied_ed, virtual_ed = _frame_and_matrices(

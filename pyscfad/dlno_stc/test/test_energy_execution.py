@@ -16,11 +16,10 @@ def _pools(api):
             if p['user_api'] == api}
 
 
-@pytest.mark.parametrize('scope', ['domain', 'system'])
 @pytest.mark.parametrize('with_grad', [False, True])
-def test_native_energy_blas_budget_and_restoration(monkeypatch, scope, with_grad):
+def test_native_energy_blas_budget_and_restoration(monkeypatch, with_grad):
     extension = native()
-    name = 'solve_selected' if scope == 'domain' else 'solve_full'
+    name = 'solve_selected'
     original = getattr(extension, name)
     seen = []
 
@@ -35,12 +34,15 @@ def test_native_energy_blas_budget_and_restoration(monkeypatch, scope, with_grad
         before = (_pools('blas'), _pools('openmp'))
         assert before[0]
         result = backend._solve_local(inputs, metadata, controls, with_grad=with_grad,
-                                      aux_offsets=None, scope=scope)
+                                      aux_offsets=None)
         assert (_pools('blas'), _pools('openmp')) == before
-        arguments = ((0,), controls) if scope == 'domain' else (controls,)
+        arguments = ((0,), controls)
         expected = original(*(inputs[k] for k in ('foo', 'fvv', 'B')), *arguments,
                             with_grad=with_grad)
-    assert set(seen[0][0].values()) == {2 if with_grad else 1}
+    if with_grad:
+        assert seen[0][0] == before[0]
+    else:
+        assert set(seen[0][0].values()) == {1}
     assert seen[0][1] == before[1]
     np.testing.assert_allclose(result['energy'], expected['energy'], atol=2e-13, rtol=0)
     if with_grad:

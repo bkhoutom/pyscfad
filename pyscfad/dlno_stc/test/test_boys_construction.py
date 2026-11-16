@@ -1,4 +1,5 @@
 """Ordered Boys construction: concrete labels and continuous local frames."""
+from pyscfad.dlno_stc.test import system_reference
 
 from dataclasses import replace
 from copy import copy
@@ -27,7 +28,7 @@ def test_public_selection_preserves_permuted_labels_and_concrete_anchors(referen
     assert hasattr(dlno_stc, "build_domain_selections")
     static = dlno_stc.build_domain_selections(
         reference, frozen=1, frag_lolist=[[3], [1], [0], [2]],
-        force_full_domains=True,
+        full_domain=True,
     )
     assert type(static).__module__ == "pyscfad.dlno_stc._selection"
     common = domain.rebuild_domain_data(reference, static)
@@ -55,7 +56,7 @@ def test_selection_rejects_invalid_target_partition_and_rank_loss(reference):
         dlno_stc.build_domain_selections(reference, frozen=1, frag_lolist=[[0, 1], [2], [3]])
     with pytest.raises(ValueError, match="orthonormal|span"):
         dlno_stc.build_domain_selections(reference, frozen=1, target_coeff=np.ones((7, 4)))
-    static = dlno_stc.build_domain_selections(reference, frozen=1, force_full_domains=True)
+    static = dlno_stc.build_domain_selections(reference, frozen=1, full_domain=True)
     common = domain.rebuild_domain_data(reference, static)
     fragment = replace(static.fragments[2], strong_occ_metric_keep=np.arange(3))
     broken = replace(static, fragments=static.fragments[:2] + (fragment,) + static.fragments[3:])
@@ -66,14 +67,14 @@ def test_selection_rejects_invalid_target_partition_and_rank_loss(reference):
 def test_standalone_system_frame_replays_frozen_virtual_and_continuous_response(reference):
     assert hasattr(domain, "build_system_local_frame")
     occupied, virtual = np.arange(1, 5), np.array([5])
-    frame = domain.build_system_local_frame(reference, occupied, virtual)
-    expected = domain.build_system_local_frame(reference, occupied, virtual)
+    frame = system_reference.build_system_local_frame(reference, occupied, virtual)
+    expected = system_reference.build_system_local_frame(reference, occupied, virtual)
     np.testing.assert_allclose(frame.occupied_coeff, expected.occupied_coeff, atol=2e-7)
     np.testing.assert_allclose(frame.virtual_coeff, expected.virtual_coeff, atol=1e-9)
     with pytest.raises(ValueError, match="concrete.*before tracing"):
-        jax.vjp(lambda mf: domain.build_system_local_frame(mf, occupied, virtual).virtual_coeff, reference)
+        jax.vjp(lambda mf: system_reference.build_system_local_frame(mf, occupied, virtual).virtual_coeff, reference)
     seed = jax.numpy.asarray(np.random.default_rng(4).normal(size=frame.virtual_coeff.shape))
-    _, pullback = jax.vjp(lambda mf: domain.build_system_local_frame(
+    _, pullback = jax.vjp(lambda mf: system_reference.build_system_local_frame(
         mf, occupied, virtual, boys_reference=frame.boys_reference,
         virtual_anchor_columns=frame.virtual_anchor_columns,
     ).virtual_coeff, reference)
@@ -82,10 +83,10 @@ def test_standalone_system_frame_replays_frozen_virtual_and_continuous_response(
 
 
 def test_selection_accepts_empty_frozen_and_excludes_explicit_virtual(reference):
-    empty = dlno_stc.build_domain_selections(reference, frozen=[], force_full_domains=True)
+    empty = dlno_stc.build_domain_selections(reference, frozen=[], full_domain=True)
     np.testing.assert_array_equal(empty.active_occ_indices, np.arange(5))
     np.testing.assert_array_equal(empty.active_vir_indices, [5, 6])
-    static = dlno_stc.build_domain_selections(reference, frozen=[0, 6], force_full_domains=True)
+    static = dlno_stc.build_domain_selections(reference, frozen=[0, 6], full_domain=True)
     np.testing.assert_array_equal(static.active_occ_indices, [1, 2, 3, 4])
     np.testing.assert_array_equal(static.active_vir_indices, [5])
     np.testing.assert_array_equal(static.pao_projected_out_indices, [0, 1, 2, 3, 4, 6])

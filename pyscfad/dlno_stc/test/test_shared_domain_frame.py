@@ -1,4 +1,5 @@
 """One domain frame producer/reverse shared by W and molecular LIS CCSD(T)."""
+from pyscfad.dlno_stc.test._cc_options import cc_options
 
 from types import SimpleNamespace
 
@@ -26,11 +27,13 @@ def molecular_group():
     domains = accept.selection(mf)
     controls = dict(accept.controls(), threads=1)
     static = ccsd.build_static_selections(
-        mf, domains, matrix_kind='W', thresh_occ=1e-4, thresh_vir=3e-5,
-        baseline_controls=controls, matrix_controls=controls, single_pass=False)
+        mf, domains, thresh_occ=1e-4, thresh_vir=3e-5,
+        **cc_options(controls, controls))
+    from pyscfad.dlno_stc.test._saved_selection import save_from_run
+    static = save_from_run(mf, static)
     group = ccsd.build_domain_groups(domains)[0]
-    indices = tuple(i for i, _ in ccsd._group_cc_fragments(static, group))[:2]
-    assert len(indices) == 2
+    indices = tuple(i for i, _ in ccsd._group_cc_fragments(static, group))
+    assert len(indices) == 4
     assert len(domains.fragments[group.representative_index].extended_ao_indices) < mf.mol.nao
     return SimpleNamespace(mf=mf, scf_pullback=scf_pullback, static=static,
                            controls=controls, group=group, indices=indices)
@@ -99,7 +102,7 @@ def test_molecular_shared_frame_matches_rebuilt_energy_and_gradient(
         rows = ccsd._run_group(
             state, case.static, case.group, case.controls, case.controls,
             with_grad=with_grad, verbose_imp=0, ccsd_t=True,
-            triples_controls=triples, fragment_indices=case.indices)
+            triples_controls=triples)
         # Finalization consumes the common frame and its saved response.
         bars = state['mf_bar'], state['common_bar']
         result = ccsd.driver._finish(state, with_grad=with_grad, include_hf=False)
@@ -137,11 +140,14 @@ def test_molecular_shared_frame_matches_rebuilt_energy_and_gradient(
 def test_selection_reuses_prepared_frame(molecular_group, monkeypatch):
     case = molecular_group
     counts = counted_frames(monkeypatch)
-    # Select only the two physical fragments in one preparation group.
+    # Every preparation group builds one shared frame for all its fragments.
     selected = ccsd.build_static_selections(
-        case.mf, case.static.mp2_static, matrix_kind='W', thresh_occ=1e-4, thresh_vir=3e-5,
-        baseline_controls=case.controls, matrix_controls=case.controls,
-        fragment_indices=case.indices, single_pass=False)
-    assert counts == dict(forward=1, reverse=0)
-    for index in case.indices:
+        case.mf, case.static.mp2_static, thresh_occ=1e-4, thresh_vir=3e-5,
+        **cc_options(case.controls, case.controls),)
+    assert counts == dict(forward=0, reverse=0)
+    from pyscfad.dlno_stc.test._saved_selection import save_from_run
+    selected = save_from_run(case.mf, selected)
+    groups = ccsd.build_domain_groups(case.static.mp2_static)
+    assert counts == dict(forward=len(groups), reverse=0)
+    for index in range(len(case.static.mp2_static.fragments)):
         assert ccsd._fragment_dimensions(selected, index) == ccsd._fragment_dimensions(case.static, index)

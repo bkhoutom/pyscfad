@@ -1,4 +1,5 @@
 """Independent Boys packets preserve fixed frames and three-tensor response."""
+from pyscfad.dlno_stc.test import system_reference
 
 from copy import copy
 
@@ -97,7 +98,7 @@ def test_boys_packet_uses_finite_ao_aux_support_and_fixed_frame(boys_water_dimer
     assert actual["B"].shape[0] < mf.with_df.auxmol.nao
 
 
-def test_boys_three_bar_fock_direction_and_disk_replay(boys_water_dimer):
+def test_boys_three_bar_fock_direction(boys_water_dimer):
     mf, common, static = boys_water_dimer
     ao = numpy.asarray(static.fragments[0].extended_ao_indices)
     perturbation = numpy.zeros_like(common.fock)
@@ -114,9 +115,6 @@ def test_boys_three_bar_fock_direction_and_disk_replay(boys_water_dimer):
     bars = {name: numpy.asarray(value) * 0.1 for name, value in packet.items()}
     result = _result(packet, bars)
     direct, = adjoint.apply_selected_pullback(pullback, packet, result)
-    replay, = adjoint.pullback_inputs(projected, (scale,), packet, result)
-    numpy.testing.assert_allclose(direct, replay, atol=1e-11, rtol=0)
-
     def functional(value):
         return sum(jnp.sum(projected(value)[name] * bar) for name, bar in bars.items())
 
@@ -158,8 +156,8 @@ def test_system_preparation_preserves_active_spectra(boys_water_dimer, fock_from
     mf, _common, static = boys_water_dimer
     occupied = numpy.asarray(static.active_occ_indices)
     virtual = numpy.asarray(static.active_vir_indices)
-    frame = domain.build_system_local_frame(mf, occupied, virtual)
-    packet = prepare.prepare_system_inputs(
+    frame = system_reference.build_system_local_frame(mf, occupied, virtual)
+    packet = system_reference.prepare_system_inputs(
         mf, occupied, virtual, boys_reference=frame.boys_reference,
         virtual_anchor_columns=frame.virtual_anchor_columns, fock_from_scf=fock_from_scf)
     assert set(packet) == {"foo", "fvv", "B"}
@@ -205,12 +203,12 @@ def test_independent_system_streamed_and_direct_three_bar_response(
         mf, scf_pullback = jax.vjp(build_mf, reference.mol)
     occupied = numpy.asarray(static.active_occ_indices)
     virtual = numpy.asarray(static.active_vir_indices)
-    frame = domain.build_system_local_frame(mf, occupied, virtual)
+    frame = system_reference.build_system_local_frame(mf, occupied, virtual)
     options = dict(boys_reference=frame.boys_reference,
                    virtual_anchor_columns=frame.virtual_anchor_columns,
                    fock_from_scf=True)
     expected, expected_pullback = jax.vjp(
-        lambda value: prepare.prepare_system_inputs(value, occupied, virtual, **options), mf)
+        lambda value: system_reference.prepare_system_inputs(value, occupied, virtual, **options), mf)
     if source == "saved":
         path = str(tmp_path / "boys-system-cderi.h5")
         with h5py.File(path, "w") as handle:
@@ -235,7 +233,7 @@ def test_independent_system_streamed_and_direct_three_bar_response(
     with monkeypatch.context() as guard:
         guard.setattr(type(current), "get_fock", forbidden_fock)
         actual, pullback = jax.vjp(
-            lambda value: prepare.prepare_system_inputs(value, occupied, virtual, **options),
+            lambda value: system_reference.prepare_system_inputs(value, occupied, virtual, **options),
             current,
         )
     for name in actual:
@@ -245,8 +243,8 @@ def test_independent_system_streamed_and_direct_three_bar_response(
     for name in ("foo", "fvv"):
         bars[name] = (bars[name] + bars[name].T) / 2
     result = _result(actual, bars)
-    actual_bar, = adjoint.apply_full_pullback(pullback, actual, result)
-    expected_bar, = adjoint.apply_full_pullback(expected_pullback, expected, result)
+    actual_bar, = adjoint.apply_selected_pullback(pullback, actual, result)
+    expected_bar, = adjoint.apply_selected_pullback(expected_pullback, expected, result)
     # Cached factors carry their own bar; streamed/direct integrals return
     # molecular bars. Close both through the same SCF/DF construction before
     # comparing physical responses, rather than unequal intermediate leaves.

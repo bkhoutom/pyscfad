@@ -32,7 +32,6 @@ def main():
     from pyscf import gto as reference_gto, scf as reference_scf
     from pyscfad import gto, scf, dlno_stc
     from pyscfad.dlno_stc import ccsd
-    from pyscfad.dlno_stc.laplace import make_laplace_grid
 
     started = time.perf_counter()
     output_dir = args.output_dir.resolve()
@@ -80,7 +79,7 @@ def main():
         raise RuntimeError("reference and differentiable SCF disagree")
     frozen = 5  # One 1s core orbital per carbon.
     domains = dlno_stc.build_domain_selections(
-        mf, frozen=frozen, force_full_domains=True, boys_grouping="molecule",
+        mf, frozen=frozen, full_domain=True, boys_grouping="molecule",
         lo_kwargs=dict(init_guess="atomic", conv_tol=1e-10,
                        gmres_options=dict(restart=120, maxiter=100)),
     )
@@ -88,24 +87,18 @@ def main():
         raise RuntimeError("expected one molecular Boys fragment")
     report(f"Boys domains: {len(domains.fragments)} occupied targets in one fragment")
 
-    orbital_energies = np.asarray(mf.mo_energy)
-    roots, weights, grid_diagnostics = make_laplace_grid(
-        orbital_energies[domains.active_occ_indices],
-        orbital_energies[domains.active_vir_indices],
-        kind="fitted", points=6, lambda_gradient=0.1,
-    )
-    grid = dict(laplace_roots=roots, laplace_weights=weights)
-    baseline = dict(mode="deterministic", threads=32, global_seed=666, **grid)
+    roots, weights = domains.mp2_grid
+    grid_diagnostics = domains.mp2_grid_diagnostics
+    baseline = dict(mode="deterministic", threads=32, global_seed=666)
     matrix = dict(mode="deterministic", threads=32,
-                  memory_limit_mb=args.max_memory, **grid)
+                  memory_limit_mb=args.max_memory)
     selected = ccsd.build_static_selections(
-        mf, domains, matrix_kind="W", thresh_occ=1e-4, thresh_vir=1e-5,
+        mf, domains, thresh_occ=1e-4, thresh_vir=1e-5,
         baseline_controls=baseline, matrix_controls=matrix, merge_identical=True,
-        single_pass=False,
     )
-    if len(selected.fragments) != 1 or selected.fragments[0] is None:
-        raise RuntimeError("expected one populated molecular LIS")
-    report("W matrix and one molecular LIS selected")
+    if len(selected.fragments) != 1:
+        raise RuntimeError("expected one molecular fragment")
+    report("Planned one molecular fragment; W and LIS will be built during production")
 
     common = dict(geometry=xyz, basis="cc-pvdz", auxbasis="auto", frozen=frozen,
                   threads=32, max_memory_mb=args.max_memory,
@@ -116,7 +109,7 @@ def main():
                   laplace_grid=dict(roots=roots.tolist(), weights=weights.tolist(),
                                     diagnostics=grid_diagnostics))
     options = dict(baseline_controls=baseline, matrix_controls=matrix,
-                   matrix_kind="W", ccsd_t=True, include_hf=True,
+                    ccsd_t=True, include_hf=True,
                    return_components=True, merge_identical=True)
 
     def run(mode, triples_controls):

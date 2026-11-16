@@ -33,7 +33,6 @@ def main():
     from pyscf import gto as reference_gto, scf as reference_scf
     from pyscfad import gto, scf, dlno_stc
     from pyscfad.dlno_stc import ccsd
-    from pyscfad.dlno_stc.laplace import make_laplace_grid
 
     def report(stage):
         print(f"[{time.perf_counter() - started:.1f}s] {stage}", flush=True)
@@ -76,31 +75,27 @@ def main():
     report(f"DF-RHF converged: {float(mf.e_tot):.12f} Eh")
     frozen = 0  # Hydrogen has no core orbital to freeze.
     static = dlno_stc.build_domain_selections(
-        mf, frozen=frozen, force_full_domains=True, boys_grouping="molecule",
+        mf, frozen=frozen, full_domain=True, boys_grouping="molecule",
         lo_kwargs=dict(init_guess="atomic", conv_tol=1e-10,
                        gmres_options=dict(restart=120, maxiter=100)),
     )
     report(f"Boys selection: {len(static.fragments)} targets, "
            f"{len(static.physical_groups)} physical fragment")
-    energies = np.asarray(mf.mo_energy)
-    roots, weights, grid_diagnostics = make_laplace_grid(
-        energies[static.active_occ_indices], energies[static.active_vir_indices],
-        kind="fitted", points=6, lambda_gradient=0.1,
-    )
-    report("Six-point Laplace grid fitted")
-    grid = dict(laplace_roots=roots, laplace_weights=weights)
-    baseline = dict(mode="deterministic", threads=32, global_seed=666, **grid)
+    roots, weights = static.mp2_grid
+    grid_diagnostics = static.mp2_grid_diagnostics
+    report("Global MP2 grid fitted and saved by domain selection")
+    baseline = dict(mode="deterministic", threads=32, global_seed=666)
     matrix = dict(mode="deterministic", threads=32,
-                  memory_limit_mb=args.max_memory, **grid)
+                  memory_limit_mb=args.max_memory)
     triples = dict(mode="stochastic", nsamples=20000, global_seed=71,
                    energy_tolerance=0.00005)
     selected = ccsd.build_static_selections(
-        mf, static, matrix_kind="W", thresh_occ=1e-4, thresh_vir=1e-5,
+        mf, static, thresh_occ=1e-4, thresh_vir=1e-5,
         baseline_controls=baseline, matrix_controls=matrix, merge_identical=True,
     )
-    report("Single-pass W/LIS selection plan ready")
+    report("Fragment plan and global MP2 grid saved; W/LIS and (T) grids follow in production")
     options = dict(baseline_controls=baseline, matrix_controls=matrix,
-                   matrix_kind="W", ccsd_t=True, triples_controls=triples,
+                    ccsd_t=True, triples_controls=triples,
                    include_hf=True, return_components=True, merge_identical=True)
     if args.gradient:
         energy, mol_bar, components = ccsd.value_and_grad(mol, build_mf, selected, **options)

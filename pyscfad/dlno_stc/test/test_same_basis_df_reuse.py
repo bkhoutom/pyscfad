@@ -1,4 +1,5 @@
 """Explicit identical correlation fits reuse the reference factor source."""
+from pyscfad.dlno_stc.test import system_reference
 import numpy as np
 import pytest
 from pyscfad import gto, scf
@@ -17,8 +18,8 @@ def reference():
 @pytest.mark.parametrize('canonical', [False, True])
 def test_identical_explicit_basis_uses_cached_source(reference, monkeypatch, canonical):
     mf = reference
-    operation = (prepare.prepare_canonical_system_inputs if canonical
-                 else prepare.prepare_system_inputs)
+    operation = (system_reference.prepare_canonical_system_inputs if canonical
+                 else system_reference.prepare_system_inputs)
     expected = operation(mf, [0], [1])
     source = mf.with_df._get_cderi_source()
     def unexpected(*args, **kwargs):
@@ -77,11 +78,11 @@ def test_disk_source_is_reused(reference, tmp_path, monkeypatch):
     with h5py.File(path, 'w') as handle:
         handle['j3c'] = np.asarray(reference.with_df._get_cderi_source())
     mf.with_df.attach_outcore_cderi(path)
-    expected = prepare.prepare_canonical_system_inputs(mf, [0], [1])
+    expected = system_reference.prepare_canonical_system_inputs(mf, [0], [1])
     def unexpected(*args, **kwargs):
         raise AssertionError('disk source was replaced by direct factors')
     monkeypatch.setattr(prepare.lno_df, 'get_local_Lov', unexpected)
-    actual = prepare.prepare_canonical_system_inputs(
+    actual = system_reference.prepare_canonical_system_inputs(
         mf, [0], [1], correlation_auxbasis='weigend')
     np.testing.assert_allclose(actual['B'], expected['B'], atol=1e-12, rtol=0)
     assert mf.with_df._get_cderi_source() == path
@@ -102,14 +103,14 @@ def test_concrete_basis_route_reuses_cache_inside_vjp(reference, monkeypatch):
     # The driver fixes this numerical route before duplicated pytree leaves
     # become distinct tracers; the scientific basis identity stays explicit.
     result, pullback = jax.vjp(
-        lambda mf: prepare.prepare_system_inputs(
+        lambda mf: system_reference.prepare_system_inputs(
             mf, [0], [1], boys_reference=boys, virtual_anchor_columns=anchors,
             correlation_auxbasis=None if reuse else 'weigend')['B'], reference)
     assert result.shape[1:] == (1, 1)
     pullback(np.ones(result.shape))
 
 
-def test_high_level_identical_basis_gradient_uses_cache(reference, monkeypatch):
+def test_high_level_identical_basis_gradient_uses_fragment_fitting(reference, monkeypatch):
     from pyscfad import dlno_stc
     from pyscfad.dlno_stc.test.test_backend import native
     from pyscfad.dlno_stc.test.test_correlation_auxbasis import _controls
@@ -121,10 +122,14 @@ def test_high_level_identical_basis_gradient_uses_cache(reference, monkeypatch):
         return mf
     options = dict(scope='system', frozen=0, controls=_controls(), include_hf=True)
     expected, expected_bar = dlno_stc.value_and_grad(reference.mol, factory, **options)
-    def unexpected(*args, **kwargs):
-        raise AssertionError('high-level same-basis gradient rebuilt local factors')
-    monkeypatch.setattr(prepare.lno_df, 'get_local_Lov', unexpected)
+    local_factors = prepare.lno_df.get_local_Lov
+    calls = []
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return local_factors(*args, **kwargs)
+    monkeypatch.setattr(prepare.lno_df, 'get_local_Lov', counted)
     actual, actual_bar = dlno_stc.value_and_grad(
         reference.mol, factory, correlation_auxbasis='weigend', **options)
     np.testing.assert_allclose(actual, expected, atol=1e-12, rtol=0)
     np.testing.assert_allclose(actual_bar.coords, expected_bar.coords, atol=1e-10, rtol=0)
+    assert calls == [1]

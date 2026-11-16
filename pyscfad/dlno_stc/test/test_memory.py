@@ -172,54 +172,28 @@ def workflow_mf(monkeypatch):
     return mf, static
 
 
-@pytest.mark.parametrize('guard', ['packet', 'domain', 'system'])
+@pytest.mark.parametrize('guard', ['domain'])
 def test_workflow_guards_continue_over_soft_budget(workflow_mf, guard):
     from pyscfad.dlno_stc import _workflow
     mf, static = workflow_mf
     mf.max_memory = 1e-6
     with pytest.warns(RuntimeWarning):
-        if guard == 'packet':
-            result = _workflow.check_memory(mf, 2, 3)
-        elif guard == 'domain':
-            result = _workflow.check_domain_memory(mf, static, 0, with_grad=True)
-        else:
-            result = _workflow.check_system_memory(mf, 2, 3, with_grad=True)
+        result = _workflow.check_domain_memory(mf, static, 0, with_grad=True)
     assert result > mf.max_memory
 
 
-@pytest.mark.parametrize('guard', ['domain', 'system'])
+@pytest.mark.parametrize('guard', ['domain'])
 def test_workflow_known_new_factor_larger_than_cgroup_stops(workflow_mf, monkeypatch, guard):
     from pyscfad.dlno_stc import _memory, _workflow
     mf, static = workflow_mf
     monkeypatch.setattr(_memory, 'observe_memory', lambda: observation(enforced_limit_mb=.0004))
     # One required float64 B[10,2,3] occupies 480 bytes, above the 400-byte limit.
     with pytest.raises(MemoryError, match='unavoidable'):
-        if guard == 'domain':
-            _workflow.check_domain_memory(mf, static, 0, with_grad=True)
-        else:
-            _workflow.check_system_memory(mf, 2, 3, with_grad=True)
+        _workflow.check_domain_memory(mf, static, 0, with_grad=True)
 
 
-def test_system_resident_arrays_are_not_added_twice(workflow_mf, monkeypatch):
-    from pyscfad.dlno_stc import _memory, _workflow
-    mf, _ = workflow_mf
-    monkeypatch.setattr(_memory, 'observe_memory', lambda: observation())
-    with pytest.warns(RuntimeWarning) as caught:
-        estimate = _workflow.check_system_memory(mf, 2, 3, with_grad=False)
-    # Existing mo_coeff/occ/energy occupy 192 bytes; the estimator already counts them.
-    assert f'peak={estimate + 50. - .000192:.1f}' in str(caught[0].message)
 
 
-def test_system_original_estimate_still_triggers_configured_warning(workflow_mf, monkeypatch):
-    from pyscfad.dlno_stc import _memory, _workflow
-    mf, _ = workflow_mf
-    mf.max_memory = 1e9
-    monkeypatch.setattr(_memory, 'observe_memory', lambda: observation())
-    estimate = _workflow.check_system_memory(mf, 2, 3, with_grad=False)
-    # The budget lies between the original estimate and normalized new workspace.
-    mf.max_memory = estimate - .0001
-    with pytest.warns(RuntimeWarning):
-        _workflow.check_system_memory(mf, 2, 3, with_grad=False)
 
 
 def test_unknown_rss_does_not_claim_a_measured_peak():

@@ -54,6 +54,37 @@ arma::vec triples_spin(const arma::vec& input,size_t n) {
 // worker has a private copy of the (potentially very large) tensor bank.
 // Pair-resolved tensors lock the occupied pair actually updated by a block;
 // independent j slices must not contend on a common i-only lock.
+using triples_right_profile=stc_triples::right_profile;
+struct triples_profile_scope {
+    double* elapsed;
+    double start;
+    explicit triples_profile_scope(double* value):elapsed(value),start(value ? omp_get_wtime() : 0.) {}
+    ~triples_profile_scope() {if(elapsed) *elapsed+=omp_get_wtime()-start;}
+};
+double* triples_profile_phase(triples_right_profile* p,triples_right_profile::phase phase) {
+    return p ? &p->seconds[phase] : nullptr;
+}
+// Time waiting for acquisition separately from the writes under the lock.
+// No try_lock or altered locking order: profiling preserves synchronization.
+struct triples_profile_lock {
+    std::mutex& mutex;
+    triples_right_profile* profile;
+    size_t item;
+    double acquired=0.;
+    triples_profile_lock(std::mutex& lock,triples_right_profile* p,size_t index)
+        :mutex(lock),profile(p),item(index) {
+        const double tick=profile ? omp_get_wtime() : 0.;
+        mutex.lock();
+        if(profile) {
+            acquired=omp_get_wtime();profile->lock_wait[item]+=acquired-tick;
+            ++profile->lock_calls[item];
+        }
+    }
+    ~triples_profile_lock() {
+        if(profile) profile->store[item]+=omp_get_wtime()-acquired;
+        mutex.unlock();
+    }
+};
 struct triples_bar_locks {
     std::vector<size_t> starts;
     std::unique_ptr<std::mutex[]> locks;
@@ -101,7 +132,8 @@ struct triples_raw_workspace {
 void triples_raw_block(std::vector<tensor>& bank,const operations& op,
                        size_t no,size_t nv,bool singles,arma::vec& raw,
                        const arma::vec* raw_bar=nullptr,triples_bar_locks* locks=nullptr,
-                       triples_raw_workspace* workspace=nullptr,bool reuse_packed=false) {
+                       triples_raw_workspace* workspace=nullptr,bool reuse_packed=false,
+                       triples_right_profile* profile=nullptr) {
     auto& gv=bank[op.ids[0]]; auto& tv=bank[op.ids[1]];
     auto& go=bank[op.ids[2]]; auto& to=bank[op.ids[3]];
     const size_t ng=gv.offset(op.indices[0]),nt=tv.offset(op.indices[1]);
@@ -114,6 +146,7 @@ void triples_raw_block(std::vector<tensor>& bank,const operations& op,
     auto& h=work.h;auto& u=work.u;
     h.set_size(no,nv);u.set_size(nv*nv,no);
     if(!reuse_packed) {
+        triples_profile_scope timer(triples_profile_phase(profile,triples_right_profile::pack));
         for(size_t a=0;a<nv;++a)
             std::copy_n(go.value.memptr()+ngo+a*go_step,no,h.colptr(a));
         for(size_t m=0;m<no;++m)
@@ -122,24 +155,31 @@ void triples_raw_block(std::vector<tensor>& bank,const operations& op,
     if(!raw_bar) {
         raw.set_size(nv*nv*nv);
         arma::mat abc(raw.memptr(),nv,nv*nv,false,true);
-        abc=t.t()*g;
+        {triples_profile_scope timer(triples_profile_phase(profile,triples_right_profile::forward_virtual));
+         abc=t.t()*g;}
         arma::mat bca(raw.memptr(),nv*nv,nv,false,true);
-        bca-=u*h;
+        {triples_profile_scope timer(triples_profile_phase(profile,triples_right_profile::forward_occupied));
+         bca-=u*h;}
     } else {
         arma::mat abc(const_cast<double*>(raw_bar->memptr()),nv,nv*nv,false,true);
         arma::mat bca(const_cast<double*>(raw_bar->memptr()),nv*nv,nv,false,true);
         arma::mat gb(gv.bar.memptr()+ng,nv,nv*nv,false,true);
         arma::mat tb(tv.bar.memptr()+nt,nv,nv,false,true);
-        work.gb=t*abc;
-        { std::lock_guard<std::mutex> guard(locks->at(op,0,gv)); gb+=work.gb; }
-        work.tb=g*abc.t();
-        { std::lock_guard<std::mutex> guard(locks->at(op,1,tv)); tb+=work.tb; }
-        work.hb=-u.t()*bca;work.ub=-bca*h.t();
+        {triples_profile_scope timer(triples_profile_phase(profile,triples_right_profile::reverse_gv));
+         work.gb=t*abc;}
+        { triples_profile_lock guard(locks->at(op,0,gv),profile,0); gb+=work.gb; }
+        {triples_profile_scope timer(triples_profile_phase(profile,triples_right_profile::reverse_tv));
+         work.tb=g*abc.t();}
+        { triples_profile_lock guard(locks->at(op,1,tv),profile,1); tb+=work.tb; }
+        {triples_profile_scope timer(triples_profile_phase(profile,triples_right_profile::reverse_go));
+         work.hb=-u.t()*bca;}
+        {triples_profile_scope timer(triples_profile_phase(profile,triples_right_profile::reverse_to));
+         work.ub=-bca*h.t();}
         const auto& hb=work.hb;const auto& ub=work.ub;
-        { std::lock_guard<std::mutex> guard(locks->at(op,2,go));
+        { triples_profile_lock guard(locks->at(op,2,go),profile,2);
           for(size_t a=0;a<nv;++a) for(size_t m=0;m<no;++m)
             go.bar[ngo+a*go_step+m]+=hb(m,a); }
-        { std::lock_guard<std::mutex> guard(locks->at(op,3,to));
+        { triples_profile_lock guard(locks->at(op,3,to),profile,3);
           for(size_t m=0;m<no;++m) for(size_t bc=0;bc<nv*nv;++bc)
             to.bar[nto+m*to_step+bc]+=ub(bc,m); }
     }

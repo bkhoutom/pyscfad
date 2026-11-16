@@ -3,6 +3,7 @@
 #include "native/triples_prepared.h"
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 #include <cmath>
 #include <cstring>
 #include <cstdint>
@@ -389,14 +390,16 @@ void bind_triples(py::module_& module) {
     module.attr("TRIPLES_DIAGONAL_VIRTUAL_DRESSING")=true;
     // Bump the native checkpoint identity when the numerical algorithm changes.
     module.attr("TRIPLES_VERSION")=
-        "stc_triples:stable-external-legs:deterministic-blocks-v3:quadrature-reuse-v1:diagonal-virtual-v1:shared-dressing-v3:fused-cubes-v1:direct-L-v1:dynamic-blocks-v1:reverse-memory-v3:fused-singles-adjoint-v1:original-lis-occupied-v1:returned-bars-reserve-v1:streaming-quartic-memory-v1:one-permutation-left-v1:grouped-adjoint-128-v1";
+        "stc_triples:stable-external-legs:deterministic-blocks-v3:quadrature-reuse-v1:diagonal-virtual-v1:shared-dressing-v3:fused-cubes-v1:direct-L-v1:dynamic-blocks-v1:reverse-memory-v3:fused-singles-adjoint-v1:original-lis-occupied-v1:returned-bars-reserve-v1:streaming-quartic-memory-v1:one-permutation-left-v1:grouped-adjoint-128-v1:point-profile-v1";
     module.attr("TRIPLES_QUADRATURE_REUSE")=true;
     module.attr("TRIPLES_QUADRATURE_STREAMING")=true;
     module.attr("TRIPLES_GROUPED_ADJOINT")=true;
+    module.attr("TRIPLES_RIGHT_PROFILE")=true;
     module.attr("TRIPLES_MAX_STREAMING_BLOCKS")=Triples::maximum_streaming_blocks;
     module.attr("TRIPLES_MAX_CACHED_BLOCKS")=Triples::maximum_cached_blocks;
     module.def("triples_quadrature_stream",[](py::tuple left,py::sequence points,
-            py::sequence weight_values,bool with_grad,py::handle workspace_limit,py::handle block_batch_size) {
+            py::sequence weight_values,bool with_grad,py::handle workspace_limit,py::handle block_batch_size,
+            bool profile_right) {
         PreparedInput zero(left);
         std::vector<std::unique_ptr<PreparedInput>> inputs;
         std::vector<const Triples::triples_prepared*> prepared;
@@ -413,7 +416,7 @@ void bind_triples(py::module_& module) {
         Triples::triples_result result;std::vector<Triples::triples_vjp> bars;
         { py::gil_scoped_release release;
           result=Triples::quadrature_stream(zero.value,prepared,weights,size_t(budget),size_t(batch),energies,
-                                           with_grad ? &bars : nullptr); }
+                                           with_grad ? &bars : nullptr,profile_right); }
         Triples::quadrature_cache shape;shape.no=zero.value.no;shape.nv=zero.value.nv;shape.ns=zero.value.ns;
         auto out=cache_result(result,nullptr,shape);
         py::array_t<double> energy(energies.size());
@@ -426,6 +429,31 @@ void bind_triples(py::module_& module) {
         out["left_reverse_worker_seconds"]=result.left_reverse_worker_seconds;
         out["left_build_wall_seconds"]=result.left_build_wall_seconds;
         out["right_wall_seconds"]=result.right_wall_seconds;
+        out["right_profile_enabled"]=result.right_profile_enabled;
+        out["point_right_wall_seconds"]=result.point_right_wall_seconds;
+        out["point_right_batch_wall_seconds"]=result.point_right_batch_wall_seconds;
+        py::list profiles;
+        const char* phases[]={"pack", "forward_virtual_gemm", "forward_occupied_gemm",
+            "energy_singles_adjoint", "ket_bar", "reverse_gv_gemm", "reverse_tv_gemm",
+            "reverse_go_gemm", "reverse_to_gemm"};
+        const char* destinations[]={"gv", "tv", "go", "to", "t1", "fov", "t2", "gg"};
+        for(const auto& p:result.point_right_profiles) {
+            py::dict item,seconds,wait,store,calls;
+            for(size_t i=0;i<p.seconds.size();++i) seconds[phases[i]]=p.seconds[i];
+            for(size_t i=0;i<8;++i) {
+                wait[destinations[i]]=p.lock_wait[i];store[destinations[i]]=p.store[i];
+                calls[destinations[i]]=p.lock_calls[i];
+            }
+            item["worker_seconds"]=p.worker_seconds;item["cpu_seconds"]=p.cpu_seconds;
+            item["barrier_worker_seconds"]=p.barrier_seconds;item["blocks"]=p.blocks;
+            item["minor_page_faults"]=p.minor_faults;item["major_page_faults"]=p.major_faults;
+            item["voluntary_context_switches"]=p.voluntary_switches;
+            item["involuntary_context_switches"]=p.involuntary_switches;
+            item["phase_worker_seconds"]=seconds;item["lock_wait_worker_seconds"]=wait;
+            item["store_worker_seconds"]=store;item["lock_calls"]=calls;
+            profiles.append(item);
+        }
+        out["point_right_profiles"]=profiles;
         out["left_reverse_wall_seconds"]=result.left_reverse_wall_seconds;
         out["occupied_block_batch_size"]=result.occupied_block_batch_size;
         out["occupied_block_batches"]=result.occupied_block_batches;
@@ -442,7 +470,7 @@ void bind_triples(py::module_& module) {
         return out;
     },py::arg("left"),py::arg("points"),py::arg("weights"),py::kw_only(),
        py::arg("with_grad")=false,py::arg("workspace_limit_bytes")=size_t(16)*1024*1024*1024,
-       py::arg("block_batch_size")=Triples::maximum_streaming_blocks);
+       py::arg("block_batch_size")=Triples::maximum_streaming_blocks,py::arg("profile_right")=false);
     py::class_<Triples::quadrature_cache>(module,"TriplesQuadratureCache")
         .def(py::init([](py::tuple values,py::handle first,py::handle count,bool with_grad) {
             PreparedInput input(values);

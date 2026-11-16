@@ -1,4 +1,5 @@
 """Total triples energy budgets are normalized and allocated before execution."""
+from pyscfad.dlno_stc.test._cc_options import cc_options
 from types import SimpleNamespace
 
 import numpy as np
@@ -51,14 +52,15 @@ def test_derived_standard_error_is_not_a_public_sampling_control():
 def public_reference(monkeypatch):
     """Keep real normalization/selection validation, replace SCF and CC solves."""
     settings = dict(mode='deterministic', threads=1)
-    baseline, matrix = ccsd._normalize_controls(settings, settings, 'D')
+    baseline, matrix = ccsd._normalize_controls(**cc_options(settings, settings))
     domain = SimpleNamespace(fragments=(object(),) * 16,
         frag_lolist=tuple((i,) for i in range(16)), boys_grouping='singleton',
         physical_groups=tuple((i,) for i in range(16)))
-    fragments = tuple(SimpleNamespace(lis_space='domain') for _ in range(16))
-    lis = LISSelections(domain, 'D', 0., 0., 1e-6, fragments,
-                        smooth_frames=(object(),)*16)
-    static = ccsd.CCSDSelections(lis, ccsd._scientific_identity(baseline, matrix))
+    fragments = tuple(SimpleNamespace() for _ in range(16))
+    lis = LISSelections(domain, 0., 0., 1e-6, fragments,
+                        smooth_frames=(object(),)*16, triples_grid=(object(),)*16)
+    static = ccsd.CCSDSelections(lis, ccsd._scientific_identity(baseline, matrix),
+        mp2_grid=(baseline["laplace_roots"], baseline["laplace_weights"]))
     monkeypatch.setattr(ccsd, '_group_cc_fragments', lambda static, group:
         tuple((i, (target,)) for i, target in
               zip(group.fragment_indices, group.target_indices)))
@@ -67,20 +69,20 @@ def public_reference(monkeypatch):
     monkeypatch.setattr(ccsd.driver, '_initialize', lambda *a, **k: dict(
         energy=np.float64(0.), variance=0., baseline_energy=0., weak_energy=0.,
         mf_bar=None, common_bar=None))
+    monkeypatch.setattr(ccsd, '_run_weak', lambda *a, **k: None)
     monkeypatch.setattr(ccsd, '_finish', lambda state, static, records, **k: tuple(records))
     return static, settings
 
 
 def _public_call(api, static, settings, **options):
     args = (None, static) if api == 'kernel' else (None, None, static)
-    return getattr(ccsd, api)(*args, baseline_controls=settings, matrix_controls=settings,
-                             ccsd_t=True, include_baseline=False, **options)
+    return getattr(ccsd, api)(*args, **cc_options(settings, settings),
+                             ccsd_t=True, **options)
 
 
 @pytest.mark.parametrize('api', ['kernel', 'value_and_grad'])
 @pytest.mark.parametrize('tolerance,indices,expected', [
     (1e-4, None, 2.5e-5), (5e-5, None, 1.25e-5),
-    (1e-4, (0, 3, 7, 12), 5e-5), (1e-4, (12,), 1e-4),
 ])
 @pytest.mark.parametrize('merged', [False, True])
 def test_public_initializers_allocate_by_global_requested_singletons(
@@ -94,28 +96,15 @@ def test_public_initializers_allocate_by_global_requested_singletons(
         target = options['triples_controls']['target_standard_error']
         return [ccsd.FragmentComponents(i, 0., 0., 0., 0.,
                     triples_diagnostics={'target_standard_error': target})
-                for i in group.fragment_indices if i in options['fragment_indices']]
+                for i in group.fragment_indices]
 
     monkeypatch.setattr(ccsd, '_run_group', solve)
     supplied = dict(mode='stochastic', nsamples=20, energy_tolerance=tolerance)
     result = _public_call(api, static, settings, triples_controls=supplied,
-                          fragment_indices=indices, merge_identical=merged)
+                          merge_identical=merged)
     assert tuple(row.fragment_index for row in result) == (tuple(range(16)) if indices is None else indices)
     assert all(row.triples_diagnostics['target_standard_error'] == expected for row in result)
     assert 'target_standard_error' not in supplied
-
-
-@pytest.mark.parametrize('api', ['kernel', 'value_and_grad'])
-def test_empty_requested_subset_makes_no_triples_calls(monkeypatch, public_reference, api):
-    static, settings = public_reference
-    monkeypatch.setattr(ccsd, 'build_domain_groups', lambda *a, **k:
-                        (DomainGroup(tuple(range(16)), 0, tuple(range(16))),))
-    def forbidden(*a, **k):
-        raise AssertionError('empty subset attempted a triples group')
-    monkeypatch.setattr(ccsd, '_run_group', forbidden)
-    result = _public_call(api, static, settings, fragment_indices=(),
-                          triples_controls=dict(mode='stochastic', nsamples=20, energy_tolerance=1e-4))
-    assert result == ()
 
 
 @pytest.mark.parametrize('api', ['kernel', 'value_and_grad'])
@@ -126,7 +115,7 @@ def test_allocation_precedes_mpi_distribution(monkeypatch, public_reference, api
     monkeypatch.setattr(ccsd.driver, '_root_call', lambda comm, rank, call, context: call())
     def distribute(initializer, worker_initializer, comm, **options):
         state, selected, baseline, matrix = initializer()
-        return state['cc_triples_controls'], state['cc_fragment_indices']
+        return state['cc_triples_controls'], ccsd._all_fragment_indices(selected)
     monkeypatch.setattr(_mpi_ccsd, '_run_mpi', distribute)
     allocated, indices = _public_call(api, static, settings, comm=comm,
         triples_controls=dict(mode='stochastic', nsamples=20, energy_tolerance=1e-4))

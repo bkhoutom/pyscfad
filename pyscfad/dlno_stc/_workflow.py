@@ -1,8 +1,6 @@
-"""Host-only helpers shared by full and finite STC packet workflows."""
+"""Domain memory forecasts, sampling budgets and checkpoint identity."""
 
-from pathlib import Path
 import math
-import subprocess
 
 import numpy
 from pyscf import df as pyscf_df
@@ -12,8 +10,8 @@ from ._restart import df_source_fingerprint
 from ._memory import assess_memory
 
 
-def _native_workspace_mb(naux, nocc, nvir, *, with_grad, system,
-                         mode="stochastic", target_batch_size=1, threads=None):
+def _native_workspace_mb(naux, nocc, nvir, *, with_grad,
+                         mode="deterministic", target_batch_size=1, threads=None):
     """Account for bounded OpenMP scratch, without private full B tensors."""
     # Query the runtime so lib.num_threads() overrides are counted too. Using
     # its requested maximum conservatively covers a smaller OMP_THREAD_LIMIT.
@@ -27,7 +25,7 @@ def _native_workspace_mb(naux, nocc, nvir, *, with_grad, system,
     # Exact pair GEMMs have a 64 MiB worker ceiling and a tiled fallback.
     # A single auxiliary column is the unavoidable lower bound on scratch.
     exact = owners * max(64 * 1024**2, 48 * naux)
-    if with_grad and not system:
+    if with_grad:
         exact += 16 * owners * naux * nvir  # one-target U/C reductions
     transform = 8 * owners * naux * nvir
     if with_grad:
@@ -40,33 +38,13 @@ def _native_workspace_mb(naux, nocc, nvir, *, with_grad, system,
     workspace = max(exact, transform) + scatter
     if mode == "deterministic":
         from .controls import _integer_control
-        batch = min(nocc, _integer_control("target_batch_size", target_batch_size))
+        batch = nocc if target_batch_size is None else min(nocc, _integer_control("target_batch_size", target_batch_size))
         # Conservatively reserve the selected Gram cache and reverse scratch
         # beyond the DF/layout buffers counted by the caller. No all-target
         # cache is retained unless the caller explicitly requests that batch.
         workspace += 8 * nocc * nvir * nvir * ((2 if with_grad else 1) * batch
                                                 + (4 if with_grad else 1))
     return workspace / 1e6
-
-
-def format_domain_dimensions(rows):
-    """Return a compact per-fragment ED size table for progress output."""
-    columns = ("Fragment", "ED AO", "Occ", "Vir")
-    values = [
-        (str(row["fragment_id"]), str(row["ed_ao"]),
-         str(row["nocc"]), str(row["nvir"]))
-        for row in rows
-    ]
-    widths = [
-        max([len(columns[index])] + [len(row[index]) for row in values])
-        for index in range(4)
-    ]
-
-    def line(row):
-        return "  ".join(value.rjust(width) for value, width in zip(row, widths))
-
-    header = line(columns)
-    return "\n".join((header, "-" * len(header), *(line(row) for row in values)))
 
 
 def run_payload(mf, frozen, *, driver, correlation_auxbasis=None):
@@ -93,54 +71,8 @@ def run_payload(mf, frozen, *, driver, correlation_auxbasis=None):
     return payload
 
 
-def revision_status():
-    root = Path(__file__).resolve().parents[2]
-    try:
-        revision = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=root, check=True,
-            capture_output=True, text=True,
-        ).stdout.strip()
-        dirty = bool(subprocess.run(
-            ["git", "status", "--porcelain"], cwd=root, check=True,
-            capture_output=True, text=True,
-        ).stdout.strip())
-        return revision, dirty
-    except (OSError, subprocess.CalledProcessError):
-        return "unknown", None
-
-
-def packet_auxiliary_size(mf, *, correlation_auxbasis=None):
-    """Return the full auxiliary dimension used for packet memory forecasts."""
-    with_df = getattr(mf, "with_df", None)
-    if with_df is None:
-        raise ValueError("STC packet preparation requires density fitting")
-    auxmol = (getattr(with_df, "auxmol", None)
-              if correlation_auxbasis is None else None)
-    if auxmol is None:
-        auxbasis = with_df.auxbasis if correlation_auxbasis is None else correlation_auxbasis
-        auxmol = pyscf_df.addons.make_auxmol(mf.mol.to_pyscf(), auxbasis)
-    return int(auxmol.nao)
-
-
-def check_memory(mf, nocc, nvir, *, correlation_auxbasis=None, naux=None):
-    """Warn about a potentially oversized in-core DF packet before allocation.
-
-    The factor eight allows for input, imported bar, replay, and AD temporaries;
-    it is a conservative prototype estimate, not a measured peak guarantee.
-    A caller exporting multiple packets may supply their shared auxiliary size.
-    """
-    if naux is None:
-        naux = packet_auxiliary_size(mf, correlation_auxbasis=correlation_auxbasis)
-    estimate_mb = 8 * int(naux) * int(nocc) * int(nvir) * 8 / 1e6
-    limit_mb = float(getattr(mf, "max_memory", mf.mol.max_memory))
-    # The global auxiliary size is an upper estimate for finite packets, so it
-    # cannot establish the unavoidable size of the actual local factor.
-    assess_memory('packet', estimate_mb, configured_mb=limit_mb)
-    return estimate_mb
-
-
 def check_domain_memory(mf, static, fragment_index, *, with_grad,
-                          virtual_block_size=16, mode="stochastic",
+                          virtual_block_size=16, mode="deterministic",
                           target_batch_size=1, threads=None, correlation_auxbasis=None):
     """Guard one finite domain using its local auxiliary basis and buffers.
 
@@ -173,75 +105,13 @@ def check_domain_memory(mf, static, fragment_index, *, with_grad,
         mf.mol.max_memory, getattr(mf.with_df, 'max_memory', mf.mol.max_memory),
         reserve_bytes=elements * 8)
     estimate_mb += _native_workspace_mb(naux, nocc, nvir,
-                                        with_grad=with_grad, system=False,
+                                        with_grad=with_grad,
                                         mode=mode, target_batch_size=target_batch_size,
                                         threads=threads)
     limit_mb = float(getattr(mf, "max_memory", mf.mol.max_memory))
     # One local float64 B[P,i,a] is unavoidable; all copy/scratch factors above
     # remain forecasts and cannot justify a stop.
     assess_memory('domain', estimate_mb, configured_mb=limit_mb,
-                  unavoidable_bytes=naux * nocc * nvir * numpy.dtype('float64').itemsize)
-    return estimate_mb
-
-
-def check_system_memory(mf, nocc, nvir, *, with_grad, virtual_block_size=16,
-                        auxiliary_group_size=32, mode="stochastic",
-                        target_batch_size=1, threads=None, correlation_auxbasis=None):
-    """Guard one complete replica plus root preparation/SCF residency.
-
-    Conservative counts include tensor layout/host/AD copies, the dense
-    auxiliary metric, pair-conditioned proposals and bounded scatter/tiles.
-    Worker replicas use less memory because they have no SCF preparation.
-    This is an estimate of known arrays, not a measured peak guarantee.
-    """
-    from pyscfad.lno._df_direct import _local_direct_workspace_mb
-
-    if nocc == 0 or nvir == 0:
-        return 0.0
-    for name, value in (("virtual_block_size", virtual_block_size),
-                        ("auxiliary_group_size", auxiliary_group_size)):
-        if (not isinstance(value, (int, numpy.integer))
-                or isinstance(value, (bool, numpy.bool_)) or value <= 0):
-            raise ValueError(f"{name} must be a positive integer")
-    with_df = getattr(mf, "with_df", None)
-    if with_df is None:
-        raise ValueError("system STC preparation requires density fitting")
-    # Match the direct transformation's auxiliary regeneration, without
-    # installing an auxmol on (and changing the pytree of) the SCF object.
-    auxbasis = with_df.auxbasis if correlation_auxbasis is None else correlation_auxbasis
-    auxmol = pyscf_df.addons.make_auxmol(mf.mol.to_pyscf(), auxbasis)
-    naux, nao = int(auxmol.nao), int(mf.mol.nao)
-    ngroup = (naux + int(auxiliary_group_size) - 1) // int(auxiliary_group_size)
-    # Budget six full B-sized buffers for preparation and solver work.
-    elements = 6 * naux * nocc * nvir
-    elements += (6 if with_grad else 4) * naux * naux
-    elements += (12 if with_grad else 6) * (nocc * nocc + nvir * nvir)
-    # Four residual models with occupied-pair conditional virtual tables,
-    # and absolute-column/group scores plus alias tables.
-    elements += 24 * nocc * nocc * nvir + 12 * ngroup * nocc * nvir
-    block = min(nvir, int(virtual_block_size))
-    elements += 12 * block * block + 8 * naux * block
-    # Native scatter buffers are bounded independently of production draws.
-    scatter_mb = 8.0 if with_grad else 0.0
-    resident_bytes = 0
-    for value in (mf.mo_coeff, mf.mo_occ, mf.mo_energy,
-                  getattr(mf, "_eri", None), getattr(with_df, "_cderi", None)):
-        if hasattr(value, "shape") and hasattr(value, "dtype"):
-            resident_bytes += math.prod(value.shape) * numpy.dtype(value.dtype).itemsize
-    elements += (12 if with_grad else 4) * nao * nao
-    estimate_mb = (8 * elements + (3 if with_grad else 1) * resident_bytes) / 1e6
-    estimate_mb += _local_direct_workspace_mb(
-        mf.mol.max_memory, getattr(with_df, 'max_memory', mf.mol.max_memory),
-        reserve_bytes=estimate_mb * 1e6 - resident_bytes) + scatter_mb
-    estimate_mb += _native_workspace_mb(naux, nocc, nvir,
-                                        with_grad=with_grad, system=True,
-                                        mode=mode, target_batch_size=target_batch_size,
-                                        threads=threads)
-    limit_mb = float(getattr(mf, "max_memory", mf.mol.max_memory))
-    # The estimator includes one existing resident copy (and, for gradients,
-    # two forecast copies). Remove only that existing copy before adding RSS.
-    assess_memory('system', estimate_mb - resident_bytes / 1e6,
-                  configured_mb=limit_mb, budget_estimate_mb=estimate_mb,
                   unavoidable_bytes=naux * nocc * nvir * numpy.dtype('float64').itemsize)
     return estimate_mb
 

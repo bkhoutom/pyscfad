@@ -2,23 +2,22 @@
 
 This branch supports multiple physical occupied fragments **S**, each with its
 own possibly truncated local interacting space (**LIS**). The energy combines
-an independent MP2 baseline with fragment `CCSD + (T) - MP2-LIS` corrections.
-The gradient includes the retained D/W subspace, AO overlap, integrals, CCSD
+the W-derived domain MP2 baseline with fragment `CCSD + (T) - MP2-LIS` corrections.
+The gradient includes the retained W subspace, AO overlap, integrals, CCSD
 amplitudes, fragment weights, and full occupied/virtual Fock response.
 
 See the [complete API and command-line reference](doc/source/user_guide/smooth_lis_triples.md)
 for every smooth CCSD(T) driver option, units, allocation formulas, and diagnostics.
 The [frame theory note](NOTE_SMOOTH_LIS_FRAME.md) explains the orbital-gap problem.
-The [STC guide](pyscfad/dlno_stc/README.md) covers MP2, D/W matrices, and native builds.
+The [STC guide](pyscfad/dlno_stc/README.md) covers MP2, W matrices, and native builds.
 
 ## Supported modes
 
 | Selection / triples setting | Behavior |
 | --- | --- |
-| `smooth=True` (default), `ccsd_t=False` (default) | Anchored full-LIS CCSD, without triples. |
-| `smooth=True`, `ccsd_t=True`, `triples_controls=None` or `{"mode": "deterministic"}` | Deterministic native asymmetric Laplace triples on the fitted grid. Selected-occupied virtual blocks use GEMMs for energy and gradients. |
-| `smooth=True`, `ccsd_t=True`, `{"mode": "stochastic", ...}` | Native asymmetric Laplace triples with selected-space sampling; energy and gradient use the same production draws. |
-| `smooth=False`, deterministic triples | Conventional semicanonical reference with direct denominators. Stochastic triples are rejected. |
+| `ccsd_t=False` (default) | Anchored full-LIS CCSD, without triples. |
+| `ccsd_t=True`, `triples_controls=None` or `{"mode": "deterministic"}` | Deterministic native asymmetric Laplace triples on the fitted grid. Selected-occupied virtual blocks use GEMMs for energy and gradients. |
+| `ccsd_t=True`, `{"mode": "stochastic", ...}` | Native asymmetric Laplace triples with selected-space sampling; energy and gradient use the same production draws. |
 
 The smooth path always uses one complete occupied frame and one complete
 virtual frame **within the retained LIS**. This does not disable LIS truncation.
@@ -37,10 +36,12 @@ These are library defaults, not the overrides in the run scripts below.
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `boys_grouping` | `"singleton"` | One S per active Boys orbital; `"atom"` groups by heavy atom with associated H atoms, and `"molecule"` makes one S. |
-| `force_full_domains` | `False` | Full extended domains when enabled; `"molecule"` enables this automatically. This is separate from LIS eigenvalue cutoffs. |
-| `matrix_kind`, `thresh_occ`, `thresh_vir` | Required | Choose D or W and its occupied/virtual absolute-eigenvalue cutoffs; zero keeps the full corresponding space. |
+| `full_domain` | `False` | Full extended domains when enabled; `"molecule"` enables this automatically. This is separate from LIS eigenvalue cutoffs. |
+| `thresh_occ`, `thresh_vir` | Required | Occupied/virtual absolute-eigenvalue cutoffs; zero keeps the full corresponding space. |
 | `internal_rank_threshold` | `1e-6` | Numerical rank threshold when completing the LIS to the full MO layout; all original S orbitals remain retained. |
-| `smooth` / `smooth_laplace_points` | `True` / `4` | Anchored frames and a positive fitted triples grid per LIS. |
+| `triples_laplace_points` | `4` | Fit a positive (T) grid per LIS, independently of MP2/W. |
+| `mp2_laplace_points` | `6` | Domain selection fits one global MP2/W grid from the full active spectrum and saves it for all domains. |
+| `mp2_grid` | `None` | Shared MP2/W `(roots, weights)`; `None` reuses the globally fitted grid saved by domain selection. |
 | `ccsd_t` / `triples_controls` | `False` / `None` | Enable triples explicitly; omitted controls then mean deterministic. |
 | `triples_controls.mode` | `"deterministic"` | `"stochastic"` enables sampling. |
 | `integral_transform` | `"df"` | `"rotate"` directly rotates cached CCSD `ovvv`, `ovoo`, and `ovov` at each Laplace point; available for either smooth triples mode. |
@@ -49,15 +50,15 @@ These are library defaults, not the overrides in the run scripts below.
 | `pilot_samples` | `10000` | Independent discarded pilot draws **per Laplace point per S**. |
 | `global_seed` | `71` | Separate fragment, point, pilot, and production streams are derived from this seed. |
 | `trace_exponent` | `5.0` | Triples Laplace-point variance allocation exponent. The MP2 trace model uses `1.4`. |
-| `fragment_energies` | Saved MP2 fragment proxies | Optional full vector of reference energies, e.g. CCSD fragment energies; variance shares use absolute values. |
-| `include_hf` / `include_baseline` | `False` / `True` | Return correlation energy by default; enable HF for total molecular energy and forces. |
+| `variance_allocation` | `"occupied_count"` | Fragment plans allocate variance by original occupied target count, without a W prepass. |
+| `include_hf` | `False` | Return correlation energy by default; enable HF for total molecular energy and forces. |
 | `merge_identical` | `True` | Share preparation for identical domains; preserve physical S corrections. |
 | `return_components` | `False` | Include per-fragment energies, sample counts, and SE diagnostics when enabled. |
 
 Sampling-only controls are invalid with `mode="deterministic"`. The triples
 dictionary has no thread, batch, dressing, or separate backward-sampling option.
-MP2 baseline and D/W matrix controls are independent dictionaries; changing their
-mode does not change the triples mode.
+W supplies the MP2 baseline and uses independent controls from triples.
+Its stochastic mode does not change the triples mode.
 
 To reuse CCSD integrals, add `"integral_transform": "rotate"` to
 `triples_controls`, for example
@@ -170,7 +171,7 @@ semicanonical; the force differentiates all Fock entries in their transported fr
 ## Total triples SE and point allocation
 
 Positive `energy_tolerance` allocates total **variance** among S in proportion to
-absolute fragment energy proxies, then among its Laplace points using the trace
+original occupied target counts, then among its Laplace points using the trace
 model. Every point has an independent pilot, at least 10000 production draws,
 and adaptive extension until its reported SE meets its allocation. Prepared
 tensors and probability tables are reused for that point's pilot and production.
@@ -190,7 +191,7 @@ CPU affinity and numerical thread limits before importing JAX. Always pass
 `--threads 32` for our runs. Native sample blocks are processed in groups of up to
 the actual OpenMP thread count; there is no separate user batch-count setting.
 
-From the repository root, compare stochastic forces with conventional
+From the repository root, compare stochastic forces with smooth deterministic
 deterministic forces for C5H6/cc-pVDZ, one untruncated LIS and five frozen cores:
 
 ```bash

@@ -53,16 +53,15 @@ def test_gradient_service_worker_adopts_closed_shell_placeholders_without_scf(mo
 
 @pytest.mark.parametrize('comm', [None, SimpleNamespace(Get_size=lambda: 1)])
 def test_serial_runner_does_not_receive_or_activate_scf_service_options(monkeypatch, comm):
-    state = {'cc_fragment_indices': (1,), 'cc_triples_controls': None}
+    state = {'cc_triples_controls': None}
 
     def forbidden_worker():
         raise AssertionError('serial execution activated a worker initializer')
 
     def serial(state_arg, static, baseline, matrix, *, with_grad,
-               fragment_indices, triples_controls, checkpoint_dir, resume):
+               triples_controls, checkpoint_dir, resume):
         assert state_arg is state
         assert (static, baseline, matrix) == ('static', 'baseline', 'matrix')
-        assert fragment_indices == (1,)
         assert triples_controls is None
         assert checkpoint_dir is None and resume is False
         assert with_grad is False

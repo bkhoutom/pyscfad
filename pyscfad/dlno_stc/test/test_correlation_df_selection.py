@@ -131,13 +131,13 @@ def test_public_selection_callback_inherits_ri_on_detached_reference(
         # Invoke the real builder without repeating the keyword. Full domains
         # keep this focused on selection routing, with no correlation reverse.
         return dlno_stc.build_domain_selections(reference, frozen=1,
-            pair_energy_model='exact', force_full_domains=True)
+            pair_energy_model='exact', full_domain=True)
     def initialize(current, selected, controls, **options):
         assert current is mf and options['correlation_auxbasis'] == 'cc-pvdz-ri'
         return selected
     monkeypatch.setattr(driver, '_initialize_scf', lambda *args, **kwargs: (mf, lambda bar: (bar,)))
     monkeypatch.setattr(driver, '_initialize', initialize)
-    monkeypatch.setattr(driver, '_run_domain', lambda initialize, *args, **kwargs: initialize())
+    monkeypatch.setattr(driver, '_run_serial', lambda initialize, *args, **kwargs: initialize())
     selected = dlno_stc.value_and_grad(mf.mol, lambda mol: mf, controls={},
         build_static=choose, correlation_auxbasis='cc-pvdz-ri')
     assert selected.correlation_basis_identity == basis_identity(mf, 'cc-pvdz-ri')
@@ -154,7 +154,7 @@ def test_real_standalone_cc_selection_records_only_explicit_ri_identity(selectio
 
     mf = selection_water_reference
     domains = build_domain_selections(mf, frozen=1, pair_energy_model='all')
-    options = dict(matrix_kind='W', thresh_occ=1e-5, thresh_vir=1e-5,
+    options = dict( thresh_occ=1e-5, thresh_vir=1e-5,
                    baseline_controls={}, matrix_controls={})
     default = ccsd.build_static_selections(mf, domains, **options)
     explicit = ccsd.build_static_selections(mf, domains,
@@ -163,7 +163,7 @@ def test_real_standalone_cc_selection_records_only_explicit_ri_identity(selectio
     assert domains.correlation_basis_identity is None
     assert explicit.correlation_basis_identity == basis_identity(mf, 'cc-pvdz-ri')
     assert explicit.correlation_basis_identity != basis_identity(mf, None)
-    assert default.deferred_selection == explicit.deferred_selection
+    assert default.selection_options == explicit.selection_options
     assert _restart.scientific_digest(default) != _restart.scientific_digest(explicit)
     assert not hasattr(mf, '_stc_correlation_auxbasis')
     assert mf.with_df.auxbasis == 'weigend'

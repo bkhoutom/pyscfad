@@ -1,4 +1,5 @@
 """ED plans become live frames only when their fragment is prepared."""
+from pyscfad.dlno_stc.test._cc_options import cc_options
 from dataclasses import replace
 import gc
 import weakref
@@ -142,14 +143,13 @@ def test_streamed_ed_ccsdt_matches_fixed_ed_energy_and_full_gradient(molecular_g
     monkeypatch.setattr(_ed_selection, 'select_boys_ed_frame', select)
     def run(domains):
         static = ccsd.build_static_selections(
-            case.mf, domains, matrix_kind='W', thresh_occ=1e-4, thresh_vir=3e-5,
-            baseline_controls=case.controls, matrix_controls=case.controls,
-            fragment_indices=case.indices)
+            case.mf, domains, thresh_occ=1e-4, thresh_vir=3e-5,
+            **cc_options(case.controls, case.controls))
         state = driver._initialize(case.mf, domains, case.controls, with_grad=True,
                                    scf_pullback=case.scf_pullback)
         rows = ccsd._run_group(
             state, static, case.group, case.controls, case.controls, with_grad=True,
-            verbose_imp=0, ccsd_t=True, fragment_indices=case.indices,
+            verbose_imp=0, ccsd_t=True,
             triples_controls=ccsd.normalize_triples_controls(
                 dict(mode='deterministic', integral_transform='rotate'), ccsd_t=True))
         value, grad = driver._finish(state, with_grad=True, include_hf=False)

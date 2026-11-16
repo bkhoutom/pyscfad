@@ -1,11 +1,10 @@
-"""Domain and whole-system STC-MP2 energies and molecular gradients.
+"""Fragment STC-MP2 energies and molecular gradients.
 
     Discrete domains, ranks, partner sets and Laplace grid are fixed. Nuclear
     coordinate gradients require coordinate-only molecule leaves and a
     positive-definite local auxiliary fitting metric.
 """
 
-from functools import partial
 from contextlib import contextmanager, nullcontext, ExitStack
 import gc
 import math
@@ -13,12 +12,13 @@ import warnings
 
 import jax
 import numpy
-from pyscf import df as pyscf_df, lib
+from pyscf import lib
 from pyscfad import config_update, numpy as np
 from pyscfad.ops import stop_trace
 from pyscfad.lib._compilation_cache import configure_compilation_cache
 from pyscfad.tools import resource_profile
-from ._selection import DomainSelections, _extract_active_indices, build_domain_groups
+from ._selection import (DomainSelections, _extract_active_indices,
+                         build_domain_groups, build_domain_selections)
 from .domain import build_scf_data, rebuild_domain_data
 from ._selection import _validate_boys_target_groups as validate_boys_target_groups
 from .adjoint import (
@@ -33,15 +33,10 @@ from ._pairs import weak_pair_energy_and_grad, weak_pair_energy_sum, weak_pair_i
 from . import backend
 from ._memory import memory_calculation
 from ._cleanup import release_memory as _release_memory
-from ._workflow import check_system_memory, check_domain_memory, allocate_domain_controls
-from .adjoint import apply_full_pullback, apply_selected_pullback
+from ._workflow import check_domain_memory, allocate_domain_controls
+from .adjoint import apply_selected_pullback
 from .controls import DEFAULT_ENERGY_TOLERANCE, default_laplace_grid
-from .domain import (
-    select_system_boys_reference, select_system_virtual_anchor_columns,
-)
-from .parallel import run_backend
-from .prepare import prepare_system_inputs, prepare_boys_group_inputs
-from .protocol import ARRAY_NAMES
+from .prepare import prepare_boys_group_inputs
 from ._df_basis import basis_kwargs, can_reuse_scf_df, validate_selection_basis
 
 
@@ -88,13 +83,21 @@ def _validate_static(static):
             raise ValueError("strong partner selections disagree with strong_mask")
 
 
-def _driver_controls(controls, *, scope=None):
+def _driver_controls(controls, *, static=None, defer_grid=False):
     """Copy root-owned options and apply high-level defaults before preparation."""
     if not isinstance(controls, dict):
         raise TypeError("controls must be a dictionary")
     controls = controls.copy()
-    if "laplace_roots" not in controls and "laplace_weights" not in controls:
-        controls["laplace_roots"], controls["laplace_weights"] = default_laplace_grid()
+    missing_grid = not {'laplace_roots', 'laplace_weights'} & controls.keys()
+    if missing_grid:
+        if static is None:
+            controls['laplace_roots'], controls['laplace_weights'] = default_laplace_grid()
+        else:
+            grid = getattr(static, 'mp2_grid', None)
+            if grid is None:
+                raise ValueError('domain selections have no saved MP2 grid; rebuild selections')
+            from .controls import resolve_mp2_grid
+            controls.update(resolve_mp2_grid(grid))
     if controls.get("mode", "deterministic") == "stochastic" and "production_samples" not in controls:
         controls.setdefault("energy_tolerance", DEFAULT_ENERGY_TOLERANCE)
     _validate_controls(controls)
@@ -103,6 +106,11 @@ def _driver_controls(controls, *, scope=None):
             "high-level STC uses full local Fock blocks; canonical_fock=True "
             "is reserved for low-level canonical reference calculations"
         )
+    if defer_grid and missing_grid:
+        # Preflight settings before SCF, but resolve the actual grid only
+        # after the saved selection or selection callback is available.
+        controls.pop('laplace_roots')
+        controls.pop('laplace_weights')
     return controls
 
 
@@ -138,7 +146,7 @@ def _validate_controls(controls):
 
 def _validate_reference(mf, static, *, correlation_auxbasis=None):
     validate_selection_basis(mf, static, correlation_auxbasis)
-    _system_active_indices(mf, static.frozen)
+    _active_indices(mf, static.frozen)
     for name, expected in zip(
         ("active_occ_indices", "active_vir_indices", "pao_projected_out_indices"),
         _extract_active_indices(mf, static.frozen),
@@ -231,7 +239,7 @@ def _initialize(mf, static, controls, *, with_grad, scf_pullback=None,
                 scf_data=None, scf_data_pullback=None, prepared_domain=None,
                 correlation_auxbasis=None):
     _validate_static(static)
-    _validate_controls(controls)
+    controls = _driver_controls(controls, static=static)
     _validate_reference(mf, static, **basis_kwargs(correlation_auxbasis))
     configure_compilation_cache()
     pending = pending_energy = None
@@ -437,8 +445,7 @@ def _finish_response(state, energy, mf_bar, *, include_hf):
         hf_energy = state["mf"].e_tot
         mf_bar.e_tot = _add_cotangent(mf_bar.e_tot, np.ones_like(hf_energy))
         energy = energy + hf_energy
-    scope = 'system' if 'fock_from_scf' in state else 'domain'
-    with resource_profile.section(f'stc.{scope}.scf_response'):
+    with resource_profile.section('stc.domain.scf_response'):
         scf_pullback = state.pop("scf_pullback")
         data_bar = state.pop('_scf_data_bar', None)
         mol_bar, = (scf_pullback(mf_bar) if data_bar is None
@@ -487,81 +494,62 @@ def _finish_mp2_df(shared, mf_bar):
     return mf_bar
 
 
-def _run_domain(initializer, static, controls, comm, *, with_grad, include_hf=False,
+def _run_serial(initializer, static, controls, *, with_grad, include_hf=False,
                 merge_identical=True):
-    rank = 0 if comm is None else comm.Get_rank()
+    """Consume each group's energy and response before preparing the next."""
     with resource_profile.section('stc.domain.initialize'):
-        state = _root_call(comm, rank, initializer, "initial preparation")
-    # Selection endpoint tapes have been consumed; common/SCF VJPs stay live.
-    # Compilation-cache clearing is opt-in here, never between domain groups.
-    _root_call(comm, rank, lambda: _release_memory(
-        'after_selection', state['common'], state['mf_bar'], state['common_bar'],
-        state['energy'], clear_caches=True), "selection memory cleanup")
-    if rank == 0 and static is None:
-        static = state["static"]
-    groups = _root_call(comm, rank,
-                        lambda: build_domain_groups(static, merge_identical=merge_identical),
-                        "group selection")
-    pairs = state["weak_pairs"] if rank == 0 else None
-    if comm is not None:
-        groups, pairs = comm.bcast((groups, pairs), root=0)
-    settings = allocate_domain_controls(controls, len(groups)) if rank == 0 else None
-    for group in groups:
-        fragment_id = group.representative_index
-        with ExitStack() as resources:
-            shared = _root_call(comm, rank, lambda: resources.enter_context(
-                _mp2_df_scope(state, static.fragments[fragment_id].extended_atoms,
-                              static.fragments[fragment_id].pao_center_atoms,
-                              with_grad=with_grad)),
-                f"group {fragment_id} DF setup")
-            with resource_profile.section('stc.domain.prepare'):
-                prepared = _root_call(comm, rank,
-                    lambda: _prepare(state, static, group, controls, with_grad),
-                    f"group {fragment_id} preparation")
-            metadata = ({"fragment_id": fragment_id, "target_indices": group.target_indices,
-                         "fragment_indices": group.fragment_indices,
-                         "global_target_orbitals": tuple(int(static.frag_lolist[i][0])
-                                                         for i in group.fragment_indices),
-                         "budget": {"total_tolerance": controls.get("energy_tolerance"),
-                                    "effective_tolerance": settings.get("energy_tolerance"),
-                                    "original_target_count": len(static.fragments),
-                                    "group_count": len(groups)}} if rank == 0 else None)
-            with resource_profile.section('stc.domain.native'):
-                result = run_backend(prepared[1] if rank == 0 else None, metadata, settings,
-                                     partial(backend.solve, with_grad=with_grad), comm=comm)
-
-            def apply_group():
-                if with_grad:
-                    _add_bars(state, *apply_selected_pullback(prepared[2], prepared[0], result))
-                state["mf_bar"] = _finish_mp2_df(shared, state["mf_bar"])
-                state["energy"] = state["energy"] + result["energy"]
-                state["variance"] += float(result["energy_standard_error"]) ** 2
-                jax.block_until_ready((state["energy"], state["mf_bar"], state["common_bar"]))
-
-            with resource_profile.section('stc.domain.input_pullback'):
-                _root_call(comm, rank, apply_group, f"group {fragment_id} pullback")
-        del prepared, result, apply_group
-        _root_call(comm, rank, lambda: _release_memory(
-            'after_domain', state['energy'], state['mf_bar'], state['common_bar'],
-            fragment_id=fragment_id), f"group {fragment_id} memory cleanup")
+        state = initializer()
+    if state.get('empty', False):
+        return _finish(state, with_grad=with_grad, include_hf=include_hf)
+    _release_memory('after_selection', state['common'], state['mf_bar'],
+                    state['common_bar'], state['energy'], clear_caches=True)
+    if static is None:
+        static = state['static']
+    controls = _driver_controls(controls, static=static)
+    groups = build_domain_groups(static, merge_identical=merge_identical)
+    settings = allocate_domain_controls(controls, len(groups))
+    pairs = state['weak_pairs']
     if pairs:
-        def apply_weak():
+        with resource_profile.section('stc.domain.weak'):
             if with_grad:
                 energy, bars = _weak_energy_and_grad(state, static, pairs)
                 _add_bars(state, *bars)
+                del bars
             else:
                 energy = _weak_energy(state, static, pairs)
-            state["energy"] = state["energy"] + energy
-            jax.block_until_ready((state["energy"], state["mf_bar"], state["common_bar"]))
-        with resource_profile.section('stc.domain.weak'):
-            _root_call(comm, rank, apply_weak, "weak endpoint response")
-        del apply_weak
+            state['energy'] = state['energy'] + energy
+            jax.block_until_ready((state['energy'], state['mf_bar'], state['common_bar']))
         if not with_grad:
-            # The gradient helper already collects after releasing its tapes.
             gc.collect()
+    for group in groups:
+        fragment_id = group.representative_index
+        fragment = static.fragments[fragment_id]
+        with _mp2_df_scope(state, fragment.extended_atoms, fragment.pao_center_atoms,
+                           with_grad=with_grad) as shared:
+            with resource_profile.section('stc.domain.prepare'):
+                inputs, host, pullback = _prepare(state, static, group, controls, with_grad)
+            metadata = {"fragment_id": fragment_id, "target_indices": group.target_indices,
+                        "fragment_indices": group.fragment_indices,
+                        "global_target_orbitals": tuple(int(static.frag_lolist[i][0])
+                                                        for i in group.fragment_indices),
+                        "budget": {"total_tolerance": controls.get("energy_tolerance"),
+                                   "effective_tolerance": settings.get("energy_tolerance"),
+                                   "original_target_count": len(static.fragments),
+                                   "group_count": len(groups)}}
+            with resource_profile.section('stc.domain.native'):
+                result = backend.solve(host, metadata, settings, with_grad=with_grad)
+            with resource_profile.section('stc.domain.input_pullback'):
+                if with_grad:
+                    _add_bars(state, *apply_selected_pullback(pullback, inputs, result))
+                state['mf_bar'] = _finish_mp2_df(shared, state['mf_bar'])
+                state['energy'] = state['energy'] + result['energy']
+                state['variance'] += float(result['energy_standard_error']) ** 2
+                jax.block_until_ready((state['energy'], state['mf_bar'], state['common_bar']))
+        del inputs, host, pullback, result
+        _release_memory('after_domain', state['energy'], state['mf_bar'], state['common_bar'],
+                        fragment_id=fragment_id)
     with resource_profile.section('stc.domain.response'):
-        return _root_call(comm, rank, lambda: _finish(state, with_grad=with_grad,
-                         include_hf=include_hf), "final response")
+        return _finish(state, with_grad=with_grad, include_hf=include_hf)
 
 
 def _select_scope(static, scope, frozen, lo_kwargs=None):
@@ -584,20 +572,24 @@ def _shared_scope(static, scope, frozen, comm, lo_kwargs=None):
     return selected if comm is None else comm.bcast(selected, root=0)
 
 
-def _system_active_indices(mf, frozen):
+def _active_indices(mf, frozen):
     """Validate restricted DF and frozen spaces before inherited selection."""
     if getattr(mf, "with_df", None) is None:
-        raise ValueError("system STC requires a density-fitted SCF object")
+        raise ValueError("STC requires a density-fitted SCF object")
     if not getattr(mf, "converged", False):
-        raise ValueError("system STC requires a converged SCF reference")
+        raise ValueError("STC requires a converged SCF reference")
     coeff, occ = numpy.asarray(mf.mo_coeff), numpy.asarray(mf.mo_occ)
     if numpy.iscomplexobj(coeff) or numpy.iscomplexobj(occ):
-        raise NotImplementedError("system STC supports real orbitals only")
+        raise NotImplementedError("STC supports real orbitals only")
     if (coeff.ndim != 2 or occ.ndim != 1 or occ.size != coeff.shape[1]
             or not numpy.all((numpy.abs(occ) < 1e-12) | (numpy.abs(occ - 2) < 1e-12))):
-        raise NotImplementedError("system STC supports restricted closed-shell references only")
+        raise NotImplementedError("STC supports restricted closed-shell references only")
     if not numpy.isfinite(coeff).all() or not numpy.isfinite(occ).all():
-        raise ValueError("system SCF orbitals and occupations must be finite")
+        raise ValueError("SCF orbitals and occupations must be finite")
+    energies = numpy.asarray(mf.mo_energy)
+    if (energies.shape != (coeff.shape[1],) or numpy.iscomplexobj(energies)
+            or not numpy.isfinite(energies).all()):
+        raise ValueError("SCF orbital energies must be real, finite and match the coefficient columns")
     noccupied, nmo = int(numpy.count_nonzero(occ > 1)), occ.size
     if frozen is None:
         frozen = 0
@@ -617,6 +609,16 @@ def _system_active_indices(mf, frozen):
         raise TypeError("frozen must be None, an integer, or an integer MO index list")
     occupied, virtual, _ = _extract_active_indices(mf, frozen)
     return occupied, virtual
+
+
+def _empty_reference(mf, frozen, *, with_grad, scf_pullback=None):
+    """Skip correlation work when freezing removes an entire active space."""
+    occupied, virtual = _active_indices(mf, frozen)
+    if len(occupied) and len(virtual):
+        return None
+    return dict(empty=True, mf=mf, scf_pullback=scf_pullback,
+                energy=np.zeros((), dtype=mf.mo_coeff.dtype), variance=0.0,
+                mf_bar=_zero_mf_cotangent(mf, mf.mo_coeff.dtype) if with_grad else None)
 
 
 class _JointSCFPullback:
@@ -679,9 +681,9 @@ def _sgx_scf_pullback(mf, pullback):
     return apply
 
 
-def _root_owned_scf_response(comm, parallel_scf_jk, *, scope='domain'):
+def _root_owned_scf_response(comm, parallel_scf_jk):
     """Whether the complete shared reverse runs without a distributed J/K service."""
-    return (scope == 'system' or comm is None or comm.Get_size() <= 1
+    return (comm is None or comm.Get_size() <= 1
             or not parallel_scf_jk)
 
 
@@ -708,155 +710,6 @@ def _serial_scf_pullback(pullback):
     return apply
 
 
-def _initialize_system(mf, frozen, controls, *, with_grad, scf_pullback=None,
-                       lo_kwargs=None, fock_from_scf=False, correlation_auxbasis=None):
-    _validate_controls(controls)
-    occupied, virtual = _system_active_indices(mf, frozen)
-    requested_fock_from_scf = fock_from_scf
-    if fock_from_scf and len(occupied) and len(virtual):
-        energies = numpy.asarray(mf.mo_energy)
-        if (energies.shape != (mf.mo_coeff.shape[1],) or numpy.iscomplexobj(energies)
-                or not numpy.isfinite(energies).all()):
-            raise ValueError("SCF Fock projection requires real finite orbital energies "
-                             "matching the canonical coefficient columns")
-        # SCF's generalized-eigh response masks rotations at gaps <= 1e-9.
-        # Reconstructing F from those outputs would lose off-diagonal Fock
-        # response inside a degenerate active block. Select the general path
-        # outside the AD tape, using the same cutoff as the SCF eigensolver.
-        if any(numpy.any(numpy.diff(numpy.sort(energies[indices])) <= 1e-9)
-               for indices in (occupied, virtual)):
-            fock_from_scf = False
-    resource_profile.checkpoint('stc.system.fock_state',
-        requested_fock_from_scf=requested_fock_from_scf, fock_from_scf=fock_from_scf,
-        degeneracy_fallback=requested_fock_from_scf and not fock_from_scf)
-    dtype = mf.mo_coeff.dtype
-    return {"mf": mf, "correlation_auxbasis": correlation_auxbasis,
-            "occupied": occupied, "virtual": virtual,
-            "lo_kwargs": lo_kwargs, "fock_from_scf": fock_from_scf,
-            "scf_pullback": scf_pullback, "energy": np.zeros((), dtype=dtype),
-            "variance": 0.0,
-            "mf_bar": (_zero_mf_cotangent(mf, dtype)
-                       if with_grad and not (len(occupied) and len(virtual)) else None)}
-
-
-def _validate_canonical_system(mf):
-    """Validate the converged canonical eigenproblem outside the AD tape."""
-    coeff = numpy.asarray(mf.mo_coeff)
-    energies = numpy.asarray(mf.mo_energy)
-    if energies.shape != (coeff.shape[1],) or not numpy.isfinite(energies).all():
-        raise ValueError("canonical_fock requires finite canonical orbital energies")
-    fock = numpy.asarray(mf.get_fock())
-    residual = float(numpy.max(numpy.abs(coeff.T @ fock @ coeff - numpy.diag(energies))))
-    grad_tolerance = mf.conv_tol_grad
-    if grad_tolerance is None:
-        energy_tolerance = float(mf.conv_tol)
-        if not math.isfinite(energy_tolerance) or energy_tolerance <= 0:
-            raise ValueError("canonical_fock requires a finite positive SCF energy tolerance")
-        grad_tolerance = math.sqrt(energy_tolerance)
-    grad_tolerance = float(grad_tolerance)
-    if not math.isfinite(grad_tolerance) or grad_tolerance <= 0:
-        raise ValueError("canonical_fock requires a finite positive SCF gradient tolerance")
-    residual_limit = max(1e-7, grad_tolerance)
-    if not numpy.isfinite(residual) or residual > residual_limit:
-        raise ValueError(
-            "canonical_fock requires canonical SCF orbitals and matching energies; "
-            f"max |C.T F C - diag(eps)| = {residual:.3g} Eh "
-            f"exceeds {residual_limit:.3g} Eh")
-
-
-def _prepare_system(state, controls, with_grad):
-    memory_controls = ({"mode": "deterministic",
-                        "target_batch_size": controls.get("target_batch_size", 1),
-                        "threads": controls.get("threads")}
-                       if controls.get("mode", "deterministic") == "deterministic" else {})
-    check_system_memory(state["mf"], len(state["occupied"]), len(state["virtual"]),
-                        with_grad=with_grad,
-                        virtual_block_size=controls.get("virtual_block_size", 16),
-                        auxiliary_group_size=controls.get("auxiliary_group_size", 32),
-                        **memory_controls, **basis_kwargs(state.get("correlation_auxbasis")))
-    fitting = state["mf"].with_df
-    basis = state.get("correlation_auxbasis")
-    if can_reuse_scf_df(state["mf"], basis):
-        # Eigenvalue fallback drops auxiliary rows. Check an existing source's
-        # rank without rebuilding the metric solely for validation.
-        auxmol = fitting.auxmol
-        if auxmol is None:
-            auxmol = pyscf_df.addons.make_auxmol(state["mf"].mol.to_pyscf(), fitting.auxbasis)
-        if fitting.get_naoaux() != auxmol.nao:
-            raise NotImplementedError(
-                "system STC requires a full-rank cached factor for a positive-definite "
-                "auxiliary fitting metric; cached and auxiliary dimensions differ")
-        # Resolve source compatibility on the concrete reference. Separate
-        # geometry leaves become distinct tracers inside the preparation VJP.
-        basis = None
-    # Save discrete labels before building the VJP; rebuild all continuous
-    # coefficients inside it. System scope needs no domain selections.
-    state["boys_reference"] = select_system_boys_reference(
-        state["mf"], state["occupied"], lo_kwargs=state["lo_kwargs"],
-    )
-    state["virtual_anchor_columns"] = select_system_virtual_anchor_columns(
-        state["mf"], state["virtual"],
-    )
-    prepare = lambda mf_: prepare_system_inputs(
-        mf_, state["occupied"], state["virtual"],
-        boys_reference=state["boys_reference"],
-        virtual_anchor_columns=state["virtual_anchor_columns"],
-        fock_from_scf=state["fock_from_scf"], **basis_kwargs(basis),
-    )
-    with warnings.catch_warnings():
-        warnings.filterwarnings("error", message="integral-direct local Lov is unavailable.*",
-                                category=RuntimeWarning)
-        if with_grad:
-            inputs, pullback = jax.vjp(prepare, state["mf"])
-        else:
-            inputs, pullback = prepare(state["mf"]), None
-    return inputs, backend.host_inputs(inputs, scope="system"), pullback
-
-
-def _run_system(initializer, controls, comm, *, with_grad, include_hf=False):
-    rank = 0 if comm is None else comm.Get_rank()
-    with resource_profile.section('stc.system.scf'):
-        state = _root_call(comm, rank, initializer, "initial system preparation")
-        if rank == 0 and resource_profile.enabled():
-            jax.block_until_ready((state["mf"], state["scf_pullback"]))
-    has_work = bool(len(state["occupied"]) and len(state["virtual"])) if rank == 0 else None
-    if comm is not None:
-        has_work = comm.bcast(has_work, root=0)
-    if has_work:
-        with ExitStack() as resources:
-            shared = _root_call(comm, rank, lambda: resources.enter_context(
-                _mp2_df_scope(state, with_grad=with_grad)), "system DF setup")
-            with resource_profile.section('stc.system.prepare'):
-                prepared = _root_call(comm, rank, lambda: _prepare_system(state, controls, with_grad),
-                                      "system preparation")
-            with resource_profile.section('stc.system.native'):
-                result = run_backend(
-                    prepared[1] if rank == 0 else None, {} if rank == 0 else None,
-                    controls if rank == 0 else None,
-                    partial(backend.solve, with_grad=with_grad, scope="system"),
-                    comm=comm, array_names=ARRAY_NAMES,
-                )
-
-            def apply_system():
-                if with_grad:
-                    # Validate the existing host mirror without compiling many
-                    # bounded JAX slices solely for repeated finite-value checks.
-                    state["mf_bar"], = apply_full_pullback(prepared[2], prepared[1], result)
-                state["mf_bar"] = _finish_mp2_df(shared, state["mf_bar"])
-                state["energy"] = state["energy"] + result["energy"]
-                state["variance"] = float(result["energy_standard_error"]) ** 2
-                jax.block_until_ready((state["energy"], state["mf_bar"]))
-
-            with resource_profile.section('stc.system.input_pullback'):
-                _root_call(comm, rank, apply_system, "system pullback")
-        del prepared, result, apply_system
-        _root_call(comm, rank, lambda: _release_memory(
-            'after_system', state['energy'], state['mf_bar']), "system memory cleanup")
-    with resource_profile.section('stc.system.response'):
-        return _root_call(comm, rank, lambda: _finish(state, with_grad=with_grad,
-                                                    include_hf=include_hf), "final response")
-
-
 @memory_calculation
 def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
            lo_kwargs=None, merge_identical=True, parallel_scf_jk=True,
@@ -873,23 +726,26 @@ def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
     The default ``parallel_scf_jk=True`` distributes common-preparation DF J/K
     work for multi-rank domain calls; ``False`` keeps this work on root.
     SCF preceding this energy-only API is caller-owned.
-    System, serial and single-rank calls retain their existing behavior.
+    System scope uses one molecular fragment in the same executor.
     """
     scope = _shared_scope(static, scope, frozen, comm, lo_kwargs)
     rank = 0 if comm is None else comm.Get_rank()
-    controls = _root_call(comm, rank, lambda: _driver_controls(controls, scope=scope),
+    controls = _root_call(comm, rank, lambda: _driver_controls(controls, defer_grid=True),
                           "control validation")
 
     def initialize():
         if any(isinstance(x, jax.core.Tracer) for x in jax.tree_util.tree_leaves(mf)):
             raise TypeError("STC kernel is forward-only; use value_and_grad")
+        selected = static
         if scope == "system":
-            return _initialize_system(mf, frozen, controls, with_grad=False,
-                                      lo_kwargs=lo_kwargs, **basis_kwargs(correlation_auxbasis))
-        return _initialize(mf, static, controls, with_grad=False, **basis_kwargs(correlation_auxbasis))
+            empty = _empty_reference(mf, frozen, with_grad=False)
+            if empty is not None:
+                return empty
+            selected = build_domain_selections(
+                mf, scope="system", frozen=0 if frozen is None else frozen,
+                lo_kwargs=lo_kwargs, **basis_kwargs(correlation_auxbasis))
+        return _initialize(mf, selected, controls, with_grad=False, **basis_kwargs(correlation_auxbasis))
 
-    if scope == "system":
-        return _run_system(initialize, controls, comm, with_grad=False)
     if comm is not None and comm.Get_size() > 1:
         from ._mpi import _run_domain_mpi
 
@@ -905,7 +761,7 @@ def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
                                with_grad=False, merge_identical=merge_identical,
                                parallel_scf_jk=parallel_scf_jk,
                                scf_worker_initializer=lambda: mf)
-    return _run_domain(initialize, static, controls, comm, with_grad=False,
+    return _run_serial(initialize, static, controls, with_grad=False,
                        merge_identical=merge_identical)
 
 
@@ -918,18 +774,11 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
     ``correlation_auxbasis`` selects local correlation fitting independently
     of HF/Fock/SCF response. ``None`` preserves the existing fitting workflow.
     A selection callback inherits the explicit correlation basis.
-    Discrete selections and the Laplace grid are fixed. System scope fixes
-    Boys reference labels and complete PAO virtual anchors, while coordinate
-    response includes localization, projections, Cholesky orthonormalization,
-    full Fock blocks, fitted factors and SCF.
-    For system scope, ``build_mf`` must return converged canonical orbitals
-    and matching orbital energies without subsequent orbital rotations.
-    Local Fock blocks use these differentiable energies and rotations to
-    avoid a separate AO Fock construction and its preparation pullback.
-    Degenerate active occupied or virtual spectra use AO Fock preparation
-    because the SCF eigensolver masks their internal rotation response.
-    System ``lo_kwargs`` are passed to the shared Boys localization; domain
-    calls take their saved localization options from ``static``.
+    Discrete selections and the Laplace grid are fixed. ``scope="system"``
+    builds one molecular fragment and uses the same preparation, selected
+    solver and response as domain calculations. Its ``lo_kwargs`` and frozen
+    setting are used when selecting that fragment. Domain calls use the
+    settings saved in ``static``.
     Domain calls may instead supply ``build_static(mf)``. It runs once on
     a detached, phase-fixed reference after the single differentiated SCF,
     and returns fixed ``DomainSelections``. AO overlap/Fock data are built
@@ -952,7 +801,7 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
     root's converged state.
     An attached out-of-core CDERI source must be available on every rank.
     ``parallel_scf_jk=False`` retains root-only SCF and common response.
-    System, serial and single-rank calls never activate this executor.
+    Serial and single-rank calls never activate this executor.
     All root-owned calls, including MPI fragment execution, scope the complete
     SCF pullback for DF geometry fusion, response caching, resident DF buffer
     sharing and dense-BLAS controller reuse. Enable
@@ -962,7 +811,7 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
     """
     scope = _shared_scope(static, scope, frozen, comm, lo_kwargs)
     rank = 0 if comm is None else comm.Get_rank()
-    controls = _root_call(comm, rank, lambda: _driver_controls(controls, scope=scope),
+    controls = _root_call(comm, rank, lambda: _driver_controls(controls, defer_grid=True),
                           "control validation")
 
     def initialize():
@@ -976,24 +825,28 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
                 raise TypeError("build_static must be callable")
         elif scope == "domain":
             _validate_static(static)
-        local_response = _root_owned_scf_response(comm, parallel_scf_jk, scope=scope)
-        with (resource_profile.section('stc.domain.scf') if scope == 'domain' else nullcontext()):
+        local_response = _root_owned_scf_response(comm, parallel_scf_jk)
+        with resource_profile.section('stc.domain.scf'):
             mf, scf_pullback = _initialize_scf(
-                mol, build_mf, combine_df=local_response, share_scf_data=scope == 'domain')
+                mol, build_mf, combine_df=local_response, share_scf_data=True)
         if local_response:
             scf_pullback = _serial_scf_pullback(scf_pullback)
+        selector = build_static
         if scope == "system":
-            return _initialize_system(mf, frozen, controls, with_grad=True,
-                                      scf_pullback=scf_pullback, lo_kwargs=lo_kwargs,
-                                      fock_from_scf=True, **basis_kwargs(correlation_auxbasis))
+            empty = _empty_reference(mf, frozen, with_grad=True, scf_pullback=scf_pullback)
+            if empty is not None:
+                return empty
+            selector = lambda reference: build_domain_selections(
+                reference, scope="system", frozen=0 if frozen is None else frozen,
+                lo_kwargs=lo_kwargs, **basis_kwargs(correlation_auxbasis))
         selected = static
         scf_data = getattr(scf_pullback, 'scf_data', None)
         scf_data_pullback = prepared_domain = None
-        if build_static is not None:
+        if selector is not None:
             # Distributed MP2 already owns endpoint work across ranks. Preserve
             # that executor; CCSD's root-owned weak completion can reuse selection.
             selected, scf_data, scf_data_pullback, prepared_domain = _select_domain_reference(
-                mf, build_static, reuse_weak=comm is None or comm.Get_size() == 1,
+                mf, selector, reuse_weak=comm is None or comm.Get_size() == 1,
                 scf_data=scf_data,
                 **basis_kwargs(correlation_auxbasis))
         return _initialize(mf, selected, controls, with_grad=True,
@@ -1001,8 +854,6 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
                            scf_data_pullback=scf_data_pullback,
                            prepared_domain=prepared_domain, **basis_kwargs(correlation_auxbasis))
 
-    if scope == "system":
-        return _run_system(initialize, controls, comm, with_grad=True, include_hf=include_hf)
     if comm is not None and comm.Get_size() > 1:
         from ._mpi import _run_domain_mpi
 
@@ -1031,5 +882,5 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
                                merge_identical=merge_identical,
                                parallel_scf_jk=parallel_scf_jk,
                                scf_worker_initializer=initialize_scf_worker)
-    return _run_domain(initialize, static, controls, comm, with_grad=True, include_hf=include_hf,
+    return _run_serial(initialize, static, controls, with_grad=True, include_hf=include_hf,
                        merge_identical=merge_identical)

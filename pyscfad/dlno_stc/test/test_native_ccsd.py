@@ -1,4 +1,5 @@
 """Native fragment CCSD retains the full DLNO geometry response."""
+from pyscfad.dlno_stc.test._cc_options import cc_options
 import numpy as np
 
 from pyscfad import config_update
@@ -10,9 +11,9 @@ from pyscfad.dlno_stc.test.test_shared_domain_frame import molecular_group
 def test_native_dlno_ccsdt_energy_gradient(molecular_group, monkeypatch, record_property):
     case = molecular_group
     monkeypatch.setenv('PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE', 'direct')
-    options = dict(baseline_controls=case.controls, matrix_controls=case.controls,
-                   ccsd_t=True, fragment_indices=case.indices,
-                   include_baseline=True, return_components=True,
+    options = dict(**cc_options(case.controls, case.controls),
+                   ccsd_t=True,
+                    return_components=True,
                    triples_controls=dict(mode='deterministic', integral_transform='rotate'))
     results = []
     for enabled in (False, True):

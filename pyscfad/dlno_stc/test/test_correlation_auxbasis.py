@@ -1,4 +1,6 @@
 """Independent molecular checks for distinct SCF and correlation DF fits."""
+from pyscfad.dlno_stc.test._cc_options import cc_options
+from pyscfad.dlno_stc.test import system_reference
 
 import jax
 import h5py
@@ -53,11 +55,11 @@ def _oracle_factors(mol, co, cv, auxbasis):
 def test_system_distinct_fit_uses_ri_factors_and_preserves_jk_fock(molecule):
     mf = _mf(molecule)
     occupied, virtual = np.arange(1, 5), np.arange(5, 7)
-    frame = domain.build_system_local_frame(mf, occupied, virtual)
+    frame = system_reference.build_system_local_frame(mf, occupied, virtual)
     before_tree = jax.tree_util.tree_structure(mf)
     before_cderi = mf.with_df._cderi
-    shared = prepare.prepare_system_inputs(mf, occupied, virtual)
-    actual = prepare.prepare_system_inputs(
+    shared = system_reference.prepare_system_inputs(mf, occupied, virtual)
+    actual = system_reference.prepare_system_inputs(
         mf, occupied, virtual, correlation_auxbasis=RIFIT)
     assert set(actual) == {"foo", "fvv", "B"}
     expected = _oracle_factors(molecule, frame.occupied_coeff,
@@ -69,7 +71,7 @@ def test_system_distinct_fit_uses_ri_factors_and_preserves_jk_fock(molecule):
     assert mf.with_df.auxbasis == JKFIT
     assert mf.with_df._cderi is before_cderi
     assert jax.tree_util.tree_structure(mf) == before_tree
-    explicit_none = prepare.prepare_system_inputs(
+    explicit_none = system_reference.prepare_system_inputs(
         mf, occupied, virtual, correlation_auxbasis=None)
     for name in shared:
         np.testing.assert_array_equal(shared[name], explicit_none[name])
@@ -206,12 +208,11 @@ def test_finite_domain_distinct_fit_matches_local_ri_oracle(boys_water_dimer):
 def _cc_plan(mf):
     from pyscfad.dlno_stc import ccsd
     domains = dlno_stc.build_domain_selections(
-        mf, frozen=1, boys_grouping="molecule", force_full_domains=True,
+        mf, frozen=1, boys_grouping="molecule", full_domain=True,
         correlation_auxbasis=RIFIT)
     return ccsd.build_static_selections(
-        mf, domains, matrix_kind="W", thresh_occ=0., thresh_vir=0.,
-        baseline_controls=_controls(), matrix_controls=_controls(),
-        smooth=False, single_pass=True, correlation_auxbasis=RIFIT)
+        mf, domains, thresh_occ=0., thresh_vir=0.,
+        **cc_options(_controls(), _controls()), correlation_auxbasis=RIFIT)
 
 
 def _independent_ccsd_total(mol):
@@ -240,7 +241,7 @@ def test_cc_correction_distinct_fit_half_direct_and_coordinate_response(
     monkeypatch.setattr(lno_ccsd.RCCSD, "conv_tol", 1e-12)
     monkeypatch.setattr(lno_ccsd.RCCSD, "conv_tol_normt", 1e-10)
     static = _cc_plan(_mf(molecule))
-    options = dict(baseline_controls=_controls(), matrix_controls=_controls(),
+    options = dict(**cc_options(_controls(), _controls()),
                    correlation_auxbasis=RIFIT, include_hf=True)
     results = []
     for mode in ("direct", "half"):

@@ -15,6 +15,28 @@ def default_laplace_grid():
     return roots * 2.6, weights * 2.6
 
 
+def resolve_mp2_grid(grid=None):
+    """Own and validate an MP2/W (roots, weights) pair; never a triples grid."""
+    if grid is None:
+        grid = default_laplace_grid()
+    if not isinstance(grid, (tuple, list)) or len(grid) != 2:
+        raise ValueError('mp2_grid must be a (roots, weights) pair')
+    result = {}
+    for name, raw in zip(('laplace_roots', 'laplace_weights'), grid):
+        if raw is None or numpy.iscomplexobj(raw):
+            raise ValueError(f'{name} must be a nonempty finite real vector')
+        try:
+            values = numpy.array(raw, dtype=numpy.float64, copy=True)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f'{name} must be a nonempty finite real vector') from exc
+        if values.ndim != 1 or not values.size or not numpy.isfinite(values).all():
+            raise ValueError(f'{name} must be a nonempty finite real vector')
+        result[name] = values
+    if result['laplace_roots'].shape != result['laplace_weights'].shape or numpy.any(result['laplace_roots'] < 0):
+        raise ValueError('Laplace roots/weights must match and roots must be nonnegative')
+    return result
+
+
 _MATRIX_COMMON = frozenset((
     'mode', 'laplace_roots', 'laplace_weights', 'global_seed', 'threads',
     'target_batch_size', 'memory_limit_mb', 'auxiliary_group_size',
@@ -25,11 +47,6 @@ _MATRIX_SAMPLING = {
     'virtual_domain_tau': 0.0003,
     'pair_pilot_samples': 100000,
     'min_samples': 64,
-    'resident_points': 3,
-}
-_MATRIX_D_SAMPLING = {
-    'energy_tolerance': DEFAULT_ENERGY_TOLERANCE,
-    'system_workload_cutoff': 0.0065,
 }
 
 
@@ -62,7 +79,7 @@ def _triples_integral_transform(controls):
 
 
 def normalize_triples_controls(controls, *, ccsd_t):
-    """Validate triples independently of baseline and D/W selection settings.
+    """Validate triples independently of baseline and W selection settings.
 
     Omitted controls select deterministic evaluation. Sampling uses the
     asymmetric Laplace numerator and physical selected-space restriction.
@@ -140,63 +157,35 @@ def normalize_triples_controls(controls, *, ccsd_t):
     return settings
 
 
-def normalize_matrix_controls(controls, matrix_kind):
-    """Copy and validate the explicit native D/W interface controls.
+def normalize_matrix_controls(controls):
+    """Copy and validate the explicit native W interface controls.
 
     Sampling counts are chosen by the native precision-targeted allocation;
     energy-only fixed-count options do not belong to this matrix interface.
     The default grid and caller-supplied grid arrays are independently owned.
     """
-    if matrix_kind not in ('D', 'W'):
-        raise ValueError('matrix_kind must be D or W')
     if not isinstance(controls, dict):
         raise TypeError('controls must be a dictionary')
     settings = controls.copy()
-    allowed = _MATRIX_COMMON | _MATRIX_SAMPLING.keys() | _MATRIX_D_SAMPLING.keys()
+    allowed = _MATRIX_COMMON | _MATRIX_SAMPLING.keys()
     unknown = set(settings) - allowed
     if unknown:
         raise ValueError('unsupported matrix controls: ' + ', '.join(sorted(map(str, unknown))))
     mode = settings.setdefault('mode', 'deterministic')
     if mode not in ('deterministic', 'stochastic'):
         raise ValueError('mode must be deterministic or stochastic')
-    if matrix_kind == 'W':
-        invalid = settings.keys() & _MATRIX_D_SAMPLING.keys()
-        if 'resident_points' in settings:
-            invalid = invalid | {'resident_points'}
-        if invalid:
-            raise ValueError('W targets matrix precision; unsupported controls: '
-                             + ', '.join(sorted(invalid)))
     if mode == 'deterministic':
-        invalid = settings.keys() & (_MATRIX_SAMPLING.keys() | _MATRIX_D_SAMPLING.keys())
+        invalid = settings.keys() & _MATRIX_SAMPLING.keys()
         if invalid:
             raise ValueError('deterministic matrices do not accept sampling controls: '
                              + ', '.join(sorted(invalid)))
     else:
         for name, value in _MATRIX_SAMPLING.items():
-            if matrix_kind == 'W' and name == 'resident_points':
-                continue
             settings.setdefault(name, value)
-        if matrix_kind == 'D':
-            for name, value in _MATRIX_D_SAMPLING.items():
-                settings.setdefault(name, value)
-    if 'laplace_roots' not in settings and 'laplace_weights' not in settings:
-        settings['laplace_roots'], settings['laplace_weights'] = default_laplace_grid()
-    for name in ('laplace_roots', 'laplace_weights'):
-        if name not in settings:
-            raise ValueError(f'controls must supply {name}')
-        raw = numpy.asarray(settings[name])
-        if numpy.iscomplexobj(raw):
-            raise ValueError(f'{name} must be a real finite vector')
-        try:
-            values = numpy.array(raw, dtype=numpy.float64, copy=True)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(f'{name} must be a real finite vector') from exc
-        if values.ndim != 1 or not values.size or not numpy.isfinite(values).all():
-            raise ValueError(f'{name} must be a nonempty finite vector')
-        settings[name] = values
-    roots, weights = settings['laplace_roots'], settings['laplace_weights']
-    if roots.shape != weights.shape or numpy.any(roots < 0):
-        raise ValueError('Laplace roots/weights must match and roots must be nonnegative')
+    settings.update(resolve_mp2_grid(
+        None if not {'laplace_roots', 'laplace_weights'} & settings.keys() else
+        (settings.get('laplace_roots'), settings.get('laplace_weights'))))
+    weights = settings['laplace_weights']
     if mode == 'stochastic' and numpy.any(weights <= 0):
         raise ValueError('stochastic matrix Laplace weights must be strictly positive')
     for name, default in (('global_seed', 0), ('threads', 1),
@@ -214,20 +203,14 @@ def normalize_matrix_controls(controls, matrix_kind):
     if mode == 'stochastic':
         for name in ('pair_pilot_samples', 'min_samples'):
             settings[name] = _integer_control(name, settings[name], minimum=2)
-        if 'resident_points' in settings:
-            settings['resident_points'] = _integer_control('resident_points', settings['resident_points'])
-            if settings['resident_points'] not in (2, 3):
-                raise ValueError('resident_points must be 2 or 3')
-        for name in ('matrix_tolerance', 'energy_tolerance', 'system_workload_cutoff'):
-            if name in settings:
-                settings[name] = _finite_control(name, settings[name])
+        settings['matrix_tolerance'] = _finite_control('matrix_tolerance', settings['matrix_tolerance'])
         for name in ('domain_tau', 'virtual_domain_tau'):
             if name in settings:
                 settings[name] = _finite_control(name, settings[name], positive=False)
     return settings
 
 
-def estimate_matrix_memory(naux, nocc, nvir, ntarget, controls, *, matrix_kind,
+def estimate_matrix_memory(naux, nocc, nvir, ntarget, controls, *,
                            with_grad=True, auxiliary_group_count=None):
     """Conservative bytes newly needed by one staged matrix call and reverse.
 
@@ -239,7 +222,7 @@ def estimate_matrix_memory(naux, nocc, nvir, ntarget, controls, *, matrix_kind,
     deterministic calls beyond the requested target batch. The default batch
     contains all targets in the physical fragment and is counted in full.
     """
-    settings = normalize_matrix_controls(controls, matrix_kind)
+    settings = normalize_matrix_controls(controls)
     dims = [_integer_control(name, value, minimum=0 if name in ('naux', 'nvir') else 1)
             for name, value in
             (('naux', naux), ('nocc', nocc), ('nvir', nvir), ('ntarget', ntarget))]
@@ -272,17 +255,16 @@ def estimate_matrix_memory(naux, nocc, nvir, ntarget, controls, *, matrix_kind,
     # Selected amplitudes, reverse amplitudes, and single-target spin/Gram
     # cubes. Deterministic W uses no spin-amplitude cube in either pass.
     if settings['mode'] == 'deterministic':
-        extra = ((3 if with_grad else 0) if matrix_kind == 'W'
-                 else (2 if with_grad else 1))
+        extra = 3 if with_grad else 0
         # W rotates the adapter's private input DF in place and reuses C for
         # its final gradient rotation. Neither rotation adds a full factor.
         breakdown['amplitude_buffers'] = ((2 if with_grad else 1) * batch + extra) * single_amplitude
         # Occupied W batches up to four spin-Gram columns per worker for
         # GEMM reuse. Reserve this panel in addition to existing scratch.
-        panel = min(4, max(1, nocc // threads)) if matrix_kind == 'W' else 0
+        panel = min(4, max(1, nocc // threads))
         breakdown['scratch'] = 8 * threads * ((6 + panel) * nvir * nvir + 2 * naux * nvir)
     else:
-        points = min(len(settings['laplace_roots']), settings['resident_points']) if matrix_kind == 'D' else 2
+        points = 2
         ngroup = ((naux + settings['auxiliary_group_size'] - 1) // settings['auxiliary_group_size']
                   if auxiliary_group_count is None else
                   _integer_control('auxiliary_group_count', auxiliary_group_count))
@@ -291,31 +273,29 @@ def estimate_matrix_memory(naux, nocc, nvir, ntarget, controls, *, matrix_kind,
             + 8 * nocc * nvir * (8 * ngroup + 8))
         # Every resident point owns atom_weight. W's fixed B and dressed C
         # also keep atom_l1 for the occupied mixture and virtual reform.
-        breakdown['atom_weights'] = 8 * points * ngroup * nocc * nvir * (
-            2 if matrix_kind == 'W' else 1)
-        if matrix_kind == 'W':
-            # Occupied and virtual B/C aliases coexist. Reserve 16 bytes per
-            # probability/index entry plus headers and normalization totals.
-            alias_count = (4 * ngroup + 5) * nvir + (3 * ngroup + 10) * nocc
-            breakdown['proposal_caches'] = (
-                16 * nocc * nvir * (7 * ngroup + 15) + 72 * alias_count)
-            # Default per-stream proposals retain all alias entries and vector
-            # objects alongside the shared caches. Occupied and virtual phases
-            # run sequentially; reserve the larger, including inline metadata
-            # for at most twelve proposals. Construction scratch stays below.
-            occupied_entries = ngroup * ((11 * batch + 3) * nvir + 4 * batch + 3)
-            occupied_aliases = ngroup * (8 * batch + 6)
-            virtual_entries = (ngroup * (3 * nocc * nvir + 3 * batch * nvir + 9 * nocc)
-                               + 12 * nocc * nvir + 4 * nvir)
-            virtual_aliases = ngroup * (3 * nocc + 6) + 12 * nvir
-            breakdown['proposal_caches'] += max(
-                16 * occupied_entries + 72 * occupied_aliases,
-                16 * virtual_entries + 72 * virtual_aliases) + 12 * 1024
+        breakdown['atom_weights'] = 16 * points * ngroup * nocc * nvir
+        # Occupied and virtual B/C aliases coexist. Reserve 16 bytes per
+        # probability/index entry plus headers and normalization totals.
+        alias_count = (4 * ngroup + 5) * nvir + (3 * ngroup + 10) * nocc
+        breakdown['proposal_caches'] = (
+            16 * nocc * nvir * (7 * ngroup + 15) + 72 * alias_count)
+        # Default per-stream proposals retain all alias entries and vector
+        # objects alongside the shared caches. Occupied and virtual phases
+        # run sequentially; reserve the larger, including inline metadata
+        # for at most twelve proposals. Construction scratch stays below.
+        occupied_entries = ngroup * ((11 * batch + 3) * nvir + 4 * batch + 3)
+        occupied_aliases = ngroup * (8 * batch + 6)
+        virtual_entries = (ngroup * (3 * nocc * nvir + 3 * batch * nvir + 9 * nocc)
+                           + 12 * nocc * nvir + 4 * nvir)
+        virtual_aliases = ngroup * (3 * nocc + 6) + 12 * nvir
+        breakdown['proposal_caches'] += max(
+            16 * occupied_entries + 72 * occupied_aliases,
+            16 * virtual_entries + 72 * virtual_aliases) + 12 * 1024
         if with_grad:
             # At most two factor channels are live. Each lock is padded to
             # one cache line, with up to 16 stripes per occupied/atom block.
             breakdown['locks'] = 2 * 64 * nocc * ngroup * min(16, nvir)
-            chunk_limit = 160000 if matrix_kind == 'W' else 260000
+            chunk_limit = 160000
             chunk = max(1, min(chunk_limit, 480 * 1024**2 // (64 * threads)))
             events = threads * max(64, chunk)
             # Two 24-byte record queues coexist. A final global sort uses

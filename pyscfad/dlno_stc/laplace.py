@@ -201,3 +201,22 @@ def make_laplace_grid(occupied=None, virtual=None, *, kind="default", points=6,
         diagnostics.update(laplace_grid_diagnostics(occupied, virtual, roots, weights))
     diagnostics['points'] = int(roots.size)
     return roots, weights, diagnostics
+
+
+def select_mp2_grid(occupied, virtual, *, grid=None, points=6):
+    """Fit one global MP2/W grid, or save an explicit override with diagnostics.
+
+    Returned metadata is scientific and reproducible: timing is deliberately
+    omitted so repeated selection at the same reference can resume checkpoints.
+    """
+    if grid is None:
+        roots, weights, diagnostics = make_laplace_grid(
+            occupied, virtual, kind='fitted', points=points)
+        diagnostics.pop('fitting_seconds', None)
+    else:
+        from .controls import resolve_mp2_grid
+        resolved = resolve_mp2_grid(grid)
+        roots, weights = resolved['laplace_roots'], resolved['laplace_weights']
+        diagnostics = dict(kind='explicit', points=len(roots),
+            **laplace_grid_diagnostics(occupied, virtual, roots, weights))
+    return (roots, weights), diagnostics

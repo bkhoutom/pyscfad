@@ -76,8 +76,8 @@ def test_lis_removes_ed_occupied_overlap_with_live_frame_response():
     frame = frame._replace(virtual_coeff=orthonormalize(contaminated, common.s1e[:5, :5]))
     matrices = dict(occupied=jnp.eye(1), virtual=jnp.eye(3))
     chosen = lis.build_fragment_lis_selection(None, domains, 0, common=common,
-        frame=frame, matrices=matrices, matrix_kind='D', thresh_occ=0., thresh_vir=0.)
-    static = lis.LISSelections(domains, 'D', 0., 0., 1e-6, (chosen,))
+        frame=frame, matrices=matrices, thresh_occ=0., thresh_vir=0.)
+    static = lis.LISSelections(domains, 0., 0., 1e-6, (chosen,))
     seed = jnp.asarray(np.random.default_rng(19).normal(size=(7, 7)))
     direction = jnp.asarray(np.random.default_rng(20).normal(size=(5, 3))) * .03
     def build(x):

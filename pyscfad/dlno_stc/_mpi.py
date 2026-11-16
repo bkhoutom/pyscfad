@@ -5,7 +5,6 @@ its pullback stay together on their round-robin owner. MPI is imported lazily.
 """
 
 from contextlib import contextmanager
-from functools import partial
 import gc
 import math
 import time
@@ -423,7 +422,6 @@ def _run_domain_jobs(initializer, worker_initializer, static, controls, comm, *,
     from ._selection import build_domain_groups
     from ._workflow import allocate_domain_controls
     from .adjoint import apply_selected_pullback, zero_term_cotangents
-    from .parallel import run_backend
 
     rank, size = comm.Get_rank(), comm.Get_size()
     totals, group_rows, phases = {}, [], {}
@@ -432,11 +430,18 @@ def _run_domain_jobs(initializer, worker_initializer, static, controls, comm, *,
         state = (driver._root_call(comm, rank, initializer, 'initial preparation')
                  if scf_service is None else scf_service.run_initial(initializer))
 
+        empty = comm.bcast(state.get('empty', False) if rank == 0 else None, root=0)
+        if empty:
+            finish = lambda: driver._finish(state, with_grad=with_grad, include_hf=include_hf)
+            return (driver._root_call(comm, rank, finish, 'empty response')
+                    if scf_service is None else scf_service.run_final(finish))
+
         def root_metadata():
             authoritative = state['static']
             groups = build_domain_groups(authoritative, merge_identical=merge_identical)
-            return (authoritative, groups, state['weak_pairs'], controls,
-                    allocate_domain_controls(controls, len(groups)),
+            resolved = driver._driver_controls(controls, static=authoritative)
+            return (authoritative, groups, state['weak_pairs'], resolved,
+                    allocate_domain_controls(resolved, len(groups)),
                     _reference_signature(state['mf']),
                     {'correlation_auxbasis': state.get('correlation_auxbasis')})
 
@@ -479,6 +484,17 @@ def _run_domain_jobs(initializer, worker_initializer, static, controls, comm, *,
         del payload, metadata
     phases['initialize'] = time.perf_counter() - phase_start
     phase_start = time.perf_counter()
+    def apply_weak():
+        energy, bars = _weak_contribution(state, static, pairs, comm, with_grad=with_grad)
+        state['energy'] = state['energy'] + energy
+        if with_grad:
+            driver._add_bars(state, *bars)
+        jax.block_until_ready((state['energy'], state['mf_bar'], state['common_bar']))
+
+    with _timed_section('stc.domain.weak', totals, 'weak'):
+        _collective_call(comm, apply_weak, 'weak contribution assembly')
+    phases['weak'] = time.perf_counter() - phase_start
+    phase_start = time.perf_counter()
     error = None
     group_id = None
     try:
@@ -487,7 +503,7 @@ def _run_domain_jobs(initializer, worker_initializer, static, controls, comm, *,
             group_id = group.representative_index
             row = {'global_position': position, 'fragment_id': group_id, 'owner': rank,
                    'target_indices': tuple(group.target_indices),
-                   'fragment_indices': tuple(group.fragment_indices), 'replica_count': 1}
+                   'fragment_indices': tuple(group.fragment_indices)}
             group_start = time.perf_counter()
             with driver._mp2_df_scope(state, static.fragments[group_id].extended_atoms,
                                       static.fragments[group_id].pao_center_atoms,
@@ -508,8 +524,7 @@ def _run_domain_jobs(initializer, worker_initializer, static, controls, comm, *,
                 }
                 with _timed_section('stc.domain.native', totals, 'native'):
                     stage_start = time.perf_counter()
-                    result = run_backend(prepared[1], metadata, settings,
-                                         partial(backend.solve, with_grad=with_grad), comm=None)
+                    result = backend.solve(prepared[1], metadata, settings, with_grad=with_grad)
                     row['native'] = time.perf_counter() - stage_start
                 with _timed_section('stc.domain.input_pullback', totals, 'input_pullback'):
                     stage_start = time.perf_counter()
@@ -534,17 +549,6 @@ def _run_domain_jobs(initializer, worker_initializer, static, controls, comm, *,
     phases['strong'] = time.perf_counter() - phase_start
     phase_start = time.perf_counter()
 
-    def apply_weak():
-        energy, bars = _weak_contribution(state, static, pairs, comm, with_grad=with_grad)
-        state['energy'] = state['energy'] + energy
-        if with_grad:
-            driver._add_bars(state, *bars)
-        jax.block_until_ready((state['energy'], state['mf_bar'], state['common_bar']))
-
-    with _timed_section('stc.domain.weak', totals, 'weak'):
-        _collective_call(comm, apply_weak, 'weak contribution assembly')
-    phases['weak'] = time.perf_counter() - phase_start
-    phase_start = time.perf_counter()
     reduced_scalars = tree_sum_to_root(comm, (state['energy'], numpy.float64(state['variance'])))
     bars = tree_sum_to_root(comm, (state['mf_bar'], state['common_bar'])) if with_grad else None
 

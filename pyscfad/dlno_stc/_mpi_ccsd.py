@@ -1,7 +1,7 @@
 """Complete CC group jobs on their owners, then close shared response on root.
 
 Only selection metadata, numerical reference arrays, scalar records and completed
-host cotangents cross MPI. A deferred single-pass plan is materialized from each
+host cotangents cross MPI. A fragment plan is materialized from each
 owner's W result inside _run_group. Its new LIS choices, native matrix replay
 and Python pullbacks stay local to that group.
 """
@@ -20,7 +20,6 @@ from ._mpi import (
     _install_correlation_config,
 )
 from ._selection import build_domain_groups
-from ._workflow import allocate_domain_controls
 from .adjoint import zero_term_cotangents
 
 
@@ -40,8 +39,8 @@ def _build_cc_worker(worker_initializer, canonical, signature):
 
 def _run_mpi(initializer, worker_initializer, comm, *, with_grad,
              include_hf=False, merge_identical=True, verbose_imp=0,
-             ccsd_t=False, return_components=False, include_baseline=True,
-             fragment_indices=None, parallel_scf_jk=True, scf_worker_initializer=None,
+             ccsd_t=False, return_components=False,
+              parallel_scf_jk=True, scf_worker_initializer=None,
              vvvv_direct=False):
     """Run CC owner jobs between optional distributed SCF/reference sessions."""
     _collective_call(comm, _check_mpi_thread_support, 'CC MPI thread preflight')
@@ -65,8 +64,8 @@ def _run_mpi(initializer, worker_initializer, comm, *, with_grad,
                          with_grad=with_grad, include_hf=include_hf,
                          merge_identical=merge_identical, verbose_imp=verbose_imp,
                          ccsd_t=ccsd_t, return_components=return_components,
-                         include_baseline=include_baseline,
-                         fragment_indices=fragment_indices, scf_service=service,
+
+                          scf_service=service,
                          vvvv_direct=vvvv_direct)
     finally:
         # Collective failures after PAUSE leave all ranks outside serve().
@@ -77,7 +76,7 @@ def _run_mpi(initializer, worker_initializer, comm, *, with_grad,
 
 def _run_jobs(initializer, worker_initializer, comm, *, with_grad,
               include_hf, merge_identical, verbose_imp, ccsd_t,
-              return_components, include_baseline, fragment_indices, scf_service,
+              return_components,   scf_service,
               vvvv_direct):
     """Keep round-robin CC ownership paused between the two shared phases."""
     from . import ccsd
@@ -90,16 +89,9 @@ def _run_jobs(initializer, worker_initializer, comm, *, with_grad,
     def root_metadata():
         _, static, baseline, matrix = initialized
         groups = build_domain_groups(static.mp2_static, merge_identical=merge_identical)
-        indices = state['cc_fragment_indices']
-        if not include_baseline:
-            wanted = set(indices)
-            groups = tuple(group for group in groups
-                           if any(index in wanted for index, _ in
-                                  ccsd._group_cc_fragments(static, group)))
         options = dict(include_hf=include_hf, verbose_imp=verbose_imp, ccsd_t=ccsd_t,
                        triples_controls=state['cc_triples_controls'], vvvv_direct=vvvv_direct,
-                       return_components=return_components, include_baseline=include_baseline,
-                       fragment_indices=indices)
+                       return_components=return_components)
         options.update(state.get('cc_solver_options', {}))
         return (static, baseline, matrix, groups, state['weak_pairs'], options,
                 _reference_signature(state['mf']),
@@ -140,22 +132,25 @@ def _run_jobs(initializer, worker_initializer, comm, *, with_grad,
     if with_grad:
         _collect_tree_schema(comm, (state['mf_bar'], state['common_bar']))
     del initialized, shared, payload, metadata
-    allocated = allocate_domain_controls(baseline, len(groups))
+    # Weak completion belongs to the separate baseline and is counted once.
+    _collective_call(comm, lambda: ccsd._run_weak(state, static, with_grad=with_grad)
+                     if rank == 0 else None,
+                     'CC baseline weak completion')
     records, error, group_id = [], None, None
     try:
         for position in range(rank, len(groups), size):
             group = groups[position]
             group_id = group.representative_index
-            # The broadcast static may be a deferred plan. _run_group selects
+            # The broadcast static may be a fragment plan. _run_group selects
             # each requested LIS from its live W, consumes its complete VJP,
             # and returns only component records; it never mutates the plan.
             records.extend(ccsd._run_group(
-                state, static, group, allocated, matrix, with_grad=with_grad,
+                state, static, group, baseline, matrix, with_grad=with_grad,
                 verbose_imp=options['verbose_imp'], ccsd_t=options['ccsd_t'],
                 triples_controls=options['triples_controls'],
                 vvvv_direct=options['vvvv_direct'],
-                include_baseline=options['include_baseline'],
-                fragment_indices=options['fragment_indices'],
+
+
                 **{key: options[key] for key in (
                     'cc_solver', 'stc_cc_controls', 'lis_aux_svd_tol') if key in options}))
             ccsd._clear_jax_caches('after_group', state['energy'], state['mf_bar'],
@@ -164,10 +159,6 @@ def _run_jobs(initializer, worker_initializer, comm, *, with_grad,
     except Exception as exc:
         error = _error(exc, f'CC group {group_id}')
     _raise_if_any_rank_failed(comm, error)
-    # Weak completion belongs to the separate baseline and is counted once.
-    _collective_call(comm, lambda: ccsd._run_weak(state, static, with_grad=with_grad)
-                     if rank == 0 and options['include_baseline'] else None,
-                     'CC baseline weak completion')
     scalars = tree_sum_to_root(comm, (
         state['energy'], state['variance'], state['baseline_energy'], state['weak_energy']))
     bars = tree_sum_to_root(comm, (state['mf_bar'], state['common_bar'])) if with_grad else None

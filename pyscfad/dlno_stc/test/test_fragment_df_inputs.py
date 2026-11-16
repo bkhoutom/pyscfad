@@ -1,4 +1,5 @@
 """Molecular W -> LIS -> CCSD(T) response with cached integral pullbacks."""
+from pyscfad.dlno_stc.test._cc_options import cc_options
 from types import SimpleNamespace
 
 import h5py
@@ -38,12 +39,12 @@ def molecular_case(tmp_path_factory):
         mf, pullback = jax.vjp(build, mol)
     domains = accept.selection(mf)
     controls = dict(accept.controls(), threads=1)
-    static = ccsd.build_static_selections(mf, domains, matrix_kind='W',
+    static = ccsd.build_static_selections(mf, domains,
         thresh_occ=1e-4, thresh_vir=3e-5,
-        baseline_controls=controls, matrix_controls=controls, single_pass=True)
+        **cc_options(controls, controls))
     group = ccsd.build_domain_groups(domains)[0]
-    indices = tuple(i for i, _ in ccsd._group_cc_fragments(static, group))[:2]
-    assert len(indices) == 2
+    indices = tuple(i for i, _ in ccsd._group_cc_fragments(static, group))
+    assert len(indices) == 4
     assert len(domains.fragments[group.representative_index].extended_ao_indices) < mol.nao
     return SimpleNamespace(mf=mf, pullback=pullback, domains=domains,
         static=static, group=group, indices=indices, controls=controls)
@@ -59,9 +60,8 @@ def test_default_half_matches_direct_with_one_integral_pass(
     if triples_mode == 'stochastic':
         controls.update(nsamples=16, pilot_samples=16, global_seed=71)
     triples = ccsd.normalize_triples_controls(controls, ccsd_t=True)
-    static = ccsd.build_static_selections(case.mf, case.domains, matrix_kind='W',
-        thresh_occ=1e-4, thresh_vir=3e-5, baseline_controls=case.controls,
-        matrix_controls=case.controls, single_pass=True)
+    static = ccsd.build_static_selections(case.mf, case.domains,
+        thresh_occ=1e-4, thresh_vir=3e-5, **cc_options(case.controls, case.controls),)
     receipts = []
     close = _df_shared.LocalDFReverse.close
     def closed(scope):
@@ -77,7 +77,7 @@ def test_default_half_matches_direct_with_one_integral_pass(
             with_grad=True, scf_pullback=case.pullback)
         records = ccsd._run_group(state, static, case.group,
             case.controls, case.controls, with_grad=True, verbose_imp=0,
-            ccsd_t=True, triples_controls=triples, fragment_indices=case.indices,
+            ccsd_t=True, triples_controls=triples,
             lis_aux_svd_tol=auxiliary_tolerance)
         bars = state['mf_bar'], state['common_bar']
         value, gradient = ccsd.driver._finish(state, with_grad=True, include_hf=False)

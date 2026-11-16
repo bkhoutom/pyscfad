@@ -26,15 +26,14 @@ def open_checkpoint(state, static, groups, *, checkpoint_dir, resume, options):
                    cc_convergence=(RCCSD.conv_tol, RCCSD.conv_tol_normt, RCCSD.max_cycle),
                    controls=static.controls_identity, options=options, groups=groups,
                    cc_selection_schema=static.schema_version,
-                   lis_space=static.lis_static.lis_space,
+
                    boys_grouping=static.mp2_static.boys_grouping,
                    physical_groups=static.mp2_static.physical_groups)
     if options.get('cc_solver') == 'stc':
         from .stc_ccsd import external_implementation_identity
         payload['external_stc_implementation'] = external_implementation_identity()
     triples = options.get('triples_controls')
-    if triples is not None and (triples['mode'] == 'stochastic'
-                               or static.lis_static.smooth_frames is not None):
+    if triples is not None:
         payload['native_triples_version'] = _stc_mp2.TRIPLES_VERSION
     manager = RestartManager(checkpoint_dir, resume=resume, method='stc-ccsd',
                              scientific_payload=payload)

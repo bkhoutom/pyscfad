@@ -1,4 +1,5 @@
 """Whole-system preparation reuses global fitted factors and their response."""
+from pyscfad.dlno_stc.test import system_reference
 
 from types import SimpleNamespace
 
@@ -47,8 +48,8 @@ def _holder(mol, coeff, with_df):
 def _frame_selections(mf):
     # Select the discrete Boys branch and PAO anchors before either VJP.
     return {
-        "boys_reference": domain.select_system_boys_reference(mf, OCCUPIED),
-        "virtual_anchor_columns": domain.select_system_virtual_anchor_columns(
+        "boys_reference": system_reference.select_system_boys_reference(mf, OCCUPIED),
+        "virtual_anchor_columns": system_reference.select_system_virtual_anchor_columns(
             mf, VIRTUAL,
         ),
     }
@@ -59,7 +60,7 @@ def _direct_B(mol, coeff, *, boys_reference, virtual_anchor_columns):
     holder = _holder(mol, coeff, with_df)
     # This oracle tests fitted-factor reuse in the tracked local frame; the
     # independent local-frame tests cover the localization itself.
-    frame = domain.build_system_local_frame(
+    frame = system_reference.build_system_local_frame(
         holder, OCCUPIED, VIRTUAL, boys_reference=boys_reference,
         virtual_anchor_columns=virtual_anchor_columns,
     )
@@ -141,7 +142,7 @@ def test_system_outcore_cache_preserves_factors_coordinate_and_coefficient_vjps(
     def cached_B(mol_, coeff_):
         with_df = df.DF(mol_, auxbasis="weigend", incore=False)
         with_df.attach_outcore_cderi(source)
-        return prepare.prepare_system_inputs(
+        return system_reference.prepare_system_inputs(
             _holder(mol_, coeff_, with_df), OCCUPIED, VIRTUAL,
             **frame_selections,
         )["B"]
@@ -234,7 +235,7 @@ def test_system_incore_cache_preserves_factors_and_coefficient_vjp(reference, mo
     monkeypatch.setattr(lno_df, "_local_direct_nr_e2", forbidden_regeneration)
 
     def cached_B(coeff_):
-        return prepare.prepare_system_inputs(
+        return system_reference.prepare_system_inputs(
             _holder(mol, coeff_, reference.with_df), OCCUPIED, VIRTUAL,
             **frame_selections,
         )["B"]
@@ -258,7 +259,7 @@ def test_system_without_global_cache_preserves_direct_factor_response(reference)
 
     def uncached_B(mol_, coeff_):
         with_df = df.DF(mol_, auxbasis="weigend")
-        result = prepare.prepare_system_inputs(
+        result = system_reference.prepare_system_inputs(
             _holder(mol_, coeff_, with_df), OCCUPIED, VIRTUAL,
             **frame_selections,
         )["B"]

@@ -97,7 +97,6 @@ def calculate(args):
     from pyscf import lib, gto as pgto, df as pdf
     from pyscfad import config, gto, scf, dlno_stc
     from pyscfad.dlno_stc import ccsd
-    from pyscfad.dlno_stc.controls import default_laplace_grid
     from pyscfad.tools.linear_solver import eager_gmres
     from pyscfad.tools import resource_profile
     from pyscf.lo.boys import Boys as PySCFBoys
@@ -135,13 +134,10 @@ def calculate(args):
                          f'{2 * args.waters} hydrogen atoms')
 
     frozen = args.waters  # One oxygen 1s orbital per water molecule.
-    roots, weights = default_laplace_grid()
-    baseline = dict(mode='deterministic', threads=args.threads,
-                    laplace_roots=roots, laplace_weights=weights)
+    baseline = dict(mode='deterministic', threads=args.threads)
     matrix = dict(mode='deterministic', threads=args.threads,
                   target_batch_size=args.matrix_target_batch_size,
-                  memory_limit_mb=args.max_memory_mb,
-                  laplace_roots=roots, laplace_weights=weights)
+                  memory_limit_mb=args.max_memory_mb)
     triples = dict(mode='stochastic', nsamples=args.pilot_samples,
                    pilot_samples=args.pilot_samples, global_seed=args.seed,
                    energy_tolerance=args.triples_tolerance_meh / 1000,
@@ -161,9 +157,9 @@ def calculate(args):
                          'PYSCFAD_DENSE_BLAS_THREADS', 'PYSCFAD_STC_DENSE_BLAS_THREADS',
                          'PYSCFAD_SCF_OCCUPIED_CACHE', 'PYSCFAD_SCF_RESPONSE_FACTOR_CACHE_MB')},
                     domain_thresholds=asdict(thresholds), lno_occ=args.lno_occ,
-                    lno_vir=args.lno_vir, matrix_kind='W', mp2_mode='deterministic',
+                    lno_vir=args.lno_vir, mp2_mode='deterministic',
                     triples=triples, vvvv_direct=args.vvvv_direct,
-                    laplace_grid=dict(kind='default', roots=roots.tolist(), weights=weights.tolist()),
+                    laplace_grid=dict(kind='fitted', points=6, scope='global'),
                     gradient_unit='Eh/bohr')
     print('Calculation settings:\n' + json.dumps(settings, indent=2), flush=True)
     (output / 'settings.json').write_text(json.dumps(settings, indent=2) + '\n')
@@ -247,16 +243,19 @@ def calculate(args):
                 nocc=len(fragment.strong_occ_metric_keep),
                 nvir=(None if fragment.virtual_anchor_columns is None else
                       len(fragment.virtual_anchor_columns))))
+        roots, weights = domains.mp2_grid
+        settings['laplace_grid'] = dict(roots=roots.tolist(), weights=weights.tolist(),
+                                         **domains.mp2_grid_diagnostics)
+        (output / 'settings.json').write_text(json.dumps(settings, indent=2) + '\n')
         (output / 'domain_sizes.json').write_text(json.dumps(domain_sizes, indent=2) + '\n')
         print('MP2 domain sizes: ' + json.dumps(domain_sizes), flush=True)
         return ccsd.build_static_selections(
-            mf, domains, matrix_kind='W', thresh_occ=args.lno_occ, thresh_vir=args.lno_vir,
-            baseline_controls=baseline, matrix_controls=matrix, smooth=True,
-            single_pass=True, merge_identical=True)
+            mf, domains, thresh_occ=args.lno_occ, thresh_vir=args.lno_vir,
+            baseline_controls=baseline, matrix_controls=matrix, merge_identical=True)
 
     energy, mol_bar, components = ccsd.value_and_grad(
         mol, build_mf, build_static=build_static, baseline_controls=baseline,
-        matrix_controls=matrix, matrix_kind='W', ccsd_t=True,
+        matrix_controls=matrix, ccsd_t=True,
         triples_controls=triples, include_hf=True, return_components=True,
         checkpoint_dir=str(output / 'checkpoint'), resume=args.resume,
         vvvv_direct=args.vvvv_direct)

@@ -3,7 +3,7 @@
 Example: --xyz-file examples/dlno_stc/c5h6_force_compare.xyz --frozen 5
          --output-dir results/smooth_c5h6
          --samples 16446469 --seeds 71 72 73
-Use --smooth-deterministic on small systems to verify exact-force recovery.
+The reference uses deterministic smooth triples; --seeds enables sampling comparisons.
 """
 import argparse
 from dataclasses import asdict
@@ -37,13 +37,8 @@ def main():
                         help='exponent in the smooth triples point-variance trace model')
     parser.add_argument('--triples-budget-energy', choices=('mp2', 'ccsd'), default='mp2',
                         help='divide total variance in proportion to absolute fragment correlation energies')
-    parser.add_argument('--seeds', type=int, nargs='*', default=[71, 72, 73])
-    parser.add_argument('--smooth-deterministic', action='store_true')
+    parser.add_argument('--seeds', type=int, nargs='*', default=[])
     parser.add_argument('--reference', type=Path)
-    parser.add_argument('--sampling-fragment', type=int,
-                        help='test one zero-based physical S correction and its gradient; requires --reference or --fragment-deterministic, skips full-force comparison')
-    parser.add_argument('--fragment-deterministic', action='store_true',
-                        help='also compute the conventional deterministic force for --sampling-fragment')
     parser.add_argument('--fd-coordinate', type=int, nargs=2, metavar=('ATOM', 'AXIS'))
     parser.add_argument('--fd-step', type=float, default=1e-4, help='Bohr')
     parser.add_argument('--cc-conv-tol', type=float, default=1e-10)
@@ -58,21 +53,11 @@ def main():
         parser.error('triples pilots require at least two samples and at least one Laplace point')
     if not math.isfinite(args.triples_trace_exponent) or args.triples_trace_exponent <= 0:
         parser.error('--triples-trace-exponent must be finite and positive')
-    if args.sampling_fragment is not None:
-        if args.sampling_fragment < 0 or (args.reference is None and not args.fragment_deterministic):
-            parser.error('--sampling-fragment requires a nonnegative index and --reference or --fragment-deterministic')
-        if args.reference is None and args.triples_budget_energy == 'ccsd':
-            parser.error('CCSD fragment budgeting requires --reference')
-        if args.smooth_deterministic or args.fd_coordinate:
-            parser.error('--sampling-fragment is a stochastic correction/gradient test')
-    elif args.fragment_deterministic:
-        parser.error('--fragment-deterministic requires --sampling-fragment')
     import jax
     import numpy as np
     from pyscf import gto as pgto, scf as pscf
     from pyscfad import gto, scf, dlno_stc
     from pyscfad.dlno_stc import ccsd
-    from pyscfad.dlno_stc.laplace import make_laplace_grid
     from pyscfad.lno.ccsd import RCCSD
     RCCSD.conv_tol = args.cc_conv_tol
     RCCSD.conv_tol_normt = args.cc_conv_tol_normt
@@ -123,33 +108,27 @@ def main():
     setup_timings['differentiable_scf_seconds'] = time.perf_counter()-phase
     phase = time.perf_counter()
     domains = dlno_stc.build_domain_selections(mf, frozen=args.frozen,
-        force_full_domains=not args.finite_domains, boys_grouping=args.boys_grouping,
+        full_domain=not args.finite_domains, boys_grouping=args.boys_grouping,
         lo_kwargs=dict(init_guess='atomic', conv_tol=1e-10,
                        gmres_options=dict(restart=120, maxiter=100)))
     setup_timings['domain_selection_seconds'] = time.perf_counter()-phase
     phase = time.perf_counter()
     eo = np.asarray(mf.mo_energy)[domains.active_occ_indices]
     ev = np.asarray(mf.mo_energy)[domains.active_vir_indices]
-    roots, weights, _ = make_laplace_grid(eo, ev, kind='fitted', points=6, lambda_gradient=.1)
-    setup_timings['mp2_grid_fit_seconds'] = time.perf_counter()-phase
-    grid = dict(laplace_roots=roots, laplace_weights=weights)
-    baseline = dict(mode='deterministic', threads=args.threads, global_seed=666, **grid)
-    matrix = dict(mode='deterministic', threads=args.threads, memory_limit_mb=800000, **grid)
-    selection_options = dict(matrix_kind='W', thresh_occ=args.lno_thresh_occ, thresh_vir=args.lno_thresh_vir,
-        baseline_controls=baseline, matrix_controls=matrix, merge_identical=True, single_pass=False)
-    phase = time.perf_counter()
-    ordinary = ccsd.build_static_selections(mf, domains, smooth=False, **selection_options)
-    setup_timings['conventional_lis_selection_seconds'] = time.perf_counter()-phase
+    baseline = dict(mode='deterministic', threads=args.threads, global_seed=666)
+    matrix = dict(mode='deterministic', threads=args.threads, memory_limit_mb=800000)
+    selection_options = dict( thresh_occ=args.lno_thresh_occ, thresh_vir=args.lno_thresh_vir,
+        baseline_controls=baseline, matrix_controls=matrix, merge_identical=True)
     phase = time.perf_counter()
     smooth = ccsd.build_static_selections(mf, domains,
-        smooth_laplace_points=args.triples_laplace_points, **selection_options)
+        triples_laplace_points=args.triples_laplace_points, **selection_options)
     setup_timings['smooth_lis_and_triples_grids_seconds'] = time.perf_counter()-phase
     fragment_settings = [dict(index=i, target_orbitals=len(domains.physical_groups[i]),
         nocc_lis=ccsd._fragment_dimensions(smooth, i)[0], nvir_lis=ccsd._fragment_dimensions(smooth, i)[1],
         occupied_block_size=frames[0].anchor.shape[1] if frames else 0,
         virtual_block_size=frames[1].anchor.shape[1] if frames else 0,
-        mp2_budget_energy_eh=smooth.mp2_fragment_energies[i],
-        triples_quadrature=smooth.lis_static.smooth_grid[i][2] if frames else None)
+
+        triples_quadrature=smooth.lis_static.triples_grid[i][2] if frames else None)
         for i, frames in enumerate(smooth.lis_static.smooth_frames)]
     save('settings.json', dict(basis=args.basis, frozen=args.frozen, threads=args.threads,
          max_memory_mb=800000, hf_energy_eh=float(mf.e_tot), samples=args.samples,
@@ -160,10 +139,9 @@ def main():
          triples_trace_exponent=args.triples_trace_exponent,
          triples_dressing="asymmetric", triples_dressing_backend="native",
          triples_adaptive=True, setup_timings=setup_timings,
-         sampling_fragment=args.sampling_fragment,
          triples_budget_energy=args.triples_budget_energy,
          cc_conv_tol=args.cc_conv_tol, cc_conv_tol_normt=args.cc_conv_tol_normt,
-         boys_grouping=args.boys_grouping, force_full_domains=not args.finite_domains,
+         boys_grouping=args.boys_grouping, full_domain=not args.finite_domains,
          lno_thresh_occ=args.lno_thresh_occ, lno_thresh_vir=args.lno_thresh_vir,
          nao=mol.nao, nocc_active=len(eo), nvir_active=len(ev), auxbasis=auxbasis or 'auto',
          fragments=fragment_settings))
@@ -171,7 +149,7 @@ def main():
     if args.selection_only:
         return
     options = dict(baseline_controls=baseline, matrix_controls=matrix,
-        matrix_kind='W', ccsd_t=True, include_hf=True, return_components=True, merge_identical=True)
+         ccsd_t=True, include_hf=True, return_components=True, merge_identical=True)
 
     def run(label, selected, controls):
         report(f'Starting {label}')
@@ -182,7 +160,7 @@ def main():
         force = -np.asarray(bar.coords)
         if not np.isfinite(force).all():
             raise RuntimeError('nonfinite force')
-        energy_key = 'total_energy_eh' if args.sampling_fragment is None else 'correction_energy_eh'
+        energy_key = 'total_energy_eh'
         data = dict(force_eh_per_bohr=force.tolist(),
                     components=asdict(components), elapsed_seconds=time.perf_counter()-phase,
                     setup_timings=setup_timings, setup_seconds=phase-started,
@@ -191,12 +169,9 @@ def main():
                     geometry=str(args.xyz_file.resolve()), hf_energy=float(mf.e_tot),
                     triples_controls=controls,
                     boys_grouping=args.boys_grouping, lno_thresh_occ=args.lno_thresh_occ,
-                    lno_thresh_vir=args.lno_thresh_vir, force_full_domains=not args.finite_domains,
+                    lno_thresh_vir=args.lno_thresh_vir, full_domain=not args.finite_domains,
                     scf_density_ao=np.asarray(mf.make_rdm1()).tolist())
         data[energy_key] = float(energy)
-        if args.sampling_fragment is not None:
-            data['sampling_fragment'] = args.sampling_fragment
-            data['energy_scope'] = 'one S: CCSD + (T) - MP2-LIS correction'
         save(label + '.json', data)
         report(f'{label}: {float(energy):.12f} Eh, {data["elapsed_seconds"]:.1f}s')
         del energy, bar, components
@@ -210,12 +185,8 @@ def main():
                 or reference.get('boys_grouping', 'molecule') != args.boys_grouping
                 or reference.get('lno_thresh_occ', 0.) != args.lno_thresh_occ
                 or reference.get('lno_thresh_vir', 0.) != args.lno_thresh_vir
-                or reference.get('force_full_domains', True) != (not args.finite_domains)):
+                or reference.get('full_domain', True) != (not args.finite_domains)):
             raise ValueError('reference molecular settings or SCF energy disagree')
-    elif args.sampling_fragment is None:
-        reference = run('canonical_deterministic', ordinary, dict(mode='deterministic'))
-    else:
-        reference = None  # The requested fragment computes its own reference below.
     reference_force = np.asarray(reference['force_eh_per_bohr']) if reference is not None else None
     def stochastic_controls(seed):
         controls = dict(mode='stochastic', nsamples=args.samples, global_seed=seed,
@@ -226,40 +197,10 @@ def main():
             records = {row['fragment_index']: row for row in reference['components']['fragments']}
             controls['fragment_energies'] = [records[i]['e_ccsd'] for i in range(len(smooth.fragments))]
         return controls
-    if args.sampling_fragment is not None:
-        index = args.sampling_fragment
-        if index >= len(smooth.fragments) or smooth.fragments[index] is None:
-            raise ValueError('sampling fragment index is outside the selected physical S')
-        # The CLI tolerance is the target for this one requested correction.
-        # For an isolated comparison, pass its original globally allocated SE.
-        options.update(fragment_indices=(index,), include_baseline=False, include_hf=False)
-        fragment_reference = (reference if reference is not None
-                              and reference.get('sampling_fragment') == index else None)
-        if args.fragment_deterministic:
-            fragment_reference = run(f'canonical_deterministic_fragment_{index}', ordinary,
-                                     dict(mode='deterministic'))
-        fragment_comparisons = []
-        for seed in args.seeds:
-            label = f'smooth_stochastic_fragment_{index}_seed_{seed}'
-            result = run(label, smooth, stochastic_controls(seed))
-            if fragment_reference is not None:
-                delta = (np.asarray(result['force_eh_per_bohr'])
-                         - np.asarray(fragment_reference['force_eh_per_bohr']))
-                fragment_comparisons.append(dict(label=label,
-                    rms_force_error_meh_per_bohr=float(np.sqrt(np.mean(delta**2))*1000),
-                    max_abs_force_error_meh_per_bohr=float(np.max(np.abs(delta))*1000),
-                    standard_error_meh=float(np.sqrt(sum(f['triples_standard_error']**2
-                        for f in result['components']['fragments']))*1000),
-                    samples=sum(f['triples_samples'] for f in result['components']['fragments']),
-                    energy_difference_meh=(result['correction_energy_eh']
-                                          - fragment_reference['correction_energy_eh'])*1000))
-                save('fragment_comparison.json', fragment_comparisons)
-                report(str(fragment_comparisons[-1]))
-        return
     if args.fd_coordinate is not None:
         index = tuple(args.fd_coordinate)
         original = np.asarray(mol.atom_coords())
-        energies = {'canonical': [], 'smooth': []}
+        energies = {'smooth': []}
         for sign in (-1, 1):
             coords = original.copy()
             coords[index] += sign * args.fd_step
@@ -267,7 +208,7 @@ def main():
                 unit='Bohr', basis=basis, max_memory=800000, verbose=4)
             displaced.build(trace_exp=False, trace_ctr_coeff=False)
             current_mf = build_mf(displaced)
-            for label, selected in [('canonical', ordinary), ('smooth', smooth)]:
+            for label, selected in [('smooth', smooth)]:
                 value, _ = ccsd.kernel(current_mf, selected,
                     triples_controls=dict(mode='deterministic'), **options)
                 energies[label].append(float(value))
@@ -289,9 +230,6 @@ def main():
         comparisons.append(item)
         save('comparison.json', comparisons)
         report(str(item))
-    if args.smooth_deterministic:
-        compare('smooth_deterministic', run('smooth_deterministic', smooth,
-                dict(mode='deterministic')))
     for seed in args.seeds:
         label = f'smooth_stochastic_seed_{seed}'
         compare(label, run(label, smooth, stochastic_controls(seed)))

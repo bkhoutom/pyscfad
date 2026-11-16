@@ -1,4 +1,5 @@
 """The system solver uses one complete differentiable local orbital frame."""
+from pyscfad.dlno_stc.test import system_reference
 
 import jax
 import numpy as np
@@ -8,7 +9,7 @@ from pyscfad import config_update, gto, scf
 from pyscfad import dlno_stc
 from pyscfad.dlno_stc.adjoint import fix_restart_mo_phases as _fix_restart_mo_phases
 from pyscfad.dlno_stc import backend, domain, prepare
-from pyscfad.dlno_stc.adjoint import apply_full_pullback
+from pyscfad.dlno_stc.adjoint import apply_selected_pullback
 
 
 OCCUPIED = np.array([1, 2, 3, 4], dtype=np.int32)
@@ -46,7 +47,7 @@ def _controls():
 
 
 def _local_prepare(mf, frame, virtual=VIRTUAL):
-    return prepare.prepare_system_inputs(
+    return system_reference.prepare_system_inputs(
         mf, OCCUPIED, virtual, boys_reference=frame.boys_reference,
         virtual_anchor_columns=frame.virtual_anchor_columns,
     )
@@ -55,7 +56,7 @@ def _local_prepare(mf, frame, virtual=VIRTUAL):
 def test_system_preparation_uses_nondiagonal_local_fock_blocks(reference):
     # Replacing the local frame with active canonical MOs loses both local
     # Fock couplings, even though the resulting MP2 energy is invariant.
-    inputs = prepare.prepare_system_inputs(reference, OCCUPIED, VIRTUAL)
+    inputs = system_reference.prepare_system_inputs(reference, OCCUPIED, VIRTUAL)
     assert _off_diagonal_norm(inputs["foo"]) > 1e-3
     assert _off_diagonal_norm(inputs["fvv"]) > 1e-3
 
@@ -66,7 +67,7 @@ def test_local_frame_spans_exactly_the_selected_active_spaces(reference, virtual
     # Forming PAOs from the complement of occupied MOs would reintroduce a
     # frozen virtual here; retaining AO parents directly would lose S metric
     # orthogonality or produce more than the selected number of columns.
-    frame = domain.build_system_local_frame(reference, OCCUPIED, virtual)
+    frame = system_reference.build_system_local_frame(reference, OCCUPIED, virtual)
     overlap = np.asarray(reference.get_ovlp())
     canonical = np.asarray(reference.mo_coeff)
     co, cv = np.asarray(frame.occupied_coeff), np.asarray(frame.virtual_coeff)
@@ -94,9 +95,9 @@ def test_local_preparation_rotates_every_tensor_in_the_same_frame(reference, vir
     # Independently transform the canonical tensors: using the local Focks
     # with canonical B, or localizing either retained space incompletely,
     # breaks these contractions even if individual dimensions still match.
-    frame = domain.build_system_local_frame(reference, OCCUPIED, virtual)
+    frame = system_reference.build_system_local_frame(reference, OCCUPIED, virtual)
     actual = _local_prepare(reference, frame, virtual)
-    canonical = prepare.prepare_canonical_system_inputs(reference, OCCUPIED, virtual)
+    canonical = system_reference.prepare_canonical_system_inputs(reference, OCCUPIED, virtual)
     overlap = np.asarray(reference.get_ovlp())
     coeff = np.asarray(reference.mo_coeff)
     uo = coeff[:, OCCUPIED].T @ overlap @ np.asarray(frame.occupied_coeff)
@@ -119,7 +120,7 @@ def test_scf_energy_local_focks_match_generic_without_building_fock(
     from copy import copy
     import h5py
 
-    frame = domain.build_system_local_frame(reference, OCCUPIED, virtual)
+    frame = system_reference.build_system_local_frame(reference, OCCUPIED, virtual)
     expected = _local_prepare(reference, frame, virtual)
     current = copy(reference)
     current.with_df = copy(reference.with_df)
@@ -136,7 +137,7 @@ def test_scf_energy_local_focks_match_generic_without_building_fock(
         raise AssertionError("SCF-energy preparation must not build an AO Fock")
 
     monkeypatch.setattr(type(current), "get_fock", forbidden_fock)
-    actual, pullback = jax.vjp(lambda mf: prepare.prepare_system_inputs(
+    actual, pullback = jax.vjp(lambda mf: system_reference.prepare_system_inputs(
         mf, OCCUPIED, virtual, boys_reference=frame.boys_reference,
         virtual_anchor_columns=frame.virtual_anchor_columns, fock_from_scf=True,
     ), current)
@@ -153,7 +154,7 @@ def test_scf_energy_local_focks_match_generic_without_building_fock(
 def test_virtual_frame_is_the_cholesky_orthonormalized_ao_projection(reference):
     # A further arbitrary virtual rotation preserves the active projector but
     # changes this prescribed PAO anchor gauge and its coordinate response.
-    frame = domain.build_system_local_frame(reference, OCCUPIED, VIRTUAL)
+    frame = system_reference.build_system_local_frame(reference, OCCUPIED, VIRTUAL)
     overlap = np.asarray(reference.get_ovlp())
     cv = np.asarray(reference.mo_coeff[:, VIRTUAL])
     columns = np.asarray(frame.virtual_anchor_columns)
@@ -166,7 +167,7 @@ def test_virtual_frame_is_the_cholesky_orthonormalized_ao_projection(reference):
 
 @pytest.mark.parametrize("metadata", ["none", "boys-only", "anchors-only"])
 def test_traced_system_preparation_requires_all_concrete_frame_metadata(reference, metadata):
-    frame = domain.build_system_local_frame(reference, OCCUPIED, VIRTUAL)
+    frame = system_reference.build_system_local_frame(reference, OCCUPIED, VIRTUAL)
     options = {}
     if metadata == "boys-only":
         options["boys_reference"] = frame.boys_reference
@@ -175,7 +176,7 @@ def test_traced_system_preparation_requires_all_concrete_frame_metadata(referenc
     # Discrete pivoting or Boys branch selection during an input VJP would
     # depend on tracer values instead of the fixed concrete reference.
     with pytest.raises(ValueError, match="concrete.*before tracing"):
-        jax.vjp(lambda mf: prepare.prepare_system_inputs(
+        jax.vjp(lambda mf: system_reference.prepare_system_inputs(
             mf, OCCUPIED, VIRTUAL, **options,
         ), reference)
 
@@ -183,9 +184,9 @@ def test_traced_system_preparation_requires_all_concrete_frame_metadata(referenc
 @pytest.mark.parametrize("columns", [(5,), (5, 5), (0, 7)],
                          ids=["wrong-count", "duplicate", "out-of-range"])
 def test_system_frame_rejects_invalid_fixed_virtual_anchors(reference, columns):
-    boys_reference = domain.select_system_boys_reference(reference, OCCUPIED)
+    boys_reference = system_reference.select_system_boys_reference(reference, OCCUPIED)
     with pytest.raises(ValueError, match="anchor columns"):
-        domain.build_system_local_frame(
+        system_reference.build_system_local_frame(
             reference, OCCUPIED, VIRTUAL, boys_reference=boys_reference,
             virtual_anchor_columns=columns,
         )
@@ -193,10 +194,10 @@ def test_system_frame_rejects_invalid_fixed_virtual_anchors(reference, columns):
 
 def test_system_local_frame_handles_one_selected_occupied_orbital(reference):
     occupied = OCCUPIED[:1]
-    frame = domain.build_system_local_frame(reference, occupied, VIRTUAL)
+    frame = system_reference.build_system_local_frame(reference, occupied, VIRTUAL)
     np.testing.assert_allclose(frame.occupied_coeff, reference.mo_coeff[:, occupied],
                                atol=2e-11, rtol=0)
-    inputs = prepare.prepare_system_inputs(
+    inputs = system_reference.prepare_system_inputs(
         reference, occupied, VIRTUAL, boys_reference=frame.boys_reference,
         virtual_anchor_columns=frame.virtual_anchor_columns,
     )
@@ -212,7 +213,7 @@ def test_system_boys_response_is_stable_under_large_occupied_rotations(reference
     from copy import copy
     from scipy.linalg import block_diag
 
-    frame = domain.build_system_local_frame(reference, OCCUPIED, VIRTUAL)
+    frame = system_reference.build_system_local_frame(reference, OCCUPIED, VIRTUAL)
     angle = np.pi - 1e-4
     rotation = np.array([[np.cos(angle), -np.sin(angle)],
                          [np.sin(angle), np.cos(angle)]])
@@ -226,7 +227,7 @@ def test_system_boys_response_is_stable_under_large_occupied_rotations(reference
     def localize(coeff):
         current = copy(reference)
         current.mo_coeff = current.mo_coeff.at[:, OCCUPIED].set(coeff)
-        return domain.build_system_local_frame(
+        return system_reference.build_system_local_frame(
             current, OCCUPIED, VIRTUAL,
             boys_reference=frame.boys_reference,
             virtual_anchor_columns=frame.virtual_anchor_columns,
@@ -279,14 +280,14 @@ def test_system_boys_uses_domain_setup_without_extra_searches(guess, monkeypatch
     mf.mo_coeff = jax.numpy.asarray(coeff)
 
     options = None if guess is None else {"init_guess": guess}
-    selected = domain.select_system_boys_reference(mf, occupied, lo_kwargs=options)
+    selected = system_reference.select_system_boys_reference(mf, occupied, lo_kwargs=options)
     assert len(calls) == 1
     assert calls[0]["init_guess"] == (guess or "atomic")
     assert calls[0]["conv_tol"] == 1e-10
     assert calls[0].get("conv_tol_grad") is None
     assert calls[0]["gmres_options"] == {"restart": 120, "maxiter": 100}
     virtual = np.arange(9, coeff.shape[1], dtype=np.int32)
-    frame = domain.build_system_local_frame(
+    frame = system_reference.build_system_local_frame(
         mf, occupied, virtual, boys_reference=selected,
     )
     assert len(calls) == 2
@@ -304,7 +305,7 @@ def test_system_driver_passes_boys_options_to_reference_selection(reference, mon
     from pyscfad.dlno_stc import driver
 
     calls = []
-    real_select = driver.select_system_boys_reference
+    real_select = driver.build_domain_selections
     options = {"init_guess": "cholesky", "conv_tol": 1e-11,
                "gmres_options": {"restart": 80, "maxiter": 60}}
 
@@ -312,7 +313,7 @@ def test_system_driver_passes_boys_options_to_reference_selection(reference, mon
         calls.append(kwargs["lo_kwargs"])
         return real_select(*args, **kwargs)
 
-    monkeypatch.setattr(driver, "select_system_boys_reference", record_selection)
+    monkeypatch.setattr(driver, "build_domain_selections", record_selection)
     energy = dlno_stc.kernel(
         reference, scope="system", frozen=1, controls=_controls(), lo_kwargs=options,
     )
@@ -342,17 +343,17 @@ def coordinate_response(reference):
         )
     # Keep the production localization defaults in this fixture: the
     # arbitrary-seed finite difference also checks their response accuracy.
-    frame = domain.build_system_local_frame(mf, OCCUPIED, VIRTUAL)
+    frame = system_reference.build_system_local_frame(mf, OCCUPIED, VIRTUAL)
     local, local_pullback = jax.vjp(lambda mf_: _local_prepare(mf_, frame), mf)
     canonical, canonical_pullback = jax.vjp(
-        lambda mf_: prepare.prepare_canonical_system_inputs(mf_, OCCUPIED, VIRTUAL), mf,
+        lambda mf_: system_reference.prepare_canonical_system_inputs(mf_, OCCUPIED, VIRTUAL), mf,
     )
     values = {}
     for name, inputs, pullback in (("local", local, local_pullback),
                                    ("canonical", canonical, canonical_pullback)):
-        host = backend.host_inputs(inputs, scope="system")
-        result = backend.solve(host, {}, _controls(), with_grad=True, scope="system")
-        mf_bar, = apply_full_pullback(pullback, host, result)
+        host = backend.host_inputs(inputs)
+        result = system_reference.solve(host, {}, _controls(), with_grad=True, scope="system")
+        mf_bar, = apply_selected_pullback(pullback, host, result)
         mol_bar, = scf_pullback(mf_bar)
         values[name] = (result["energy"], mol_bar)
     return {"mol": reference.mol, "mf": mf, "frame": frame, "inputs": local,
@@ -414,7 +415,7 @@ def test_scf_energy_local_fock_coordinate_vjp_matches_generic_and_differences(
     # build its own Fock map when composing the final coordinate derivative.
     with monkeypatch.context() as guard:
         guard.setattr(type(state["mf"]), "get_fock", forbidden_fock)
-        _, pullback = jax.vjp(lambda mf: prepare.prepare_system_inputs(
+        _, pullback = jax.vjp(lambda mf: system_reference.prepare_system_inputs(
             mf, OCCUPIED, VIRTUAL, boys_reference=frame.boys_reference,
             virtual_anchor_columns=frame.virtual_anchor_columns,
             fock_from_scf=True,
@@ -462,25 +463,30 @@ def test_degenerate_scf_uses_full_local_fock_response_for_arbitrary_seed():
         mf, scf_pullback = jax.vjp(
             lambda mol_: _fix_restart_mo_phases(_mf(mol_)), mol,
         )
-    state = driver._initialize_system(
-        mf, 1, _controls(), with_grad=True, scf_pullback=scf_pullback,
-        fock_from_scf=True,
-    )
+    occupied, virtual = driver._active_indices(mf, 1)
     energies = np.asarray(mf.mo_energy)
     assert any(np.min(np.diff(np.sort(energies[indices]))) <= 1e-9
-               for indices in (state["occupied"], state["virtual"]))
-    inputs, _, selected_pullback = driver._prepare_system(state, _controls(), True)
-    generic, generic_pullback = jax.vjp(lambda current: prepare.prepare_system_inputs(
-        current, state["occupied"], state["virtual"],
-        boys_reference=state["boys_reference"],
-        virtual_anchor_columns=state["virtual_anchor_columns"],
-    ), mf)
+               for indices in (occupied, virtual))
+    static = dlno_stc.build_domain_selections(mf, frozen=1, scope="system")
+    state = driver._initialize(mf, static, _controls(), with_grad=True,
+                               scf_pullback=scf_pullback)
+    group, = dlno_stc.build_domain_groups(static)
+    inputs, _, selected_pullback = driver._prepare(state, static, group, _controls(), True)
+    # Compare the selected response against a direct VJP through the same
+    # fixed domain labels, including AO Fock response at degenerate eigenvalues.
+    static = state['_prepared_domain_static']
+    def direct(current):
+        common = driver.rebuild_domain_data(current, static)
+        return prepare.prepare_boys_group_inputs(current, common, static, group)
+    generic, generic_pullback = jax.vjp(direct, mf)
     for name in inputs:
         np.testing.assert_allclose(inputs[name], generic[name], atol=5e-10, rtol=2e-10)
     rng = np.random.default_rng(142)
     seeds = {name: jax.numpy.asarray(rng.normal(size=value.shape))
              for name, value in inputs.items()}
-    selected_mf_bar, = selected_pullback(seeds)
+    direct_bar, common_bar = selected_pullback(seeds)
+    common_bars = state['common_pullback'](common_bar)
+    selected_mf_bar = jax.tree_util.tree_map(driver._add_cotangent, direct_bar, common_bars[0])
     generic_mf_bar, = generic_pullback(seeds)
     selected_bar, = scf_pullback(selected_mf_bar)
     generic_bar, = scf_pullback(generic_mf_bar)
@@ -496,23 +502,12 @@ def test_system_driver_passes_local_focks_and_matches_canonical_response(
     # Check the real backend boundary as well as the invariant final result:
     # returning to a canonical shortcut would otherwise pass energy tests.
     real_solve = backend.solve
-    real_prepare = driver.prepare_system_inputs
-
-    def prepare_without_fock(mf, *args, **kwargs):
-        def forbidden_fock(*args, **kwargs):
-            raise AssertionError("system SCF preparation must use orbital energies")
-
-        with monkeypatch.context() as guard:
-            guard.setattr(type(mf), "get_fock", forbidden_fock)
-            return real_prepare(mf, *args, **kwargs)
-
     def local_solve(inputs, metadata, controls, **kwargs):
         assert _off_diagonal_norm(inputs["foo"]) > 1e-3
         assert _off_diagonal_norm(inputs["fvv"]) > 1e-3
         return real_solve(inputs, metadata, controls, **kwargs)
 
     monkeypatch.setattr(backend, "solve", local_solve)
-    monkeypatch.setattr(driver, "prepare_system_inputs", prepare_without_fock)
     energy, bar = dlno_stc.value_and_grad(
         coordinate_response["mol"], _mf, scope="system", frozen=1,
         controls=_controls(),

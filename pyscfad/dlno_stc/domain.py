@@ -1,4 +1,4 @@
-"""STC-owned finite Boys and complete-system orbital frames."""
+"""STC-owned Boys fragment orbital frames."""
 
 from typing import NamedTuple
 from types import SimpleNamespace
@@ -14,110 +14,9 @@ from pyscfad.lno.lno_base import SEMICANONICAL_DEG_THRESH
 from ._profile import response
 from ._selection import (
     DomainSelections, EDLocalPAOSelection, _PAO_ORTH_THRESHOLD, _host_array, _hermitian_numpy,
-    _orthogonalize, _build_boys_targets, _resolve_boys_options,
+    _orthogonalize, _build_boys_targets,
     _validate_virtual_anchor_columns,
 )
-
-
-class SystemBoysReference(NamedTuple):
-    """Fixed initializer and orbital labels for active-occupied Boys replay."""
-
-    target_reference_coeff: object
-    target_reference_coords: object
-    lo_kwargs: dict | None = None
-
-
-class SystemLocalFrame(NamedTuple):
-    """Complete active spaces, with discrete Boys and AO-anchor metadata."""
-
-    occupied_coeff: object
-    virtual_coeff: object
-    boys_reference: SystemBoysReference | None
-    virtual_anchor_columns: tuple[int, ...]
-
-
-def _require_concrete_system_selection(mf):
-    if any(isinstance(leaf, jax.core.Tracer)
-           for leaf in jax.tree_util.tree_leaves((mf.mol, mf.mo_coeff))):
-        raise ValueError(
-            "select the system Boys reference and virtual anchor columns "
-            "from concrete data before tracing preparation"
-        )
-
-
-def select_system_boys_reference(mf, active_occ_indices, *, lo_kwargs=None):
-    """Select active-occupied Boys labels using the shared domain setup."""
-
-    _require_concrete_system_selection(mf)
-    occupied = mf.mo_coeff[:, active_occ_indices]
-    if not occupied.shape[1]:
-        return None
-    options = _resolve_boys_options(lo_kwargs)
-    # Match the Boys-domain benchmark: explicit atomic initialization, the
-    # standard derived gradient tolerance, and its localization response solve.
-    options = {"init_guess": "atomic", "conv_tol": 1e-10,
-               "gmres_options": {"restart": 120, "maxiter": 100}, **options}
-    localized = (_build_boys_targets(mf.mol, occupied, options, fock=build_scf_data(mf)[1])
-                 if options.get('method') == 'lambda_boys' else
-                 _build_boys_targets(mf.mol, occupied, options))
-    return SystemBoysReference(
-        numpy.array(_host_array(localized), copy=True),
-        numpy.array(_host_array(mf.mol.atom_coords()), copy=True),
-        options,
-    )
-
-
-def select_system_virtual_anchor_columns(mf, active_vir_indices):
-    """Select exactly nvir independent projected AO columns, without domains."""
-    _require_concrete_system_selection(mf)
-    virtual = mf.mo_coeff[:, active_vir_indices]
-    nvir = virtual.shape[1]
-    if not nvir:
-        return ()
-    overlap = mf.mol.intor_symmetric("int1e_ovlp")
-    cross = _host_array(virtual.T.conj() @ overlap)
-    _, triangular, pivots = scipy_linalg.qr(
-        cross, pivoting=True, mode="economic", check_finite=True,
-    )
-    diagonal = numpy.abs(numpy.diag(triangular))
-    if diagonal.size < nvir or numpy.min(diagonal[:nvir]) < 1e-10:
-        raise ValueError("system projected AO anchors do not span the active virtual space")
-    return tuple(int(column) for column in pivots[:nvir])
-
-
-def build_system_local_frame(
-    mf, active_occ_indices, active_vir_indices, *, boys_reference=None,
-    virtual_anchor_columns=None,
-):
-    """Rebuild one complete Boys/PAO frame with only discrete choices fixed.
-
-    Frozen occupied and virtual columns must already be excluded by the
-    supplied active indices. Concrete calls may select their reference and
-    anchors; a preparation VJP must receive both selections from its caller.
-    Current Boys coefficients, AO projections, overlap and Cholesky remain
-    differentiable. No ED support selection or virtual rank truncation occurs.
-    """
-
-    occupied = mf.mo_coeff[:, active_occ_indices]
-    virtual = mf.mo_coeff[:, active_vir_indices]
-    if boys_reference is None and occupied.shape[1]:
-        boys_reference = select_system_boys_reference(mf, active_occ_indices)
-    if virtual_anchor_columns is None:
-        virtual_anchor_columns = select_system_virtual_anchor_columns(mf, active_vir_indices)
-    columns = _validate_virtual_anchor_columns(
-        virtual_anchor_columns, numpy.arange(mf.mol.nao), virtual.shape[1],
-    )
-    co = (_rebuild_boys_targets(mf, occupied, boys_reference)
-          if occupied.shape[1] else occupied)
-    if virtual.shape[1]:
-        overlap = response('stc.system.input_pullback.overlap',
-                           lambda mol: mol.intor_symmetric("int1e_ovlp"), mf.mol)
-        cv = response('stc.system.input_pullback.virtual_frame',
-                      lambda v, s: _cholesky_metric_orthonormalize(
-                          v @ (v.T.conj() @ s[:, columns]), s), virtual, overlap)
-    else:
-        cv = virtual
-    return SystemLocalFrame(co, cv, boys_reference, columns)
 
 
 def _fragment_support(static, fragment_index):
@@ -348,8 +247,7 @@ def _rebuild_boys_targets(mf, occupied, static, *, _stationary=False, fock=None)
     # and invalidate the saved orbital labels/domains. The implicit Boys
     # response, stationarity test and orbital-match guard remain active.
     options["max_saddle_escapes"] = 0
-    parent = ('stc.system.input_pullback' if isinstance(static, SystemBoysReference)
-              else 'stc.domain.common_pullback')
+    parent = 'stc.domain.common_pullback'
     def localize(mol, coeff):
         if _stationary:
             from pyscfad.lo.boys import _boys_at_stationary_frame, BoysStationarityError

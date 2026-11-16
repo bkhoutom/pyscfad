@@ -17,6 +17,7 @@
 #include <cstdlib>
 #if defined(__linux__)
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #endif
 
@@ -243,8 +244,9 @@ stc_triples::triples_result stc_triples::quadrature_finish(const triples_prepare
 
 stc_triples::triples_result stc_triples::quadrature_stream(const triples_prepared& left,
         const std::vector<const triples_prepared*>& points,const std::vector<double>& weights,
-        size_t workspace_limit,size_t block_batch_size,std::vector<double>& energies,std::vector<triples_vjp>* bars) {
-    return triples_stream_kernel(left,points,weights,workspace_limit,block_batch_size,energies,bars);
+        size_t workspace_limit,size_t block_batch_size,std::vector<double>& energies,std::vector<triples_vjp>* bars,
+        bool profile_right) {
+    return triples_stream_kernel(left,points,weights,workspace_limit,block_batch_size,energies,bars,profile_right);
 }
 
 stc_triples::triples_result stc_triples::asymmetric_triples(

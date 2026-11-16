@@ -73,7 +73,7 @@ def test_solver_headroom_without_verified_limit_never_proves_failure():
                             observation=observed, unavoidable_bytes=10_000_001)
 
 
-@pytest.mark.parametrize("matrix_kind", ["D", "W"])
+@pytest.mark.parametrize("matrix_kind", ["W"])
 def test_matrix_peak_uses_one_observation_and_keeps_existing_estimate(monkeypatch, matrix_kind):
     from pyscfad.dlno_stc import _memory
 
@@ -82,72 +82,71 @@ def test_matrix_peak_uses_one_observation_and_keeps_existing_estimate(monkeypatc
         calls.append(None)
         return observation(rss_mb=12., allowance_mb=100.)
     monkeypatch.setattr(_memory, "observe_memory", observe)
-    settings = normalize_matrix_controls({"mode": "deterministic"}, matrix_kind)
+    settings = normalize_matrix_controls({"mode": "deterministic"})
     estimate, rss_mb, peak_bytes = backend._check_matrix_memory(
-        matrix_inputs(), 2, settings, matrix_kind, np.array([0, 4]))
+        matrix_inputs(), 2, settings, np.array([0, 4]))
     assert len(calls) == 1
     assert rss_mb == 12.
     assert peak_bytes == estimate["total_bytes"] + 12_000_000
 
 
-@pytest.mark.parametrize("matrix_kind", ["D", "W"])
+@pytest.mark.parametrize("matrix_kind", ["W"])
 def test_unknown_rss_keeps_matrix_peak_unknown(monkeypatch, matrix_kind):
     from pyscfad.dlno_stc import _memory
 
     monkeypatch.setattr(_memory, "observe_memory", lambda: observation(rss_mb=None))
-    settings = normalize_matrix_controls({"mode": "deterministic"}, matrix_kind)
+    settings = normalize_matrix_controls({"mode": "deterministic"})
     _, rss_mb, peak_bytes = backend._check_matrix_memory(
-        matrix_inputs(naux=0), 2, settings, matrix_kind, np.array([0, 0]))
+        matrix_inputs(naux=0), 2, settings, np.array([0, 0]))
     assert rss_mb is None
     assert peak_bytes is None
     forward = backend.solve_matrices(matrix_inputs(naux=0),
-                                     {"target_indices": (0, 1)}, {},
-                                     matrix_kind=matrix_kind)
+                                     {"target_indices": (0, 1)}, {})
     assert forward["diagnostics"]["current_rss_mb"] is None
     assert forward["diagnostics"]["estimated_process_peak_mb"] is None
 
 
-@pytest.mark.parametrize("matrix_kind", ["D", "W"])
+@pytest.mark.parametrize("matrix_kind", ["W"])
 @pytest.mark.parametrize("stage", ["forward", "reverse"])
 def test_matrix_required_new_array_stops_before_allocation(monkeypatch, matrix_kind, stage):
     from pyscfad.dlno_stc import _memory
 
     monkeypatch.setattr(_memory, "observe_memory", lambda: observation(
         enforced_limit_mb=.00005, allowance_mb=.00005))
-    settings = normalize_matrix_controls({"mode": "deterministic"}, matrix_kind)
+    settings = normalize_matrix_controls({"mode": "deterministic"})
     # The 3 x 3 float64 output is 72 bytes, independently of the forecast.
     with pytest.raises(MemoryError):
         backend._check_matrix_memory(matrix_inputs(naux=0), 2, settings,
-                                     matrix_kind, np.array([0, 0]), stage=stage)
+                                     np.array([0, 0]), stage=stage)
 
 
-@pytest.mark.parametrize("matrix_kind", ["D", "W"])
+@pytest.mark.parametrize("matrix_kind", ["W"])
 def test_conservative_forecast_above_limit_continues_when_each_array_fits(monkeypatch, matrix_kind):
     from pyscfad.dlno_stc import _memory
 
     monkeypatch.setattr(_memory, "observe_memory", lambda: observation(
         enforced_limit_mb=.0002, allowance_mb=.0002))
-    settings = normalize_matrix_controls({"mode": "deterministic"}, matrix_kind)
+    settings = normalize_matrix_controls({"mode": "deterministic"})
     # The largest new native copy is B (192 bytes); the forecast is much larger.
     with pytest.warns(RuntimeWarning):
-        backend._check_matrix_memory(matrix_inputs(), 2, settings, matrix_kind,
+        backend._check_matrix_memory(matrix_inputs(), 2, settings,
                                      np.array([0, 4]))
 
 
-@pytest.mark.parametrize("matrix_kind", ["D", "W"])
+@pytest.mark.parametrize("matrix_kind", ["W"])
 @pytest.mark.parametrize("stage", ["forward", "reverse"])
 def test_native_input_copy_is_a_new_array(monkeypatch, matrix_kind, stage):
     from pyscfad.dlno_stc import _memory
 
     monkeypatch.setattr(_memory, "observe_memory", lambda: observation(
         enforced_limit_mb=.0001, allowance_mb=.0001))
-    settings = normalize_matrix_controls({"mode": "deterministic"}, matrix_kind)
+    settings = normalize_matrix_controls({"mode": "deterministic"})
     with pytest.raises(MemoryError):
-        backend._check_matrix_memory(matrix_inputs(), 2, settings, matrix_kind,
+        backend._check_matrix_memory(matrix_inputs(), 2, settings,
                                      np.array([0, 4]), stage=stage)
 
 
-@pytest.mark.parametrize("matrix_kind", ["D", "W"])
+@pytest.mark.parametrize("matrix_kind", ["W"])
 @pytest.mark.parametrize("dimensions", [{"naux": 0}, {"nvir": 0}])
 def test_forward_reverse_warn_and_continue_with_advisory_budget(monkeypatch, matrix_kind, dimensions):
     from pyscfad.dlno_stc import _memory
@@ -156,8 +155,7 @@ def test_forward_reverse_warn_and_continue_with_advisory_budget(monkeypatch, mat
     inputs = matrix_inputs(**dimensions)
     with pytest.warns(RuntimeWarning, match=f"matrix {matrix_kind} forward"):
         forward = backend.solve_matrices(inputs, {"target_indices": (0, 1)},
-                                         {"memory_limit_mb": .001},
-                                         matrix_kind=matrix_kind)
+                                         {"memory_limit_mb": .001})
     with pytest.warns(RuntimeWarning, match=f"matrix {matrix_kind} reverse"):
         bars = backend.pullback_matrices(
             inputs, forward, energy_bar=1., occupied_bar=np.zeros_like(inputs["foo"]),
@@ -173,7 +171,7 @@ def test_forward_reverse_warn_and_continue_with_advisory_budget(monkeypatch, mat
     assert not caught
 
 
-@pytest.mark.parametrize("matrix_kind", ["D", "W"])
+@pytest.mark.parametrize("matrix_kind", ["W"])
 def test_native_matrices_and_bars_are_unchanged_by_advisory_warning(monkeypatch, matrix_kind):
     from pyscfad.dlno_stc import _memory
     from pyscfad.dlno_stc.test.test_backend import native
@@ -183,12 +181,11 @@ def test_native_matrices_and_bars_are_unchanged_by_advisory_warning(monkeypatch,
     inputs["B"] = np.random.default_rng(57).normal(size=(4, 2, 3)) / 5
     monkeypatch.setattr(_memory, "observe_memory", lambda: observation())
     metadata = {"target_indices": (0, 1)}
-    reference = backend.solve_matrices(inputs, metadata, {}, matrix_kind=matrix_kind)
+    reference = backend.solve_matrices(inputs, metadata, {})
     seeds = dict(energy_bar=.7, occupied_bar=np.eye(2), virtual_bar=np.eye(3))
     reference_bars = backend.pullback_matrices(inputs, reference, **seeds)
     with pytest.warns(RuntimeWarning, match=f"matrix {matrix_kind} forward"):
-        advised = backend.solve_matrices(inputs, metadata, {"memory_limit_mb": .001},
-                                         matrix_kind=matrix_kind)
+        advised = backend.solve_matrices(inputs, metadata, {"memory_limit_mb": .001})
     with pytest.warns(RuntimeWarning, match=f"matrix {matrix_kind} reverse"):
         advised_bars = backend.pullback_matrices(inputs, advised, **seeds)
     for name in ("energy", "occupied", "virtual"):
@@ -197,14 +194,13 @@ def test_native_matrices_and_bars_are_unchanged_by_advisory_warning(monkeypatch,
         np.testing.assert_array_equal(advised_bars[name], reference_bars[name])
 
 
-@pytest.mark.parametrize("matrix_kind", ["D", "W"])
+@pytest.mark.parametrize("matrix_kind", ["W"])
 def test_reverse_rechecks_limit_after_successful_forward(monkeypatch, matrix_kind):
     from pyscfad.dlno_stc import _memory
 
     monkeypatch.setattr(_memory, "observe_memory", lambda: observation())
     inputs = matrix_inputs(naux=0)
-    forward = backend.solve_matrices(inputs, {"target_indices": (0, 1)}, {},
-                                     matrix_kind=matrix_kind)
+    forward = backend.solve_matrices(inputs, {"target_indices": (0, 1)}, {})
     monkeypatch.setattr(_memory, "observe_memory", lambda: observation(
         enforced_limit_mb=.00005, allowance_mb=.00005))
     with pytest.raises(MemoryError, match=f"matrix {matrix_kind} reverse"):
@@ -233,5 +229,5 @@ def test_outer_calculation_deduplicates_separate_matrix_replays(monkeypatch):
         calculation()
         calculation()
     assert len(caught) == 4
-    assert sum("matrix D forward" in str(item.message) for item in caught) == 2
-    assert sum("matrix D reverse" in str(item.message) for item in caught) == 2
+    assert sum("matrix W forward" in str(item.message) for item in caught) == 2
+    assert sum("matrix W reverse" in str(item.message) for item in caught) == 2

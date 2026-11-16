@@ -39,6 +39,7 @@ def grouping_fixture():
         tuple(np.array([label]) for label in labels), (None,) * 8,
         np.ones((8, 8), dtype=bool), fragments,
         target_reference_coords=np.zeros((2, 3)),
+        mp2_grid=(np.array([.1]), np.array([.7])),
     )
 
 
@@ -165,7 +166,7 @@ def test_strong_selection_and_qr_run_once_per_unique_frame(
     monkeypatch.setattr(domain, "build_boys_ed_frame", unexpected_frame_replay)
     static = dlno_stc.build_domain_selections(
         mf, frozen=reference.frozen, target_coeff=reference.target_reference_coeff,
-        force_full_domains=True, pair_energy_model="all-strong",
+        full_domain=True, pair_energy_model="all-strong",
         boys_grouping=boys_grouping,
     )
     assert len(dlno_stc.build_domain_groups(static)) == 1

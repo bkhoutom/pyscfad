@@ -22,23 +22,6 @@ def test_shared_frame_control_defaults_on_and_preserves_explicit_overrides():
             adapter.normalize_controls({'shared_local_frame': invalid})
 
 
-@pytest.mark.parametrize('deferred',[False,True])
-def test_shared_frame_requires_full_fock_triples(deferred):
-    from pyscfad.dlno_stc import ccsd
-    def selection(smooth):
-        return SimpleNamespace(deferred_selection={'smooth':smooth} if deferred else None,
-            lis_static=SimpleNamespace(smooth_frames=() if smooth else None))
-    for shared in [False,True]:
-        ccsd._validate_shared_frame_triples(selection(True),True,{'shared_local_frame':shared})
-        ccsd._validate_shared_frame_triples(selection(False),False,{'shared_local_frame':shared})
-    ccsd._validate_shared_frame_triples(selection(False),True,{'shared_local_frame':False})
-    default_controls = ccsd._cc_solver_options('stc', None)['stc_cc_controls']
-    ccsd._validate_shared_frame_triples(selection(True),True,default_controls)
-    with pytest.raises(ValueError,match='smooth'):
-        ccsd._validate_shared_frame_triples(selection(False),True,default_controls)
-    assert ccsd._cc_solver_options('deterministic', None) == {}
-
-
 def test_default_stc_matches_legacy_response_without_backrotation(monkeypatch):
     from pyscfad import gto, scf
     from pyscfad.lno.ccsd import RCCSD, FragmentAmplitudeResult, ccsd_fragment_energy

@@ -30,7 +30,7 @@ from .domain import build_boys_ed_frame
 from .protocol import validate_full_result, validate_input_cotangents
 
 
-CC_SELECTIONS_SCHEMA_VERSION = 12
+CC_SELECTIONS_SCHEMA_VERSION = 13
 
 
 def _clear_jax_caches(stage, *live_results, **metadata):

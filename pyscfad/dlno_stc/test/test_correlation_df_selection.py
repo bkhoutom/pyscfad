@@ -104,7 +104,9 @@ def test_exact_pair_screening_matches_independent_pyscf_ri_oracle(selection_wate
     rotation = (co.T @ np.asarray(common.s1e) @ np.asarray(common.iao_coeff))[:, labels]
     target_g = np.einsum('ip,iajb,jq->paqb', rotation, g, rotation)
     target_t = np.einsum('ip,iajb,jq->paqb', rotation, t, rotation)
-    directed = 4 * np.einsum('paqb,paqb->pq', target_g, target_t)
+    # Closed-shell direct MP2 contributes 2 per ordered endpoint. Combining
+    # the two directions gives the production/MRCC factor 4 per distinct pair.
+    directed = 2 * np.einsum('paqb,paqb->pq', target_g, target_t)
     expected = directed + directed.T
     np.fill_diagonal(expected, np.diag(directed))
     actual = _pairs._exact_boys_pair_scores(mf, common, static, correlation_auxbasis=basis)

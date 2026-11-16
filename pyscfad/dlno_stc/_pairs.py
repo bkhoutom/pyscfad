@@ -15,10 +15,12 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
+import scipy.linalg as scipy_linalg
 
 from pyscfad.lno.tools import fake_mol_by_atom, project_mo
 from pyscfad.tools import resource_profile
 from pyscfad.lib._compilation_cache import configure_compilation_cache
+from pyscfad.lib._threading import blas_threads
 from pyscfad.lib._multipole import (
     symmetric_coordinate_moment_jvp, endpoint_matches_reference,
     pad_endpoint, crop_endpoint_cotangent,
@@ -430,6 +432,31 @@ def build_weak_multipole_screen(common, static, fragment_index, *, _pao_preproje
         preprojection=_pao_preprojection,
     )
     return _finish_weak_screen(occupied, virtual, fock, fragment_index)
+
+
+@blas_threads(1)
+def _finish_weak_screen_reference(occupied, virtual, fock, fragment_index):
+    """Finish concrete primary selection without compiling its Fock operations.
+
+    Live response and replay use ``_finish_weak_screen`` below. This helper
+    preserves its semicanonical spaces and screening-gap validation.
+    """
+    occupied, virtual, fock = map(np.asarray, (occupied, virtual, fock))
+    occupied_energy = np.real(np.einsum('ui,uv,vi->i', occupied.conj(), fock, occupied))
+    if virtual.shape[1] == 0:
+        virtual_energy = np.zeros((0,), dtype=np.real(virtual).dtype)
+    else:
+        projected = virtual.T.conj() @ fock @ virtual
+        projected = .5 * (projected + projected.T.conj())
+        if virtual.shape[1] == 1:
+            virtual_energy = np.real(projected).reshape(-1)
+        else:
+            virtual_energy, rotation = scipy_linalg.eigh(projected)
+            virtual = virtual @ rotation
+    gaps = virtual_energy[:, None] - occupied_energy
+    if not np.isfinite(gaps).all() or np.any(gaps <= 0):
+        raise RuntimeError(f"Boys target {fragment_index} has invalid screening denominators")
+    return WeakScreen(occupied_energy, occupied, virtual_energy, virtual)
 
 
 def _finish_weak_screen(occupied, virtual, fock, fragment_index):

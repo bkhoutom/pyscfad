@@ -12,6 +12,33 @@ from pyscfad.dlno_stc.test.test_correlation_auxbasis import (
 from pyscfad.lno import _df_shared
 
 
+@pytest.mark.parametrize('with_grad', [False, True])
+def test_metric_tapes_only_for_gradient(molecule, monkeypatch, with_grad):
+    mf = _mf(molecule)
+    calls = []
+    original = _df_shared.jax.vjp
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(_df_shared.jax, 'vjp', counted)
+    with _df_shared.reverse_scope(mf, np.arange(molecule.natm),
+                                  correlation_auxbasis=RIFIT,
+                                  with_grad=with_grad) as shared:
+        low = shared.metric_factor()
+        np.testing.assert_allclose(low @ low.T, shared.metric, atol=2e-12, rtol=2e-12)
+        assert len(calls) == (2 if with_grad else 0)
+        assert (shared._metric_pullback is not None) == with_grad
+        assert (shared._factor_pullback is not None) == with_grad
+        assert shared.metric_factor() is low
+        assert len(calls) == (2 if with_grad else 0)
+        if not with_grad:
+            with pytest.raises(RuntimeError, match='energy-only'):
+                shared.add(None, None, None, None)
+        shared.finish()
+
+
 @pytest.mark.parametrize('scope', ['system', 'domain'])
 @pytest.mark.parametrize('with_grad', [False, True])
 @pytest.mark.parametrize('cache_mode', ['direct', 'half'])

@@ -351,6 +351,26 @@ def weak_pair_contribution(*args, **kwargs):
     return contribution(*args, **kwargs)
 
 
+def _weak_contribution(state, static, pairs, comm, *, with_grad):
+    """Reuse root's same-reference scalar once; keep response owner jobs live."""
+    if not with_grad:
+        rank = comm.Get_rank()
+        pending = state.get('_prepared_weak_energy') if rank == 0 else None
+        energy = (pending[1] if pending is not None and tuple(pairs) == pending[0]
+                  else None)
+        energy = comm.bcast(energy, root=0)
+        if energy is not None:
+            from . import _mpi_weak
+            _mpi_weak.LAST_DIAGNOSTICS.clear()
+            _mpi_weak.LAST_DIAGNOSTICS.update(
+                rank=rank, n_endpoint_builds=0, n_pairs=0, n_endpoint_replays=0,
+                reused_selection_energy=True)
+            return np.asarray(energy if rank == 0 else 0.,
+                              dtype=state['common'].s1e.dtype), None
+    return weak_pair_contribution(state['mf'], state['common'], static, pairs,
+                                  comm, with_grad=with_grad)
+
+
 @contextmanager
 def _timed_section(name, totals, stage):
     start = time.perf_counter()
@@ -470,7 +490,8 @@ def _run_domain_jobs(initializer, worker_initializer, static, controls, comm, *,
                    'fragment_indices': tuple(group.fragment_indices), 'replica_count': 1}
             group_start = time.perf_counter()
             with driver._mp2_df_scope(state, static.fragments[group_id].extended_atoms,
-                                      static.fragments[group_id].pao_center_atoms) as shared:
+                                      static.fragments[group_id].pao_center_atoms,
+                                      with_grad=with_grad) as shared:
                 with _timed_section('stc.domain.prepare', totals, 'prepare'):
                     stage_start = time.perf_counter()
                     prepared = driver._prepare(state, static, group, controls, with_grad)
@@ -514,8 +535,7 @@ def _run_domain_jobs(initializer, worker_initializer, static, controls, comm, *,
     phase_start = time.perf_counter()
 
     def apply_weak():
-        energy, bars = weak_pair_contribution(
-            state['mf'], state['common'], static, pairs, comm, with_grad=with_grad)
+        energy, bars = _weak_contribution(state, static, pairs, comm, with_grad=with_grad)
         state['energy'] = state['energy'] + energy
         if with_grad:
             driver._add_bars(state, *bars)

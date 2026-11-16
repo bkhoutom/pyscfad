@@ -48,7 +48,7 @@ def _same_domain(left, right):
 
 
 class LocalDFReverse:
-    def __init__(self, mf, atoms, correlation_auxbasis=None, aux_atoms=None):
+    def __init__(self, mf, atoms, correlation_auxbasis=None, aux_atoms=None, *, with_grad=True):
         from .df import make_local_mol, make_local_auxmol
         self.atoms = numpy.asarray(atoms, dtype=numpy.int32)
         self.global_natm = mf.mol.natm
@@ -58,6 +58,7 @@ class LocalDFReverse:
         self.max_memory_mb = float(mf.mol.max_memory)
         self.workspace_mb = float(mf.with_df.max_memory)
         self.terms = []
+        self.with_grad = with_grad
         self.metric_bar = None
         self.metric = self.low = None
         self._metric_pullback = self._factor_pullback = None
@@ -88,14 +89,18 @@ class LocalDFReverse:
                 and _same_domain(auxmol, self.auxmol))
 
     def metric_factor(self):
-        """Retain primal arrays and one geometry tape at the scope's geometry."""
+        """Retain the metric/factor and, when requested, their response tapes."""
         if self.finished:
             raise RuntimeError('Cannot use a finished local DF reverse')
         if self.low is None:
-            metric, self._metric_pullback = jax.vjp(
-                lambda a: a.intor(a._add_suffix('int2c2e'), hermi=1), self.auxmol)
-            low, self._factor_pullback = jax.vjp(
-                lambda a: jsp_linalg.cholesky(a, lower=True), metric)
+            build_metric = lambda a: a.intor(a._add_suffix('int2c2e'), hermi=1)
+            factor = lambda a: jsp_linalg.cholesky(a, lower=True)
+            if self.with_grad:
+                metric, self._metric_pullback = jax.vjp(build_metric, self.auxmol)
+                low, self._factor_pullback = jax.vjp(factor, metric)
+            else:
+                metric = build_metric(self.auxmol)
+                low = factor(metric)
             low = numpy.asarray(jax.device_get(low))
             if (not numpy.all(numpy.isfinite(low))
                     or numpy.any(numpy.diag(low) <= 0)):
@@ -144,6 +149,8 @@ class LocalDFReverse:
         """
         if self.finished:
             raise RuntimeError('Cannot add to a finished local DF reverse')
+        if not self.with_grad:
+            raise RuntimeError('Cannot add a response to an energy-only local DF scope')
         z = numpy.asarray(z)
         coeff = numpy.asarray(jax.device_get(coeff))
         if z.dtype != numpy.float64 or coeff.dtype != numpy.float64:
@@ -254,11 +261,11 @@ class LocalDFReverse:
 
 
 @contextmanager
-def reverse_scope(mf, atoms, correlation_auxbasis=None, aux_atoms=None):
+def reverse_scope(mf, atoms, correlation_auxbasis=None, aux_atoms=None, *, with_grad=True):
     if _ACTIVE.get() is not None:
         raise RuntimeError('Nested local DF reverse scopes are unsupported')
     scope = LocalDFReverse(mf, atoms, correlation_auxbasis=correlation_auxbasis,
-                           aux_atoms=aux_atoms)
+                           aux_atoms=aux_atoms, with_grad=with_grad)
     token = _ACTIVE.set(scope)
     try:
         yield scope

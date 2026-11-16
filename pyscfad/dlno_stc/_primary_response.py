@@ -36,15 +36,27 @@ def _eigh(matrix, threshold, *, deg_thresh=1e-9):
 def _metric_space(coeff, overlap, threshold):
     if not coeff.shape[1]:
         return coeff, np.empty(0, dtype=np.int32)
-    vectors, keep = _eigh(coeff.T.conj() @ overlap @ coeff, threshold)
+    metric = coeff.T.conj() @ overlap @ coeff
+    if coeff.shape[1] == 1:
+        # Only the rank label is detached; normalization retains its S/C response.
+        norm2 = jnp.real(metric[0, 0])
+        keep = _keep(norm2[None], threshold)
+        return (coeff / jnp.sqrt(norm2) if keep.size else coeff[:, :0]), keep
+    vectors, keep = _eigh(metric, threshold)
     if keep.size == coeff.shape[1]:
         # The eigensolve has selected the full span. Its eigenvectors are an
         # arbitrary gauge; normalize directly and avoid their reverse rule.
-        return _cholesky_metric_orthonormalize(coeff, overlap), keep
-    retained = coeff @ vectors[:, keep]
+        return _cholesky_metric_orthonormalize(coeff, overlap, metric=metric), keep
+    rotation = vectors[:, keep]
+    retained = coeff @ rotation
     if not keep.size:
         return retained, keep
-    return _cholesky_metric_orthonormalize(retained, overlap), keep
+    # Rotate the live Gram only when it is no larger than the AO overlap.
+    # Its off-diagonal response is needed within degenerate retained spaces;
+    # replacing it by the selected eigenvalues would drop that response.
+    retained_metric = (rotation.T.conj() @ metric @ rotation
+                       if metric.shape[0] <= overlap.shape[0] else None)
+    return _cholesky_metric_orthonormalize(retained, overlap, metric=retained_metric), keep
 
 
 def _select_preprojection(common, products, *, columns, support, ao, thresholds,

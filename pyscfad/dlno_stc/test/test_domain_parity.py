@@ -63,8 +63,9 @@ def test_boys_localization_and_common_arrays_match_native(finite_case, native_ca
     })
 
 
-def test_fixed_supports_ranks_masks_and_target_mapping_match_native(
+def test_fixture_supports_weak_spaces_and_target_mapping_match_native(
         finite_case, native_case):
+    from pyscfad.dlno_stc._selection import EDLocalPAOSelection
     mf, static, _ = finite_case
     topology, old, _ = native_case
     for name in ("active_occ_indices", "active_vir_indices",
@@ -88,7 +89,14 @@ def test_fixed_supports_ranks_masks_and_target_mapping_match_native(
         assert len(new.extended_ao_indices) < mf.mol.nao
         assert new.target_index == list(new.strong_fragments).index(i)
         assert len(new.strong_occ_metric_keep) == len(new.strong_fragments)
-        for name in ("strong_virtual", "weak_virtual"):
+        # The strong ED now selects individual PAOs locally; its completeness
+        # indices no longer label the native global canonical eigenvectors.
+        assert isinstance(new.strong_virtual, EDLocalPAOSelection)
+        np.testing.assert_array_equal(new.strong_virtual.support_ao_indices,
+                                      new.extended_ao_indices)
+        np.testing.assert_array_equal(new.strong_virtual.parent_columns,
+                                      ref.strong_virtual.parent_columns)
+        for name in ("weak_virtual",):
             space, old_space = getattr(new, name), getattr(ref, name)
             if space is None:
                 assert old_space is None

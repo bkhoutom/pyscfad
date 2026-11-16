@@ -97,6 +97,20 @@ energy, gradient = dlno_stc.value_and_grad(
 ```
 
 `build_domain_selections` returns the pair graph and a lightweight ED plan.
+Concrete primary-space metric and PAO-preprojection operations temporarily use
+one BLAS thread. Their Fock diagonalization uses NumPy/SciPy under the same
+limit; differentiable primary selection and replay retain the JAX path.
+Selection discovers the loaded BLAS libraries once, and each dense helper
+restores the caller's limits on return or error. This does not change OpenMP
+budgets for integrals/native MP2, any selection cutoff, or ED QR construction.
+The default parent PAO cutoff is `pao_norm=1e-2` on the norm, equivalent
+to a squared norm greater than `1e-4`. Individual normalized PAOs are
+projected onto the ED AOs, retained when their squared norm is at least
+`ed_pao - 1e-4` (default `0.9949`), and orthogonalized among themselves
+with the local Gram cutoff `ed_pao_rank=1e-6`. ED MP2 retains the small
+occupied--virtual overlap introduced by AO truncation. CC restores
+occupied--virtual orthogonality after LNO selection, against the retained
+occupied LIS, with a differentiated Cholesky normalization.
 The MP2 and CCSD(T) fragment loops select each ED's virtual ranks and QR
 anchors just before preparing its tensors. The selected numerical frame and
 its derivative are used immediately, then released with that fragment.
@@ -149,13 +163,15 @@ in system preparation and exact pair screening. Memory
 estimates use the chosen correlation auxiliary dimension; there is no new
 disk fallback for an oversized local factor, metric, H cache or adjoint.
 
-Standalone domain MP2 and direct system MP2 retain one auxiliary metric,
-Cholesky factor and derivative tape through each preparation/pullback pair,
+Standalone domain MP2 and direct system MP2 retain one auxiliary metric and
+Cholesky factor per preparation. Gradient calls also retain their derivative tapes,
 including MPI owner jobs and saved-packet replay. Positive definiteness is
 checked by the retained factorization, without a separate validation build.
 Cached system factors use a dimension check to reject rank-reduced fitting
-sources. Domain MP2 now uses the same `half`/`direct` cache setting as CCSD(T),
-including MPI owner jobs and saved-packet replay. The default `half` mode retains
+sources. Domain MP2 uses the same `half`/`direct` cache setting as CCSD(T),
+including MPI owner jobs and saved-packet replay. Energy-only MP2 defaults to
+`direct`: it needs no resident half-transformed H tensor or metric response tape.
+Gradient calls and CCSD(T) retain the `half` default. That mode retains
 H through the coefficient pullback, reducing ordinary three-center integral
 generation from two passes to one per energy/gradient group. H is released
 before the deferred geometry contraction. Set
@@ -163,6 +179,20 @@ before the deferred geometry contraction. Set
 lower resident memory. System MP2 retains its existing cached-factor/direct
 streaming policy without an H cache. Local integral response finishes before
 common/Fock/SCF response in both modes.
+
+For an unchanged numerical reference, domain selection hands its prepared
+overlap/Fock, occupied/PAO data and screened weak correction to MP2 energy calls.
+This transient handoff retains only the latest selection, is not serialized, and
+checks reference identities and scientific inputs before reuse. Changed inputs,
+restored selections and gradients use their existing reconstruction/response
+paths. Mutable in-memory integral sources conservatively disable this reuse.
+Supplied Boys frames must agree with the existing localization replay before
+their weak screening result can be reused. ED occupied and raw virtual columns
+share one overlap solve and reuse their Gram contractions; QR anchors remain.
+
+Deterministic MP2 energy kernels temporarily use one BLAS thread inside their
+OpenMP work. The surrounding BLAS limits are restored even on errors. This
+does not change the selected Laplace grid or the gradient threading policy.
 
 `mp2.imported_value_and_grad` uses the production driver's single-SCF
 initialization, final overlap/Fock outputs, common response and final SCF
@@ -222,9 +252,10 @@ are generated locally in bounded shell tiles and are never cached on disk.
 Fragment DF has two modes, selected by
 `PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE` (benchmark: `--fragment-df-mode`):
 
-- `half` (default, option 2): one integral-generation pass per domain group.
+- `half` (default for gradients and CCSD(T), option 2): one integral-generation pass per domain group.
   Retain `H_ED[P,mu,p] = sum_nu (P|mu nu) C_ED[nu,p]` and fitted `B_ED,ov`.
-  Each LIS lies in its occupied/virtual ED parent span, so `H_LIS = H_ED U`.
+  Each LIS lies in the combined occupied-plus-virtual ED span, so
+  `H_LIS = H_ED U`; delayed occupied removal may mix the two ED blocks.
   Its fitted oo/ov/vv blocks and both coefficient-response legs use this H.
   The current LIS H/output is released after its correction; ED H and MP2
   factors remain live through the W/MP2 pullback. No `A_ED` is retained.
@@ -234,8 +265,8 @@ Fragment DF has two modes, selected by
   Forward-only execution needs `1+k` passes.
 
 These counts refer to ordinary three-center inputs. Gradient runs still
-compute derivative integrals. Both modes cache one metric, Cholesky factor
-and response tape per group, and combine all local three-center/metric
+compute derivative integrals. Both modes cache one metric and Cholesky factor
+per group. Gradient calls also retain the response tapes and combine all local three-center/metric
 coordinate responses into one contraction. ED/LIS coefficient pullbacks
 remain separate and feed the W/D and orbital responses normally. This works
 with deterministic and stochastic triples, independently of their integral
@@ -552,7 +583,7 @@ For W, `matrix_controls` determines strong-domain energy precision;
 `baseline_controls` remains part of preparation configuration, and the two
 Laplace grids must match. D calculations retain their independent MP2 solver.
 Rebuild saved CC selections and start a new checkpoint after this merge;
-selection schema 9 requires rebuilding earlier LIS selections and checkpoints.
+selection schema 13 requires rebuilding earlier LIS selections and checkpoints.
 
 The fit uses 600 single-gap points and three positive least-squares starts.
 Diagnostics include fitting seconds, exact molecular denominator bounds,
@@ -933,7 +964,7 @@ this policy are unsupported. The enabled build adds a CTest for scope restoratio
 `pyscfad/dlno_stc/test/test_triples_blas_threads.py` checks numerical parity and
 observed thread counts.
 
-Restart algorithm ABI 3 and grouping convention `boys_exact_domain_groups_v3`
+Restart algorithm ABI 5 and grouping convention `boys_exact_domain_groups_v3`
 require fresh checkpoints after restoring the anchored virtual frame. Older
 finite packets using `local_before_fock_v1` or `local_before_fock_v2` must be
 re-exported; the outer tensor exchange schema and checkpoint container version
@@ -946,10 +977,14 @@ remain 1.
 CCSD(T) correction; identical extended domains may share preparation.
 
 Domain-space LIS is the only supported construction. D/W is diagonalized
-within the orthonormal occupied/virtual ED frames. Occupied selection retains
+within the separately orthonormal occupied/virtual ED frames. Occupied selection retains
 the normalized projections of the physical fragment's original Boys targets
 and selects LNOs in their orthogonal complement. Virtual selection uses the
-ED matrix directly. Zero cutoffs retain the entire corresponding ED space.
+ED matrix directly. Selected virtual LNOs are then projected against the
+retained occupied LIS and normalized before semicanonical or smooth framing.
+The virtual projector metadata describes selection before this projection.
+Zero cutoffs retain the full occupied ED space and the corresponding
+occupied-projected virtual ED space.
 The `lis_space` checkpoint marker and optional Python argument accept only
 `"domain"`; the benchmark no longer has a `--lis-space` selector.
 
@@ -968,7 +1003,8 @@ frame, native triples selects target rows by copying and scatters their
 cotangents; it still evaluates the full independent fragment-projector
 cotangent. Existing smooth anchors remain readable in their saved ordering.
 Global-space LIS checkpoints are rejected and must be rebuilt. Selection
-schema 10 remains valid for existing domain-space checkpoints.
+schema 13 and algorithm ABI 5 invalidate checkpoints from the earlier ED
+occupied-projection equations.
 
 `build_static_selections` defaults to `single_pass=True` for W calculations
 and returns a plan without a W prepass. Production
@@ -1036,7 +1072,7 @@ force-comparison examples. Library triples defaults are deterministic mode,
 point and trace exponent 5.0. The MP2 trace model uses exponent 1.4. The production
 examples request total triples SE `5e-5` Eh (0.05 mEh). These controls affect energies and
 their gradients; production energy and derivative estimates share samples.
-CC selections use schema 10; rebuild saved selections/checkpoints after changing
+CC selections use schema 13; rebuild saved selections/checkpoints after changing
 from earlier implementations. Native energy/VJP entry points are
 `triples_asymmetric_energy` and `triples_asymmetric_energy_vjp`.
 

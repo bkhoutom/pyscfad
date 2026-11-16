@@ -53,7 +53,7 @@ __all__ = [
 _FORMAT_NAME = "pyscfad-dlno-stc-boys-restart"
 _FORMAT_VERSION = 1
 # Invalidate cotangents when the selected three-input Boys equations change.
-_ALGORITHM_ABI = 3
+_ALGORITHM_ABI = 5
 _EQUATION_ID = "boys-selected-three-input-v1"
 _GROUPING_CONVENTION = "boys_exact_domain_groups_v3"
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -138,13 +138,13 @@ def _array_digest(array):
 def _static_registry():
     # No aliases to native DLNO classes: old weighted records are incompatible.
     from ._selection import (
-        BoysDomainThresholds, FixedPAOSubspaceSelection,
+        BoysDomainThresholds, FixedPAOSubspaceSelection, EDLocalPAOSelection,
         FragmentDomainSelection, DomainSelections, DomainGroup,
     )
     from .lis import FragmentLISSelection, LISSelections
     from .ccsd import CCSDSelections
     from .smooth import AnchoredFrame
-    classes = (BoysDomainThresholds, FixedPAOSubspaceSelection,
+    classes = (BoysDomainThresholds, FixedPAOSubspaceSelection, EDLocalPAOSelection,
                FragmentDomainSelection, DomainSelections, DomainGroup,
                FragmentLISSelection, LISSelections, CCSDSelections, AnchoredFrame)
     return {_class_tag(cls): cls for cls in classes}
@@ -436,6 +436,7 @@ def _decode_value(node, reader):
             )
         optional = ({'correlation_basis_identity', 'ed_selection_pending', 'ao_atom_slices'}
                     if cls.__name__ == 'DomainSelections' else
+                    {'ed_pao_rank'} if cls.__name__ == 'BoysDomainThresholds' else
                     {'correlation_basis_identity'} if cls.__name__ == 'CCSDSelections' else set())
         compatible = tuple(name for name in expected if name in names or name not in optional)
         if names != compatible:

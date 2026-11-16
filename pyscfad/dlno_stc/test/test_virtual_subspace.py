@@ -12,6 +12,46 @@ from pyscfad.dlno_stc import domain
 from pyscfad.dlno_stc.test.test_boys_construction import reference
 
 
+@pytest.mark.parametrize('width,threshold,rank,ao_grams', [
+    (3, .1, 3, 1), (3, 1.5, 2, 1), (9, 1.5, 7, 2)])
+def test_metric_space_reuses_gram_without_increasing_contraction_size(
+        monkeypatch, width, threshold, rank, ao_grams):
+    from pyscfad.dlno_stc import _primary_response
+    coeff = jnp.asarray(np.eye(8, width) * np.sqrt(np.arange(1, width + 1)))
+    overlap = jnp.eye(8)
+    frame, keep = _primary_response._metric_space(coeff, overlap, threshold)
+    assert frame.shape[1] == rank
+    # Freeze only the eager integer rank decision to inspect the real traced
+    # contractions. A second C^H S C duplicates an AO Gram in the first two
+    # cases; rotating the Gram in the last case would do larger work instead.
+    monkeypatch.setattr(_primary_response, '_keep', lambda values, cutoff: keep)
+    traced = jax.make_jaxpr(lambda c, s: _primary_response._metric_space(c, s, threshold)[0])(
+        coeff, overlap)
+    products_with_overlap = [eqn for eqn in traced.jaxpr.eqns
+                             if eqn.primitive.name == 'dot_general'
+                             and traced.jaxpr.invars[1] in eqn.invars]
+    assert len(products_with_overlap) == ao_grams
+    np.testing.assert_allclose(frame.T @ overlap @ frame, np.eye(rank), atol=2e-13)
+
+
+@pytest.mark.parametrize('threshold', [.1, 1.5])
+def test_metric_space_normalization_keeps_full_metric_response(threshold):
+    from pyscfad.dlno_stc._primary_response import _metric_space
+    rng = np.random.default_rng(139)
+    coeff = jnp.asarray(np.eye(6, 3) * np.sqrt([1., 2., 2.]))
+    dc = jnp.asarray(rng.normal(size=coeff.shape) * .03)
+    ds = rng.normal(size=(6, 6)) * .02
+    ds = jnp.asarray(ds + ds.T)
+    seed = jnp.asarray(rng.normal(size=(6, 6)))
+    def objective(x):
+        frame, _ = _metric_space(coeff + x * dc, jnp.eye(6) + x * ds, threshold)
+        return jnp.sum((frame @ frame.T) * seed)
+    actual = jax.grad(objective)(0.)
+    finite = (objective(1e-5) - objective(-1e-5)) / 2e-5
+    assert abs(float(actual)) > 1e-3
+    np.testing.assert_allclose(actual, finite, atol=2e-8, rtol=2e-7)
+
+
 @pytest.mark.parametrize('indices', [np.arange(5), np.array([0, 2, 4])])
 def test_ao_support_projection_value_and_response(indices):
     rng = np.random.default_rng(91)
@@ -61,6 +101,7 @@ def test_real_boys_replay_uses_saved_anchors_without_qr(reference, monkeypatch):
         force_full_domains=True,
     )
     common = domain.rebuild_domain_data(reference, static)
+    static = dlno_stc.materialize_domain_selections(reference, static, common=common)
 
     def forbidden_qr(*args, **kwargs):
         raise AssertionError("preparation must reuse saved QR pivots")
@@ -77,9 +118,9 @@ def test_real_boys_replay_uses_saved_anchors_without_qr(reference, monkeypatch):
                                                frame.extended_ao_indices)]
         virtual = np.asarray(frame.virtual_coeff)
         np.testing.assert_allclose(virtual.T @ overlap @ virtual, np.eye(2), atol=1e-9)
-        raw = domain._rebuild_local_virtual_subspace(
-            common, fragment.strong_virtual, frame.extended_ao_indices,
-            frame.occupied_coeff, boys_metric_threshold=static.thresholds.metric_rank)
+        raw, _ = domain._local_ed_pao_space(
+            common, fragment.strong_virtual.parent_columns, frame.extended_ao_indices,
+            frame.occupied_coeff, static.thresholds, selection=fragment.strong_virtual)
         np.testing.assert_allclose(virtual @ virtual.T, raw @ raw.T, atol=1e-9)
     def coefficients(current):
         rebuilt = domain.build_boys_ed_frame(current, static, 0)

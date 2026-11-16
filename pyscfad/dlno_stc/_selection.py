@@ -17,6 +17,7 @@ from pyscf.mp.mp2 import _mo_splitter
 from pyscf.dft.rks import KohnShamDFT
 from pyscfad.mp import dfmp2
 from pyscfad.lib._compilation_cache import configure_compilation_cache
+from pyscfad.lib._threading import blas_threads, dense_blas_scope
 from pyscfad.lno import tools
 from pyscfad.lo.boys import boys
 from pyscfad.scf.hf import RHF
@@ -26,23 +27,29 @@ _PAO_ORTH_THRESHOLD = 1e-6
 
 @dataclass(frozen=True)
 class BoysDomainThresholds:
-    """Boys BP/PAO and pair-screen cutoffs, retaining the native defaults."""
+    """Boys BP/PAO, local ED rank, and pair-screen cutoffs.
+
+    ED completeness uses squared individual projected norms with the fixed
+    1e-4 margin: ``max(0, ed_pao - 1e-4)``. ``ed_pao_rank`` is the final
+    normalized local Gram cutoff, independent of occupied ``metric_rank``.
+    """
 
     bp_occ: float = 0.985
     bp_primary: float = 0.999
     bp_ed: float = 0.9998
     bp_pao: float = 0.98
-    pao_norm: float = 1e-4
+    pao_norm: float = 1e-2
     domain_pao: float = 1e-4
     ed_pao: float = 0.995
     metric_rank: float = 1e-10
     pair_energy: float = 7.5e-6
     near_pair_distance: float = 3.5
     multipole_order: int = 4
+    ed_pao_rank: float = 1e-6
 
     def __post_init__(self):
         values = (self.bp_occ, self.bp_primary, self.bp_ed, self.bp_pao,
-                  self.pao_norm, self.domain_pao, self.ed_pao, self.metric_rank,
+                  self.pao_norm, self.domain_pao, self.ed_pao, self.ed_pao_rank, self.metric_rank,
                   self.pair_energy, self.near_pair_distance)
         if not numpy.isfinite(values).all():
             raise ValueError("Boys thresholds must be finite")
@@ -55,6 +62,8 @@ class BoysDomainThresholds:
             raise ValueError("domain and pair cutoffs must be non-negative")
         if self.multipole_order not in (2, 3, 4):
             raise ValueError("multipole_order must be 2, 3, or 4")
+        if self.ed_pao_rank <= 0:
+            raise ValueError("ED PAO rank cutoff must be positive")
 
 
 @dataclass(frozen=True)
@@ -63,6 +72,22 @@ class FixedPAOSubspaceSelection:
     support_ao_indices: numpy.ndarray
     canonical_keep: numpy.ndarray
     overlap_keep: numpy.ndarray
+    completeness_keep: numpy.ndarray
+    metric_keep: numpy.ndarray
+
+
+@dataclass(frozen=True)
+class EDLocalPAOSelection:
+    """Individual parent PAOs and the retained local Gram eigenvalue indices.
+
+    ``completeness_keep`` indexes ``parent_columns``. ``metric_keep`` indexes
+    the Gram spectrum after ED projection and individual normalization.
+    Occupied removal is deferred to the LIS. No global canonical or support
+    eigenspace is selected.
+    """
+
+    parent_columns: numpy.ndarray
+    support_ao_indices: numpy.ndarray
     completeness_keep: numpy.ndarray
     metric_keep: numpy.ndarray
 
@@ -77,7 +102,7 @@ class FragmentDomainSelection:
     extended_ao_indices: numpy.ndarray
     pao_center_atoms: numpy.ndarray
     strong_occ_metric_keep: numpy.ndarray
-    strong_virtual: FixedPAOSubspaceSelection | None
+    strong_virtual: EDLocalPAOSelection | FixedPAOSubspaceSelection | None
     primary_atoms: numpy.ndarray
     primary_ao_indices: numpy.ndarray
     primary_bp_atoms: numpy.ndarray
@@ -263,14 +288,21 @@ def _strong_preparation_key(static, fragment, index, labels):
         if fragment.virtual_anchor_columns is not None:
             raise ValueError('pending ED selection cannot contain virtual anchors')
         return ('pending', partners, candidates, keep, supports), candidates, slot
-    if not isinstance(selection, FixedPAOSubspaceSelection):
+    if not isinstance(selection, (EDLocalPAOSelection, FixedPAOSubspaceSelection)):
         raise ValueError(f"Boys domain {index} must retain its strong PAO selection")
     parent = _grouping_indices(selection.parent_columns,
                                len(static.pao_parent_ao_indices), "PAO parents")
     support = _grouping_indices(selection.support_ao_indices, nao, "PAO AO support")
-    canonical = _grouping_indices(selection.canonical_keep, len(parent), "canonical PAO keep")
-    overlap = _grouping_indices(selection.overlap_keep, len(canonical), "overlap PAO keep")
-    completeness = _grouping_indices(selection.completeness_keep, len(overlap), "completeness PAO keep")
+    if isinstance(selection, EDLocalPAOSelection):
+        if support != supports[1]:
+            raise ValueError(f"Boys domain {index} local PAO support must match ED AO support")
+        completeness = _grouping_indices(selection.completeness_keep, len(parent), "completeness PAO keep")
+        virtual_key = ('local-ed-pao', parent, support, completeness)
+    else:
+        canonical = _grouping_indices(selection.canonical_keep, len(parent), "canonical PAO keep")
+        overlap = _grouping_indices(selection.overlap_keep, len(canonical), "overlap PAO keep")
+        completeness = _grouping_indices(selection.completeness_keep, len(overlap), "completeness PAO keep")
+        virtual_key = ('canonical-pao', parent, support, canonical, overlap, completeness)
     metric = _grouping_indices(selection.metric_keep, len(completeness), "metric PAO keep")
     if fragment.virtual_anchor_columns is None:
         raise ValueError(f"Boys domain {index} requires saved virtual anchors before grouping")
@@ -278,7 +310,7 @@ def _strong_preparation_key(static, fragment, index, labels):
         fragment.virtual_anchor_columns, parent, len(metric),
     )
     return (partners, candidates, keep, supports,
-            (parent, support, canonical, overlap, completeness, metric), anchors), candidates, slot
+            virtual_key + (metric,), anchors), candidates, slot
 
 
 def build_domain_groups(static, *, merge_identical=True) -> tuple[DomainGroup, ...]:
@@ -334,10 +366,19 @@ def _eigh_keep_numpy(matrix, threshold):
     return eigenvalue, eigenvector, keep
 
 
+@blas_threads(1)
 def _reference_metric_space(coeff, overlap, threshold):
-    """Choose a metric rank and build its canonical frame from one eigensolve."""
+    """Select a metric rank; singleton spaces need only scalar normalization."""
     coeff = numpy.asarray(coeff)
+    if not coeff.shape[1]:
+        return coeff, numpy.empty(0, dtype=numpy.int32)
     metric = coeff.T.conj() @ numpy.asarray(overlap) @ coeff
+    if coeff.shape[1] == 1:
+        norm2 = numpy.real(metric[0, 0])
+        if not numpy.isfinite(norm2):
+            raise RuntimeError('nonfinite primary-space selection spectrum')
+        keep = numpy.flatnonzero(numpy.atleast_1d(norm2) > threshold).astype(numpy.int32)
+        return (coeff / numpy.sqrt(norm2) if keep.size else coeff[:, :0]), keep
     eigenvalue, eigenvector, keep = _eigh_keep_numpy(metric, threshold)
     normalized = coeff @ (
         eigenvector[:, keep] / numpy.sqrt(numpy.real(eigenvalue[keep]))[None, :]
@@ -376,6 +417,7 @@ def _reference_pao_products(pao_coeff, overlap):
     return pao.T.conj() @ overlap_pao, overlap_pao
 
 
+@blas_threads(1)
 def _reference_pao_preprojection(
     mol, pao_coeff, ao2pao_map, overlap, *, parent_atoms, support_atoms,
     representation_atoms, completeness_threshold, overlap_threshold,
@@ -493,15 +535,21 @@ def _extract_active_indices(mf, frozen):
 
 
 def get_bp_domain(mol, mos, s1e=None, bp_thr=0.999,
-                  q_thr=None, atmlst=None):
+                  q_thr=None, atmlst=None, *, atom_order="distance"):
     """BP domains based on partial Mulliken charges.
+
+    Occupied domains grow by decreasing absolute atom population. PAO domains
+    retain the default distance ordering about the largest-population atom.
     """
+    if atom_order not in ("distance", "population"):
+        raise ValueError("atom_order must be 'distance' or 'population'")
     if s1e is None:
         s1e = mol.intor_symmetric('int1e_ovlp')
     if q_thr is None:
         q_thr = min(0.05, 5*(1-bp_thr))
     if atmlst is None:
         atmlst = numpy.arange(mol.natm)
+    atmlst = numpy.asarray(atmlst)
 
     mos = numpy.asarray(mos)
     if mos.ndim == 1:
@@ -511,7 +559,6 @@ def get_bp_domain(mol, mos, s1e=None, bp_thr=0.999,
     # TODO project MOs onto smaller basis
     assert nao == mol.nao
 
-    rr = atom_distance(mol, atmlst)
     aoslices = mol.aoslice_by_atom()[:,2:]
     bp_atmlst = []
 
@@ -523,20 +570,23 @@ def get_bp_domain(mol, mos, s1e=None, bp_thr=0.999,
     q_by_atom = numpy.abs(numpy.asarray([
         numpy.sum(gop[slice(*aoslices[a])], axis=0) for a in atmlst
     ]))
-    sorted_atom_idx = numpy.argsort(rr, axis=1)
+    sorted_atom_idx = (numpy.argsort(atom_distance(mol, atmlst), axis=1)
+                       if atom_order == "distance" else None)
 
     for i in range(nmo):
         orbi = mos[:, i]
         q = q_by_atom[:, i]
 
         _atms = atmlst[q > q_thr]
-        av = _compute_av_numpy(mol, orbi, s1e, _atms)
+        av = _compute_av_numpy(mol, orbi, s1e, _atms) if _atms.size else 0.
 
         if av < bp_thr:
-            center_id = int(numpy.argsort(-q)[0])
-            _sorted_atm_idx = sorted_atom_idx[center_id]
+            population_order = numpy.argsort(-q)
+            _sorted_atm_idx = (population_order if atom_order == "population"
+                               else sorted_atom_idx[int(population_order[0])])
 
-            for iatm in _sorted_atm_idx[1:]:
+            # Include the center if the initial population seed was empty.
+            for iatm in _sorted_atm_idx:
                 a = atmlst[iatm]
                 if a not in _atms:
                     _atms = numpy.append(_atms, a)
@@ -728,6 +778,7 @@ def _validate_reference(mf, frozen):
         raise ValueError("frozen must be an occupied count or distinct MO indices")
 
 
+@dense_blas_scope()
 def build_domain_selections(
     mf, *, frozen, thresholds=None, lo_kwargs=None, target_coeff=None,
     frag_lolist=None, pair_energy_model="multipole", force_full_domains=False,
@@ -744,7 +795,7 @@ def build_domain_selections(
     and puts every active occupied target in one physical fragment.
     """
     from .domain import DomainData, TargetOccupiedData, build_scf_data
-    from ._pairs import (screen_pairs, _WeakScreenProducts, _finish_weak_screen,
+    from ._pairs import (screen_pairs, _WeakScreenProducts, _finish_weak_screen_reference,
                          _multipole_orbital_data, _origin_zero_moments,
                          _fake_mol_with_traced_centers, pad_endpoint)
     from ._df_basis import basis_kwargs, basis_identity, selection_auxbasis
@@ -831,7 +882,8 @@ def build_domain_selections(
     ao2pao = numpy.full(mol.nao, -1, dtype=numpy.int32)
     ao2pao[pao_parent] = numpy.arange(pao_parent.size)
     ordered = targets[:, [int(group[0]) for group in groups]]
-    compact, primary_bp, tight = (get_bp_domain(mol, ordered, overlap, bp_thr=cutoff)
+    compact, primary_bp, tight = (get_bp_domain(mol, ordered, overlap, bp_thr=cutoff,
+                                               atom_order="population")
                                   for cutoff in (thresholds.bp_occ, thresholds.bp_primary, thresholds.bp_ed))
     pao_bp = get_bp_domain(mol, pao_coeff, overlap, bp_thr=thresholds.bp_pao)
     primary = get_primary_domain(mol, primary_bp, pao_bp, ao2pao)
@@ -907,7 +959,7 @@ def build_domain_selections(
                     ao_moments = _origin_zero_moments(
                         _fake_mol_with_traced_centers(mol, support),
                         max(1, thresholds.multipole_order - 1))
-                screen = _finish_weak_screen(
+                screen = _finish_weak_screen_reference(
                     normalized, weak_coeff, fock[numpy.ix_(ao, ao)], i)
                 reference_endpoints[i] = pad_endpoint(_multipole_orbital_data(
                     mol, screen, support, thresholds.multipole_order, ao_moments=ao_moments))
@@ -976,4 +1028,7 @@ def build_domain_selections(
                      weak_pair_energy=weak_pair, forced_strong_mask=forced)
     if response is not None:
         response.bind(static)
+    else:
+        from ._energy_preparation import remember
+        remember(mf, static, common, verify_stationary=target_coeff is not None)
     return static

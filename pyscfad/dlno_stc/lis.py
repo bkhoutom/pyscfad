@@ -3,7 +3,8 @@
 The supplied blocks and BoysEDFrame must describe the same native call. The
 reference step saves only discrete labels; reconstruction differentiates the
 blocks, numerical ED frame and original Boys target overlaps. Every LIS
-orbital stays within its occupied or virtual ED parent span.
+occupied orbital stays in its ED parent span. Selected virtual LNOs have
+the retained occupied LIS component removed before entering the CC solver.
 """
 from __future__ import annotations
 
@@ -81,7 +82,9 @@ class FragmentLIS:
     All ``*_coeff`` arrays have global AO rows, with zeros outside the ED.
     ``mo_coeff`` contains LIS occupied then virtual columns; ``frozen`` is
     empty. The solver receives the explicit occupied LIS count. Projectors
-    and D/W blocks use the orthonormal ED occupied/virtual coordinates.
+    and D/W blocks use the separately orthonormal ED coordinates. The virtual
+    projector records LNO selection before occupied-LIS removal; final virtual
+    coefficients additionally include that removal and normalization.
     ``density_*_active`` are None; no global active-space density is formed.
     Both target fields contain the normalized domain projection of the
     physical Boys block used for the fragment energy partition.
@@ -192,6 +195,23 @@ def _semicanonical_space(coeff, fock):
     return lno_base.semicanonicalize(fock, coeff)[1]
 
 
+def _orthogonalize_lis_virtual(virtual, occupied, overlap):
+    """Restore CC occupied/virtual orthogonality with a live metric response.
+
+    This fixed-rank step follows ED/LNO selection. A lost rank requires new
+    selections rather than silently changing the solver dimensions.
+    """
+    if not virtual.shape[1]:
+        return virtual
+    projected = virtual - occupied @ (occupied.T.conj() @ overlap @ virtual)
+    metric = _hermitize(projected.T.conj() @ overlap @ projected)
+    chol = np.linalg.cholesky(metric)
+    pivots = numpy.asarray(jax.device_get(jax.lax.stop_gradient(np.real(np.diag(chol)))))
+    if not numpy.isfinite(pivots).all() or numpy.any(pivots ** 2 <= 1e-10):
+        raise RuntimeError('LIS virtual projection loses rank; rebuild domain/LIS selections')
+    return solve_triangular(chol, projected.T.conj(), lower=True).T.conj()
+
+
 def _validate_kind(matrix_kind):
     if matrix_kind not in ('D', 'W'):
         raise ValueError("matrix_kind must be 'D' or 'W'")
@@ -269,7 +289,7 @@ def _domain_targets(common, domains, index, frame):
 
 
 def _build_domain_lis(mf, common, static, index, frame, occupied, virtual):
-    """Select and frame LIS orbitals entirely within the orthonormal ED.
+    """Select LNOs in the ED and enforce orthogonality at the CC boundary.
 
     Global AO rows are a zero-padded representation only. There is no global
     HF occupied/virtual projection or completion with frozen HF orbitals.
@@ -312,6 +332,8 @@ def _build_domain_lis(mf, common, static, index, frame, occupied, virtual):
         coeff = embedded @ rotation
         if spin == 0:
             original_occupied = coeff
+        else:
+            coeff = _orthogonalize_lis_virtual(coeff, coefficients[0], common.s1e)
         if frames is None:
             coeff = _semicanonical_space(coeff, common.fock)
         elif not split_occupied:

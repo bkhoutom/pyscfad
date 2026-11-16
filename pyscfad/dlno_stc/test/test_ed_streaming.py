@@ -67,6 +67,14 @@ def test_one_fragment_reuses_selected_frame_and_preserves_packet_response(
         rng = np.random.default_rng(208)
         bars = {key:rng.normal(size=value.shape) for key,value in inputs.items()}
         extra = (rng.normal(size=frame.occupied_coeff.shape), rng.normal(size=frame.virtual_coeff.shape))
+        def forbidden(*args, **kwargs):
+            raise AssertionError('ED pullback must use the retained forward tape')
+        monkeypatch.setattr(_ed_selection, 'select_boys_ed_frame', forbidden)
+        monkeypatch.setattr(domain, 'build_boys_ed_frame', forbidden)
+        monkeypatch.setattr(domain, '_local_ed_pao_space', forbidden)
+        monkeypatch.setattr(domain, '_project_ed_columns', forbidden)
+        monkeypatch.setattr(domain, '_project_to_ao_support', forbidden)
+        monkeypatch.setattr(domain, '_stable_virtual_frame', forbidden)
         actual, want = pullback((bars, extra)), expected_pb((bars, extra))
         for got, ref in zip(jax.tree_util.tree_leaves(actual), jax.tree_util.tree_leaves(want)):
             if got.dtype != jax.dtypes.float0:

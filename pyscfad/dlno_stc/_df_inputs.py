@@ -2,19 +2,19 @@
 import os
 
 
-def cache_mode():
-    mode = os.environ.get('PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE', 'half').lower()
+def cache_mode(*, default='half'):
+    mode = os.environ.get('PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE', default).lower()
     if mode not in ('direct', 'half'):
         raise ValueError('PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE must be direct or half')
     return mode
 
 
-def configure_cache(scope, static=None):
-    """Retain H for domain MP2 and optional LIS consumers of the same frame."""
+def configure_cache(scope, static=None, *, default='half'):
+    """Choose the forward cache, preserving explicit user configuration."""
     if static is not None:
         from .lis import _validate_lis_space
         _validate_lis_space(static.lis_static.lis_space)
-    mode = cache_mode()
+    mode = cache_mode(default=default)
     scope.receipt['cache_mode'] = mode
     if mode == 'half':
         from pyscfad.lno._df_half import HalfTransformedDFCache

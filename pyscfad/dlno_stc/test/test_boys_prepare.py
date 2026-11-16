@@ -139,7 +139,9 @@ def test_boys_B_bar_follows_fixed_anchor_pao_response(boys_water_dimer):
             static, 0,
         )
 
-    scale = jnp.asarray(0.003)
+    # Stay on the saved local-rank branch: at .003 the formerly null Gram
+    # mode is 6.9e-6, above the ED 1e-6 cutoff; at .0001 it is only 7.6e-9.
+    scale = jnp.asarray(0.0001)
     packet, pullback = jax.vjp(projected, scale)
     bars = {name: numpy.zeros_like(value) for name, value in packet.items()}
     bars["B"] = numpy.random.default_rng(117).normal(size=packet["B"].shape)

@@ -2,11 +2,13 @@
 
 import importlib
 import math
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field
 
 import numpy as np
 from pyscfad.tools import resource_profile
+from pyscfad.lib._threading import blas_threads
 
 from .protocol import (
     ARRAY_NAMES, validate_full_inputs, validate_full_result,
@@ -50,10 +52,15 @@ def _solve_local(inputs, metadata, controls, *, with_grad, aux_offsets, scope="d
     names, _, _ = _scope_boundary(scope)
     solver = extension.solve_selected if scope == "domain" else extension.solve_full
     arguments = (tuple(metadata["target_indices"]), controls) if scope == "domain" else (controls,)
-    return solver(
-        *(inputs[key] for key in names), *arguments,
-        aux_offsets=aux_offsets, with_grad=with_grad,
-    )
+    # The deterministic forward kernel already distributes work with OpenMP.
+    # Nested BLAS teams dominate the small local contractions. Discover the
+    # extension's libraries before applying the temporary limit.
+    serial_blas = not with_grad and controls.get('mode', 'deterministic') == 'deterministic'
+    with blas_threads(1) if serial_blas else nullcontext():
+        return solver(
+            *(inputs[key] for key in names), *arguments,
+            aux_offsets=aux_offsets, with_grad=with_grad,
+        )
 
 
 def solve(inputs, metadata, controls, *, comm=None, with_grad=True, aux_offsets=None,

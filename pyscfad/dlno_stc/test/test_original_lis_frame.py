@@ -62,20 +62,24 @@ def test_target_first_retained_frame_keeps_density_and_target_response():
 
 
 @pytest.mark.parametrize('full', [False, True])
-def test_domain_builder_keeps_targets_first_with_moving_ao_metric(monkeypatch, full):
+@pytest.mark.parametrize('contamination', [0., .12])
+def test_domain_builder_keeps_targets_first_and_virtuals_orthogonal(
+        monkeypatch, full, contamination):
     rng = np.random.default_rng(448)
     q = np.linalg.qr(rng.normal(size=(7, 7)))[0]
     nocc = 4 if full else 3
     anchor = q[:, :4] if full else q[:, [0, 2, 3]]
-    frame = SimpleNamespace(occupied_coeff=jnp.asarray(q[:, :4]),
-                            virtual_coeff=jnp.asarray(q[:, 4:]),
-                            extended_ao_indices=np.arange(7))
+    mixing = contamination * np.array([[1., 0., 1.], [1., 1., 0.],
+                                       [0., 1., 0.], [1., 0., 1.]])
+    raw_virtual = q[:, 4:] + q[:, :4] @ mixing
+    virtual_anchor = raw_virtual[:, :2] - anchor @ (anchor.T @ raw_virtual[:, :2])
+    virtual_anchor = np.linalg.qr(virtual_anchor)[0]
     selection = SimpleNamespace(occupied_lno_keep=np.array([1, 2]),
         full_occupied_space=full, virtual_lno_keep=np.array([0, 1]),
         full_virtual_space=False, occupied_map_columns=np.array([1, 2, 3]))
     static = SimpleNamespace(fragments=(selection,), mp2_static=None,
         smooth_frames=((AnchoredFrame(anchor, n_internal=1),
-                        AnchoredFrame(q[:, 4:6])),))
+                        AnchoredFrame(virtual_anchor)),))
     monkeypatch.setattr(lis, '_domain_targets',
         lambda common, domains, index, current: jnp.eye(4)[:, :1])
     ds = rng.normal(size=(7, 7)); ds = jnp.asarray((ds+ds.T)*.03)
@@ -85,20 +89,27 @@ def test_domain_builder_keeps_targets_first_with_moving_ao_metric(monkeypatch, f
         # Move the parent with the metric. The internal target follows this
         # parent, rather than a fixed AO anchor that could mix S and E again.
         parent = orthonormalize(jnp.asarray(q), metric)
+        # ED blocks are separately orthonormal. Their cross-overlap must be
+        # removed only against the retained occupied LIS, before smooth framing.
+        virtual = orthonormalize(parent[:, 4:] + parent[:, :4] @ mixing, metric)
         current = SimpleNamespace(occupied_coeff=parent[:, :4],
-            virtual_coeff=parent[:, 4:], extended_ao_indices=np.arange(7))
+            virtual_coeff=virtual, extended_ao_indices=np.arange(7))
         common = SimpleNamespace(s1e=metric, fock=jnp.eye(7))
         value = lis._build_domain_lis(None, common, static, 0, current,
             jnp.diag(jnp.array([0., .01, .3, .7])),
             jnp.diag(jnp.array([.1, .4, .8])))
-        return value.active_occupied_coeff, value.fragment_iao_coeff
+        return value.mo_coeff, value.fragment_iao_coeff
 
-    (co, target), (dco, dtarget) = jax.jvp(build, (0.,), (1.,))
-    np.testing.assert_allclose(co[:, :1], target, atol=2e-14)
-    np.testing.assert_allclose(dco[:, :1], dtarget, atol=2e-13)
-    np.testing.assert_allclose(co.T @ co, np.eye(nocc), atol=2e-14)
-    np.testing.assert_allclose(dco.T @ co + co.T @ dco + co.T @ ds @ co,
+    (coeff, target), (tangent, dtarget) = jax.jvp(build, (0.,), (1.,))
+    np.testing.assert_allclose(coeff[:, :1], target, atol=2e-14)
+    np.testing.assert_allclose(tangent[:, :1], dtarget, atol=2e-13)
+    np.testing.assert_allclose(coeff.T @ coeff, np.eye(nocc+2), atol=2e-14)
+    virtual = coeff[:, nocc:]
+    np.testing.assert_allclose(virtual @ virtual.T,
+                               virtual_anchor @ virtual_anchor.T, atol=2e-14)
+    np.testing.assert_allclose(tangent.T @ coeff + coeff.T @ tangent + coeff.T @ ds @ coeff,
                                0., atol=2e-13)
+    assert np.linalg.norm(tangent[:, nocc:]) > 1e-3
     h = 1e-5
-    np.testing.assert_allclose(dco, (build(h)[0]-build(-h)[0])/(2*h),
+    np.testing.assert_allclose(tangent, (build(h)[0]-build(-h)[0])/(2*h),
                                atol=2e-9, rtol=2e-6)

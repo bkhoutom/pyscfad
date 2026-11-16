@@ -13,7 +13,7 @@ from pyscfad.lno import tools
 from pyscfad.lno.lno_base import SEMICANONICAL_DEG_THRESH
 from ._profile import response
 from ._selection import (
-    DomainSelections, _PAO_ORTH_THRESHOLD, _host_array, _hermitian_numpy,
+    DomainSelections, EDLocalPAOSelection, _PAO_ORTH_THRESHOLD, _host_array, _hermitian_numpy,
     _orthogonalize, _build_boys_targets, _resolve_boys_options,
     _validate_virtual_anchor_columns,
 )
@@ -150,6 +150,59 @@ def _project_to_ao_support(coeff, overlap, ao):
         # Avoid solving S X = S C, including its cancelling overlap VJP.
         return coeff
     return tools.project_mo(coeff, overlap[ao], overlap[numpy.ix_(ao, ao)])
+
+
+def _project_ed_columns(common, occupied, parent, ao):
+    """Project occupied targets and raw PAOs with one AO overlap solve."""
+    nocc = occupied.shape[1]
+    columns = np.concatenate((occupied, common.pao_coeff[:, parent]), axis=1)
+    projected = _project_to_ao_support(columns, common.s1e, ao)
+    return projected[:, :nocc], projected[:, nocc:]
+
+
+_ED_PAO_COMPLETENESS_MARGIN = 1e-4
+
+
+def _local_ed_pao_space(common, parent, ao, occupied, thresholds, *, selection=None,
+                        projected=None):
+    """Select/replay individual PAOs with one local Gram rank decomposition.
+
+    The squared ED norm must be at least ``max(0, ed_pao - 1e-4)``; hence
+    the default .995 accepts .9949. ``ed_pao_rank`` applies to the Gram of
+    individually normalized projected columns. ED MP2 retains their small
+    occupied overlap; cross-orthogonalization is deferred to the LIS.
+    Selection and replay
+    share this live computation, whose ordinary JAX tape supplies the VJP.
+    """
+    from ._primary_response import _metric_space
+
+    if not len(parent):
+        raise RuntimeError('Boys ED has no parent PAOs; rebuild domains')
+    overlap = common.s1e[numpy.ix_(ao, ao)]
+    if projected is None:
+        projected = _project_to_ao_support(common.pao_coeff[:, parent], common.s1e, ao)
+    norm2 = np.real(np.sum(projected.conj() * (overlap @ projected), axis=0))
+    host_norm2 = _host_array(jax.lax.stop_gradient(norm2))
+    if not numpy.isfinite(host_norm2).all():
+        raise RuntimeError('nonfinite individual ED PAO completeness; rebuild domains')
+    cutoff = max(0., thresholds.ed_pao - _ED_PAO_COMPLETENESS_MARGIN)
+    complete = numpy.flatnonzero((host_norm2 >= cutoff)
+                                 & (host_norm2 > thresholds.metric_rank)).astype(numpy.int32)
+    if selection is not None:
+        if not numpy.array_equal(selection.support_ao_indices, ao):
+            raise ValueError('saved local ED PAO support differs from the ED AO support')
+        if not numpy.array_equal(complete, selection.completeness_keep):
+            raise RuntimeError('individual ED PAO completeness changed; rebuild domains')
+        complete = selection.completeness_keep
+    if not len(complete):
+        raise RuntimeError('Boys ED has no individually complete PAOs; rebuild domains')
+    candidate = projected[:, complete] / np.sqrt(norm2[complete])[None, :]
+    virtual, metric = _metric_space(candidate, overlap, thresholds.ed_pao_rank)
+    if selection is not None and not numpy.array_equal(metric, selection.metric_keep):
+        raise RuntimeError('Boys virtual ED metric rank changed; rebuild domains')
+    if not len(metric):
+        raise RuntimeError('Boys ED has no retained virtual space; rebuild domains')
+    return virtual, (complete, metric)
 
 
 def _rebuild_local_virtual_subspace(
@@ -332,9 +385,10 @@ def _rebuild_boys_targets(mf, occupied, static, *, _stationary=False, fock=None)
     return localized[:, permutation] * signs[None, :]
 
 
-def _cholesky_metric_orthonormalize(coeff, overlap):
+def _cholesky_metric_orthonormalize(coeff, overlap, *, metric=None):
     """Return a smooth metric-orthonormal frame for a full-rank column set."""
-    metric = coeff.T.conj() @ overlap @ coeff
+    if metric is None:
+        metric = coeff.T.conj() @ overlap @ coeff
     metric = 0.5 * (metric + metric.T.conj())
     metric_cholesky = np.linalg.cholesky(metric)
     return solve_triangular(
@@ -384,9 +438,10 @@ def _fixed_semicanonicalize(coeff, fock):
     return np.real(energy), coeff @ rotation
 
 
-def _validate_boys_metric_rank(coeff, overlap, keep, threshold, label):
+def _validate_boys_metric_rank(coeff, overlap, keep, threshold, label, *, metric=None):
     """Reject a changed domain rank at the eager fixed-selection boundary."""
-    metric = coeff.T.conj() @ overlap @ coeff
+    if metric is None:
+        metric = coeff.T.conj() @ overlap @ coeff
     metric = _host_array(jax.lax.stop_gradient(metric))
     if not numpy.isfinite(metric).all():
         raise RuntimeError(f"Boys {label} metric rank is unusable; rebuild domains")
@@ -624,10 +679,17 @@ def build_boys_ed_frame(common, static, fragment_index, *, virtual_anchor_column
     candidate = np.concatenate([common.fragment_occupied_data[int(partner)].iao_coeff for partner in partners], axis=1)
     if candidate.shape[1] != nocc:
         raise ValueError("Boys targets require a complete singleton partition")
-    occupied = _project_to_ao_support(candidate, common.s1e, ao)
+    projected_pao = None
+    if isinstance(fragment.strong_virtual, EDLocalPAOSelection):
+        occupied, projected_pao = _project_ed_columns(
+            common, candidate, fragment.strong_virtual.parent_columns, ao)
+    else:
+        occupied = _project_to_ao_support(candidate, common.s1e, ao)
+    occupied_metric = occupied.T.conj() @ overlap22 @ occupied
     _validate_boys_metric_rank(occupied, overlap22, fragment.strong_occ_metric_keep,
-                               static.thresholds.metric_rank, f"domain {fragment_index} occupied target/partner ED")
-    occupied = _cholesky_metric_orthonormalize(occupied, overlap22)
+                               static.thresholds.metric_rank, f"domain {fragment_index} occupied target/partner ED",
+                               metric=occupied_metric)
+    occupied = _cholesky_metric_orthonormalize(occupied, overlap22, metric=occupied_metric)
     occupied = occupied * _positive_pivot_phases(occupied)
     if virtual_anchor_columns is None:
         virtual_anchor_columns = fragment.virtual_anchor_columns
@@ -635,15 +697,22 @@ def build_boys_ed_frame(common, static, fragment_index, *, virtual_anchor_column
         raise ValueError("select virtual anchors from concrete data before preparing the domain")
     columns = tuple(virtual_anchor_columns)
 
-    def virtual_frame(pao, overlap, occupied):
+    def virtual_frame(pao, overlap, occupied, projected_pao):
         data = SimpleNamespace(pao_coeff=pao, s1e=overlap)
-        virtual = _rebuild_local_virtual_subspace(
-            data, fragment.strong_virtual, ao, occupied,
-            boys_metric_threshold=static.thresholds.metric_rank)
+        if isinstance(fragment.strong_virtual, EDLocalPAOSelection):
+            virtual, _ = _local_ed_pao_space(
+                data, fragment.strong_virtual.parent_columns, ao, occupied,
+                static.thresholds, selection=fragment.strong_virtual,
+                projected=projected_pao)
+        else:
+            virtual = _rebuild_local_virtual_subspace(
+                data, fragment.strong_virtual, ao, occupied,
+                boys_metric_threshold=static.thresholds.metric_rank)
         virtual, _ = _stable_virtual_frame(
             data, fragment, ao, overlap[numpy.ix_(ao, ao)], virtual, columns)
         return virtual * _positive_pivot_phases(virtual)
 
     virtual = response('stc.domain.input_pullback.virtual_frame', virtual_frame,
-                       common.pao_coeff, common.s1e, occupied, group=fragment_index)
+                       common.pao_coeff, common.s1e, occupied, projected_pao,
+                       group=fragment_index)
     return BoysEDFrame(occupied, virtual, ao, atoms, fragment.target_index, columns)

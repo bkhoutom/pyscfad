@@ -245,9 +245,9 @@ def test_scheduler_uneven_owners_and_idle_live_bars(monkeypatch):
     monkeypatch.setattr(_mpi, '_validate_shared_reference', lambda *args, **kwargs: None)
     monkeypatch.setattr(_mpi, '_build_worker', lambda *args: mf)
     original_scope = driver._mp2_df_scope
-    def checked_scope(state, atoms, aux_atoms=None):
+    def checked_scope(state, atoms, aux_atoms=None, *, with_grad=True):
         numpy.testing.assert_array_equal(aux_atoms, atoms+10)
-        return original_scope(state, atoms, aux_atoms)
+        return original_scope(state, atoms, aux_atoms, with_grad=with_grad)
     monkeypatch.setattr(driver, '_mp2_df_scope', checked_scope)
     captured = {}
     root_bars = None

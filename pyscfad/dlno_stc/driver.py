@@ -219,6 +219,14 @@ def _weak_energy_and_grad(state, static, pairs):
     return weak_pair_energy_and_grad(state['mf'], state['common'], static, pairs=pairs)
 
 
+def _weak_energy(state, static, pairs):
+    """Use the same-reference screening result, or rebuild the weak endpoints."""
+    pending = state.get('_prepared_weak_energy')
+    if pending is not None and tuple(pairs) == pending[0]:
+        return pending[1]
+    return weak_pair_energy_sum(state['mf'], state['common'], static, pairs=pairs)
+
+
 def _initialize(mf, static, controls, *, with_grad, scf_pullback=None,
                 scf_data=None, scf_data_pullback=None, prepared_domain=None,
                 correlation_auxbasis=None):
@@ -226,7 +234,7 @@ def _initialize(mf, static, controls, *, with_grad, scf_pullback=None,
     _validate_controls(controls)
     _validate_reference(mf, static, **basis_kwargs(correlation_auxbasis))
     configure_compilation_cache()
-    pending = None
+    pending = pending_energy = None
     with resource_profile.section('stc.domain.common_prepare'):
         if with_grad:
             if scf_data is None:
@@ -245,16 +253,22 @@ def _initialize(mf, static, controls, *, with_grad, scf_pullback=None,
 
             mf_bar, common_bar = _zero_term_cotangents(mf, common)
         else:
-            if scf_data is None:
-                scf_data = getattr(mf, '_stc_scf_data', None)
-            common = rebuild_domain_data(mf, static, scf_data=scf_data)
+            from ._energy_preparation import lookup
+            adopted = lookup(mf, static) if scf_data is None else None
+            if adopted is None:
+                if scf_data is None:
+                    scf_data = getattr(mf, '_stc_scf_data', None)
+                common = rebuild_domain_data(mf, static, scf_data=scf_data)
+            else:
+                common, pending_energy = adopted
             common_pullback = mf_bar = common_bar = None
         jax.block_until_ready(common)
     return {"mf": mf, "correlation_auxbasis": correlation_auxbasis, "static": static,
             "common": common, "common_pullback": common_pullback,
             "scf_pullback": scf_pullback, "mf_bar": mf_bar, "common_bar": common_bar,
             "energy": np.zeros((), dtype=common.s1e.dtype), "variance": 0.0,
-            "weak_pairs": tuple(weak_pair_indices(static)), "_prepared_weak": pending}
+            "weak_pairs": tuple(weak_pair_indices(static)), "_prepared_weak": pending,
+            "_prepared_weak_energy": pending_energy}
 
 
 def _prepare(state, static, group, controls, with_grad, *, return_frame=False):
@@ -436,8 +450,8 @@ def _finish_response(state, energy, mf_bar, *, include_hf):
 
 
 @contextmanager
-def _mp2_df_scope(state, atoms=None, aux_atoms=None):
-    """Retain the metric/tape and, for domains, the configured H cache."""
+def _mp2_df_scope(state, atoms=None, aux_atoms=None, *, with_grad=True):
+    """Retain the metric; default to resident H only for domain pullbacks."""
     from pyscfad.lno import _df_shared
     mf = state['mf']
     if not hasattr(mf, 'mol'):
@@ -450,10 +464,11 @@ def _mp2_df_scope(state, atoms=None, aux_atoms=None):
             yield None
             return
         atoms = numpy.arange(mf.mol.natm, dtype=numpy.int32)
-    with _df_shared.reverse_scope(mf, atoms, aux_atoms=aux_atoms, **basis_kwargs(basis)) as shared:
+    with _df_shared.reverse_scope(mf, atoms, aux_atoms=aux_atoms, with_grad=with_grad,
+                                  **basis_kwargs(basis)) as shared:
         if domain_scope:
             from ._df_inputs import configure_cache
-            configure_cache(shared)
+            configure_cache(shared, default='half' if with_grad else 'direct')
         yield shared
 
 
@@ -496,7 +511,8 @@ def _run_domain(initializer, static, controls, comm, *, with_grad, include_hf=Fa
         with ExitStack() as resources:
             shared = _root_call(comm, rank, lambda: resources.enter_context(
                 _mp2_df_scope(state, static.fragments[fragment_id].extended_atoms,
-                              static.fragments[fragment_id].pao_center_atoms)),
+                              static.fragments[fragment_id].pao_center_atoms,
+                              with_grad=with_grad)),
                 f"group {fragment_id} DF setup")
             with resource_profile.section('stc.domain.prepare'):
                 prepared = _root_call(comm, rank,
@@ -534,8 +550,7 @@ def _run_domain(initializer, static, controls, comm, *, with_grad, include_hf=Fa
                 energy, bars = _weak_energy_and_grad(state, static, pairs)
                 _add_bars(state, *bars)
             else:
-                energy = weak_pair_energy_sum(
-                    state["mf"], state["common"], static, pairs=pairs)
+                energy = _weak_energy(state, static, pairs)
             state["energy"] = state["energy"] + energy
             jax.block_until_ready((state["energy"], state["mf_bar"], state["common_bar"]))
         with resource_profile.section('stc.domain.weak'):
@@ -810,7 +825,7 @@ def _run_system(initializer, controls, comm, *, with_grad, include_hf=False):
     if has_work:
         with ExitStack() as resources:
             shared = _root_call(comm, rank, lambda: resources.enter_context(
-                _mp2_df_scope(state)), "system DF setup")
+                _mp2_df_scope(state, with_grad=with_grad)), "system DF setup")
             with resource_profile.section('stc.system.prepare'):
                 prepared = _root_call(comm, rank, lambda: _prepare_system(state, controls, with_grad),
                                       "system preparation")

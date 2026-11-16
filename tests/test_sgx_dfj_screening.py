@@ -12,7 +12,7 @@ def obj(request):
     mol = gto.M(atom='O 0 0 0; H 0 -.7 .6; H 0 .7 .6; '
                      'O 0 0 14; H 0 -.7 14.6; H 0 .7 14.6',
                 basis='cc-pvdz', cart=request.param, verbose=0)
-    result = _configure(mol, 'weigend', 0, True, 100, 100)
+    result = _configure(mol, 'weigend', 0, True, 100)
     dm = scf.hf.init_guess_by_minao(mol)
     _dfj.get_j(result, dm)
     _dfj._initialize(result, dm, 1e-13)

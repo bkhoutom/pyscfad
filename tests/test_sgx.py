@@ -24,7 +24,7 @@ def mol():
 
 def build(mol, **kw):
     mf = sgx_fit(scf.RHF(mol), auxbasis='weigend', grid_level=0,
-                 max_memory=100, **kw)
+                 df_memory_mb=100, **kw)
     mf.conv_tol, mf.conv_tol_grad, mf.chkfile = 1e-12, 1e-9, None
     return mf
 
@@ -119,7 +119,7 @@ def test_scf_gradient_and_nonstationary_response(mol, monkeypatch, implicit):
     monkeypatch.setattr(scf.hf, 'gen_gmres', partial(
         linear_solver.gen_gmres_with_default_kwargs, tol=1e-11))
     native = sgx_fit(pscf.RHF(mol.to_pyscf()), auxbasis='weigend', grid_level=0,
-                     max_memory=100)
+                     df_memory_mb=100)
     native.conv_tol, native.conv_tol_grad = 1e-12, 1e-9
     native.kernel()
     native_grad = native.nuc_grad_method().kernel()
@@ -142,6 +142,25 @@ def test_scf_gradient_and_nonstationary_response(mol, monkeypatch, implicit):
         h = 1e-4
         fd = (objective(moved(mol, h), .03)-objective(moved(mol, -h), .03))/(2*h)
         np.testing.assert_allclose(response.coords[1, 2], fd, atol=5e-7)
+
+
+@pytest.mark.parametrize('native', [False, True])
+def test_default_screening_reaches_native_plan(mol, native):
+    from pyscfad.sgx import _native
+    dll = _native.library()
+    if dll is None or dll.SGX_generated_version() < 4:
+        pytest.skip('Per-pair generated SGX required')
+    ref = pscf.RHF(mol.to_pyscf()) if native else scf.RHF(mol)
+    mf = sgx_fit(ref, auxbasis='weigend', grid_level=0, df_memory_mb=100)
+    if native:
+        mf.build()
+    mf.get_jk(dm=np.eye(mol.nao))
+    obj = mf.with_df if native else mf._sgx_backend.native(mol, mf.direct_scf_tol)
+    accuracy = _native.get_plan(obj._pjs_data).accuracy
+    assert accuracy['screening_mode'] == 'per_pair'
+    assert accuracy['screening'] and not accuracy['mixed']
+    assert accuracy['energy_tol'] == 1e-10
+    assert accuracy['potential_tol'] == 1e-8
 
 
 def test_correlation_df_preserved_and_unsupported_modes_rejected(mol):
@@ -208,7 +227,7 @@ def test_direct_bilinear_kernels_match_native_gradients(cart, fit):
     rng = np.random.default_rng(107)
     dm, bar = impl._sym(rng.normal(size=(2, m.nao, m.nao)))
     mf = sgx_fit(scf.RHF(m), auxbasis='weigend', grid_level=0,
-                 fit_ovlp=fit, max_memory=32)
+                 fit_ovlp=fit, df_memory_mb=32)
     actual_jk = mf.get_jk(dm=dm)
     obj = mf._sgx_backend.native(m, mf.direct_scf_tol)
     native = native_sgx.SGX(m.to_pyscf(), auxbasis='weigend')

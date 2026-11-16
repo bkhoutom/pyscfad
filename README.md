@@ -10,22 +10,23 @@ PySCF with Auto-differentiation
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.6960749.svg)](https://doi.org/10.5281/zenodo.6960749)
 
 * [Documentation](https://fishjojo.github.io/pyscfad/index.html)
-* [Smooth DLNO-CCSD(T): modes, defaults, theory, and force examples](README_SMOOTH_CCSD_T.md)
+* [Domain MP2 and DLNO-CCSD/CCSD(T): energies, forces and usage](pyscfad/dlno_stc/README.md)
 
 DLNO-STC branch
 --------------
 
-This checkout includes D/W-selected LIS CCSD(T) with deterministic reference
-forces and native asymmetric stochastic triples. Multiple physical fragments
-and truncated LISs use anchored occupied/virtual frames with full Fock response.
-See the [branch README](README_SMOOTH_CCSD_T.md) for supported modes and defaults,
-32-thread examples, the 0.05 mEh triples SE target, and force-error reporting.
-Library defaults and run-script overrides are listed separately.
-See [serial DF/SCF optimization guidance](README_SERIAL_DF_SCF.md) for shared
-buffers, streamed pullbacks, response caches and workstation settings.
+This checkout provides domain MP2 and DLNO-CCSD/CCSD(T) energies and forces.
+Standalone MP2 computes scalar energies without W; CC uses one W calculation
+per physical fragment with smooth LIS frames. Solvers default to deterministic,
+with stochastic solvers available explicitly.
+
+Start with the [DLNO-STC user guide](pyscfad/dlno_stc/README.md) for the pipeline,
+controls and examples. See [smooth LIS and triples theory](doc/source/user_guide/smooth_lis_triples.md)
+for derivations and [SCF/DF performance notes](README_SERIAL_DF_SCF.md) for
+shared buffers, streamed pullbacks and response caches.
 
 For this implementation, install the current checkout (`pip install -e .`) and
-follow the [native STC build instructions](pyscfad/dlno_stc/README.md#build-and-checks).
+follow the [native STC build instructions](pyscfad/dlno_stc/README.md#build-and-verification).
 The release and upstream installation commands below install upstream PySCFAD.
 
 Installation

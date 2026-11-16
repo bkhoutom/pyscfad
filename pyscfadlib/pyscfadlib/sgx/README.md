@@ -8,7 +8,9 @@ shells, used by the complete geometry-response driver. Higher angular momentum
 and modified Coulomb operators use libcint in `integral_backend='auto'` mode.
 Version 3 adds optional density-dependent tile screening and mixed precision.
 Version 4 adds independent per-pair screening with size-independent nominal cutoffs.
-The original static-screened FP64 path remains the default accuracy reference.
+Per-pair screening with FP64 arithmetic is the default and requires library
+version 4 or later. Set `screening='static'` for the strict FP64 reference
+or the libcint backend.
 
 The public precision switch is `mixed_precision`:
 
@@ -97,10 +99,16 @@ mf_fp64 = sgx_fit(mf, mixed_precision=False, **settings)
 mf_mixed = sgx_fit(mf, mixed_precision=True, **settings)
 ```
 
-`generated` requires the new library and supported integrals. The default `auto`
-falls back to libcint when the library is unavailable, the operator/basis is
+Pass the driver's DF workspace budget as `sgx_fit(mf, df_memory_mb=...)`
+(default 4000 MB). SGX has no separate public `max_memory` option.
+The total process-memory allowance still comes from `mol.max_memory`.
+
+`generated` requires the new library and supported integrals. With static FP64
+screening, `auto` falls back to libcint when the library is unavailable, the operator/basis is
 unsupported, or the primitive-pair metadata exceeds its memory allowance.
-`libcint` explicitly selects the reference engine. The density-independent
+`libcint` explicitly selects the reference engine and requires
+`screening='static', mixed_precision=False`. The default per-pair screening
+requires generated kernels; it cannot fall back to libcint. The density-independent
 shell-pair screen, grids, overlap correction and exchange operator are shared.
 An older version 1 library still accelerates values and retains libcint for
 integral derivatives.
@@ -108,7 +116,10 @@ integral derivatives.
 ### Adaptive screening and mixed precision
 
 For `screening='adaptive'`, the `auto` energy budget is the SCF integral tolerance (normally 1e-13), and
-the `auto` potential budget is its square root (approximately 3.16e-7). These
+the `auto` potential budget is the square root of the resolved energy budget
+(approximately 3.16e-7 by default). An explicit energy budget also changes
+automatic potential resolution: `energy_tol=1e-10, potential_tol='auto'`
+gives a potential budget of `1e-5` in adaptive mode. These
 match the installed PySCF automatic screening tolerance values. Before this
 adaptive implementation, PySCFAD explicitly disabled density-dependent energy
 and potential screening; these were not active cutoffs in its reference path.
@@ -126,6 +137,10 @@ the nominal cutoffs remain fixed as the system grows. Scaling by
 batches and is our convention, not Q-Chem's exact algorithm. Integral
 estimates and the AO norm used by the local Q-Chem checkout also differ.
 Equal parameters do not establish equal decisions or molecular accuracy.
+
+With `screening='static', mixed_precision=False`, energy/potential budgets
+are unused. Static mixed precision resolves automatic budgets as in adaptive
+mode for FP32 classification, with density-dependent skipping disabled.
 
 For each shell and 128-point tile it computes the weighted L2 norm of the
 Cartesian F entries. For multiple densities/adjoints it takes the maximum

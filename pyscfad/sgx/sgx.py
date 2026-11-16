@@ -24,12 +24,12 @@ from pyscf.sgx.grad import rhf as sgx_grad
 from . import _dfj, _sgx_grad
 
 
-def _configure(mol, auxbasis, grid_level, fit_ovlp, max_memory, workspace,
+def _configure(mol, auxbasis, grid_level, fit_ovlp, df_memory_mb,
                integral_backend='auto', accuracy=None):
     if not hasattr(sgx_grad, 'get_k_grad_only'):
         raise ImportError('DF-J/SGX-K requires PySCF with optimized SGX gradients (2.14+)')
     obj = _sgx_grad.SGX(mol, auxbasis=copy.deepcopy(auxbasis))
-    obj._response_workspace_bytes = int(workspace * 1e6)
+    obj._response_workspace_bytes = int(df_memory_mb * 1e6)
     obj._response_total_memory_mb = float(mol.max_memory)
     obj._integral_backend = integral_backend
     obj._sgx_accuracy = copy.deepcopy(accuracy)
@@ -42,12 +42,13 @@ def _configure(mol, auxbasis, grid_level, fit_ovlp, max_memory, workspace,
     # implemented in our generated driver, including the bilinear response;
     # upstream PySCF's forward-only screening must remain disabled here.
     obj.sgx_tol_energy = obj.sgx_tol_potential = None
-    obj.max_memory = max_memory
+    # Adapt the DF workspace to PySCF's RSS-subtracting memory interface.
+    obj.max_memory = lib.current_memory()[0] + df_memory_mb
     return obj
 
 
 def sgx_fit(mf, auxbasis=None, *, grid_level=2, fit_ovlp=True,
-            max_memory=None, integral_backend='auto', screening='static',
+            df_memory_mb=4000, integral_backend='auto', screening='per_pair',
             mixed_precision=False, energy_tol='auto', potential_tol='auto',
             fp32_multiplier=1e5):
     """Return RHF using integral-direct DF-J and optimized symmetric SGX-K.
@@ -63,9 +64,10 @@ def sgx_fit(mf, auxbasis=None, *, grid_level=2, fit_ovlp=True,
     FP32 work to FP64 when the derivative crossover predicts faster execution.
     There is no all-FP32 mode. Screening is independent of precision: use
     ``screening='per_pair'`` in both modes to compare at the same skip cutoffs.
-    The default remains static screening with FP64 only.
+    The default is per-pair screening with FP64 only.
 
-    ``max_memory`` is the J/K working-memory allowance in MB (default 4000).
+    ``df_memory_mb`` is the shared DF/J/K working-memory allowance in MB
+    (default 4000). Pass the driver's DF budget; SGX has no separate budget.
     No global three-index tensor or AO-pair derivative panel is built.
     Grid panels grow with the thread count and AO dimension, targeting four
     native grid jobs per thread within the workspace and current memory
@@ -76,8 +78,9 @@ def sgx_fit(mf, auxbasis=None, *, grid_level=2, fit_ovlp=True,
     Metric derivative tiles remain bounded at 32 MiB.
 
     ``integral_backend='auto'`` uses portable generated FP64 s--g value and
-    first-derivative kernels when libsgx_ad is installed, falling back to
-    libcint otherwise. Version 1 libraries accelerate values only.
+    first-derivative kernels when libsgx_ad is installed. With static FP64
+    screening it can fall back to libcint; per-pair screening requires the
+    generated backend. Version 1 libraries accelerate values only.
     ``'generated'`` requires those kernels; ``'libcint'`` selects the reference
     engine. Version 2 combines values and integral derivatives in one native
     call. Both engines use the same density-independent shell-pair screen,
@@ -86,16 +89,18 @@ def sgx_fit(mf, auxbasis=None, *, grid_level=2, fit_ovlp=True,
     ``screening='adaptive'`` uses cumulative density-dependent screening budgets
     for shell-pair/grid tiles. ``mixed_precision=True`` evaluates small contributions
     and accumulates their G/dG buffers in FP32 before merging into FP64. Both
-    options require version 3 of the generated library. The default retains
-    the original static-screened FP64 reference. ``energy_tol='auto'`` uses
-    ``direct_scf_tol`` (normally 1e-13); ``potential_tol='auto'`` uses its square
-    root. Estimated screening budgets are distributed over the grid and spent
+    options require version 3 of the generated library. In adaptive mode,
+    ``energy_tol='auto'`` uses ``direct_scf_tol`` (normally 1e-13);
+    ``potential_tol='auto'`` uses the square
+    root of the resolved energy tolerance, including an explicit energy value.
+    Estimated screening budgets are distributed over the grid and spent
     across pairs. ``fp32_multiplier`` multiplies each tile's budgets to select
     FP32 work. These settings do not certify a molecular force error: validate
     against the strict reference for the intended system and property.
 
     ``screening='per_pair'`` (library version 4) instead tests each shell pair
-    independently. Its auto tolerances are energy=1e-10 and potential=1e-8.
+    independently and is the default. Its auto tolerances are energy=1e-10
+    and potential=1e-8. Use static screening for the libcint reference path.
     Each is multiplied by the whole grid's mean absolute weight and by
     tile_points/1024, with no total-grid-size divisor. Keep these nominal
     tolerances fixed across system sizes; accumulated errors still require
@@ -132,9 +137,9 @@ def sgx_fit(mf, auxbasis=None, *, grid_level=2, fit_ovlp=True,
         raise NotImplementedError('DF-J/SGX-K supports real closed-shell RHF only')
     if isinstance(grid_level, bool) or not isinstance(grid_level, int) or not 0 <= grid_level <= 7:
         raise ValueError('SGX grid_level must be an integer from 0 to 7')
-    memory = 4000. if max_memory is None else float(max_memory)
-    if not math.isfinite(memory) or memory <= 0:
-        raise ValueError('SGX max_memory must be finite and positive')
+    df_memory_mb = float(df_memory_mb)
+    if not math.isfinite(df_memory_mb) or df_memory_mb <= 0:
+        raise ValueError('SGX df_memory_mb must be finite and positive')
     if not isinstance(fit_ovlp, bool):
         raise TypeError('fit_ovlp must be a bool')
     if integral_backend not in ('auto', 'generated', 'libcint'):
@@ -161,14 +166,14 @@ def sgx_fit(mf, auxbasis=None, *, grid_level=2, fit_ovlp=True,
         mf = mf.copy()
         if getattr(mf, 'with_df', None) is None:
             mf = mf.density_fit(auxbasis=auxbasis)
-        mf._sgx_backend = _Backend(auxbasis, grid_level, fit_ovlp, memory, integral_backend, accuracy)
+        mf._sgx_backend = _Backend(auxbasis, grid_level, fit_ovlp, df_memory_mb, integral_backend, accuracy)
         mf._eri = None
         mf.direct_scf = False
         from . import _shared
         _shared.register_producer(mf)
         return mf
     obj = _configure(mf.mol, auxbasis, grid_level, fit_ovlp,
-                     lib.current_memory()[0] + memory, memory, integral_backend, accuracy)
+                     df_memory_mb, integral_backend, accuracy)
     result = native_sgx.sgx_fit(mf, with_df=obj, pjs=True)
     result.direct_scf = False
     return result
@@ -193,9 +198,10 @@ def _sym(x):
 
 class _Backend:
     """One geometry cache per SCF, shared by its pytree copies and response."""
-    def __init__(self, auxbasis, grid_level, fit_ovlp, memory, integral_backend='auto', accuracy=None):
+    def __init__(self, auxbasis, grid_level, fit_ovlp, df_memory_mb, integral_backend='auto', accuracy=None):
         self.auxbasis = copy.deepcopy(auxbasis)
-        self.grid_level, self.fit_ovlp, self.memory = grid_level, fit_ovlp, memory
+        self.grid_level, self.fit_ovlp = grid_level, fit_ovlp
+        self.df_memory_mb = df_memory_mb
         self.integral_backend = integral_backend
         self.accuracy = copy.deepcopy(accuracy)
         self._key = self._native = None
@@ -211,14 +217,14 @@ class _Backend:
         # change the molecule while retaining this backend. The nuclear
         # attraction atom selector is scratch, irrelevant to J/K integrals.
         key = (*_source_key(mol), tol)
-        budget = lib.current_memory()[0] + self.memory
+        budget = lib.current_memory()[0] + self.df_memory_mb
         if key != self._key:
             self._primal_cache.clear()
             self.primal_cache_stats['retained_bytes'] = 0
             native = mol.to_pyscf().copy()
             native.set_geom_(coords, unit='Bohr')
             obj = _configure(native, self.auxbasis, self.grid_level,
-                             self.fit_ovlp, budget, self.memory, self.integral_backend, self.accuracy)
+                             self.fit_ovlp, self.df_memory_mb, self.integral_backend, self.accuracy)
             obj.build()
             obj._build_pjs(tol)
             self._native, self._key = obj, key
@@ -264,7 +270,7 @@ class _Backend:
         available = _sgx_grad._system_available_bytes()
         if available is not None:
             headroom = min(headroom, available)
-        cap = min(.05*self.memory*1e6, .05*headroom)
+        cap = min(.05*self.df_memory_mb*1e6, .05*headroom)
         self._primal_cache = [e for e in self._primal_cache if e is not entry]
         self._primal_cache.append(entry)
         size = lambda e: sum(x.nbytes for x in e.values() if x is not None)

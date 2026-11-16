@@ -1,4 +1,76 @@
-# Water-16 domain MP2/LNO-CCSD with stochastic (T) gradients
+# Water-cluster DLNO-CCSD(T) force example
+
+This guide describes the water runner and launcher overrides. Use the
+[DLNO-STC user guide](../../pyscfad/dlno_stc/README.md) for library defaults,
+the MP2 versus CC pipelines, quadratures, and integral storage choices.
+
+## Bulk water16 from the completed SGX benchmark
+
+The completed November 10 SGX energy-and-force run is recorded in the local
+`results/water16_water24_sgx_dlno_ccsdt_frozen64_recovery_20261110/` archive:
+`recovery_report.md` and `water16/attempt_1/settings.json`. These archived
+outputs are excluded from this repository.
+It used cc-pVTZ, 16 frozen oxygen cores, 16 atom-grouped Boys fragments,
+LIS cutoffs `1e-4`/`3e-5` Eh, and **`pair_energy=1.5e-5` Eh**.
+The saved result was `-1221.4137050689542` Eh with a `(T)` SE of
+`0.099105` mEh, finite forces and 16/16 converged local responses. Its
+2541.76 s wall time and 45.22 GiB peak RSS describe that historical run only.
+
+The new [launcher](run_water_16_bulk_sgx.sh) uses the exact archived geometry
+in [water_16_bulk.xyz](water_16_bulk.xyz), whose SHA256 is
+`6696d451e230da0b4cdeed720ab0944a7ec2081011886420291f3bb989e3926f`.
+This bulk-carved cluster differs from the minimized `water_16.xyz` below.
+The [domain input](water_16_bulk_thresholds.json) preserves every recorded
+domain threshold except the requested change to `pair_energy=5e-6` Eh:
+
+| Domain parameter | Archived run | New example | Current library default |
+| --- | --- | --- | --- |
+| `pair_energy` (Eh) | `1.5e-5` | `5e-6` | `5e-6` |
+| `pao_norm` | `1e-4` | `1e-4` | `1e-2` |
+| `bp_occ`, `bp_primary`, `bp_ed` | `0.985`, `0.999`, `0.9998` | Same | Same |
+| `bp_pao`, `domain_pao`, `ed_pao` | `0.98`, `1e-4`, `0.995` | Same | Same |
+| `metric_rank`, `near_pair_distance`, `multipole_order` | `1e-10`, `3.5` bohr, `4` | Same | Same |
+
+The current `ed_pao_rank=1e-6` is also explicit in the input; the old run
+predates that independent option. The public CC builder has **no implicit
+occupied/virtual LIS cutoffs**: both arguments are required. The general
+water runner defaults to `1e-4`/`1e-5` Eh; this launcher explicitly sets
+`1e-4`/`3e-5` Eh.
+
+From the repository root, with PySCFAD and its STC, generated SGX and optional
+C++ CCSD extensions built in the selected Python environment:
+
+```bash
+PYTHON_BIN=.venv/bin/python THREADS=32 \
+  examples/dlno_stc/run_water_16_bulk_sgx.sh \
+  --output-dir output/water_16_bulk_deterministic
+```
+
+This runs cold and warm SCF followed by the full CCSD(T) energy and analytic
+forces. The launcher explicitly selects deterministic W, CCSD and (T), with
+**three fitted Laplace points per LIS for (T)**. The archived run used
+stochastic (T); its sampling controls are not part of this example.
+
+The command uses generated mixed-precision SGX, per-pair screening,
+grid level 2, overlap fitting, `1e-10`/`1e-8` energy/potential tolerances,
+resident half-transformed correlation integrals, and the packed CC virtual
+ladder (`vvvv_direct=False`). The C++ ladder is preferred when its extension
+and sufficient memory are available. SCF does not build global DF factors.
+See the [SGX settings and build guide](../../pyscfadlib/pyscfadlib/sgx/README.md#build-and-use)
+for backend, screening and precision options. Ordinary Boys remains selected.
+Numerical settings are saved in `settings.json`; energy, forces and fragment
+diagnostics go to `deterministic.json`.
+
+`MAX_MEMORY_MB=900000` and `DF_MEMORY_MB=500000` preserve the old workspace
+budgets; set these environment variables for your machine. They are not
+predictions or hard limits on process memory. The launcher uses the current
+pipeline and separate fitted grids: six global MP2 points and three (T) points
+per LIS, replacing the old ten-point smooth-triples setting. Changed code,
+pair screening and quadratures mean the historical energy is not a regression
+target for these new commands. This example has been checked for input/CLI
+consistency; the updated full water16 calculation has not been rerun.
+
+## Minimized water-cluster runner
 
 The geometry in `water_16.xyz` is a copy of the existing
 `stc_qc_paper/run/xyz/water/water16_min.xyz` geometry (Angstrom). Its XYZ
@@ -105,7 +177,7 @@ comparison rather than the current automatic workspace policy.
 The STC extension is required in the selected environment; ordinary PySCFAD
 imports alone do not establish that it is installed. Build it for this branch
 and Python environment with the CMake instructions in
-[`pyscfad/dlno_stc/README.md`](../../pyscfad/dlno_stc/README.md#build-and-checks).
+[`pyscfad/dlno_stc/README.md`](../../pyscfad/dlno_stc/README.md#build-and-verification).
 This requires pybind11, Armadillo, and OpenMP. Rebuild after native source changes.
 
 Use a PySCF installation with OpenMP enabled to parallelize integral construction
@@ -116,30 +188,28 @@ The current branch also supports resident half-transformed DF inputs. Set
 `PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE=half` to enable them for this example;
 the core driver defaults to `half`, while these launchers retain the measured
 lower-memory `direct` policy. Both modes share the local integral adjoints.
-Resident inputs consume additional memory and are admitted under the process
-allowance; the core README documents their sizes and optional cap.
+Resident inputs consume additional memory; the main guide explains their
+lifetime and the advisory process-memory policy.
 
-The upstream domain-only LIS update uses selection schema 10. Start fresh
-output directories after this update: the older schema-9 water runs and their
-timing/energy comparisons describe the previous implementation. The component
-benchmarks above are historical measurements, not a full benchmark of the merged
-schema-10 method.
+The component timings above are historical measurements. Checkpoint
+compatibility is checked against the current selections, settings and code;
+see the [checkpoint guidance](../../pyscfad/dlno_stc/README.md#mpi-and-checkpoints).
 
-The defaults are:
+The runner's defaults and explicit overrides are:
 
-- Restricted DF-HF, cc-pVTZ, 16 frozen occupied oxygen core orbitals.
-- Boys localized occupied orbitals, atom-grouped fragments and finite domains,
-  with the branch's standard domain thresholds and pair cutoff 1.5e-5 Eh.
-- Deterministic domain MP2 and deterministic W matrix, W-selected LNO-CCSD
-  (occupied and virtual W cutoffs 1e-4 and 1e-5), including weak-pair MP2.
-- Smooth stochastic (T) with 20,000 pilot samples, seed 71, and a target
-  molecular triples energy standard error of 0.1 mEh, allocated by occupied
-  fragment count. The target concerns stochastic energy uncertainty; it does
-  not bound gradient uncertainty or errors from domains, LNOs or quadratures.
-- The branch's fixed six-point MP2 Laplace grid and four-point smooth triples
-  grid. The discrete domain and LNO selections and quadrature are held fixed
-  during nuclear response. Test convergence with tighter settings or independent
-  seeds as appropriate for the intended accuracy.
+- Restricted DF-HF, cc-pVTZ, one frozen oxygen core orbital per water.
+- Boys atom-grouped fragments and finite domains, with `pair_energy=5e-6` Eh.
+- Deterministic W, supplying the strong-domain MP2 baseline and selecting the
+  smooth CCSD LIS; occupied/virtual W cutoffs are `1e-4`/`1e-5`. Weak-pair MP2
+  completes the baseline. This CC calculation does not run a separate scalar
+  strong-domain MP2 solver.
+- Explicit stochastic (T), with 20000 pilot samples, seed 71, and total triples
+  energy SE target `0.1` mEh, allocated by original occupied target counts.
+  This runner override is separate from the deterministic library default.
+- One automatically fitted global six-point MP2/W grid and a separate fitted
+  four-point (T) grid for each nonempty LIS. Each grid is fixed during its
+  associated response. The energy SE excludes quadrature, domain, LNO and
+  force errors.
 
 The total energy, gradient in Eh/bohr, fragment components, sampling diagnostics
 and settings are written to `result.json` in the output directory. Forces are

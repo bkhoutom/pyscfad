@@ -161,7 +161,7 @@ def test_adaptive_force_and_signed_response(mixed, mode):
     mol = gto.M(atom='O 0 0 0; H 0 -.7 .5; H 0 .7 .5; '
                     'O 0 0 4; H 0 -.7 4.5; H 0 .7 4.5',
                 basis='cc-pvdz', verbose=0, max_memory=2000)
-    mf = sgx_fit(scf.RHF(mol), grid_level=0, max_memory=500, integral_backend='generated')
+    mf = sgx_fit(scf.RHF(mol), grid_level=0, df_memory_mb=500, integral_backend='generated')
     mf.build()
     obj = mf.with_df
     dm = scf.RHF(mol).get_init_guess()
@@ -226,7 +226,7 @@ def test_adaptive_scf_implicit_response(monkeypatch, mode, multiplier, gradient_
     def objective(m, adaptive):
         # Forward and response use the same public precision setting.
         mf = sgx_fit(adscf.RHF(m), auxbasis='weigend', grid_level=0,
-                     max_memory=100, integral_backend='generated',
+                     df_memory_mb=100, integral_backend='generated',
                      screening=mode if adaptive else 'static',
                      mixed_precision=adaptive and mixed,
                      fp32_multiplier=multiplier)
@@ -279,7 +279,7 @@ def test_response_follows_precision_setting_and_restores_screening(mixed, monkey
     mol = gto.M(atom='He 0 0 0; He 0 0 3', basis='cc-pvdz', verbose=0)
     # Force FP32 classification to prove response honors the public flag,
     # while the equally generous skipping thresholds must never drop tiles.
-    settings = dict(grid_level=0, max_memory=500, integral_backend='generated',
+    settings = dict(grid_level=0, df_memory_mb=500, integral_backend='generated',
                     screening='per_pair', energy_tol=1e5, potential_tol=1e5,
                     fp32_multiplier=1e5)
     mf = sgx_fit(scf.RHF(mol), mixed_precision=mixed, **settings)

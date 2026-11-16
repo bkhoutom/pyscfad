@@ -109,8 +109,8 @@ def test_fused_contraction(all_shells, cart):
 def test_full_k_and_linear_operator(dll, cart):
     mol = gto.M(atom='O 0 0 0; H 0 -.7 .5; H 0 .7 .5', basis='cc-pvdz',
                 cart=cart, verbose=0, max_memory=2000)
-    mf = sgx_fit(scf.RHF(mol), grid_level=0, max_memory=500,
-                 integral_backend='generated')
+    mf = sgx_fit(scf.RHF(mol), grid_level=0, df_memory_mb=500,
+                 integral_backend='generated', screening='static')
     mf.build()
     rng = np.random.default_rng(71)
     dm = rng.normal(size=(2, mol.nao, mol.nao))
@@ -252,7 +252,8 @@ def test_geometry_uses_generated_derivatives(dll, monkeypatch):
         pytest.skip('libsgx_ad version 2 required')
     mol = gto.M(atom='O 0 0 0; H 0 -.7 .5; H 0 .7 .5', basis='cc-pvdz',
                 verbose=0, max_memory=2000)
-    mf = sgx_fit(scf.RHF(mol), grid_level=0, max_memory=500, integral_backend='generated')
+    mf = sgx_fit(scf.RHF(mol), grid_level=0, df_memory_mb=500,
+                 integral_backend='generated', screening='static')
     mf.build()
     obj = mf.with_df
     obj._build_pjs(1e-13)

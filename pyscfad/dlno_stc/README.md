@@ -1,5 +1,9 @@
 # Domain MP2 and DLNO-CCSD/CCSD(T)
 
+This is the user guide for `pyscfad.dlno_stc`. It covers the four supported
+workflows and their shared domain construction. For the mathematical details,
+see [smooth LIS frames and Laplace triples](../../doc/source/user_guide/smooth_lis_triples.md).
+
 The library supports four workflows:
 
 | Calculation | Forward energy | Energy and nuclear gradient |
@@ -12,7 +16,7 @@ energy calls for total molecular results. MP2 `kernel` returns correlation
 energy; add `mf.e_tot` for total energy. Forward calls do not create response
 tapes. Use `ccsd_t=True` to include triples.
 
-W selection and smooth anchored LIS frames are the only supported choices.
+For CC, W selection and smooth anchored LIS frames are the only supported choices.
 Every solver mode defaults to deterministic. Stochastic MP2, W, CCSD and
 triples remain available explicitly.
 
@@ -43,27 +47,59 @@ physical fragment retains its own target projector and CC correction.
 
 ## Calculation interface
 
-```python
-controls = {"mode": "deterministic", "threads": 1}
-mp2_energy = dlno_stc.kernel(mf, domains, controls=controls)
-mp2_energy, mp2_gradient = dlno_stc.value_and_grad(
-    mol, build_mf, domains, controls=controls, include_hf=True,
-)
+This small deterministic example runs all four workflows. `build_static`
+callbacks let force calculations share the differentiated SCF with screening
+and selection. `build_mf` can run cold SCF or use a caller-supplied warm density.
+It must return a converged restricted density-fitted reference.
 
-selected = ccsd.build_static_selections(
-    mf, domains, thresh_occ=1e-4, thresh_vir=1e-5,
-    baseline_controls=controls, matrix_controls=controls,
-)
+```python
+from pyscfad import gto, scf, dlno_stc
+from pyscfad.dlno_stc import ccsd
+
+mol = gto.Mole(atom="H 0 0 0; H 0 0 0.8; H 0 0 2.2; H 0 0 3.0",
+               basis="sto-3g", verbose=0)
+mol.build(trace_exp=False, trace_ctr_coeff=False)
+
+def build_mf(current):
+    mf = scf.RHF(current).density_fit()
+    mf.conv_tol = 1e-11
+    mf.chkfile = None
+    mf.kernel()  # mf.kernel(dm0=...) can supply a warm starting density.
+    if not mf.converged:
+        raise RuntimeError("SCF did not converge")
+    return mf
+
+def select_domains(mf):
+    return dlno_stc.build_domain_selections(
+        mf, frozen=0, boys_grouping="singleton", full_domain=True)
+
+controls = {"mode": "deterministic", "threads": 1}
+
+def select_cc(mf):
+    return ccsd.build_static_selections(
+        mf, select_domains(mf), thresh_occ=1e-4, thresh_vir=1e-5,
+        baseline_controls=controls, matrix_controls=controls)
+
+mf = build_mf(mol)
+mp2_corr = dlno_stc.kernel(mf, select_domains(mf), controls=controls)
+mp2_total = mf.e_tot + mp2_corr
+mp2_total_grad, mp2_bar = dlno_stc.value_and_grad(
+    mol, build_mf, build_static=select_domains, controls=controls, include_hf=True)
+
 options = dict(baseline_controls=controls, matrix_controls=controls,
                ccsd_t=True, include_hf=True)
-cc_energy = ccsd.kernel(mf, selected, **options)
-cc_energy, cc_gradient = ccsd.value_and_grad(mol, build_mf, selected, **options)
+cc_total = ccsd.kernel(mf, select_cc(mf), **options)
+cc_total_grad, cc_bar = ccsd.value_and_grad(
+    mol, build_mf, build_static=select_cc, **options)
+mp2_forces, cc_forces = -mp2_bar.coords, -cc_bar.coords
 ```
 
-`build_mf(mol)` must return a converged restricted density-fitted reference.
-For gradients, `build_static(mf)` can replace explicit selections so selection
-and production share the differentiated SCF. The MP2 entry points also accept
-`scope="system", frozen=...` directly to select the molecular fragment.
+Set `ccsd_t=False` for CCSD. Energy is in Eh; coordinate gradients and forces
+are in Eh/bohr. Use `value_and_grad` for derivatives; the forward-only `kernel`
+interfaces are not outer JAX differentiation targets. Alternatively, pass
+explicit `domains` or a CC plan as `static` instead of `build_static`.
+The MP2 entry points also accept `scope="system", frozen=...` with no `static`
+to select one molecular fragment.
 
 CC always includes every physical fragment and the complete domain MP2
 baseline, including weak-pair completion:
@@ -90,6 +126,184 @@ ranks, anchors and the independent (T) grid, held fixed in that fragment's
 energy and pullback. `correlation_auxbasis`
 selects a separate correlation fitting basis; selection and execution must
 use the same basis. HF/Fock continue using the SCF fit.
+
+## Driver options
+
+### SGX settings
+
+Use `pyscfad.sgx.sgx_fit(mf, ...)` for integral-direct DF-J and SGX exchange
+in SCF and its force response. The correlation DF object remains separate.
+Apply the same SGX settings to cold and warm SCF. The
+[SGX README](../../pyscfadlib/pyscfadlib/sgx/README.md#build-and-use)
+covers native builds, backend selection, screening, mixed precision and
+geometry response.
+
+| Setting | Library default | Meaning |
+| --- | --- | --- |
+| `integral_backend` | `"auto"` | Prefer generated kernels when supported, with libcint fallback. `"generated"` requires the native kernels; `"libcint"` selects the reference engine. |
+| `grid_level` | `2` | Numerical integration grid level (0–7); higher levels use denser grids. |
+| `fit_ovlp` | `True` | Apply the overlap-fitting correction to reduce grid-integration error. |
+| `screening` | `"per_pair"` | Static density-independent screening; `"adaptive"` distributes cumulative density-dependent budgets over tiles; `"per_pair"` tests each pair independently. |
+| `mixed_precision` | `False` | FP64 throughout; `True` selects FP32/FP64 for forward, density-response and geometry kernels. |
+| `energy_tol` | `"auto"` | Threshold for estimated exchange-energy contributions in density-dependent screening and FP32 classification. |
+| `potential_tol` | `"auto"` | Threshold for estimated exchange-potential contributions; both energy and potential tests must pass to skip a contribution. |
+| `fp32_multiplier` | `1e5` | Multiply the classification thresholds to select FP32 work. Larger values allow more FP32 work without changing which contributions are skipped. |
+| `df_memory_mb` | `4000` MB | DF/J/K workspace budget, shared with the driver's DF setting; there is no separate SGX `max_memory` option. |
+| `mf.direct_scf_tol` | `1e-13` | DF-J integral-screening threshold, set on the SCF object rather than passed to `sgx_fit`. Also sets the base SGX integral tolerance. |
+
+**DF-J screening** is enabled independently of the SGX-K `screening` mode.
+Set `mf.direct_scf_tol` on both cold and warm SCF objects before running SCF.
+Forward J uses Schwarz shell bounds and density-dependent tests in both DF
+passes. Density response uses a fixed Schwarz mask, with density-dependent
+tests disabled so tiny or signed response vectors preserve linearity. Force
+integrals use separate AO-derivative and auxiliary-derivative Schwarz bounds;
+metric derivatives are evaluated in memory-bounded tiles. See the
+[DF-J implementation](../sgx/_dfj.py).
+
+`direct_scf_tol` is not the same threshold as SGX `energy_tol`: DF-J screens
+integral bounds (and density-weighted bounds in the forward passes), while
+SGX screens density- and grid-weighted estimates of exchange contributions.
+The inspected local Q-Chem implementation also keeps them separate: RI-J uses
+`10**(-THRESH)`, with ordinary SCF default `THRESH=SCF_CONVERGENCE+4` and
+CC/EOM default `THRESH=14`. Thus SCF convergence exponent 9 gives `1e-13`,
+while SNK independently defaults to energy/potential cutoffs `1e-10`/`1e-8`.
+This supports `1e-13` as a conservative DF-J default for tight SCF/forces;
+it does not establish that a looser cutoff would preserve a particular
+energy or force accuracy. Q-Chem source locations are
+`libgen/rem_setup.C` (integral defaults),
+`libgscf/libgscf/qchem/fock/setup_fock_builder.C` (RI-J threshold), and
+`libgscf/gen_scfman/get_scf_params.C` (SNK defaults).
+
+The default `per_pair` screening requires generated SGX kernels (library
+version 4 or later). Use `screening="static"` for the libcint reference path.
+
+`"auto"` resolves according to the screening mode:
+
+- **`per_pair`:** `energy_tol=1e-10` and `potential_tol=1e-8`, independently.
+- **`adaptive`:** energy uses the SCF integral screening tolerance
+  (`direct_scf_tol`, normally `1e-13`); potential uses the square root of the
+  resolved energy tolerance (normally about `3.16e-7`). Thus explicitly setting
+  `energy_tol=1e-10` while leaving potential automatic gives `potential_tol=1e-5`.
+- **`static`:** with the default FP64 precision, these two tolerances are unused.
+  With mixed precision enabled, the same automatic values as `adaptive` control
+  FP32 classification, while density-dependent skipping stays disabled.
+
+These are integral-screening/classification thresholds, not SCF convergence
+criteria or guaranteed bounds on total molecular energy or force error.
+Explicit numeric tolerances must be finite and positive.
+
+The general benchmark runner enables SGX with `--scf-jk dfj-sgx` and exposes
+its accuracy settings as `--sgx-*` flags; its SCF default is DF. It passes
+`--df-memory-mb` to `sgx_fit(df_memory_mb=...)` for both cold and warm SCF.
+The [bulk-water16 launcher](../../examples/dlno_stc/run_water_16_bulk_sgx.sh)
+sets SGX explicitly. SGX precision and screening are independent of whether
+the correlation solvers use deterministic or stochastic evaluation.
+
+### Domain selection
+
+`build_domain_selections(mf, ...)` accepts the following settings. The
+[selection implementation](_selection.py) defines and validates their defaults.
+
+| Keyword | Default | Meaning |
+| --- | --- | --- |
+| `frozen` | Required | Frozen-space specification; `0` retains all occupied orbitals. |
+| `scope`, `boys_grouping` | `"domain"`, `"singleton"` | Domain scope and physical fragment grouping described above. |
+| `full_domain` | `False` | Expand domains without combining fragments; molecular grouping enables it automatically. |
+| `thresholds` | `BoysDomainThresholds()` | Domain completeness, ranks and weak-pair screening thresholds. |
+| `lo_kwargs` | `None` | [Boys or lambda-Boys localization options](#boys-and-lambda-boys-localization). |
+| `target_coeff` | `None` | Optional reference target coefficients. |
+| `frag_lolist` | `None` | Optional complete singleton occupied-column partition; use `boys_grouping` for physical grouping. |
+| `pair_energy_model` | `"multipole"` | Also `multipole-os`/`os-multipole`, `exact`, and `all`/`all-strong`. |
+| `correlation_auxbasis` | `None` | Correlation fit override; defaults to the SCF fit. |
+| `mp2_laplace_points`, `mp2_grid` | `6`, `None` | Global fitted MP2 quadrature size or an explicit pair of arrays. |
+
+`BoysDomainThresholds` defaults:
+
+| Fields | Defaults | Role |
+| --- | --- | --- |
+| `bp_occ`, `bp_primary`, `bp_ed` | `0.985`, `0.999`, `0.9998` | Occupied BP completeness thresholds. |
+| `bp_pao` | `0.98` | PAO BP completeness. |
+| `pao_norm`, `domain_pao` | `1e-2`, `1e-4` | PAO norm and domain screening. |
+| `ed_pao`, `ed_pao_rank` | `0.995`, `1e-6` | ED PAO completeness and normalized local Gram rank cutoff. |
+| `metric_rank` | `1e-10` | Occupied metric rank cutoff. |
+| `pair_energy` | `5e-6` Eh | Strong-pair energy threshold. |
+| `near_pair_distance`, `multipole_order` | `3.5`, `4` | Near-pair distance in Bohr and multipole order. |
+
+### Boys and lambda-Boys localization
+
+Ordinary Boys is the default. To enable lambda-Boys, pass `lo_kwargs` during
+domain selection; the saved options apply to both energies and forces:
+
+```python
+domains = dlno_stc.build_domain_selections(
+    mf, frozen=1, boys_grouping="atom",
+    lo_kwargs={"method": "lambda_boys", "lambda_": 100.0},
+)
+```
+
+[Lambda-Boys](../lo/lambda_boys.py) minimizes the sum of Boys spreads plus
+`lambda_ * sum(i != j, |F_ij|**2)`, with F in the localized occupied basis.
+Both ordered entries `F_ij` and `F_ji` count. `lambda_` defaults to `100`
+in bohr²/Eh², must be finite and nonnegative, and `lambda_=0` recovers
+ordinary Boys. Larger values penalize off-diagonal Fock elements more strongly.
+The current SCF Fock is fixed during orbital rotations; its response is
+included when computing forces.
+
+Both methods accept `init_guess`, `conv_tol`, `conv_tol_grad`, `max_cycle`,
+`max_saddle_escapes`, `symmetry` and `gmres_options` in `lo_kwargs`.
+`gmres_options` controls the localization response solve (default `tol=1e-7`,
+`atol=1e-7`); it is separate from the CCSD lambda-equation controls.
+
+### LIS cutoffs
+
+Set the occupied and virtual cutoffs explicitly on
+`ccsd.build_static_selections(mf, domains, thresh_occ=..., thresh_vir=...)`.
+These select the CC local interacting space (LIS) from W and apply to both
+CCSD and CCSD(T), for energies and forces. Standalone domain MP2 does not use
+these cutoffs or build W.
+
+| Keyword | Public API default | Meaning |
+| --- | --- | --- |
+| `thresh_occ` | Required | Retain external occupied W eigenvectors with `abs(eigenvalue) > thresh_occ`; the internal target span is retained. |
+| `thresh_vir` | Required | Retain virtual W eigenvectors with `abs(eigenvalue) > thresh_vir`. |
+
+Both cutoffs are nonnegative energy thresholds in Eh. The quickstart and
+general water-16 runner use `thresh_occ=1e-4`, `thresh_vir=1e-5`; the
+[archived-run example](../../examples/dlno_stc/README_water_16.md#bulk-water16-from-the-completed-sgx-benchmark)
+explicitly uses `1e-4`/`3e-5`. A zero cutoff retains
+the full corresponding domain parent space, including zero-eigenvalue modes.
+Smaller positive cutoffs retain more orbitals. `full_domain=True` expands the
+parent domains but still applies these LIS cutoffs. Ranks and labels are
+selected once from each fragment's W and held fixed during its pullback.
+
+### CC plan and execution
+
+`ccsd.build_static_selections(mf, domains, ...)` requires `thresh_occ` and
+`thresh_vir`, the [LIS cutoffs](#lis-cutoffs) described above. Its other settings
+are `baseline_controls=None`, `matrix_controls=None`, `mp2_grid=None`,
+`internal_rank_threshold=1e-6`, `triples_laplace_points=4` and
+`correlation_auxbasis=None`. `merge_identical=True` is accepted by this builder
+for compatibility; actual preparation grouping occurs during execution.
+
+| Execution keyword | Default | Applies to |
+| --- | --- | --- |
+| `controls` | Required; `{}` selects deterministic | Standalone MP2. |
+| `baseline_controls`, `matrix_controls`, `mp2_grid` | `None` | CC; use the settings associated with the plan. |
+| `ccsd_t`, `triples_controls` | `False`, `None` | CC; enable triples explicitly. |
+| `include_hf` | `False` | Both gradient drivers and CC energy; MP2 energy always returns correlation energy. |
+| `return_components` | `False` | CC; append fragment energies, dimensions, SEs and diagnostics. |
+| `merge_identical` | `True` | Both methods; share identical-domain preparation. |
+| `comm`, `parallel_scf_jk` | `None`, `True` | Both methods; MPI and shared DF J/K work. |
+| `correlation_auxbasis` | `None` | Both methods; use the same fit for selection and execution. |
+| `checkpoint_dir`, `resume` | `None`, `False` | Serial CC progress checkpoints. |
+| `vvvv_direct`, `lis_aux_svd_tol` | `False`, `1e-5` | CC virtual-ladder storage and LIS auxiliary compression. |
+| `cc_solver`, `stc_cc_controls` | `"deterministic"`, `None` | CC amplitude solver and optional stochastic controls. |
+| `verbose_imp` | `0` | CC impurity solver verbosity. |
+
+Gradient drivers accept either `static` or `build_static(mf)`. The molecule must
+have coordinate derivatives enabled with
+`mol.build(trace_exp=False, trace_ctr_coeff=False)`. With `return_components=True`,
+CC returns `(energy, components)` or `(energy, mol_bar, components)`.
 
 ## Separate MP2 and triples quadratures
 
@@ -134,13 +348,111 @@ choices are independent:
   `energy_tolerance` enables adaptive allocation. The fragment pipeline uses
   `variance_allocation="occupied_count"` across all physical targets.
 
-Seeds depend on physical fragment and sampling stream, not MPI rank. Saved
+MP2 seeds depend on preparation-group identity; W and CC seeds depend on
+physical fragment identity. Sampling streams do not depend on MPI rank. Saved
 production samples are reused for response. Reported energy standard errors
 do not bound force errors.
 
-See the [smooth solver guide](../../doc/source/user_guide/smooth_lis_triples.md)
-for equations, quadrature, stochastic controls, CC convergence and diagnostics.
-The [smooth CCSD(T) examples](../../README_SMOOTH_CCSD_T.md) cover practical runs.
+### Standalone MP2 controls
+
+Pass `controls` explicitly, using `{}` for deterministic defaults. The high-level
+stochastic default is an adaptive total strong-domain energy SE target of
+`3e-4` Eh, divided in variance across the preparation jobs. Explicit
+`production_samples` selects fixed-count sampling instead. Forces reuse the
+scalar solver's production samples and input cotangents; no W is constructed.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `mode` | `"deterministic"` | Explicit `"stochastic"` enables sampling. |
+| `global_seed` | `0` | Root seed for rank-independent group streams. |
+| `energy_tolerance` | `3e-4` Eh in adaptive mode | Total strong-domain energy SE target. |
+| `production_samples` | Omitted | Fixed production count; overrides adaptive allocation when supplied. |
+| `pilot_samples` | `100000` | Independent pilot budget in adaptive mode. |
+| `min_production_samples` | `10000` | Adaptive production minimum. |
+| `max_production_samples` | `0` | Optional adaptive cap; zero means uncapped. |
+| `laplace_roots`, `laplace_weights` | Saved global grid | Supply both to override standalone MP2 quadrature. |
+
+Advanced scalar sampling and execution controls are defined in the
+[native selected-solver parser](cpp/bindings.cpp). W sampling controls below
+belong to a different solver and should not be used for standalone MP2.
+
+### W controls for CC
+
+Use `matrix_controls` for W. In the CC API, `baseline_controls` supplies
+preparation settings; it does not launch an additional scalar MP2 solve.
+Scientific controls must match those used to construct the CC plan. Pass
+quadrature through `mp2_grid`, not either control dictionary.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `mode` | `"deterministic"` | Explicit `"stochastic"` enables W sampling. |
+| `global_seed`, `threads` | `0`, `1` | Sampling root seed and native thread count. |
+| `target_batch_size` | `None` | All targets in a physical fragment; a positive cap reduces batch storage. |
+| `auxiliary_group_size` | `32` | Auxiliary grouping size. |
+| `memory_limit_mb` | Omitted | Optional memory budget for staged W calls. |
+| `matrix_tolerance` | `1e-4` | Stochastic occupied/virtual matrix precision target. |
+| `domain_tau`, `virtual_domain_tau` | `0.003`, `0.0003` | Stochastic compact-domain cutoffs. |
+| `pair_pilot_samples`, `min_samples` | `100000`, `64` | Stochastic pilot budget and minimum production allocation. |
+
+The last three rows apply only to stochastic W. Its MP2 energy SE includes
+occupied/virtual trace covariance. It is not an estimate of the total CCSD(T)
+uncertainty caused by selecting a LIS from sampled W.
+
+### Triples controls
+
+`triples_controls=None` means deterministic triples when `ccsd_t=True`.
+Leave it `None` when triples are disabled. Accepted keys are:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `mode` | `"deterministic"` | `"stochastic"` samples the same smooth numerator. |
+| `integral_transform` | `"df"` | `"rotate"` reuses cached CCSD integrals; both support energies and forces. |
+| `nsamples` | Required for stochastic mode | Integer ≥ 2; nominal production budget per fragment in fixed-count mode. Still required with a tolerance. |
+| `energy_tolerance` | Omitted or `0` | A positive value targets total triples energy SE in Eh; `5e-5` Eh is `0.05` mEh. |
+| `pilot_samples` | `10000` | Independent discarded pilot draws per Laplace point per fragment. |
+| `global_seed` | `71` | Root seed for fragment, point, pilot and production streams. |
+| `trace_exponent` | `5.0` | Positive exponent for point-variance allocation in tolerance mode. |
+| `variance_allocation` | `"occupied_count"` for fragment plans | Fragment variance shares follow original occupied target counts. |
+| `fragment_energies` | Omitted | Only for `mp2_energy` allocation with previously captured concrete labels; incompatible with plan-based occupied-count allocation. |
+
+Only `mode` and `integral_transform` are accepted for deterministic triples.
+For ordinary fragment plans, retain `variance_allocation="occupied_count"`;
+energy-proxy allocation would require results before the fragment loop.
+A positive tolerance enables adaptive production, with at least 10000 draws
+per point. Without it, pilot variances allocate `nsamples` across points;
+rounding can increase the total. Pilot draws are additional and do not enter
+the energy or force. Quadrature error is separate from sampling SE.
+
+```python
+triples = dict(mode="stochastic", nsamples=10000, pilot_samples=10000,
+               global_seed=71, energy_tolerance=5e-5,
+               variance_allocation="occupied_count")
+energy, bar, components = ccsd.value_and_grad(
+    mol, build_mf, build_static=select_cc, triples_controls=triples,
+    return_components=True, **options)
+forces = -bar.coords
+```
+
+### CCSD solver and convergence
+
+`cc_solver="deterministic"` is the default. `cc_solver="stc"` enables the
+optional external `stc_cc_jax` solver and accepts `stc_cc_controls`.
+Its [adapter](stc_ccsd.py) defines accepted keys, units and precision-replica
+controls; deterministic calculations do not import that external package.
+
+The deterministic fragment solver inherits RCCSD defaults `conv_tol=1e-7` Eh,
+`conv_tol_normt=1e-5` and `max_cycle=50`. Set
+`pyscfad.lno.ccsd.RCCSD.conv_tol`, `.conv_tol_normt` and `.max_cycle` before
+calling the driver to override them. Both forward convergence tests must pass.
+The default custom response uses the amplitude tolerance and iteration limit
+for lambda too; a force request does not automatically tighten them.
+`PYSCFAD_LNO_CCSD_DIIS_SPACE=3` is the impurity DIIS default; nonpositive values
+disable it. These settings are independent of `triples_controls`.
+
+Native CPU DF-CCSD is the deterministic fragment default. The optional C++
+virtual-ladder extension and the JAX reference implementation are described
+under [build and verification](#build-and-verification) and in the
+[implementation notes](../../doc/source/user_guide/smooth_lis_triples.md#deterministic-ccsd-and-response).
 
 ## Integral storage and memory
 
@@ -207,13 +519,86 @@ python -m pytest pyscfad/dlno_stc/test/test_calculation_modes.py \
   pyscfad/dlno_stc/test/test_w_delayed_pullback.py
 ```
 
-Imports do not build or download dependencies. Examples include
-`water_tetramer.py`, `water_tetramer_full.py`, `benchmark_lno_w_triples.py` and
-`smooth_force_compare.py`. Benchmark runners use deterministic calculations by
-default; sampling comparisons require explicit stochastic options.
+The optional CPU CCSD ladder kernel requires CMake, pybind11, an OpenMP C++
+compiler and the active Python/SciPy environment:
+
+```bash
+cmake -S pyscfad/cc/cpp -B build/ccsd -DCMAKE_BUILD_TYPE=Release \
+  -DPython_EXECUTABLE="$(command -v python)" \
+  -Dpybind11_DIR="$(python -m pybind11 --cmakedir)" \
+  -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="$PWD/pyscfad/cc"
+cmake --build build/ccsd -j 2
+```
+
+It is used when available and applicable. `config.update('pyscfad_dfccsd_cpp', False)`
+disables the optional ladder kernel; `config.update('pyscfad_dfccsd_native', False)`
+selects the JAX fragment reference implementation. Higher derivatives require
+the JAX path; the native RCCSD adapter supports real float64 energies and first
+derivatives. Imports do not build or download dependencies.
 
 The native `solve_full` entry point delegates to `solve_selected` with every
-occupied target, for both deterministic and stochastic calculations and their
-responses. Independent full-system reference sources live in `cpp/test_reference`
-and are compiled only with `BUILD_TESTING=ON`, exposing `_solve_full_reference`
-for numerical tests. Use `-DBUILD_TESTING=OFF` for a production-only extension.
+occupied target. Independent reference sources in `cpp/test_reference` compile
+only with `BUILD_TESTING=ON`, exposing `_solve_full_reference` for tests.
+Use `-DBUILD_TESTING=OFF` for a production-only STC extension.
+
+## Command-line examples
+
+Run from the repository root with this checkout installed. The scripts expose
+machine-specific memory and threading policies; their defaults can differ from
+the library. Inspect their help before choosing a workload:
+
+```bash
+python examples/dlno_stc/water_tetramer.py --help
+python examples/dlno_stc/smooth_force_compare.py --help
+python examples/dlno_stc/benchmark_lno_w_triples.py --help
+python examples/dlno_stc/water_16_ccsd_t_gradient.py --help
+```
+
+| Runner | Purpose and current behavior |
+| --- | --- |
+| [water_tetramer.py](../../examples/dlno_stc/water_tetramer.py) | Standalone scalar domain MP2; `--energy-only` skips forces and `--mode stochastic` selects scalar sampling. |
+| [water_tetramer_full.py](../../examples/dlno_stc/water_tetramer_full.py) | Standalone system-scope MP2 with scalar energy/response. |
+| [smooth_force_compare.py](../../examples/dlno_stc/smooth_force_compare.py) | General smooth CCSD(T) force comparison. Deterministic unless `--seeds` is supplied. Defaults to molecular grouping, zero LIS cutoffs, 32 threads and an 800000 MB process budget. |
+| [benchmark_lno_w_triples.py](../../examples/dlno_stc/benchmark_lno_w_triples.py) | C5H6 molecular or atom-grouped alkane/water runner. Deterministic by default; `--compare-solvers` or `--stochastic-only` requires `--targets-meh` and `--seeds`. Exposes process/DF budgets, half/direct storage and a `--domain-thresholds` JSON input. |
+| [water_16_ccsd_t_gradient.py](../../examples/dlno_stc/water_16_ccsd_t_gradient.py) | Water-cluster force runner with explicit stochastic triples; see the [water example guide](../../examples/dlno_stc/README_water_16.md) for its launcher defaults. |
+| [run_water_16_bulk_sgx.sh](../../examples/dlno_stc/run_water_16_bulk_sgx.sh) | Archived bulk-water16 geometry and domain parameters, `pair_energy=5e-6`, LIS cutoffs `1e-4`/`3e-5`, generated SGX and packed CC ladder. Explicitly deterministic W, CCSD and (T), with three fitted (T) points per LIS. |
+
+The full water16 energy-and-force example runs with:
+
+```bash
+PYTHON_BIN=.venv/bin/python THREADS=32 \
+  examples/dlno_stc/run_water_16_bulk_sgx.sh \
+  --output-dir output/water_16_bulk_deterministic
+```
+
+See the [water16 input and provenance](../../examples/dlno_stc/README_water_16.md#bulk-water16-from-the-completed-sgx-benchmark)
+for the domain-default comparison and memory settings.
+
+For example, this explicitly requests a deterministic reference and sampled
+triples forces on C5H6, with full domains and one untruncated LIS:
+
+```bash
+python examples/dlno_stc/benchmark_lno_w_triples.py \
+  --xyz-file examples/dlno_stc/c5h6_force_compare.xyz \
+  --basis cc-pvdz --frozen 5 --boys-grouping molecule \
+  --lno-thresh-occ 0 --lno-thresh-vir 0 --threads 4 \
+  --max-memory-mb 10000 --df-memory-mb 1000 \
+  --triples-laplace-points 4 --pilot-samples 10000 \
+  --compare-solvers --targets-meh 0.05 --seeds 71 \
+  --output-dir output/c5h6_triples_comparison
+```
+
+The benchmark runner has no `--single-pass-w`, `--selection-only` or `--reference`
+option. The comparison runner still accepts `--selection-only` (a domain/CC
+plan, not completed W/LIS selection) and `--reference`; its
+`--triples-budget-energy ccsd` option is incompatible with ordinary fragment
+plans, so retain the default. Its `--fd-coordinate` refits LIS/(T) choices on
+displaced evaluations; this is not a fixed-label derivative check.
+
+The two comparison runners set `RCCSD.max_cycle=200`. Their energy/amplitude
+tolerances differ: `smooth_force_compare.py` uses `1e-10`/`1e-8`, while
+`benchmark_lno_w_triples.py` uses `1e-7`/`1e-5`. The benchmark's default pilots
+are 20000, the comparison runner's 10000. Output includes settings and individual
+energy/force records; the comparison runner also writes `comparison.json`.
+Force comparisons use Cartesian-component RMS in mEh/bohr. These diagnostics
+are separate from the stochastic energy SE target.

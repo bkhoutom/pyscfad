@@ -14,13 +14,13 @@ During eager GMRES, its actual vector size, dtype and restart length determine
 a temporary solver reservation (including not-yet-resident basis pages).
 Planning also reserves AO matrices and native per-thread buffers and leaves
 20 percent of headroom for other allocations. The total ceiling comes from
-mol.max_memory (or the enclosing SCF-response scope); max_memory below is
+mol.max_memory (or the enclosing SCF-response scope); df_memory_mb below is
 the J/K workspace allowance. Metric derivative tiles remain at most 32 MiB.
 
-The default uses symmetric overlap fitting, a fixed level-2 SGX grid, static
+The default uses symmetric overlap fitting, a fixed level-2 SGX grid, per-pair
 screening and FP64-only arithmetic. Set mixed_precision=True for mixed FP32/FP64
-forward, response and geometry kernels. With libsgx_ad version 4, use
-screening='per_pair' for independent density-dependent skip thresholds:
+forward, response and geometry kernels. The default requires libsgx_ad
+version 4 and uses independent density-dependent skip thresholds:
 energy_tol=1e-10 and potential_tol=1e-8 (also the per-pair auto defaults).
 Use the same screening settings with mixed_precision=False to isolate the
 precision error. Keep those cutoffs fixed across system sizes and while tuning
@@ -68,7 +68,7 @@ def build_mf(current):
     # basis can differ from this correlation fitting basis.
     mf = scf.RHF(current).density_fit(auxbasis='def2-svp-ri')
     mf = sgx_fit(mf, auxbasis='def2-universal-jfit', grid_level=2,
-                 max_memory=2000)
+                 df_memory_mb=2000)
     # For either precision mode with the validated per-pair skip policy, add:
     # screening='per_pair', mixed_precision=False (FP64) or True (mixed).
     mf.conv_tol, mf.conv_tol_grad, mf.chkfile = 1e-11, 1e-8, None

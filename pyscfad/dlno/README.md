@@ -1,11 +1,12 @@
 # DLNO: domains on top of LNO
 
-The complete developer guide is in
-[documentation/DLNO.md](../../../documentation/DLNO.md), with separate chapters
-for [theory](../../../documentation/DLNO_THEORY.md) and
-[implementation](../../../documentation/DLNO_IMPLEMENTATION.md). The theory
-defines the quantities and equations; the implementation chapter maps those
-equations to functions and explains shapes, AD, MPI, storage and restart.
+This README describes the separate `pyscfad.dlno` class API. For the scalar
+STC-MP2 and W-selected smooth DLNO-CCSD(T) workflows, use the
+[`pyscfad.dlno_stc` guide](../dlno_stc/README.md).
+
+For this implementation, [domain construction](domain.py),
+[domain selections](_selection.py), [MP2](mp2.py) and [CCSD](ccsd.py) are the
+source references for equations, array shapes, AD and execution behavior.
 
 ```python
 from pyscfad.dlno import DLNOMP2, DLNOCCSD, DLNOThresholds
@@ -85,5 +86,4 @@ MPI frame/reduction order intact when editing numerical code.
 The older dictionary-based LNO-prescreen adapter and its comparison examples
 have been retired. Use the public DLNO drivers above for IAO/Boys calculations
 and `pyscfad.lno` for plain LNO. Historical record fields such as `iao_coeff`
-and `e_iao_mp2` also carry Boys data; see the guide's migration and checkpoint
-sections before changing serialized names.
+and `e_iao_mp2` also carry Boys data; inspect the [restart format](_restart.py) before changing serialized names.

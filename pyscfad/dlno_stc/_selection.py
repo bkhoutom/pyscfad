@@ -42,7 +42,7 @@ class BoysDomainThresholds:
     domain_pao: float = 1e-4
     ed_pao: float = 0.995
     metric_rank: float = 1e-10
-    pair_energy: float = 7.5e-6
+    pair_energy: float = 5e-6
     near_pair_distance: float = 3.5
     multipole_order: int = 4
     ed_pao_rank: float = 1e-6

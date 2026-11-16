@@ -1,5 +1,10 @@
 # Root-owned DF, SCF and pullback performance
 
+These notes cover SCF/DF implementation and performance. The
+[DLNO-STC user guide](pyscfad/dlno_stc/README.md) owns calculation workflows,
+solver defaults, correlation storage choices and public controls. Timings below
+refer to the recorded component studies, not current whole-calculation guarantees.
+
 ## Optional direct-to-final-layout DF construction
 
 The serial benchmark and water drivers accept

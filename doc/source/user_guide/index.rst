@@ -13,3 +13,4 @@ The user guide offers in depth guidelines for using pyscfad and developing custo
    backends
    custom_methods
    lno_triples_memory
+   smooth_lis_triples

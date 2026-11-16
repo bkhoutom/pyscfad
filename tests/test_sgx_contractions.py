@@ -77,7 +77,7 @@ def test_panel_alignment_preserves_forward_response_and_geometry(monkeypatch):
         pytest.skip('Per-pair generated SGX required')
     mol = gto.M(atom='O 0 0 0; H 0 -.7 .5; H 0 .7 .5',
                 basis='cc-pvdz', verbose=0, max_memory=2000)
-    mf = sgx_fit(scf.RHF(mol), grid_level=0, max_memory=500,
+    mf = sgx_fit(scf.RHF(mol), grid_level=0, df_memory_mb=500,
                  integral_backend='generated', screening='per_pair',
                  mixed_precision=True, energy_tol=1e-10, potential_tol=1e-8,
                  fp32_multiplier=1e5)

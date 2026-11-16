@@ -23,7 +23,7 @@ os.environ["PYSCFAD_DLNO_RESOURCE_PROFILE"] = "1"
 faulthandler.enable()
 
 
-_SGX_DEFAULTS = dict(integral_backend='auto', screening='static',
+_SGX_DEFAULTS = dict(integral_backend='auto', screening='per_pair',
                      mixed_precision=False, energy_tol='auto',
                      potential_tol='auto', fp32_multiplier=1e5)
 
@@ -64,6 +64,8 @@ def main():
     parser.add_argument("--basis", required=True)
     parser.add_argument("--frozen", type=int, required=True)
     parser.add_argument("--boys-grouping", choices=("molecule", "atom"), required=True)
+    parser.add_argument("--domain-thresholds", type=Path,
+                        help="JSON object of BoysDomainThresholds overrides; omitted fields use library defaults")
     parser.add_argument("--targets-meh", type=float, nargs="+", default=[])
     parser.add_argument("--seeds", type=int, nargs="+", default=[])
     parser.add_argument("--job-indices", type=int, nargs="+",
@@ -155,10 +157,11 @@ def main():
         os.environ.setdefault('PYSCFAD_PRECOND_CACHE_MEMORY_MB',
                               str(args.max_memory_mb * 1e6 / 1024**2))
 
-    # Molecule grouping intentionally defines a single full molecular domain
-    # (C5H6). Atom-grouped alkanes use the physical domain/pair cutoffs.
+    # Molecule grouping defines one full domain; atom grouping uses finite domains.
     full_domain = args.boys_grouping == "molecule"
-    domain_thresholds = dlno_stc.BoysDomainThresholds()
+    threshold_options = (json.loads(args.domain_thresholds.read_text())
+                         if args.domain_thresholds is not None else {})
+    domain_thresholds = dlno_stc.BoysDomainThresholds(**threshold_options)
     snapshot_root = os.environ.get("LNO_BENCHMARK_SOURCE_ROOT")
     if snapshot_root and not Path(pyscfad.__file__).resolve().is_relative_to(Path(snapshot_root).resolve()):
         raise RuntimeError("benchmark did not import its pinned source snapshot")
@@ -170,6 +173,8 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     if (output / "settings.json").exists():
         previous = json.loads((output / "settings.json").read_text())
+        if previous.get('domain_thresholds') != asdict(domain_thresholds):
+            raise ValueError('domain thresholds differ; use a new output directory')
         for key, value, old_default in (
                 ('scf_jk', args.scf_jk, 'df'),
                 ('sgx_grid_level', args.sgx_grid_level, 2),
@@ -234,11 +239,19 @@ def main():
     elements = [mol.atom_symbol(i) for i in range(mol.natm)]
     if args.boys_grouping == "molecule":
         assert elements == ["C"] * 5 + ["H"] * 6
+        expected_groups = 1
     else:
         carbons = elements.count("C")
         hydrogens = elements.count("H")
-        if carbons < 2 or hydrogens != 2 * carbons + 2 or carbons + hydrogens != len(elements):
-            raise ValueError("atom-grouped alkane benchmark requires C_n H_(2n+2)")
+        oxygens = elements.count("O")
+        if oxygens > 0 and hydrogens == 2 * oxygens and oxygens + hydrogens == len(elements):
+            if args.frozen != oxygens:
+                raise ValueError("water benchmark requires one frozen oxygen core per water")
+            expected_groups = oxygens
+        elif carbons >= 2 and hydrogens == 2 * carbons + 2 and carbons + hydrogens == len(elements):
+            expected_groups = carbons
+        else:
+            raise ValueError("atom-grouped benchmark requires (H2O)_n or C_n H_(2n+2)")
     refmol = pgto.M(atom=str(xyz), basis=basis, unit="Angstrom",
                      max_memory=args.max_memory_mb, verbose=0)
     ref = pscf.RHF(refmol).density_fit(auxbasis=auxbasis)
@@ -246,7 +259,7 @@ def main():
         from pyscfad.sgx import sgx_fit
         ref = sgx_fit(pscf.RHF(refmol), auxbasis=auxbasis,
                       grid_level=args.sgx_grid_level, fit_ovlp=args.sgx_fit_overlap,
-                      max_memory=args.df_memory_mb, **sgx_options)
+                      df_memory_mb=args.df_memory_mb, **sgx_options)
         report(f'Integral-direct DF-J / SGX-K (grid {args.sgx_grid_level}); no global SCF DF factors')
     cderi_path = (output / "scf_cderi.h5"
                   if args.scf_jk == 'df' and args.df_storage == "outcore" else None)
@@ -288,7 +301,7 @@ def main():
         mf = scf.RHF(current).density_fit(auxbasis=auxbasis)
         if args.scf_jk == 'dfj-sgx':
             mf = sgx_fit(mf, auxbasis=auxbasis, grid_level=args.sgx_grid_level,
-                         fit_ovlp=args.sgx_fit_overlap, max_memory=args.df_memory_mb,
+                         fit_ovlp=args.sgx_fit_overlap, df_memory_mb=args.df_memory_mb,
                          **sgx_options)
         # This is scratch space, not a ceiling on the whole process RSS.
         # Keep J/K panels useful when retained correlation state exceeds it.
@@ -312,7 +325,6 @@ def main():
             raise RuntimeError("differentiable RHF failed")
         return mf
 
-    expected_groups = 1 if args.boys_grouping == "molecule" else carbons
     baseline = dict(mode="deterministic", threads=args.threads, global_seed=666)
     matrix = dict(mode="deterministic", threads=args.threads,
                   memory_limit_mb=args.max_memory_mb)

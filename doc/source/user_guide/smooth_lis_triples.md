@@ -1,22 +1,32 @@
-# Full-LIS CCSD(T) forces and selected Laplace sampling
+# Smooth LIS frames, Laplace triples and response
 
-For runnable C5H6 and C6H14 examples and a short defaults table, start with the
-[smooth CCSD(T) README](../../../README_SMOOTH_CCSD_T.md). This reference describes
-the current public Python drivers and both run scripts. Defaults below are
-source defaults; run-script overrides are listed separately.
+This is the theory and implementation companion to the
+[DLNO-STC user guide](../../../pyscfad/dlno_stc/README.md). Installation, the four
+calculation workflows, Python controls, defaults, storage choices, MPI and
+command-line examples are maintained there.
 
-The supported smooth implementation has three parts:
+The CC calculation uses W-selected retained spaces, one smooth occupied frame
+and one smooth virtual frame per LIS, and asymmetric Laplace triples with full
+Fock response. “Full frame” means the complete retained LIS; it does not disable
+LNO truncation or physical fragment weighting. Standalone domain MP2 uses its
+scalar energy solver without constructing W.
 
-1. One full occupied block and one full virtual block in each retained LIS.
-   The internal Fock projector is the identity.
-2. Native asymmetric Laplace `(T)` dressing with full off-diagonal Fock response.
-3. Restricted sampling over the physical selected occupied target S, with a
-   fused sampled energy and input derivative calculation.
+## Energy and shared W response
 
-W selection and smooth LIS treatment are fixed; neither needs a mode argument.
-Deterministic solvers are the default, with stochastic solvers available explicitly. Canonical stochastic
-triples, equal-weight dressing, the JAX production dressing backend, explicit-S
-frames and the older adaptive Gaussian triples grid have been removed.
+For physical fragment S, the correlation energy is
+
+```text
+E_corr = E_MP2,weak + sum_S [E_MP2,strong,S + E_CCSD,S + E_(T),S - E_MP2,LIS,S].
+E_MP2,strong,S = (Tr W_occ,S + Tr W_vir,S) / 2.
+```
+
+In CC calculations, one W forward supplies the strong-domain MP2 contribution
+and the LIS selection. Its delayed reverse receives unit MP2 energy cotangent
+and the occupied/virtual W cotangents from the correction. Direct orbital and
+Fock cotangents accumulate through the shared preparation. The weak-pair
+response and the final common-data/SCF response complete the derivative.
+With stochastic W, energy and response reuse the saved production samples;
+the trace covariance enters the reported MP2 baseline SE.
 
 ## Frames and physical selection
 
@@ -29,26 +39,12 @@ projected targets and retained W spaces remain differentiated.
 
 CCSD receives the local occupied count and only the active LIS columns. The
 global AO Fock is projected into this basis, including occupied-virtual entries.
-Selection schema 18 records the saved global MP2 grid and domain-only LIS definition;
-rebuild checkpoints from earlier schemas or global-space LIS calculations.
-
-`build_domain_selections` fits one global MP2/W grid from the full active
-canonical spectrum (`mp2_laplace_points=6`), excluding frozen orbitals, and
-saves it for every domain. `build_static_selections` records a fragment plan
-and inherits that grid, without computing W. There is no `single_pass` option.
-The only pipeline runs SCF, screens weak pairs and groups orbitals, then builds
-each fragment domain. Standalone MP2 computes the scalar energy without W.
-CCSD/(T) builds W once for its MP2 baseline, smooth LIS selection and
-independent (T) grid. The fragment
-consumes its pullbacks before the final common-data and SCF response.
-Discrete ranks, anchors and both quadratures are fixed during each pullback.
-Separate production calls select new LIS labels and (T) grids; fixed-label
-finite differences must reuse labels captured from a reference run.
-With MPI, each owner retains its local preparation and LIS pullbacks; completed
-cotangents are reduced for shared response on root. `select_frame` saves
-semicanonical reference anchors;
-`rebuild_frame` transports those anchors with the current LIS and AO overlap.
-Its input contains no Fock matrix, so the Fock-frame cotangent is zero.
+A retained occupied/virtual subspace is transported against fixed AO anchors.
+`select_frame` saves semicanonical reference anchors; `rebuild_frame` transports
+them with the current LIS and AO overlap. The transport itself contains no
+Fock matrix. Discrete ranks, anchors and quadratures are held fixed for the
+fragment's derivative. Their lifecycle is documented in the
+[user guide](../../../pyscfad/dlno_stc/README.md#separate-mp2-and-triples-quadratures).
 
 Writing the current metric-orthonormal retained coefficients as C, the saved AO
 anchor columns as A0, and the AO overlap as S_AO, the transport is
@@ -168,74 +164,28 @@ operations, including cache construction and reverse work.
 This preserves the existing asymmetric physical fragment partition. Only
 the quadrature approximates the denominator; `samples` and `standard_error`
 remain zero. It requires rebuilding the STC extension, and its native version
-changes the correlation checkpoint identity. The ordinary semicanonical
-triples path is unchanged. Smooth frames retain full occupied and virtual
-Fock matrices; the new contraction does not assume they are diagonal.
+changes the correlation checkpoint identity. Smooth frames retain full occupied and virtual Fock matrices; the
+contraction does not assume they are diagonal.
 
 Positive counts use selected-space sampling with proposal tables
 built from the stable factors. The VJP uses the same draws as the energy.
-Individual seeded realizations change because the proposal factors changed;
-the deterministic energy and full derivative are preserved. The older
-`TriplesDressing` and `triples_asymmetric_*` interfaces remain as low-level
-reference interfaces and are not used by the default solver.
+Proposal probabilities are held fixed in the derivative; the same sampled
+realization supplies energy and tensor cotangents.
 
-## Controls
+## Independent quadratures
 
-The following assumes a converged density-fitted `mf`, its molecule `mol`, a
-`build_mf(mol)` callback returning a converged differentiable MF, domain selections
-`domains`, and separate MP2 `baseline` / W `matrix` control dictionaries.
-Set `mp2_grid=(roots, weights)` once for MP2/W, or use `None` to inherit the globally fitted grid from domain selection.
-Those dictionaries contain no quadrature keys. The per-LIS (T) fit is separate.
+The MP2 fit uses double-excitation denominator bounds from the full active
+canonical spectrum, excluding frozen orbitals. Every fragment uses that same
+saved rule. The triples fit uses the triple-excitation denominator range of
+each nonempty selected LIS. These are separate approximation problems.
 
-```python
-from pyscfad.dlno_stc import ccsd
+Both fits account for energy and derivative accuracy. In particular, the
+positive triples fit approximates inverse first and second denominator powers;
+its derivative weight is fixed at `0.1`. Fit diagnostics report these errors
+separately from stochastic SE. The LIS MP2 subtraction instead solves the
+noncanonical MP2 equation with an implicit derivative of the full Fock operator.
 
-mp2_grid = None  # Reuse the global MP2 fit saved by domain selection.
-static = ccsd.build_static_selections(
-    mf, domains, thresh_occ=1e-4, thresh_vir=1e-5,
-    baseline_controls=baseline, matrix_controls=matrix, mp2_grid=mp2_grid,
-    triples_laplace_points=4,
-)
-triples = dict(
-    mode="stochastic", nsamples=10000, pilot_samples=10000,
-    global_seed=71, energy_tolerance=5e-5, trace_exponent=5.0,
-)
-energy, mol_bar, components = ccsd.value_and_grad(
-    mol, build_mf, static, baseline_controls=baseline, matrix_controls=matrix, mp2_grid=mp2_grid,
-    ccsd_t=True, triples_controls=triples, include_hf=True, return_components=True,
-)
-forces = -mol_bar.coords  # Eh/bohr
-```
-
-`ccsd.kernel` is an energy-only entry point and cannot be wrapped in JAX AD.
-Use `ccsd.value_and_grad` for forces. With `return_components=False`, they return
-`energy` and `(energy, mol_bar)`, respectively. With it enabled, they return
-`(energy, components)` and `(energy, mol_bar, components)`.
-
-The tolerance is in Hartree and controls the system `(T)` energy standard error.
-Fragment variance budgets default to `variance_allocation="occupied_count"`,
-using each fragment's original occupied count divided by the whole molecule's
-active occupied count. This allocation needs no preliminary W calculation.
-Point budgets use a trace model with configurable positive
-`trace_exponent` (default 5.0 in the API and both runners). The MP2 trace model
-uses exponent 1.4.
-
-Independent discarded pilots choose production counts, with at least 10000
-production draws per point in tolerance mode. Production extends until each
-point meets its allocated SE. The pilot and production share prepared tensors
-and proposal tables; pilot draws are excluded from production statistics and
-forces. Zero or omitted energy tolerance selects a fixed production budget.
-
-The fitted triples grid uses four positive points by default, fitting both inverse
-first and second powers of denominators. Grid diagnostics report energy and
-derivative approximation errors separately from stochastic SE. Point count,
-seeds, sample counts, tolerances and trace exponents remain configurable.
-This triples grid is separate from the MP2 baseline / W grid. The latter
-defaults to the existing six fixed points; the example runners instead fit six
-MP2 points with `lambda_gradient=0.1`. The triples fitter also fixes its
-derivative weight at `0.1`; this is not a separate public triples option.
-
-### Forward choices and backward response
+## Differentiation boundaries
 
 The controls configure the calculation before evaluation. Ranks, grouping,
 anchors, quadrature rules, proposal probabilities, random draws, and allocation
@@ -251,120 +201,7 @@ DF-CCSD custom response uses `conv_tol_normt` and `max_cycle` for its backward
 lambda solve as well as its forward solve. The `(T)` SE target controls estimated
 energy uncertainty; it does not impose a force uncertainty or RMS-error target.
 
-### Domain and LIS selection options
-
-`dlno_stc.build_domain_selections(mf, ...)`:
-
-| Keyword | Default | Meaning |
-| --- | --- | --- |
-| `frozen` | Required | Frozen occupied specification; use `0` for no frozen core. |
-| `boys_grouping` | `"singleton"` | `singleton`: one S per active Boys orbital; `atom`: assign Boys orbitals to heavy-atom/H groups by Löwdin population; `molecule`: all targets in one S. |
-| `full_domain` | `False` | Full extended domains; automatically true for molecule grouping. It does not set LIS cutoffs to zero. |
-| `thresholds` | `None` → `BoysDomainThresholds()` | Domain completeness, PAO rank, and pair-screen controls below. |
-| `lo_kwargs` | `None` → `{}` | Boys options: `init_guess`, `conv_tol`, `conv_tol_grad`, `max_cycle`, `symmetry`, `gmres_options`. Unspecified options inherit the Boys implementation defaults. |
-| `target_coeff` | `None` | Build Boys targets; supply coefficients to use reference target orbitals. |
-| `frag_lolist` | `None` | Default singleton occupied-column partition; explicit input must also be a complete disjoint singleton partition. Use `boys_grouping` to combine physical S. |
-| `pair_energy_model` | `"multipole"` | Also accepts `multipole-os` / `os-multipole`, `exact`, and `all` / `all-strong`. |
-
-`BoysDomainThresholds` defaults: `bp_occ=0.985`, `bp_primary=0.999`,
-`bp_ed=0.9998`, `bp_pao=0.98`, `pao_norm=1e-4`, `domain_pao=1e-4`,
-`ed_pao=0.995`, `metric_rank=1e-10`, `pair_energy=1.5e-5`,
-`near_pair_distance=3.5`, and `multipole_order=4`.
-See the [domain and MP2 guide](../../../pyscfad/dlno_stc/README.md) for their definitions.
-
-`ccsd.build_static_selections(mf, mp2_static, ...)`:
-
-| Keyword | Default | Meaning |
-| --- | --- | --- |
-| `thresh_occ`, `thresh_vir` | Required | Nonnegative absolute-eigenvalue thresholds for retained external occupied/virtual directions. Zero retains the full corresponding space. |
-| `mp2_grid` | `None` | One MP2/W `(roots, weights)` pair; inherit the fitted grid saved by domain selection. Independent of (T). |
-| `baseline_controls`, `matrix_controls` | `None` | MP2 preparation and W settings. W construction also supplies the strong-domain MP2 energy. `{}` selects deterministic defaults. |
-| `internal_rank_threshold` | `1e-6` | Numerical rank threshold for constructing discarded complements when completing the full MO layout; all original S orbitals are retained. |
-| `merge_identical` | `True` | Reuse identical-domain preparation while retaining physical S identities. |
-| `triples_laplace_points` | `4` | Positive integer; fit a separate positive triples quadrature for each nonempty LIS. Independent of `mp2_grid`. |
-
-The baseline and matrix dictionaries must match the scientific settings used to
-build selections. W matrices can independently use `mode="deterministic"`
-(default) or `"stochastic"`. Matrix defaults include `global_seed=0`, `threads=1`,
-`target_batch_size=None` (all targets in the physical fragment),
-`auxiliary_group_size=32`, and no `memory_limit_mb`.
-Standalone MP2 uses its scalar energy solver; CC uses W. Stochastic controls are listed in the
-[matrix control table](../../../pyscfad/dlno_stc/README.md#deterministic-and-stochastic-controls).
-Those controls are not accepted in `triples_controls`.
-
-Both deterministic and stochastic W supply
-`E_MP2 = (trace(Wo) + trace(Wv))/2`; deterministically each trace equals this
-energy. The CC driver reuses it instead of evaluating a separate strong-domain
-MP2 energy or gradient. The delayed W pullback receives `energy_bar=1` together
-with the W cotangents from LIS CCSD(T). In stochastic mode it replays the same
-saved samples. Direct Fock/orbital cotangents follow their own preparation
-paths and are accumulated with the W response. Weak-pair terms remain separate.
-The shared `mp2_grid` supplies MP2 and W; W sampling precision is controlled
-by `matrix_controls`. The reported MP2 SE describes the sampled W energy, not
-the total CCSD(T) uncertainty induced by stochastic LIS selection.
-
-### Energy and gradient driver options
-
-These keywords are common to `ccsd.kernel` and `ccsd.value_and_grad`:
-
-| Keyword | Default | Meaning |
-| --- | --- | --- |
-| `mp2_grid` | `None` | One MP2/W `(roots, weights)` pair; inherit the fitted grid saved by domain selection. Independent of (T). |
-| `baseline_controls`, `matrix_controls` | `None` | MP2 baseline and W settings matching the saved selections. |
-| `ccsd_t` | `False` | Enable perturbative triples when true. |
-| `triples_controls` | `None` | Deterministic triples if `ccsd_t=True`; must remain `None` if triples are disabled. |
-| `include_hf` | `False` | Include HF once for total molecular energy and gradient. |
-| `return_components` | `False` | Append `CCSDComponents` to the result. |
-| `merge_identical` | `True` | Share identical-domain preparation. |
-| `verbose_imp` | `0` | Impurity solver verbosity. |
-| `comm` | `None` | Serial execution; optionally supply an MPI communicator. |
-| `parallel_scf_jk` | `True` | Distribute shared DF J/K work and its applicable response for MPI domain calls. Set to `False` to keep SCF and shared response on root; no effect on serial calls. |
-| `checkpoint_dir` | `None` | Optional serial progress checkpoint directory. |
-| `resume` | `False` | Resume compatible progress; requires `checkpoint_dir`. Multiple-rank CC progress checkpoints are not supported. |
-
-`kernel(mf, static, ...)` requires a converged MF and selections.
-`value_and_grad(mol, build_mf, static=None, ..., build_static=None)` accepts either
-saved `static` or a `build_static(mf)` callback, which selects once on the detached
-SCF reference. Supply one of these, not both. Its molecule must be configured
-for coordinate derivatives (`mol.build(trace_exp=False, trace_ctr_coeff=False)`).
-With multiple ranks, `build_mf` must also accept the supplied `mo_coeff_init`,
-`mo_energy_init`, `mo_occ_init`, and `e_tot_init`, adopting them without another SCF
-on workers. The comparison runners below use one process.
-
-### Triples dictionary: complete accepted keys
-
-| Key | Default | Meaning / allowed values |
-| --- | --- | --- |
-| `mode` | `"deterministic"` | `deterministic` or `stochastic`. With smooth selections, deterministic means block contraction of the complete selected-space numerator on the fitted Laplace grid, not exact integration of the denominator. |
-| `integral_transform` | `"df"` | `df` contracts raw DF factors into three integral blocks once per fragment; `rotate` reuses cached CCSD `ovvv`, `ovoo`, and `ovov`. Both apply the same stable dressing and support deterministic and stochastic modes. |
-| `nsamples` | Required in stochastic mode | Integer ≥ 2. Nominal production samples per S in fixed-count mode. Still required with a positive tolerance; it does not cap adaptive production. |
-| `global_seed` | `71` | Nonnegative integer smaller than `2**64`. |
-| `energy_tolerance` | Omitted; `0` is equivalent | Total requested triples SE in Eh. Positive values enable adaptive production. |
-| `pilot_samples` | `10000` | Integer ≥ 2, per Laplace point per S; independent pilots are discarded. |
-| `trace_exponent` | `5.0` | Finite positive exponent for triples point variance allocation in tolerance mode. MP2 uses `1.4`. Fixed-count allocation uses measured pilot variances instead. |
-| `variance_allocation` | `"occupied_count"` | Fragment variance shares in tolerance mode. Fragment plans require `occupied_count`. |
-| `fragment_energies` | Saved MP2 proxies in `mp2_energy` mode | Optional finite one-dimensional vector, one value for every physical S; absolute values allocate variance. CCSD proxies must be supplied explicitly. Incompatible with `occupied_count`. |
-
-The last seven keys are sampling controls and are rejected with deterministic
-mode. High-level stochastic `nsamples=0` is invalid: use deterministic mode for
-contraction. The `nsamples=0` convention belongs only to the native entry points.
-
-For example, `triples_controls={"mode": "deterministic", "integral_transform": "rotate"}`
-selects cached-integral rotation. Add `"integral_transform": "rotate"` to a
-stochastic dictionary to use the same option with sampling. The default remains
-`"df"`; the transform choice is included in checkpoint compatibility checks.
-
-Rotation unpacks the CCSD `ovvv` cache once per fragment evaluation and applies
-the occupied/virtual matrix exponentials to each integral index at each Laplace
-point. Reciprocal exponentials on internal contracted indices preserve the
-existing numerator exactly. This route does not prepare transformed B factors
-or rebuild the integral blocks from them. Its pullback reverses the rotations,
-accumulates integral and Fock-block cotangents across points, and differentiates
-the original cached-integral construction once. The outer JAX backward uses
-those accumulated cotangents. Four-index rotation has its own memory and work
-cost, so a speed advantage depends on fragment dimensions and auxiliary rank.
-
-### Variance allocation and sample accounting
+## Variance allocation and sample accounting
 
 For total requested SE T and requested fragment set I, the streaming-selection
 allocation (`variance_allocation="occupied_count"`) is
@@ -377,8 +214,8 @@ T_S^2 = T^2 f_S.
 The counts refer to original occupied fragment targets. The denominator includes
 all active occupied orbitals in the molecule. I contains every physical fragment.
 
-For previously captured concrete labels, `variance_allocation="mp2_energy"` can use saved/overridden
-energies e_S instead give
+For previously captured concrete labels, the internal
+`variance_allocation="mp2_energy"` alternative uses saved/overridden energies e_S:
 
 ```text
 a_S = max(|e_S| / max_{R in I}|e_R|, 1e-12)
@@ -415,145 +252,36 @@ floor; `sigma_q` is the estimated single-draw standard deviation including
 additional. This mode prepares all points for pilot-based allocation, whereas
 positive-target mode can finish and release one point at a time.
 
-### CCSD convergence
+## Deterministic CCSD and response
 
-The inherited RCCSD defaults, absent user configuration, are `conv_tol=1e-7`
-Eh, `conv_tol_normt=1e-5`, and `max_cycle=50`. Both the energy-change and
-amplitude-update-norm tests must pass. The usual diagonal-Fock single/double
-excitation denominators precondition the update; off-diagonal Fock entries remain
-in the equations. The impurity solver uses `PYSCFAD_LNO_CCSD_DIIS_SPACE=3` by
-default; a nonpositive value disables DIIS.
+Deterministic LNO/DLNO fragments use PySCF CPU DF-CCSD iterations and NumPy/BLAS
+lambda response by default. Local Fock, DF and ERI tensors pass in memory;
+the PySCF disk integral builder is bypassed. JAX connects the host solver to
+orbital and geometry response through the custom derivative boundary.
 
-The default `pyscfad_dfccsd_custom_response=True` path solves the response lambda
-equations with tolerance `mycc.conv_tol_normt` and limit `mycc.max_cycle`, using
-DIIS when enabled. These are not separate triples-dictionary options. Set
-`pyscfad.lno.ccsd.RCCSD.conv_tol`, `.conv_tol_normt`, and `.max_cycle` before
-calling the driver; the example runners expose the first two as CLI flags and
-set `.max_cycle=200`. Force requests do not automatically tighten them.
+The lambda source includes the projected fragment energy and triples response,
+with explicit spin-metric and packed-amplitude conversions. Integral adjoints
+are accumulated with the orbital/Fock cotangents. Both forward convergence
+criteria must pass; the amplitude tolerance and iteration limit also govern the
+lambda solve. The diagonal-Fock denominators are preconditioners, while full
+off-diagonal Fock entries remain in the equations.
 
-### Removed controls and saved selections
+`vvvv_direct` controls virtual-ladder caching independently of the local
+half-transformed DF storage. The native solver caches a packed pair matrix
+when allowed by available memory; otherwise it contracts DF factors in blocks.
+Forward iterations share their cache. Backward builds a cache shared by lambda
+and the integral adjoint, releasing it after the host solve. Packed raw `ovvv`
+integrals remain resident with either ladder policy. The optional C++ ladder
+kernel obtains BLAS from SciPy and uses per-worker GEMM panels; other CCSD
+contractions use the host implementation.
 
-`dressing`, `dressing_backend`, `adaptive`, `smooth_explicit_s`, `smooth_gap`,
-`smooth_full_blocks` and a `None` triples point count are not accepted options.
-The CC selection schema is 6. Rebuild selections/checkpoints after this cleanup;
-the native implementation version also participates in checkpoint identity.
+The native RCCSD adapter supports real float64 energies and first derivatives;
+the JAX reference path is needed for higher derivatives. DCSD and CC2 do not
+use that adapter. See the [user guide's build section](../../../pyscfad/dlno_stc/README.md#build-and-verification)
+for the optional extension and configuration switches, and
+[SCF/DF performance notes](../../../README_SERIAL_DF_SCF.md) for the outer response.
 
-## Command-line runners
-
-Run from the repository root with this checkout installed and the native module
-built. [Build instructions](../../../pyscfad/dlno_stc/README.md#build-and-checks)
-list CMake, pybind11, Armadillo, and OpenMP requirements. Both scripts configure
-CPU affinity and numerical workers before importing JAX. Use `--threads 32` for
-the intended host; Python matrix controls otherwise default to one thread.
-The native triples loop processes up to the OpenMP worker count of sample blocks
-at once. Neither script exposes a separate batch count or backward sample count.
-
-### `examples/dlno_stc/smooth_force_compare.py`
-
-Compares smooth deterministic forces with smooth stochastic forces. This
-is the general geometry runner, including C5H6, C6H14, and square H4.
-
-| Flag | Default | Meaning |
-| --- | --- | --- |
-| `--xyz-file` | Required | XYZ geometry, in Angstrom. |
-| `--output-dir` | Required | JSON output directory. |
-| `--threads` | `32` | CPU affinity and numerical worker budget. |
-| `--basis` | `cc-pvdz` | Orbital basis; H/C `def2-SV(P)` is handled explicitly. |
-| `--frozen` | `0` | Frozen occupied count. |
-| `--boys-grouping` | `molecule` | `singleton`, `atom`, or `molecule`. |
-| `--lno-thresh-occ`, `--lno-thresh-vir` | Both `0` | W cutoffs; defaults are untruncated. |
-| `--finite-domains` | Off | Use finite domains; molecule grouping still forces full domains. |
-| `--selection-only` | Off | Stop after selections and settings output. |
-| `--triples-energy-tolerance-mha` | `0.05` | Total requested `(T)` SE in mEh; zero selects fixed counts. |
-| `--samples` | `16446469` | Nominal production draws per S when tolerance is zero. |
-| `--triples-pilot-samples` | `10000` | Independent pilot draws per point per S. |
-| `--triples-laplace-points` | `4` | Fitted triples point count. |
-| `--triples-trace-exponent` | `5.0` | Triples trace-model exponent. |
-| `--triples-budget-energy` | `mp2` | `mp2` uses selection proxies; `ccsd` uses fragment energies from the deterministic reference. |
-| `--seeds` | Empty | One stochastic calculation per seed; an empty list skips stochastic runs. |
-| `--reference` | None | Reuse a compatible deterministic result JSON instead of computing it. |
-| `--fd-coordinate` | None | Two zero-based integers `ATOM AXIS`; central finite differences of smooth deterministic energies. |
-| `--fd-step` | `1e-4` | Finite-difference displacement in bohr. |
-| `--cc-conv-tol` | `1e-10` | Forward CCSD energy-change threshold in Eh. |
-| `--cc-conv-tol-normt` | `1e-8` | Forward amplitude and backward response update-norm threshold. |
-
-### `examples/dlno_stc/benchmark_lno_w_triples.py`
-
-Runs a queue of target/seed pairs, saving each result. This specialized runner
-currently asserts C5H6 for molecule grouping (including C-then-H atom order) and
-C20H42 for atom grouping, with one or twenty physical S respectively. Use the
-comparison runner above for other molecules.
-
-| Flag | Default | Meaning |
-| --- | --- | --- |
-| `--threads`, `--xyz-file`, `--basis`, `--frozen`, `--output-dir` | Required | Worker budget and molecular/output settings. |
-| `--boys-grouping` | Required | `molecule` or `atom`, subject to the restrictions above. |
-| `--targets-meh` | Empty | Positive distinct total triples SE targets in mEh. |
-| `--seeds` | Empty | Distinct nonnegative seeds. |
-| `--job-indices` | All target/seed jobs | Zero-based subset of the target-major, seed-minor job list. |
-| `--pilot-samples` | `20000` | Pilot draws per triples point per S; pass `10000` to match the chosen production setup. |
-| `--max-memory-mb` | `800000` | Molecular memory setting and advisory matrix planning budget, in MB. |
-| `--cc-conv-tol` | `1e-7` | Forward CCSD energy-change threshold in Eh. |
-| `--cc-conv-tol-normt` | `1e-5` | Forward amplitude and backward response update-norm threshold. |
-| `--triples-method` | `smooth` | Only `smooth` is supported. |
-| `--triples-integral-transform` | `df` | `df` or `rotate`. |
-| `--triples-laplace-points` | `4` | Fitted triples points per LIS. |
-| `--smooth-trace-exponent` | `5.0` | Trace-model exponent. |
-| `--selection-only` | Off | Stop after selections and settings output. |
-| `--deterministic-only` | Default | Compute only the deterministic reference. |
-| `--compare-solvers` | Off | Compute the deterministic reference and requested stochastic jobs. |
-| `--stochastic-only` | Off | Run only requested stochastic jobs. Mutually exclusive with `--deterministic-only`. |
-| `--reference` | None | Reuse a compatible deterministic JSON; invalid with `--deterministic-only`. |
-
-This runner uses cutoff-selected MP2 domains for `boys_grouping="atom"`,
-with `full_domain=False` and the `BoysDomainThresholds` defaults.
-Molecule grouping retains one full molecular domain. Actual selected MP2
-domain sizes and all cutoffs are written to `domain_selection.json`.
-The runner uses W with `thresh_occ=1e-4` and
-`thresh_vir=1e-5`. Smooth deterministic triples use the selected-occupied
-block algorithm described above. Target/seed arguments are required only for
-`--stochastic-only` or `--compare-solvers`; deterministic is the default.
-
-### Settings shared by the runners
-
-Both obtain deterministic MP2 energy from their W matrices, using a six-point fitted MP2 grid
-with `lambda_gradient=0.1` and automatic auxiliary-basis
-selection. For H/C `def2-SV(P)`, the scripts explicitly use def2-SVP on carbon,
-only its s shells on hydrogen, and `def2-svp-jkfit` as the auxiliary basis.
-Both use DF-RHF thresholds `conv_tol=1e-9` and `conv_tol_grad=1e-6`, atomic Boys
-initialization with `conv_tol=1e-10`, and Boys derivative GMRES settings
-`restart=120`, `maxiter=100`. These are runner settings, not triples controls.
-Boys localization checks the lowest orbital-Hessian curvature before its
-implicit response and attempts up to three saddle escapes by default
-(`max_saddle_escapes=3`). If no minimum is found, it retains the best stationary
-solution with a warning; failure to find a stationary solution still raises.
-Saved STC branches replay with zero saddle escapes to preserve their orbital
-labels and domains. Negative response modes remain included. Every response
-checks the original equation's residual, with default relative and absolute
-tolerances of `1e-7`. Declared gauge null modes require a compatible right-hand
-side; incompatible components are rejected instead of silently discarded.
-
-STC Boys reference replay differentiates the occupied-frame polar alignment,
-including the current-geometry side of the cross-AO overlap. Its derivative
-uses sums of singular values, so equal singular values at the reference are
-well defined. Internal canonical occupied rotations cancel before the SCF
-response; occupied–virtual and overlap response remain included. This does
-not change SCF eigenvalue-gap thresholds or freeze localization response.
-The real restricted SCF fixed-point density also uses a spectral-projector
-derivative: equal-occupation blocks have zero Fock response and their exact
-overlap response. Only different-occupation blocks require energy denominators.
-This avoids cancellation noise in the density Jacobian at occupied or virtual
-degeneracies; individual canonical-orbital output derivatives are unchanged.
-The two runners fix CCSD `max_cycle=200`. The comparison script fixes memory at 800000 MB;
-the benchmark exposes it as a flag. This setting leaves room on the approximately
-900 GB host; STC planning budgets are advisory rather than memory reservations.
-
-## Results and verification
-
-`benchmark_lno_w_triples.py --triples-method smooth` runs the retained path.
-`smooth_force_compare.py` compares retained smooth calculations with a
-smooth deterministic energy/force reference, including finite differences.
-CPU affinity is derived from the requested thread count before JAX imports.
+## Diagnostics and verification
 
 `return_components=True` provides each fragment's `e_mp2_lis`, `e_ccsd`, `e_triples`,
 `triples_samples`, `triples_standard_error`, and `triples_diagnostics`. The latter
@@ -563,9 +291,7 @@ initial/adaptive/total production counts, weighted energies/variances,
 `triples_grid` holds the quadrature-fit diagnostics. The MP2 baseline SE is
 separate from triples SE.
 
-The comparison runner writes `settings.json`, the individual energy/force result
-JSONs, and `comparison.json` (or `fragment_comparison.json` for a one-S test).
-It reports
+The comparison runner reports
 
 ```text
 RMS force error [mEh/bohr]

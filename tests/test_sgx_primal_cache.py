@@ -37,7 +37,7 @@ def test_exact_primal_cache_reuses_components_and_protects_outputs(mol, monkeypa
 def test_primal_cache_invalidates_and_obeys_bounds(mol, change):
     mf = build(mol)
     backend, tol = mf._sgx_backend, mf.direct_scf_tol
-    original_workspace = backend.memory
+    original_workspace = backend.df_memory_mb
     dm = np.eye(mol.nao)
     backend.primal_jk(mol, dm, True, True, tol)
     current = mol
@@ -54,7 +54,7 @@ def test_primal_cache_invalidates_and_obeys_bounds(mol, change):
         current._env = mol._env.copy()
         current._env[AS_RINV_ORIG_ATOM] = 1
     else:
-        backend.memory = 1e-9
+        backend.df_memory_mb = 1e-9
     before = backend.primal_cache_stats.copy()
     actual = backend.primal_jk(current, dm, True, True, tol)
     if change == 'budget':
@@ -62,7 +62,7 @@ def test_primal_cache_invalidates_and_obeys_bounds(mol, change):
         assert not backend._primal_cache
         # Restore calculation workspace for the independent uncached build.
         # A sub-byte allowance cannot hold an aligned generated grid panel.
-        backend.memory = original_workspace
+        backend.df_memory_mb = original_workspace
     elif change == 'scratch_origin':
         assert backend.primal_cache_stats['hits'] == before['hits']+1
     else:

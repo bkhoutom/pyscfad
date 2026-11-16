@@ -178,7 +178,7 @@ class _DFHF(pytree.PytreeNode, pyscf_df_jk._DFHF):
         native = util.to_pyscf(self, nocopy_names=('mol',), out=RHF(mol))
         return sgx_fit(native, auxbasis=backend.auxbasis,
                        grid_level=backend.grid_level, fit_ovlp=backend.fit_ovlp,
-                       max_memory=backend.memory)
+                       df_memory_mb=backend.df_memory_mb)
 
     def _get_veff_from_occ(self, mo_coeff=None, mo_occ=None, *, factors=None,
                           factor_response=True):

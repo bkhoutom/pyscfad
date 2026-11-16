@@ -103,8 +103,14 @@ limit; differentiable primary selection and replay retain the JAX path.
 Selection discovers the loaded BLAS libraries once, and each dense helper
 restores the caller's limits on return or error. This does not change OpenMP
 budgets for integrals/native MP2, any selection cutoff, or ED QR construction.
-The default parent PAO cutoff is `pao_norm=1e-2` on the norm, equivalent
-to a squared norm greater than `1e-4`. Individual normalized PAOs are
+The parent PAO cutoff `pao_norm` applies directly to the squared AO-overlap
+norm: retain a raw PAO `p` when `p.T @ S @ p > pao_norm`. The default is
+`pao_norm=1e-4`, so STC inputs using `--pao-norm 1e-4` select this same cutoff.
+This preserves the physical default formerly written as `pao_norm=1e-2`
+under the norm convention. To preserve another old explicit norm cutoff,
+square its value. Rebuild saved selections and checkpoints from the old
+convention. Retained PAOs are still normalized by the square root of their
+squared norm. Individual normalized PAOs are
 projected onto the ED AOs, retained when their squared norm is at least
 `ed_pao - 1e-4` (default `0.9949`), and orthogonalized among themselves
 with the local Gram cutoff `ed_pao_rank=1e-6`. ED MP2 retains the small
@@ -964,7 +970,7 @@ this policy are unsupported. The enabled build adds a CTest for scope restoratio
 `pyscfad/dlno_stc/test/test_triples_blas_threads.py` checks numerical parity and
 observed thread counts.
 
-Restart algorithm ABI 5 and grouping convention `boys_exact_domain_groups_v3`
+Restart algorithm ABI 6 and grouping convention `boys_exact_domain_groups_v3`
 require fresh checkpoints after restoring the anchored virtual frame. Older
 finite packets using `local_before_fock_v1` or `local_before_fock_v2` must be
 re-exported; the outer tensor exchange schema and checkpoint container version
@@ -1003,8 +1009,8 @@ frame, native triples selects target rows by copying and scatters their
 cotangents; it still evaluates the full independent fragment-projector
 cotangent. Existing smooth anchors remain readable in their saved ordering.
 Global-space LIS checkpoints are rejected and must be rebuilt. Selection
-schema 13 and algorithm ABI 5 invalidate checkpoints from the earlier ED
-occupied-projection equations.
+schema 13 and algorithm ABI 6 invalidate checkpoints from the earlier ED
+occupied-projection equations and norm-based parent PAO cutoff convention.
 
 `build_static_selections` defaults to `single_pass=True` for W calculations
 and returns a plan without a W prepass. Production

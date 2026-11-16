@@ -262,6 +262,9 @@ energy uncertainty; it does not impose a force uncertainty or RMS-error target.
 `bp_ed=0.9998`, `bp_pao=0.98`, `pao_norm=1e-4`, `domain_pao=1e-4`,
 `ed_pao=0.995`, `metric_rank=1e-10`, `pair_energy=1.5e-5`,
 `near_pair_distance=3.5`, and `multipole_order=4`.
+`pao_norm` is a squared AO-overlap norm cutoff: a parent PAO `p` is retained
+when `p.T @ S @ p > pao_norm`. Thus `pao_norm=1e-4` means a squared-norm
+threshold of `1e-4` (equivalent to the former norm threshold of `1e-2`).
 See the [domain and MP2 guide](../../../pyscfad/dlno_stc/README.md) for their definitions.
 
 `ccsd.build_static_selections(mf, mp2_static, ...)`:

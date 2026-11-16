@@ -67,7 +67,7 @@ def _root_call(comm, rank, function, phase):
 def _validate_static(static):
     if not isinstance(static, DomainSelections):
         raise TypeError("static must be DomainSelections")
-    if vars(static).get('domain_convention') != 'individual-partners-pair4-pcd-aux-v2':
+    if vars(static).get('domain_convention') != 'individual-partners-pair4-pcd-aux-pao-norm2-v3':
         raise ValueError('incompatible domain convention; rebuild domain selections')
     if static.frozen is None:
         raise ValueError("STC requires an explicit frozen-space setting")

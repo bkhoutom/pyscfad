@@ -53,7 +53,7 @@ __all__ = [
 _FORMAT_NAME = "pyscfad-dlno-stc-boys-restart"
 _FORMAT_VERSION = 1
 # Invalidate cotangents when the selected three-input Boys equations change.
-_ALGORITHM_ABI = 5
+_ALGORITHM_ABI = 6
 _EQUATION_ID = "boys-selected-three-input-v1"
 _GROUPING_CONVENTION = "boys_exact_domain_groups_v3"
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -449,9 +449,9 @@ def _decode_value(node, reader):
         }
         if (cls.__name__ == "DomainSelections" and
                 kwargs["domain_convention"] !=
-                "individual-partners-pair4-pcd-aux-v2"):
+                "individual-partners-pair4-pcd-aux-pao-norm2-v3"):
             raise RestartMismatchError(
-                "Domain pair normalization is incompatible. Rebuild selections "
+                "Domain convention (PAO cutoff and pair normalization) is incompatible. Rebuild selections "
                 "and checkpoints; migration is unsupported."
             )
         if cls.__name__ == "CCSDSelections":

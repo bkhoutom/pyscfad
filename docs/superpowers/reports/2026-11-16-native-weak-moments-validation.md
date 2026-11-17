@@ -1,7 +1,18 @@
 # Native weak-moment integration validation
 
 Target: `dlno-stc`, based on `11c00a34`, including primary workspace bucketing
-(`63d458e2`, `441da7d8`) and native moment contractions (`8c55ea5d`).
+(`63d458e2`, `441da7d8`), native moment contractions (`8c55ea5d`), and driver
+integration (`9ee9a665`).
+
+The complete range `11c00a34..9ee9a665` received an independent review with
+no critical, important, or minor findings. The reviewer independently ran
+67 weak-moment, primary-bucket, native-moment, and endpoint-replay checks.
+The target was refreshed, fast-forwarded without conflicts, and verified
+from the main `dlno-stc` checkout: **109 tests passed in 76.51 seconds**
+(weak-moment kernels, native moments/replay, primary buckets, shared
+multipoles, and shared weak endpoints). The production changes were pushed
+without force and remote/local agreement at `9ee9a665` was verified.
+Subsequent completion-record updates change documentation only.
 
 Local environment: Python 3.11, JAX 0.10.2, NumPy 2.4.6, CPU float64,
 AMD Ryzen 7 7800X3D. Numerical checks used CPU affinity 0–3,

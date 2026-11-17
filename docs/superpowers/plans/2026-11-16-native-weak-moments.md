@@ -57,8 +57,8 @@
 
 **Interfaces:** Combined diff from `origin/dlno-stc` through the finished candidate, including earlier primary-bucketing commits.
 
-- [ ] Request one fresh whole-branch code review, addressing critical/important findings with reproducing tests.
-- [ ] Finish applicable verification, check the diff and clean status, and record exact results.
-- [ ] Fetch `origin`, incorporate any new target changes and retest if necessary.
-- [ ] Fast-forward or merge the verified result into local `dlno-stc` and push `origin dlno-stc` without force.
-- [ ] Verify remote/local commit agreement and report commit IDs, tests, and remaining large-system validation limits.
+- [x] Request one fresh whole-branch code review, addressing critical/important findings with reproducing tests.
+- [x] Finish applicable verification, check the diff and clean status, and record exact results.
+- [x] Fetch `origin`, incorporate any new target changes and retest if necessary.
+- [x] Fast-forward or merge the verified result into local `dlno-stc` and push `origin dlno-stc` without force.
+- [x] Verify remote/local commit agreement and report commit IDs, tests, and remaining large-system validation limits.

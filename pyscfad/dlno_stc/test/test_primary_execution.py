@@ -92,6 +92,13 @@ def test_concrete_finishing_does_not_replace_live_response(boys_water_dimer,monk
         target_coeff=reference.target_reference_coeff)
     assert calls['reference']>0 and calls['live']==0
     calls['reference']=0
-    driver._select_domain_reference(mf,lambda current:
+    static,_,_,receipt=driver._select_domain_reference(mf,lambda current:
         _selection.build_domain_selections(current,frozen=reference.frozen))
     assert calls['reference']==0 and calls['live']>0
+    _,_,pending=receipt.take(static)
+    assert pending is not None
+    _,(_,common_bar)=pending[1]
+    # Preserve the carryover's numerical check alongside host dispatch counts.
+    for name in ('s1e','fock','pao_coeff'):
+        derivative=np.asarray(getattr(common_bar,name))
+        assert np.isfinite(derivative).all() and np.linalg.norm(derivative)>0

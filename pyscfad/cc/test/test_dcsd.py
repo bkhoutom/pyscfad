@@ -14,7 +14,7 @@
 
 import numpy
 import jax
-from pyscfad import scf
+from pyscfad import config_update, scf
 from pyscfad.cc import dfdcsd
 
 def test_df_nuc_grad(get_mol):
@@ -25,7 +25,10 @@ def test_df_nuc_grad(get_mol):
         mycc = dfdcsd.RDCSD(mf)
         mycc.kernel()
         return mycc.e_tot
-    g1 = jax.grad(energy)(mol).coords
+    # DCSD retains the reference response; the custom DF-CCSD adjoint only
+    # implements ordinary CCSD. Keep this numerical DCSD gradient regression.
+    with config_update('pyscfad_dfccsd_custom_response', False):
+        g1 = jax.grad(energy)(mol).coords
     # finite difference
     g0 = numpy.array([[0., 0., -0.08500490828],
                       [0., 0.,  0.08500490828]])

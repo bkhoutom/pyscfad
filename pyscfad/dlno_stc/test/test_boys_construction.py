@@ -31,6 +31,7 @@ def test_public_selection_preserves_permuted_labels_and_concrete_anchors(referen
         full_domain=True,
     )
     assert type(static).__module__ == "pyscfad.dlno_stc._selection"
+    static = dlno_stc.materialize_domain_selections(reference, static)
     common = domain.rebuild_domain_data(reference, static)
     for index, fragment in enumerate(static.fragments):
         frame = domain.build_boys_ed_frame(common, static, index)
@@ -46,8 +47,11 @@ def test_public_selection_preserves_permuted_labels_and_concrete_anchors(referen
         pivot = np.argmax(abs(expected), axis=0)
         expected *= np.where(expected[pivot, np.arange(4)] < 0, -1., 1.)
         np.testing.assert_allclose(frame.occupied_coeff, expected, atol=1e-10)
-        coeff = np.concatenate((frame.occupied_coeff, frame.virtual_coeff), axis=1)
-        np.testing.assert_allclose(coeff.T @ s22 @ coeff, np.eye(6), atol=1e-9)
+        # ED MP2 keeps AO-truncation occupied/virtual overlap by design.
+        # Each retained space must still be normalized independently.
+        for coeff in (frame.occupied_coeff, frame.virtual_coeff):
+            np.testing.assert_allclose(coeff.T @ s22 @ coeff,
+                                       np.eye(coeff.shape[1]), atol=1e-9)
 
 
 def test_selection_rejects_invalid_target_partition_and_rank_loss(reference):
@@ -57,6 +61,7 @@ def test_selection_rejects_invalid_target_partition_and_rank_loss(reference):
     with pytest.raises(ValueError, match="orthonormal|span"):
         dlno_stc.build_domain_selections(reference, frozen=1, target_coeff=np.ones((7, 4)))
     static = dlno_stc.build_domain_selections(reference, frozen=1, full_domain=True)
+    static = dlno_stc.materialize_domain_selections(reference, static)
     common = domain.rebuild_domain_data(reference, static)
     fragment = replace(static.fragments[2], strong_occ_metric_keep=np.arange(3))
     broken = replace(static, fragments=static.fragments[:2] + (fragment,) + static.fragments[3:])
@@ -65,7 +70,7 @@ def test_selection_rejects_invalid_target_partition_and_rank_loss(reference):
 
 
 def test_standalone_system_frame_replays_frozen_virtual_and_continuous_response(reference):
-    assert hasattr(domain, "build_system_local_frame")
+    assert hasattr(system_reference, "build_system_local_frame")
     occupied, virtual = np.arange(1, 5), np.array([5])
     frame = system_reference.build_system_local_frame(reference, occupied, virtual)
     expected = system_reference.build_system_local_frame(reference, occupied, virtual)

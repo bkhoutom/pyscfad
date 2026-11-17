@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 from pyscfad.dlno_stc import _pairs
+from pyscfad.lib._multipole import pair_energy as reference_pair_energy
 
 
 def test_weak_mpi_subprocess():
@@ -60,7 +61,9 @@ def _fixture(order):
     mf = Inputs(jnp.array([[0., .1, .2], [.2, .1, -.1], [-.1, .3, .2]]), jnp.array(.7))
     common = Common(jnp.array([.2, .4, .6]))
     static = SimpleNamespace(thresholds=SimpleNamespace(multipole_order=order),
-                             strong_mask=np.eye(10, dtype=bool))
+                             strong_mask=np.eye(10, dtype=bool),
+                             fragments=tuple(SimpleNamespace(primary_atoms=(i,))
+                                             for i in range(10)))
     pairs = ((2, 5), (2, 9), (5, 9))
 
     def endpoint(m, c, s, index):
@@ -77,7 +80,7 @@ def _fixture(order):
 
 
 def _install_split_fixture(monkeypatch, order):
-    """Replace only the numerical screen and moment builders, keeping AD real."""
+    """Supply synthetic values and explicit tapes at the host replay boundaries."""
     fixture = _fixture(order)
     calls = Counter()
 
@@ -103,6 +106,24 @@ def _install_split_fixture(monkeypatch, order):
     monkeypatch.setattr(_pairs, '_weak_endpoint_from_screen', moments)
     monkeypatch.setattr(_pairs, 'build_weak_endpoint',
                         lambda m, c, s, i: moments(m, screen(c, s, i), s, i))
+
+    def fixed_screen(common, static, index):
+        return jax.vjp(lambda current: _pairs.build_weak_multipole_screen(
+            current, static, index), common)
+
+    def raw_moments(mf, atoms, order):
+        # Synthetic molecular leaves stand in for raw AO operators. Production
+        # replay still composes their tape with the retained orbital tape.
+        return mf, lambda bar: (bar,)
+
+    def moment_response(mf, saved_screen, raw, static, index):
+        return jax.vjp(lambda current_screen, current_raw:
+            _pairs._weak_endpoint_from_screen(current_raw, current_screen, static, index),
+            saved_screen, raw)
+
+    monkeypatch.setattr(_pairs._weak_numpy, 'fixed_screen', fixed_screen)
+    monkeypatch.setattr(_pairs, '_origin_zero_moments_vjp', raw_moments)
+    monkeypatch.setattr(_pairs, '_weak_moment_vjp', moment_response)
     return fixture, calls
 
 
@@ -136,7 +157,7 @@ def test_distributed_retained_screen_and_idle_rank(monkeypatch, order, with_grad
 
     def direct(m, c):
         return sum((.5 if (i, j) == (2, 5) else 1.) *
-                   _pairs._multipole_pair_energy(endpoint(m, c, static, i),
+                   reference_pair_energy(endpoint(m, c, static, i),
                    endpoint(m, c, static, j), order) for i, j in pairs)
 
     expected, expected_bars = jax.value_and_grad(direct, argnums=(0, 1))(mf, common)
@@ -272,7 +293,7 @@ def test_energy_only_avoids_all_cotangent_preparation(monkeypatch, empty):
     monkeypatch.setattr(_pairs, 'build_weak_endpoint', endpoint)
     def forbidden(*args):
         raise AssertionError('energy-only weak path prepared cotangents')
-    monkeypatch.setattr(_mpi_weak, 'zero_term_cotangents', forbidden)
+    monkeypatch.setattr(_pairs._weak_numpy, 'zeros', forbidden)
     monkeypatch.setattr(_pairs, 'pair_energy_and_grad', forbidden)
     monkeypatch.setattr(_pairs, '_prepare_weak_endpoint', forbidden)
     monkeypatch.setattr(_pairs, '_replay_weak_endpoint', forbidden)

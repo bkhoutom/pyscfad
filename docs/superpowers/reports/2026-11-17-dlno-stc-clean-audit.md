@@ -165,3 +165,20 @@ to at most 67 target rows and 19 preprojection rows because the host path has no
 bucket boundary. Varied endpoint widths retain 127/128/129 and reach 259 for the
 compilation-growth check. These are bounded workstation regressions, not a claim
 about HPC-scale memory or end-to-end performance.
+
+## Additional baseline fixture repair found during final validation
+
+`test_mpi_weak.py` was unchanged between the source tips, but its synthetic
+fixtures still expected the pre-NumPy response boundaries. A fresh four-rank
+run failed 10 of 12 cases on every rank: missing fragment metadata, JAX AD
+through a host-only pair function, and a guard on a removed allocation helper.
+The real molecular domain/pipeline MPI checks passed independently.
+
+The test-only repair supplies explicit screen/raw/moment tapes at current host
+boundaries, uses the independent JAX pair oracle, and guards the current host
+zero allocator. All original tests and assertions remain, including asymmetric
+pair weights, idle owners, collective failures, variable buffers and tape
+release. Production endpoint exchange, replay and pair derivatives remain active.
+After review, all 12 cases passed on each of four ranks and the bounded subprocess
+wrapper passed. This is an additional intentional test difference from the fix
+baseline, not a production modification.

@@ -235,3 +235,61 @@ def test_nongrouped_endpoint_replay_preserves_molecule_and_orbital_response(monk
         np.testing.assert_allclose(got, want, rtol=2e-12, atol=1e-10)
     assert np.linalg.norm(actual_screen.occupied_coeff) > 1e-6
     assert np.linalg.norm(actual_screen.virtual_coeff) > 1e-6
+
+
+@pytest.mark.parametrize('grouped', [False, True])
+def test_native_endpoint_replay_preserves_all_shared_molecular_and_screen_response(monkeypatch, grouped):
+    from pyscfad.dlno_stc import _weak_moments
+
+    mf = scf.RHF(_molecule())
+    supports = ((0, 1, 2), (0, 1, 2), (2, 0))
+    static = SimpleNamespace(
+        fragments=tuple(SimpleNamespace(primary_atoms=np.asarray(a)) for a in supports),
+        thresholds=SimpleNamespace(multipole_order=4))
+    common = jnp.asarray(.23)
+    screens = []
+    rng = np.random.default_rng(384)
+    for atoms, columns in zip(supports, (3, 129, 5)):
+        rows = _pairs._fake_mol_with_traced_centers(mf.mol, atoms).nao
+        screens.append(_pairs.WeakScreen(np.array([-.5]), rng.normal(size=(rows, 1)) * .07,
+            np.linspace(.2, 1., columns), rng.normal(size=(rows, columns)) * .05))
+
+    def build_screen(value, index):
+        s = screens[index]
+        return s._replace(occupied_coeff=s.occupied_coeff * (1 + value),
+                          virtual_coeff=s.virtual_coeff * (1 - .2 * value),
+                          virtual_energy=s.virtual_energy + value * .1)
+
+    def reference(m, c):
+        return tuple(_pairs._weak_endpoint_from_screen(m, build_screen(c, i), static, i)
+                     for i in range(3))
+
+    expected, reference_pullback = jax.vjp(reference, mf, common)
+    seeds = tuple(_seeds(value, seed=42+i) for i, value in enumerate(expected))
+    expected_bars = reference_pullback(seeds)
+    _, zero_pullback = jax.vjp(lambda m, c: jnp.asarray(0.), mf, common)
+    bars = zero_pullback(jnp.asarray(1.))
+    linearizations = {i: jax.vjp(lambda c: build_screen(c, i), common) for i in range(3)}
+    originals = {i: expected[i] for i in range(3)}
+    used = []
+    original_linearize = _weak_moments.linearize
+
+    def tracked(screen, raw, order):
+        used.append(screen.virtual_coeff.shape)
+        return original_linearize(screen, raw, order)
+
+    monkeypatch.setattr(_weak_moments, 'linearize', tracked)
+    if grouped:
+        bars = _pairs._grouped_weak_pullback(mf, static, dict(originals), dict(originals),
+            linearizations, {i: seeds[i] for i in range(3)}, bars, {}, {})
+    else:
+        from pyscfad.dlno_stc.adjoint import add_cotangent
+        for i in range(3):
+            value, pullback = _pairs._replay_weak_endpoint(mf, linearizations[i], static, i)
+            assert _pairs.endpoint_matches_reference(value, originals[i])
+            bars = jax.tree_util.tree_map(add_cotangent, bars, pullback(seeds[i]))
+    for got, want in zip(jax.tree_util.tree_leaves(bars), jax.tree_util.tree_leaves(expected_bars)):
+        np.testing.assert_allclose(got, want, rtol=2e-10, atol=2e-10)
+    assert len(used) == 3, 'endpoint replay still compiled physical AO dimensions'
+    assert np.linalg.norm(bars[0].mol.coords) > 1e-6
+    assert abs(float(bars[1])) > 1e-6

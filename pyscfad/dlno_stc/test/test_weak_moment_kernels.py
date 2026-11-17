@@ -127,3 +127,90 @@ def test_traced_inputs_are_left_to_general_jax():
 
     actual = jax.grad(check)(jnp.asarray(screen.virtual_coeff))
     np.testing.assert_allclose(actual, 2 * screen.virtual_coeff, rtol=1e-14, atol=1e-14)
+
+
+def _driver_linearize():
+    function = getattr(_pairs, '_linearize_weak_moments', None)
+    assert callable(function), 'weak replay must dispatch supported endpoint moments to native BLAS'
+    return function
+
+
+@pytest.mark.parametrize('case', ['order2', 'order3', 'mixed', 'float32', 'full_cartesian'])
+def test_driver_fallback_preserves_values_and_all_input_response(case):
+    linearize = _driver_linearize()
+    screen, raw = _fixture(11, 5)
+    order = 4
+    if case.startswith('order'):
+        order = int(case[-1])
+        raw = raw[:order] + (None,) * (4 - order)
+    elif case == 'mixed':
+        screen = screen._replace(virtual_coeff=screen.virtual_coeff * (1 + .2j))
+    elif case == 'float32':
+        screen, raw = jax.tree_util.tree_map(lambda x: x.astype(np.float32), (screen, raw))
+    else:
+        rng = np.random.default_rng(38)
+        raw = (*raw[:2], rng.normal(size=(3, 3, 11, 11)), rng.normal(size=(3, 3, 3, 11, 11)))
+    expected, reference_pullback = jax.vjp(lambda s, r: _reference(s, r, order), screen, raw)
+    actual, pullback = linearize(screen, raw, order)
+    _assert_tree(actual, expected)
+    _assert_tree(pullback(_seeds(expected)), reference_pullback(_seeds(expected)))
+
+
+def test_driver_native_pullback_accepts_traced_weights():
+    linearize = _driver_linearize()
+    screen, raw = _fixture(17, 129)
+    endpoint, pullback = linearize(screen, raw, 4)
+    _, reference_pullback = jax.vjp(_reference, screen, raw)
+    seeds, direction = _seeds(endpoint), _seeds(endpoint, 84)
+    actual, tangent = jax.jvp(pullback, (seeds,), (direction,))
+    _assert_tree(actual, reference_pullback(seeds))
+    _assert_tree(tangent, reference_pullback(direction))
+
+
+def test_driver_traced_primals_preserve_directional_derivative():
+    linearize = _driver_linearize()
+    screen, raw = _fixture(13, 7)
+    direction = _seeds((screen, raw), 43)
+    expected = jax.jvp(_reference, (screen, raw), direction)
+    actual = jax.jvp(lambda s, r: linearize(s, r, 4)[0], (screen, raw), direction)
+    _assert_tree(actual, expected)
+
+
+def test_driver_new_physical_sizes_do_not_compile_more_endpoint_kernels(caplog):
+    linearize = _driver_linearize()
+    crop = getattr(_pairs, '_crop_weak_endpoint_cotangent', None)
+    accumulate = getattr(_pairs, '_accumulate_weak_raw_bars', None)
+    assert callable(crop) and callable(accumulate)
+
+    def evaluate(rows, columns):
+        screen, raw = _fixture(rows, columns)
+        value, pullback = linearize(screen, raw, 4)
+        seed = _seeds(value)
+        padded = (seed[0],) + tuple(np.pad(x, ((0, 0),) * (x.ndim - 1) +
+            ((0, (-columns) % 128),)) for x in seed[1:])
+        screen_bar, raw_bar = pullback(crop(padded, value))
+        accumulator = accumulate(None, raw_bar)
+        accumulator = accumulate(accumulator, raw_bar)
+        jax.block_until_ready((screen_bar, accumulator))
+
+    with jax.log_compiles(True):
+        # Check that compilation logging is observable before asserting its
+        # absence for additional physical dimensions.
+        jax.jit(lambda x: x + .37)(np.zeros(3)).block_until_ready()
+        assert any('Compiling' in r.getMessage() for r in caplog.records)
+        evaluate(7, 3)
+        caplog.clear()
+        for rows, columns in ((19, 127), (37, 128), (71, 129), (133, 259)):
+            evaluate(rows, columns)
+    assert not [r.getMessage() for r in caplog.records if 'Compiling' in r.getMessage()]
+
+
+def test_host_raw_accumulation_preserves_traced_linear_response():
+    accumulate = getattr(_pairs, '_accumulate_weak_raw_bars', None)
+    assert callable(accumulate)
+    left = (np.arange(6.).reshape(2, 3), None)
+    right = (np.full((2, 3), .3), None)
+    tangent = (np.full((2, 3), .7), None)
+    actual, derivative = jax.jvp(lambda value: accumulate(left, value), (right,), (tangent,))
+    _assert_tree(actual, (left[0] + right[0], None))
+    _assert_tree(derivative, tangent)

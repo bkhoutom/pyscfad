@@ -31,7 +31,8 @@ def is_concrete_cpu(tree):
 
 def supports(screen, raw, order):
     """Restrict the native rule to one double-precision packed order-4 endpoint."""
-    if (order != 4 or not jax.config.x64_enabled or len(raw) != 4
+    if (order != 4 or not jax.config.x64_enabled
+            or not hasattr(screen, 'occupied_coeff') or len(raw) != 4
             or any(value is None for value in raw)
             or not is_concrete_cpu((screen, raw))):
         return False

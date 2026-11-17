@@ -401,6 +401,30 @@ exact screen, then applies the retained orbital pullback. Orbital and energy
 response remain differentiated; there is no eigensolver reconstruction or
 orbital-sign matching during replay.
 
+Concrete CPU order-4 endpoints use native BLAS for packed AO-moment
+contractions and fixed 128-column JAX tiles for moment translation and its
+transpose. Physical AO and virtual tensors retain their selected dimensions;
+only the small translation tiles are padded. The same kernels are reused as
+physical dimensions grow. Concrete cotangent cropping and shared raw-moment
+accumulation also run on the host, avoiding additional shape-specific JAX
+slices and additions. Native contractions honor `PYSCFAD_DENSE_BLAS_THREADS`.
+This translation tile size is independent of `PYSCFAD_WEAK_PAIR_BUCKET_SIZE`.
+
+The fast endpoint rule supports homogeneous float64 or complex128 coefficients
+and packed operators, with real float64 orbital energies. Lower moment orders,
+other layouts/dtypes/devices, and traced inputs retain the general JAX rule.
+A native linearization also re-enters the JAX rule if its eventual cotangent
+is traced, preserving differentiation of the pullback. No scientific threshold,
+pair-energy formula, or orbital-selection rule changes.
+
+Primary response uses geometrically spaced padded workspaces for its dense
+algebra while retaining physical rank selection and original-frame fallbacks
+near ambiguous cutoffs or degenerate gauges. This reduces compiled variants
+without splitting eigensystems. Endpoint tiling and primary bucketing reduce
+mapping pressure in their respective kernels; other phases can still create
+compiled shapes. They do not impose a process-wide mapping budget or clear
+JAX caches.
+
 For gradient calls using `build_static`, serial MP2 and the CCSD driver now
 prepare these endpoints during domain screening. Weak energy and cotangents are
 completed after atom-group expansion of the strong mask, before strong-frame

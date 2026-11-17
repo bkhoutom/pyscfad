@@ -44,12 +44,12 @@
 
 **Interfaces:** `_linearize_weak_moments(screen, raw, order)` chooses native or reference VJP and handles traced pullback seeds. Existing `_weak_endpoint_from_screen`, `_replay_weak_endpoint`, and `_grouped_weak_pullback` retain signatures and outputs. Host cotangent cropping and accumulation must preserve the traced JAX path.
 
-- [ ] Write failing integration tests for the native replay route and stable executable compilation as physical dimensions change. Add traced seeds, unsupported orders/layouts/dtypes, and grouped/non-grouped response checks.
-- [ ] Run those tests before modifying the driver; verify the missing-route/compilation failure.
-- [ ] Route supported forward and reverse calls through Task 1, crop concrete CPU seeds on host, and accumulate raw cotangents on host with general AD fallback.
-- [ ] Run weak endpoint, moment, pair, primary, MPI-weak (when available), and shared multipole regressions. Expected: all applicable tests pass; record unavailable infrastructure explicitly.
-- [ ] Run complete 48/96-AO MP2 energy/gradient comparisons and a fresh-process growing-shape mapping probe using integrated source. Compare against stored original numerical results; no prototype adapter in the numerical path.
-- [ ] Document the optimization and its scope; commit the integrated change.
+- [x] Write failing integration tests for the native replay route and stable executable compilation as physical dimensions change. Add traced seeds, unsupported orders/layouts/dtypes, and grouped/non-grouped response checks.
+- [x] Run those tests before modifying the driver; verify the missing-route/compilation failure.
+- [x] Route supported forward and reverse calls through Task 1, crop concrete CPU seeds on host, and accumulate raw cotangents on host with general AD fallback.
+- [x] Run weak endpoint, moment, pair, primary, MPI-weak (when available), and shared multipole regressions. Compare failures against the untouched target and record baseline failures explicitly; see the validation report.
+- [x] Run complete 48/96-AO MP2 energy/gradient comparisons and a fresh-process growing-shape mapping probe using integrated source. Compare against stored original numerical results; no prototype adapter in the numerical path.
+- [x] Document the optimization and its scope; commit the integrated change.
 
 ### Task 3: Review and publish
 

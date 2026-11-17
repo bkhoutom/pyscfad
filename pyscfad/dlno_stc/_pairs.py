@@ -29,6 +29,7 @@ from pyscfad.lib._multipole import (
 )
 from pyscfad.lib._cartesian_moments import cartesian_components
 from pyscfad.lib._weak_endpoint import prepare_endpoint, replay_endpoint
+from . import _weak_moments
 
 _MOMENT_SLAB_BYTES = 32 * 1024**2
 
@@ -509,10 +510,72 @@ def _weak_endpoint_from_screen(mf, screen, static, fragment_index, *, ao_moments
     """Contract AO moments using the supplied, differentiable orbital screen."""
     if screen is None:
         raise RuntimeError(f"a fixed weak endpoint {fragment_index} has no multipole screen")
+    order = static.thresholds.multipole_order
+    atoms = static.fragments[fragment_index].primary_atoms
+    if order == 4 and _native_weak_moments_supported(mf):
+        if ao_moments is None:
+            ao_moments = _origin_zero_moments(_fake_mol_with_traced_centers(mf.mol, atoms), 3)
+        if _weak_moments.supports(screen, ao_moments, order):
+            return _weak_moments.endpoint(screen, ao_moments, order)
     return _multipole_orbital_data(
-        mf.mol, screen, static.fragments[fragment_index].primary_atoms,
-        static.thresholds.multipole_order, ao_moments=ao_moments,
+        mf.mol, screen, atoms, order, ao_moments=ao_moments,
     )
+
+
+def _linearize_weak_moments(screen, raw, order, *, reference=None):
+    """Compose native moments with a general-AD fallback for either argument."""
+    if reference is None:
+        reference = lambda saved, operators: _multipole_orbital_data(
+            None, saved, None, order, ao_moments=operators)
+    if not _weak_moments.supports(screen, raw, order):
+        return jax.vjp(reference, screen, raw)
+    value, native_pullback = _weak_moments.linearize(screen, raw, order)
+
+    def pullback(seed):
+        if (not _weak_moments.is_concrete_cpu(seed)
+                or jax.tree_util.tree_structure(seed) != jax.tree_util.tree_structure(value)
+                or any(got.shape != want.shape or got.dtype != want.dtype
+                       for got, want in zip(jax.tree_util.tree_leaves(seed),
+                                            jax.tree_util.tree_leaves(value)))):
+            # The primal may be concrete while its later weights are traced.
+            # Recreate only this moment tape; retain the saved orbital frame.
+            _, fallback = jax.vjp(reference, screen, raw)
+            return fallback(seed)
+        return native_pullback(seed)
+
+    return value, pullback
+
+
+def _crop_weak_endpoint_cotangent(cotangent, original):
+    """Undo concrete pair padding without compiling a slice per physical size."""
+    if not _weak_moments.is_concrete_cpu((cotangent, original)):
+        return crop_endpoint_cotangent(cotangent, original)
+    columns = original[2].shape[0]
+    return (np.asarray(cotangent[0]),) + tuple(
+        None if value is None else np.asarray(value)[..., :columns]
+        for value in cotangent[1:])
+
+
+def _accumulate_weak_raw_bars(accumulator, contribution):
+    """Own a mutable host sum, retaining the original rule for traced bars."""
+    from .adjoint import add_cotangent
+    concrete = (_weak_moments.is_concrete_cpu((accumulator, contribution))
+                and all(value.dtype.kind in 'fc'
+                        for value in jax.tree_util.tree_leaves((accumulator, contribution))))
+    if accumulator is None:
+        return (jax.tree_util.tree_map(lambda value: np.array(value, copy=True), contribution)
+                if concrete else contribution)
+    if not concrete:
+        return jax.tree_util.tree_map(add_cotangent, accumulator, contribution)
+
+    def add(left, right):
+        left, right = np.asarray(left), np.asarray(right)
+        if left.flags.writeable and left.dtype == right.dtype:
+            left += right
+            return left
+        return left + right
+
+    return jax.tree_util.tree_map(add, accumulator, contribution)
 
 
 def _prepare_weak_endpoint(mf, common, static, fragment_index, *, ao_moments=None,
@@ -560,10 +623,11 @@ def _replay_weak_endpoint(mf, linearization, static, fragment_index, *,
         atoms = static.fragments[fragment_index].primary_atoms
         raw, raw_pullback = _origin_zero_moments_vjp(
             mf, atoms, max(1, static.thresholds.multipole_order - 1))
-        endpoint, moment_pullback = jax.vjp(
-            lambda saved, operators: _weak_endpoint_from_screen(
+        endpoint, moment_pullback = _linearize_weak_moments(
+            screen, raw, static.thresholds.multipole_order,
+            reference=lambda saved, operators: _weak_endpoint_from_screen(
                 mf, saved, static, fragment_index, ao_moments=operators),
-            screen, raw)
+        )
 
         def pullback(endpoint_bar):
             screen_bar, raw_bar = moment_pullback(endpoint_bar)
@@ -675,23 +739,24 @@ def _grouped_weak_pullback(mf, static, endpoints, originals, linearizations,
     order = static.thresholds.multipole_order
     for atoms, indices in supports.items():
         raw, raw_pullback = _origin_zero_moments_vjp(mf, atoms, max(1, order - 1))
-        raw_bar = jax.tree_util.tree_map(jnp.zeros_like, raw)
+        raw_bar = None
         for index in indices:
             endpoint_bar = endpoint_bars.pop(index)
             del endpoints[index]
             original = originals.pop(index)
             screen, screen_pullback = linearizations.pop(index)
-            rebuilt, moment_pullback = jax.vjp(
-                lambda saved, operators: _weak_endpoint_from_screen(
+            rebuilt, moment_pullback = _linearize_weak_moments(
+                screen, raw, order,
+                reference=lambda saved, operators: _weak_endpoint_from_screen(
                     mf, saved, static, index, ao_moments=operators),
-                screen, raw)
+            )
             _check_endpoint_replay(rebuilt, original, index)
             screen_bar, operators_bar = moment_pullback(
-                crop_endpoint_cotangent(endpoint_bar, original))
+                _crop_weak_endpoint_cotangent(endpoint_bar, original))
             common_bar = _apply_weak_screen_pullback(
                 screen_pullback, screen_bar, shared_pao_bars, shared_product_bars)
             bars = (bars[0], jax.tree_util.tree_map(add_cotangent, bars[1], common_bar))
-            raw_bar = jax.tree_util.tree_map(add_cotangent, raw_bar, operators_bar)
+            raw_bar = _accumulate_weak_raw_bars(raw_bar, operators_bar)
             jax.block_until_ready((bars[1], raw_bar))
             del (rebuilt, moment_pullback, original, endpoint_bar, screen,
                  screen_pullback, screen_bar, operators_bar, common_bar)
@@ -796,7 +861,7 @@ def weak_pair_energy_and_grad(mf, common, static, *, pairs=None,
                 else:
                     rebuilt, pullback = _replay_weak_endpoint(mf, linearization, static, index)
                 _check_endpoint_replay(rebuilt, original, index)
-                contribution = pullback(crop_endpoint_cotangent(endpoint_bar, original))
+                contribution = pullback(_crop_weak_endpoint_cotangent(endpoint_bar, original))
                 bars = jax.tree_util.tree_map(add_cotangent, bars, contribution)
                 jax.block_until_ready(bars)
                 del rebuilt, original, pullback, contribution, endpoint_bar, linearization

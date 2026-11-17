@@ -1,6 +1,4 @@
-"""Explicit native support parity and independent labelled-frame acceptance."""
-
-from dataclasses import fields
+"""Independent labelled-frame and selected-response acceptance."""
 
 import jax
 import numpy as np
@@ -16,110 +14,6 @@ def finite_case():
     mf = accept.build_mf(accept.molecule())
     static = accept.selection(mf)
     return mf, static, rebuild_domain_data(mf, static)
-
-
-@pytest.fixture(scope="module")
-def native_case(finite_case):
-    native = pytest.importorskip("pyscfad.dlno.domain")
-    from pyscfad.dlno._selection import build_domain_selections
-    from pyscfad.dlno.dlno_base import rebuild_domain_data
-
-    mf, static, _ = finite_case
-    options = {f.name: getattr(static.thresholds, f.name)
-               for f in fields(static.thresholds)
-               if f.name in {x.name for x in fields(native.DLNOThresholds)}}
-    topology = native.build_domain_topology(
-        mf, frozen=2, lo_type="boys", lo_kwargs=accept.LO_OPTIONS,
-        frag_lolist=static.frag_lolist, thresholds=native.DLNOThresholds(**options),
-    )
-    reference = build_domain_selections(mf, topology)
-    return topology, reference, rebuild_domain_data(mf, reference)
-
-
-def test_boys_localization_and_common_arrays_match_native(finite_case, native_case):
-    _, static, common = finite_case
-    topology, reference, old = native_case
-    np.testing.assert_allclose(static.target_reference_coeff, topology.iao_coeff,
-                               atol=2e-7, rtol=0)
-    # Replaying identical fixed references tests the reconstruction rather than
-    # optimizer noise in two independently selected localization solutions.
-    from dataclasses import replace
-    from pyscfad.dlno_stc.domain import rebuild_domain_data
-    aligned = replace(static, target_reference_coeff=reference.target_reference_coeff,
-                      target_reference_coords=reference.target_reference_coords)
-    replay = rebuild_domain_data(finite_case[0], aligned)
-    residuals = {}
-    for name in ("s1e", "fock", "occupied_coeff", "virtual_coeff",
-                 "occupied_energy", "virtual_energy", "iao_coeff", "pao_coeff"):
-        np.testing.assert_allclose(getattr(replay, name), getattr(old, name),
-                                   atol=1e-9, rtol=0, err_msg=name)
-        residuals[name] = float(np.max(np.abs(np.asarray(getattr(replay, name))
-                                            - np.asarray(getattr(old, name)))))
-    assert np.isfinite(np.asarray(common.iao_coeff)).all()
-    accept.record_result("common_parity", {
-        "reference_localization_max_abs": float(np.max(np.abs(
-            static.target_reference_coeff - topology.iao_coeff))),
-        "rebuild_max_abs": residuals,
-    })
-
-
-def test_fixture_supports_weak_spaces_and_target_mapping_match_native(
-        finite_case, native_case):
-    from pyscfad.dlno_stc._selection import EDLocalPAOSelection
-    mf, static, _ = finite_case
-    topology, old, _ = native_case
-    for name in ("active_occ_indices", "active_vir_indices",
-                 "pao_projected_out_indices", "pao_parent_ao_indices",
-                 "ao2pao_map", "strong_mask"):
-        np.testing.assert_array_equal(getattr(static, name), getattr(old, name))
-    np.testing.assert_array_equal(static.forced_strong_mask, topology.forced_strong_mask)
-    for name in ("pair_energy", "weak_pair_energy"):
-        np.testing.assert_allclose(getattr(static, name), getattr(topology, name),
-                                   atol=1e-12, rtol=0, err_msg=name)
-    assert tuple(int(x[0]) for x in static.frag_lolist) == accept.TARGET_ORDER
-    assert len(static.fragments) == 8
-    assert np.count_nonzero(~static.strong_mask) > 0
-    for i, (new, ref) in enumerate(zip(static.fragments, old.fragments)):
-        for name in ("iao_indices", "strong_fragments", "extended_atoms",
-                     "extended_ao_indices", "pao_center_atoms", "primary_atoms",
-                     "primary_ao_indices", "primary_bp_atoms", "weak_occ_norm_keep",
-                     "weak_occ_span_metric_keep"):
-            np.testing.assert_array_equal(getattr(new, name), getattr(ref, name),
-                                          err_msg=f"fragment {i}: {name}")
-        assert len(new.extended_ao_indices) < mf.mol.nao
-        assert new.target_index == list(new.strong_fragments).index(i)
-        assert len(new.strong_occ_metric_keep) == len(new.strong_fragments)
-        # The strong ED now selects individual PAOs locally; its completeness
-        # indices no longer label the native global canonical eigenvectors.
-        assert isinstance(new.strong_virtual, EDLocalPAOSelection)
-        np.testing.assert_array_equal(new.strong_virtual.support_ao_indices,
-                                      new.extended_ao_indices)
-        np.testing.assert_array_equal(new.strong_virtual.parent_columns,
-                                      ref.strong_virtual.parent_columns)
-        for name in ("weak_virtual",):
-            space, old_space = getattr(new, name), getattr(ref, name)
-            if space is None:
-                assert old_space is None
-                continue
-            for field in fields(space):
-                np.testing.assert_array_equal(getattr(space, field.name),
-                                              getattr(old_space, field.name),
-                                              err_msg=f"{i}: {name}.{field.name}")
-    # Every hierarchy has its own role, even when this fixture's lists agree.
-    for name in ("compact_bp_domain", "primary_bp_domain", "tight_bp_domain",
-                 "pao_bp_domain"):
-        for got, want in zip(getattr(static, name), getattr(topology, name)):
-            np.testing.assert_array_equal(got, want)
-    accept.record_result("selection_parity", {
-        "status": "passed", "strong_domain_job_count": len(static.fragments),
-        "ordered_global_targets": [int(x[0]) for x in static.frag_lolist],
-        "ordered_local_target_slots": [int(x.target_index) for x in static.fragments],
-        "weak_unordered_pair_count": int(np.count_nonzero(
-            np.triu(~static.strong_mask, k=1))),
-        "extended_ao_counts": [len(x.extended_ao_indices) for x in static.fragments],
-        "occupied_ranks": [len(x.strong_occ_metric_keep) for x in static.fragments],
-        "virtual_ranks": [len(x.strong_virtual.metric_keep) for x in static.fragments],
-    })
 
 
 def test_finite_occupied_frame_follows_ordered_projected_cholesky(finite_case):

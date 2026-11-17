@@ -127,8 +127,8 @@ def transition_moments(occupied, virtual, overlap, dipole, second, third, order)
         dipole_transition_expr, virtual.conj(), dipole, occupied
     )
 
-    transition_quadrupole = None
-    transition_octupole = None
+    raw_second = None
+    raw_third = None
     if order > 2:
         if second.ndim == 3:
             raw_second = jnp.einsum(dipole_transition_expr, virtual.conj(), second, occupied)
@@ -137,6 +137,24 @@ def transition_moments(occupied, virtual, overlap, dipole, second, third, order)
         else:
             raw_second = jnp.einsum(
                 quadrupole_transition_expr, virtual.conj(), second, occupied)
+    if order > 3:
+        if third.ndim == 3:
+            raw_third = jnp.einsum(dipole_transition_expr, virtual.conj(), third, occupied)
+            raw_third = raw_third[:, cartesian_components(3)[1], :].reshape(
+                occupied.shape[1], 3, 3, 3, -1)
+        else:
+            raw_third = jnp.einsum(
+                octupole_transition_expr, virtual.conj(), third, occupied)
+    return (center, *_translate_moments(
+        center, transition_overlap, transition_dipole, raw_second, raw_third, order))
+
+
+def _translate_moments(center, transition_overlap, transition_dipole,
+                       raw_second, raw_third, order):
+    """Translate contracted moments, retaining a leading occupied-mode axis."""
+    transition_quadrupole = None
+    transition_octupole = None
+    if order > 2:
         translated_second = raw_second
         translated_second = translated_second - jnp.einsum(
             'ix,iya->ixya', center, transition_dipole
@@ -157,13 +175,6 @@ def transition_moments(occupied, virtual, overlap, dipole, second, third, order)
         )
 
     if order > 3:
-        if third.ndim == 3:
-            raw_third = jnp.einsum(dipole_transition_expr, virtual.conj(), third, occupied)
-            raw_third = raw_third[:, cartesian_components(3)[1], :].reshape(
-                occupied.shape[1], 3, 3, 3, -1)
-        else:
-            raw_third = jnp.einsum(
-                octupole_transition_expr, virtual.conj(), third, occupied)
         translated_third = raw_third
         translated_third = translated_third - jnp.einsum(
             'ix,iyza->ixyza', center, raw_second
@@ -202,9 +213,7 @@ def transition_moments(occupied, virtual, overlap, dipole, second, third, order)
             - jnp.einsum('xy,iza->ixyza', identity, trace_xy)
         )
 
-    return (
-        center, transition_dipole, transition_quadrupole, transition_octupole
-    )
+    return transition_dipole, transition_quadrupole, transition_octupole
 
 
 def endpoint_matches_reference(endpoint, reference, *, rtol=1e-9, atol=1e-9):

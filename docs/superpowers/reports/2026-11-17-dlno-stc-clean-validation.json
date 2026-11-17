@@ -1,0 +1,1134 @@
+{
+  "validated_code_commit": "7f07f47e09813b9dbf3e186c441b44013c059f86",
+  "source_tips": {
+    "origin/dlno-stc": "c4f64d13377ebaf683659aecf695709a7db8bd8a",
+    "origin/dlno-stc-fix": "551cd2d4c263b324d68dbfbc7fdec53fff87edf7",
+    "dlno-stc": "c4f64d13377ebaf683659aecf695709a7db8bd8a"
+  },
+  "common_base": "8ade7f4b2765d0d771f2276662cf6d66b912785f",
+  "worktree": "/home/bkhou/Project/DLNO_CC/pyscfad-dlno-stc-clean",
+  "production_identical_to": "551cd2d4c263b324d68dbfbc7fdec53fff87edf7",
+  "focused": [
+    {
+      "name": "cc_checkpoints",
+      "command": [
+        "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "--tb=short",
+        "--junitxml=/tmp/dlno-stc-clean-integration/focused/cc_checkpoints.xml",
+        "pyscfad/dlno_stc/test/test_triples.py::test_checkpoint_rejects_changed_triples_controls_and_native_version",
+        "pyscfad/dlno_stc/test/test_triples.py::test_cc_checkpoint_rejects_changed_ladder_mode",
+        "pyscfad/dlno_stc/test/test_triples.py::test_deterministic_default_resume_accepts_explicit_mode"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 9.077604423742741,
+      "head": "0570c146ed375cb85d5eecc50efe73910b1e8a2b",
+      "tests": 3,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 3,
+      "max_rss_kb": 900460,
+      "xml_sha256": "7c29c0e4897b16e0289cb1f700b10e84e4583fc8694527291c81a4435e7ca3ba",
+      "runner_affinity": "4-7",
+      "thread_overrides": {
+        "OMP_NUM_THREADS": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1"
+      }
+    },
+    {
+      "name": "dcsd",
+      "command": [
+        "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "--tb=short",
+        "--junitxml=/tmp/dlno-stc-clean-integration/focused/dcsd.xml",
+        "pyscfad/cc/test/test_dcsd.py"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 20.944588215090334,
+      "head": "0570c146ed375cb85d5eecc50efe73910b1e8a2b",
+      "tests": 1,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 1,
+      "max_rss_kb": 1908020,
+      "xml_sha256": "00ed341ad947d0a31ba29bb5757c01887ef1d447c6583668f5465a43ad6c58cc",
+      "thread_environment": "recipes.native-env.sh"
+    },
+    {
+      "name": "domain_parity",
+      "command": [
+        "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "--tb=short",
+        "--junitxml=/tmp/dlno-stc-clean-integration/focused/domain_parity.xml",
+        "pyscfad/dlno_stc/test/test_domain_parity.py"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 19.692457316908985,
+      "head": "0570c146ed375cb85d5eecc50efe73910b1e8a2b",
+      "tests": 4,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 4,
+      "max_rss_kb": 1712724,
+      "xml_sha256": "e89f639d7f264e3f6af070cf7a8b4dc77e3996ddd20ff3553a70a36ef78777e6",
+      "thread_environment": "recipes.native-env.sh"
+    },
+    {
+      "name": "fd_ccsd",
+      "command": [
+        "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "--tb=short",
+        "--junitxml=/tmp/dlno-stc-clean-integration/focused/fd_ccsd.xml",
+        "pyscfad/dlno_stc/test/test_saved_quadratures.py::test_saved_grids_reach_every_domain_and_fixed_grid_forces[ccsd]"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 27.908383150119334,
+      "head": "0570c146ed375cb85d5eecc50efe73910b1e8a2b",
+      "tests": 1,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 1,
+      "max_rss_kb": 2129140,
+      "xml_sha256": "d3d1f2315813ed1760c80351742651428ef04027a6ea8ae9681591c439d33637",
+      "thread_environment": "recipes.native-env.sh"
+    },
+    {
+      "name": "fd_ccsd_t",
+      "command": [
+        "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "--tb=short",
+        "--junitxml=/tmp/dlno-stc-clean-integration/focused/fd_ccsd_t.xml",
+        "pyscfad/dlno_stc/test/test_saved_quadratures.py::test_saved_grids_reach_every_domain_and_fixed_grid_forces[ccsd_t]"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 26.851188906934112,
+      "head": "0570c146ed375cb85d5eecc50efe73910b1e8a2b",
+      "tests": 1,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 1,
+      "max_rss_kb": 2175756,
+      "xml_sha256": "e59fecec7bc2e1e1805dc56f849e1d07deed08974702fb3f42f4402271b3d6e0",
+      "thread_environment": "recipes.native-env.sh"
+    },
+    {
+      "name": "fd_mp2",
+      "command": [
+        "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "--tb=short",
+        "--junitxml=/tmp/dlno-stc-clean-integration/focused/fd_mp2.xml",
+        "pyscfad/dlno_stc/test/test_saved_quadratures.py::test_saved_grids_reach_every_domain_and_fixed_grid_forces[mp2]"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 21.299894912168384,
+      "head": "0570c146ed375cb85d5eecc50efe73910b1e8a2b",
+      "tests": 1,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 1,
+      "max_rss_kb": 1719884,
+      "xml_sha256": "57e56992237ea351e09b83d5f0ae3802892f23e0c0278b29468a4bb331ae6d59",
+      "thread_environment": "recipes.native-env.sh"
+    },
+    {
+      "name": "fragment_pipeline",
+      "command": [
+        "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "--tb=short",
+        "--junitxml=/tmp/dlno-stc-clean-integration/focused/fragment_pipeline.xml",
+        "pyscfad/dlno_stc/test/test_fragment_pipeline.py"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 177.92347044311464,
+      "head": "0570c146ed375cb85d5eecc50efe73910b1e8a2b",
+      "tests": 15,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 15,
+      "max_rss_kb": 3123460,
+      "xml_sha256": "bccdcc4e3b5c97fcb69b5177cb82ef1433e6e9b76319f558c6d72ba4696da29c",
+      "thread_environment": "recipes.native-env.sh"
+    },
+    {
+      "name": "independent_mp2",
+      "command": [
+        "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "--tb=short",
+        "--junitxml=/tmp/dlno-stc-clean-integration/focused/independent_mp2.xml",
+        "pyscfad/dlno_stc/test/test_system.py::test_system_matches_native_dfmp2_with_frozen_and_coordinate_response"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 24.730869124177843,
+      "head": "0570c146ed375cb85d5eecc50efe73910b1e8a2b",
+      "tests": 1,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 1,
+      "max_rss_kb": 1629312,
+      "xml_sha256": "ba46dd025c6fe4434b8150b1d66fae9bebee71d9844a8ca82420aa151d8d3aec",
+      "runner_affinity": "4-7",
+      "thread_overrides": {
+        "OMP_NUM_THREADS": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1"
+      }
+    },
+    {
+      "name": "lis_reuse",
+      "command": [
+        "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "--tb=short",
+        "--junitxml=/tmp/dlno-stc-clean-integration/focused/lis_reuse.xml",
+        "pyscfad/dlno_stc/test/test_lis_construction_reuse.py"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 36.78691493393853,
+      "head": "5b319107fdfa8a193551ce797837b219971e7fe5",
+      "tests": 9,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 9,
+      "max_rss_kb": 2620584,
+      "xml_sha256": "9ba0cf764730fa50dd482d469b45957afc0cd42be0116bc938e5d20c09224d83",
+      "thread_environment": "recipes.native-env.sh"
+    },
+    {
+      "name": "modes",
+      "command": [
+        "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "--tb=short",
+        "--junitxml=/tmp/dlno-stc-clean-integration/focused/modes.xml",
+        "pyscfad/dlno_stc/test/test_calculation_modes.py"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 46.28020880185068,
+      "head": "0570c146ed375cb85d5eecc50efe73910b1e8a2b",
+      "tests": 16,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 16,
+      "max_rss_kb": 2345068,
+      "xml_sha256": "6058c7541cfc4b2de1c0f714f4eafc3a08f4b1c8ce3ec2e4ade2215be6f9ea30",
+      "thread_environment": "recipes.native-env.sh"
+    },
+    {
+      "name": "mrcc",
+      "command": [
+        "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "--tb=short",
+        "--junitxml=/tmp/dlno-stc-clean-integration/focused/mrcc.xml",
+        "pyscfad/dlno_stc/test/test_mrcc_triples.py"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 22.798633264377713,
+      "head": "5b319107fdfa8a193551ce797837b219971e7fe5",
+      "tests": 17,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 17,
+      "max_rss_kb": 1556872,
+      "xml_sha256": "002f91bc5eb15ac139e2373f192e0c08e9331b9e1e2c2435e72dc6c41d30d2ea",
+      "thread_environment": "recipes.native-env.sh"
+    },
+    {
+      "name": "native_ccsd_t",
+      "command": [
+        "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "--tb=short",
+        "--junitxml=/tmp/dlno-stc-clean-integration/focused/native_ccsd_t.xml",
+        "pyscfad/dlno_stc/test/test_native_ccsd.py::test_native_dlno_ccsdt_energy_gradient"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 67.79684805683792,
+      "head": "0570c146ed375cb85d5eecc50efe73910b1e8a2b",
+      "tests": 1,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 1,
+      "max_rss_kb": 3464580,
+      "xml_sha256": "efb99c87f25a89fbe10be1bb23b0dc5885a68ddc788d195c3f7b43e4b4ed32a5",
+      "runner_affinity": "4-7",
+      "thread_overrides": {
+        "OMP_NUM_THREADS": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1"
+      }
+    },
+    {
+      "name": "pao_reuse",
+      "command": [
+        "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "--tb=short",
+        "--junitxml=/tmp/dlno-stc-clean-integration/focused/pao_reuse.xml",
+        "pyscfad/dlno_stc/test/test_pao_response_reuse.py",
+        "pyscfad/dlno_stc/test/test_weak_local_products.py"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 14.583605052903295,
+      "head": "5b319107fdfa8a193551ce797837b219971e7fe5",
+      "tests": 46,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 46,
+      "max_rss_kb": 1135644,
+      "xml_sha256": "a73d24b31aca8b6db9baf81ea6945f1588f1edf2a68d1b8da1e1154e92bb1dda",
+      "thread_environment": "recipes.native-env.sh"
+    },
+    {
+      "name": "pao_selection",
+      "command": [
+        "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "--tb=short",
+        "--junitxml=/tmp/dlno-stc-clean-integration/focused/pao_selection.xml",
+        "pyscfad/dlno_stc/test/test_pao_norm_threshold.py",
+        "pyscfad/dlno_stc/test/test_ed_metadata.py",
+        "pyscfad/dlno_stc/test/test_ed_local_pao.py",
+        "pyscfad/dlno_stc/test/test_boys_construction.py",
+        "pyscfad/dlno_stc/test/test_primary_execution.py"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 25.100111835170537,
+      "head": "5b319107fdfa8a193551ce797837b219971e7fe5",
+      "tests": 60,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 60,
+      "max_rss_kb": 2123068,
+      "xml_sha256": "0c99a44f1585e3eea49b8e722a2efb1d4dc0316824af043d0911be33abf52eeb",
+      "thread_environment": "recipes.native-env.sh"
+    },
+    {
+      "name": "primary_response",
+      "command": [
+        "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "--tb=short",
+        "--junitxml=/tmp/dlno-stc-clean-integration/focused/primary_response.xml",
+        "pyscfad/dlno_stc/test/test_primary_response.py"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 15.337575651239604,
+      "head": "5b319107fdfa8a193551ce797837b219971e7fe5",
+      "tests": 7,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 7,
+      "max_rss_kb": 1271748,
+      "xml_sha256": "7205b2dc62da7231123cb7b6fed74f011f6fc3deb62ebc1d054fb43c1e12d472",
+      "thread_environment": "recipes.native-env.sh"
+    },
+    {
+      "name": "restart",
+      "command": [
+        "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "--tb=short",
+        "--junitxml=/tmp/dlno-stc-clean-integration/focused/restart.xml",
+        "pyscfad/dlno_stc/test/test_boys_restart.py"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 1.0652271760627627,
+      "head": "0570c146ed375cb85d5eecc50efe73910b1e8a2b",
+      "tests": 13,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 13,
+      "max_rss_kb": 289468,
+      "xml_sha256": "927f636410a27ea2fc773ab1048eab655bf04eacf8d07709133768f200a00d76",
+      "thread_environment": "recipes.native-env.sh"
+    },
+    {
+      "name": "saved_grids",
+      "command": [
+        "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "--tb=short",
+        "--junitxml=/tmp/dlno-stc-clean-integration/focused/saved_grids.xml",
+        "pyscfad/dlno_stc/test/test_saved_quadratures.py",
+        "-k",
+        "not fixed_grid_forces"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 10.78114638198167,
+      "head": "0570c146ed375cb85d5eecc50efe73910b1e8a2b",
+      "tests": 2,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 2,
+      "max_rss_kb": 960216,
+      "xml_sha256": "c26763bfeab89d21e84b758b3cce7256155359ad8eb3d141ee8df3fde16dd6f5",
+      "thread_environment": "recipes.native-env.sh"
+    },
+    {
+      "name": "w_baseline",
+      "command": [
+        "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "--tb=short",
+        "--junitxml=/tmp/dlno-stc-clean-integration/focused/w_baseline.xml",
+        "pyscfad/dlno_stc/test/test_w_baseline_reuse.py"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 2.8178476239554584,
+      "head": "5b319107fdfa8a193551ce797837b219971e7fe5",
+      "tests": 4,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 4,
+      "max_rss_kb": 490672,
+      "xml_sha256": "2e3d8b8eef1fc0a0354f1a49c130d4a6e54ecf5aec453bd3f57a04893c3edf5d",
+      "thread_environment": "recipes.native-env.sh"
+    },
+    {
+      "name": "w_native",
+      "command": [
+        "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "--tb=short",
+        "--junitxml=/tmp/dlno-stc-clean-integration/focused/w_native.xml",
+        "pyscfad/dlno_stc/test/test_w_delayed_pullback.py",
+        "pyscfad/dlno_stc/test/test_selected_kernel.py"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 4.3197007779963315,
+      "head": "5b319107fdfa8a193551ce797837b219971e7fe5",
+      "tests": 39,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 39,
+      "max_rss_kb": 608392,
+      "xml_sha256": "7720bd41396a50f9c307563b6514dfe303dd6afca2f2afb8ebba06f261084fc6",
+      "thread_environment": "recipes.native-env.sh"
+    },
+    {
+      "name": "weak_endpoints",
+      "command": [
+        "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "--tb=short",
+        "--junitxml=/tmp/dlno-stc-clean-integration/focused/weak_endpoints.xml",
+        "pyscfad/dlno_stc/test/test_weak_endpoints.py"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 10.783358978107572,
+      "head": "5b319107fdfa8a193551ce797837b219971e7fe5",
+      "tests": 50,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 50,
+      "max_rss_kb": 881236,
+      "xml_sha256": "c37ea80990a0ddca44144541972d74dfe4001b0338cbbc68ecb9e4efceff314c",
+      "thread_environment": "recipes.native-env.sh"
+    },
+    {
+      "name": "weak_native",
+      "command": [
+        "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "--tb=short",
+        "--junitxml=/tmp/dlno-stc-clean-integration/focused/weak_native.xml",
+        "pyscfad/dlno_stc/test/test_weak_moment_native.py"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 1.7752535957843065,
+      "head": "5b319107fdfa8a193551ce797837b219971e7fe5",
+      "tests": 20,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 20,
+      "max_rss_kb": 454112,
+      "xml_sha256": "3d748ec7dcbbeafaa3052a0e86f5ba2aaabddeb90a55688495dfb74a45462a24",
+      "thread_environment": "recipes.native-env.sh"
+    },
+    {
+      "name": "weak_numpy",
+      "command": [
+        "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "--tb=short",
+        "--junitxml=/tmp/dlno-stc-clean-integration/focused/weak_numpy.xml",
+        "pyscfad/dlno_stc/test/test_weak_numpy.py"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 14.68568792520091,
+      "head": "5b319107fdfa8a193551ce797837b219971e7fe5",
+      "tests": 31,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 31,
+      "max_rss_kb": 1419440,
+      "xml_sha256": "09a76a9e481a2c11cd44f52fcdfb7dfd962d8d8c91b19fb32290692ba7ccbbd1",
+      "thread_environment": "recipes.native-env.sh"
+    }
+  ],
+  "host_carryover": {
+    "command": [
+      "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+      "-m",
+      "pytest",
+      "pyscfad/dlno_stc/test/test_host_carryover.py",
+      "-q",
+      "--durations=10"
+    ],
+    "passed": 21,
+    "failures": 0,
+    "skipped": 0,
+    "seconds": 28.6,
+    "max_rss_kb": 688588,
+    "source_sha256": "bbaa2393f0b452b1bbbfa73f25f23f9021d1065e5a090dad88fa8618fe35d73e"
+  },
+  "native": {
+    "status": "ok",
+    "python": "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+    "pyscfad_path": "/home/bkhou/Project/DLNO_CC/pyscfad-dlno-stc-clean/pyscfad/__init__.py",
+    "pyscfadlib_path": "/tmp/dlno-stc-clean-integration/support-source/pyscfadlib/__init__.py",
+    "stc_path": "/home/bkhou/Project/DLNO_CC/pyscfad-dlno-stc-clean/pyscfad/dlno_stc/_stc_mp2.cpython-311-x86_64-linux-gnu.so",
+    "ccsd_path": "/home/bkhou/Project/DLNO_CC/pyscfad-dlno-stc-clean/pyscfad/cc/_ccsd_kernels.cpython-311-x86_64-linux-gnu.so",
+    "stc_independent_reference": true,
+    "sgx_abi": 4,
+    "blas_config": "OpenBLAS 0.3.34 DYNAMIC_ARCH NO_AFFINITY Cooperlake MAX_THREADS=128",
+    "libcintad_sha256": "751ef86a4883400364cc36ff563c5c2779422786a16ec9a30cdaecdae221784d",
+    "native_sha256": {
+      "/tmp/dlno-stc-clean-integration/support-source/pyscfadlib/libao2mo_vjp.so": "c54eea7f7aa36a610394878298f8009248668fbfe8626d11e71addd1ce6ecc42",
+      "/tmp/dlno-stc-clean-integration/support-source/pyscfadlib/libcc_vjp.so": "7e6b54098943f765f3eebba72380a7196e411351f97b4d35e3623b86aa63c6b9",
+      "/tmp/dlno-stc-clean-integration/support-source/pyscfadlib/libcgto_ad.so": "821e435f2e9813339c5b4e721def70d3d7e41b3644325c954aa81a00325a1c36",
+      "/tmp/dlno-stc-clean-integration/support-source/pyscfadlib/libcgto_vjp.so": "dd7b9419a0f3857eb5b5a9a7c9e49faed0acb19de730880af437446ca608e6ac",
+      "/tmp/dlno-stc-clean-integration/support-source/pyscfadlib/libcvhf_vjp.so": "ae5fd9ca7d507dc6f3cc2974453e14d8897d9fdf7231880aa78ccfc1fa3b7596",
+      "/tmp/dlno-stc-clean-integration/support-source/pyscfadlib/libmp_vjp.so": "fd30a2ddb4ade9645d39320cd0851a55e6e77ee12a40105be4993405f1d30c43",
+      "/tmp/dlno-stc-clean-integration/support-source/pyscfadlib/libnp_helper_ad.so": "bb85f9a7e7a3e4e5723cbca384d742c9fdbc9921a2dc1311193c76e54a814f12",
+      "/tmp/dlno-stc-clean-integration/support-source/pyscfadlib/libnp_helper_vjp.so": "2f8856bda13e66ec924cfca778853acdde8ce6b7439a8ee13b8cb743f326094c",
+      "/tmp/dlno-stc-clean-integration/support-source/pyscfadlib/libsgx_ad.so": "9f541ef8307f0927485f4d1b7b25fdbfe4088126ae5427fe89122c424716966c",
+      "/tmp/dlno-stc-clean-integration/support-source/pyscfadlib/libvjp_util.so": "7c250b8bc31057a1ab1b9c19a3929ddbb942a5ac411496ebc33c5ecd604b18d8",
+      "/tmp/dlno-stc-clean-integration/support-source/pyscfadlib/pyscfad_lapack.cpython-311-x86_64-linux-gnu.so": "4e1e259bc36bd67b2a56f2e6cbd31fd0b14ee3aa30d62a40bd083ac04557c768",
+      "/home/bkhou/Project/DLNO_CC/pyscfad-dlno-stc-clean/pyscfad/dlno_stc/_stc_mp2.cpython-311-x86_64-linux-gnu.so": "ae7bb0d4aa20a29e39d6533399ecadc6de62962a80f125079645c24adbb70683",
+      "/home/bkhou/Project/DLNO_CC/pyscfad-dlno-stc-clean/pyscfad/cc/_ccsd_kernels.cpython-311-x86_64-linux-gnu.so": "11ef6b80f932682c296b3f8864d10d3d6af23bb72de57519f006c69b623f1182"
+    },
+    "versions": {
+      "pyscf": "2.14.0",
+      "pyscfad": "0.3.1",
+      "pyscfadlib": "0.3.3+ompfix.ef9edb92",
+      "jax": "0.10.2",
+      "jaxlib": "0.10.2",
+      "numpy": "2.4.6",
+      "scipy": "1.17.1",
+      "pytest": "9.1.1",
+      "mpi4py": "4.1.2"
+    },
+    "paths": {
+      "PYTHONPATH": "/tmp/dlno-stc-clean-integration/support-source:/home/bkhou/Project/DLNO_CC/pyscfad-dlno-stc-clean",
+      "LD_LIBRARY_PATH": "/home/bkhou/Project/DLNO_CC/pyscfad/build/deps/native/usr/lib:/home/bkhou/Project/DLNO_CC/pyscfad/build/deps/native/usr/lib/x86_64-linux-gnu:/home/bkhou/miniforge3/envs/pyscfad_env/lib:/home/bkhou/software/openmpi-4.1.8/lib:/home/bkhou/software/openmpi-4.1.8/lib64:"
+    },
+    "reused_sgx_evidence": "/tmp/dlno-stc-clean-integration/reused-sgx-provenance.json",
+    "rebuilt_support_targets": [
+      "np_helper_ad",
+      "cgto_ad",
+      "vjp_util",
+      "cgto_vjp",
+      "np_helper_vjp",
+      "ao2mo_vjp",
+      "cvhf_vjp",
+      "mp_vjp",
+      "cc_vjp",
+      "pyscfad_lapack"
+    ]
+  },
+  "native_tests": {
+    "df": {
+      "passed": 47,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "pytest_seconds": 1.473,
+      "wall_clock": "0:01.67",
+      "max_rss_kb": 253708
+    },
+    "sgx-native": {
+      "passed": 38,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "pytest_seconds": 1.096,
+      "wall_clock": "0:01.76",
+      "max_rss_kb": 332660
+    },
+    "sgx-basic": {
+      "passed": 8,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "pytest_seconds": 2.095,
+      "wall_clock": "0:02.71",
+      "max_rss_kb": 272848
+    },
+    "ctest": {
+      "passed": 3,
+      "failed": 0,
+      "skipped": 0,
+      "wall_seconds": 0.91,
+      "max_rss_kb": 16788,
+      "cpu_affinity": "0,1",
+      "note": "CTest concurrency cases intentionally exercise up to 32 worker threads but CPU affinity limits execution to two CPUs."
+    },
+    "commit": "5b319107fdfa8a193551ce797837b219971e7fe5",
+    "native_sources_identical_to": "551cd2d4c263b324d68dbfbc7fdec53fff87edf7",
+    "total_pytest_passed": 93
+  },
+  "mpi": {
+    "domain": {
+      "tests": 1,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 1,
+      "argv": [
+        "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "-rA",
+        "pyscfad/dlno_stc/test/test_domain_mpi.py::test_deterministic_domain_only_serial_one_two_four_rank_parity",
+        "--junitxml=/tmp/dlno-stc-clean-integration/native-tests-mpi-domain.xml",
+        "--basetemp=/tmp/dlno-stc-clean-integration/mpi-domain-tmp"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 101.046127486974,
+      "sampled_aggregate_peak_rss_kb": 3405800,
+      "peak_process_count": 6,
+      "child_max_rss_kb": 1700552,
+      "limit_exceeded": false,
+      "rss_sampling_seconds": 0.2
+    },
+    "pipeline": {
+      "tests": 4,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 4,
+      "argv": [
+        "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "-rA",
+        "pyscfad/dlno_stc/test/test_ccsd_pipeline_mpi.py",
+        "--junitxml=/tmp/dlno-stc-clean-integration/native-tests-mpi-pipeline.xml",
+        "--basetemp=/tmp/dlno-stc-clean-integration/mpi-pipeline-tmp"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 131.23225890286267,
+      "sampled_aggregate_peak_rss_kb": 4503464,
+      "peak_process_count": 5,
+      "child_max_rss_kb": 2369376,
+      "limit_exceeded": false,
+      "rss_sampling_seconds": 0.2
+    },
+    "weak_baseline": {
+      "per_rank": [
+        {
+          "tests": 12,
+          "failures": 10,
+          "errors": 0,
+          "skipped": 0,
+          "rank": 0,
+          "passed": 2
+        },
+        {
+          "tests": 12,
+          "failures": 10,
+          "errors": 0,
+          "skipped": 0,
+          "rank": 1,
+          "passed": 2
+        },
+        {
+          "tests": 12,
+          "failures": 10,
+          "errors": 0,
+          "skipped": 0,
+          "rank": 2,
+          "passed": 2
+        },
+        {
+          "tests": 12,
+          "failures": 10,
+          "errors": 0,
+          "skipped": 0,
+          "rank": 3,
+          "passed": 2
+        }
+      ],
+      "failure_causes": [
+        "Fixture patches obsolete build_weak_multipole_screen boundary instead of explicit fixed_screen VJP.",
+        "Fixture replay lacks explicit host moment VJP and fragment metadata.",
+        "Oracle calls JAX AD on production weak pair energy, which explicitly rejects tracers.",
+        "Energy-only fixture patches removed zero_term_cotangents; host zeros is the live boundary."
+      ],
+      "argv": [
+        "mpiexec",
+        "-n",
+        "4",
+        "/bin/bash",
+        "-c",
+        "exec \"$DLNO_PYTHON\" -m pytest -q -rA pyscfad/dlno_stc/test/test_mpi_weak.py -k \"not test_weak_mpi_subprocess\" --junitxml=\"$DLNO_NATIVE_ROOT/native-tests-mpi-weak-rank-$OMPI_COMM_WORLD_RANK.xml\" --basetemp=\"$DLNO_NATIVE_ROOT/mpi-weak-rank-$OMPI_COMM_WORLD_RANK-tmp\""
+      ],
+      "exit_code": 1,
+      "elapsed_seconds": 3.772633731830865,
+      "sampled_aggregate_peak_rss_kb": 1507112,
+      "peak_process_count": 5,
+      "child_max_rss_kb": 375264,
+      "limit_exceeded": false,
+      "rss_sampling_seconds": 0.2
+    },
+    "weak_repaired": {
+      "per_rank": [
+        {
+          "tests": 12,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0,
+          "rank": 0,
+          "passed": 12
+        },
+        {
+          "tests": 12,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0,
+          "rank": 1,
+          "passed": 12
+        },
+        {
+          "tests": 12,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0,
+          "rank": 2,
+          "passed": 12
+        },
+        {
+          "tests": 12,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0,
+          "rank": 3,
+          "passed": 12
+        }
+      ],
+      "source_sha256": "aadaac1d9e0376bd6e9bef1a06d60feba56354ad8c7c0dd65f3e628402642e60  pyscfad/dlno_stc/test/test_mpi_weak.py",
+      "argv": [
+        "mpiexec",
+        "-n",
+        "4",
+        "/bin/bash",
+        "-c",
+        "exec \"$DLNO_PYTHON\" -m pytest -q -rA pyscfad/dlno_stc/test/test_mpi_weak.py -k \"not test_weak_mpi_subprocess\" --junitxml=\"$DLNO_NATIVE_ROOT/native-tests-mpi-weak-repaired-rank-$OMPI_COMM_WORLD_RANK.xml\" --basetemp=\"$DLNO_NATIVE_ROOT/mpi-weak-repaired-rank-$OMPI_COMM_WORLD_RANK-tmp\""
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 9.829171457793564,
+      "sampled_aggregate_peak_rss_kb": 2523232,
+      "peak_process_count": 5,
+      "child_max_rss_kb": 637504,
+      "limit_exceeded": false,
+      "rss_sampling_seconds": 0.2
+    },
+    "weak_wrapper": {
+      "tests": 1,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 1,
+      "argv": [
+        "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "-rA",
+        "pyscfad/dlno_stc/test/test_mpi_weak.py::test_weak_mpi_subprocess",
+        "--junitxml=/tmp/dlno-stc-clean-integration/native-tests-mpi-weak-wrapper.xml",
+        "--basetemp=/tmp/dlno-stc-clean-integration/mpi-weak-wrapper-tmp"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 12.13626078888774,
+      "sampled_aggregate_peak_rss_kb": 2792932,
+      "peak_process_count": 6,
+      "child_max_rss_kb": 642180,
+      "limit_exceeded": false,
+      "rss_sampling_seconds": 0.2
+    },
+    "environment": {
+      "mpi": "Open MPI 5.0.10",
+      "python": "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+      "rank_thread_limit": 1,
+      "max_ranks": 4,
+      "max_aggregate_rss_guard_gib": 10,
+      "original_audited_files": 1472,
+      "original_changed_files": 0,
+      "production_native_matches": "551cd2d4c263b324d68dbfbc7fdec53fff87edf7"
+    },
+    "molecular_comparisons": {
+      "domain": {
+        "1": {
+          "energy": 0.0,
+          "correlation_energy": 0.0,
+          "supplied_energy": 0.0,
+          "gradient": 0.0,
+          "correlation_gradient": 0.0
+        },
+        "2": {
+          "energy": 0.0,
+          "correlation_energy": 2.7755575615628914e-17,
+          "supplied_energy": 2.7755575615628914e-17,
+          "gradient": 1.9595436384634013e-14,
+          "correlation_gradient": 2.185751579730777e-16
+        },
+        "4": {
+          "energy": 0.0,
+          "correlation_energy": 2.7755575615628914e-17,
+          "supplied_energy": 2.7755575615628914e-17,
+          "gradient": 1.9595436384634013e-14,
+          "correlation_gradient": 2.0469737016526324e-16
+        }
+      },
+      "pipeline": {
+        "test_pipeline_mpi_all_cc_keeps0": {
+          "energy": 1.3877787807814457e-17,
+          "baseline": 0.0,
+          "weak": 0.0
+        },
+        "test_pipeline_mpi_all_cc_keeps1": {
+          "energy": 2.2717938641392266e-14,
+          "baseline": 1.1102230246251565e-16,
+          "weak": 7.252719610864947e-21
+        },
+        "test_pipeline_mpi_gradient_and0": {
+          "energy": 1.3877787807814457e-17,
+          "baseline": 1.3877787807814457e-17,
+          "weak": 0.0,
+          "gradient": 4.562322741819003e-16
+        }
+      }
+    }
+  },
+  "baseline_boys_failures": {
+    "baseline": "551cd2d4c263b324d68dbfbc7fdec53fff87edf7",
+    "test_source": "pyscfad/dlno_stc/test/test_boys_construction.py",
+    "baseline_test_sha256": "6bd5894f28bbd31e9e231750f7385e4cda3fcc2933befdda13df35bcf161f708",
+    "copied_test_sha256": "6bd5894f28bbd31e9e231750f7385e4cda3fcc2933befdda13df35bcf161f708",
+    "command": [
+      "/home/bkhou/miniforge3/envs/pyscfad_env/bin/python",
+      "-m",
+      "pytest",
+      "-vv",
+      "-p",
+      "no:cacheprovider",
+      "-c",
+      "/dev/null",
+      "--rootdir",
+      "/tmp/dlno-stc-clean-integration/baseline-tests",
+      "/tmp/dlno-stc-clean-integration/baseline-tests/test_boys_construction_baseline.py::test_public_selection_preserves_permuted_labels_and_concrete_anchors",
+      "/tmp/dlno-stc-clean-integration/baseline-tests/test_boys_construction_baseline.py::test_selection_rejects_invalid_target_partition_and_rank_loss",
+      "/tmp/dlno-stc-clean-integration/baseline-tests/test_boys_construction_baseline.py::test_standalone_system_frame_replays_frozen_virtual_and_continuous_response"
+    ],
+    "affinity": [
+      15
+    ],
+    "thread_env": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "PYSCFAD_DENSE_BLAS_THREADS": "1",
+      "PYTHONDONTWRITEBYTECODE": "1"
+    },
+    "exit_code": 1,
+    "production_diff_vs_baseline": [],
+    "tests_run": 3,
+    "failed": 3,
+    "warnings": 1,
+    "elapsed_seconds": 4.96
+  },
+  "molecular_values": {
+    "fock_direction_1e-05": {
+      "step": 1e-05,
+      "adjoint": 0.0055324508430887945,
+      "central_difference": 0.005532450854752769,
+      "absolute_error": 1.1663974473774541e-11
+    },
+    "coordinate_response": {
+      "correlation_energy_Eh": -0.07406737501085058,
+      "adjoint_Eh_per_bohr": -0.016822148415105716,
+      "gradient_Eh_per_bohr": [
+        [
+          0.0029202958400663392,
+          0.0014579521115922903,
+          0.03442734024833741
+        ],
+        [
+          -0.0024368468638334556,
+          0.014405457543612624,
+          -0.016822148415105716
+        ],
+        [
+          -0.00048387365048381537,
+          -0.015863691854395123,
+          -0.01760133133446956
+        ],
+        [
+          0.004392255794211918,
+          0.0020486667384978755,
+          0.03452497441857192
+        ],
+        [
+          -0.003271528402564828,
+          0.014131311307771155,
+          -0.016873906176401426
+        ],
+        [
+          -0.0011203019761455938,
+          -0.016179694075020082,
+          -0.017654915908394412
+        ]
+      ],
+      "force_Eh_per_bohr": [
+        [
+          -0.0029202958400663392,
+          -0.0014579521115922903,
+          -0.03442734024833741
+        ],
+        [
+          0.0024368468638334556,
+          -0.014405457543612624,
+          0.016822148415105716
+        ],
+        [
+          0.00048387365048381537,
+          0.015863691854395123,
+          0.01760133133446956
+        ],
+        [
+          -0.004392255794211918,
+          -0.0020486667384978755,
+          -0.03452497441857192
+        ],
+        [
+          0.003271528402564828,
+          -0.014131311307771155,
+          0.016873906176401426
+        ],
+        [
+          0.0011203019761455938,
+          0.016179694075020082,
+          0.017654915908394412
+        ]
+      ],
+      "fixed_choice_central_differences": [
+        {
+          "step_bohr": 1e-05,
+          "central_difference_Eh_per_bohr": -0.01682214864975884,
+          "absolute_error_Eh_per_bohr": 2.3465312332104915e-10
+        },
+        {
+          "step_bohr": 5e-06,
+          "central_difference_Eh_per_bohr": -0.016822149527528918,
+          "absolute_error_Eh_per_bohr": 1.1124232021653135e-09
+        }
+      ]
+    },
+    "ordered_frame_parity": {
+      "occupied_max_abs": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "fragment_pipeline_gradient": {
+      "energy_difference_eh": -2.2093438190040615e-14,
+      "max_gradient_difference_eh_per_bohr": 1.5468182290589993e-13,
+      "corrected_fragments": [
+        0,
+        1,
+        4,
+        5
+      ],
+      "variance_allocation": "occupied_count"
+    },
+    "fragment_pipeline_lis": {
+      "energy_difference_eh": -6.149941667032977e-14,
+      "max_gradient_difference_eh_per_bohr": 2.7542204628083766e-12,
+      "frame_counts": {
+        "forward": 1,
+        "reverse": 1
+      },
+      "w_forward_fragments": [
+        0,
+        1,
+        4,
+        5
+      ],
+      "w_reverse_fragments": [
+        0,
+        1,
+        4,
+        5
+      ],
+      "corrected_fragments": [
+        0,
+        1,
+        4,
+        5
+      ],
+      "lis_eigenspace": "domain"
+    },
+    "fock_direction_5e-06": {
+      "step": 5e-06,
+      "adjoint": 0.0055324508430887945,
+      "central_difference": 0.00553245084623094,
+      "absolute_error": 3.142145398038476e-12
+    }
+  },
+  "sgx_reuse": {
+    "source_revision": "42e4406e4fa1ab9d1b3d4866c47742b33e0af044",
+    "target_baseline": "551cd2d4c263b324d68dbfbc7fdec53fff87edf7",
+    "source_archive": "/home/bkhou/Project/DLNO_CC/pyscfad/build/rebuild-42e4406e/source/pyscfadlib/sgx",
+    "source_exclusions": [
+      "README.md"
+    ],
+    "binary_original": "/home/bkhou/miniforge3/envs/pyscfad_env/lib/python3.11/site-packages/pyscfadlib/libsgx_ad.so",
+    "binary_staged": "/tmp/dlno-stc-clean-integration/support-source/pyscfadlib/libsgx_ad.so",
+    "binary_sha256": "9f541ef8307f0927485f4d1b7b25fdbfe4088126ae5427fe89122c424716966c",
+    "artifact_evidence": "/home/bkhou/Project/DLNO_CC/pyscfad/build/rebuild-42e4406e/artifact.json",
+    "verification_evidence": "/home/bkhou/Project/DLNO_CC/pyscfad/build/rebuild-42e4406e/installed-verification.json",
+    "source_file_count": 317
+  },
+  "top_level_pytest_passed": 462,
+  "additional_direct_rank_case_executions_passed": 48,
+  "ctest_passed": 3,
+  "selected_final_skipped": 0,
+  "introduced_failures_remaining": 0,
+  "raw_evidence_directory": "/tmp/dlno-stc-clean-integration",
+  "recipes": {
+    "native-env.sh": "export DLNO_CLEAN_ROOT=/home/bkhou/Project/DLNO_CC/pyscfad-dlno-stc-clean\nexport DLNO_NATIVE_ROOT=/tmp/dlno-stc-clean-integration\nexport DLNO_PYTHON=/home/bkhou/miniforge3/envs/pyscfad_env/bin/python\nexport PYTHONDONTWRITEBYTECODE=1\nexport PYTHONNOUSERSITE=1\nexport PYTHONPATH=\"$DLNO_NATIVE_ROOT/support-source:$DLNO_CLEAN_ROOT\"\nexport LD_LIBRARY_PATH=\"/home/bkhou/Project/DLNO_CC/pyscfad/build/deps/native/usr/lib:/home/bkhou/Project/DLNO_CC/pyscfad/build/deps/native/usr/lib/x86_64-linux-gnu:/home/bkhou/miniforge3/envs/pyscfad_env/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\"\nexport OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1\nexport JAX_ENABLE_X64=true JAX_PLATFORMS=cpu\nexport JAX_COMPILATION_CACHE_DIR=\"$DLNO_NATIVE_ROOT/jax-cache\"\n",
+    "reproduce-native.sh": "#!/usr/bin/env bash\nset -euo pipefail\nsource /tmp/dlno-stc-clean-integration/native-env.sh\nnative_original=/home/bkhou/Project/DLNO_CC/pyscfad\nnative_env=/home/bkhou/miniforge3/envs/pyscfad_env\n\"$DLNO_PYTHON\" - <<'PY'\nimport hashlib,json,pathlib,shutil\nroot=pathlib.Path('/home/bkhou/Project/DLNO_CC/pyscfad-dlno-stc-clean')\nstage=pathlib.Path('/tmp/dlno-stc-clean-integration/support-source/pyscfadlib')\nassert not stage.exists(), f'Use a fresh stage, or run resume-native.sh for the existing build: {stage}'\nshutil.copytree(root/'pyscfadlib/pyscfadlib',stage,ignore=shutil.ignore_patterns('__pycache__','*.so','config.h','thirdparty'))\nsource={str(p.relative_to(stage)):hashlib.sha256(p.read_bytes()).hexdigest() for p in stage.rglob('*') if p.is_file()}\n(stage.parent.parent/'support-source-sha256.json').write_text(json.dumps(source,indent=2)+'\\n')\nthirdparty=pathlib.Path('/home/bkhou/miniforge3/envs/pyscfad_env/lib/python3.11/site-packages/pyscfadlib/thirdparty')\nshutil.copytree(thirdparty,stage/'thirdparty',symlinks=True)\nPY\nset -x\nLDFLAGS=\"-Wl,--no-as-needed -Wl,-rpath,$native_env/lib\" cmake \\\n  -S \"$DLNO_NATIVE_ROOT/support-source/pyscfadlib\" -B \"$DLNO_NATIVE_ROOT/support-build\" \\\n  -DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE=\"$DLNO_PYTHON\" \\\n  -DCMAKE_C_COMPILER=\"$native_env/bin/x86_64-conda-linux-gnu-cc\" \\\n  -DCMAKE_CXX_COMPILER=\"$native_env/bin/x86_64-conda-linux-gnu-c++\" \\\n  -DCMAKE_C_FLAGS=\"-O3 -march=native -mtune=native -std=gnu99\" \\\n  -DCMAKE_CXX_FLAGS=\"-O3 -march=native -mtune=native\" \\\n  -DBLAS_LIBRARIES=\"$native_env/lib/libopenblas.so\" \\\n  -DLAPACK_LIBRARIES=\"$native_env/lib/libopenblas.so\" \\\n  -DENABLE_OPENMP=ON -DBUILD_MARCH_NATIVE=ON -DBUILD_LIBCINT=OFF -DWITH_F12=OFF\n\"$DLNO_PYTHON\" \"$DLNO_NATIVE_ROOT/reuse-sgx.py\"\ncmake --build \"$DLNO_NATIVE_ROOT/support-build\" --parallel 2 --target np_helper_ad cgto_ad vjp_util cgto_vjp np_helper_vjp ao2mo_vjp cvhf_vjp mp_vjp cc_vjp pyscfad_lapack\ncmake -S \"$DLNO_CLEAN_ROOT/pyscfad/dlno_stc/cpp\" -B \"$DLNO_NATIVE_ROOT/stc-build\" \\\n  -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \\\n  -DPython_EXECUTABLE=\"$DLNO_PYTHON\" \\\n  -Dpybind11_DIR=\"$native_original/build/deps/python/pybind11/share/cmake/pybind11\" \\\n  -DARMADILLO_INCLUDE_DIR=\"$native_original/build/deps/native/usr/include\" \\\n  -DARMADILLO_LIBRARY=\"$native_original/build/deps/native/usr/lib/libarmadillo.so\" \\\n  -DCMAKE_CXX_COMPILER=/usr/bin/c++ \\\n  -DCMAKE_SHARED_LINKER_FLAGS=\"-Wl,--disable-new-dtags\" \\\n  -DCMAKE_BUILD_RPATH=\"$native_original/build/deps/native/usr/lib;$native_original/build/deps/native/usr/lib/x86_64-linux-gnu;$native_env/lib\" \\\n  -DCMAKE_LIBRARY_OUTPUT_DIRECTORY=\"$DLNO_CLEAN_ROOT/pyscfad/dlno_stc\"\ncmake --build \"$DLNO_NATIVE_ROOT/stc-build\" --parallel 2\ncmake -S \"$DLNO_CLEAN_ROOT/pyscfad/cc/cpp\" -B \"$DLNO_NATIVE_ROOT/ccsd-build\" \\\n  -DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE=\"$DLNO_PYTHON\" \\\n  -Dpybind11_DIR=\"$native_original/build/deps/python/pybind11/share/cmake/pybind11\" \\\n  -DCMAKE_CXX_COMPILER=/usr/bin/c++ \\\n  -DCMAKE_LIBRARY_OUTPUT_DIRECTORY=\"$DLNO_CLEAN_ROOT/pyscfad/cc\"\ncmake --build \"$DLNO_NATIVE_ROOT/ccsd-build\" --parallel 2\nctest --test-dir \"$DLNO_NATIVE_ROOT/stc-build\" --output-on-failure\n\"$DLNO_PYTHON\" \"$DLNO_NATIVE_ROOT/audit-native.py\" \"$DLNO_NATIVE_ROOT/native-after.json\" \"$DLNO_NATIVE_ROOT/native-before.json\"\n\"$DLNO_PYTHON\" \"$DLNO_NATIVE_ROOT/verify-native.py\"\n",
+    "reuse-sgx.py": "from pathlib import Path\nimport hashlib,json,shutil\nrecord=Path('/home/bkhou/Project/DLNO_CC/pyscfad/build/rebuild-42e4406e')\nclean=Path('/home/bkhou/Project/DLNO_CC/pyscfad-dlno-stc-clean/pyscfadlib/pyscfadlib/sgx')\narchive=record/'source/pyscfadlib/sgx'\nfiles=[p for p in clean.rglob('*') if p.is_file() and p.name!='README.md' and '__pycache__' not in p.parts]\nassert {str(p.relative_to(clean)) for p in files}=={str(p.relative_to(archive)) for p in archive.rglob('*') if p.is_file() and p.name!='README.md' and '__pycache__' not in p.parts}\nassert all(p.read_bytes()==(archive/p.relative_to(clean)).read_bytes() for p in files)\ninstalled=Path('/home/bkhou/miniforge3/envs/pyscfad_env/lib/python3.11/site-packages/pyscfadlib/libsgx_ad.so')\nverification=json.loads((record/'installed-verification.json').read_text())\nsha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()\nassert sha(installed)==verification['native_sha256']['libsgx_ad.so']\nstage=Path('/tmp/dlno-stc-clean-integration/support-source/pyscfadlib/libsgx_ad.so')\nshutil.copy2(installed,stage)\nprovenance={'source_revision':'42e4406e4fa1ab9d1b3d4866c47742b33e0af044','target_baseline':'551cd2d4c263b324d68dbfbc7fdec53fff87edf7','source_archive':str(archive),'source_files':{str(p.relative_to(clean)):sha(p) for p in files},'source_exclusions':['README.md'],'binary_original':str(installed),'binary_staged':str(stage),'binary_sha256':sha(installed),'artifact_evidence':str(record/'artifact.json'),'verification_evidence':str(record/'installed-verification.json')}\nPath('/tmp/dlno-stc-clean-integration/reused-sgx-provenance.json').write_text(json.dumps(provenance,indent=2)+'\\n')\nprint(f'Verified {len(files)} SGX source files and binary SHA256 {sha(installed)}; copied unchanged SGX binary to isolated stage.')\n",
+    "native-tests.sh": "#!/usr/bin/env bash\nset -uo pipefail\nsource /tmp/dlno-stc-clean-integration/native-env.sh\nexport OMP_NUM_THREADS=2 OMP_THREAD_LIMIT=2 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1\ncd \"$DLNO_CLEAN_ROOT\"\nset -x\ngit rev-parse HEAD > \"$DLNO_NATIVE_ROOT/native-tests-commit.txt\"\n\"$DLNO_PYTHON\" \"$DLNO_NATIVE_ROOT/verify-native.py\" > \"$DLNO_NATIVE_ROOT/native-tests-provenance.log\" 2>&1\n/usr/bin/time -v -o \"$DLNO_NATIVE_ROOT/native-tests-df.time\" taskset -c 0,1 \"$DLNO_PYTHON\" -m pytest -q -rA \\\n  pyscfad/df/test/test_native_dynamic_teams.py \\\n  pyscfad/df/test/test_reverse_native_slices.py \\\n  pyscfad/lno/test/test_half_df_contract.py \\\n  --junitxml=\"$DLNO_NATIVE_ROOT/native-tests-df.xml\" > \"$DLNO_NATIVE_ROOT/native-tests-df.log\" 2>&1\nnative_df_status=$?\n/usr/bin/time -v -o \"$DLNO_NATIVE_ROOT/native-tests-sgx-native.time\" taskset -c 0,1 \"$DLNO_PYTHON\" -m pytest -q -rA \\\n  tests/test_sgx_native.py \\\n  --junitxml=\"$DLNO_NATIVE_ROOT/native-tests-sgx-native.xml\" > \"$DLNO_NATIVE_ROOT/native-tests-sgx-native.log\" 2>&1\nnative_sgx_status=$?\n/usr/bin/time -v -o \"$DLNO_NATIVE_ROOT/native-tests-sgx-basic.time\" taskset -c 0,1 \"$DLNO_PYTHON\" -m pytest -q -rA \\\n  tests/test_sgx.py::test_default_screening_reaches_native_plan \\\n  tests/test_sgx.py::test_correlation_df_preserved_and_unsupported_modes_rejected \\\n  tests/test_sgx.py::test_density_response_is_linear_without_geometry_work \\\n  tests/test_sgx.py::test_pullback_with_tiny_response_seeds \\\n  --junitxml=\"$DLNO_NATIVE_ROOT/native-tests-sgx-basic.xml\" > \"$DLNO_NATIVE_ROOT/native-tests-sgx-basic.log\" 2>&1\nnative_sgx_basic_status=$?\n/usr/bin/time -v -o \"$DLNO_NATIVE_ROOT/native-tests-ctest.time\" taskset -c 0,1 ctest --test-dir \"$DLNO_NATIVE_ROOT/stc-build\" --output-on-failure > \"$DLNO_NATIVE_ROOT/native-tests-ctest.log\" 2>&1\nnative_ctest_status=$?\n\"$DLNO_PYTHON\" \"$DLNO_NATIVE_ROOT/audit-native.py\" \"$DLNO_NATIVE_ROOT/native-tests-original-after.json\" \"$DLNO_NATIVE_ROOT/native-before.json\" > \"$DLNO_NATIVE_ROOT/native-tests-original-audit.log\"\nprintf 'df=%s\\nsgx_native=%s\\nsgx_basic=%s\\nctest=%s\\n' \"$native_df_status\" \"$native_sgx_status\" \"$native_sgx_basic_status\" \"$native_ctest_status\" > \"$DLNO_NATIVE_ROOT/native-tests-status.txt\"\n",
+    "native-tests-mpi.sh": "#!/usr/bin/env bash\nset -uo pipefail\nsource /tmp/dlno-stc-clean-integration/mpi-tests-env.sh\ncd \"$DLNO_CLEAN_ROOT\"\nset -x\nmpiexec -n 1 \"$DLNO_PYTHON\" -c 'from mpi4py import MPI; import pyscfad,pyscfadlib; print(MPI.get_vendor(), MPI.COMM_WORLD.Get_size(), pyscfad.__file__, pyscfadlib.__file__)' > \"$DLNO_NATIVE_ROOT/native-tests-mpi-provenance.log\" 2>&1\n\"$DLNO_PYTHON\" \"$DLNO_NATIVE_ROOT/measure-process-tree.py\" \"$DLNO_NATIVE_ROOT/native-tests-mpi-domain.time.json\" \\\n  \"$DLNO_PYTHON\" -m pytest -q -rA pyscfad/dlno_stc/test/test_domain_mpi.py::test_deterministic_domain_only_serial_one_two_four_rank_parity \\\n  --junitxml=\"$DLNO_NATIVE_ROOT/native-tests-mpi-domain.xml\" --basetemp=\"$DLNO_NATIVE_ROOT/mpi-domain-tmp\" > \"$DLNO_NATIVE_ROOT/native-tests-mpi-domain.log\" 2>&1\nmpi_domain_status=$?\n\"$DLNO_PYTHON\" \"$DLNO_NATIVE_ROOT/measure-process-tree.py\" \"$DLNO_NATIVE_ROOT/native-tests-mpi-pipeline.time.json\" \\\n  \"$DLNO_PYTHON\" -m pytest -q -rA pyscfad/dlno_stc/test/test_ccsd_pipeline_mpi.py \\\n  --junitxml=\"$DLNO_NATIVE_ROOT/native-tests-mpi-pipeline.xml\" --basetemp=\"$DLNO_NATIVE_ROOT/mpi-pipeline-tmp\" > \"$DLNO_NATIVE_ROOT/native-tests-mpi-pipeline.log\" 2>&1\nmpi_pipeline_status=$?\n\"$DLNO_PYTHON\" \"$DLNO_NATIVE_ROOT/measure-process-tree.py\" \"$DLNO_NATIVE_ROOT/native-tests-mpi-weak.time.json\" \\\n  mpiexec -n 4 /bin/bash -c 'exec \"$DLNO_PYTHON\" -m pytest -q -rA pyscfad/dlno_stc/test/test_mpi_weak.py -k \"not test_weak_mpi_subprocess\" --junitxml=\"$DLNO_NATIVE_ROOT/native-tests-mpi-weak-rank-$OMPI_COMM_WORLD_RANK.xml\" --basetemp=\"$DLNO_NATIVE_ROOT/mpi-weak-rank-$OMPI_COMM_WORLD_RANK-tmp\"' > \"$DLNO_NATIVE_ROOT/native-tests-mpi-weak.log\" 2>&1\nmpi_weak_status=$?\nprintf 'domain=%s\\npipeline=%s\\nweak=%s\\n' \"$mpi_domain_status\" \"$mpi_pipeline_status\" \"$mpi_weak_status\" > \"$DLNO_NATIVE_ROOT/native-tests-mpi-status.txt\"\n",
+    "native-tests-mpi-weak-repaired.sh": "#!/usr/bin/env bash\nset -uo pipefail\nsource /tmp/dlno-stc-clean-integration/mpi-tests-env.sh\ncd \"$DLNO_CLEAN_ROOT\"\nset -x\nsha256sum pyscfad/dlno_stc/test/test_mpi_weak.py > \"$DLNO_NATIVE_ROOT/native-tests-mpi-weak-repaired-source.sha256\"\n\"$DLNO_PYTHON\" \"$DLNO_NATIVE_ROOT/measure-process-tree.py\" \"$DLNO_NATIVE_ROOT/native-tests-mpi-weak-repaired.time.json\" \\\n  mpiexec -n 4 /bin/bash -c 'exec \"$DLNO_PYTHON\" -m pytest -q -rA pyscfad/dlno_stc/test/test_mpi_weak.py -k \"not test_weak_mpi_subprocess\" --junitxml=\"$DLNO_NATIVE_ROOT/native-tests-mpi-weak-repaired-rank-$OMPI_COMM_WORLD_RANK.xml\" --basetemp=\"$DLNO_NATIVE_ROOT/mpi-weak-repaired-rank-$OMPI_COMM_WORLD_RANK-tmp\"' > \"$DLNO_NATIVE_ROOT/native-tests-mpi-weak-repaired.log\" 2>&1\nmpi_weak_status=$?\n\"$DLNO_PYTHON\" \"$DLNO_NATIVE_ROOT/measure-process-tree.py\" \"$DLNO_NATIVE_ROOT/native-tests-mpi-weak-wrapper.time.json\" \\\n  \"$DLNO_PYTHON\" -m pytest -q -rA pyscfad/dlno_stc/test/test_mpi_weak.py::test_weak_mpi_subprocess \\\n  --junitxml=\"$DLNO_NATIVE_ROOT/native-tests-mpi-weak-wrapper.xml\" --basetemp=\"$DLNO_NATIVE_ROOT/mpi-weak-wrapper-tmp\" > \"$DLNO_NATIVE_ROOT/native-tests-mpi-weak-wrapper.log\" 2>&1\nmpi_wrapper_status=$?\nprintf 'weak=%s\\nwrapper=%s\\n' \"$mpi_weak_status\" \"$mpi_wrapper_status\" > \"$DLNO_NATIVE_ROOT/native-tests-mpi-weak-repaired-status.txt\"\n",
+    "run-focused.py": "import json,os,pathlib,subprocess,sys,time\nroot=pathlib.Path('/home/bkhou/Project/DLNO_CC/pyscfad-dlno-stc-clean')\nout=pathlib.Path('/tmp/dlno-stc-clean-integration/focused');out.mkdir(exist_ok=True)\np='pyscfad/dlno_stc/test/'\ngroups=[\n('pao_selection',[p+'test_pao_norm_threshold.py',p+'test_ed_metadata.py',p+'test_ed_local_pao.py',p+'test_boys_construction.py',p+'test_primary_execution.py']),\n('weak_numpy',[p+'test_weak_numpy.py']),\n('weak_native',[p+'test_weak_moment_native.py']),\n('primary_response',[p+'test_primary_response.py']),\n('pao_reuse',[p+'test_pao_response_reuse.py',p+'test_weak_local_products.py']),\n('weak_endpoints',[p+'test_weak_endpoints.py']),\n('w_native',[p+'test_w_delayed_pullback.py',p+'test_selected_kernel.py']),\n('mrcc',[p+'test_mrcc_triples.py']),\n('lis_reuse',[p+'test_lis_construction_reuse.py']),\n('w_baseline',[p+'test_w_baseline_reuse.py']),\n('fragment_pipeline',[p+'test_fragment_pipeline.py']),\n('restart',[p+'test_boys_restart.py']),\n('saved_grids',[p+'test_saved_quadratures.py','-k','not fixed_grid_forces']),\n('fd_mp2',[p+'test_saved_quadratures.py::test_saved_grids_reach_every_domain_and_fixed_grid_forces[mp2]']),\n('fd_ccsd',[p+'test_saved_quadratures.py::test_saved_grids_reach_every_domain_and_fixed_grid_forces[ccsd]']),\n('fd_ccsd_t',[p+'test_saved_quadratures.py::test_saved_grids_reach_every_domain_and_fixed_grid_forces[ccsd_t]']),\n('modes',[p+'test_calculation_modes.py']),\n('domain_parity',[p+'test_domain_parity.py']),\n('dcsd',['pyscfad/cc/test/test_dcsd.py']),\n('independent_mp2',[p+'test_system.py::test_system_matches_native_dfmp2_with_frozen_and_coordinate_response']),\n('native_ccsd_t',[p+'test_native_ccsd.py::test_native_dlno_ccsdt_energy_gradient']),\n('cc_checkpoints',[p+'test_triples.py::test_checkpoint_rejects_changed_triples_controls_and_native_version',p+'test_triples.py::test_cc_checkpoint_rejects_changed_ladder_mode',p+'test_triples.py::test_deterministic_default_resume_accepts_explicit_mode']),\n]\nif len(sys.argv)>1:groups=[g for g in groups if g[0] in sys.argv[1:]]\nfor name,args in groups:\n    cmd=[sys.executable,'-m','pytest','-q','--tb=short','--junitxml='+str(out/(name+'.xml')),*args]\n    started=time.monotonic();print('START '+name,flush=True)\n    with (out/(name+'.log')).open('w') as log:\n        try:r=subprocess.run(['/usr/bin/time','-v','-o',str(out/(name+'.time')),*cmd],cwd=root,stdout=log,stderr=subprocess.STDOUT,timeout=900);code=r.returncode\n        except subprocess.TimeoutExpired:code=124\n    result={'name':name,'command':cmd,'exit_code':code,'elapsed_seconds':time.monotonic()-started,'head':subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip()}\n    (out/(name+'.json')).write_text(json.dumps(result,indent=2))\n    print('END '+name+' exit='+str(code)+' seconds='+str(round(result['elapsed_seconds'],1)),flush=True)\n    print('\\n'.join((out/(name+'.log')).read_text().splitlines()[-3:]),flush=True)\n",
+    "mpi-tests-env.sh": "source /tmp/dlno-stc-clean-integration/native-env.sh\nexport PATH=/home/bkhou/miniforge3/envs/pyscfad_env/bin:/usr/bin:/bin\nexport LD_LIBRARY_PATH=/home/bkhou/Project/DLNO_CC/pyscfad/build/deps/native/usr/lib:/home/bkhou/Project/DLNO_CC/pyscfad/build/deps/native/usr/lib/x86_64-linux-gnu:/home/bkhou/miniforge3/envs/pyscfad_env/lib\nfor mpi_setting in $(compgen -e | /usr/bin/rg '^(OMPI|OPAL|PMI|PMIX|MPI)_'); do\n  unset \"$mpi_setting\"\ndone\nexport OMP_NUM_THREADS=1 OMP_THREAD_LIMIT=1 OMP_MAX_ACTIVE_LEVELS=1 OMP_DYNAMIC=FALSE OMP_PROC_BIND=FALSE\nexport OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 MKL_DYNAMIC=FALSE BLIS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1\nexport PYSCFAD_DENSE_BLAS_THREADS=1\nexport XLA_FLAGS=--xla_cpu_multi_thread_eigen=false\n",
+    "measure-process-tree.py": "import json,os,pathlib,resource,signal,subprocess,sys,time\nout=pathlib.Path(sys.argv[1]);command=sys.argv[2:]\nstart=time.monotonic(); process=subprocess.Popen(command,start_new_session=True)\npeak_kb=0;peak_processes=0;limit_kb=10*1024*1024;limited=False\nwhile True:\n    stats={}\n    for p in pathlib.Path('/proc').iterdir():\n        if not p.name.isdecimal(): continue\n        try:\n            fields=(p/'stat').read_text().rsplit(')',1)[1].split()\n            stats[int(p.name)]=(int(fields[1]),int(fields[21])*os.sysconf('SC_PAGE_SIZE')//1024)\n        except (OSError,ValueError,IndexError): pass\n    descendants={process.pid}\n    while True:\n        new={p for p,(parent,rss) in stats.items() if parent in descendants}-descendants\n        if not new: break\n        descendants.update(new)\n    total=sum(stats[p][1] for p in descendants if p in stats)\n    peak_kb=max(peak_kb,total);peak_processes=max(peak_processes,len(descendants))\n    if total>limit_kb:\n        limited=True;os.killpg(process.pid,signal.SIGTERM)\n    status=process.poll()\n    if status is not None: break\n    if time.monotonic()-start>1200:\n        limited=True;os.killpg(process.pid,signal.SIGTERM)\n    time.sleep(.2)\nresult={'argv':command,'exit_code':status,'elapsed_seconds':time.monotonic()-start,'sampled_aggregate_peak_rss_kb':peak_kb,'peak_process_count':peak_processes,'child_max_rss_kb':resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,'limit_exceeded':limited,'rss_sampling_seconds':.2}\nout.write_text(json.dumps(result,indent=2)+'\\n')\nprint(json.dumps(result),flush=True)\nsys.exit(status if status>=0 else 128-status)\n",
+    "audit-native.py": "import hashlib, json, pathlib, sys\nroot=pathlib.Path('/home/bkhou/Project/DLNO_CC/pyscfad')\nenv=pathlib.Path('/home/bkhou/miniforge3/envs/pyscfad_env')\nfiles=set()\nfor subtree in [root/'build/dlno_stc', root/'build/deps', env/'lib/python3.11/site-packages/pyscfadlib']:\n    files.update(p for p in subtree.rglob('*') if p.is_file() and '__pycache__' not in p.parts)\nfor subtree in [root/'pyscfad',root/'pyscfadlib/pyscfadlib']:\n    files.update(subtree.rglob('*.so'))\nsite=env/'lib/python3.11/site-packages'\nfor pattern in ['__editable__*pyscfad*','pyscfad-*.dist-info/*','pyscfadlib-*.dist-info/*']:\n    files.update(p for p in site.glob(pattern) if p.is_file())\nout={str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(files)}\npath=pathlib.Path(sys.argv[1]); path.write_text(json.dumps(out,indent=2)+'\\n')\nprint(f'Audited {len(out)} existing native/dependency/installed files into {path}')\nif len(sys.argv)>2:\n    old=json.loads(pathlib.Path(sys.argv[2]).read_text())\n    differences=sorted(p for p in old.keys()|out.keys() if old.get(p)!=out.get(p))\n    print(json.dumps({'changed':differences},indent=2))\n    assert not differences\n",
+    "verify-native.py": "import ctypes,hashlib,importlib.metadata as metadata,json,os,pathlib,subprocess,sys\nroot=pathlib.Path('/home/bkhou/Project/DLNO_CC/pyscfad-dlno-stc-clean')\nrecord=pathlib.Path('/tmp/dlno-stc-clean-integration')\nstage=record/'support-source/pyscfadlib'\nprefix=pathlib.Path('/home/bkhou/miniforge3/envs/pyscfad_env')\nassert pathlib.Path(sys.prefix)==prefix\nimport pyscfad,pyscfadlib\nfrom pyscfad.dlno_stc import _stc_mp2\nfrom pyscfad.cc import _ccsd_kernels\nfrom pyscfad.sgx import _native\nassert pathlib.Path(pyscfad.__file__).resolve()==root/'pyscfad/__init__.py'\nassert pathlib.Path(pyscfadlib.__file__).resolve()==stage/'__init__.py'\nstc=pathlib.Path(_stc_mp2.__file__).resolve()\ncc=pathlib.Path(_ccsd_kernels.__file__).resolve()\nassert stc.parent==root/'pyscfad/dlno_stc'\nassert cc.parent==root/'pyscfad/cc'\nassert hasattr(_stc_mp2,'_solve_full_reference')\nsgx=_native.library()\nassert sgx is not None and sgx.SGX_generated_version()==4\nsha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()\nlibs=sorted(stage.glob('*.so'))\nassert len(libs)==11,libs\nhashes={}; links={}\nfor lib in [*libs,stc,cc]:\n    output=subprocess.check_output(['ldd',str(lib)],text=True)\n    assert 'not found' not in output,(lib,output)\n    ctypes.CDLL(str(lib))\n    hashes[str(lib)]=sha(lib);links[str(lib)]=output\n    if lib in libs:\n        assert pathlib.Path(pyscfadlib.__file__).resolve().parent==stage\nblas=ctypes.CDLL(str(prefix/'lib/libopenblas.so'))\nblas.openblas_get_config.restype=ctypes.c_char_p\nconfig=blas.openblas_get_config().decode();assert 'USE64BITINT' not in config\noriginal_cint=prefix/'lib/python3.11/site-packages/pyscfadlib/thirdparty/lib/libcintad.so'\nassert sha(stage/'thirdparty/lib/libcintad.so')==sha(original_cint)\ninitial=json.loads((record/'support-source-sha256.json').read_text())\nsource_changes=[p for p,v in initial.items() if sha(root/'pyscfadlib/pyscfadlib'/p)!=v]\nassert not source_changes,source_changes\nsource_manifest={}\nfor sub in ['pyscfad/dlno_stc/cpp','pyscfad/cc/cpp']:\n    source_manifest.update({str(p.relative_to(root)):sha(p) for p in (root/sub).rglob('*') if p.is_file()})\n(record/'extensions-source-sha256.json').write_text(json.dumps(source_manifest,indent=2)+'\\n')\nresult={'status':'ok','python':sys.executable,'pyscfad_path':pyscfad.__file__,'pyscfadlib_path':pyscfadlib.__file__,'stc_path':str(stc),'ccsd_path':str(cc),'stc_version':_stc_mp2.TRIPLES_VERSION,'stc_independent_reference':True,'sgx_abi':sgx.SGX_generated_version(),'blas_config':config,'libcintad_sha256':sha(original_cint),'native_sha256':hashes,'linkage':links,'versions':{p:metadata.version(p) for p in ['pyscf','pyscfad','pyscfadlib','jax','jaxlib','numpy','scipy','pytest','mpi4py']},'paths':{'PYTHONPATH':os.environ['PYTHONPATH'],'LD_LIBRARY_PATH':os.environ['LD_LIBRARY_PATH']},'reused_sgx_evidence':str(record/'reused-sgx-provenance.json'),'rebuilt_support_targets':['np_helper_ad','cgto_ad','vjp_util','cgto_vjp','np_helper_vjp','ao2mo_vjp','cvhf_vjp','mp_vjp','cc_vjp','pyscfad_lapack']}\n(record/'native-verification.json').write_text(json.dumps(result,indent=2)+'\\n')\nprint(json.dumps({k:v for k,v in result.items() if k not in ['linkage','native_sha256','paths']},indent=2))\n"
+  },
+  "original_checkout_initial": {
+    "original_path": "/home/bkhou/Project/DLNO_CC/pyscfad",
+    "head": "c4f64d13377ebaf683659aecf695709a7db8bd8a",
+    "branch": "dlno-stc",
+    "status": "",
+    "source_local_refs": "refs/heads/dlno-stc c4f64d13377ebaf683659aecf695709a7db8bd8a\n",
+    "remote_refs_before_fetch": "refs/remotes/origin/dlno-stc c4f64d13377ebaf683659aecf695709a7db8bd8a\nrefs/remotes/origin/dlno-stc-fix 551cd2d4c263b324d68dbfbc7fdec53fff87edf7\n",
+    "diff": "",
+    "index": ""
+  },
+  "original_checkout_final": {
+    "head": "c4f64d13377ebaf683659aecf695709a7db8bd8a",
+    "branch": "dlno-stc",
+    "status": "",
+    "source_local_refs": "refs/heads/dlno-stc c4f64d13377ebaf683659aecf695709a7db8bd8a\n",
+    "diff": "",
+    "index": ""
+  },
+  "intentional_changed_tracked_paths_before_report_commit": [
+    "docs/superpowers/plans/2026-11-17-dlno-stc-clean.md",
+    "docs/superpowers/reports/2026-11-17-dlno-stc-clean-audit.md",
+    "pyscfad/cc/test/test_dcsd.py",
+    "pyscfad/dlno_stc/test/test_boys_construction.py",
+    "pyscfad/dlno_stc/test/test_domain_parity.py",
+    "pyscfad/dlno_stc/test/test_host_carryover.py",
+    "pyscfad/dlno_stc/test/test_mpi_weak.py",
+    "pyscfad/dlno_stc/test/test_primary_execution.py"
+  ]
+}

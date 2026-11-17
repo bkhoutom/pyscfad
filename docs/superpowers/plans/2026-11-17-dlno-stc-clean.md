@@ -48,16 +48,17 @@ pytest and MPI when available.
   Print executable, Python imports and extension paths; preserve original builds.
 - [x] Commit reconciliation and regression changes; assert ancestry of all
   recorded source tips before final validation.
-- [ ] Run focused PAO/rank/degeneracy/empty-space, weak values/all cotangents,
+- [x] Run focused PAO/rank/degeneracy/empty-space, weak values/all cotangents,
   grouped response, W/LIS reuse, saved grids and restart rejection tests.
-- [ ] Run deterministic molecular MP2 and CCSD(T) energies/coordinate gradients,
+- [x] Run deterministic molecular MP2 and CCSD(T) energies/coordinate gradients,
   finite differences, DF/SGX native checks and available serial/MPI comparisons.
   Keep settings explicit and report unavailable or pre-existing failures.
-- [ ] Inspect workstation memory/compilation behavior with a small case;
+- [x] Inspect workstation memory/compilation behavior with a small case;
   review the whole final diff independently; rerun affected tests after fixes.
-- [ ] Record exact commands/results, source IDs and limitations; commit report;
-  verify unchanged original status/files/refs and remote tips, then normally push
-  only `HEAD:refs/heads/dlno-stc-clean` after required checks pass.
+- [x] Record exact commands/results, source IDs and limitations; prepare report;
+  verify unchanged original status/files/refs and remote tips, then prepare the
+  authorized normal push of only `HEAD:refs/heads/dlno-stc-clean`. The push and
+  remote-HEAD verification follow the evidence commit and are reported at delivery.
 
 ## Review focus
 
@@ -82,3 +83,11 @@ pytest and MPI when available.
   review identified and added upstream degenerate preprojection coverage.
 - Final validation runs in separate processes under the isolated native env;
   detailed commands, results and resource usage will accompany the report.
+
+- Final selected checks: 462 top-level pytest cases, 48 additional direct rank
+  executions and 3 CTests passed; no final skips/failures. Three baseline Boys
+  failures and ten baseline weak-MPI fixture failures per rank were reproduced
+  and repaired without production edits. Full audit/evidence committed alongside
+  the validation report. Original installation and 1,472 native files unchanged.
+- User-selected delivery is a normal push of only `dlno-stc-clean`; preserve the
+  sibling worktree and both source branches. No PR or branch cleanup is requested.

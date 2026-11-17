@@ -1,6 +1,5 @@
 """Ordered Boys construction: concrete labels and continuous local frames."""
 
-from dataclasses import replace
 from copy import copy
 
 import jax
@@ -21,46 +20,6 @@ def reference():
     mf.conv_tol = 1e-11
     mf.kernel()
     return mf
-
-
-def test_public_selection_preserves_permuted_labels_and_concrete_anchors(reference):
-    assert hasattr(dlno_stc, "build_domain_selections")
-    static = dlno_stc.build_domain_selections(
-        reference, frozen=1, frag_lolist=[[3], [1], [0], [2]],
-        force_full_domains=True,
-    )
-    assert type(static).__module__ == "pyscfad.dlno_stc._selection"
-    common = domain.rebuild_domain_data(reference, static)
-    for index, fragment in enumerate(static.fragments):
-        frame = domain.build_boys_ed_frame(common, static, index)
-        assert frame.target_index == index
-        assert fragment.target_index == index
-        assert len(fragment.virtual_anchor_columns) == 2
-        ao = fragment.extended_ao_indices
-        s22 = np.asarray(common.s1e)[np.ix_(ao, ao)]
-        candidates = np.asarray(common.iao_coeff)[:, [3, 1, 0, 2]]
-        projected = np.linalg.solve(s22, np.asarray(common.s1e)[ao] @ candidates)
-        lower = np.linalg.cholesky(projected.T @ s22 @ projected)
-        expected = np.linalg.solve(lower, projected.T).T
-        pivot = np.argmax(abs(expected), axis=0)
-        expected *= np.where(expected[pivot, np.arange(4)] < 0, -1., 1.)
-        np.testing.assert_allclose(frame.occupied_coeff, expected, atol=1e-10)
-        coeff = np.concatenate((frame.occupied_coeff, frame.virtual_coeff), axis=1)
-        np.testing.assert_allclose(coeff.T @ s22 @ coeff, np.eye(6), atol=1e-9)
-
-
-def test_selection_rejects_invalid_target_partition_and_rank_loss(reference):
-    assert hasattr(dlno_stc, "build_domain_selections")
-    with pytest.raises(ValueError, match="singleton"):
-        dlno_stc.build_domain_selections(reference, frozen=1, frag_lolist=[[0, 1], [2], [3]])
-    with pytest.raises(ValueError, match="orthonormal|span"):
-        dlno_stc.build_domain_selections(reference, frozen=1, target_coeff=np.ones((7, 4)))
-    static = dlno_stc.build_domain_selections(reference, frozen=1, force_full_domains=True)
-    common = domain.rebuild_domain_data(reference, static)
-    fragment = replace(static.fragments[2], strong_occ_metric_keep=np.arange(3))
-    broken = replace(static, fragments=static.fragments[:2] + (fragment,) + static.fragments[3:])
-    with pytest.raises(RuntimeError, match="domain 2|fragment 2"):
-        domain.build_boys_ed_frame(common, broken, 2)
 
 
 def test_standalone_system_frame_replays_frozen_virtual_and_continuous_response(reference):

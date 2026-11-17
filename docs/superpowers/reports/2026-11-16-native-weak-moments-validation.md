@@ -71,6 +71,12 @@ they do not establish a large-system whole-job speedup.
 
 ## Repository-wide test limitation
 
+Follow-up: the repository owner identified the five tests below as outdated
+and requested their removal. They have been retired, along with their unused
+fixture and imports. The entries below preserve the integration-time results.
+Cleanup verification: the remaining tests in `test_boys_construction.py` and
+`test_domain_parity.py` passed (12 tests, 29.28 seconds).
+
 `python -m pytest -q --maxfail=1` stopped after 11 passing tests, 2 skips,
 and 18 deselections at `pyscfad/cc/test/test_dcsd.py::test_df_nuc_grad`:
 `NotImplementedError: Saved update intermediates require ordinary DF-CCSD`

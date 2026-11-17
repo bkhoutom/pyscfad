@@ -25,7 +25,7 @@ class MeanField(NamedTuple):
     mol: object
 
 
-def _fixture(monkeypatch, changed=None):
+def _fixture(monkeypatch, changed=None, *, numpy_backend=False):
     rng = np.random.default_rng(12)
     nao = 8
     root = np.eye(nao) + .06 * rng.normal(size=(nao, nao))
@@ -70,6 +70,8 @@ def _fixture(monkeypatch, changed=None):
     # transformations (including their VJPs) remain the production routines.
     monkeypatch.setattr(_pairs, '_fake_mol_with_traced_centers', lambda mol, atoms: mol)
     monkeypatch.setattr(_pairs, '_origin_zero_moments', moments)
+    monkeypatch.setattr(_pairs, '_origin_zero_moments_vjp',
+        lambda mf, atoms, order: jax.vjp(lambda m: _pairs._origin_zero_moments(m.mol, order), mf))
     return mf, common, static
 
 
@@ -84,13 +86,14 @@ def test_identical_paos_share_eigensolvers_and_preserve_full_common_gradient(mon
     mf, common, static = _fixture(monkeypatch)
     expected, expected_bars = _pairs.weak_pair_energy_and_grad(mf, common, static)
     eigensolves = Counter()
-    eigh = domain.scipy.linalg.eigh
+    from pyscfad.dlno_stc import _weak_numpy
+    eigh = _weak_numpy.eigh
 
     def counted(matrix, *args, **kwargs):
         eigensolves[matrix.shape] += 1
         return eigh(matrix, *args, **kwargs)
 
-    monkeypatch.setattr(domain.scipy.linalg, 'eigh', counted)
+    monkeypatch.setattr(_weak_numpy, 'eigh', counted)
     prepared = {}
     _pairs.screen_pairs(mf, common, static, prepared_endpoints=prepared)
     # Three endpoints need one canonical PAO solve and one support solve,
@@ -121,13 +124,14 @@ def test_distinct_saved_pao_labels_and_supports_never_share(monkeypatch, changed
     mf, common, static = _fixture(monkeypatch, changed)
     expected, expected_bars = _pairs.weak_pair_energy_and_grad(mf, common, static)
     calls = Counter()
-    eigh = domain.scipy.linalg.eigh
+    from pyscfad.dlno_stc import _weak_numpy
+    eigh = _weak_numpy.eigh
 
     def counted(matrix, *args, **kwargs):
         calls[matrix.shape] += 1
         return eigh(matrix, *args, **kwargs)
 
-    monkeypatch.setattr(domain.scipy.linalg, 'eigh', counted)
+    monkeypatch.setattr(_weak_numpy, 'eigh', counted)
     prepared = {}
     _pairs.screen_pairs(mf, common, static, prepared_endpoints=prepared)
     assert calls == Counter({(4, 4): 2, (3, 3): 2, (2, 2): 3})
@@ -140,26 +144,19 @@ def test_distinct_saved_pao_labels_and_supports_never_share(monkeypatch, changed
 @pytest.mark.parametrize('pairs', [(), ((0, 1),), ((0, 1), (0, 2), (1, 2))])
 def test_shared_reverse_runs_once_only_for_used_group_and_releases_tapes(monkeypatch, pairs):
     mf, common, static = _fixture(monkeypatch)
-    preprojection = getattr(domain, '_rebuild_selected_pao_preprojection', None)
-    assert callable(preprojection), 'PAO preprojection needs a separately reusable response'
+    from pyscfad.dlno_stc import _weak_numpy
+    preprojection = _weak_numpy.fixed_preprojection
     calls = Counter()
     tapes = []
-    vjp = jax.vjp
-
-    def counted(fun, *args, **kwargs):
-        value, pullback = vjp(fun, *args, **kwargs)
-        if getattr(fun, 'func', None) is preprojection:
-            calls['forward'] += 1
-
-            def tracked(bar):
-                calls['reverse'] += 1
-                return pullback(bar)
-
-            tapes.append(weakref.ref(tracked))
-            return value, tracked
-        return value, pullback
-
-    monkeypatch.setattr(jax, 'vjp', counted)
+    def counted(*args, **kwargs):
+        value, pullback = preprojection(*args, **kwargs)
+        calls['forward'] += 1
+        def tracked(bar):
+            calls['reverse'] += 1
+            return pullback(bar)
+        tapes.append(weakref.ref(tracked))
+        return value, tracked
+    monkeypatch.setattr(_weak_numpy, 'fixed_preprojection', counted)
     prepared = {}
     _pairs.screen_pairs(mf, common, static, prepared_endpoints=prepared)
     assert calls == Counter(forward=1)
@@ -177,17 +174,14 @@ def test_shared_reverse_runs_once_only_for_used_group_and_releases_tapes(monkeyp
 @pytest.mark.parametrize('grouped_ao', [False, True])
 def test_shared_tape_is_released_before_replaying_the_next_pao_group(monkeypatch, grouped_ao):
     mf, common, static = _fixture(monkeypatch, ('canonical_keep', [1, 2, 3]))
-    preprojection = domain._rebuild_selected_pao_preprojection
+    from pyscfad.dlno_stc import _weak_numpy
+    preprojection = _weak_numpy.fixed_preprojection
     tapes = []
-    vjp = jax.vjp
-
-    def track(fun, *args, **kwargs):
-        value, pullback = vjp(fun, *args, **kwargs)
-        if getattr(fun, 'func', None) is preprojection:
-            tapes.append(weakref.ref(pullback))
+    def track(*args, **kwargs):
+        value, pullback = preprojection(*args, **kwargs)
+        tapes.append(weakref.ref(pullback))
         return value, pullback
-
-    monkeypatch.setattr(jax, 'vjp', track)
+    monkeypatch.setattr(_weak_numpy, 'fixed_preprojection', track)
     prepared = {}
     _pairs.screen_pairs(mf, common, static, prepared_endpoints=prepared)
     assert len(tapes) == 2
@@ -215,13 +209,14 @@ def test_target_metric_ranks_remain_independent_of_shared_preprojection(monkeypa
     fragment.weak_virtual = replace(fragment.weak_virtual, metric_keep=np.array([1]))
     expected, expected_bars = _pairs.weak_pair_energy_and_grad(mf, common, static)
     calls = Counter()
-    eigh = domain.scipy.linalg.eigh
+    from pyscfad.dlno_stc import _weak_numpy
+    eigh = _weak_numpy.eigh
 
     def counted(matrix, *args, **kwargs):
         calls[matrix.shape] += 1
         return eigh(matrix, *args, **kwargs)
 
-    monkeypatch.setattr(domain.scipy.linalg, 'eigh', counted)
+    monkeypatch.setattr(_weak_numpy, 'eigh', counted)
     prepared = {}
     _pairs.screen_pairs(mf, common, static, prepared_endpoints=prepared)
     assert [item[1][0].virtual_coeff.shape[1] for item in prepared.values()] == [1, 2, 2]

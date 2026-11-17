@@ -189,14 +189,21 @@ void GTOnr3c_ij_r0_vjp(int (*intor)(), void (*fill)(), double *vjp, double *ybar
         const int cache_size = GTOmax_cache_size(intor, shls_slice, 3,
                                                  atm, natm, bas, nbas, env);
         const int njobs = (MAX(nish,njsh) / BLKSIZE + 1) * nksh;
-        // Retain reproducible static scheduling by default.  The opt-in
-        // dynamic schedule balances unequal shell costs without changing
-        // private buffers, worksharing barriers, or the ordered reduction.
+        // Shell costs vary strongly. Let available workers take the next job
+        // dynamically, with an adaptive team bounded by the caller and 32.
+        // Retain static/cyclic assignment for reproducibility comparisons.
         const char *schedule = getenv("PYSCFAD_INTEGRAL_VJP_SCHEDULE");
-        const int dynamic_schedule = schedule != NULL && strcmp(schedule, "dynamic") == 0;
+        const int contiguous_schedule = schedule != NULL && strcmp(schedule, "static") == 0;
+        const int cyclic_schedule = schedule != NULL && strcmp(schedule, "cyclic") == 0;
+        const int dynamic_schedule = !contiguous_schedule && !cyclic_schedule;
+        const int nthreads = MIN(32, omp_get_max_threads_safe());
+#ifdef _OPENMP
+        const int previous_dynamic = omp_get_dynamic();
+        omp_set_dynamic(1);
+#endif
 
-        double **vjp_loc_bufs = calloc(omp_get_max_threads_safe(), sizeof(double *));
-#pragma omp parallel
+        double **vjp_loc_bufs = calloc(nthreads, sizeof(double *));
+#pragma omp parallel num_threads(nthreads)
 {
         int thread_id = omp_get_thread_num();
         int jobid;
@@ -215,8 +222,14 @@ void GTOnr3c_ij_r0_vjp(int (*intor)(), void (*fill)(), double *vjp, double *ybar
                         (*fill)(intor, vjp_loc, ybar, buf, comp, jobid, shls_slice, ao_loc,
                                 cintopt, atm, natm, bas, nbas, env);
                 }
-        } else {
+        } else if (contiguous_schedule) {
                 #pragma omp for schedule(static)
+                for (jobid = 0; jobid < njobs; jobid++) {
+                        (*fill)(intor, vjp_loc, ybar, buf, comp, jobid, shls_slice, ao_loc,
+                                cintopt, atm, natm, bas, nbas, env);
+                }
+        } else {
+                #pragma omp for schedule(static, 1)
                 for (jobid = 0; jobid < njobs; jobid++) {
                         (*fill)(intor, vjp_loc, ybar, buf, comp, jobid, shls_slice, ao_loc,
                                 cintopt, atm, natm, bas, nbas, env);
@@ -230,4 +243,7 @@ void GTOnr3c_ij_r0_vjp(int (*intor)(), void (*fill)(), double *vjp, double *ybar
         }
 }
         free(vjp_loc_bufs);
+#ifdef _OPENMP
+        omp_set_dynamic(previous_dynamic);
+#endif
 }

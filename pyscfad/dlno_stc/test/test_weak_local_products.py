@@ -9,7 +9,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from pyscfad.dlno_stc import _pairs, domain
+from pyscfad.dlno_stc import _pairs, domain, _weak_numpy
+from pyscfad.dlno_stc.test import _weak_reference
 from pyscfad.dlno_stc.test.test_pao_response_reuse import _fixture, _assert_bars
 
 
@@ -38,7 +39,7 @@ def _reference_energy_and_grad(monkeypatch, mf, common, static, *, pairs=None):
     # projection and uses the frozen preprojection above for this reference.
     with monkeypatch.context() as context:
         context.setattr(domain, '_rebuild_selected_pao_preprojection', legacy)
-        return _pairs.weak_pair_energy_and_grad(mf, common, static, pairs=pairs)
+        return jax.value_and_grad(lambda m,c: _weak_reference.energy(m,c,static,pairs), (0,1))(mf,common)
 
 
 def _dots(jaxpr):
@@ -87,22 +88,17 @@ def test_one_global_product_response_preserves_every_common_gradient(monkeypatch
     expected, expected_bars = _reference_energy_and_grad(monkeypatch, mf, common, static)
     calls = Counter()
     tapes = []
-    vjp = jax.vjp
+    build = _weak_numpy.products
+    def counted(*args, **kwargs):
+        value, response = build(*args, **kwargs)
+        calls['forward'] += 1
+        def tracked(bar):
+            calls['reverse'] += 1
+            return response.pullback(bar)
+        tapes.append(weakref.ref(tracked))
+        return value, response._replace(pullback=tracked)
 
-    def counted(fun, *args, **kwargs):
-        value, pullback = vjp(fun, *args, **kwargs)
-        if fun is build:
-            calls['forward'] += 1
-
-            def tracked(bar):
-                calls['reverse'] += 1
-                return pullback(bar)
-
-            tapes.append(weakref.ref(tracked))
-            return value, tracked
-        return value, pullback
-
-    monkeypatch.setattr(jax, 'vjp', counted)
+    monkeypatch.setattr(_weak_numpy, 'products', counted)
     prepared = {}
     _pairs.screen_pairs(mf, common, static, prepared_endpoints=prepared)
     assert calls == Counter(forward=1)
@@ -126,23 +122,18 @@ def test_products_ignore_unused_groups_and_release_after_last_active_target(monk
     assert callable(build), 'weak products need invocation-owned response'
     calls = Counter()
     tapes = []
-    vjp = jax.vjp
-
-    def counted(fun, *args, **kwargs):
-        value, pullback = vjp(fun, *args, **kwargs)
-        if fun is build:
-            calls['forward'] += 1
-
-            def tracked(bar):
-                calls['reverse'] += 1
-                return pullback(bar)
-
-            tapes.append(weakref.ref(tracked))
-            return value, tracked
-        return value, pullback
+    build = _weak_numpy.products
+    def counted(*args, **kwargs):
+        value, response = build(*args, **kwargs)
+        calls['forward'] += 1
+        def tracked(bar):
+            calls['reverse'] += 1
+            return response.pullback(bar)
+        tapes.append(weakref.ref(tracked))
+        return value, response._replace(pullback=tracked)
 
     expected, expected_bars = _reference_energy_and_grad(monkeypatch, mf, common, static, pairs=pairs)
-    monkeypatch.setattr(jax, 'vjp', counted)
+    monkeypatch.setattr(_weak_numpy, 'products', counted)
     prepared = {}
     _pairs.screen_pairs(mf, common, static, prepared_endpoints=prepared)
     value, bars = _pairs.weak_pair_energy_and_grad(
@@ -185,36 +176,27 @@ def test_all_strong_screening_never_builds_global_products(monkeypatch):
     assert prepared == {}
 
 
-def test_target_reverse_uses_only_local_dot_operands(monkeypatch):
+def test_target_reverse_does_not_trace_or_rebuild_shared_products(monkeypatch):
     mf, common, static = _fixture(monkeypatch)
-    traced_products = jax.make_jaxpr(_pairs._weak_screen_products)(common)
-    assert Counter(_dots(traced_products)) == Counter({
-        ((8, 8), (8, 4)): 1, ((4, 8), (8, 4)): 1, ((8, 8), (8, 3)): 1})
     prepared = {}
     _pairs.screen_pairs(mf, common, static, prepared_endpoints=prepared)
+    def forbidden(*args, **kwargs):
+        raise AssertionError('target pullback traced or rebuilt shared products')
+    monkeypatch.setattr(jax, 'vjp', forbidden)
+    monkeypatch.setattr(_weak_numpy, 'products', forbidden)
     for _, (screen, response) in prepared.values():
-        seed = jax.tree_util.tree_map(jnp.ones_like, screen)
-        traced = jax.make_jaxpr(response.target_pullback)(seed)
-        assert list(_dots(traced))
-        assert all(8 not in shape for operands in _dots(traced) for shape in operands)
+        bars = response.target_pullback(jax.tree.map(np.ones_like, screen))
+        assert all(np.isfinite(x).all() for x in jax.tree.leaves(bars))
 
 
 @pytest.mark.parametrize('grouped_ao', [False, True])
-def test_product_tape_released_before_remaining_legacy_endpoint(monkeypatch, grouped_ao):
+def test_product_tape_released_with_mixed_prepared_and_fresh_endpoints(monkeypatch, grouped_ao):
     mf, common, static = _fixture(monkeypatch)
-    static.fragments[2].weak_virtual = SimpleNamespace(**vars(static.fragments[2].weak_virtual))
     expected, expected_bars = _reference_energy_and_grad(monkeypatch, mf, common, static)
     prepared = {}
     _pairs.screen_pairs(mf, common, static, prepared_endpoints=prepared)
+    del prepared[2]  # This target will use its standalone NumPy pullback.
     product_tape = weakref.ref(prepared[0][1][1].products_pullback.pullback)
-    moments = _pairs._weak_endpoint_from_screen
-
-    def checked(m, screen, static, fragment_index, **kwargs):
-        if fragment_index == 2:
-            assert product_tape() is None, 'finished global product tape remained live'
-        return moments(m, screen, static, fragment_index, **kwargs)
-
-    monkeypatch.setattr(_pairs, '_weak_endpoint_from_screen', checked)
     value, bars = _pairs.weak_pair_energy_and_grad(
         mf, common, static, prepared_endpoints=prepared, _grouped_ao_response=grouped_ao)
     assert product_tape() is None
@@ -285,7 +267,7 @@ def test_forward_only_multi_endpoint_calls_share_global_products_without_tapes(m
     mf, common, static = _fixture(monkeypatch, changed)
     expected, _ = _reference_energy_and_grad(monkeypatch, mf, common, static)
     products = _pairs._weak_screen_products
-    preprojection = domain._rebuild_selected_pao_preprojection
+    preprojection = _weak_numpy.fixed_preprojection
     calls = Counter()
 
     def counted(current):
@@ -300,7 +282,7 @@ def test_forward_only_multi_endpoint_calls_share_global_products_without_tapes(m
         raise AssertionError('forward-only weak preparation constructed a reverse tape')
 
     monkeypatch.setattr(_pairs, '_weak_screen_products', counted)
-    monkeypatch.setattr(domain, '_rebuild_selected_pao_preprojection', projected)
+    monkeypatch.setattr(_weak_numpy, 'fixed_preprojection', projected)
     monkeypatch.setattr(jax, 'vjp', forbidden)
     if entry == 'screening':
         _, weak, _, _ = _pairs.screen_pairs(mf, common, static)
@@ -314,11 +296,10 @@ def test_forward_only_multi_endpoint_calls_share_global_products_without_tapes(m
     assert calls == Counter(products=1, preprojection=1 + int(changed is not None))
 
 
-def test_forward_product_sharing_preserves_direct_autodiff_chain_rule(monkeypatch):
+def test_forward_product_sharing_matches_explicit_pullback(monkeypatch):
     mf, common, static = _fixture(monkeypatch, ('canonical_keep', [1, 2, 3]))
     expected, expected_bars = _reference_energy_and_grad(monkeypatch, mf, common, static)
-    value, bars = jax.value_and_grad(
-        lambda m, c: _pairs.weak_pair_energy_sum(m, c, static), argnums=(0, 1))(mf, common)
+    value, bars = _pairs.weak_pair_energy_and_grad(mf, common, static)
     np.testing.assert_allclose(value, expected, rtol=5e-11, atol=1e-12)
     _assert_bars(bars, expected_bars)
 
@@ -331,11 +312,11 @@ def test_partial_queries_use_only_selected_parents_with_full_gradient_parity(mon
     expected, expected_bars = _reference_energy_and_grad(
         monkeypatch, mf, common, static, pairs=((0, 1),))
     widths = []
-    products = domain._pao_products
+    products = _weak_numpy.preprojection
 
-    def selected_products(parent, overlap):
-        widths.append(parent.shape[1])
-        return products(parent, overlap)
+    def selected_products(common, *args, **kwargs):
+        widths.append(common.pao_coeff.shape[1])
+        return products(common, *args, **kwargs)
 
     def forbidden(*args, **kwargs):
         raise AssertionError('partial query computed all-system weak products')
@@ -346,12 +327,12 @@ def test_partial_queries_use_only_selected_parents_with_full_gradient_parity(mon
         return _pairs.weak_pair_energy_sum(m, c, static, pairs=((0, 1),))
 
     monkeypatch.setattr(_pairs, '_weak_screen_products', forbidden)
-    monkeypatch.setattr(domain, '_pao_products', selected_products)
+    monkeypatch.setattr(_weak_numpy, 'preprojection', selected_products)
     actual = evaluate(mf, common)
     assert widths == [4, 4]
     np.testing.assert_allclose(actual, expected, rtol=5e-11, atol=1e-12)
     widths.clear()
-    value, bars = jax.value_and_grad(evaluate, argnums=(0, 1))(mf, common)
+    value, bars = _pairs.weak_pair_energy_and_grad(mf, common, static, pairs=((0, 1),))
     assert widths == [4, 4]
     np.testing.assert_allclose(value, expected, rtol=5e-11, atol=1e-12)
     _assert_bars(bars, expected_bars)

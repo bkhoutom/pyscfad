@@ -8,17 +8,22 @@ import sys
 import pytest
 
 
-@pytest.mark.parametrize('dynamic', [None, ('TRUE', 'FALSE')])
+@pytest.mark.parametrize('dynamic', [None, ('TRUE', 'FALSE'), ('FALSE', 'TRUE')])
 def test_runtime_defaults_and_caller_settings_survive_benchmark_startup(dynamic):
     if not hasattr(os, 'sched_getaffinity') or len(os.sched_getaffinity(0)) < 2:
         pytest.skip('requires Linux affinity and at least two available CPUs')
     code = r'''
 import ctypes, json, os, sys
 sys.path.insert(0, sys.argv[1])
-from benchmark_affinity import configure_cpu_workload, check_worker_affinity
+from benchmark_affinity import configure_cpu_workload, check_worker_affinity, choose_balanced_cpus
 before = {key: os.environ.get(key) for key in ('OMP_DYNAMIC', 'MKL_DYNAMIC')}
+expected_cpus = choose_balanced_cpus(os.sched_getaffinity(0), 2)
 cpus = configure_cpu_workload(2)
-assert {key: os.environ.get(key) for key in before} == before
+assert cpus == expected_cpus
+assert os.environ['PYSCFAD_BENCHMARK_CPU_POLICY'] == 'balanced'
+expected_dynamic = before['OMP_DYNAMIC'] or 'TRUE'
+assert os.environ['OMP_DYNAMIC'] == expected_dynamic
+assert os.environ.get('MKL_DYNAMIC') == before['MKL_DYNAMIC']
 import jax, jax.numpy as jnp
 from pyscf import lib
 jax.block_until_ready(jnp.ones((4, 4)) @ jnp.ones((4, 4)))
@@ -27,7 +32,7 @@ try:
     mkl = ctypes.CDLL('libmkl_rt.so.2')
 except OSError:
     sys.exit(77)
-assert bool(omp.omp_get_dynamic()) == (before['OMP_DYNAMIC'] == 'TRUE')
+assert bool(omp.omp_get_dynamic()) == (expected_dynamic == 'TRUE')
 assert omp.omp_get_thread_limit() == 2
 assert 1 <= omp.omp_get_max_threads() <= 2
 assert bool(mkl.MKL_Get_Dynamic()) == (before['MKL_DYNAMIC'] != 'FALSE')
@@ -59,7 +64,8 @@ for task in __import__('pathlib').Path('/proc/self/task').iterdir():
 print(json.dumps(info))
 '''
     env = dict(os.environ)
-    for key in ('OMP_DYNAMIC', 'MKL_DYNAMIC'):
+    for key in ('OMP_DYNAMIC', 'MKL_DYNAMIC', 'PYSCFAD_BENCHMARK_CPU_LIST',
+                'PYSCFAD_BENCHMARK_CPU_POLICY'):
         env.pop(key, None)
     if dynamic is not None:
         env.update(zip(('OMP_DYNAMIC', 'MKL_DYNAMIC'), dynamic))

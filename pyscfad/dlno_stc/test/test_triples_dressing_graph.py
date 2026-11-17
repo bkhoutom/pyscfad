@@ -52,13 +52,15 @@ def test_zero_node_needs_no_retained_transform_tape():
 
 
 @pytest.mark.parametrize('node', [0., .37])
-@pytest.mark.parametrize('spectrum', ['dense', 'diagonal', 'degenerate'])
+@pytest.mark.parametrize('spectrum', ['dense', 'diagonal', 'semicanonical', 'degenerate'])
 @pytest.mark.parametrize('cache_limit', [0, 1, 2**24])
 def test_independent_slot_bars_match_separately_dressed_reference(node, spectrum, cache_limit):
     """A missing shared-consumer contribution corrupts independent slot bars."""
     inputs = list(fixture(selected=2, degenerate=spectrum == 'degenerate'))
-    if spectrum == 'diagonal':
+    if spectrum in ('diagonal', 'semicanonical'):
         inputs[7] = np.diag([1.1, .3, 1.6, .7])
+    if spectrum == 'semicanonical':
+        inputs[6] = np.diag([-.8, -1.2, -.4])
     inputs = tuple(inputs)
     shift = .5 * (np.linalg.eigvalsh(inputs[6]).max()
                   + np.linalg.eigvalsh(inputs[7]).min())

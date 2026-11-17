@@ -18,6 +18,7 @@ import scipy.linalg
 from pyscf import lib
 from pyscfad import numpy as np
 from pyscfad.lib._threading import dense_blas_threads
+from ._df_half_contract import coefficient_contractions
 
 
 class HalfTransformedDFCache:
@@ -157,23 +158,20 @@ class HalfTransformedDFCache:
         bar = numpy.zeros_like(coeff)
         if kc*lc:
             n = self.scope.mol.nao
-            rows, _ = self._rows(2*n*entry.h.shape[2] + 3*kc*lc,
+            # Bound input tiles plus private worker accumulators/scratch.
+            # There are at most as many workers as auxiliary rows in a tile.
+            rows, _ = self._rows(4*n*entry.h.shape[2] + 4*kc*lc,
                                  reserve_bytes=bar.nbytes)
             for p0 in range(0, self.scope.auxmol.nao, rows):
                 p1 = min(p0+rows, self.scope.auxmol.nao)
                 z = numpy.asarray(read_z(p0, p1)).reshape(p1-p0, kc, lc)
                 h = entry.h[p0:p1]
-                with dense_blas_threads():
-                    if symmetric:
-                        # Both orbital legs contribute, including AO directions
-                        # outside the retained ED/LIS subspace.
-                        bar[:, k0:k1] += 2 * numpy.einsum(
-                            'pml,pkl->mk', h[:, :, entry.right], z, optimize=True)
-                    else:
-                        bar[:, k0:k1] += numpy.einsum(
-                            'pml,pkl->mk', h[:, :, entry.right], z, optimize=True)
-                        bar[:, l0:l1] += numpy.einsum(
-                            'pmk,pkl->ml', h[:, :, entry.left], z, optimize=True)
+                occupied, virtual = coefficient_contractions(
+                    h, z, entry.left, entry.right, symmetric=symmetric)
+                bar[:, k0:k1] += occupied
+                if not symmetric:
+                    bar[:, l0:l1] += virtual
+                del occupied, virtual
         entry.consumed = True
         self.scope.receipt['half_pullbacks'] += 1
         return bar

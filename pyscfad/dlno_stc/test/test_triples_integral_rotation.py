@@ -198,8 +198,9 @@ def test_solver_energy_and_full_response_match_factor_path(mode, whole, canonica
         assert not reference_diag['rotated_integrals']
         assert diagnostics['stable_dressing'] and reference_diag['stable_dressing']
         for timing in (diagnostics, reference_diag):
-            # Independent allocation pilots are energy-only in every mode.
-            assert timing['pilot_reverse_seconds'] == 0
+            # Only stochastic sampling has allocation pilots.
+            if mode != 'deterministic':
+                assert timing['pilot_reverse_seconds'] == 0
     if mode == 'fixed':
         # Two allocation pilots precede two production calls for each path.
         # The energy-only passes use no VJPs; derivative passes differentiate

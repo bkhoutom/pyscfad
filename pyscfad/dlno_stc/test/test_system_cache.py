@@ -311,7 +311,7 @@ def test_system_outcore_total_energy_and_nuclear_gradient_match_dfmp2(
                 "laplace_weights": 20 * weights}
     with config_update("pyscfad_moleintor_opt", True):
         actual_energy, actual_bar = dlno_stc.value_and_grad(
-            reference.mol, build_mf, scope="system", frozen=1,
+            reference.mol, build_mf, boys_grouping="system", frozen=1,
             controls=controls, include_hf=True,
         )
     np.testing.assert_allclose(actual_energy, expected_energy, atol=2e-10, rtol=0)

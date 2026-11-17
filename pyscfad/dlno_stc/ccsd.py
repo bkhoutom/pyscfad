@@ -29,7 +29,7 @@ from .domain import build_boys_ed_frame
 from .protocol import validate_input_cotangents
 
 
-CC_SELECTIONS_SCHEMA_VERSION = 18
+CC_SELECTIONS_SCHEMA_VERSION = 19
 
 
 def _clear_jax_caches(stage, *live_results, **metadata):
@@ -316,8 +316,12 @@ def build_static_selections(mf, mp2_static, *, thresh_occ, thresh_vir,
 
 def _select_fragment_lis(mf, common, domains, index, group, frame, forward, *,
                          thresh_occ, thresh_vir, internal_rank_threshold,
-                         triples_laplace_points):
-    """Choose concrete labels/anchors from existing inputs; never build W here."""
+                         triples_laplace_points, prepared_lis=None, with_grad=False):
+    """Select labels and build the solver LIS, optionally retaining its VJP.
+
+    Anchors/grid are frozen choices; numerical orbitals and their response are
+    returned in the call-local ``prepared_lis`` holder for solver reuse.
+    """
     from .lis import LISSelections, build_fragment_lis_selection, build_fragment_lis
     matrices = {name: np.asarray(forward[name]) for name in ('occupied', 'virtual')}
     with resource_profile.section('stc.lis.select_ranks', frag=index+1):
@@ -327,21 +331,40 @@ def _select_fragment_lis(mf, common, domains, index, group, frame, forward, *,
             thresh_occ=thresh_occ, thresh_vir=thresh_vir,
             internal_rank_threshold=internal_rank_threshold)
     frames = grid = None
-    from .smooth import select_frame, select_occupied_frame
+    from .smooth import select_frame
     from .smooth_triples import make_grid
     selections = [None] * len(_physical_groups(domains))
     selections[index] = selection
     partial_lis = LISSelections(domains, thresh_occ, thresh_vir,
                                internal_rank_threshold, tuple(selections))
-    with resource_profile.section('stc.lis.select_frame', frag=index+1):
-        selected = build_fragment_lis(mf, common, partial_lis, index,
-            matrices=matrices, frame=frame, frame_fragment_index=group.representative_index)
+    chosen_frames = []
+    def choose_frame(coeff, fock):
+        anchor = select_frame(jax.lax.stop_gradient(coeff), jax.lax.stop_gradient(fock))
+        chosen_frames.append(anchor)
+        return anchor
+
+    def build(current, data, blocks, coeff):
+        current_frame = frame._replace(occupied_coeff=coeff[0], virtual_coeff=coeff[1])
+        selected = build_fragment_lis(current, data, partial_lis, index,
+            matrices=blocks, frame=current_frame, frame_fragment_index=group.representative_index,
+            frame_selector=choose_frame)
+        return _SolverLIS(selected.mo_coeff, selected.fragment_iao_coeff,
+            selected.active_occupied_coeff, selected.active_virtual_coeff,
+            tuple(int(i) for i in selected.frozen))
+
+    with resource_profile.section('stc.lis.build', frag=index+1):
+        arguments = (mf, common, matrices, (frame.occupied_coeff, frame.virtual_coeff))
+        if with_grad and prepared_lis is not None:
+            selected, pullback = jax.vjp(build, *arguments)
+            prepared_lis['pullback'] = pullback
+        else:
+            selected = build(*arguments)
+        if prepared_lis is not None:
+            prepared_lis['value'] = selected
         coefficients = (selected.active_occupied_coeff, selected.active_virtual_coeff)
         jax.block_until_ready(coefficients)
         if all(coeff.shape[1] for coeff in coefficients):
-            frames = (select_occupied_frame(selected.original_occupied_coeff,
-                          selected.fragment_iao_coeff, common.s1e),
-                      select_frame(coefficients[1], common.fock))
+            frames = tuple(chosen_frames)
             spectra = [numpy.linalg.eigvalsh(item.anchor.T @
                 numpy.asarray(common.fock) @ item.anchor) for item in frames]
     if frames is not None:
@@ -350,7 +373,8 @@ def _select_fragment_lis(mf, common, domains, index, group, frame, forward, *,
     return selection, frames, grid
 
 
-def _select_current_fragment(state, static, index, group, frame, forward):
+def _select_current_fragment(state, static, index, group, frame, forward, *,
+                             prepared_lis=None, with_grad=False):
     """Create this fragment's immutable selection while its input VJP is live."""
     if static.fragments[index] is not None:
         return static
@@ -358,11 +382,11 @@ def _select_current_fragment(state, static, index, group, frame, forward):
     with resource_profile.section('stc.cc.lis_selection', frag=index+1):
         selection, frames, grid = _select_fragment_lis(
             state['mf'], state['common'], static.mp2_static, index, group, frame, forward,
-             thresh_occ=static.lis_static.thresh_occ,
+            thresh_occ=static.lis_static.thresh_occ,
             thresh_vir=static.lis_static.thresh_vir,
             internal_rank_threshold=static.lis_static.internal_rank_threshold,
-
-            triples_laplace_points=options['triples_laplace_points'])
+            triples_laplace_points=options['triples_laplace_points'],
+            prepared_lis=prepared_lis, with_grad=with_grad)
     fragments = list(static.fragments)
     fragments[index] = selection
     lis = replace(static.lis_static, fragments=tuple(fragments))
@@ -496,13 +520,15 @@ def _solve_fragment(mf, common, static, fragment_index, matrices, group, *,
                     verbose_imp, ccsd_t, triples_controls=None, with_grad=False,
                     vvvv_direct=False, cc_solver='deterministic', stc_cc_controls=None,
                     frame=None, correlation_auxbasis=None, df_compressor=None,
-                    sampling_frame=None):
+                    sampling_frame=None, prepared_lis=None):
     """Return MP2-LIS, CCSD and triples; stochastic calls also return diagnostics."""
     representative = group.representative_index
     if frame is None:
         frame = build_boys_ed_frame(common, static.mp2_static, representative)
-    lis = _build_solver_lis(mf, common, static.lis_static, fragment_index,
-                            matrices, frame, representative)
+    lis = prepared_lis
+    if lis is None:
+        lis = _build_solver_lis(mf, common, static.lis_static, fragment_index,
+                                matrices, frame, representative)
     stochastic = triples_controls is not None and triples_controls['mode'] == 'stochastic'
     if not lis.active_occupied_coeff.shape[1] or not lis.active_virtual_coeff.shape[1]:
         zero = np.zeros((), dtype=common.s1e.dtype)
@@ -622,7 +648,11 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
         state['baseline_energy'] = state.get('baseline_energy', 0.) + float(forward['energy'])
         state['variance'] += float(forward['diagnostics']['energy_standard_error']) ** 2
         matrices = {name: np.asarray(forward[name]) for name in ('occupied', 'virtual')}
-        fragment_static = _select_current_fragment(state, static, index, group, frame, forward)
+        # Call-local orbitals and tape: share selection's construction with all
+        # solver replicas, without freezing the physical LIS response.
+        prepared_lis = {}
+        fragment_static = _select_current_fragment(state, static, index, group, frame, forward,
+            prepared_lis=prepared_lis, with_grad=with_grad)
         _clear_jax_caches('before_correction', matrices, frame_coeff, frag=index+1)
         local_triples = _fragment_triples_controls(triples_controls, index)
         sampling_frame = None
@@ -643,13 +673,14 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
                 from ._aux_compress import make_compressor
                 compressor = make_compressor(lis_aux_svd_tol)
                 solver_options['df_compressor'] = compressor
-            def correction(mf, common, blocks, coeff):
+            def correction(mf, common, blocks, coeff, lis):
                 current_frame = frame._replace(occupied_coeff=coeff[0], virtual_coeff=coeff[1])
+                lis_options = {} if lis is None else {'prepared_lis': lis}
                 values = _solve_fragment(mf, common, fragment_static, index, blocks, group,
                                          verbose_imp=verbose_imp, ccsd_t=ccsd_t,
                                          triples_controls=local_triples, with_grad=need_grad,
                                          vvvv_direct=vvvv_direct, frame=current_frame, **solver_options,
-                                         **basis_kwargs(state.get('correlation_auxbasis')))
+                                         **basis_kwargs(state.get('correlation_auxbasis')), **lis_options)
                 if lis_aux_svd_tol or cc_solver == 'stc' or ccsd_t:
                     values, diagnostics = values
                 else:
@@ -668,13 +699,15 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
                         if cache is not None:
                             df._lno_local_df_cache = dict(cache)
                     reference = pilot_mf
-                energy, auxiliary = correction(reference, state['common'], matrices, frame_coeff)
+                energy, auxiliary = correction(reference, state['common'], matrices, frame_coeff,
+                                                prepared_lis.get('value'))
                 if compressor is not None:
                     auxiliary[1]['auxiliary_compression'] = dict(compressor.diagnostics)
                 return energy, auxiliary, None
             with resource_profile.section('stc.cc.correction_forward', frag=index+1):
                 energy, pullback, auxiliary = jax.vjp(
-                    correction, state['mf'], state['common'], matrices, frame_coeff, has_aux=True)
+                    correction, state['mf'], state['common'], matrices, frame_coeff,
+                    prepared_lis.get('value'), has_aux=True)
                 jax.block_until_ready((energy, auxiliary))
             _clear_jax_caches('before_correction_pullback', energy, auxiliary, frag=index+1)
             with resource_profile.section('stc.cc.correction_pullback', frag=index+1):
@@ -690,7 +723,18 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
         else:
             energy, auxiliary, correction_bars = evaluate(stc_cc_controls, with_grad)
         if with_grad:
-            mf_bar, common_bar, matrix_bars, coeff_bars = correction_bars
+            direct_bars, lis_bar = correction_bars[:4], correction_bars[4]
+            if lis_bar is not None:
+                # Sum replica cotangents before applying the retained LIS tape
+                # once. This includes W, overlap, targets and domain orbitals.
+                with resource_profile.section('stc.lis.pullback', frag=index+1):
+                    lis_bars = prepared_lis['pullback'](lis_bar)
+                    direct_bars = jax.tree.map(lambda a, b: a + b, direct_bars, lis_bars)
+                    jax.block_until_ready(direct_bars)
+                del lis_bars
+            mf_bar, common_bar, matrix_bars, coeff_bars = direct_bars
+            del direct_bars, lis_bar
+            prepared_lis.clear()
             frame_bars = tuple(left + right for left, right in zip(frame_bars, coeff_bars))
             jax.block_until_ready((mf_bar, common_bar, matrix_bars, frame_bars))
             # The direct host response holds the shared frame fixed; apply its
@@ -754,6 +798,7 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
                                            ccsd_diagnostics=cc_diagnostics,
                                            auxiliary_compression=compression_diagnostics))
         del forward, matrices, evaluate, pilot_mf, energy, values, auxiliary, diagnostics, fragment_static
+        del prepared_lis
         release_consumed_inputs(forward_only=not with_grad)
         gc.collect()
     if input_bars is not None:
@@ -895,8 +940,13 @@ def kernel(mf, static, *, baseline_controls=None, matrix_controls=None, mp2_grid
     selection. ``None`` reuses the grid saved in the selections. The separately fitted
     (T) grids come from the saved selections. The MP2 baseline includes weak
     completion.
-    With ``ccsd_t=True``, omitted ``triples_controls`` preserves deterministic
-    triples; stochastic mode requires integer ``nsamples >= 2``. A positive
+    With ``ccsd_t=True``, omitted ``triples_controls`` selects deterministic
+    MRCC symmetric half-Laplace triples (2024+ spin expression).
+    It shares one connected numerator and its adjoint per quadrature point.
+    Individual fragment energies generally differ between partitions; the
+    whole-space energy agrees for identical spaces/amplitudes. Stochastic
+    evaluation currently supports only the asymmetric partition and requires
+    integer ``nsamples >= 2``. A positive
     ``energy_tolerance`` targets the total triples energy SE in Hartree and
     divides variance according to ``variance_allocation``. ``occupied_count``
     uses each physical fragment's occupied targets divided by all active

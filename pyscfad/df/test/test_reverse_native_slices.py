@@ -7,6 +7,18 @@ from pyscfad import gto
 from pyscfad.df import _cderi_vjp, _int3c_cross_opt
 
 
+@pytest.fixture(params=[None, 'static', 'cyclic', 'dynamic'])
+def native_schedule(request, monkeypatch):
+    from pyscf import lib
+    from pyscfad.lib._threading import fixed_threads
+    if request.param is None:
+        monkeypatch.delenv('PYSCFAD_INTEGRAL_VJP_SCHEDULE', raising=False)
+    else:
+        monkeypatch.setenv('PYSCFAD_INTEGRAL_VJP_SCHEDULE', request.param)
+    with lib.with_omp_threads(4), fixed_threads():
+        yield
+
+
 def _molecules():
     mol = gto.Mole(atom='O 0 0 0; H 0 -.757 .587; H 0 .757 .587',
                    basis='sto-3g', verbose=0)
@@ -43,7 +55,8 @@ def _assert_coords(actual, expected):
 
 @pytest.mark.parametrize('i0', [0, 1])
 @pytest.mark.parametrize('slice_kind', ['within_atom', 'across_atoms', 'last_atom'])
-def test_native_auxiliary_slice_preserves_pair_and_atom_offsets(i0, slice_kind):
+def test_native_auxiliary_slice_preserves_pair_and_atom_offsets(i0, slice_kind,
+                                                               native_schedule):
     """Wrong global/local aux offsets or shifted packed rows change gradients."""
     mol, auxmol = _molecules()
     boundary = int(auxmol.aoslice_by_atom()[1, 0])

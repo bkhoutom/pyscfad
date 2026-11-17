@@ -53,17 +53,22 @@ stc_triples::triples_result triples_stream_kernel(const stc_triples::triples_pre
             throw std::invalid_argument("streaming triples: invalid point dimensions or weight");
     if(!requested_batch || requested_batch>stc_triples::maximum_streaming_blocks)
         throw std::invalid_argument("streaming triples: block_batch_size must be between 1 and 128");
+    if(points.size()!=1 || points[0]!=&left)
+        throw std::invalid_argument("MRCC triples requires one shared point bank");
     const triples_layout layout(no,nv,ns);
     std::vector<std::unique_ptr<triples_stream_bank>> banks;
     banks.push_back(std::make_unique<triples_stream_bank>(left,layout,gradient));
-    for(const auto* point:points) banks.push_back(std::make_unique<triples_stream_bank>(*point,layout,gradient));
-    triples_left_pack packed(banks[0]->tensors,layout,false);
+    triples_left_pack packed(banks[0]->tensors,layout,false,true);
+    triples_direct_adjoint retained(banks[0]->tensors,layout,gradient);
     struct zero_task {double* data;size_t length;};
     std::vector<zero_task> zero_tasks;
     constexpr size_t panel=(2*1024*1024)/sizeof(double);
     if(gradient) for(auto& bank:banks) for(auto& t:bank->tensors)
         for(size_t first=0;first<t.bar.n_elem;first+=panel)
             zero_tasks.push_back({t.bar.memptr()+first,std::min(panel,size_t(t.bar.n_elem)-first)});
+    for(auto* values:{&retained.gv_swap,&retained.to_normal,&retained.to_swap})
+        for(auto& t:*values) for(size_t first=0;first<t.n_elem;first+=panel)
+            zero_tasks.push_back({t.memptr()+first,std::min(panel,size_t(t.n_elem)-first)});
     const auto blocks=quadrature_blocks(no,ns);
     const size_t workspace=(8*cube+6*no*nv*nv+8*nv*nv)*sizeof(double)
         +(gradient ? triples_group_scratch::bytes(no,nv) : 0);
@@ -95,12 +100,14 @@ stc_triples::triples_result triples_stream_kernel(const stc_triples::triples_pre
         size_t(workers),std::vector<triples_right_profile>(points.size()));
     std::vector<double> energies(blocks.size()*points.size());
     std::vector<std::array<double,3>> worker_times(size_t(workers),{0.,0.,0.});
+    std::vector<std::array<std::array<double,3>,4>> grouped_profiles{size_t(workers)};
     std::vector<arma::vec> ket(batch_size),ket_bar(gradient ? batch_size : 0);
     for(auto& value:ket) value.set_size(cube);
     for(auto& value:ket_bar) value.set_size(cube);
     triples_adjoint_plan plan;
-    std::vector<size_t> calls(size_t(workers),0),reductions(size_t(workers),0);
+    std::vector<size_t> calls(size_t(workers),0);
     double stage_start=0.,point_start=0.;
+    double grouped_start=0.;
     std::exception_ptr failure;std::mutex error_lock;std::atomic<bool> failed{false};
     auto record_failure=[&]() {
         std::lock_guard<std::mutex> guard(error_lock);
@@ -138,7 +145,13 @@ stc_triples::triples_result triples_stream_kernel(const stc_triples::triples_pre
                     triples_left_one_permutation(banks[0]->tensors,layout,base,packed,
                                                  no,nv,raw,tmp,workspace);
                     triples_spin_into(ket[b],raw,nv);
-                    if(gradient) ket_bar[b].zeros();
+                    {
+                        const double factor=-(ijk[1]==ijk[2] ? 1. : 2.)*weights[0]/3.;
+                        energies[first+b]=factor*arma::dot(raw,ket[b]);
+                        // Combined connected seed: A(2 f W + f L/2).
+                        // Store the pre-spin seed until singles are added below.
+                        if(gradient) ket_bar[b]=2.*factor*raw;
+                    }
                     times[0]+=omp_get_wtime()-tick;
                 } catch(...) {record_failure();}
             }
@@ -157,22 +170,33 @@ stc_triples::triples_result triples_stream_kernel(const stc_triples::triples_pre
                         const auto b=blocks[first+index];
                         const tuple base{{{b[0],b[1],b[2],0,0,0}},0};
                         const double tick=omp_get_wtime();
-                        auto& bank=banks[q+1]->tensors;auto& locks=*banks[q+1]->locks;
-                        const double factor=-2.*weights[q]/3.;
-                        double energy=0.;
-                        for(size_t swap=0;swap<(b[1]==b[2] ? 1u : 2u);++swap) {
-                            tuple oriented=base;
-                            if(swap) std::swap(oriented.x[1],oriented.x[2]);
-                            for(size_t p=0;p<3;++p) {
-                                const auto op=quadrature_describe(layout,permute(oriented,p,true),1);
-                                triples_raw_block(bank,op,no,nv,false,raw,nullptr,nullptr,&workspace,false,profile);
-                                energy+=quadrature_right(tmp,gradient ? &ket_bar[index] : nullptr,raw,ket[index],
-                                    bank,op,nv,p,bool(swap),factor,gradient,workspace,profile);
-                                if(gradient) {
-                                    quadrature_singles_store(bank,op,nv,workspace,locks,profile);
-                                    triples_raw_block(bank,op,no,nv,false,raw,&tmp,&locks,&workspace,true,profile);
+                        auto& selected_bank=*banks[0];
+                        auto& bank=selected_bank.tensors;auto& locks=*selected_bank.locks;
+                        double energy=energies[first+index];
+                        {
+                            const double f=-(b[1]==b[2] ? 1. : 2.)*weights[q]/3.;
+                            // Singles-only specialization neither reads the dummy raw
+                            // numerator nor writes an unused connected cotangent cube.
+                            std::array<operations,6> ops;
+                            for(size_t p=0;p<6;++p)
+                                ops[p]=quadrature_describe(layout,permute(base,p,true),1);
+                            const std::array<quadrature_singles,6> singles{{
+                                {bank,ops[0]},{bank,ops[1]},{bank,ops[2]},
+                                {bank,ops[3]},{bank,ops[4]},{bank,ops[5]}}};
+                            for(size_t p=0;p<6;++p) {
+                                const auto& op=ops[p];
+                                const size_t inverse=p==1 ? 2 : p==2 ? 1 : p;
+#define MRCC_SINGLES(P) case P: energy+=gradient \
+    ? mrcc_singles_contract<P,true>(ket[index],singles[p],nv,f,workspace,profile) \
+    : mrcc_singles_contract<P,false>(ket[index],singles[p],nv,f,workspace,profile); break;
+                                switch(inverse) {
+                                    MRCC_SINGLES(0) MRCC_SINGLES(1) MRCC_SINGLES(2)
+                                    MRCC_SINGLES(3) MRCC_SINGLES(4) MRCC_SINGLES(5)
                                 }
+#undef MRCC_SINGLES
+                                if(gradient) quadrature_singles_store(bank,op,nv,workspace,locks,profile);
                             }
+                            if(gradient) mrcc_singles_seed(ket_bar[index],singles,nv,f);
                         }
                         energies[(first+index)*points.size()+q]=energy;
                         const double elapsed=omp_get_wtime()-tick;
@@ -211,6 +235,8 @@ stc_triples::triples_result triples_stream_kernel(const stc_triples::triples_pre
                 }
                 #pragma omp single
                 {
+                    result.grouped_spin_wall_seconds+=omp_get_wtime()-stage_start;
+                    grouped_start=omp_get_wtime();
                     try {
                         if(!failed) {
                             plan=triples_group_plan(banks[0]->tensors,layout,blocks,first,count,nv);
@@ -218,6 +244,8 @@ stc_triples::triples_result triples_stream_kernel(const stc_triples::triples_pre
                             result.grouped_adjoint_max_terms=std::max(result.grouped_adjoint_max_terms,plan.largest_group);
                         }
                     } catch(...) {record_failure();}
+                    result.grouped_plan_wall_seconds+=omp_get_wtime()-grouped_start;
+                    grouped_start=omp_get_wtime();
                 }
                 #pragma omp for schedule(dynamic,1)
                 for(size_t j=0;j<plan.jobs.size();++j) {
@@ -225,20 +253,33 @@ stc_triples::triples_result triples_stream_kernel(const stc_triples::triples_pre
                     try {
                         const double tick=omp_get_wtime();
                         const auto& job=plan.jobs[j];const auto& group=plan.groups[job.group];
+                        auto* gp=profile_right ? &grouped_profiles[worker][size_t(group.kind)] : nullptr;
                         if(group.kind==triples_adjoint_kind::gv)
-                            calls[worker]+=triples_group_large<triples_adjoint_kind::gv>(group,job,plan,
-                                banks[0]->tensors,ket,ket_bar,no,nv,grouped,reductions[worker]);
+                            calls[worker]+=triples_group_direct<triples_adjoint_kind::gv>(group,job,plan,
+                                banks[0]->tensors,retained,ket,ket_bar,no,nv,gp);
                         else if(group.kind==triples_adjoint_kind::to)
-                            calls[worker]+=triples_group_large<triples_adjoint_kind::to>(group,job,plan,
-                                banks[0]->tensors,ket,ket_bar,no,nv,grouped,reductions[worker]);
+                            calls[worker]+=triples_group_direct<triples_adjoint_kind::to>(group,job,plan,
+                                banks[0]->tensors,retained,ket,ket_bar,no,nv,gp);
                         else calls[worker]+=triples_group_small(group,plan,banks[0]->tensors,packed,
-                                ket,ket_bar,no,nv,workspace,grouped);
+                                ket,ket_bar,no,nv,workspace,grouped,gp);
                         times[2]+=omp_get_wtime()-tick;
                     } catch(...) {record_failure();}
                 }
+                #pragma omp single
+                result.grouped_jobs_wall_seconds+=omp_get_wtime()-grouped_start;
             }
             #pragma omp single
             result.left_reverse_wall_seconds+=gradient ? omp_get_wtime()-stage_start : 0.;
+        }
+        if(gradient) {
+            #pragma omp single
+            stage_start=omp_get_wtime();
+            retained.commit(banks[0]->tensors,no,nv);
+            #pragma omp single
+            {
+                result.grouped_commit_wall_seconds=omp_get_wtime()-stage_start;
+                result.left_reverse_wall_seconds+=result.grouped_commit_wall_seconds;
+            }
         }
     }
     if(failure) std::rethrow_exception(failure);
@@ -268,11 +309,12 @@ stc_triples::triples_result triples_stream_kernel(const stc_triples::triples_pre
     result.occupied_block_batch_size=batch_size;
     result.occupied_block_batches=(blocks.size()+batch_size-1)/batch_size;
     for(size_t c:calls) result.grouped_adjoint_gemm_calls+=c;
-    for(size_t r:reductions) result.grouped_adjoint_max_reduction=std::max(result.grouped_adjoint_max_reduction,r);
-    result.rank_four_packing_bytes=packed.bytes();
+    for(const auto& p:grouped_profiles) for(size_t k=0;k<4;++k) for(size_t s=0;s<3;++s)
+        result.grouped_profile_seconds[k][s]+=p[k][s];
+    result.rank_four_packing_bytes=packed.bytes()+retained.bytes();
     for(const auto& bank:banks) for(const auto& t:bank->tensors)
         result.resident_tensor_bytes+=(t.value.n_elem+t.bar.n_elem)*sizeof(double);
-    result.resident_tensor_bytes+=packed.bytes();
+    result.resident_tensor_bytes+=packed.bytes()+retained.bytes();
     if(gradient) {
         vjps->resize(banks.size());
         for(size_t q=0;q<banks.size();++q) {

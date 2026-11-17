@@ -92,13 +92,13 @@ def _independent_mp2_total(mol):
 def test_system_distinct_fit_total_energy_and_coordinate_gradient(molecule):
     native()
     total, gradient = dlno_stc.value_and_grad(
-        molecule, _mf, scope="system", frozen=1, controls=_controls(),
+        molecule, _mf, boys_grouping="system", frozen=1, controls=_controls(),
         correlation_auxbasis=RIFIT, include_hf=True)
     np.testing.assert_allclose(total, _independent_mp2_total(molecule),
                                atol=3e-10, rtol=0)
     mf = _mf(molecule)
     energy_only = mf.e_tot + dlno_stc.kernel(
-        mf, scope="system", frozen=1, controls=_controls(),
+        mf, boys_grouping="system", frozen=1, controls=_controls(),
         correlation_auxbasis=RIFIT)
     np.testing.assert_allclose(energy_only, total, atol=2e-11, rtol=0)
     direction = np.zeros((molecule.natm, 3))
@@ -118,7 +118,7 @@ def test_system_distinct_fit_total_energy_and_coordinate_gradient(molecule):
 
 def test_system_none_preserves_default_energy_and_gradient(molecule):
     native()
-    options = dict(scope="system", frozen=1, controls=_controls(), include_hf=True)
+    options = dict(boys_grouping="system", frozen=1, controls=_controls(), include_hf=True)
     default, default_bar = dlno_stc.value_and_grad(molecule, _mf, **options)
     explicit, explicit_bar = dlno_stc.value_and_grad(
         molecule, _mf, correlation_auxbasis=None, **options)
@@ -166,7 +166,7 @@ def test_system_distinct_fit_outcore_jk_source_and_geometry_response(
             mf.kernel()
         references.append(mf)
         return mf
-    options = dict(scope="system", frozen=1, controls=_controls(),
+    options = dict(boys_grouping="system", frozen=1, controls=_controls(),
                    correlation_auxbasis=RIFIT, include_hf=True)
     with config_update("pyscfad_moleintor_opt", True):
         expected, expected_bar = dlno_stc.value_and_grad(mol, _mf, **options)

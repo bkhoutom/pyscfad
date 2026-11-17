@@ -58,7 +58,7 @@ def test_high_level_budget_reaches_solver_without_mutating_caller(monkeypatch, s
     if scope == 'system':
         state['weak_pairs'] = ()
     monkeypatch.setattr(driver, 'build_domain_selections', lambda *a, **k: static)
-    value = driver.kernel(None, static if scope == 'domain' else None, scope=scope, controls=controls)
+    value = driver.kernel(None, static if scope == 'domain' else None, boys_grouping='system' if scope == 'system' else None, controls=controls)
     assert value == (-2.25 if scope == 'domain' else -1.)
     assert len(received) == (2 if scope == 'domain' else 1)
     for passed in received:
@@ -82,7 +82,7 @@ def test_high_level_budget_reaches_solver_without_mutating_caller(monkeypatch, s
 @pytest.mark.parametrize('bad', [0, -1, float('nan'), float('inf')])
 def test_invalid_budget_rejected_before_system_preparation(bad):
     with pytest.raises(ValueError, match='energy_tolerance'):
-        driver.kernel(None, scope='system', controls={
+        driver.kernel(None, boys_grouping='system', controls={
             'mode': 'stochastic', 'energy_tolerance': bad,
             'laplace_roots': [1.], 'laplace_weights': [1.]})
 
@@ -91,4 +91,4 @@ def test_invalid_budget_rejected_before_system_preparation(bad):
 def test_partial_grid_rejected_before_reference_use(supplied):
     missing = 'laplace_weights' if supplied == 'laplace_roots' else 'laplace_roots'
     with pytest.raises(ValueError, match=missing):
-        driver.kernel(None, scope='system', controls={'mode': 'stochastic', supplied: [1.]})
+        driver.kernel(None, boys_grouping='system', controls={'mode': 'stochastic', supplied: [1.]})

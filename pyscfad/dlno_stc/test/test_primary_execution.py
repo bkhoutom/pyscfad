@@ -4,6 +4,8 @@ import pytest
 from threadpoolctl import threadpool_info, threadpool_limits
 
 from pyscfad import gto
+from pyscfad.dlno_stc.test import _weak_reference
+from pyscfad.dlno_stc import _weak_numpy
 from pyscfad.dlno_stc import _pairs, _primary_response, _selection, driver
 from pyscfad.dlno_stc.test.test_boys_prepare import boys_water_dimer
 from pyscfad.lib._threading import dense_blas_scope
@@ -20,7 +22,7 @@ def test_reference_fock_matches_live_finishing(nvir):
     fock=np.array([[-1., .1, 0., 0.], [.1, .5, .2, .1],
                    [0., .2, 1., .3], [0., .1, .3, 1.5]])
     got=_pairs._finish_weak_screen_reference(occupied, virtual, fock, 0)
-    want=_pairs._finish_weak_screen(occupied, virtual, fock, 0)
+    want=_weak_reference._finish_weak_screen(occupied, virtual, fock, 0)
     np.testing.assert_allclose(got.occupied_energy,want.occupied_energy,atol=2e-14)
     np.testing.assert_allclose(got.virtual_energy,want.virtual_energy,atol=2e-14)
     # Compare spectral projectors; eigenvector signs are not physical outputs.
@@ -76,7 +78,7 @@ def test_primary_blas_limit_preserves_openmp_and_restores(monkeypatch,operation,
 def test_concrete_finishing_does_not_replace_live_response(boys_water_dimer,monkeypatch):
     mf,_,reference=boys_water_dimer
     reference_finish=_pairs._finish_weak_screen_reference
-    live_finish=_primary_response._finish_weak_screen
+    live_finish=_weak_numpy.target
     calls={'reference':0,'live':0}
     def concrete(*a,**k):
         calls['reference']+=1
@@ -85,7 +87,7 @@ def test_concrete_finishing_does_not_replace_live_response(boys_water_dimer,monk
         calls['live']+=1
         return live_finish(*a,**k)
     monkeypatch.setattr(_pairs,'_finish_weak_screen_reference',concrete)
-    monkeypatch.setattr(_primary_response,'_finish_weak_screen',live)
+    monkeypatch.setattr(_weak_numpy,'target',live)
     _selection.build_domain_selections(mf,frozen=reference.frozen,
         target_coeff=reference.target_reference_coeff)
     assert calls['reference']>0 and calls['live']==0

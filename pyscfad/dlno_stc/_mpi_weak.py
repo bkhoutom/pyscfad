@@ -8,11 +8,10 @@ import gc
 import time
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 
 from . import _pairs
-from .adjoint import add_cotangent, zero_term_cotangents
+from .adjoint import add_cotangent
 
 
 LAST_DIAGNOSTICS = {}
@@ -97,7 +96,7 @@ def _exchange_endpoints(comm, prepared, indices, owners, check):
                 else:
                     shape, dtype, nbytes = record
                     array = receive[offset:offset+nbytes].view(np.dtype(dtype)).reshape(shape)
-                    leaves.append(jnp.asarray(array))
+                    leaves.append(array.copy())
                     offset += nbytes
             endpoints[index] = tuple(leaves)
         jax.block_until_ready(endpoints)
@@ -134,8 +133,10 @@ def weak_pair_contribution(mf, common, static, pairs, comm, *, with_grad):
         indices = sorted({int(index) for pair in pairs for index in pair})
         owners = {index: slot % size for slot, index in enumerate(indices)}
         owned_indices = tuple(index for index in indices if owners[index] == rank)
-        bars = zero_term_cotangents(mf, common) if with_grad else None
-        energy = jnp.zeros((), dtype=common.s1e.dtype)
+        _pairs._weak_numpy.require_supported(mf, common)
+        bars = _pairs._weak_numpy.zeros((mf, common)) if with_grad else None
+        xp = np
+        energy = xp.zeros((), dtype=common.s1e.dtype)
         prepared = {}
         linearizations = {}
         # Allocate the owner map before the ordered numerical reductions.
@@ -170,13 +171,13 @@ def weak_pair_contribution(mf, common, static, pairs, comm, *, with_grad):
 
     start, error, pair = time.perf_counter(), None, None
     try:
-        # Keep raw owner values for replay checks. All ranks pad the same
+        # Keep raw owner values for replay checks. All ranks use the same
         # exchanged endpoints, so numerical reductions have identical shapes.
         originals = ({index: endpoints[index] for index in owned_indices}
                      if with_grad else {})
         endpoints = {index: _pairs.pad_endpoint(value)
                      for index, value in endpoints.items()}
-        endpoint_bars = ({index: jax.tree_util.tree_map(jnp.zeros_like, endpoints[index])
+        endpoint_bars = ({index: jax.tree_util.tree_map(xp.zeros_like, endpoints[index])
                           for index in indices} if with_grad else None)
         for pair in pairs[rank::size]:
             left, right = pair
@@ -237,4 +238,4 @@ def weak_pair_contribution(mf, common, static, pairs, comm, *, with_grad):
     check(comm, error)
     diagnostics['endpoint_response_seconds'] = time.perf_counter() - start
     LAST_DIAGNOSTICS.update(diagnostics)
-    return jnp.real(energy), bars
+    return xp.real(energy), bars

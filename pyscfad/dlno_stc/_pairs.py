@@ -1,8 +1,9 @@
 """Boys multipole screening and directed weak-pair completion.
 
-Moment translation, Cartesian response contractions, and pair kernels are
-shared through ``pyscfad.lib._multipole``. Fixed primary-screen reconstruction
-uses each singleton Boys target. Weak pairs accumulate compact endpoint
+Concrete weak algebra uses explicit NumPy/SciPy forward and reverse kernels;
+JAX is used only for shared molecular producers and pytree bookkeeping.
+Fixed primary-screen reconstruction uses each singleton Boys target.
+Weak pairs accumulate compact endpoint
 cotangents before replaying each endpoint response once; no native DLNO
 module is imported by this implementation.
 """
@@ -13,24 +14,35 @@ from functools import partial
 from typing import NamedTuple
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import scipy.linalg as scipy_linalg
 
-from pyscfad.lno.tools import fake_mol_by_atom, project_mo
+from pyscfad.lno.tools import fake_mol_by_atom
 from pyscfad.tools import resource_profile
 from pyscfad.lib._compilation_cache import configure_compilation_cache
 from pyscfad.lib._threading import blas_threads
-from pyscfad.lib._multipole import (
-    symmetric_coordinate_moment_jvp, endpoint_matches_reference,
-    pad_endpoint, crop_endpoint_cotangent,
-    pair_energy as _multipole_pair_energy,
-    pair_energy_and_grad, transition_moments,
-)
+from pyscfad.lib._multipole import endpoint_matches_reference, crop_endpoint_cotangent
+from pyscfad.lib import _multipole_numpy
+from . import _weak_numpy
 from pyscfad.lib._cartesian_moments import cartesian_components
-from pyscfad.lib._weak_endpoint import prepare_endpoint, replay_endpoint
 
 _MOMENT_SLAB_BYTES = 32 * 1024**2
+
+
+def pad_endpoint(endpoint):
+    """Concrete endpoints need no padding or shape-specific compilation."""
+    _weak_numpy.require_supported(endpoint)
+    return jax.tree.map(np.asarray, endpoint)
+
+
+def _multipole_pair_energy(left, right, order):
+    _weak_numpy.require_supported(left, right)
+    return _multipole_numpy.pair(left, right, order)
+
+
+def pair_energy_and_grad(left, right, order):
+    _weak_numpy.require_supported(left, right)
+    return _multipole_numpy.pair(left, right, order, with_grad=True)
 
 
 class WeakScreen(NamedTuple):
@@ -65,40 +77,12 @@ class _WeakProductsPullback(NamedTuple):
 
 def _weak_screen_products(common):
     """Compute global PAO and independent target products once per invocation."""
-    from .domain import _pao_products
-    targets = tuple(target.iao_coeff for target in common.fragment_occupied_data)
-    if targets:
-        combined = common.s1e @ jnp.concatenate(targets, axis=1)
-        offsets = np.cumsum([target.shape[1] for target in targets[:-1]])
-        occupied = tuple(jnp.split(combined, offsets, axis=1))
-    else:
-        occupied = ()
-    return _WeakScreenProducts(_pao_products(common.pao_coeff, common.s1e), occupied)
+    return _weak_numpy.products(common)[0]
 
 
 def _cached_weak_screen_products(common, products):
     """Attach the exact ambient response without recomputing cached primals."""
-    overlap, pao = common.s1e, common.pao_coeff
-    overlap_pao = products.pao[1]
-    targets = tuple(target.iao_coeff for target in common.fragment_occupied_data)
-    combined = jnp.concatenate(targets, axis=1) if targets else None
-    offsets = np.cumsum([target.shape[1] for target in targets[:-1]])
-
-    def differential(tangent):
-        overlap_t, pao_t = tangent.s1e, tangent.pao_coeff
-        overlap_pao_t = overlap_t @ pao + overlap @ pao_t
-        gram_t = pao_t.T.conj() @ overlap_pao + pao.T.conj() @ overlap_pao_t
-        occupied_t = ()
-        if targets:
-            combined_t = jnp.concatenate(
-                tuple(target.iao_coeff for target in tangent.fragment_occupied_data), axis=1)
-            product_t = overlap_t @ combined + overlap @ combined_t
-            occupied_t = tuple(jnp.split(product_t, offsets, axis=1))
-        return _WeakScreenProducts((gram_t, overlap_pao_t), occupied_t)
-
-    metadata = lambda value: jax.ShapeDtypeStruct(value.shape, value.dtype)
-    pullback = jax.linear_transpose(differential, jax.tree_util.tree_map(metadata, common))
-    return products, _WeakProductsPullback(pullback, jax.tree_util.tree_map(metadata, products))
+    return _weak_numpy.products(common, cached=products)
 
 
 def _weak_pao_preprojection_key(fragment):
@@ -138,7 +122,7 @@ def _apply_weak_screen_pullback(pullback, screen_bar, shared_pao_bars, shared_pr
             remaining, product_bar = shared_product_bars.pop(products.pullback)
             if product_bar is None:
                 product_bar = jax.tree_util.tree_map(
-                    lambda shape: jnp.zeros(shape.shape, shape.dtype), products.shapes)
+                    lambda shape: np.zeros(shape.shape, shape.dtype), products.shapes)
             occupied_bars = list(product_bar.occupied)
             occupied_bars[pullback.occupied_index] += occupied_bar
             pao_bars = product_bar.pao
@@ -164,7 +148,8 @@ def _fake_mol_with_traced_centers(mol, atmlst):
         # its shallow copy otherwise retains the full parent coordinate leaf.
         # Slice that leaf so JAX scatters a local-moment cotangent back to the
         # corresponding parent atoms rather than to atoms 0..len(atmlst)-1.
-        fake_mol.coords = coords[jnp.asarray(atmlst, dtype=int)]
+        _weak_numpy.require_supported(coords)
+        fake_mol.coords = np.asarray(coords)[np.asarray(atmlst, dtype=int)]
     return fake_mol
 
 
@@ -174,7 +159,7 @@ def _packed_moment_integral(fake_mol, rank, *, bra_derivative=False):
     Libcint still evaluates its standard component set within each slab.
     The full redundant AO tensor is never allocated: higher-rank slabs are
     limited to 32 MiB (or one shell), and only unique components leave this function.
-    Keeping the ordinary intor calls also preserves basis-parameter AD.
+    The explicit coordinate reverse contracts shell derivatives separately.
     """
     nao = fake_mol.nao
     intor = {0: 'int1e_ovlp', 1: 'int1e_r', 2: 'int1e_rr', 3: 'int1e_rrr'}[rank]
@@ -188,11 +173,11 @@ def _packed_moment_integral(fake_mol, rank, *, bra_derivative=False):
     # packing copies and repeated slab calls, especially for order two.
     if rank <= 1:
         with fake_mol.with_common_origin((0.0, 0.0, 0.0)):
-            return jnp.asarray(fake_mol.intor(intor)).reshape(ncart, nao, nao)
+            value = fake_mol.intor(intor)
+            return value.reshape(ncart, nao, nao)
     ao_loc = fake_mol.ao_loc_nr()
     rows = max(1, _MOMENT_SLAB_BYTES // max(8 * ncart * nao, 1))
     packed = None
-    traced_blocks = []
     with fake_mol.with_common_origin((0.0, 0.0, 0.0)):
         start = 0
         while start < fake_mol.nbas:
@@ -201,106 +186,24 @@ def _packed_moment_integral(fake_mol, rank, *, bra_derivative=False):
             p0, p1 = ao_loc[start], ao_loc[end]
             block = fake_mol.intor(intor, shls_slice=(start, end, 0, fake_mol.nbas))
             block = block.reshape(ncart, p1 - p0, nao)
-            if isinstance(block, jax.core.Tracer):
-                traced_blocks.append(block[indices])
-            else:
-                if packed is None:
-                    packed = np.empty((len(indices), nao, nao), dtype=block.dtype)
-                packed[:, p0:p1] = np.asarray(block)[indices]
+            _weak_numpy.require_supported(block)
+            if packed is None:
+                packed = np.empty((len(indices), nao, nao), dtype=block.dtype)
+            packed[:, p0:p1] = np.asarray(block)[indices]
             del block
             start = end
-    if traced_blocks:
-        return jnp.concatenate(traced_blocks, axis=1)
     if packed is None:
         packed = np.empty((len(indices), nao, nao))
-    return jnp.asarray(packed)
-
-
-def _raw_cartesian_moment_impl(fake_mol, rank):
-    """Unique Cartesian AO moments about the fixed global origin."""
-    return _packed_moment_integral(fake_mol, rank)
-
-
-def _raw_cartesian_moment_coordinate_jvp(fake_mol, coords_t, rank):
-    """Packed coordinate JVP, using ket = bra transposed in AO indices."""
-    nao = fake_mol.nao
-    bra = -_packed_moment_integral(fake_mol, rank, bra_derivative=True)
-    bra = bra.reshape(3, len(cartesian_components(rank)[0]), nao, nao)
-
-    ao_owner = np.empty(nao, dtype=np.int32)
-    for atom, (_, _, p0, p1) in enumerate(fake_mol.aoslice_by_atom()):
-        ao_owner[p0:p1] = atom
-    return symmetric_coordinate_moment_jvp(bra, coords_t, ao_owner)
-
-
-@partial(jax.custom_jvp, nondiff_argnums=(1,))
-def _raw_cartesian_moment(fake_mol, rank):
-    """Packed Cartesian moment with a rank-aware nuclear-coordinate JVP."""
-    return _raw_cartesian_moment_impl(fake_mol, rank)
-
-
-@_raw_cartesian_moment.defjvp
-def _raw_cartesian_moment_jvp(rank, primals, tangents):
-    fake_mol, = primals
-    fake_mol_t, = tangents
-    primal = _raw_cartesian_moment(fake_mol, rank)
-
-    # Preserve the pre-existing exponent/contraction-coefficient response by
-    # asking the general integral rule for a JVP with its coordinate tangent
-    # zeroed.  The coordinate part is supplied below with the correct
-    # Cartesian component ordering.
-    other_tangent = jnp.zeros_like(primal)
-    if any(
-        getattr(fake_mol, name, None) is not None
-        for name in ('exp', 'ctr_coeff', 'r0')
-    ):
-        basis_tangent = fake_mol_t.copy(deep=False)
-        if basis_tangent.coords is not None:
-            basis_tangent.coords = jnp.zeros_like(basis_tangent.coords)
-        _, other_tangent = jax.jvp(
-            partial(_raw_cartesian_moment_impl, rank=rank),
-            (fake_mol,),
-            (basis_tangent,),
-        )
-
-    coordinate_tangent = jnp.zeros_like(primal)
-    if fake_mol.coords is not None:
-        coordinate_tangent = _raw_cartesian_moment_coordinate_jvp(
-            fake_mol, fake_mol_t.coords, rank
-        )
-    return primal, other_tangent + coordinate_tangent
+    return packed
 
 
 def _origin_zero_moments(fake_mol, order):
-    """Evaluate raw Cartesian moments about the fixed global origin.
-
-    PySCF stores the common origin in a NumPy ``_env`` buffer, so its
-    ``with_common_origin`` context cannot consume a traced, geometry-dependent
-    origin.  A concrete zero origin is safe inside a JAX trace; the moments
-    can then be translated with ordinary JAX algebra.
-    """
-    nao = fake_mol.nao
-    with fake_mol.with_common_origin((0.0, 0.0, 0.0)):
-        rr = None
-        rrr = None
-        # A plain PySCF Mole is not a registered JAX pytree, so it cannot be
-        # passed through the custom-JVP wrapper merely because some unrelated
-        # input (for example an orbital energy) is traced.  Use the identical
-        # primal integral call when this molecule has no differentiable basis
-        # or coordinate leaves.
-        moment = _raw_cartesian_moment
-        if not any(
-            getattr(fake_mol, name, None) is not None
-            for name in ('coords', 'exp', 'ctr_coeff', 'r0')
-        ):
-            moment = _raw_cartesian_moment_impl
-        overlap = moment(fake_mol, 0).reshape(nao, nao)
-        r = moment(fake_mol, 1)
-        if order >= 2:
-            rr = moment(fake_mol, 2)
-        if order >= 3:
-            rrr = moment(fake_mol, 3)
-    return overlap, r, rr, rrr
+    """Packed host AO moments; coordinate response uses the native VJP."""
+    _weak_numpy.require_supported(fake_mol)
+    return tuple(_packed_moment_integral(fake_mol, rank).reshape(
+        fake_mol.nao, fake_mol.nao) if rank == 0 else
+        _packed_moment_integral(fake_mol, rank) if rank <= order else None
+        for rank in range(4))
 
 
 def _native_weak_moments_supported(mf):
@@ -316,7 +219,7 @@ def _native_weak_moments_supported(mf):
         return False
     # GTOint2c_r0_vjp reserves CACHESIZE=144000 doubles for shell output.
     # Bound the largest supported moment (octupole), including contractions;
-    # unusual large shells must use the general rule instead of overrunning C.
+    # Reject unusually large shells before entering the native contraction.
     largest_shell = int(np.max(np.diff(mol.ao_loc_nr()), initial=0))
     return 0 < largest_shell and 3 * 27 * largest_shell ** 2 <= 144000
 
@@ -324,31 +227,20 @@ def _native_weak_moments_supported(mf):
 def _origin_zero_moments_vjp(mf, atoms, order):
     """Replay raw values, deferring coordinate derivatives until contraction.
 
-    Only the small submolecule coordinate map is linearized on the native
-    path. The incoming weights combine all endpoints on this support before
+    The submolecule coordinate map is reversed by a NumPy scatter. Incoming
+    weights combine all endpoints on this support before
     the C driver generates each bra shell block and contracts W + W.T. No
-    full bra/ket derivative arrays are constructed or retained. General AD
-    and basis-parameter response continue to use the original integral JVPs.
+    full bra/ket derivative arrays are constructed or retained.
     """
-    def evaluate(current):
-        return _origin_zero_moments(
-            _fake_mol_with_traced_centers(current.mol, atoms), order)
-
     if not _native_weak_moments_supported(mf):
-        return jax.vjp(evaluate, mf)
+        raise TypeError('Weak-pair pullback requires concrete float64 coordinate-only molecules '
+                        'within the native moment shell-size limit')
 
-    fake_mol, scatter = jax.vjp(
-        lambda current: _fake_mol_with_traced_centers(current.mol, atoms), mf)
+    fake_mol = _fake_mol_with_traced_centers(mf.mol, atoms)
     raw = _origin_zero_moments(fake_mol, order)
 
     def pullback(raw_bar):
-        # A concrete reference can still receive traced seeds when a caller
-        # differentiates this linear map. Build the general tape only then.
-        if any(isinstance(leaf, jax.core.Tracer)
-               or getattr(leaf, 'dtype', None) != np.float64
-               for leaf in jax.tree_util.tree_leaves(raw_bar)):
-            _, fallback = jax.vjp(evaluate, mf)
-            return fallback(raw_bar)
+        _weak_numpy.require_supported(raw_bar)
 
         from pyscfad.gto._moleintor_vjp import _int1e_r0_deriv
         coords_bar = np.zeros((fake_mol.natm, 3), dtype=np.float64)
@@ -371,9 +263,10 @@ def _origin_zero_moments_vjp(mf, atoms, order):
                     coords_bar += _int1e_r0_deriv(
                         fake_mol._add_suffix(name + '_dr10'), None,
                         3 ** rank, 1, fake_mol, weight)
-        mol_bar = fake_mol.copy(deep=False)
-        mol_bar.coords = jnp.asarray(coords_bar)
-        return scatter(mol_bar)
+        mf_bar = _weak_numpy.zeros(mf)
+        indices = np.arange(mf.mol.natm) if atoms is None else np.asarray(atoms, dtype=int)
+        np.add.at(mf_bar.mol.coords, indices, coords_bar)
+        return (mf_bar,)
 
     return raw, pullback
 
@@ -382,8 +275,8 @@ def _multipole_orbital_data(mol, screen, atoms, order, *, ao_moments=None):
     """Build the one Boys endpoint using translated raw transition moments."""
     if order not in (2, 3, 4):
         raise ValueError("multipole order must be 2, 3, or 4")
-    occupied = jnp.asarray(screen.occupied_coeff)
-    virtual = jnp.asarray(screen.virtual_coeff)
+    occupied = screen.occupied_coeff
+    virtual = screen.virtual_coeff
     if occupied.ndim != 2 or occupied.shape[1] != 1:
         raise ValueError("a Boys weak screen requires one occupied target")
     if virtual.ndim != 2 or virtual.shape[0] != occupied.shape[0]:
@@ -391,55 +284,25 @@ def _multipole_orbital_data(mol, screen, atoms, order, *, ao_moments=None):
     if ao_moments is None:
         fake_mol = _fake_mol_with_traced_centers(mol, atoms)
         ao_moments = _origin_zero_moments(fake_mol, max(1, order - 1))
-    overlap, dipole, second, third = ao_moments
-    center, mu, theta, omega = transition_moments(
-        occupied, virtual, overlap, dipole, second, third, order
-    )
-    excitation = jnp.asarray(screen.virtual_energy) - jnp.asarray(screen.occupied_energy)[0]
-    return (center[0], mu[0], excitation,
-            None if theta is None else theta[0],
-            None if omega is None else omega[0])
+    return _multipole_numpy.endpoint(screen, ao_moments, order)
 
 
 def build_weak_multipole_screen(common, static, fragment_index, *, _pao_preprojection=None,
                                 _occupied_projection_rhs=None):
     """Replay saved primary supports/ranks with a normalized current target."""
-    from .domain import (_fixed_metric_orthonormalize,
-                         _rebuild_selected_pao_space)
     fragment = static.fragments[int(fragment_index)]
     if fragment.weak_virtual is None:
         return None
-    ao = fragment.primary_ao_indices
-    overlap = common.s1e[np.ix_(ao, ao)]
-    fock = common.fock[np.ix_(ao, ao)]
-    if _occupied_projection_rhs is None:
-        occupied = project_mo(common.fragment_occupied_data[fragment.fragment_index].iao_coeff,
-                              common.s1e[ao], overlap)
-    else:
-        occupied = jnp.linalg.solve(overlap, _occupied_projection_rhs[ao])
-    norm2 = jnp.real(jnp.einsum('ui,uv,vi->i', occupied.conj(), overlap, occupied))
-    current = np.asarray(jax.device_get(jax.lax.stop_gradient(norm2)))
-    keep = fragment.weak_occ_norm_keep
-    if (not np.isfinite(current).all()
-            or not np.array_equal(np.flatnonzero(current > static.thresholds.metric_rank), keep)
-            or len(keep) != 1):
-        raise RuntimeError("Boys screening target rank changed; rebuild domains")
-    occupied = occupied[:, keep] / jnp.sqrt(norm2[keep])[None, :]
-    span = _fixed_metric_orthonormalize(occupied, overlap, fragment.weak_occ_span_metric_keep)
-    virtual = _rebuild_selected_pao_space(
-        common, fragment.weak_virtual, ao, span,
-        boys_metric_threshold=static.thresholds.metric_rank,
-        preprojection=_pao_preprojection,
-    )
-    return _finish_weak_screen(occupied, virtual, fock, fragment_index)
+    return _weak_numpy.fixed_screen(common, static, int(fragment_index),
+        candidate=_pao_preprojection, rhs=_occupied_projection_rhs)[0]
 
 
 @blas_threads(1)
 def _finish_weak_screen_reference(occupied, virtual, fock, fragment_index):
     """Finish concrete primary selection without compiling its Fock operations.
 
-    Live response and replay use ``_finish_weak_screen`` below. This helper
-    preserves its semicanonical spaces and screening-gap validation.
+    Live response uses the explicit NumPy primary-space pullback. This helper
+    serves forward-only reference selection.
     """
     occupied, virtual, fock = map(np.asarray, (occupied, virtual, fock))
     occupied_energy = np.real(np.einsum('ui,uv,vi->i', occupied.conj(), fock, occupied))
@@ -454,18 +317,6 @@ def _finish_weak_screen_reference(occupied, virtual, fock, fragment_index):
             virtual_energy, rotation = scipy_linalg.eigh(projected)
             virtual = virtual @ rotation
     gaps = virtual_energy[:, None] - occupied_energy
-    if not np.isfinite(gaps).all() or np.any(gaps <= 0):
-        raise RuntimeError(f"Boys target {fragment_index} has invalid screening denominators")
-    return WeakScreen(occupied_energy, occupied, virtual_energy, virtual)
-
-
-def _finish_weak_screen(occupied, virtual, fock, fragment_index):
-    """Semicanonicalize an already selected or replayed primary space."""
-    from .domain import _fixed_semicanonicalize
-    occupied = jnp.asarray(occupied)
-    occupied_energy = jnp.real(jnp.einsum('ui,uv,vi->i', occupied.conj(), fock, occupied))
-    virtual_energy, virtual = _fixed_semicanonicalize(virtual, fock)
-    gaps = np.asarray(jax.device_get(jax.lax.stop_gradient(virtual_energy[:, None] - occupied_energy)))
     if not np.isfinite(gaps).all() or np.any(gaps <= 0):
         raise RuntimeError(f"Boys target {fragment_index} has invalid screening denominators")
     return WeakScreen(occupied_energy, occupied, virtual_energy, virtual)
@@ -494,7 +345,7 @@ def weak_screen_pair_energy(mf, left, right, static, left_index, right_index):
     order = static.thresholds.multipole_order
     lhs = _multipole_orbital_data(mf.mol, left, static.fragments[left_index].primary_atoms, order)
     rhs = _multipole_orbital_data(mf.mol, right, static.fragments[right_index].primary_atoms, order)
-    return weak_pair_weight(static, left_index, right_index) * jnp.real(
+    return weak_pair_weight(static, left_index, right_index) * np.real(
         _multipole_pair_energy(pad_endpoint(lhs), pad_endpoint(rhs), order))
 
 
@@ -526,27 +377,32 @@ def _prepare_weak_endpoint(mf, common, static, fragment_index, *, ao_moments=Non
     moments = partial(_weak_endpoint_from_screen, static=static, fragment_index=fragment_index)
     if ao_moments is not None:
         moments = partial(moments, ao_moments=ao_moments)
-    if pao_preparation is not None:
+    _weak_numpy.require_supported(common)
+    if pao_preparation is None:
+        screen, screen_pullback = _weak_numpy.fixed_screen(common, static, fragment_index)
+    else:
         preprojection, preprojection_pullback = pao_preparation
-        if products_preparation is not None:
-            products, products_pullback = products_preparation
-            occupied_index = static.fragments[fragment_index].fragment_index
-            screen, target_pullback = jax.vjp(
-                lambda current, candidate, rhs: build_weak_multipole_screen(
-                    current, static, fragment_index, _pao_preprojection=candidate,
-                    _occupied_projection_rhs=rhs),
-                common, preprojection, products.occupied[occupied_index])
-            return moments(mf, screen), (screen, _SharedPAOPullback(
-                target_pullback, preprojection_pullback, products_pullback, occupied_index))
-        screen, target_pullback = jax.vjp(
-            lambda current, candidate: build_weak_multipole_screen(
-                current, static, fragment_index, _pao_preprojection=candidate),
-            common, preprojection)
-        return moments(mf, screen), (screen, _SharedPAOPullback(
-            target_pullback, preprojection_pullback))
-    return prepare_endpoint(
-        partial(build_weak_multipole_screen, static=static, fragment_index=fragment_index),
-        moments, mf, common)
+        fragment = static.fragments[fragment_index]
+        if products_preparation is None:
+            occupied_index = fragment.fragment_index
+            target = np.asarray(common.fragment_occupied_data[occupied_index].iao_coeff)
+            overlap = np.asarray(common.s1e)
+            screen, target_pb = _weak_numpy.fixed_target(common, preprojection,
+                overlap @ target, fragment, static.thresholds, fragment_index)
+            def target_pullback(bar):
+                common_bar, candidate_bar, rhs_bar = target_pb(bar)
+                common_bar.s1e[:] += rhs_bar @ target.T
+                common_bar.fragment_occupied_data[occupied_index].iao_coeff[:] += overlap.T @ rhs_bar
+                return common_bar, candidate_bar
+            screen_pullback = _SharedPAOPullback(target_pullback, preprojection_pullback)
+            return moments(mf, screen), (screen, screen_pullback)
+        products, products_pullback = products_preparation
+        occupied_index = fragment.fragment_index
+        screen, target_pullback = _weak_numpy.fixed_target(common, preprojection,
+            products.occupied[occupied_index], fragment, static.thresholds, fragment_index)
+        screen_pullback = _SharedPAOPullback(target_pullback, preprojection_pullback,
+                                             products_pullback, occupied_index)
+    return moments(mf, screen), (screen, screen_pullback)
 
 
 def _replay_weak_endpoint(mf, linearization, static, fragment_index, *,
@@ -556,31 +412,29 @@ def _replay_weak_endpoint(mf, linearization, static, fragment_index, *,
     if isinstance(screen_pullback, _SharedPAOPullback):
         linearization = (screen, lambda bar: (_apply_weak_screen_pullback(
             screen_pullback, bar, shared_pao_bars, shared_product_bars),))
-    if _native_weak_moments_supported(mf):
-        atoms = static.fragments[fragment_index].primary_atoms
-        raw, raw_pullback = _origin_zero_moments_vjp(
-            mf, atoms, max(1, static.thresholds.multipole_order - 1))
-        endpoint, moment_pullback = jax.vjp(
-            lambda saved, operators: _weak_endpoint_from_screen(
-                mf, saved, static, fragment_index, ao_moments=operators),
-            screen, raw)
+    atoms = static.fragments[fragment_index].primary_atoms
+    raw, raw_pullback = _origin_zero_moments_vjp(
+        mf, atoms, max(1, static.thresholds.multipole_order - 1))
+    endpoint, moment_pullback = _weak_moment_vjp(mf, screen, raw, static, fragment_index)
 
-        def pullback(endpoint_bar):
-            screen_bar, raw_bar = moment_pullback(endpoint_bar)
-            common_bar, = linearization[1](screen_bar)
-            mf_bar, = raw_pullback(raw_bar)
-            return mf_bar, common_bar
+    def pullback(endpoint_bar):
+        screen_bar, raw_bar = moment_pullback(endpoint_bar)
+        common_bar, = linearization[1](screen_bar)
+        mf_bar, = raw_pullback(raw_bar)
+        return mf_bar, common_bar
 
-        return endpoint, pullback
-    return replay_endpoint(
-        partial(_weak_endpoint_from_screen, static=static, fragment_index=fragment_index),
-        mf, linearization)
+    return endpoint, pullback
+
+
+def _weak_moment_vjp(mf, screen, raw, static, index):
+    return _multipole_numpy.endpoint(screen, raw, static.thresholds.multipole_order,
+                                      with_grad=True)
 
 
 def weak_pair_energy(mf, common, static, left_index, right_index):
     """Evaluate one pair using the same endpoint boundary as the full sum."""
     left_index, right_index = _validate_weak_pair(static, left_index, right_index)
-    return weak_pair_weight(static, left_index, right_index) * jnp.real(_multipole_pair_energy(
+    return weak_pair_weight(static, left_index, right_index) * np.real(_multipole_pair_energy(
         pad_endpoint(build_weak_endpoint(mf, common, static, left_index)),
         pad_endpoint(build_weak_endpoint(mf, common, static, right_index)),
         static.thresholds.multipole_order,
@@ -617,10 +471,9 @@ def _weak_endpoints(mf, common, static, pairs):
 def _forward_weak_screens(common, static, indices, *, products=None):
     """Yield current screens sharing primal products, without reverse tapes.
 
-    A None entry requests the caller's legacy endpoint path. Each yielded
+    A None entry denotes an empty or unavailable screen. Each yielded
     screen may be contracted and released before constructing the next.
     """
-    from .domain import _rebuild_selected_pao_preprojection
     preprojections = {}
     for index in indices:
         fragment = static.fragments[index]
@@ -633,9 +486,7 @@ def _forward_weak_screens(common, static, indices, *, products=None):
             configure_compilation_cache()
             products = _weak_screen_products(common)
         if key not in preprojections:
-            preprojections[key] = _rebuild_selected_pao_preprojection(
-                common, products.pao, selection=fragment.weak_virtual,
-                representation_ao_indices=fragment.primary_ao_indices)
+            preprojections[key] = _weak_numpy.fixed_preprojection(common, products.pao, fragment)[0]
         yield index, build_weak_multipole_screen(
             common, static, index, _pao_preprojection=preprojections[key],
             _occupied_projection_rhs=products.occupied[fragment.fragment_index])
@@ -655,13 +506,14 @@ def weak_pair_energy_sum(mf, common, static, *, pairs=None):
         if resource_profile.enabled():
             jax.block_until_ready(endpoints)
     with resource_profile.section('stc.cc.weak_forward', pairs=len(pairs)):
-        energy = jnp.zeros((), dtype=common.s1e.dtype)
+        xp = np
+        energy = xp.zeros((), dtype=common.s1e.dtype)
         for left, right in pairs:
             energy += weak_pair_weight(static, left, right) * _multipole_pair_energy(
                 endpoints[left], endpoints[right], static.thresholds.multipole_order)
         if resource_profile.enabled():
             jax.block_until_ready(energy)
-    return jnp.real(energy)
+    return xp.real(energy)
 
 
 def _grouped_weak_pullback(mf, static, endpoints, originals, linearizations,
@@ -675,16 +527,13 @@ def _grouped_weak_pullback(mf, static, endpoints, originals, linearizations,
     order = static.thresholds.multipole_order
     for atoms, indices in supports.items():
         raw, raw_pullback = _origin_zero_moments_vjp(mf, atoms, max(1, order - 1))
-        raw_bar = jax.tree_util.tree_map(jnp.zeros_like, raw)
+        raw_bar = _weak_numpy.zeros(raw)
         for index in indices:
             endpoint_bar = endpoint_bars.pop(index)
             del endpoints[index]
             original = originals.pop(index)
             screen, screen_pullback = linearizations.pop(index)
-            rebuilt, moment_pullback = jax.vjp(
-                lambda saved, operators: _weak_endpoint_from_screen(
-                    mf, saved, static, index, ao_moments=operators),
-                screen, raw)
+            rebuilt, moment_pullback = _weak_moment_vjp(mf, screen, raw, static, index)
             _check_endpoint_replay(rebuilt, original, index)
             screen_bar, operators_bar = moment_pullback(
                 crop_endpoint_cotangent(endpoint_bar, original))
@@ -707,7 +556,7 @@ def weak_pair_energy_and_grad(mf, common, static, *, pairs=None,
                              _prepared_pairs=None):
     """Reuse orbital pullbacks and replay one AO-moment tape at a time.
 
-    Each orbital screen and its reverse rule come from one forward VJP.
+    Each orbital screen and its reverse rule come from one forward evaluation.
     Pair contractions share compact transition moments. Their accumulated
     bars pass through AO-moment replay using the exact saved screen, then
     through its retained orbital pullback. No eigensolver is replayed.
@@ -723,11 +572,13 @@ def weak_pair_energy_and_grad(mf, common, static, *, pairs=None,
     Its ``_prepared_pairs`` transfers the screening energy and accumulated
     endpoint bars, so pair contractions are not evaluated a second time.
     """
-    from .adjoint import add_cotangent, zero_term_cotangents
+    from .adjoint import add_cotangent
     configure_compilation_cache()
     pairs = weak_pair_indices(static) if pairs is None else tuple(pairs)
-    bars = zero_term_cotangents(mf, common)
-    energy = jnp.zeros((), dtype=common.s1e.dtype)
+    _weak_numpy.require_supported(mf, common)
+    xp = np
+    bars = _weak_numpy.zeros((mf, common))
+    energy = xp.zeros((), dtype=common.s1e.dtype)
     originals, linearizations = {}, {}
     with resource_profile.section('stc.domain.weak_prepare'):
         for index in sorted({index for pair in pairs for index in pair}):
@@ -750,8 +601,8 @@ def weak_pair_energy_and_grad(mf, common, static, *, pairs=None,
             if isinstance(value[1], _SharedPAOPullback)
             and value[1].products_pullback is not None).items()}
         endpoints = {index: pad_endpoint(value) for index, value in originals.items()}
-        endpoint_bars = {index: jax.tree_util.tree_map(jnp.zeros_like, value)
-                         for index, value in endpoints.items()}
+        zero = _weak_numpy.zeros
+        endpoint_bars = {index: zero(value) for index, value in endpoints.items()}
         if resource_profile.enabled():
             jax.block_until_ready((endpoints, endpoint_bars))
     if _prepared_pairs is not None:
@@ -804,7 +655,7 @@ def weak_pair_energy_and_grad(mf, common, static, *, pairs=None,
         # Release each tape promptly, but scan the Python heap only after
         # the complete weak response. Automatic collection remains enabled.
         gc.collect()
-    return jnp.real(energy), bars
+    return xp.real(energy), bars
 
 
 def _exact_boys_pair_scores(mf, common, static, *, correlation_auxbasis=None):
@@ -869,7 +720,8 @@ def _screen_pair_response(endpoints, static, forced, exact_scores, response):
     selected = SimpleNamespace(strong_mask=mask, fragments=static.fragments)
     pairs = weak_pair_indices(selected)
     accumulated = {}
-    energy = jnp.zeros(())
+    xp = np
+    energy = xp.zeros(())
     with resource_profile.section('stc.domain.screen_pair_value_and_grad'):
         for left, right in pairs:
             weight = weak_pair_weight(selected, left, right)
@@ -880,7 +732,7 @@ def _screen_pair_response(endpoints, static, forced, exact_scores, response):
                 accumulated[index] = (bar if index not in accumulated else
                     jax.tree_util.tree_map(add_cotangent, accumulated[index], bar))
             jax.block_until_ready((energy, accumulated))
-    response.update(pairs=pairs, energy=jnp.real(energy), endpoint_bars=accumulated)
+    response.update(pairs=pairs, energy=xp.real(energy), endpoint_bars=accumulated)
     return weak
 
 
@@ -916,7 +768,8 @@ def screen_pairs(mf, common, static, model='multipole', full_domain=False,
         if prepared_endpoints is None:
             raise ValueError('pair response requires prepared screening endpoints')
         _pair_response.clear()
-        _pair_response.update(pairs=(), energy=jnp.zeros(()), endpoint_bars={})
+        xp = np
+        _pair_response.update(pairs=(), energy=xp.zeros(()), endpoint_bars={})
     nfrag = len(static.fragments)
     if full_domain or static.thresholds.pair_energy <= 0 or model in ('all', 'all-strong'):
         return (np.zeros((nfrag, nfrag)), np.zeros((nfrag, nfrag)),
@@ -964,17 +817,10 @@ def screen_pairs(mf, common, static, model='multipole', full_domain=False,
                 preparation = {}
                 if key is not None:
                     if products_preparation is None:
-                        products, products_pullback = jax.vjp(_weak_screen_products, common)
-                        shapes = jax.tree_util.tree_map(
-                            lambda value: jax.ShapeDtypeStruct(value.shape, value.dtype), products)
-                        products_preparation = products, _WeakProductsPullback(products_pullback, shapes)
+                        products_preparation = _weak_numpy.products(common)
                     if key not in pao_preparations:
-                        from .domain import _rebuild_selected_pao_preprojection
-                        pao_preparations[key] = jax.vjp(partial(
-                            _rebuild_selected_pao_preprojection,
-                            selection=fragment.weak_virtual,
-                            representation_ao_indices=fragment.primary_ao_indices),
-                            common, products_preparation[0].pao)
+                        pao_preparations[key] = _weak_numpy.fixed_preprojection(
+                            common, products_preparation[0].pao, fragment)
                     preparation['pao_preparation'] = pao_preparations[key]
                     preparation['products_preparation'] = products_preparation
                 prepared_endpoints[index] = _prepare_weak_endpoint(

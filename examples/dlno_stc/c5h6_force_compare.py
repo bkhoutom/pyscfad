@@ -79,7 +79,7 @@ def main():
         raise RuntimeError("reference and differentiable SCF disagree")
     frozen = 5  # One 1s core orbital per carbon.
     domains = dlno_stc.build_domain_selections(
-        mf, frozen=frozen, full_domain=True, boys_grouping="molecule",
+        mf, frozen=frozen, full_domain=True, boys_grouping="system",
         lo_kwargs=dict(init_guess="atomic", conv_tol=1e-10,
                        gmres_options=dict(restart=120, maxiter=100)),
     )

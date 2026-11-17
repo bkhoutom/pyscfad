@@ -95,12 +95,12 @@ def main():
                 error = comm.bcast(error, root=0)
             if error is not None:
                 raise RuntimeError(error)
-            result = kernel(mf, static, scope='domain', controls=controls if rank == 0 else None,
+            result = kernel(mf, static, controls=controls if rank == 0 else None,
                             comm=comm, merge_identical=not args.unmerged,
                             parallel_scf_jk=args.parallel_scf_jk)
         else:
             result = value_and_grad(mol, build_mf,
-                build_static=build_static if rank == 0 else None, scope='domain',
+                build_static=build_static if rank == 0 else None,
                 controls=controls if rank == 0 else None, comm=comm, include_hf=False,
                 merge_identical=not args.unmerged, parallel_scf_jk=args.parallel_scf_jk)
         jax.block_until_ready(result)
@@ -110,7 +110,7 @@ def main():
         return
     energy, gradient = (result, None) if args.energy_only else result
     groups = dlno_stc.build_domain_groups(static, merge_identical=not args.unmerged)
-    summary = dict(scope='domain', correlation_energy=float(energy), mpi_size=size,
+    summary = dict(boys_grouping='singleton', correlation_energy=float(energy), mpi_size=size,
         parallel_scf_jk=args.parallel_scf_jk and size > 1,
         elapsed_seconds=elapsed, original_targets=len(static.fragments),
         group_sizes=[len(g.target_indices) for g in groups],

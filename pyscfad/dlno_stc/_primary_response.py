@@ -4,17 +4,15 @@ Only integer labels leave this eager selection boundary as metadata. Primal
 arrays and their pullbacks belong to the current SelectionResponse and are
 consumed before the strong-domain construction.
 """
-from functools import partial
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
 from pyscfad import scipy
-from ._selection import (FixedPAOSubspaceSelection, _PAO_ORTH_THRESHOLD,
-                         _pao_columns_on_atoms, _orthogonalize)
+from ._selection import FixedPAOSubspaceSelection, _pao_columns_on_atoms
 from .domain import _cholesky_metric_orthonormalize
-from ._pairs import _finish_weak_screen, _SharedPAOPullback
+from ._pairs import _SharedPAOPullback
 from pyscfad.lno import tools
 
 
@@ -59,50 +57,6 @@ def _metric_space(coeff, overlap, threshold):
     return _cholesky_metric_orthonormalize(retained, overlap, metric=retained_metric), keep
 
 
-def _select_preprojection(common, products, *, columns, support, ao, thresholds,
-                          completeness_threshold=None):
-    gram_all, overlap_pao = products
-    gram = gram_all[np.ix_(columns, columns)]
-    vectors, canonical = _eigh(gram, _PAO_ORTH_THRESHOLD, deg_thresh=_PAO_ORTH_THRESHOLD)
-    empty = np.empty(0, dtype=np.int32)
-    if not canonical.size:
-        return jnp.zeros((len(ao), 0), dtype=gram.dtype), (canonical, empty, empty)
-    transform = _cholesky_metric_orthonormalize(vectors[:, canonical], gram)
-    tmp = overlap_pao[np.ix_(support, columns)] @ transform
-    projected = jnp.linalg.solve(common.s1e[np.ix_(support, support)], tmp)
-    vectors, overlap_keep = _eigh(tmp.T.conj() @ projected, thresholds.domain_pao,
-                                 deg_thresh=_PAO_ORTH_THRESHOLD)
-    if not overlap_keep.size:
-        return jnp.zeros((len(ao), 0), dtype=gram.dtype), (canonical, overlap_keep, empty)
-    rotation = vectors[:, overlap_keep]
-    if np.array_equal(support, ao):
-        candidate, rhs = projected @ rotation, tmp @ rotation
-    else:
-        rhs = overlap_pao[np.ix_(ao, columns)] @ (transform @ rotation)
-        candidate = jnp.linalg.solve(common.s1e[np.ix_(ao, ao)], rhs)
-    completeness = jnp.real(jnp.sum(candidate.conj() * rhs, axis=0))
-    complete = _keep(completeness, thresholds.bp_pao if completeness_threshold is None
-                     else completeness_threshold)
-    return candidate[:, complete], (canonical, overlap_keep, complete)
-
-
-def _select_target(common, candidate, occupied_rhs, *, ao, thresholds, index):
-    overlap, fock = common.s1e[np.ix_(ao, ao)], common.fock[np.ix_(ao, ao)]
-    occupied = jnp.linalg.solve(overlap, occupied_rhs[ao])
-    norm2 = jnp.real(jnp.einsum('ui,uv,vi->i', occupied.conj(), overlap, occupied))
-    norm_keep = _keep(norm2, thresholds.metric_rank)
-    empty = np.empty(0, dtype=np.int32)
-    if not norm_keep.size:
-        return None, (norm_keep, empty, empty)
-    occupied = occupied[:, norm_keep] / jnp.sqrt(norm2[norm_keep])[None, :]
-    span, span_keep = _metric_space(occupied, overlap, thresholds.metric_rank)
-    virtual, metric_keep = _metric_space(
-        _orthogonalize(span, candidate, overlap), overlap, thresholds.metric_rank)
-    if not virtual.shape[1]:
-        return None, (norm_keep, span_keep, metric_keep)
-    return _finish_weak_screen(occupied, virtual, fock, index), (norm_keep, span_keep, metric_keep)
-
-
 def prepare_primary(common, products_preparation, mol, ao2pao, thresholds,
                     index, primary_bp, primary, cache):
     """Return fixed labels and one live orbital linearization, without replay."""
@@ -111,16 +65,14 @@ def prepare_primary(common, products_preparation, mol, ao2pao, thresholds,
     support = tools.ao_index_by_atom(mol, np.asarray(primary_bp, dtype=np.int32)).astype(np.int32)
     ao = tools.ao_index_by_atom(mol, np.asarray(primary, dtype=np.int32)).astype(np.int32)
     key = tuple(map(tuple, (columns, support, ao)))
+    from . import _weak_numpy as host
     if key not in cache:
-        cache[key] = jax.vjp(partial(
-            _select_preprojection, columns=columns, support=support, ao=ao,
-            thresholds=thresholds), common, products.pao, has_aux=True)
+        cache[key] = host.preprojection(common, products.pao, columns=columns,
+            support=support, ao=ao, thresholds=thresholds)
     candidate, preprojection_pullback, (canonical, overlap_keep, complete) = cache[key]
-    screen, target_pullback, (norm_keep, span_keep, metric_keep) = jax.vjp(partial(
-        _select_target, ao=ao, thresholds=thresholds, index=index),
-        common, candidate, products.occupied[index], has_aux=True)
-    selection = None
-    preparation = None
+    screen, target_pullback, (norm_keep, span_keep, metric_keep) = host.target(
+        common, candidate, products.occupied[index], ao=ao, thresholds=thresholds, index=index)
+    selection = preparation = None
     if screen is not None:
         selection = FixedPAOSubspaceSelection(
             columns, support, canonical, overlap_keep, complete, metric_keep)

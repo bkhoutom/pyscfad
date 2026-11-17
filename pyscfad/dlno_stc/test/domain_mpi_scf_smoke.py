@@ -143,7 +143,7 @@ def run(mode, output):
     elif mode not in ('default', 'serial', 'system'):
         options['parallel_scf_jk'] = True
     if mode == 'system':
-        options.update(scope='system', frozen=2)
+        options.update(boys_grouping='system', frozen=2)
     else:
         options['build_static'] = accept.selection
     active_comm = None if mode == 'serial' else comm

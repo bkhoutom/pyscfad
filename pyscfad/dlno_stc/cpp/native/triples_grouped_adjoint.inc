@@ -1,7 +1,6 @@
 // Bounded occupied-block batches. Each output tile has one owner, so no
-// adjoint GEMM or commit below needs a lock. The large GV and T2O adjoints
-// concatenate contributions along the reduction dimension; packing panels
-// are fixed-size, not another batch of virtual cubes.
+// adjoint GEMM or commit below needs a lock. GV and T2O adjoints use
+// direct BLAS views and retained rank-four output layouts.
 enum class triples_adjoint_kind { gv,tv,go,to };
 struct triples_adjoint_term {
     operations op;
@@ -22,7 +21,7 @@ struct triples_adjoint_plan {
     std::vector<triples_adjoint_job> jobs;
     size_t largest_group=0;
 };
-constexpr size_t triples_adjoint_tile=256,triples_adjoint_reduction=4096;
+constexpr size_t triples_adjoint_tile=2048;
 
 triples_adjoint_plan triples_group_plan(const std::vector<tensor>& bank,
         const triples_layout& layout,const std::vector<std::array<size_t,3>>& blocks,
@@ -57,93 +56,89 @@ triples_adjoint_plan triples_group_plan(const std::vector<tensor>& bank,
 }
 
 struct triples_group_scratch {
-    arma::vec a,b,out;
-    struct segment {size_t term,first,length,offset;};
-    std::vector<segment> segments;
-    void prepare(size_t no,size_t nv) {
-        const size_t extent=std::max({no,nv,triples_adjoint_tile});
-        a.set_size(extent*triples_adjoint_reduction);
-        b.set_size(extent*triples_adjoint_reduction);
-        out.set_size(std::max(no,nv)*std::max(nv,triples_adjoint_tile));
+    arma::vec out;
+    void prepare(size_t no,size_t nv) { out.set_size(no*nv); }
+    static size_t bytes(size_t no,size_t nv) { return no*nv*sizeof(double); }
+};
+
+// Retain only rank-four output layouts. BLAS can then consume views of the
+// two existing cotangent cube orderings without per-job panel permutations.
+struct triples_direct_adjoint {
+    std::vector<arma::vec> gv_swap,to_normal,to_swap;
+    std::vector<size_t> gv_ids,to_ids;
+    triples_direct_adjoint(const std::vector<tensor>& bank,const triples_layout& layout,bool enabled) {
+        gv_swap.resize(bank.size());to_normal.resize(bank.size());to_swap.resize(bank.size());
+        if(!enabled) return;
+        gv_ids={GV,layout.projected[0][GV][0]};
+        to_ids={T2O,layout.projected[0][T2O][1]};
+        for(size_t id:gv_ids) gv_swap[id].set_size(bank[id].value.n_elem);
+        for(size_t id:to_ids) {
+            to_normal[id].set_size(bank[id].value.n_elem);
+            to_swap[id].set_size(bank[id].value.n_elem);
+        }
     }
-    static size_t bytes(size_t no,size_t nv) {
-        const size_t extent=std::max({no,nv,triples_adjoint_tile});
-        return (2*extent*triples_adjoint_reduction+
-                std::max(no,nv)*std::max(nv,triples_adjoint_tile))*sizeof(double);
+    size_t bytes() const {
+        size_t n=0;
+        for(const auto* bank:{&gv_swap,&to_normal,&to_swap})
+            for(const auto& x:*bank) n+=x.n_elem*sizeof(double);
+        return n;
+    }
+    // Called collectively once per point, after all occupied batches.
+    void commit(std::vector<tensor>& bank,size_t no,size_t n) const {
+        for(size_t id:gv_ids) {
+            const size_t count=bank[id].dims[0]*n*n;
+            #pragma omp for schedule(static)
+            for(size_t p=0;p<count;++p) {
+                const size_t i=p/(n*n),a=p/n%n,b=p%n;
+                const double* src=gv_swap[id].memptr()+((i*n+b)*n+a)*n;
+                double* dst=bank[id].bar.memptr()+p*n;
+                #pragma omp simd
+                for(size_t f=0;f<n;++f) dst[f]+=src[f];
+            }
+        }
+        for(size_t id:to_ids) {
+            const size_t nk=bank[id].dims[1];
+            #pragma omp for schedule(static)
+            for(size_t k=0;k<nk;++k) for(size_t a=0;a<n;++a) for(size_t b=0;b<n;++b) {
+                const double* normal=to_normal[id].memptr()+(k*n*n+a*n+b)*no;
+                const double* swapped=to_swap[id].memptr()+(k*n*n+b*n+a)*no;
+                for(size_t m=0;m<no;++m)
+                    bank[id].bar[(m*nk+k)*n*n+a*n+b]+=normal[m]+swapped[m];
+            }
+        }
     }
 };
 
-// Normalized GV output columns and T2O output rows refer to the original
-// input frame. Pair permutations are absorbed into the packed cotangent,
-// avoiding both a packed rank-four bar and a final whole-bank transpose.
+void triples_gemm_view(char ta,char tb,size_t m,size_t n,size_t k,double alpha,
+        const double* a,size_t lda,const double* b,size_t ldb,double* c,size_t ldc) {
+    const arma::blas_int bm=m,bn=n,bk=k,ba=lda,bb=ldb,bc=ldc;
+    const double beta=1.;
+    arma::blas::gemm(&ta,&tb,&bm,&bn,&bk,&alpha,a,&ba,b,&bb,&beta,c,&bc);
+}
+
 template<triples_adjoint_kind Kind>
-size_t triples_group_large(const triples_adjoint_group& group,const triples_adjoint_job& job,
-        const triples_adjoint_plan& plan,std::vector<tensor>& bank,
+size_t triples_group_direct(const triples_adjoint_group& group,const triples_adjoint_job& job,
+        const triples_adjoint_plan& plan,std::vector<tensor>& bank,triples_direct_adjoint& retained,
         const std::vector<arma::vec>& main,const std::vector<arma::vec>& alternate,
-        size_t no,size_t n,triples_group_scratch& work,size_t& largest_reduction) {
+        size_t no,size_t n,std::array<double,3>* profile) {
     constexpr bool gv=Kind==triples_adjoint_kind::gv;
-    const size_t nr=gv ? n : job.length,nc=gv ? job.length : no;
-    auto& dest=bank[group.id];
-    double* output=gv ? dest.bar.memptr()+group.offset+job.first*n : work.out.memptr();
-    arma::mat out(output,nr,nc,false,true);
-    if constexpr(!gv) out.zeros();
-    size_t next=0,kfirst=0,calls=0;
-    while(next<group.terms.size()) {
-        size_t width=0;work.segments.clear();
-        while(next<group.terms.size() && width<triples_adjoint_reduction) {
-            const size_t length=std::min(n-kfirst,triples_adjoint_reduction-width);
-            work.segments.push_back({group.terms[next],kfirst,length,width});
-            width+=length;kfirst+=length;
-            if(kfirst==n) {++next;kfirst=0;}
-        }
-        largest_reduction=std::max(largest_reduction,width);
-        arma::mat a(work.a.memptr(),nr,width,false,true),b(work.b.memptr(),width,nc,false,true);
-        for(const auto& s:work.segments) {
-            const auto& term=plan.terms[s.term];const auto& op=term.op;
-            const auto& order=gv ? term.v : term.o;
-            const double* c=(order.alternate ? alternate[term.block] : main[term.block]).memptr();
-            if constexpr(gv) {
-                const auto& tv=bank[op.ids[1]];
-                const double* t=tv.value.memptr()+tv.offset(op.indices[1]);
-                std::copy_n(t+s.first*n,s.length*n,a.colptr(s.offset));
-                for(size_t j=0;j<nc;++j) {
-                    const size_t pair=job.first+j;
-                    const size_t permuted=order.swap_pair ? (pair%n)*n+pair/n : pair;
-                    double* target=b.colptr(j)+s.offset;
-                    if(!order.singleton_first) std::copy_n(c+permuted*n+s.first,s.length,target);
-                    else for(size_t k=0;k<s.length;++k) target[k]=c[(s.first+k)*n*n+permuted];
-                }
-            } else {
-                const auto& go=bank[op.ids[2]];
-                const double* h=go.value.memptr()+go.offset(op.indices[2]);
-                const size_t stride=go.dims[2]*go.dims[3];
-                for(size_t k=0;k<s.length;++k) {
-                    double* target=a.colptr(s.offset+k);
-                    for(size_t i=0;i<nr;++i) {
-                        const size_t pair=job.first+i;
-                        const size_t permuted=order.swap_pair ? (pair%n)*n+pair/n : pair;
-                        target[i]=order.singleton_first ? c[(s.first+k)*n*n+permuted]
-                                                       : c[permuted*n+s.first+k];
-                    }
-                }
-                for(size_t j=0;j<nc;++j) for(size_t k=0;k<s.length;++k)
-                    b(s.offset+k,j)=h[(s.first+k)*stride+j];
-            }
-        }
-        if constexpr(gv) out+=a*b;
-        else out-=a*b;
-        ++calls;
+    for(size_t id:group.terms) {
+        const auto& term=plan.terms[id];const auto& op=term.op;
+        const auto& order=gv ? term.v : term.o;
+        const double* c=(order.alternate ? alternate[term.block] : main[term.block]).memptr();
+        const auto& source=bank[op.ids[gv ? 1 : 2]];
+        const double* a=source.value.memptr()+source.offset(op.indices[gv ? 1 : 2]);
+        double* out;
+        if constexpr(gv) out=(order.swap_pair ? retained.gv_swap[group.id] : bank[group.id].bar).memptr()
+            +group.offset+job.first*n;
+        else out=(order.swap_pair ? retained.to_swap[group.id] : retained.to_normal[group.id]).memptr()
+            +(group.offset+job.first)*no;
+        triples_profile_scope timer(profile ? &(*profile)[1] : nullptr);
+        triples_gemm_view('N',order.singleton_first ? 'T' : 'N',gv ? n : no,job.length,n,gv ? 1. : -1.,
+            a,gv ? n : source.dims[2]*source.dims[3],
+            c+job.first*(order.singleton_first ? 1 : n),order.singleton_first ? n*n : n,out,gv ? n : no);
     }
-    if constexpr(!gv) {
-        const size_t stride=dest.dims[1]*n*n;
-        for(size_t m=0;m<no;++m) {
-            double* target=dest.bar.memptr()+group.offset+m*stride+job.first;
-            const double* source=out.colptr(m);
-            #pragma omp simd
-            for(size_t i=0;i<nr;++i) target[i]+=source[i];
-        }
-    }
-    return calls;
+    return group.terms.size();
 }
 
 // These adjoints are small matrices. Retain direct BLAS views of the large
@@ -152,11 +147,13 @@ size_t triples_group_large(const triples_adjoint_group& group,const triples_adjo
 size_t triples_group_small(const triples_adjoint_group& group,const triples_adjoint_plan& plan,
         std::vector<tensor>& bank,const triples_left_pack& packed,
         const std::vector<arma::vec>& main,const std::vector<arma::vec>& alternate,
-        size_t no,size_t n,triples_raw_workspace& workspace,triples_group_scratch& work) {
+        size_t no,size_t n,triples_raw_workspace& workspace,triples_group_scratch& work,
+        std::array<double,3>* profile=nullptr) {
     const bool tv=group.kind==triples_adjoint_kind::tv;
     auto& dest=bank[group.id];
     arma::mat out(tv ? dest.bar.memptr()+group.offset : work.out.memptr(),tv ? n : no,n,false,true);
     if(!tv) out.zeros();
+    size_t calls=0;
     for(size_t id:group.terms) {
         const auto& term=plan.terms[id];const auto& op=term.op;const auto& order=tv ? term.v : term.o;
         const auto& cotangent=order.alternate ? alternate[term.block] : main[term.block];
@@ -166,24 +163,46 @@ size_t triples_group_small(const triples_adjoint_group& group,const triples_adjo
             auto& source=bank[op.ids[0]];
             const auto& values=order.swap_pair ? packed.value[op.ids[0]] : source.value;
             arma::mat g(const_cast<double*>(values.memptr())+source.offset(op.indices[0]),n,n*n,false,true);
-            if(order.singleton_first) out+=g*c;
-            else out+=g*c.t();
+            triples_profile_scope timer(profile ? &(*profile)[1] : nullptr);
+            if(!packed.occupied_ids.empty()) {
+                // Bound the active reduction panels to cache. Both operands
+                // remain BLAS views, including the transposed cube case.
+                for(size_t first=0;first<n*n;first+=2048) {
+                    const size_t length=std::min(size_t(2048),n*n-first);
+                    triples_gemm_view('N',order.singleton_first ? 'N' : 'T',n,n,length,1.,
+                        g.memptr()+first*n,n,c.memptr()+first*(order.singleton_first ? 1 : n),
+                        order.singleton_first ? n*n : n,out.memptr(),n);
+                    ++calls;
+                }
+            } else {
+                if(order.singleton_first) out+=g*c;
+                else out+=g*c.t();
+                ++calls;
+            }
         } else {
             auto& source=bank[op.ids[3]];
             const size_t offset=source.offset(op.indices[3]),stride=source.dims[1]*n*n;
-            for(size_t m=0;m<no;++m) {
+            const double* retained=packed.occupied_slice(op,no,n,order.swap_pair);
+            {
+            triples_profile_scope timer(profile ? &(*profile)[0] : nullptr);
+            if(!retained) for(size_t m=0;m<no;++m) {
                 const double* src=source.value.memptr()+offset+m*stride;double* target=workspace.u.colptr(m);
                 if(!order.swap_pair) std::copy_n(src,n*n,target);
                 else for(size_t b=0;b<n;++b) for(size_t c=0;c<n;++c) target[b*n+c]=src[c*n+b];
             }
-            if(order.singleton_first) out-=workspace.u.t()*c;
-            else out-=workspace.u.t()*c.t();
+            }
+            arma::mat u(const_cast<double*>(retained ? retained : workspace.u.memptr()),n*n,no,false,true);
+            triples_profile_scope timer(profile ? &(*profile)[1] : nullptr);
+            if(order.singleton_first) out-=u.t()*c;
+            else out-=u.t()*c.t();
+            ++calls;
         }
     }
     if(!tv) {
+        triples_profile_scope timer(profile ? &(*profile)[2] : nullptr);
         const size_t stride=dest.dims[2]*dest.dims[3];
         for(size_t a=0;a<n;++a) for(size_t m=0;m<no;++m)
             dest.bar[group.offset+a*stride+m]+=out(m,a);
     }
-    return group.terms.size();
+    return calls;
 }

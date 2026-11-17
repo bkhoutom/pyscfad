@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from pyscfad import gto
+from pyscfad import gto, scf
 from pyscfad.dlno_stc import _pairs
 from pyscfad.lib._cartesian_moments import cartesian_components
 from pyscfad.lib import _multipole
@@ -30,12 +30,15 @@ def test_packed_slabs_and_coordinate_response(mol, rank, monkeypatch):
         bra = -np.asarray(mol.intor(intor + '_dr10')).reshape(3, 3**rank, mol.nao, mol.nao)
         ket = -np.asarray(mol.intor(intor + '_dr01')).reshape(3**rank, 3, mol.nao, mol.nao).transpose(1, 0, 2, 3)
     np.testing.assert_allclose(bra.swapaxes(-1, -2), ket, atol=3e-13, rtol=3e-13)
-    actual, pullback = jax.vjp(lambda m: _pairs._raw_cartesian_moment(m, rank), mol)
+    raw, pullback = _pairs._origin_zero_moments_vjp(scf.RHF(mol), None, max(1, rank))
+    actual = np.asarray(raw[rank]).reshape(len(indices), mol.nao, mol.nao)
     assert actual.shape == (len(indices), mol.nao, mol.nao)
     np.testing.assert_allclose(np.asarray(actual)[inverse], full, atol=3e-13, rtol=3e-13)
     rng = np.random.default_rng(83 + rank)
     seed = rng.normal(size=actual.shape)
-    gradient, = pullback(seed)
+    seeds = list(jax.tree.map(np.zeros_like, raw))
+    seeds[rank] = seed.reshape(raw[rank].shape)
+    gradient = pullback(tuple(seeds))[0].mol
     direction = rng.normal(size=mol.coords.shape)
     owner = np.repeat(np.arange(mol.natm), np.diff(mol.aoslice_by_atom()[:, 2:], axis=1).ravel())
     expected_t = _multipole.coordinate_moment_jvp(bra, ket, direction, owner)[indices]
@@ -61,12 +64,12 @@ def test_all_orders_use_only_bra_derivative_and_unique_components(mol, order, mo
         calls.append(name)
         return original(self, name, *args, **kwargs)
     monkeypatch.setattr(type(mol), 'intor', record)
-    raw, pullback = jax.vjp(lambda m: _pairs._origin_zero_moments(m, order - 1), mol)
+    raw, pullback = _pairs._origin_zero_moments_vjp(scf.RHF(mol), None, order - 1)
     gradient, = pullback(jax.tree.map(jnp.ones_like, raw))
     jax.block_until_ready(gradient)
     assert sum(value.size // mol.nao**2 for value in raw if value is not None) == {2:4, 3:10, 4:20}[order]
     assert not any('_dr01' in name for name in calls)
-    assert sum('_dr10' in name for name in calls) == order
+    assert not any('_dr' in name for name in calls)  # native VJP contracts derivatives directly
 
 
 @pytest.mark.parametrize('order', [2, 3, 4])

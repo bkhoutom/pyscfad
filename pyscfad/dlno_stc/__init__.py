@@ -21,7 +21,7 @@ def materialize_domain_selections(mf, static, *, common=None):
     return materialize(mf, static, common=common)
 
 
-def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
+def kernel(mf, static=None, *, boys_grouping=None, frozen=None, controls, comm=None,
            lo_kwargs=None, merge_identical=True, parallel_scf_jk=True,
            correlation_auxbasis=None):
     """Run domain or system correlation energy with an optional separate fit.
@@ -29,17 +29,19 @@ def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
     ``correlation_auxbasis=None`` preserves the existing SCF fitting workflow.
     An explicit basis changes local correlation factors only; HF/Fock keep
     using ``mf.with_df`` and its existing storage policy.
-    ``scope="system"`` selects one full-system fragment and uses the domain
-    executor. For explicit fragment/domain options use ``build_domain_selections``.
+    ``boys_grouping="system"`` selects one full-system fragment and uses the domain
+    executor. ``"atom"`` and ``"singleton"`` also select their fragments
+    automatically. With ``static``, omit ``boys_grouping`` and use its saved
+    settings. For explicit domain options use ``build_domain_selections``.
     """
     from .driver import kernel as domain_kernel
-    return domain_kernel(mf, static, scope=scope, frozen=frozen,
+    return domain_kernel(mf, static, boys_grouping=boys_grouping, frozen=frozen,
                          controls=controls, comm=comm, lo_kwargs=lo_kwargs,
                          merge_identical=merge_identical, parallel_scf_jk=parallel_scf_jk,
                          **basis_kwargs(correlation_auxbasis))
 
 
-def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
+def value_and_grad(mol, build_mf, static=None, *, boys_grouping=None, frozen=None,
                    controls, comm=None, include_hf=False, lo_kwargs=None, merge_identical=True,
                    build_static=None, parallel_scf_jk=True, correlation_auxbasis=None):
     """Run coordinate energy and gradient with one differentiated SCF.
@@ -48,10 +50,13 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
     callback that selects them from the returned SCF reference. The callback
     inherits ``correlation_auxbasis``; standalone selection must use the same
     basis. ``None`` preserves the existing SCF fitting workflow.
+    Alternatively, explicit ``boys_grouping`` selects fragments automatically;
+    ``"system"`` uses one full-system fragment. Do not combine it with
+    ``static`` or ``build_static``.
     """
     from .driver import value_and_grad as domain_value_and_grad
     return domain_value_and_grad(
-        mol, build_mf, static, scope=scope, frozen=frozen, controls=controls,
+        mol, build_mf, static, boys_grouping=boys_grouping, frozen=frozen, controls=controls,
         comm=comm, include_hf=include_hf, lo_kwargs=lo_kwargs,
         merge_identical=merge_identical, build_static=build_static,
         parallel_scf_jk=parallel_scf_jk, **basis_kwargs(correlation_auxbasis))

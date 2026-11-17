@@ -340,8 +340,7 @@ struct PreparedInput {
         }
     }
 };
-py::dict cache_result(const Triples::triples_result& result,const Triples::triples_vjp* bars,
-        const Triples::quadrature_cache& cache) {
+py::dict mrcc_result(const Triples::triples_result& result) {
     py::dict out;
     out["energy"]=result.energy;out["sampling_seconds"]=result.sampling_seconds;
     out["sampling_threads"]=result.sampling_threads;out["setup_threads"]=result.setup_threads;
@@ -349,17 +348,6 @@ py::dict cache_result(const Triples::triples_result& result,const Triples::tripl
     out["reverse_buffer_bytes"]=result.reverse_buffer_bytes;
     out["deterministic_blocks"]=result.deterministic_blocks;
     out["deterministic_workspace_bytes"]=result.deterministic_workspace_bytes;
-    if(bars) {
-        const libgmbpt::qchem::triples_layout layout(cache.no,cache.nv,cache.ns);
-        py::tuple values(layout.tensors.size());
-        for(size_t i=0;i<layout.tensors.size();++i) {
-            const auto& spec=layout.tensors[i];
-            py::array_t<double> a(std::vector<py::ssize_t>(spec.dims.begin(),spec.dims.begin()+spec.rank));
-            std::memcpy(a.mutable_data(),bars->prepared[i].memptr(),bars->prepared[i].n_elem*sizeof(double));
-            values[i]=std::move(a);
-        }
-        out["cotangents"]=std::move(values);
-    }
     return out;
 }
 py::tuple owned_prepared_bars(Triples::triples_vjp& bars,const libgmbpt::qchem::triples_layout& layout) {
@@ -388,113 +376,48 @@ void bind_triples(py::module_& module) {
 #endif
     module.attr("TRIPLES_DETERMINISTIC_BLOCKS")=true;
     module.attr("TRIPLES_DIAGONAL_VIRTUAL_DRESSING")=true;
+    module.attr("TRIPLES_DIAGONAL_OCCUPIED_DRESSING")=true;
     // Bump the native checkpoint identity when the numerical algorithm changes.
     module.attr("TRIPLES_VERSION")=
-        "stc_triples:stable-external-legs:deterministic-blocks-v3:quadrature-reuse-v1:diagonal-virtual-v1:shared-dressing-v3:fused-cubes-v1:direct-L-v1:dynamic-blocks-v1:reverse-memory-v3:fused-singles-adjoint-v1:original-lis-occupied-v1:returned-bars-reserve-v1:streaming-quartic-memory-v1:one-permutation-left-v1:grouped-adjoint-128-v1:point-profile-v1";
-    module.attr("TRIPLES_QUADRATURE_REUSE")=true;
+        "stc_triples:stable-external-legs:deterministic-blocks-v3:quadrature-reuse-v1:diagonal-virtual-v1:shared-dressing-v3:fused-cubes-v1:direct-L-v1:dynamic-blocks-v1:reverse-memory-v3:fused-singles-adjoint-v1:original-lis-occupied-v1:returned-bars-reserve-v1:streaming-quartic-memory-v1:one-permutation-left-v1:grouped-adjoint-128-v1:point-profile-v1:diagonal-occupied-v1:mrcc-partition-v1:mrcc-singles-only-v2:retained-t2-v1:grouped-profile-v1:blocked-group-pack-v1:direct-adjoint-layouts-v1:t2v-kblocked-v1:mrcc-deterministic-only-v1";
     module.attr("TRIPLES_QUADRATURE_STREAMING")=true;
     module.attr("TRIPLES_GROUPED_ADJOINT")=true;
     module.attr("TRIPLES_RIGHT_PROFILE")=true;
     module.attr("TRIPLES_MAX_STREAMING_BLOCKS")=Triples::maximum_streaming_blocks;
-    module.attr("TRIPLES_MAX_CACHED_BLOCKS")=Triples::maximum_cached_blocks;
-    module.def("triples_quadrature_stream",[](py::tuple left,py::sequence points,
-            py::sequence weight_values,bool with_grad,py::handle workspace_limit,py::handle block_batch_size,
-            bool profile_right) {
-        PreparedInput zero(left);
-        std::vector<std::unique_ptr<PreparedInput>> inputs;
-        std::vector<const Triples::triples_prepared*> prepared;
-        std::vector<double> weights,energies;
-        if(points.size()!=weight_values.size() || !points.size())
-            throw py::value_error("streaming triples: inconsistent quadrature points");
-        for(size_t q=0;q<size_t(points.size());++q) {
-            inputs.push_back(std::make_unique<PreparedInput>(points[q].cast<py::tuple>()));
-            prepared.push_back(&inputs.back()->value);
-            weights.push_back(weight_values[q].cast<double>());
-        }
+    module.attr("TRIPLES_MRCC_PARTITION")=true;
+    module.def("triples_mrcc_point",[](py::tuple values,double weight,bool with_grad,
+            py::handle workspace_limit,py::handle block_batch_size,bool profile_grouped) {
+        PreparedInput input(values);
         const auto budget=unsigned_integer(workspace_limit,"workspace_limit_bytes");
         const auto batch=unsigned_integer(block_batch_size,"block_batch_size");
         Triples::triples_result result;std::vector<Triples::triples_vjp> bars;
+        std::vector<double> energies;
         { py::gil_scoped_release release;
-          result=Triples::quadrature_stream(zero.value,prepared,weights,size_t(budget),size_t(batch),energies,
-                                           with_grad ? &bars : nullptr,profile_right); }
-        Triples::quadrature_cache shape;shape.no=zero.value.no;shape.nv=zero.value.nv;shape.ns=zero.value.ns;
-        auto out=cache_result(result,nullptr,shape);
-        py::array_t<double> energy(energies.size());
-        std::copy(energies.begin(),energies.end(),energy.mutable_data());
-        out["point_energies"]=std::move(energy);
+          result=Triples::quadrature_stream(input.value,{&input.value},{weight},size_t(budget),
+                size_t(batch),energies,with_grad ? &bars : nullptr,profile_grouped); }
+        auto out=mrcc_result(result);
+        out["connected_build_blocks"]=result.deterministic_blocks;
+        out["connected_gemm_calls"]=12*result.deterministic_blocks;
         out["numerator_cache_peak_bytes"]=result.numerator_cache_peak_bytes;
         out["rank_four_packing_bytes"]=result.rank_four_packing_bytes;
-        out["left_build_worker_seconds"]=result.left_build_worker_seconds;
-        out["right_worker_seconds"]=result.right_worker_seconds;
-        out["left_reverse_worker_seconds"]=result.left_reverse_worker_seconds;
-        out["left_build_wall_seconds"]=result.left_build_wall_seconds;
-        out["right_wall_seconds"]=result.right_wall_seconds;
-        out["right_profile_enabled"]=result.right_profile_enabled;
-        out["point_right_wall_seconds"]=result.point_right_wall_seconds;
-        out["point_right_batch_wall_seconds"]=result.point_right_batch_wall_seconds;
-        py::list profiles;
-        const char* phases[]={"pack", "forward_virtual_gemm", "forward_occupied_gemm",
-            "energy_singles_adjoint", "ket_bar", "reverse_gv_gemm", "reverse_tv_gemm",
-            "reverse_go_gemm", "reverse_to_gemm"};
-        const char* destinations[]={"gv", "tv", "go", "to", "t1", "fov", "t2", "gg"};
-        for(const auto& p:result.point_right_profiles) {
-            py::dict item,seconds,wait,store,calls;
-            for(size_t i=0;i<p.seconds.size();++i) seconds[phases[i]]=p.seconds[i];
-            for(size_t i=0;i<8;++i) {
-                wait[destinations[i]]=p.lock_wait[i];store[destinations[i]]=p.store[i];
-                calls[destinations[i]]=p.lock_calls[i];
-            }
-            item["worker_seconds"]=p.worker_seconds;item["cpu_seconds"]=p.cpu_seconds;
-            item["barrier_worker_seconds"]=p.barrier_seconds;item["blocks"]=p.blocks;
-            item["minor_page_faults"]=p.minor_faults;item["major_page_faults"]=p.major_faults;
-            item["voluntary_context_switches"]=p.voluntary_switches;
-            item["involuntary_context_switches"]=p.involuntary_switches;
-            item["phase_worker_seconds"]=seconds;item["lock_wait_worker_seconds"]=wait;
-            item["store_worker_seconds"]=store;item["lock_calls"]=calls;
-            profiles.append(item);
-        }
-        out["point_right_profiles"]=profiles;
-        out["left_reverse_wall_seconds"]=result.left_reverse_wall_seconds;
         out["occupied_block_batch_size"]=result.occupied_block_batch_size;
         out["occupied_block_batches"]=result.occupied_block_batches;
-        out["grouped_adjoint_groups"]=result.grouped_adjoint_groups;
-        out["grouped_adjoint_max_terms"]=result.grouped_adjoint_max_terms;
         out["grouped_adjoint_gemm_calls"]=result.grouped_adjoint_gemm_calls;
-        out["grouped_adjoint_max_reduction"]=result.grouped_adjoint_max_reduction;
-        if(with_grad) {
-            const libgmbpt::qchem::triples_layout layout(shape.no,shape.nv,shape.ns);
-            py::tuple values(bars.size());
-            for(size_t q=0;q<bars.size();++q) values[q]=owned_prepared_bars(bars[q],layout);
-            out["cotangents"]=std::move(values);
-        }
+        out["connected_build_seconds"]=result.left_build_wall_seconds;
+        out["singles_seconds"]=result.right_wall_seconds;
+        out["connected_reverse_seconds"]=result.left_reverse_wall_seconds;
+        out["grouped_profile_enabled"]=profile_grouped;
+        out["grouped_profile_worker_seconds"]=result.grouped_profile_seconds;
+        out["grouped_spin_wall_seconds"]=result.grouped_spin_wall_seconds;
+        out["grouped_plan_wall_seconds"]=result.grouped_plan_wall_seconds;
+        out["grouped_jobs_wall_seconds"]=result.grouped_jobs_wall_seconds;
+        out["grouped_commit_wall_seconds"]=result.grouped_commit_wall_seconds;
+        if(with_grad) out["cotangents"]=owned_prepared_bars(bars[0],
+            libgmbpt::qchem::triples_layout(input.value.no,input.value.nv,input.value.ns));
         return out;
-    },py::arg("left"),py::arg("points"),py::arg("weights"),py::kw_only(),
-       py::arg("with_grad")=false,py::arg("workspace_limit_bytes")=size_t(16)*1024*1024*1024,
-       py::arg("block_batch_size")=Triples::maximum_streaming_blocks,py::arg("profile_right")=false);
-    py::class_<Triples::quadrature_cache>(module,"TriplesQuadratureCache")
-        .def(py::init([](py::tuple values,py::handle first,py::handle count,bool with_grad) {
-            PreparedInput input(values);
-            auto cache=std::make_unique<Triples::quadrature_cache>();
-            const auto begin=unsigned_integer(first,"first"),length=unsigned_integer(count,"count");
-            { py::gil_scoped_release release;
-              Triples::quadrature_build(input.value,*cache,size_t(begin),size_t(length),with_grad); }
-            return cache;
-        }),py::arg("tensors"),py::kw_only(),py::arg("first"),py::arg("count"),py::arg("with_grad")=false)
-        .def_property_readonly("cache_bytes",[](const Triples::quadrature_cache& cache) {
-            size_t n=0;for(const auto& v:cache.values)n+=v.n_elem*sizeof(double);
-            for(const auto& v:cache.bars)n+=v.n_elem*sizeof(double);return n;
-        })
-        .def("step",[](Triples::quadrature_cache& cache,py::tuple values,double weight) {
-            PreparedInput input(values);Triples::triples_vjp bars;Triples::triples_result result;
-            { py::gil_scoped_release release;
-              result=Triples::quadrature_step(input.value,cache,weight,cache.gradient ? &bars : nullptr); }
-            return cache_result(result,cache.gradient ? &bars : nullptr,cache);
-        },py::arg("tensors"),py::arg("weight"))
-        .def("finish",[](Triples::quadrature_cache& cache,py::tuple values) {
-            PreparedInput input(values);Triples::triples_vjp bars;Triples::triples_result result;
-            { py::gil_scoped_release release;result=Triples::quadrature_finish(input.value,cache,&bars); }
-            return cache_result(result,&bars,cache);
-        },py::arg("tensors"));
+    },py::arg("values"),py::arg("weight")=1.,py::kw_only(),py::arg("with_grad")=false,
+      py::arg("workspace_limit_bytes")=size_t(16)*1024*1024*1024,py::arg("block_batch_size")=128,
+      py::arg("profile_grouped")=false);
     for (bool vjp : {false,true}) {
         module.def(vjp ? "triples_prepared_energy_vjp" : "triples_prepared_energy",
             [vjp](py::tuple tensors,py::handle nsamples,py::handle seed,
@@ -508,7 +431,7 @@ void bind_triples(py::module_& module) {
             },py::arg("tensors"),py::arg("nsamples"),py::arg("seed")=71,
               py::arg("target_standard_error")=0.,py::kw_only(),py::arg("pilot")=py::none(),
               "Stable Laplace numerator with undressed internal legs and direct physical projections. "
-              "nsamples=0 uses deterministic selected-occupied block GEMMs, including their VJP.");
+              "Sampling uses the asymmetric partition; deterministic evaluation uses triples_mrcc_point.");
         module.def(vjp ? "triples_asymmetric_energy_vjp" : "triples_asymmetric_energy",
             [vjp](py::handle t1,py::handle t2,py::handle Bvo,py::handle Boo,
                   py::handle Bvv,py::handle L,py::object R,py::handle nsamples,

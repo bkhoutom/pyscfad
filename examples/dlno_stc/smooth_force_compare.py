@@ -21,7 +21,7 @@ def main():
     parser.add_argument('--xyz-file', type=Path, required=True)
     parser.add_argument('--basis', default='cc-pvdz')
     parser.add_argument('--frozen', type=int, default=0)
-    parser.add_argument('--boys-grouping', choices=('singleton', 'atom', 'molecule'), default='molecule')
+    parser.add_argument('--boys-grouping', choices=('singleton', 'atom', 'system', 'molecule'), default='system')
     parser.add_argument('--lno-thresh-occ', type=float, default=0.)
     parser.add_argument('--lno-thresh-vir', type=float, default=0.)
     parser.add_argument('--finite-domains', action='store_true')
@@ -45,6 +45,8 @@ def main():
     parser.add_argument('--cc-conv-tol-normt', type=float, default=1e-8)
     parser.add_argument('--output-dir', type=Path, required=True)
     args = parser.parse_args()
+    if args.boys_grouping == 'molecule':
+        args.boys_grouping = 'system'
     from benchmark_affinity import configure_cpu_workload
     configure_cpu_workload(args.threads)
     if not math.isfinite(args.triples_energy_tolerance_mha) or args.triples_energy_tolerance_mha < 0:
@@ -182,7 +184,8 @@ def main():
         reference = json.loads(args.reference.read_text())
         if (reference['basis'] != args.basis or reference['frozen'] != args.frozen
                 or abs(reference['hf_energy'] - float(mf.e_tot)) > 1e-8
-                or reference.get('boys_grouping', 'molecule') != args.boys_grouping
+                or ('system' if reference.get('boys_grouping', 'molecule') == 'molecule'
+                    else reference['boys_grouping']) != args.boys_grouping
                 or reference.get('lno_thresh_occ', 0.) != args.lno_thresh_occ
                 or reference.get('lno_thresh_vir', 0.) != args.lno_thresh_vir
                 or reference.get('full_domain', True) != (not args.finite_domains)):

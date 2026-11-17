@@ -1709,9 +1709,10 @@ def _int3c_mo_packed_density(mo_k, mo_l, z_blk, out=None, *,
             half = numpy.ascontiguousarray(half.transpose(0, 2, 1))
         tile = min(128, nao)
         tiles = (nao + tile - 1) // tile
-        # On measured ED/LIS slabs a larger team adds overhead. Cap the
-        # team and account for every worker's tile before calling native code.
-        threads = min(max(1, pyscf_lib.num_threads()), 16,
+        # Supply up to 32 private tiles; the native kernel chooses an adaptive
+        # team and schedules tile jobs dynamically. Keep the independent
+        # workspace bound of one AO-square slab (32 tiles need at most 4 MiB).
+        threads = min(max(1, pyscf_lib.num_threads()), 32,
                       naux * tiles * (tiles + 1) // 2,
                       max(1, naux * nao * nao // (tile * tile)))
         work = _density_workspace(workspace, 'tiles', (threads, tile, tile))

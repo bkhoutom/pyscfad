@@ -81,7 +81,7 @@ def test_one_metric_and_factorization_per_mp2_group(molecule, monkeypatch,
         return coords
 
     monkeypatch.setattr(_df_shared.LocalDFReverse, 'finish', finished)
-    options = dict(scope=scope, frozen=1 if scope == 'system' else None, controls=_controls(),
+    options = dict(boys_grouping='system' if scope == 'system' else None, frozen=1 if scope == 'system' else None, controls=_controls(),
                    correlation_auxbasis=RIFIT)
     if with_grad:
         energy, gradient = dlno_stc.value_and_grad(

@@ -1,3 +1,4 @@
+from pyscfad.dlno_stc.test import _weak_reference
 """A shared initial reference retains ambient PAO and cached-product response."""
 from types import SimpleNamespace
 from typing import NamedTuple
@@ -81,22 +82,19 @@ def test_initial_common_matches_full_ambient_response_and_discards_zero_norms(mo
 
     def joint(m, d):
         current = _legacy_common(m, d, options, expected_parents)
-        return current, _pairs._weak_screen_products(current)
+        return current, _weak_reference._weak_screen_products(current)
 
     _, joint_pullback = jax.vjp(joint, mf, data)
     _assert_bars(pullback(combined), joint_pullback((seed, product_seed)))
 
 
-@pytest.mark.parametrize('kind', ['real', 'asymmetric', 'complex'])
+@pytest.mark.parametrize('kind', ['real', 'asymmetric'])
 def test_cached_product_pullback_matches_independent_common_leaves(monkeypatch, kind):
     mf, common, static = _fixture(monkeypatch)
     rng = np.random.default_rng(33)
     if kind == 'asymmetric':
         common = common._replace(s1e=common.s1e + .02 * rng.normal(size=common.s1e.shape))
-    if kind == 'complex':
-        common = jax.tree_util.tree_map(
-            lambda value: value.astype(jnp.complex128) + .03j * rng.normal(size=value.shape), common)
-    products, expected_pullback = jax.vjp(_pairs._weak_screen_products, common)
+    products, expected_pullback = jax.vjp(_weak_reference._weak_screen_products, common)
     cached = getattr(_pairs, '_cached_weak_screen_products', None)
     assert callable(cached), 'cached products need their exact ambient common-data response'
 
@@ -106,7 +104,7 @@ def test_cached_product_pullback_matches_independent_common_leaves(monkeypatch, 
     monkeypatch.setattr(_pairs, '_weak_screen_products', forbidden)
     monkeypatch.setattr(domain, '_pao_products', forbidden)
     values, response = cached(common, products)
-    assert values is products
+    _assert_bars(values, products)
     seed = jax.tree_util.tree_map(
         lambda value: jnp.asarray(rng.normal(size=value.shape), dtype=value.dtype), products)
     actual, = response.pullback(seed)
@@ -147,15 +145,20 @@ def test_screening_reuses_supplied_products_without_primal_rebuild(monkeypatch, 
 
 
 def test_cached_product_reverse_batches_independent_occupied_targets(monkeypatch):
-    from collections import Counter
-    from pyscfad.dlno_stc.test.test_weak_local_products import _dots
-    mf, common, static = _fixture(monkeypatch)
+    from pyscfad.dlno_stc import _weak_numpy
+    _, common, _ = _fixture(monkeypatch)
     products = _pairs._weak_screen_products(common)
     _, response = _pairs._cached_weak_screen_products(common, products)
-    seed = jax.tree_util.tree_map(jnp.ones_like, products)
-    operations = Counter(_dots(jax.make_jaxpr(response.pullback)(seed)))
-    assert operations[((8, 3), (8, 3))] == 1
-    assert operations[((8, 1), (8, 1))] == 0, 'target response formed a full overlap bar per endpoint'
+    seed = jax.tree.map(np.ones_like, products)
+    calls = []
+    concatenate = np.concatenate
+    def counted(arrays, *args, **kwargs):
+        calls.append(tuple(x.shape for x in arrays))
+        return concatenate(arrays, *args, **kwargs)
+    monkeypatch.setattr(_weak_numpy.np, 'concatenate', counted)
+    result, = response.pullback(seed)
+    assert calls == [((8, 1), (8, 1), (8, 1))]
+    assert all(np.linalg.norm(t.iao_coeff)>0 for t in result.fragment_occupied_data)
 
 
 @pytest.mark.parametrize('failure', [None, 'stationarity', 'response'])

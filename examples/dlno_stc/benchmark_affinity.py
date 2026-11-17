@@ -83,17 +83,18 @@ def choose_balanced_cpus(allowed, count):
     return selected
 
 
-def configure_cpu_workload(count):
-    """Set CPU/thread budgets without changing runtime dynamic-team settings.
+def configure_cpu_workload(count=32):
+    """Default to balanced physical cores and dynamically sized OpenMP teams.
 
     All subsequently created threads/children inherit this CPU affinity.
-    OpenMP/MKL dynamic adjustment is left to the runtime or caller environment.
+    Explicit CPU and OpenMP settings override the defaults. MKL's dynamic
+    adjustment is left to the runtime or caller environment.
     """
     if count < 1:
         raise ValueError("threads must be positive")
     allowed = set(os.sched_getaffinity(0))
     requested = os.environ.get("PYSCFAD_BENCHMARK_CPU_LIST")
-    policy = os.environ.get('PYSCFAD_BENCHMARK_CPU_POLICY', 'compact')
+    policy = os.environ.get('PYSCFAD_BENCHMARK_CPU_POLICY', 'balanced')
     if policy not in ('compact', 'balanced'):
         raise ValueError('CPU policy must be compact/balanced')
     choose = choose_balanced_cpus if policy == 'balanced' else choose_cpus
@@ -102,7 +103,9 @@ def configure_cpu_workload(count):
     if len(set(cpus)) != count or not set(cpus) <= allowed:
         raise RuntimeError("benchmark CPU list must contain exactly the requested allowed CPUs")
     os.sched_setaffinity(0, cpus)
+    os.environ['PYSCFAD_BENCHMARK_CPU_POLICY'] = policy
     os.environ["PYSCFAD_BENCHMARK_CPU_LIST"] = ",".join(map(str, cpus))
+    os.environ.setdefault('OMP_DYNAMIC', 'TRUE')
     for name in ("OMP_NUM_THREADS", "OMP_THREAD_LIMIT", "MKL_NUM_THREADS",
                  "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS",
                  "VECLIB_MAXIMUM_THREADS", "PYSCFAD_DENSE_BLAS_THREADS",

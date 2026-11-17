@@ -160,6 +160,15 @@ class DomainSelections:
                                tuple((i,) for i in range(len(self.fragments))))
 
 
+def _normalize_boys_grouping(grouping):
+    """Use one name for the full-system partition, including old checkpoints."""
+    if grouping == 'molecule':
+        return 'system'
+    if grouping not in ('singleton', 'atom', 'system'):
+        raise ValueError("boys_grouping must be 'singleton', 'atom' or 'system'")
+    return grouping
+
+
 def _physical_groups(static):
     """Return the saved physical partition in orbital-record coordinates."""
     if isinstance(static, DomainSelections) and not {'boys_grouping', 'physical_groups'} <= vars(static).keys():
@@ -167,9 +176,7 @@ def _physical_groups(static):
     if isinstance(static, DomainSelections) and vars(static).get('domain_convention') != 'individual-partners-pair4-pcd-aux-v2':
         raise ValueError("incompatible domain convention; rebuild domain selections")
     groups = getattr(static, "physical_groups", ())
-    mode = getattr(static, "boys_grouping", "singleton")
-    if mode not in ("singleton", "atom", "molecule"):
-        raise ValueError("boys_grouping must be 'singleton', 'atom' or 'molecule'")
+    mode = _normalize_boys_grouping(getattr(static, "boys_grouping", "singleton"))
     if not groups and mode == "singleton":
         groups = tuple((i,) for i in range(len(static.fragments)))
     normalized = tuple(_grouping_indices(group, len(static.fragments),
@@ -178,8 +185,8 @@ def _physical_groups(static):
             or sorted(i for group in normalized for i in group) != list(range(len(static.fragments)))
             or (mode == "singleton" and any(len(group) != 1 for group in normalized))):
         raise ValueError("physical fragment membership must partition orbital records exactly once")
-    if mode == "molecule" and normalized != (tuple(range(len(static.fragments))),):
-        raise ValueError("molecule physical fragment membership must contain every orbital record in one complete group")
+    if mode == "system" and normalized != (tuple(range(len(static.fragments))),):
+        raise ValueError("system physical fragment membership must contain every orbital record in one complete group")
     return normalized
 
 
@@ -784,7 +791,7 @@ def _validate_reference(mf, frozen):
 def build_domain_selections(
     mf, *, frozen, thresholds=None, lo_kwargs=None, target_coeff=None,
     frag_lolist=None, pair_energy_model="multipole",
-    boys_grouping="singleton", correlation_auxbasis=None, scope="domain", full_domain=False,
+    boys_grouping="singleton", correlation_auxbasis=None, full_domain=False,
     mp2_laplace_points=6, mp2_grid=None,
 ):
     """Select the global pair graph and lightweight fragment domain plans.
@@ -794,9 +801,9 @@ def build_domain_selections(
     are finalized from the current reference when each fragment is prepared.
     ``boys_grouping="atom"`` shares strong frames within Löwdin atom groups;
     weak screens and target records remain individual occupied orbitals.
-    ``boys_grouping="molecule"`` automatically uses full molecular domains
+    ``boys_grouping="system"`` automatically uses full molecular domains
     and puts every active occupied target in one physical fragment.
-    ``scope="system"`` selects that same single molecular fragment.
+    ``"molecule"`` is accepted as a compatibility alias for ``"system"``.
     ``full_domain=True`` expands every fragment's domains to the full system
     without changing its targets or physical grouping.
     Fit one global MP2/W quadrature from the full active canonical spectrum
@@ -817,15 +824,10 @@ def build_domain_selections(
     thresholds = BoysDomainThresholds() if thresholds is None else thresholds
     if not isinstance(thresholds, BoysDomainThresholds):
         raise TypeError("thresholds must be BoysDomainThresholds")
-    if boys_grouping not in ("singleton", "atom", "molecule"):
-        raise ValueError("boys_grouping must be 'singleton', 'atom' or 'molecule'")
-    if scope not in ("domain", "system"):
-        raise ValueError("scope must be domain or system")
+    boys_grouping = _normalize_boys_grouping(boys_grouping)
     if not isinstance(full_domain, (bool, numpy.bool_)):
         raise TypeError("full_domain must be a boolean")
-    if scope == "system":
-        boys_grouping = "molecule"
-    full_domain = full_domain or boys_grouping == "molecule"
+    full_domain = full_domain or boys_grouping == "system"
     _validate_reference(mf, frozen)
     options = _resolve_boys_options(lo_kwargs)
     model = str(pair_energy_model).lower().replace("_", "-")
@@ -895,7 +897,7 @@ def build_domain_selections(
         pao_products = _reference_pao_products(pao_coeff, overlap)
         overlap_targets = overlap @ targets
         products = _WeakScreenProducts(pao_products, tuple(overlap_targets[:, group] for group in groups))
-    if boys_grouping == "molecule":
+    if boys_grouping == "system":
         physical_groups = (numpy.arange(len(groups), dtype=numpy.int32),)
     elif boys_grouping == "atom":
         physical_groups = _boys_atom_groups(mol, targets, groups)

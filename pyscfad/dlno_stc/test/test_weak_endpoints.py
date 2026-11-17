@@ -11,6 +11,9 @@ import numpy as np
 import pytest
 
 from pyscfad.dlno_stc import _pairs
+from pyscfad.lib._multipole import pair_energy as reference_pair_energy
+from pyscfad.lib._weak_endpoint import prepare_endpoint, replay_endpoint
+from functools import partial
 
 
 class Inputs(NamedTuple):
@@ -51,7 +54,7 @@ def test_orbital_screen_is_built_once_and_its_forward_pullback_is_reused(monkeyp
         return endpoint(m, Common(saved), static, fragment_index)
 
     def direct(m, c):
-        return sum(_pairs._multipole_pair_energy(endpoint(m, c, static, i),
+        return sum(reference_pair_energy(endpoint(m, c, static, i),
                    endpoint(m, c, static, j), order)
                    for i, j in _pairs.weak_pair_indices(static))
 
@@ -153,7 +156,7 @@ def test_screening_reuses_endpoint_response_and_falls_back_only_for_missing(monk
 
     pairs = _pairs.weak_pair_indices(static)
     def direct(m, c):
-        return sum(_pairs._multipole_pair_energy(endpoint(m, c, static, i),
+        return sum(reference_pair_energy(endpoint(m, c, static, i),
                    endpoint(m, c, static, j), order) for i, j in pairs)
 
     expected, expected_bars = jax.value_and_grad(direct, argnums=(0, 1))(mf, common)
@@ -296,7 +299,7 @@ def test_screening_shares_raw_ao_moments_by_ordered_support_with_full_response(
     def direct(current_mf, current_common):
         endpoints = [_pairs.build_weak_endpoint(current_mf, current_common, static, i)
                      for i in range(3)]
-        return sum(_pairs._multipole_pair_energy(endpoints[i], endpoints[j], order)
+        return sum(reference_pair_energy(endpoints[i], endpoints[j], order)
                    for i, j in ((0, 1), (0, 2), (1, 2)))
 
     expected_value, expected_bars = jax.value_and_grad(direct, argnums=(0, 1))(mf, common)
@@ -314,7 +317,7 @@ def test_staged_response_matches_direct_chain_rule_with_shared_endpoints(monkeyp
     indices = _pairs.weak_pair_indices(static)
 
     def direct(m, c):
-        return sum(_pairs._multipole_pair_energy(endpoint(m, c, static, i),
+        return sum(reference_pair_energy(endpoint(m, c, static, i),
                    endpoint(m, c, static, j), order) for i, j in indices)
 
     expected, expected_bars = jax.value_and_grad(direct, argnums=(0, 1))(mf, common)
@@ -341,7 +344,7 @@ def test_forward_weak_sum_builds_each_incident_endpoint_once(monkeypatch, order)
 
     monkeypatch.setattr(_pairs, 'build_weak_endpoint', counted)
     actual = total(mf, common, static)
-    expected = sum(_pairs._multipole_pair_energy(endpoint(mf, common, static, i),
+    expected = sum(reference_pair_energy(endpoint(mf, common, static, i),
                    endpoint(mf, common, static, j), order) for i, j in _pairs.weak_pair_indices(static))
     np.testing.assert_allclose(actual, expected, rtol=2e-12, atol=1e-14)
     assert calls == Counter({0: 1, 1: 1, 2: 1})
@@ -432,7 +435,7 @@ def test_domain_collects_once_after_complete_weak_response(monkeypatch, with_gra
     compact_values, orbital_pullbacks = [], []
 
     def direct(m, c):
-        return sum(_pairs._multipole_pair_energy(endpoint(m, c, static, i),
+        return sum(reference_pair_energy(endpoint(m, c, static, i),
                    endpoint(m, c, static, j), 4) for i, j in pairs)
 
     expected, expected_bars = jax.value_and_grad(direct, argnums=(0, 1))(mf, common)
@@ -472,7 +475,7 @@ def test_domain_collects_once_after_complete_weak_response(monkeypatch, with_gra
                         (state['energy'], (state['mf_bar'], state['common_bar'])))
     monkeypatch.setattr(_pairs.gc, 'collect', collect)
     actual, actual_bars = driver._run_serial(
-        initialize, static, {}, with_grad=with_grad)
+        initialize, static, {'laplace_roots': [1.], 'laplace_weights': [1.]}, with_grad=with_grad)
     np.testing.assert_allclose(actual, expected, rtol=2e-12, atol=1e-14)
     if with_grad:
         for got, want in zip(jax.tree_util.tree_leaves(actual_bars),
@@ -524,7 +527,7 @@ def test_screening_pair_response_reuses_weighted_missing_shares(monkeypatch, ord
         assert _pairs.weak_pair_weight(static, 0, 2) == .5
 
     def direct(m, c):
-        return sum((_pairs.weak_pair_weight(static, i, j) * primal(
+        return sum((_pairs.weak_pair_weight(static, i, j) * reference_pair_energy(
                     endpoint(m, c, static, i), endpoint(m, c, static, j), order)
                     for i, j in pairs), jnp.zeros(()))
 
@@ -600,9 +603,9 @@ def test_asymmetric_weak_completion_forward_and_pullback(monkeypatch, order):
     _install_split(monkeypatch, endpoint)
     monkeypatch.setattr(_pairs, 'build_weak_endpoint', endpoint)
     def reference(m, c):
-        return (.5 * _pairs._multipole_pair_energy(
+        return (.5 * reference_pair_energy(
                     endpoint(m, c, static, 0), endpoint(m, c, static, 1), order)
-                + _pairs._multipole_pair_energy(
+                + reference_pair_energy(
                     endpoint(m, c, static, 0), endpoint(m, c, static, 2), order))
     expected, expected_bars = jax.value_and_grad(reference, (0, 1))(mf, common)
     forward = _pairs.weak_pair_energy_sum(mf, common, static)
@@ -612,3 +615,32 @@ def test_asymmetric_weak_completion_forward_and_pullback(monkeypatch, order):
     np.testing.assert_allclose([forward, single, value], expected, atol=1e-14)
     for got, want in zip(jax.tree_util.tree_leaves(bars), jax.tree_util.tree_leaves(expected_bars)):
         np.testing.assert_allclose(got, want, atol=1e-13, rtol=2e-11)
+
+
+@pytest.fixture(autouse=True)
+def synthetic_endpoint_callbacks(monkeypatch):
+    # These orchestration fixtures use synthetic screens, not molecular PAOs.
+    def prepare(mf, common, static, index, *, ao_moments=None, **kwargs):
+        screen = partial(_pairs.build_weak_multipole_screen, static=static, fragment_index=index)
+        moments = partial(_pairs._weak_endpoint_from_screen, static=static, fragment_index=index)
+        if ao_moments is not None:
+            moments = partial(moments, ao_moments=ao_moments)
+        return prepare_endpoint(screen, moments, mf, common)
+    def replay(mf, linearization, static, index, **kwargs):
+        return replay_endpoint(partial(_pairs._weak_endpoint_from_screen,
+            static=static, fragment_index=index), mf, linearization)
+    monkeypatch.setattr(_pairs, '_prepare_weak_endpoint', prepare)
+    monkeypatch.setattr(_pairs, '_replay_weak_endpoint', replay)
+
+    from pyscfad.lib._multipole import transition_moments
+    def orbital_data(mol, screen, atoms, order, *, ao_moments=None):
+        if ao_moments is None:
+            ao_moments = _pairs._origin_zero_moments(
+                _pairs._fake_mol_with_traced_centers(mol, atoms), max(1,order-1))
+        c,m,q,o = transition_moments(screen.occupied_coeff,screen.virtual_coeff,*ao_moments,order)
+        return c[0],m[0],screen.virtual_energy-screen.occupied_energy[0],None if q is None else q[0],None if o is None else o[0]
+    monkeypatch.setattr(_pairs, '_multipole_orbital_data', orbital_data)
+    monkeypatch.setattr(_pairs, '_origin_zero_moments_vjp', lambda mf, atoms, order:
+        jax.vjp(lambda m: _pairs._origin_zero_moments(_pairs._fake_mol_with_traced_centers(m.mol,atoms),order),mf))
+    monkeypatch.setattr(_pairs, '_weak_moment_vjp', lambda mf, screen, raw, static, index:
+        jax.vjp(lambda s,r: _pairs._weak_endpoint_from_screen(mf,s,static,index,ao_moments=r),screen,raw))

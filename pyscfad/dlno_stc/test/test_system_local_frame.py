@@ -315,7 +315,7 @@ def test_system_driver_passes_boys_options_to_reference_selection(reference, mon
 
     monkeypatch.setattr(driver, "build_domain_selections", record_selection)
     energy = dlno_stc.kernel(
-        reference, scope="system", frozen=1, controls=_controls(), lo_kwargs=options,
+        reference, boys_grouping="system", frozen=1, controls=_controls(), lo_kwargs=options,
     )
     assert np.isfinite(energy)
     assert calls == [options]
@@ -467,7 +467,7 @@ def test_degenerate_scf_uses_full_local_fock_response_for_arbitrary_seed():
     energies = np.asarray(mf.mo_energy)
     assert any(np.min(np.diff(np.sort(energies[indices]))) <= 1e-9
                for indices in (occupied, virtual))
-    static = dlno_stc.build_domain_selections(mf, frozen=1, scope="system")
+    static = dlno_stc.build_domain_selections(mf, frozen=1, boys_grouping="system")
     state = driver._initialize(mf, static, _controls(), with_grad=True,
                                scf_pullback=scf_pullback)
     group, = dlno_stc.build_domain_groups(static)
@@ -509,7 +509,7 @@ def test_system_driver_passes_local_focks_and_matches_canonical_response(
 
     monkeypatch.setattr(backend, "solve", local_solve)
     energy, bar = dlno_stc.value_and_grad(
-        coordinate_response["mol"], _mf, scope="system", frozen=1,
+        coordinate_response["mol"], _mf, boys_grouping="system", frozen=1,
         controls=_controls(),
     )
     canonical_energy, canonical_bar = coordinate_response["canonical"]

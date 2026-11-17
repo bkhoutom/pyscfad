@@ -110,7 +110,7 @@ def run(args, comm):
             controls["virtual_keep_fraction"] = args.keep_fraction
     solve_started = time.perf_counter()
     result = dlno_stc.value_and_grad(
-        mol, build_mf, scope="system", frozen=args.frozen,
+        mol, build_mf, boys_grouping="system", frozen=args.frozen,
         controls=controls, comm=comm, include_hf=True,
     )
     comm.Barrier()
@@ -130,7 +130,7 @@ def run(args, comm):
                   "derivative_max_error": float(np.max(np.abs(factors @ (laplace_weights * roots) - 1 / denominators**2)))}
     arrays = {"energy": energy, "hf_energy": hf_energy,
               "correlation_energy": energy - hf_energy, "gradient": gradient}
-    info = {"scope": "system", "mode": args.mode, "mpi_size": comm.Get_size(),
+    info = {"boys_grouping": "system", "mode": args.mode, "mpi_size": comm.Get_size(),
             "settings": {key: str(value) if isinstance(value, Path) else value
                          for key, value in vars(args).items()},
             "energy": energy, "hf_energy": hf_energy, "correlation_energy": energy - hf_energy,

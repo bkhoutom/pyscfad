@@ -11,7 +11,7 @@ from pyscfad.dlno_stc.test.test_system import molecule, _mf, _controls
 
 
 @pytest.mark.parametrize('options, error', [
-    ({'scope': 'other'}, ValueError),
+    ({'boys_grouping': 'other'}, ValueError),
     ({'full_domain': 'true'}, TypeError),
     ({'full_domain': 1}, TypeError),
     ({'force_full_domains': True}, TypeError),
@@ -21,6 +21,24 @@ from pyscfad.dlno_stc.test.test_system import molecule, _mf, _controls
 def test_invalid_selection_options_before_reference_use(options, error):
     with pytest.raises(error):
         dlno_stc.build_domain_selections(None, frozen=0, **options)
+
+
+def test_system_grouping_matches_molecule_alias_and_saved_partition(molecule):
+    from dataclasses import replace
+    from pyscfad.dlno_stc._selection import _physical_groups
+    mf = _mf(molecule)
+    current = dlno_stc.build_domain_selections(mf, frozen=1, boys_grouping='system')
+    alias = dlno_stc.build_domain_selections(mf, frozen=1, boys_grouping='molecule')
+    assert current.boys_grouping == alias.boys_grouping == 'system'
+    assert current.physical_groups == alias.physical_groups == (tuple(range(4)),)
+    assert _physical_groups(replace(current, boys_grouping='molecule')) == current.physical_groups
+    for selected in (current, alias):
+        assert selected.strong_mask.all()
+        for fragment in selected.fragments:
+            np.testing.assert_array_equal(fragment.extended_atoms, np.arange(molecule.natm))
+            np.testing.assert_array_equal(fragment.pao_center_atoms, np.arange(molecule.natm))
+    for key in ('active_occ_indices', 'active_vir_indices', 'strong_mask'):
+        np.testing.assert_array_equal(getattr(current, key), getattr(alias, key))
 
 
 @pytest.mark.parametrize('grouping', ['singleton', 'atom'])
@@ -51,7 +69,7 @@ def test_cc_energy_and_force_use_single_system_fragment(molecule, monkeypatch, t
     monkeypatch.setenv('PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE', df_mode)
     mf = _mf(molecule)
     controls = dict(_controls(), threads=1)
-    domains = dlno_stc.build_domain_selections(mf, frozen=1, scope='system')
+    domains = dlno_stc.build_domain_selections(mf, frozen=1, boys_grouping='system')
     assert domains.physical_groups == ((0, 1, 2, 3),)
     static = ccsd.build_static_selections(
         mf, domains, thresh_occ=0., thresh_vir=0.,
@@ -65,7 +83,7 @@ def test_cc_energy_and_force_use_single_system_fragment(molecule, monkeypatch, t
     with monkeypatch.context() as guard:
         guard.setattr(jax, 'vjp', forbidden)
         forward = ccsd.kernel(mf, static, **options)
-        mp2 = dlno_stc.kernel(mf, scope='system', frozen=1, controls=controls)
+        mp2 = dlno_stc.kernel(mf, boys_grouping='system', frozen=1, controls=controls)
     assert np.isfinite(mp2)
     from pyscfad.lno import _df_shared
     receipts = []
@@ -119,7 +137,7 @@ def test_matrix_defaults_and_removed_density_mode():
 def test_non_smooth_selections_are_rejected(molecule):
     from dataclasses import replace
     mf = _mf(molecule)
-    domains = dlno_stc.build_domain_selections(mf, frozen=1, scope='system')
+    domains = dlno_stc.build_domain_selections(mf, frozen=1, boys_grouping='system')
     selection = dict(thresh_occ=0., thresh_vir=0., baseline_controls={}, matrix_controls={})
     with pytest.raises(TypeError):
         ccsd.build_static_selections(mf, domains, smooth=False, **selection)
@@ -132,7 +150,7 @@ def test_non_smooth_selections_are_rejected(molecule):
 
 def test_mp2_and_triples_quadratures_are_independent(molecule):
     mf = _mf(molecule)
-    domains = dlno_stc.build_domain_selections(mf, frozen=1, scope='system')
+    domains = dlno_stc.build_domain_selections(mf, frozen=1, boys_grouping='system')
     options = dict(thresh_occ=0., thresh_vir=0.)
     mp2_grid = ([.13, .71], [.21, .82])
     selected = ccsd.build_static_selections(

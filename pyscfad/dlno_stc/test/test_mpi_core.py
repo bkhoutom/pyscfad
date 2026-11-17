@@ -94,6 +94,26 @@ def _reduce(trees, monkeypatch, chunk_bytes=16, root=0):
     return results, world
 
 
+@pytest.mark.parametrize('grouping', ['system', 'molecule', 'atom', None, 'invalid'])
+def test_grouping_dispatch_uses_root_choice_on_every_rank(grouping):
+    from pyscfad.dlno_stc import driver
+    world = _World(2)
+    def run(rank):
+        try:
+            return driver._shared_grouping(None, grouping if rank == 0 else None,
+                None, world.communicator(rank))
+        except Exception as exc:
+            return exc
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(run, range(2)))
+    if grouping == 'invalid':
+        assert all(isinstance(result, RuntimeError) for result in results)
+        assert all('boys_grouping' in str(result) for result in results)
+    else:
+        expected = 'system' if grouping == 'molecule' else grouping
+        assert results == [expected, expected]
+
+
 def test_reducer_sums_chunks_and_mixed_zero_leaves(monkeypatch):
     trees = [
         {'a': numpy.arange(7, dtype=float), 'b': None,

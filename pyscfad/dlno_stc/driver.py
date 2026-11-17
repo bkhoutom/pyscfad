@@ -552,23 +552,24 @@ def _run_serial(initializer, static, controls, *, with_grad, include_hf=False,
         return _finish(state, with_grad=with_grad, include_hf=include_hf)
 
 
-def _select_scope(static, scope, frozen, lo_kwargs=None):
-    """Validate root-owned call options before any scientific scope branch."""
-    if scope not in ("domain", "system"):
-        raise ValueError("scope must be domain or system")
-    if scope == "domain" and frozen is not None:
-        raise ValueError("domain frozen setting must come from static; frozen must be None")
-    if scope == "domain" and lo_kwargs is not None:
-        raise ValueError("domain localization options must come from static.lo_kwargs")
-    if scope == "system" and static is not None:
-        raise ValueError("system scope requires static=None")
-    return scope
+def _select_grouping(static, boys_grouping, frozen, lo_kwargs=None):
+    """Validate root-owned grouping before automatic or saved selection."""
+    if boys_grouping is not None:
+        from ._selection import _normalize_boys_grouping
+        boys_grouping = _normalize_boys_grouping(boys_grouping)
+        if static is not None:
+            raise ValueError("boys_grouping must come from static when static is supplied")
+    elif frozen is not None:
+        raise ValueError("frozen must come from static; automatic selection requires boys_grouping")
+    elif lo_kwargs is not None:
+        raise ValueError("localization options must come from static.lo_kwargs; automatic selection requires boys_grouping")
+    return boys_grouping
 
 
-def _shared_scope(static, scope, frozen, comm, lo_kwargs=None):
+def _shared_grouping(static, boys_grouping, frozen, comm, lo_kwargs=None):
     rank = 0 if comm is None else comm.Get_rank()
-    selected = _root_call(comm, rank, lambda: _select_scope(static, scope, frozen, lo_kwargs),
-                          "scope selection")
+    selected = _root_call(comm, rank, lambda: _select_grouping(static, boys_grouping, frozen, lo_kwargs),
+                          "grouping selection")
     return selected if comm is None else comm.bcast(selected, root=0)
 
 
@@ -711,7 +712,7 @@ def _serial_scf_pullback(pullback):
 
 
 @memory_calculation
-def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
+def kernel(mf, static=None, *, boys_grouping=None, frozen=None, controls, comm=None,
            lo_kwargs=None, merge_identical=True, parallel_scf_jk=True,
            correlation_auxbasis=None):
     """Return correlation energy on root.
@@ -726,9 +727,9 @@ def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
     The default ``parallel_scf_jk=True`` distributes common-preparation DF J/K
     work for multi-rank domain calls; ``False`` keeps this work on root.
     SCF preceding this energy-only API is caller-owned.
-    System scope uses one molecular fragment in the same executor.
+    Explicit boys_grouping selects fragments automatically; "system" uses one full-system fragment.
     """
-    scope = _shared_scope(static, scope, frozen, comm, lo_kwargs)
+    boys_grouping = _shared_grouping(static, boys_grouping, frozen, comm, lo_kwargs)
     rank = 0 if comm is None else comm.Get_rank()
     controls = _root_call(comm, rank, lambda: _driver_controls(controls, defer_grid=True),
                           "control validation")
@@ -737,12 +738,12 @@ def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
         if any(isinstance(x, jax.core.Tracer) for x in jax.tree_util.tree_leaves(mf)):
             raise TypeError("STC kernel is forward-only; use value_and_grad")
         selected = static
-        if scope == "system":
+        if boys_grouping is not None:
             empty = _empty_reference(mf, frozen, with_grad=False)
             if empty is not None:
                 return empty
             selected = build_domain_selections(
-                mf, scope="system", frozen=0 if frozen is None else frozen,
+                mf, boys_grouping=boys_grouping, frozen=0 if frozen is None else frozen,
                 lo_kwargs=lo_kwargs, **basis_kwargs(correlation_auxbasis))
         return _initialize(mf, selected, controls, with_grad=False, **basis_kwargs(correlation_auxbasis))
 
@@ -766,7 +767,7 @@ def kernel(mf, static=None, *, scope="domain", frozen=None, controls, comm=None,
 
 
 @memory_calculation
-def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
+def value_and_grad(mol, build_mf, static=None, *, boys_grouping=None, frozen=None,
                    controls, comm=None, include_hf=False, lo_kwargs=None, merge_identical=True,
                    build_static=None, parallel_scf_jk=True, correlation_auxbasis=None):
     """Return ``(energy, mol_bar)`` on root; worker ranks return ``None``.
@@ -774,7 +775,7 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
     ``correlation_auxbasis`` selects local correlation fitting independently
     of HF/Fock/SCF response. ``None`` preserves the existing fitting workflow.
     A selection callback inherits the explicit correlation basis.
-    Discrete selections and the Laplace grid are fixed. ``scope="system"``
+    Discrete selections and the Laplace grid are fixed. ``boys_grouping="system"``
     builds one molecular fragment and uses the same preparation, selected
     solver and response as domain calculations. Its ``lo_kwargs`` and frozen
     setting are used when selecting that fragment. Domain calls use the
@@ -785,7 +786,7 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
     once and shared by selection and differentiable common preparation.
     Selection-only mutations cannot
     change the live SCF tree retained by its pullback. ``static`` and
-    ``build_static`` are mutually exclusive; system scope uses neither.
+    ``build_static`` are mutually exclusive. Explicit ``boys_grouping`` uses neither.
     Identical domain frames share one selected solve/VJP unless the diagnostic
     option ``merge_identical=False`` is supplied. Public targets stay singleton.
     Stochastic energy uncertainty does not bound gradient uncertainty.
@@ -809,7 +810,7 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
     build_mf must include their DF producer. A caller-owned complete reverse
     scope is reused. See README_SERIAL_DF_SCF.md for staged/prebuilt DF cases.
     """
-    scope = _shared_scope(static, scope, frozen, comm, lo_kwargs)
+    boys_grouping = _shared_grouping(static, boys_grouping, frozen, comm, lo_kwargs)
     rank = 0 if comm is None else comm.Get_rank()
     controls = _root_call(comm, rank, lambda: _driver_controls(controls, defer_grid=True),
                           "control validation")
@@ -817,13 +818,13 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
     def initialize():
         _coordinate_only(mol)
         if build_static is not None:
-            if scope != "domain":
-                raise ValueError("build_static is only supported for domain scope")
+            if boys_grouping is not None:
+                raise ValueError("select boys_grouping inside build_static, not alongside it")
             if static is not None:
                 raise ValueError("supply either static or build_static, not both")
             if not callable(build_static):
                 raise TypeError("build_static must be callable")
-        elif scope == "domain":
+        elif boys_grouping is None:
             _validate_static(static)
         local_response = _root_owned_scf_response(comm, parallel_scf_jk)
         with resource_profile.section('stc.domain.scf'):
@@ -832,12 +833,12 @@ def value_and_grad(mol, build_mf, static=None, *, scope="domain", frozen=None,
         if local_response:
             scf_pullback = _serial_scf_pullback(scf_pullback)
         selector = build_static
-        if scope == "system":
+        if boys_grouping is not None:
             empty = _empty_reference(mf, frozen, with_grad=True, scf_pullback=scf_pullback)
             if empty is not None:
                 return empty
             selector = lambda reference: build_domain_selections(
-                reference, scope="system", frozen=0 if frozen is None else frozen,
+                reference, boys_grouping=boys_grouping, frozen=0 if frozen is None else frozen,
                 lo_kwargs=lo_kwargs, **basis_kwargs(correlation_auxbasis))
         selected = static
         scf_data = getattr(scf_pullback, 'scf_data', None)

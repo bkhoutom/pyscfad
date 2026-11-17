@@ -90,7 +90,7 @@ def test_shared_primary_selection_matches_independent_replay(boys_water_dimer, o
 
 @pytest.mark.parametrize('empty', [False, True])
 def test_rank_selection_keeps_live_subspace_response(monkeypatch, empty):
-    from pyscfad.dlno_stc._primary_response import _select_preprojection
+    from pyscfad.dlno_stc.test._weak_reference import _select_preprojection
     from pyscfad.dlno_stc.test.test_pao_response_reuse import _fixture
     _, common, _ = _fixture(monkeypatch)
     pao = common.pao_coeff.at[:, 0].multiply(1e-5)

@@ -167,18 +167,19 @@ arma::mat stable_matrix_bar(const Array& raw,const Array& bar,size_t axis,
 class StableDressing {
     std::vector<Array> inputs_;
     Spectrum occupied_,virtual_;
-    arma::vec virtual_diagonal_;
+    arma::vec virtual_diagonal_,occupied_diagonal_;
+    double occupied_offdiag_norm_=0.;
     double virtual_offdiag_norm_=0.;
     arma::mat u_;
     double shift_=0.,cached_node_=0.;
-    bool full_external_=false,selected_occupied_frame_=false;
+    bool full_external_=false,selected_occupied_frame_=false,mrcc_partition_=false;
     std::vector<libgmbpt::qchem::triples_tensor_spec> specs_;
     std::vector<std::vector<Axis>> plans_;
     std::vector<std::vector<Array>> prefixes_;
     std::vector<Array> graph_prefixes_;
     bool graph_cached_=false;
     size_t tape_bytes_=0,cached_bytes_=0,peak_bytes_=0,hits_=0,rebuilds_=0;
-    double external_time(double node) const { return full_external_ ? node : node/2; }
+    double external_time(double node) const { return full_external_ && !mrcc_partition_ ? node : node/2; }
     std::vector<arma::mat> matrices(double node,bool diagonal_virtual) const {
         if(!std::isfinite(node) || node<0) throw py::value_error("stable triples: node must be finite and nonnegative");
         // The common energy shift cancels in every sampled product. Both
@@ -189,7 +190,11 @@ class StableDressing {
         arma::mat v;
         if(diagonal_virtual) v=arma::diagmat(arma::exp((-external_time(node))*(virtual_diagonal_-shift_)));
         else v=exponential(virtual_,-external_time(node),shift_);
-        std::vector<arma::mat> result={exponential(occupied_,external_time(node),shift_),
+        arma::mat o;
+        if(occupied_diagonal_at(node))
+            o=arma::diagmat(arma::exp(external_time(node)*(occupied_diagonal_-shift_)));
+        else o=exponential(occupied_,external_time(node),shift_);
+        std::vector<arma::mat> result={std::move(o),
                                        std::move(v),u_.t()};
         if(!full_external_) result.emplace_back(u_.t()*exponential(occupied_,node,shift_));
         return result;
@@ -199,13 +204,19 @@ class StableDressing {
         if(axis.matrix==2 && selected_occupied_frame_)
             return stable_selected_axis(input,axis.axis,u_.n_rows,u_.n_cols,
                                         matrix.n_rows==u_.n_rows);
+        // The matrix bar is computed in full before this tensor-only shortcut.
+        if(axis.matrix==0 && matrix.is_diagmat())
+            return stable_scale_axis(input,axis.axis,matrix);
         return diagonal_virtual && axis.matrix==1
             ? stable_scale_axis(input,axis.axis,matrix)
             : stable_transform(input,axis.axis,matrix,full_external_);
     }
 #include "stc_triples_graph.inc"
 public:
-    explicit StableDressing(py::tuple inputs,bool full_external=false):full_external_(full_external) {
+    explicit StableDressing(py::tuple inputs,bool full_external=false,bool mrcc_partition=false)
+        :full_external_(full_external),mrcc_partition_(mrcc_partition) {
+        if(mrcc_partition_ && !full_external_)
+            throw py::value_error("MRCC partition requires the shared transform graph");
         if(inputs.size()!=9) throw py::value_error("stable triples: expected nine integral inputs");
         for(auto value:inputs) {
             auto a=Array::ensure(value);
@@ -223,6 +234,15 @@ public:
         check_shape(inputs_[5],{no,nv}); check_shape(inputs_[6],{no,no});
         check_shape(inputs_[7],{nv,nv}); check_shape(inputs_[8],{no,ns});
         occupied_=spectrum(inputs_[6]);
+        occupied_diagonal_.set_size(size_t(no));
+        for(size_t i=0;i<size_t(no);++i) {
+            occupied_diagonal_[i]=inputs_[6].data()[i*size_t(no)+i];
+            double row=0.;
+            for(size_t j=0;j<size_t(no);++j) if(i!=j)
+                row+=std::abs(.5*inputs_[6].data()[i*size_t(no)+j]
+                             +.5*inputs_[6].data()[j*size_t(no)+i]);
+            occupied_offdiag_norm_=std::max(occupied_offdiag_norm_,row);
+        }
         virtual_diagonal_.set_size(size_t(nv));
         for(size_t i=0;i<size_t(nv);++i) {
             virtual_diagonal_[i]=inputs_[7].data()[i*size_t(nv)+i];
@@ -251,6 +271,9 @@ public:
         }
         selected_occupied_frame_=selector_error<=32*std::numeric_limits<double>::epsilon();
         specs_=libgmbpt::qchem::triples_layout(size_t(no),size_t(nv),size_t(ns)).tensors;
+        // MRCC: every selected external leg has U^T O(t/2), on both sides.
+        if(mrcc_partition_) for(auto& spec:specs_)
+            for(auto& transform:spec.transform) if(transform==3) transform=4;
         for(const auto& spec:specs_) {
             std::vector<Axis> plan;
             // Project first, reducing the size of every subsequent temporary.
@@ -275,6 +298,13 @@ public:
     size_t peak_cache_bytes() const { return peak_bytes_; }
     size_t cache_rebuilds() const { return rebuilds_; }
     bool selected_occupied_frame() const { return selected_occupied_frame_; }
+    bool occupied_diagonal_at(double node) const {
+        if(!std::isfinite(node) || node<0)
+            throw py::value_error("stable triples: node must be finite and nonnegative");
+        // The shifted occupied generator is negative definite. The same
+        // Duhamel error bound as for virtual factors permits roundoff only.
+        return external_time(node)*occupied_offdiag_norm_<=32*std::numeric_limits<double>::epsilon();
+    }
     bool virtual_diagonal_at(double node) const {
         if(!std::isfinite(node) || node<0)
             throw py::value_error("stable triples: node must be finite and nonnegative");

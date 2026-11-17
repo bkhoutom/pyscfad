@@ -120,7 +120,7 @@ def test_finite_grouped_energy_gradient_weak_and_hf(monkeypatch):
 @pytest.mark.parametrize('options, error, match', [
     ({'build_static': object()}, TypeError, 'callable'),
     ({'static': object(), 'build_static': accept.selection}, ValueError, 'static'),
-    ({'scope': 'system', 'build_static': accept.selection}, ValueError, 'domain'),
+    ({'boys_grouping': 'system', 'build_static': accept.selection}, ValueError, 'boys_grouping'),
 ])
 def test_domain_builder_options_are_rejected_before_scf(options, error, match):
     from pyscfad import dlno_stc

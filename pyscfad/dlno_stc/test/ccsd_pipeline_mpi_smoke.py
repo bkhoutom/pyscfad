@@ -59,10 +59,10 @@ def run(output, *, serial=False, gradient=False,
             active_group = None
 
     original_select = ccsd._select_current_fragment
-    def select(state, static, index, current, *args):
+    def select(state, static, index, current, *args, **kwargs):
         assert active_group == current.representative_index
         observations['selected'].append(index)
-        concrete = original_select(state, static, index, current, *args)
+        concrete = original_select(state, static, index, current, *args, **kwargs)
         assert concrete.selection_options is None
         assert concrete.fragments[index] is not None
         assert all(item is None for i, item in enumerate(concrete.fragments) if i != index)

@@ -79,6 +79,7 @@ def test_half_transforms_scope_dense_threads_without_changing_integral_threads(
             check('adjoint read', 1)
             return numpy.ones((p1-p0, width))
 
+        original_matmul = numpy.matmul
         with monkeypatch.context() as patch:
             for module, name in ((numpy, 'matmul'), (numpy, 'einsum'),
                                  (scipy.linalg, 'lstsq'),
@@ -90,13 +91,16 @@ def test_half_transforms_scope_dense_threads_without_changing_integral_threads(
             cache.transform(coeff, (0, 2, 2, 4), low)
             check('after ED', 1)
             cache.transform(child, (0, 3, 0, 3), low)
+            # Auxiliary workers use serial BLAS; the forward still uses
+            # the configured dense team.
+            patch.setattr(numpy, 'matmul', observe(original_matmul, 'pullback matmul', 1))
             check('after LIS', 1)
             cache.coefficient_pullback(coeff, lambda p0, p1: read_z(p0, p1, 4),
                                        (0, 2, 2, 4))
             cache.coefficient_pullback(child, lambda p0, p1: read_z(p0, p1, 9),
                                        (0, 3, 0, 3))
             check('after pullbacks', 1)
-        assert {'matmul', 'einsum', 'lstsq', 'solve_triangular',
+        assert {'matmul', 'pullback matmul', 'lstsq', 'solve_triangular',
                 'integrals', 'unpack', 'adjoint read'} <= seen
         scope.finish()
 

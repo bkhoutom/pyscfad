@@ -39,18 +39,43 @@ def molecule():
 def test_public_options_are_explicit_before_reference_use():
     for options, error, match in [
         ({}, TypeError, "static"),
-        ({"scope": "other"}, ValueError, "scope"),
-        ({"scope": "system", "static": object()}, ValueError, "static"),
+        ({"boys_grouping": "other"}, ValueError, "boys_grouping"),
+        ({"boys_grouping": "system", "static": object()}, ValueError, "static"),
+        ({"scope": "system"}, TypeError, "scope"),
         ({"frozen": 0}, ValueError, "frozen"),
     ]:
         with pytest.raises(error, match=match):
             dlno_stc.kernel(None, controls=_controls(), **options)
 
 
+def test_scope_removed_from_selection_and_gradient_api():
+    with pytest.raises(TypeError, match='scope'):
+        dlno_stc.build_domain_selections(None, frozen=0, scope='system')
+    with pytest.raises(TypeError, match='scope'):
+        dlno_stc.value_and_grad(None, None, scope='system', controls=_controls())
+
+
+@pytest.mark.parametrize('grouping', ['singleton', 'atom', 'system', 'molecule'])
+def test_automatic_grouping_is_forwarded_to_selection(monkeypatch, grouping):
+    selected = object()
+    seen = []
+    def select(mf, **options):
+        seen.append(options)
+        return selected
+    monkeypatch.setattr(driver, 'build_domain_selections', select)
+    monkeypatch.setattr(driver, '_empty_reference', lambda *a, **k: None)
+    monkeypatch.setattr(driver, '_initialize', lambda mf, static, *a, **k: static)
+    monkeypatch.setattr(driver, '_run_serial', lambda initialize, *a, **k: initialize())
+    assert dlno_stc.kernel(None, boys_grouping=grouping, frozen=1,
+                          controls=_controls()) is selected
+    assert seen[0]['boys_grouping'] == ('system' if grouping == 'molecule' else grouping)
+    assert seen[0]['frozen'] == 1 and 'scope' not in seen[0]
+
+
 def test_system_canonical_shortcut_cannot_bypass_local_sampling_frame():
     controls = dict(_controls(), canonical_fock=True)
     with pytest.raises(ValueError, match="local Fock"):
-        dlno_stc.kernel(None, scope="system", frozen=0, controls=controls)
+        dlno_stc.kernel(None, boys_grouping="system", frozen=0, controls=controls)
 
 
 def test_full_boundary_retains_three_arrays_and_validates_bars():
@@ -70,7 +95,7 @@ def test_full_boundary_retains_three_arrays_and_validates_bars():
 @pytest.mark.parametrize("frozen", [True, -1, 6, [True], [-1], [7], [0, 0], [0.5]])
 def test_system_rejects_invalid_frozen_before_preparation(molecule, frozen):
     with pytest.raises((TypeError, ValueError), match="frozen"):
-        dlno_stc.kernel(_mf(molecule), scope="system", frozen=frozen, controls=_controls())
+        dlno_stc.kernel(_mf(molecule), boys_grouping="system", frozen=frozen, controls=_controls())
 
 
 def test_system_preparation_preserves_active_spaces_without_mutating_mf(molecule):
@@ -98,7 +123,7 @@ def test_scf_fock_projection_requires_real_finite_matching_energies(molecule, en
         return mf
 
     with pytest.raises(ValueError, match="orbital energies"):
-        dlno_stc.value_and_grad(molecule, invalid_reference, scope="system", frozen=1,
+        dlno_stc.value_and_grad(molecule, invalid_reference, boys_grouping="system", frozen=1,
                                 controls=_controls())
 
 
@@ -108,13 +133,13 @@ def test_empty_active_spaces_add_hf_once_without_fitting_or_backend(molecule, mo
     monkeypatch.setattr(driver, "prepare_boys_group_inputs", forbidden)
     monkeypatch.setattr(driver.backend, "solve", forbidden)
     for frozen in (5, [0, 1, 2, 3, 4], [5, 6]):
-        assert float(dlno_stc.kernel(_mf(molecule), scope="system", frozen=frozen,
+        assert float(dlno_stc.kernel(_mf(molecule), boys_grouping="system", frozen=frozen,
                                     controls=_controls())) == 0
-    energy, bar = dlno_stc.value_and_grad(molecule, _mf, scope="system", frozen=5,
+    energy, bar = dlno_stc.value_and_grad(molecule, _mf, boys_grouping="system", frozen=5,
                                          controls=_controls())
     assert float(energy) == 0
     np.testing.assert_array_equal(bar.coords, np.zeros((3, 3)))
-    total, total_bar = dlno_stc.value_and_grad(molecule, _mf, scope="system", frozen=5,
+    total, total_bar = dlno_stc.value_and_grad(molecule, _mf, boys_grouping="system", frozen=5,
                                              controls=_controls(), include_hf=True)
     with (config_update("pyscfad_scf_implicit_diff", True),
           config_update("pyscfad_scf_first_order_custom", False)):
@@ -145,17 +170,17 @@ def test_system_matches_native_dfmp2_with_frozen_and_coordinate_response(molecul
         lambda mf: dfmp2.MP2(mf, frozen=1).kernel(with_t2=False)[0], mf)
     native_mf_bar, = native_pullback(jax.numpy.ones_like(native_energy))
     native_bar, = scf_pullback(native_mf_bar)
-    energy, bar = dlno_stc.value_and_grad(molecule, _mf, scope="system", frozen=1,
+    energy, bar = dlno_stc.value_and_grad(molecule, _mf, boys_grouping="system", frozen=1,
                                          controls=controls)
     np.testing.assert_allclose(energy, native_energy, atol=2e-10, rtol=0)
     np.testing.assert_allclose(bar.coords, native_bar.coords, atol=2e-7, rtol=2e-5)
-    np.testing.assert_allclose(dlno_stc.kernel(mf, scope="system", frozen=[0],
+    np.testing.assert_allclose(dlno_stc.kernel(mf, boys_grouping="system", frozen=[0],
                                               controls=controls), energy, atol=2e-10, rtol=0)
-    list_energy, list_bar = dlno_stc.value_and_grad(molecule, _mf, scope="system", frozen=[0],
+    list_energy, list_bar = dlno_stc.value_and_grad(molecule, _mf, boys_grouping="system", frozen=[0],
                                                    controls=controls)
     np.testing.assert_allclose(list_energy, energy, atol=2e-10, rtol=0)
     np.testing.assert_allclose(list_bar.coords, bar.coords, atol=2e-9, rtol=0)
-    total, total_bar = dlno_stc.value_and_grad(molecule, _mf, scope="system", frozen=1,
+    total, total_bar = dlno_stc.value_and_grad(molecule, _mf, boys_grouping="system", frozen=1,
                                              controls=controls, include_hf=True)
     hf_energy, hf_pullback = jax.vjp(lambda mf: mf.e_tot, mf)
     hf_mf_bar, = hf_pullback(jax.numpy.ones_like(hf_energy))
@@ -169,7 +194,7 @@ def test_system_matches_native_dfmp2_with_frozen_and_coordinate_response(molecul
     def displaced(sign):
         moved = molecule.set_geom_(np.asarray(molecule.atom_coords()) + sign * step * direction,
                                    unit="Bohr", inplace=False)
-        return dlno_stc.kernel(_mf(moved), scope="system", frozen=1, controls=controls)
+        return dlno_stc.kernel(_mf(moved), boys_grouping="system", frozen=1, controls=controls)
     finite_difference = (displaced(1) - displaced(-1)) / (2 * step)
     np.testing.assert_allclose(np.sum(np.asarray(bar.coords) * direction), finite_difference,
                                atol=1e-6, rtol=0)
@@ -177,7 +202,7 @@ def test_system_matches_native_dfmp2_with_frozen_and_coordinate_response(molecul
 
 def test_system_uses_same_domain_path_as_molecular_fragment(molecule, monkeypatch):
     mf = _mf(molecule)
-    static = dlno_stc.build_domain_selections(mf, frozen=1, scope="system")
+    static = dlno_stc.build_domain_selections(mf, frozen=1, boys_grouping="system")
     assert static.physical_groups == (tuple(range(4)),)
     seen = []
     def forbidden_w(*args, **kwargs):
@@ -194,9 +219,9 @@ def test_system_uses_same_domain_path_as_molecular_fragment(molecule, monkeypatc
 
     monkeypatch.setattr(backend, "solve", selected_solve)
     explicit = dlno_stc.kernel(mf, static, controls=_controls())
-    automatic = dlno_stc.kernel(mf, scope="system", frozen=1, controls=_controls())
+    automatic = dlno_stc.kernel(mf, boys_grouping="system", frozen=1, controls=_controls())
     energy, bar = dlno_stc.value_and_grad(
-        molecule, _mf, scope="system", frozen=1, controls=_controls())
+        molecule, _mf, boys_grouping="system", frozen=1, controls=_controls())
     expected, expected_bar = dlno_stc.value_and_grad(
         molecule, _mf, static, controls=_controls())
     np.testing.assert_allclose([automatic, energy, expected], explicit, atol=2e-10, rtol=0)

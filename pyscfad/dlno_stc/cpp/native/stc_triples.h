@@ -61,6 +61,10 @@ public:
         size_t occupied_block_batch_size,occupied_block_batches;
         size_t grouped_adjoint_groups,grouped_adjoint_max_terms;
         size_t grouped_adjoint_gemm_calls,grouped_adjoint_max_reduction;
+        // Worker-seconds: GV, T2V, GO, T2O by pack, GEMM, commit.
+        std::array<std::array<double,3>,4> grouped_profile_seconds{};
+        double grouped_spin_wall_seconds=0.,grouped_plan_wall_seconds=0.,grouped_jobs_wall_seconds=0.;
+        double grouped_commit_wall_seconds=0.;
         bool right_profile_enabled=false;
         std::vector<double> point_right_wall_seconds;
         std::vector<std::vector<double>> point_right_batch_wall_seconds;
@@ -93,18 +97,6 @@ public:
         std::vector<arma::vec> tensors;
     };
 
-    // Bounded batch of spin-adapted, undressed selected numerator blocks.
-    struct quadrature_cache {
-        size_t no=0,nv=0,ns=0,first=0;
-        bool gradient=false,finished=false;
-        std::vector<arma::vec> values,bars;
-    };
-    static triples_result quadrature_build(const triples_prepared&,quadrature_cache&,
-        size_t first,size_t count,bool gradient);
-    static triples_result quadrature_step(const triples_prepared&,quadrature_cache&,
-        double weight,triples_vjp*);
-    static triples_result quadrature_finish(const triples_prepared&,quadrature_cache&,triples_vjp*);
-    static constexpr size_t maximum_cached_blocks=64;
     static constexpr size_t maximum_streaming_blocks=128;
     static triples_result quadrature_stream(const triples_prepared&,
         const std::vector<const triples_prepared*>&,const std::vector<double>&,

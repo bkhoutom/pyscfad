@@ -5,8 +5,9 @@ import numpy as np
 import pytest
 
 from pyscfad.dlno_stc import _stc_mp2 as native
-from pyscfad.dlno_stc.smooth_triples import _run_deterministic
-from pyscfad.dlno_stc.test.test_triples_stable import evaluate, reference
+from pyscfad.dlno_stc.mrcc_triples import run_mrcc
+from pyscfad.dlno_stc.test.test_triples_stable import evaluate, reference as asymmetric_reference
+from pyscfad.dlno_stc.test.test_mrcc_triples import reference
 
 
 _INPUT_NAMES = ('t1', 't2', 'gv', 'go', 'gg', 'fov', 'foo', 'fvv', 'u')
@@ -54,18 +55,13 @@ def test_large_full_external_energy_and_all_responses(monkeypatch, selected, dia
     results = []
     for cap in ('0', '16'):
         monkeypatch.setenv('PYSCFAD_TRIPLES_DRESSING_CACHE_MB', cap)
-        (energy, diagnostics), bars = _run_deterministic(
+        (energy, diagnostics), bars = run_mrcc(
             inputs, nodes, weights, with_grad=True, max_memory=4000.,
-            rotate=True, trace_exponent=5.)
-        assert diagnostics['numerator_cache_batches'] == 1
-        assert diagnostics['one_sided_dressing']
-        assert diagnostics['single_pair_symmetrization']
+            rotate=True)
         if cap == '0':
             assert diagnostics['dressing_cache_peak_bytes'] == 0
-            assert diagnostics['dressing_cache_hits'] == 0
         else:
             assert 0 < diagnostics['dressing_cache_peak_bytes'] <= 16 * 1024**2
-            assert diagnostics['dressing_cache_hits'] > 0
         _assert_energy_and_bars(energy, bars, expected, expected_bars)
         results.append((energy, bars))
 
@@ -82,9 +78,9 @@ def test_large_full_external_energy_and_all_responses(monkeypatch, selected, dia
             displaced = list(inputs)
             displaced[7] = inputs[7] + sign * step * direction
             assert not native.StableTriplesDressing(tuple(displaced)).virtual_diagonal_at(nodes[1])
-            (energy, _), _ = _run_deterministic(
+            (energy, _), _ = run_mrcc(
                 tuple(displaced), nodes, weights, with_grad=False,
-                max_memory=4000., rotate=True, trace_exponent=5.)
+                max_memory=4000., rotate=True)
             energies.append(energy)
         np.testing.assert_allclose(np.sum(results[1][1][7] * direction),
                                    (energies[1] - energies[0]) / (2 * step),
@@ -95,8 +91,7 @@ def test_large_half_external_energy_and_all_responses():
     """The stochastic-compatible half dressing must retain its full VJP."""
     inputs = _large_fixture(selected=1)
     node = .37
-    expected, expected_bars = jax.value_and_grad(reference)(
+    expected, expected_bars = jax.value_and_grad(asymmetric_reference)(
         tuple(map(jnp.asarray, inputs)), node)
     result, bars = evaluate(inputs, node, cache=2**24)
-    assert result['deterministic_blocks'] == 6
     _assert_energy_and_bars(result['energy'], bars, expected, expected_bars)

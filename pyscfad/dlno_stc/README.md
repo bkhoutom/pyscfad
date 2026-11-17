@@ -27,19 +27,21 @@ from pyscfad import dlno_stc
 from pyscfad.dlno_stc import ccsd
 
 domains = dlno_stc.build_domain_selections(
-    mf, frozen=1, boys_grouping="atom", scope="domain", full_domain=False,
+    mf, frozen=1, boys_grouping="atom", full_domain=False,
     mp2_laplace_points=6,
 )
 ```
 
-`scope="system"` puts all active occupied targets in one molecular fragment
-and uses the same preparation, solver and response pipeline. It is equivalent
-to `boys_grouping="molecule"`. `full_domain=True` expands every fragment's
+`boys_grouping="system"` puts all active occupied targets in one fragment,
+uses full-system domains, and runs the same preparation, solver and response
+pipeline. `full_domain=True` expands every fragment's
 occupied, primary, PAO and extended domains to the entire system while
 preserving physical fragment membership. Frozen orbitals remain excluded;
 LNO cutoffs still apply.
 
-`boys_grouping` accepts `singleton`, `atom` and `molecule`. Pair screening and
+`boys_grouping` accepts `singleton`, `atom` and `system`; `molecule` remains a
+compatibility alias for `system`. The separate `scope` keyword has been removed.
+Pair screening and
 `BoysDomainThresholds` control finite domains. Domain selection fixes discrete
 labels; production reconstructs continuous orbitals and their responses.
 `merge_identical=True` shares preparation among identical domains while each
@@ -98,8 +100,11 @@ Set `ccsd_t=False` for CCSD. Energy is in Eh; coordinate gradients and forces
 are in Eh/bohr. Use `value_and_grad` for derivatives; the forward-only `kernel`
 interfaces are not outer JAX differentiation targets. Alternatively, pass
 explicit `domains` or a CC plan as `static` instead of `build_static`.
-The MP2 entry points also accept `scope="system", frozen=...` with no `static`
-to select one molecular fragment.
+The MP2 entry points also accept `boys_grouping="system", frozen=...` with no
+`static` to select one system-wide fragment automatically. Explicit `singleton`
+or `atom` grouping also builds the corresponding selections automatically.
+When supplying `static` or `build_static`, choose grouping, frozen orbitals and
+localization options in that selection instead of passing them to the solver.
 
 CC always includes every physical fragment and the complete domain MP2
 baseline, including weak-pair completion:
@@ -121,9 +126,31 @@ There is one pipeline and no `single_pass` option:
    solves the correction. Consume the pullbacks on that owner.
 4. Accumulate the common-data response and solve the SCF response for forces.
 
+For concrete real float64 inputs, weak-pair energies and their first reverse
+pass use NumPy/SciPy with explicit adjoints. This includes primary PAO
+selection/replay, overlap projections, normalization, semicanonicalization,
+transition moments through octupoles, and pair contractions. Shared PAO
+products and projections are reversed once after summing their endpoint
+cotangents. AO-moment coordinate response uses the existing native shell
+contraction, followed by a NumPy scatter to the parent atoms. No JAX reverse
+tapes or shape-specialized weak algebra executables are created on this path.
+SCF, Boys localization and the common-data producer retain their existing
+response implementations.
+
+Weak inputs must be concrete real float64 arrays. Traced weak inputs and
+basis-parameter pullbacks are rejected; use the explicit coordinate VJP.
+The host kernels use actual endpoint dimensions without JAX padding buckets.
+Rank labels and eigengap regularization are unchanged.
+
+
 The CC builder returns a plan, without computing W. Its production W selects
 ranks, anchors and the independent (T) grid, held fixed in that fragment's
-energy and pullback. `correlation_auxbasis`
+energy and pullback. The LIS orbitals are constructed once while choosing
+the anchors, then passed directly to CCSD/(T). Force calculations retain that
+construction's pullback; they do not rebuild the LIS to obtain its response.
+Solver replicas share these orbitals and apply the LIS pullback once to their
+averaged cotangent. This reuse is local to the current fragment evaluation.
+`correlation_auxbasis`
 selects a separate correlation fitting basis; selection and execution must
 use the same basis. HF/Fock continue using the SCF fit.
 
@@ -207,8 +234,8 @@ the correlation solvers use deterministic or stochastic evaluation.
 | Keyword | Default | Meaning |
 | --- | --- | --- |
 | `frozen` | Required | Frozen-space specification; `0` retains all occupied orbitals. |
-| `scope`, `boys_grouping` | `"domain"`, `"singleton"` | Domain scope and physical fragment grouping described above. |
-| `full_domain` | `False` | Expand domains without combining fragments; molecular grouping enables it automatically. |
+| `boys_grouping` | `"singleton"` | Physical fragment grouping: `singleton`, `atom` or `system`. |
+| `full_domain` | `False` | Expand domains without combining fragments; system grouping enables it automatically. |
 | `thresholds` | `BoysDomainThresholds()` | Domain completeness, ranks and weak-pair screening thresholds. |
 | `lo_kwargs` | `None` | [Boys or lambda-Boys localization options](#boys-and-lambda-boys-localization). |
 | `target_coeff` | `None` | Optional reference target coefficients. |
@@ -310,7 +337,7 @@ CC returns `(energy, components)` or `(energy, mol_bar, components)`.
 `build_domain_selections` automatically fits **one global MP2/W grid** from
 all active canonical occupied/virtual energies, excluding frozen orbitals.
 `mp2_laplace_points=6` sets its size. Every domain uses the same saved grid;
-`scope="system"` follows the same rule. Nodes/weights are saved as
+`boys_grouping="system"` follows the same rule. Nodes/weights are saved as
 `domains.mp2_grid`, with reproducible fit diagnostics in
 `domains.mp2_grid_diagnostics`. The fit accounts for both energy and derivative
 accuracy and runs outside differentiation.
@@ -400,12 +427,13 @@ uncertainty caused by selecting a LIS from sampled W.
 
 ### Triples controls
 
-`triples_controls=None` means deterministic triples when `ccsd_t=True`.
+`triples_controls=None` selects deterministic MRCC triples when `ccsd_t=True`.
 Leave it `None` when triples are disabled. Accepted keys are:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `mode` | `"deterministic"` | `"stochastic"` samples the same smooth numerator. |
+| `mode` | `"deterministic"` | `"stochastic"` samples the asymmetric selected-space partition. |
+| `partition` | `"mrcc"` for deterministic, `"asymmetric"` for stochastic | These are the only supported mode/partition combinations. |
 | `integral_transform` | `"df"` | `"rotate"` reuses cached CCSD integrals; both support energies and forces. |
 | `nsamples` | Required for stochastic mode | Integer ≥ 2; nominal production budget per fragment in fixed-count mode. Still required with a tolerance. |
 | `energy_tolerance` | Omitted or `0` | A positive value targets total triples energy SE in Eh; `5e-5` Eh is `0.05` mEh. |
@@ -415,7 +443,11 @@ Leave it `None` when triples are disabled. Accepted keys are:
 | `variance_allocation` | `"occupied_count"` for fragment plans | Fragment variance shares follow original occupied target counts. |
 | `fragment_energies` | Omitted | Only for `mp2_energy` allocation with previously captured concrete labels; incompatible with plan-based occupied-count allocation. |
 
-Only `mode` and `integral_transform` are accepted for deterministic triples.
+Only `mode`, `integral_transform`, and `partition="mrcc"` are accepted for deterministic triples.
+The former asymmetric deterministic implementation has been removed. The MRCC
+and asymmetric partitions can assign different energies to a selected fragment
+when its occupied projector does not commute with the occupied Fock matrix.
+Their complete-system sums agree.
 For ordinary fragment plans, retain `variance_allocation="occupied_count"`;
 energy-proxy allocation would require results before the fragment loop.
 A positive tolerance enables adaptive production, with at least 10000 draws
@@ -602,3 +634,8 @@ are 20000, the comparison runner's 10000. Output includes settings and individua
 energy/force records; the comparison runner also writes `comparison.json`.
 Force comparisons use Cartesian-component RMS in mEh/bohr. These diagnostics
 are separate from the stochastic energy SE target.
+
+Weak-pair forward and pullback use NumPy/SciPy and explicit real-float64
+adjoints. The JAX weak-pair fallback has been removed. Use the explicit
+`weak_pair_energy_and_grad` API; tracing weak-pair forward functions with JAX
+is unsupported. Coordinate integral response uses the native moment VJP.

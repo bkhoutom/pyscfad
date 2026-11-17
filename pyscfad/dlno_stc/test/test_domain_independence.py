@@ -103,9 +103,9 @@ def isolated_smoke(output_dir):
     np.testing.assert_allclose(dlno_stc.kernel(mf, static, controls=controls), direct,
                                atol=1e-10, rtol=0)
     system_energy, system_mol_bar = dlno_stc.value_and_grad(
-        mf.mol, accept.build_mf, scope="system", frozen=2,
+        mf.mol, accept.build_mf, boys_grouping="system", frozen=2,
         controls=controls, lo_kwargs=accept.LO_OPTIONS)
-    np.testing.assert_allclose(dlno_stc.kernel(mf, scope="system", frozen=2,
+    np.testing.assert_allclose(dlno_stc.kernel(mf, boys_grouping="system", frozen=2,
         controls=controls, lo_kwargs=accept.LO_OPTIONS), system_energy, atol=1e-10, rtol=0)
     assert np.isfinite(np.asarray(system_mol_bar.coords)).all()
     assert not attempted

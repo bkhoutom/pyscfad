@@ -6,20 +6,38 @@
 struct triples_left_pack {
     std::vector<arma::vec> value,bar;
     std::vector<size_t> ids;
+    // T2O(m,k,b,c) -> contiguous (b,c)-by-m matrices for each k,
+    // retaining both virtual pair orderings. Rank four, never a K cache.
+    std::vector<arma::vec> occupied,occupied_swapped;
+    std::vector<size_t> occupied_ids;
     explicit triples_left_pack(const std::vector<tensor>& bank,
-            const triples_layout& layout,bool gradient) {
+            const triples_layout& layout,bool gradient,bool cache_occupied=false) {
         value.resize(bank.size());bar.resize(bank.size());
         ids={GV,layout.projected[0][GV][0]};
         for(auto id:ids) {
             value[id].set_size(bank[id].value.n_elem);
             if(gradient) bar[id].set_size(bank[id].value.n_elem);
         }
+        occupied.resize(bank.size());occupied_swapped.resize(bank.size());
+        if(cache_occupied) {
+            occupied_ids={T2O,layout.projected[0][T2O][1]};
+            for(auto id:occupied_ids) {
+                occupied[id].set_size(bank[id].value.n_elem);
+                occupied_swapped[id].set_size(bank[id].value.n_elem);
+            }
+        }
     }
     size_t bytes() const {
         size_t n=0;
         for(const auto& v:value) n+=v.n_elem*sizeof(double);
         for(const auto& v:bar) n+=v.n_elem*sizeof(double);
+        for(const auto& v:occupied) n+=v.n_elem*sizeof(double);
+        for(const auto& v:occupied_swapped) n+=v.n_elem*sizeof(double);
         return n;
+    }
+    const double* occupied_slice(const operations& op,size_t no,size_t nv,bool swap) const {
+        const auto& v=swap ? occupied_swapped[op.ids[3]] : occupied[op.ids[3]];
+        return v.n_elem ? v.memptr()+op.indices[3][1]*no*nv*nv : nullptr;
     }
 };
 
@@ -34,6 +52,19 @@ void triples_left_pack_forward(triples_left_pack& pack,const std::vector<tensor>
             std::copy_n(bank[id].value.memptr()+pair*n,n,
                         pack.value[id].memptr()+((i*n+b)*n+a)*n);
             if(pack.bar[id].n_elem) std::fill_n(pack.bar[id].memptr()+pair*n,n,0.);
+        }
+    }
+    for(auto id:pack.occupied_ids) {
+        const auto& t=bank[id];const size_t no=t.dims[0],nk=t.dims[1];
+        #pragma omp for schedule(static)
+        for(size_t pair=0;pair<no*nk;++pair) {
+            const size_t k=pair/no,m=pair%no;
+            const double* src=t.value.memptr()+(m*nk+k)*n*n;
+            double* normal=pack.occupied[id].memptr()+pair*n*n;
+            double* swapped=pack.occupied_swapped[id].memptr()+pair*n*n;
+            std::copy_n(src,n*n,normal);
+            for(size_t b=0;b<n;++b) for(size_t c=0;c<n;++c)
+                swapped[b*n+c]=src[c*n+b];
         }
     }
 }
@@ -88,25 +119,27 @@ void triples_left_virtual(std::vector<tensor>& bank,const operations& op,
 }
 
 void triples_left_occupied(std::vector<tensor>& bank,const operations& op,
-        size_t no,size_t n,const triples_output_order& order,arma::vec& output,
+        const triples_left_pack& packed,size_t no,size_t n,const triples_output_order& order,arma::vec& output,
         triples_raw_workspace& w,triples_bar_locks* locks) {
     auto& go=bank[op.ids[2]];auto& to=bank[op.ids[3]];
     const size_t ng=go.offset(op.indices[2]),nt=to.offset(op.indices[3]);
     const size_t gs=go.dims[2]*go.dims[3],ts=to.dims[1]*n*n;
     for(size_t a=0;a<n;++a) std::copy_n(go.value.memptr()+ng+a*gs,no,w.h.colptr(a));
-    for(size_t m=0;m<no;++m) {
+    const double* retained=packed.occupied_slice(op,no,n,order.swap_pair);
+    if(!retained) for(size_t m=0;m<no;++m) {
         const double* src=to.value.memptr()+nt+m*ts;double* dst=w.u.colptr(m);
         if(!order.swap_pair) std::copy_n(src,n*n,dst);
         else for(size_t b=0;b<n;++b) for(size_t c=0;c<n;++c) dst[b*n+c]=src[c*n+b];
     }
+    arma::mat u(const_cast<double*>(retained ? retained : w.u.memptr()),n*n,no,false,true);
     arma::mat c(output.memptr(),order.singleton_first ? n*n : n,
                 order.singleton_first ? n : n*n,false,true);
     if(!locks) {
-        if(order.singleton_first) c-=w.u*w.h;
-        else c-=w.h.t()*w.u.t();
+        if(order.singleton_first) c-=u*w.h;
+        else c-=w.h.t()*u.t();
     } else {
-        if(order.singleton_first) {w.hb=-w.u.t()*c;w.ub=-c*w.h.t();}
-        else {w.hb=-w.u.t()*c.t();w.ub=-c.t()*w.h.t();}
+        if(order.singleton_first) {w.hb=-u.t()*c;w.ub=-c*w.h.t();}
+        else {w.hb=-u.t()*c.t();w.ub=-c.t()*w.h.t();}
         { std::lock_guard<std::mutex> guard(locks->at(op,2,go));
           for(size_t a=0;a<n;++a) for(size_t m=0;m<no;++m) go.bar[ng+a*gs+m]+=w.hb(m,a); }
         { std::lock_guard<std::mutex> guard(locks->at(op,3,to));
@@ -129,7 +162,7 @@ void triples_left_one_permutation(std::vector<tensor>& bank,const triples_layout
         const auto op=quadrature_describe(layout,permute(base,p,true),0);
         const triples_output_order v(p,false),o(p,true);
         triples_left_virtual(bank,op,pack,n,v,v.alternate ? alternate : main,workspace,locks);
-        triples_left_occupied(bank,op,no,n,o,o.alternate ? alternate : main,workspace,locks);
+        triples_left_occupied(bank,op,pack,no,n,o,o.alternate ? alternate : main,workspace,locks);
     }
     if(!locks) triples_permute_add(main,alternate,n,4);
 }

@@ -242,7 +242,8 @@ def _domain_targets(common, domains, index, frame):
     return orthonormalize(coordinates, np.eye(coordinates.shape[0]))
 
 
-def _build_domain_lis(mf, common, static, index, frame, occupied, virtual):
+def _build_domain_lis(mf, common, static, index, frame, occupied, virtual,
+                      frame_selector=None):
     """Select LNOs in the ED and enforce orthogonality at the CC boundary.
 
     Global AO rows are a zero-padded representation only. There is no global
@@ -282,7 +283,8 @@ def _build_domain_lis(mf, common, static, index, frame, occupied, virtual):
                 mapping, density = _compact_mapped_density(
                     _external_map(mapping, target), density, selection.occupied_map_columns)
             rotation = _mapped_density_space(density, mapping, target, keep,
-                embedded, common.s1e, None if frames is None else frames[spin])
+                embedded, common.s1e, None if frames is None else frames[spin],
+                transport_basis=frame_selector is not None)
         coeff = embedded @ rotation
         if spin == 0:
             original_occupied = coeff
@@ -290,7 +292,10 @@ def _build_domain_lis(mf, common, static, index, frame, occupied, virtual):
             coeff = _orthogonalize_lis_virtual(coeff, coefficients[0], common.s1e)
         # With no anchors yet, return the physical LIS for concrete frame
         # selection. Production transports the saved smooth anchors.
-        if frames is not None and not split_occupied:
+        if frame_selector is not None:
+            from .smooth import rebuild_frame
+            coeff = rebuild_frame(coeff, common.s1e, frame_selector(coeff, common.fock))
+        elif frames is not None and not split_occupied:
             from .smooth import rebuild_frame
             coeff = rebuild_frame(coeff, common.s1e, frames[spin])
         parents.append(embedded)
@@ -350,11 +355,17 @@ def _external_map(mapping, internal):
     return mapping - internal @ (internal.T.conj() @ mapping)
 
 
-def _mapped_density_space(density, mapping, internal, keep, coeff, overlap, anchor):
+def _mapped_density_space(density, mapping, internal, keep, coeff, overlap, anchor, *,
+                          transport_basis=False):
     """Rebuild the target plus retained domain span, including mapping response."""
     empty = np.zeros((density.shape[0], 0), dtype=density.dtype)
     if anchor is None:
-        external = _fixed_density_space(density, empty, keep, False)
+        if transport_basis:
+            from ._retained_space import retained_basis
+            external = (retained_basis(tuple(int(i) for i in keep))(density)
+                        if len(keep) else empty)
+        else:
+            external = _fixed_density_space(density, empty, keep, False)
         return np.concatenate((internal, mapping @ external), axis=1)
     from ._retained_space import retained_projector
     projected_anchor = coeff.T.conj() @ overlap @ np.asarray(anchor.anchor)
@@ -424,11 +435,13 @@ def build_fragment_lis_selection(
 
 
 def build_fragment_lis(mf, common, static, fragment_index, *, matrices,
-                       frame=None, frame_fragment_index=None):
+                       frame=None, frame_fragment_index=None, frame_selector=None):
     """Replay fixed LIS labels with current W blocks and the matching ED frame.
 
     The output contains only the domain LIS and its normalized target block.
     W blocks, ED orbitals, target overlaps and retained orbitals respond to AD.
+    A concrete ``frame_selector`` can choose frozen anchors during this same
+    construction, before returning the transported orbitals to the solver.
     """
     if not isinstance(static, LISSelections):
         raise TypeError('static must be LISSelections')
@@ -443,4 +456,5 @@ def build_fragment_lis(mf, common, static, fragment_index, *, matrices,
                       else frame_fragment_index)
     frame, occupied_ed, virtual_ed = _frame_and_matrices(
         common, static.mp2_static, representative, frame, matrices)
-    return _build_domain_lis(mf, common, static, index, frame, occupied_ed, virtual_ed)
+    return _build_domain_lis(mf, common, static, index, frame, occupied_ed, virtual_ed,
+                             frame_selector=frame_selector)

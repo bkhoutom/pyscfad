@@ -63,7 +63,7 @@ def main():
     parser.add_argument("--xyz-file", type=Path, required=True)
     parser.add_argument("--basis", required=True)
     parser.add_argument("--frozen", type=int, required=True)
-    parser.add_argument("--boys-grouping", choices=("molecule", "atom"), required=True)
+    parser.add_argument("--boys-grouping", choices=("system", "atom", "molecule"), required=True)
     parser.add_argument("--domain-thresholds", type=Path,
                         help="JSON object of BoysDomainThresholds overrides; omitted fields use library defaults")
     parser.add_argument("--targets-meh", type=float, nargs="+", default=[])
@@ -102,6 +102,8 @@ def main():
     mode.add_argument("--compare-solvers", action="store_true",
                       help="run the deterministic reference and requested stochastic jobs")
     args = parser.parse_args()
+    if args.boys_grouping == "molecule":
+        args.boys_grouping = "system"
     sgx_options = {key: getattr(args, 'sgx_' + key) for key in _SGX_DEFAULTS}
     sgx_settings = {'sgx_' + key: value for key, value in sgx_options.items()}
     if not math.isfinite(args.sgx_fp32_multiplier) or args.sgx_fp32_multiplier <= 0:
@@ -158,7 +160,7 @@ def main():
                               str(args.max_memory_mb * 1e6 / 1024**2))
 
     # Molecule grouping defines one full domain; atom grouping uses finite domains.
-    full_domain = args.boys_grouping == "molecule"
+    full_domain = args.boys_grouping == "system"
     threshold_options = (json.loads(args.domain_thresholds.read_text())
                          if args.domain_thresholds is not None else {})
     domain_thresholds = dlno_stc.BoysDomainThresholds(**threshold_options)
@@ -237,7 +239,7 @@ def main():
                    max_memory=args.max_memory_mb, verbose=4)
     mol.build(trace_exp=False, trace_ctr_coeff=False)
     elements = [mol.atom_symbol(i) for i in range(mol.natm)]
-    if args.boys_grouping == "molecule":
+    if args.boys_grouping == "system":
         assert elements == ["C"] * 5 + ["H"] * 6
         expected_groups = 1
     else:

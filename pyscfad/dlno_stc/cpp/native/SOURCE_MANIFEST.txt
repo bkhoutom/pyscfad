@@ -4,20 +4,20 @@ Combined supplied directory SHA256 (sorted name + NUL + file bytes): 427459d9b91
 
 SHA256 of all supplied v2 files:
 5f0837247968e9fbe2cddce229c391015c0db238e56e9ca1ecff32b740d0a320  README.md
-ae028b5a2bcb1676ee00ec134da8d3be3ffb8c575abee3fbcf3bc6f44f155803  stc_mp2_deterministic_d_w.h
-776b9bf10a007596bfefbea82155f573e4c92e4f8282d1fc9d1717349149e0ca  stc_mp2_deterministic_energy.h
+9ed661020d90291075d05cdcecaaca199f9e0cf9f9a8f1088c489faf43fa7fa0  stc_mp2_deterministic_d_w.h
+4fa99037612d2a7bd55ad72c1fab584465625ea18b30f41fe39b77fb8267bfbd  stc_mp2_deterministic_energy.h
 182b2b988bd446df63e21d5b754190c84d4c18394dfc0a9aba584fa3b0ff097a  stc_mp2_driver_helpers.h
 7f19d1472486b35bcd603865df04df29333c7adbbd8ed809ed4547f242d7e885  stc_mp2_energy_qchem.C
 7d21bdbaa4fde074e59004ed10d8b904798590e039632c06f9800426c1dcd496  stc_mp2_energy_qchem.h
 88f89d871812dedefe08866775ee8c7ff8578d621295cf9786e6b9b4ab1ab49e  stc_mp2_gradient_qchem.C
 1c87fa302146272b033ff261ecbe4fd75c157ab9ce7b03226ac963392de8c7fe  stc_mp2_gradient_qchem.h
-c9e495d14a9d80cf37d2dce818e8bf3cbd9421c658719e698e561bca20e2441d  stc_mp2_kernel_helpers.h
+6c4f3eea0e1c1aed1c398a2a34bb5d86be29c7c9aaae10bc157934b1ba80dd8a  stc_mp2_kernel_helpers.h
 73917fde3923bab13ce4346b49684900f7167e8015a444dfe43ddf6d84997d58  stc_mp2_kernel_qchem.C
-6b89f7367b63d0ee2ffe8be2bc1c1e52da00466fc65760c41f3058d28bb9ce7c  stc_mp2_kernel_qchem.h
+20a5a520d3f4b748a67735faa36f104620d2cb6f2546ce6517e327dd91851410  stc_mp2_kernel_qchem.h
 9e4cb81aa5271faa170916c0fc9ed6205a02024688416a7394bbd8f01e269136  stc_mp2_selected_driver.h
 fd2f3013608ec3293dfea4f42084ad264b61fd28eb6cf11fb7a0507f1357dfe9  stc_mp2_selected_energy.h
 35a8319aeaa2e094030f0cc4fe67a8454d98a86e76aced7a9d72f83b710abdc0  stc_mp2_selected_energy_density.h
-d377011211bfdb11aa8d8222b93678e80673eeff55dd9bf07bbdb91285414de1  stc_mp2_stochastic_density.h
+1179608573466fc102196263118a47093a349554f1c01342bbc2425cbd4159b8  stc_mp2_stochastic_density.h
 a775c22096afc21290c5a5dd2d172b4f924de384a4f6419bb854b116f493dbf8  stc_mp2_stochastic_w.h
 
 SHA256 of adapted native source files:
@@ -78,27 +78,26 @@ Adapter integration:
 Three-way exact diffs are recorded in part1_update/native_source_diffs.
 
 Asymmetric Laplace (T) cleanup, 2026-10-30:
-Only the denominator-free asymmetric numerator and selected-space restricted
-sampler are retained. Canonical and weighted sampling entry points were removed.
+The denominator-free asymmetric numerator and selected-space restricted
+sampler are retained for stochastic evaluation and its scalar reference. Canonical and weighted sampling entry points were removed.
 The native binding exposes energy and fused energy/VJP, including fov, L and R.
 nsamples=0 enumerates an exact reference. A separate discarded pilot may choose
 production counts; a positive SE target extends the production stream.
 Historical imported-source hashes are archived in
 results/triples_cleanup_20261030/before/pyscfad/dlno_stc/cpp/native/SOURCE_MANIFEST.txt.
 SHA256 of current retained triples sources:
-3f92c4d2795ec199c6ef52e310ba8e0c83256d0858ff804b5c2f60478f610979  stc_triples.h
-303a67fe79cb6a310b4a51f7884b642630348ed83941f25c9ed3e200e0950602  stc_triples_asymmetric.C
+7e53353af3f0ccc70f5a7af4f436fdc84fbdbaa380b7d8c0e440f989ed8d5dc6  stc_triples.h
+0ff442c9f4bfcaf09d762006ac483b47b7f7258cdb110d2db7ecc112a1375e8d  stc_triples_asymmetric.C
 3cb84a2fd873ab706d3b67b9f0f9f3119981d22a9ca291535075dd78072f7a96  triples_block_sampler.h
-98a4eface2dccbfd4f536afd7d5db84e927f9fd1b00484bef15c1eb225774ca8  triples_deterministic.inc
-6636883058bc28b16d890d8a11d4aec0e9b399f072eca2d4c1b1d1ad31c25921  triples_quadrature.inc
-e0a4038571127961c6a1cbf8e9743756427d85229998eea77fd371cebd94fbac  triples_one_permutation.inc
-6ecf1cc9c1ac440c635c81d9f90ec27ad27a38cdbdd62189a5e82bb0fd91195e  triples_grouped_adjoint.inc
-c8e7ab54aaf86e04dbabe0dc0c3c15b4aaa4106af2605a20dbd4701ce6ec8326  triples_streaming.inc
+3bd5bff77f89bdfbf204fe0816bbd2ffec8cdcecf5e7a19570dbeee64f4825f5  triples_deterministic.inc
+9d784d9be98f5c04c8dce40dd0f52a1d7daea6e210cce9f35f6654bdbc4bce1d  triples_quadrature.inc
+530cfcb622004a35c4a3613a72aa06a0bb66fa6c2e61ffc10123b45e7744b92a  triples_one_permutation.inc
+c144e1e8cdbfe22df4c2c95297278b68c299b76ec08199a2ac91e819e1a9aed0  triples_grouped_adjoint.inc
+34b3eac4b1e21cc4cd35343b22cf9d262fb83159d293418523ae20d096068f12  triples_streaming.inc
 
 Streaming triples: at most 128 numerator/cotangent blocks, independent of domain
 size; shared rank-four prepared banks; one-permutation connected left numerator.
-Grouped adjoints own output tiles and concatenate large GEMM reductions in
-bounded panels. Pair permutations go into cotangent packing, eliminating the
-rank-four packed GV bar. The retained-cache reference remains capped at 64
-blocks. Full domain caches are rejected. Mathematical functional and all
-independent prepared-input derivatives are unchanged.
+Grouped adjoints own output tiles and use direct BLAS views. Pair permutations go into cotangent packing, eliminating the
+rank-four packed GV bar. Deterministic evaluation uses only MRCC partition;
+the asymmetric deterministic evaluator and retained-cache API were removed.
+Full domain caches are rejected. The stochastic asymmetric sampler remains.

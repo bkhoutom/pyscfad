@@ -202,13 +202,13 @@ def test_stc_correlated_force_uses_sgx_response(mol, monkeypatch):
     controls = dict(mode='deterministic', laplace_roots=20*(nodes+1),
                     laplace_weights=20*weights)
     energy, gradient = dlno_stc.value_and_grad(
-        mol, reference, scope='system', frozen=1, controls=controls, include_hf=True)
+        mol, reference, boys_grouping='system', frozen=1, controls=controls, include_hf=True)
     assert len(calls) == 1
     h = 1e-4
     vals = []
     for x in (h, -h):
         mf = reference(moved(mol, x))
-        vals.append(mf.e_tot + dlno_stc.kernel(mf, scope='system', frozen=1, controls=controls))
+        vals.append(mf.e_tot + dlno_stc.kernel(mf, boys_grouping='system', frozen=1, controls=controls))
     np.testing.assert_allclose(gradient.coords[1, 2], (vals[0]-vals[1])/(2*h), atol=8e-7)
     assert np.isfinite(energy)
 

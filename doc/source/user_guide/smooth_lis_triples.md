@@ -6,7 +6,7 @@ calculation workflows, Python controls, defaults, storage choices, MPI and
 command-line examples are maintained there.
 
 The CC calculation uses W-selected retained spaces, one smooth occupied frame
-and one smooth virtual frame per LIS, and asymmetric Laplace triples with full
+and one smooth virtual frame per LIS, and MRCC deterministic or asymmetric stochastic Laplace triples with full
 Fock response. “Full frame” means the complete retained LIS; it does not disable
 LNO truncation or physical fragment weighting. Standalone domain MP2 uses its
 scalar energy solver without constructing W.
@@ -109,8 +109,7 @@ reused anchors does not recanonicalize them, so later evaluations can have
 non-diagonal Fock blocks. At each node, the dresser uses scalar virtual factors
 `exp(-tau (epsilon_a - mu))` whenever `tau ||Fvv - diag(Fvv)||_inf` is at most
 32 float64 machine epsilons (using the symmetric Fock block). Here `tau=t/2`
-for the shared half-dressing path and `tau=t` for the deterministic quadrature
-reuse path. This bounds the
+for both MRCC and stochastic half-dressing. This bounds the
 absolute operator error in the virtual exponential at roundoff level, without
 an energy-scale-dependent cutoff. Exactly diagonal blocks also avoid the
 virtual eigensolve. Noncanonical nodes use the original dense matrix transform.
@@ -129,48 +128,25 @@ requires no additional full ovvv copy or six-index triples tensor. Only the
 current quadrature node retains a reverse tape, bounded by available memory;
 otherwise the dresser recomputes intermediate transforms during reverse.
 
-The single-point entry points are `triples_prepared_energy` and
-`triples_prepared_energy_vjp`. With `nsamples=0` they contract deterministic
-blocks, one selected occupied orbital and two remaining occupied indices at a
-time. Each virtual cube is assembled with matrix multiplications; its spin
-permutations are virtual permutations of the same cube. Matrix adjoints return
-cotangents to the prepared tensors before the existing dressing pullback.
-For this single-point algorithm with `nS` selected occupied orbitals, the leading numerator cost over the grid is
-`O(nq nS no^2 nv^4 + nq nS no^3 nv^3)`, with `O(nv^3 + no nv^2)`
-working storage in addition to the prepared tensors and their cotangents.
-No full occupied triples tensor or reverse sampling-event list is formed.
-Occupied blocks use triangular symmetry. They run in parallel with one BLAS
-thread per worker when supported local MKL or pthread OpenBLAS thread control
-is available; otherwise the block loop is serial. Workers share the cotangent
-bank with slab locks. Worker scratch is bounded by an 8 GiB estimate, with at
-least one worker. `deterministic_workspace_bytes` reports aggregate worker
-scratch, excluding prepared tensors, their cotangents, and the numerator cache.
+Deterministic evaluation uses the MRCC half-Laplace partition through
+`triples_mrcc_point`. Each point builds its connected numerator once and uses
+a combined connected cotangent for the grouped reverse contractions. Occupied
+blocks are cached in batches of at most 128, bounded further by
+`PYSCFAD_TRIPLES_NUMERATOR_CACHE_MB`. No fifth-order global numerator is retained.
+The leading connected forward work is
+`12 * nq * nS * no*(no+1)/2 * nv**3 * (nv+no)` floating-point operations.
+The implementation preserves full occupied and virtual Fock response, including
+when forward semicanonical factors use scalar scaling.
 
-The production smooth deterministic solver additionally reuses the undressed,
-spin-adapted selected numerator across all Laplace nodes. The other side uses
-full external dressing and three cyclic pair permutations, visiting both
-ordered orientations of each cached triangular occupied block. Its cache
-cotangent is accumulated over the grid and reversed once per batch. This
-preserves the physical fragment operator and dense Fock response.
+The old asymmetric deterministic and quadrature-cache APIs have been removed.
+`triples_controls=None` now selects MRCC. Stochastic evaluation retains the
+asymmetric partition and the `triples_prepared_energy[_vjp]` sampler. Its proposal
+probabilities are held fixed during differentiation, with the same draws for
+energy and cotangents. Scalar exhaustive evaluation remains a small-system
+reference for this sampler, not a deterministic production backend.
 
-The cache receives at most half the current `max_memory` headroom, optionally
-capped by `PYSCFAD_TRIPLES_NUMERATOR_CACHE_MB` in MiB. At least one virtual cube
-(and its cotangent for gradients) is required. Smaller budgets cause batching
-and repeated dressing, without discarding contributions. Diagnostics include
-`numerator_cache_batches`, `numerator_cache_peak_bytes`, and
-`quadrature_reused_blocks`; `deterministic_blocks` counts the evaluated block
-operations, including cache construction and reverse work.
-
-This preserves the existing asymmetric physical fragment partition. Only
-the quadrature approximates the denominator; `samples` and `standard_error`
-remain zero. It requires rebuilding the STC extension, and its native version
-changes the correlation checkpoint identity. Smooth frames retain full occupied and virtual Fock matrices; the
-contraction does not assume they are diagonal.
-
-Positive counts use selected-space sampling with proposal tables
-built from the stable factors. The VJP uses the same draws as the energy.
-Proposal probabilities are held fixed in the derivative; the same sampled
-realization supplies energy and tensor cotangents.
+MRCC and asymmetric selected-fragment energies need not agree when the occupied
+projector and Fock matrix do not commute; their complete-system sums agree.
 
 ## Independent quadratures
 

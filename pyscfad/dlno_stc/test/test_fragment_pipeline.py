@@ -27,7 +27,7 @@ def test_deferred_lis_reaches_stc_cc_once_per_fragment(group_case, monkeypatch, 
         static.selection_options = {'indices': (0, 1)}
         return run_group(state, static, *args, **options)
 
-    def select(state, static, index, *args):
+    def select(state, static, index, *args, **options):
         selected.append(index)
         return SimpleNamespace(**(vars(static) | {'selection_options': None,
                                                   'selected_index': index}))

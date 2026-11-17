@@ -192,8 +192,8 @@ py::tuple graph_pullback(double node,py::tuple cotangents,size_t cache_limit_byt
         }
         if(cached) prefixes[id]=Array();
     }
-    const arma::mat fobar=exponential_vjp(occupied_,node,shift_,mbars[0]);
-    const arma::mat fvbar=exponential_vjp(virtual_,-node,shift_,mbars[1]);
+    const arma::mat fobar=exponential_vjp(occupied_,external_time(node),shift_,mbars[0]);
+    const arma::mat fvbar=exponential_vjp(virtual_,-external_time(node),shift_,mbars[1]);
     const arma::mat ubar=mbars[2].t();
     const arma::mat* matrix_bars[3]={&fobar,&fvbar,&ubar};
     for(size_t k=0;k<3;++k) {

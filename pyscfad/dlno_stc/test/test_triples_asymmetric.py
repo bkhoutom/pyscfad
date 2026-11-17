@@ -101,7 +101,7 @@ def test_stable_and_reference_native_entry_points():
     assert {name for name in dir(native) if name.startswith('triples_')} == {
         'triples_asymmetric_energy', 'triples_asymmetric_energy_vjp',
         'triples_asymmetric_integrals_energy', 'triples_asymmetric_integrals_energy_vjp',
-        'triples_prepared_energy', 'triples_prepared_energy_vjp', 'triples_quadrature_stream'}
+        'triples_prepared_energy', 'triples_prepared_energy_vjp', 'triples_mrcc_point'}
     assert 'stable-external-legs' in native.TRIPLES_VERSION
 
 

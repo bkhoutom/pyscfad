@@ -120,7 +120,7 @@ def test_high_level_identical_basis_gradient_uses_fragment_fitting(reference, mo
         mf.conv_tol = 1e-12
         mf.kernel()
         return mf
-    options = dict(scope='system', frozen=0, controls=_controls(), include_hf=True)
+    options = dict(boys_grouping='system', frozen=0, controls=_controls(), include_hf=True)
     expected, expected_bar = dlno_stc.value_and_grad(reference.mol, factory, **options)
     local_factors = prepare.lno_df.get_local_Lov
     calls = []

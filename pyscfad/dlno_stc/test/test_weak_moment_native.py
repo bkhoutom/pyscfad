@@ -127,31 +127,18 @@ def test_native_moment_coordinate_gradient_matches_finite_difference():
     np.testing.assert_allclose(analytic, finite_difference, rtol=2e-9, atol=2e-8)
 
 
-def test_existing_forward_jvp_agrees_with_native_reverse():
-    mol = _molecule()
-    raw, pullback = _pairs._origin_zero_moments_vjp(scf.RHF(mol), (0, 1, 2), 3)
-    seeds = _seeds(raw)
-    tangent_mol = jax.tree_util.tree_map(jnp.zeros_like, mol)
-    tangent_mol.coords = jnp.array([[.2, -.3, .1], [.4, .6, -.7], [-.1, .2, .5]])
-    _, tangent = jax.jvp(lambda value: _pairs._origin_zero_moments(value, 3),
-                         (mol,), (tangent_mol,))
-    reverse, = pullback(seeds)
-    expected = sum(float(jnp.vdot(w, t)) for w, t in zip(seeds, tangent))
-    np.testing.assert_allclose(np.vdot(reverse.mol.coords, tangent_mol.coords),
-                               expected, rtol=2e-12, atol=1e-10)
 
 
-def test_traced_pullback_weights_preserve_linear_response():
+
+def test_explicit_moment_pullback_is_linear_and_rejects_tracing():
     mf = scf.RHF(_molecule())
     raw, pullback = _pairs._origin_zero_moments_vjp(mf, (2, 0), 3)
-    seeds, tangent = _seeds(raw), _seeds(raw, seed=71)
-    actual, actual_tangent = jax.jvp(lambda weights: pullback(weights)[0].mol.coords,
-                                    (seeds,), (tangent,))
-    expected, = pullback(seeds)
-    expected_tangent, = pullback(tangent)
-    np.testing.assert_allclose(actual, expected.mol.coords, rtol=2e-12, atol=1e-10)
-    np.testing.assert_allclose(actual_tangent, expected_tangent.mol.coords,
-                               rtol=2e-12, atol=1e-10)
+    a, b = _seeds(raw), _seeds(raw, seed=71)
+    combined = jax.tree.map(lambda x,y: np.asarray(x)+np.asarray(y), a,b)
+    np.testing.assert_allclose(pullback(combined)[0].mol.coords,
+        pullback(a)[0].mol.coords+pullback(b)[0].mol.coords, rtol=2e-12,atol=1e-10)
+    with pytest.raises(TypeError, match='explicit NumPy/SciPy'):
+        jax.jvp(lambda w: pullback(w)[0].mol.coords, (a,), (b,))
 
 
 def test_large_contracted_shell_keeps_response_within_native_scratch(monkeypatch):
@@ -169,35 +156,16 @@ def test_large_contracted_shell_keeps_response_within_native_scratch(monkeypatch
         raise AssertionError('shell output exceeds the native derivative scratch buffer')
 
     monkeypatch.setattr(_moleintor_vjp, '_int1e_r0_deriv', forbid_native)
-    raw, pullback = _pairs._origin_zero_moments_vjp(mf, (0,), 3)
-    actual, = pullback(_seeds(raw))
-    assert np.isfinite(actual.mol.coords).all()
+    with pytest.raises(TypeError, match='shell-size limit'):
+        _pairs._origin_zero_moments_vjp(mf, (0,), 3)
 
 
 @pytest.mark.parametrize('traced', ['exp', 'ctr_coeff'])
-def test_traced_basis_parameters_keep_the_existing_reverse_rule(traced, monkeypatch):
+def test_basis_parameters_require_coordinate_only_weak_api(traced):
     mol = _molecule(basis='sto-3g', trace_exp=traced == 'exp',
                     trace_ctr_coeff=traced == 'ctr_coeff')
-    mf = scf.RHF(mol)
-    assert not _pairs._native_weak_moments_supported(mf)
-
-    def forbid_native(*args, **kwargs):
-        raise AssertionError('coordinate-only native rule used for active basis parameters')
-
-    monkeypatch.setattr(_moleintor_vjp, '_int1e_r0_deriv', forbid_native)
-    # Use every atom: the existing submolecule adapter does not slice basis leaves.
-    evaluate = lambda current: _pairs._origin_zero_moments(
-        _pairs._fake_mol_with_traced_centers(current.mol, (0, 1, 2)), 1)
-    expected_raw, expected_pullback = jax.vjp(evaluate, mf)
-    raw, pullback = _pairs._origin_zero_moments_vjp(mf, (0, 1, 2), 1)
-    seeds = _seeds(raw)
-    actual, = pullback(seeds)
-    expected, = expected_pullback(seeds)
-    for got, want in zip(jax.tree_util.tree_leaves(raw), jax.tree_util.tree_leaves(expected_raw)):
-        np.testing.assert_array_equal(got, want)
-    for got, want in zip(jax.tree_util.tree_leaves(actual), jax.tree_util.tree_leaves(expected)):
-        np.testing.assert_allclose(got, want, rtol=2e-12, atol=1e-10)
-    assert np.linalg.norm(getattr(actual.mol, traced)) > 1e-3
+    with pytest.raises(TypeError, match='coordinate-only'):
+        _pairs._origin_zero_moments_vjp(scf.RHF(mol), (0, 1, 2), 1)
 
 
 def test_nongrouped_endpoint_replay_preserves_molecule_and_orbital_response(monkeypatch):
@@ -213,10 +181,15 @@ def test_nongrouped_endpoint_replay_preserves_molecule_and_orbital_response(monk
         fragments=(SimpleNamespace(primary_atoms=np.array([0, 1, 2])),),
         thresholds=SimpleNamespace(multipole_order=4),
     )
-    reference, reference_pullback = jax.vjp(
-        lambda m, s: _pairs._weak_endpoint_from_screen(m, s, static, 0), mf, screen)
+    from pyscfad.lib._multipole import transition_moments
+    raw, raw_pb = _pairs._origin_zero_moments_vjp(mf, (0,1,2), 3)
+    def endpoint(s, operators):
+        c,m,q,o = transition_moments(s.occupied_coeff,s.virtual_coeff,*operators,4)
+        return c[0],m[0],s.virtual_energy-s.occupied_energy[0],q[0],o[0]
+    reference, pb = jax.vjp(endpoint, screen, raw)
     seed = _seeds(reference)
-    expected_mf, expected_screen = reference_pullback(seed)
+    expected_screen, raw_bar = pb(seed)
+    expected_mf, = raw_pb(raw_bar)
     original_intor = gto.Mole.intor
 
     def forbid_full_derivatives(self, name, *args, **kwargs):

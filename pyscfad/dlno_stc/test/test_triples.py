@@ -108,7 +108,7 @@ def test_triples_defaults_are_independent_and_copy_controls():
     normalize = getattr(controls, 'normalize_triples_controls', None)
     assert callable(normalize), 'triples controls need their own normalizer'
     assert normalize(None, ccsd_t=False) is None
-    assert normalize(None, ccsd_t=True) == {'mode': 'deterministic'}
+    assert normalize(None, ccsd_t=True) == {'mode': 'deterministic', 'partition': 'mrcc'}
     supplied = {'mode': 'stochastic', 'nsamples': np.int64(7)}
     assert normalize(supplied, ccsd_t=True) == {'mode': 'stochastic', 'nsamples': 7, 'global_seed': 71}
     assert supplied == {'mode': 'stochastic', 'nsamples': 7}
@@ -260,6 +260,8 @@ def test_group_carries_triples_diagnostics_through_response(monkeypatch, with_gr
     monkeypatch.setattr(ccsd.driver, '_prepare', prepared)
     monkeypatch.setattr(ccsd, '_group_cc_fragments', lambda static, group: ((0, (0,)),))
     monkeypatch.setattr(ccsd, '_solve_fragment', fragment)
+    # This diagnostic-only stub supplies its solver and has no LIS to select.
+    monkeypatch.setattr(ccsd, '_select_current_fragment', lambda state, static, *args, **kwargs: static)
     state = dict(mf=jnp.asarray(.2), common=jnp.asarray(-.1), energy=jnp.zeros(()),
                  variance=0., mf_bar=jnp.zeros(()), common_bar=jnp.zeros(()))
     records = ccsd._run_group(state, static, group, base, {'mode':'deterministic', 'threads':1},

@@ -91,24 +91,35 @@ def normalize_triples_controls(controls, *, ccsd_t):
             raise ValueError('triples_controls requires ccsd_t=True')
         return None
     if controls is None:
-        return {'mode': 'deterministic'}
+        return {'mode': 'deterministic', 'partition': 'mrcc'}
     if not isinstance(controls, dict):
         raise TypeError('triples_controls must be a dictionary')
     settings = controls.copy()
     unknown = set(settings) - {'mode', 'nsamples', 'global_seed', 'energy_tolerance',
                                'pilot_samples', 'fragment_energies', 'trace_exponent',
-                               'integral_transform', 'variance_allocation'}
+                               'integral_transform', 'variance_allocation', 'partition'}
     if unknown:
         raise ValueError('unsupported triples controls: '
                          + ', '.join(sorted(map(str, unknown))))
     mode = settings.setdefault('mode', 'deterministic')
     if mode not in ('deterministic', 'stochastic'):
         raise ValueError('triples mode must be deterministic or stochastic')
+    partition = settings.get('partition', 'mrcc' if mode == 'deterministic' else 'asymmetric')
+    if partition not in ('asymmetric', 'mrcc'):
+        raise ValueError('triples partition must be asymmetric or mrcc')
+    if mode == 'deterministic':
+        if partition != 'mrcc':
+            raise ValueError('deterministic asymmetric triples were removed; use partition=mrcc')
+        settings['partition'] = 'mrcc'
+    else:
+        if partition != 'asymmetric':
+            raise ValueError('MRCC partition currently requires deterministic triples')
+        settings.pop('partition', None)
     if _triples_integral_transform(settings) == 'df':
         # Explicit default and omission share a checkpoint identity.
         settings.pop('integral_transform', None)
     if mode == 'deterministic':
-        if set(settings) - {'mode', 'integral_transform'}:
+        if set(settings) - {'mode', 'integral_transform', 'partition'}:
             raise ValueError('deterministic triples do not accept sampling controls')
         return settings
     allocation = settings.get('variance_allocation', 'mp2_energy')

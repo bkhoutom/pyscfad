@@ -49,7 +49,7 @@ def test_response_profile_preserves_energy_gradient_and_work(scope, monkeypatch,
                    basis='sto-3g', verbose=0, max_memory=3000)
     mol.build(trace_exp=False, trace_ctr_coeff=False)
     mol.incore_anyway = True
-    options = {'scope': scope}
+    options = {'boys_grouping': 'system' if scope == 'system' else None}
     if scope == 'domain':
         from pyscfad.dlno_stc._selection import build_domain_groups
         static = dlno_stc.build_domain_selections(_mf(mol), frozen=1)

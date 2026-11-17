@@ -75,7 +75,7 @@ def main():
     report(f"DF-RHF converged: {float(mf.e_tot):.12f} Eh")
     frozen = 0  # Hydrogen has no core orbital to freeze.
     static = dlno_stc.build_domain_selections(
-        mf, frozen=frozen, full_domain=True, boys_grouping="molecule",
+        mf, frozen=frozen, full_domain=True, boys_grouping="system",
         lo_kwargs=dict(init_guess="atomic", conv_tol=1e-10,
                        gmres_options=dict(restart=120, maxiter=100)),
     )

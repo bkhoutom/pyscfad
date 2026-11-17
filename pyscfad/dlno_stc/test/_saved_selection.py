@@ -7,8 +7,8 @@ from pyscfad.dlno_stc import ccsd
 def save_from_run(mf, plan, **options):
     selected = {}
     original = ccsd._select_current_fragment
-    def capture(state, static, index, group, frame, forward):
-        result = original(state, static, index, group, frame, forward)
+    def capture(state, static, index, group, frame, forward, **options):
+        result = original(state, static, index, group, frame, forward, **options)
         selected[index] = (result, float(forward['energy']))
         return result
     with patch.object(ccsd, '_select_current_fragment', capture):

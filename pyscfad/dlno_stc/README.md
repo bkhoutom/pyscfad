@@ -534,7 +534,32 @@ out-of-core SCF factors must be accessible on every rank.
 Serial CC supports `checkpoint_dir` and `resume`. Checkpoints save completed
 numerical contributions, selections, scientific settings and implementation
 identity. Native replay handles and AD tapes are never serialized. CC
-selection schema 18 records the fragment plan and requires all fragments; older selections must be rebuilt.
+selection schema 19 records the fragment plan and requires all fragments; older selections must be rebuilt.
+
+An SCF density-checkpoint restart can resume completed CC groups with
+`checkpoint_dir=<original directory>, resume=True`. SCF must reconverge at the
+same geometry and with compatible molecular, DF/SGX, occupation, frozen-space,
+domain and solver settings. SCF energy, orbital energies and MO coefficients
+are compared numerically (absolute tolerances `1e-7` Eh, `1e-6` Eh and `1e-5`,
+respectively), rather than by bitwise hashes. Orbital order and phase must
+agree; the gradient driver already fixes MO phases. Different SCF solutions
+or orbital rotations outside those tolerances are rejected. SCF memory/workspace
+limits and the operational MP2/W thread/block controls may change.
+
+Resume validates the requested thresholds, pair graph, effective domain/rank
+labels and physical grouping, then restores the original saved Boys/LIS
+references and quadratures **before** constructing the common-data pullback.
+Regenerated floating-point references, grid diagnostics and intermediate BP
+construction lists need not be identical. Global MP2 roots/weights must
+agree within `rtol=1e-6, atol=1e-9`; the saved grid is used for resumed work.
+The live SCF response is rebuilt, so completed gradient contributions and the
+remaining domains share the saved reference frame. Checksum validation and
+the single-writer lock remain active.
+
+New CC checkpoints include a checksummed numerical SCF reference record.
+Older checkpoints contain only hashes of that reference and cannot be safely
+migrated to this compatibility scheme; start a new domain checkpoint directory
+while retaining a compatible SCF density checkpoint.
 
 Disk request/result exchange, export/import/replay drivers, per-domain MPI
 replica averaging and public fragment-subset/correction-only modes have been

@@ -829,6 +829,23 @@ def _run_weak(state, static, *, with_grad, pairs=None):
     state['weak_energy'] = state.get('weak_energy', 0.) + float(energy)
 
 
+def _checkpoint_options(*, with_grad, include_hf, ccsd_t, triples_controls,
+                        vvvv_direct, merge_identical, solver_options):
+    return dict(with_grad=with_grad, include_hf=include_hf, ccsd_t=ccsd_t,
+                triples_controls=triples_controls, vvvv_direct=vvvv_direct,
+                merge_identical=merge_identical, **solver_options)
+
+
+def _resume_selection(mf, static, *, checkpoint_dir, correlation_auxbasis,
+                      **options):
+    from ._ccsd_checkpoint import resume_selection
+    groups = build_domain_groups(static.mp2_static,
+                                 merge_identical=options['merge_identical'])
+    return resume_selection(mf, static, groups, checkpoint_dir=checkpoint_dir,
+                            correlation_auxbasis=correlation_auxbasis,
+                            options=_checkpoint_options(**options))
+
+
 def _run_serial(state, static, baseline, matrix, *, with_grad, include_hf,
                 merge_identical, verbose_imp, ccsd_t, return_components,
                 triples_controls=None,
@@ -836,15 +853,14 @@ def _run_serial(state, static, baseline, matrix, *, with_grad, include_hf,
                 cc_solver='deterministic', stc_cc_controls=None, lis_aux_svd_tol=None):
     from ._ccsd_checkpoint import open_checkpoint, restore_progress, save_progress
     groups = build_domain_groups(static.mp2_static, merge_identical=merge_identical)
-    options = dict(with_grad=with_grad, include_hf=include_hf, ccsd_t=ccsd_t,
-                   triples_controls=triples_controls, vvvv_direct=vvvv_direct,
-
-                   merge_identical=merge_identical)
     solver_options = (dict(cc_solver=cc_solver, stc_cc_controls=stc_cc_controls)
                       if cc_solver == 'stc' else {})
     if lis_aux_svd_tol:
         solver_options['lis_aux_svd_tol'] = lis_aux_svd_tol
-    options.update(solver_options)
+    options = _checkpoint_options(with_grad=with_grad, include_hf=include_hf,
+                                  ccsd_t=ccsd_t, triples_controls=triples_controls,
+                                  vvvv_direct=vvvv_direct, merge_identical=merge_identical,
+                                  solver_options=solver_options)
     checkpoint = open_checkpoint(state, static, groups, checkpoint_dir=checkpoint_dir,
                                   resume=resume, options=options)
     try:
@@ -992,6 +1008,7 @@ def kernel(mf, static, *, baseline_controls=None, matrix_controls=None, mp2_grid
     not bound forces; cap/unmet-target diagnostics remain explicit.
     """
     def initialize():
+        selected = static
         solver_options = _cc_solver_options(cc_solver, stc_cc_controls, lis_aux_svd_tol)
         triples = normalize_triples_controls(triples_controls, ccsd_t=ccsd_t)
         baseline, matrix = _validate_run(static, baseline_controls, matrix_controls, mp2_grid)
@@ -1002,12 +1019,20 @@ def kernel(mf, static, *, baseline_controls=None, matrix_controls=None, mp2_grid
         if any(isinstance(x, jax.core.Tracer) for x in jax.tree_util.tree_leaves(mf)):
             raise TypeError('STC CC kernel is forward-only; use value_and_grad')
         validate_selection_basis(mf, static, correlation_auxbasis)
-        state = driver._initialize(mf, static.mp2_static, baseline, with_grad=False,
+        if resume:
+            selected = _resume_selection(
+                mf, static, checkpoint_dir=checkpoint_dir,
+                correlation_auxbasis=correlation_auxbasis,
+                with_grad=False, include_hf=include_hf, ccsd_t=ccsd_t,
+                triples_controls=triples, vvvv_direct=vvvv_direct,
+                merge_identical=merge_identical, solver_options=solver_options)
+            baseline, matrix = _validate_run(selected, baseline_controls, matrix_controls)
+        state = driver._initialize(mf, selected.mp2_static, baseline, with_grad=False,
                                    **basis_kwargs(correlation_auxbasis))
         state['cc_triples_controls'] = triples
         if solver_options:
             state['cc_solver_options'] = solver_options
-        return state, static, baseline, matrix
+        return state, selected, baseline, matrix
 
     def initialize_worker(canonical):
         if mf is None:
@@ -1107,6 +1132,14 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls=None, matrix
         if build_static is not None:
             _stc_precision.validate_seed_independence(solver_options.get('stc_cc_controls'), indices)
         triples = _allocate_triples_controls(triples, len(indices), static=selected, indices=indices)
+        if resume:
+            selected = _resume_selection(
+                mf, selected, checkpoint_dir=checkpoint_dir,
+                correlation_auxbasis=correlation_auxbasis,
+                with_grad=True, include_hf=include_hf, ccsd_t=ccsd_t,
+                triples_controls=triples, vvvv_direct=vvvv_direct,
+                merge_identical=merge_identical, solver_options=solver_options)
+            baseline, matrix = _validate_run(selected, baseline_controls, matrix_controls)
         state = driver._initialize(mf, selected.mp2_static, baseline, with_grad=True,
                                    scf_pullback=scf_pullback, scf_data=scf_data,
                                    scf_data_pullback=scf_data_pullback,

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <set>
+#include <memory>
 #include <omp.h>
 #ifdef __linux__
 #include <dlfcn.h>
@@ -97,16 +98,26 @@ py::dict parallel_runtime_info(py::object runtime_path) {
     return result;
 #endif
 }
-py::array checked_array(py::handle value, const char* name, int ndim) {
+py::array checked_array(py::handle value, const char* name, int ndim,
+                        bool native_layout=false) {
     if (!py::isinstance<py::array>(value))
         throw py::type_error(std::string(name)+" must be a NumPy array");
     auto a = py::reinterpret_borrow<py::array>(value);
     if (!a.dtype().is(py::dtype::of<double>()))
         throw py::type_error(std::string(name)+" must have float64 dtype");
-    if (!(a.flags() & py::array::c_style))
-        throw py::value_error(std::string(name)+" must be C-contiguous");
     if (a.ndim() != ndim)
         throw py::value_error(std::string(name)+" has incorrect rank");
+    if (native_layout) {
+        // Logical B[P,i,a], with P contiguous and (i,a) flattened in C order.
+        const py::ssize_t item=sizeof(double), np=a.shape(0), nv=a.shape(2);
+        if (a.size() && ((np>1 && a.strides(0)!=item) ||
+                        (a.shape(1)>1 && a.strides(1)!=np*nv*item) ||
+                        (nv>1 && a.strides(2)!=np*item) ||
+                        reinterpret_cast<std::uintptr_t>(a.data()) % alignof(double)))
+            throw py::value_error("B must have native (P,ia) column-major layout");
+    } else if (!(a.flags() & py::array::c_style)) {
+        throw py::value_error(std::string(name)+" must be C-contiguous");
+    }
     const auto* data = static_cast<const double*>(a.data());
     for (py::ssize_t j = 0; j < a.size(); ++j)
         if (!std::isfinite(data[j]))
@@ -194,14 +205,15 @@ void deterministic_controls(const py::dict& controls, stc::Controls& settings) {
 #ifdef PYSCFAD_STC_TEST_REFERENCE
 #include "test_reference/bindings.inc"
 #endif
-py::dict solve_selected(py::handle foo, py::handle fvv, py::handle B,
+py::dict solve_selected_impl(py::handle foo, py::handle fvv, py::handle B,
                         py::handle target_indices,
-               py::dict controls, py::object aux_offsets, bool with_grad) {
+               py::dict controls, py::object aux_offsets, bool with_grad,
+               bool borrow_b) {
     check_energy_controls(controls);
     if (controls.contains("canonical_fock") && py::cast<bool>(controls["canonical_fock"]))
         throw py::value_error("canonical_fock is not supported; full Fock response is required");
     const auto fo = checked_array(foo,"foo",2), fv = checked_array(fvv,"fvv",2);
-    const auto bp = checked_array(B,"B",3);
+    const auto bp = checked_array(B,"B",3,borrow_b);
     const py::ssize_t no = fo.shape(0), nv = fv.shape(0), np = bp.shape(0);
     if (no == 0) throw py::value_error("STC-MP2 requires at least one active occupied orbital");
     if (fo.shape(1)!=no || fv.shape(1)!=nv || bp.shape(1)!=no || bp.shape(2)!=nv)
@@ -233,6 +245,8 @@ py::dict solve_selected(py::handle foo, py::handle fvv, py::handle B,
     if (mode!="deterministic" && mode!="stochastic")
         throw py::value_error("mode must be deterministic or stochastic");
     settings.stochastic=mode=="stochastic";
+    if (borrow_b && settings.stochastic)
+        throw py::value_error("Borrowed B is supported only for deterministic MP2");
     if (!controls.contains("laplace_roots") || !controls.contains("laplace_weights"))
         throw py::value_error("explicit laplace_roots and laplace_weights are required");
     settings.roots = py::cast<std::vector<double>>(controls["laplace_roots"]);
@@ -270,11 +284,17 @@ py::dict solve_selected(py::handle foo, py::handle fvv, py::handle B,
         if (!index) throw py::error_already_set();
         settings.global_seed=py::cast<std::uint64_t>(index);
     }
-    x.B.set_size(np,no*nv);
     const auto* source = static_cast<const double*>(bp.data());
-    for (py::ssize_t P=0; P<np; ++P)
-        for (py::ssize_t i=0; i<no; ++i)
-            for (py::ssize_t a=0; a<nv; ++a) x.B(P,i*nv+a)=source[(P*no+i)*nv+a];
+    if (borrow_b) {
+        // bp keeps the Python owner alive across GIL release. The scalar
+        // deterministic kernel only reads this strict, non-owning view.
+        x.B=arma::mat(const_cast<double*>(source),np,no*nv,false,true);
+    } else {
+        x.B.set_size(np,no*nv);
+        for (py::ssize_t P=0; P<np; ++P)
+            for (py::ssize_t i=0; i<no; ++i)
+                for (py::ssize_t a=0; a<nv; ++a) x.B(P,i*nv+a)=source[(P*no+i)*nv+a];
+    }
     if (aux_offsets.is_none()) x.aux_offsets={0,static_cast<arma::uword>(np)};
     else {
         auto offsets = py::array::ensure(aux_offsets);
@@ -301,6 +321,8 @@ py::dict solve_selected(py::handle foo, py::handle fvv, py::handle B,
     diagnostics["mode"]=mode; diagnostics["global_seed"]=settings.global_seed;
     diagnostics["energy_identity"]="boys_target_laplace_mp2_v1";
     if (!settings.stochastic) {
+        diagnostics["borrowed_input_B"]=out.borrowed_input_B && x.B.memptr()==source;
+        diagnostics["peak_factor_buffers"]=out.peak_factor_buffers;
         diagnostics["propagation_calls"]=out.propagation_calls;
         diagnostics["backprop_calls"]=out.backprop_calls;
         diagnostics["cached_targets"]=out.cached_targets;
@@ -336,14 +358,28 @@ py::dict solve_selected(py::handle foo, py::handle fvv, py::handle B,
     if (with_grad) {
         py::dict bars;
         bars["foo"]=array(out.foo); bars["fvv"]=array(out.fvv);
-        py::array_t<double> bar_B({np,no,nv});
-        auto* target=bar_B.mutable_data();
-        for (py::ssize_t P=0; P<np; ++P)
-            for (py::ssize_t i=0; i<no; ++i)
-                for (py::ssize_t a=0; a<nv; ++a) target[(P*no+i)*nv+a]=out.B(P,i*nv+a);
-        bars["B"]=bar_B; result["cotangents"]=bars;
+        if (borrow_b) {
+            auto owner=std::make_unique<arma::mat>(std::move(out.B));
+            py::capsule lifetime(owner.get(), [](void* p) { delete static_cast<arma::mat*>(p); });
+            auto* matrix=owner.release();
+            const py::ssize_t item=sizeof(double);
+            bars["B"]=py::array(py::dtype::of<double>(), {np,no,nv},
+                {item,np*nv*item,np*item}, matrix->memptr(), lifetime);
+        } else {
+            py::array_t<double> bar_B({np,no,nv});
+            auto* target=bar_B.mutable_data();
+            for (py::ssize_t P=0; P<np; ++P)
+                for (py::ssize_t i=0; i<no; ++i)
+                    for (py::ssize_t a=0; a<nv; ++a) target[(P*no+i)*nv+a]=out.B(P,i*nv+a);
+            bars["B"]=bar_B;
+        }
+        result["cotangents"]=bars;
     }
     return result;
+}
+py::dict solve_selected(py::handle foo, py::handle fvv, py::handle B,
+        py::handle targets, py::dict controls, py::object offsets, bool with_grad) {
+    return solve_selected_impl(foo,fvv,B,targets,controls,offsets,with_grad,false);
 }
 py::dict solve_full(py::handle foo, py::handle fvv, py::handle B,
                     py::dict controls, py::object aux_offsets, bool with_grad) {
@@ -361,6 +397,12 @@ PYBIND11_MODULE(_stc_mp2,m) {
     m.def("solve_selected",&solve_selected,py::arg("foo"),py::arg("fvv"),py::arg("B"),
           py::arg("target_indices"),py::arg("controls"),py::kw_only(),
           py::arg("aux_offsets")=py::none(),py::arg("with_grad")=true);
+    m.def("_solve_selected_borrowed", [](py::handle foo, py::handle fvv, py::handle b,
+            py::handle targets, py::dict controls, py::object offsets, bool with_grad) {
+        return solve_selected_impl(foo,fvv,b,targets,controls,offsets,with_grad,true);
+    }, py::arg("foo"),py::arg("fvv"),py::arg("B"),py::arg("target_indices"),
+       py::arg("controls"),py::kw_only(),py::arg("aux_offsets")=py::none(),
+       py::arg("with_grad")=true);
 #ifdef PYSCFAD_STC_TEST_REFERENCE
     m.def("_solve_full_reference",&solve_full_reference,py::arg("foo"),py::arg("fvv"),py::arg("B"),
           py::arg("controls"),py::arg("aux_offsets")=py::none(),py::arg("with_grad")=false);

@@ -13,10 +13,15 @@ namespace qchem {
 
 stc_mp2_kernel::stc_mp2_kernel(
         const arma::mat& fo, const arma::mat& fv, const arma::mat& b,
-        const arma::Col<size_t>& offsets, unsigned seed, double energy_domain_tau)
+        const arma::Col<size_t>& offsets, unsigned seed, double energy_domain_tau,
+        bool borrow_original)
     : nocc_(fo.n_rows), nvirt_(fv.n_rows), naux_(b.n_rows),
       natom_(offsets.n_elem - 1), offset_aux_(offsets), occupied_fock_(fo),
-      virtual_fock_(fv), B_ia_(b), selected_domain_tau_(energy_domain_tau),
+      virtual_fock_(fv), B_ia_(borrow_original ? arma::mat() : b),
+      original_B_ia_(borrow_original
+          ? arma::mat(const_cast<double*>(b.memptr()), b.n_rows, b.n_cols, false, true)
+          : arma::mat()), borrowed_original_(borrow_original),
+      selected_domain_tau_(energy_domain_tau),
       explicit_seed_(seed) {}
 
 } // namespace qchem
@@ -592,17 +597,19 @@ Result solve_deterministic_energy(const Inputs& inputs,
     const auto no = inputs.foo.n_rows;
     const auto nv = inputs.fvv.n_rows;
     const auto np = inputs.B.n_rows;
-    if (with_grad) {
-        output.foo.zeros(no, no);
-        output.fvv.zeros(nv, nv);
-        output.B.zeros(np, no * nv);
-    }
     if (!nv || !np) {
+        if (with_grad) {
+            output.foo.zeros(no, no);
+            output.fvv.zeros(nv, nv);
+            output.B.zeros(np, no * nv);
+        }
         return output;
     }
     positive_gap(inputs);
     ThreadScope team(controls.threads > 0 ? controls.threads : omp_get_max_threads());
-    NativeKernel kernel(inputs.foo, inputs.fvv, inputs.B, offsets_array(inputs));
+    NativeKernel kernel(inputs.foo, inputs.fvv, inputs.B, offsets_array(inputs),
+                        20260920u, 6.5e-3, true);
+    output.borrowed_input_B = kernel.original_integrals().memptr() == inputs.B.memptr();
     const arma::vec roots(controls.roots), weights(controls.weights);
     const std::vector<size_t> group(targets.begin(),targets.end());
     auto result=source::evaluate_deterministic_energy(
@@ -616,6 +623,7 @@ Result solve_deterministic_energy(const Inputs& inputs,
     output.propagation_calls=result.propagation_calls;
     output.backprop_calls=result.backprop_calls;
     output.cached_targets=result.cached_targets;
+    output.peak_factor_buffers=result.peak_factor_buffers;
     output.bare_integrals_seconds=result.bare_integrals_seconds;
     output.propagation_seconds=result.propagation_seconds;
     output.contraction_seconds=result.contraction_seconds;

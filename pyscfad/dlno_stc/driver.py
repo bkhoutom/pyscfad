@@ -287,6 +287,8 @@ def _prepare(state, static, group, controls, with_grad, *, return_frame=False):
     ``(input_bars, (occupied_bar, virtual_bar))``. Static frame metadata never
     enters the differentiable output tree.
     """
+    if not return_frame and controls.get('mode', 'deterministic') == 'deterministic':
+        return _prepare_host_domain(state, static, group, controls, with_grad)
     if static.fragments[group.representative_index].strong_virtual is None and static.ed_selection_pending:
         return _prepare_planned_domain(state, static, group, controls, with_grad,
                                        return_frame=return_frame)
@@ -324,6 +326,55 @@ def _prepare(state, static, group, controls, with_grad, *, return_frame=False):
     if return_frame:
         return inputs, backend.host_inputs(inputs), pullback, frame
     return inputs, backend.host_inputs(inputs), pullback
+
+
+def _prepare_host_domain(state, static, group, controls, with_grad):
+    """Share one fitted B between scalar MP2 and the saved integral reverse."""
+    from .domain import build_boys_ed_frame
+    from ._ed_selection import select_boys_ed_frame, resolve_group
+    from ._mp2_preparation import project_inputs
+    index = group.representative_index
+    pending = (static.fragments[index].strong_virtual is None and static.ed_selection_pending)
+
+    def select(common):
+        if pending:
+            frame, labels = select_boys_ed_frame(common, static, index)
+        else:
+            frame, labels = build_boys_ed_frame(common, static, index), None
+        ao = frame.extended_ao_indices
+        return (common.fock[numpy.ix_(ao, ao)], frame.occupied_coeff,
+                frame.virtual_coeff), (frame, labels)
+
+    with resource_profile.section('stc.domain.select_ed', group=index):
+        if with_grad:
+            values, frame_pullback, (frame, labels) = jax.vjp(
+                select, state['common'], has_aux=True)
+        else:
+            values, (frame, labels) = select(state['common'])
+    resolved = resolve_group(static, group, labels) if pending else static
+    state['_prepared_domain_static'] = resolved
+    if pending:
+        lib.logger.info(state['mf'], 'STC domain %d prepared: AO %d; occupied %d; virtual %d',
+                        index, len(frame.extended_ao_indices), values[1].shape[1],
+                        values[2].shape[1])
+    check_domain_memory(state['mf'], resolved, index, with_grad=with_grad,
+        virtual_block_size=controls.get('virtual_block_size', 16), mode='deterministic',
+        shared_factor=True,
+        target_batch_size=controls.get('target_batch_size', 1), threads=controls.get('threads'),
+        **basis_kwargs(state.get('correlation_auxbasis')))
+    inputs, input_pullback = project_inputs(
+        state['mf'], *values, frame.extended_atoms,
+        aux_atoms=resolved.fragments[index].pao_center_atoms, group=index,
+        with_grad=with_grad, **basis_kwargs(state.get('correlation_auxbasis')))
+    if with_grad:
+        def pullback(seed):
+            mf_bar, fock_bar, co_bar, cv_bar = input_pullback(seed)
+            common_bar, = frame_pullback((fock_bar, co_bar, cv_bar))
+            return mf_bar, common_bar
+    else:
+        pullback = None
+    jax.block_until_ready(inputs)
+    return inputs, backend.host_inputs(inputs, native_factors=True), pullback
 
 
 def _prepare_planned_domain(state, static, group, controls, with_grad, *, return_frame=False):

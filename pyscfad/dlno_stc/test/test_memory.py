@@ -162,9 +162,9 @@ def workflow_mf(monkeypatch):
                          mo_coeff=np.zeros((4, 4)), mo_occ=np.ones(4), mo_energy=np.ones(4))
     fragment = SimpleNamespace(strong_occ_metric_keep=(0, 1),
                                strong_virtual=SimpleNamespace(metric_keep=(0, 1, 2)),
-                               extended_atoms=(0,))
+                               extended_atoms=(0,), pao_center_atoms=(0,))
     static = SimpleNamespace(fragments=(fragment,))
-    monkeypatch.setattr(_workflow.pyscf_df.addons, 'make_auxmol', lambda *a: aux)
+    monkeypatch.setattr(lno_df, 'make_local_auxmol', lambda *a: aux)
     monkeypatch.setattr(lno_df, 'make_local_mol', lambda *a: mol)
     monkeypatch.setattr(_df_direct, '_local_direct_workspace_mb', lambda *a, **k: 0.)
     monkeypatch.setattr(_workflow, '_native_workspace_mb', lambda *a, **k: 2.)

@@ -40,6 +40,8 @@ struct Result {
     std::vector<double> point_variance_targets;
     arma::mat foo, fvv, B;
     std::size_t propagation_calls = 0, backprop_calls = 0, cached_targets = 0;
+    std::size_t peak_factor_buffers = 0;
+    bool borrowed_input_B = false;
     double bare_integrals_seconds = 0, propagation_seconds = 0;
     double contraction_seconds = 0, backprop_seconds = 0;
 };

@@ -2,6 +2,7 @@
 #define LIBGMBPT_QCHEM_STC_MP2_DETERMINISTIC_ENERGY_H
 #include "stc_mp2_kernel_helpers.h"
 #include "stc_mp2_kernel_qchem.h"
+#include <set>
 
 namespace libgmbpt { namespace qchem { namespace stc_mp2 {
 
@@ -9,6 +10,7 @@ struct deterministic_energy_result {
     double energy=0, seconds=0, bare_integrals_seconds=0;
     double propagation_seconds=0, contraction_seconds=0, backprop_seconds=0;
     size_t propagation_calls=0, backprop_calls=0, cached_targets=0;
+    size_t peak_factor_buffers=0;
     arma::mat bar_b, bar_occ, bar_virt;
 };
 
@@ -57,6 +59,10 @@ inline deterministic_energy_result evaluate_deterministic_energy(stc_mp2_kernel&
             locks.resize(no);
             for(auto& lock:locks) omp_init_lock(&lock);
         }
+        // Count distinct live full-factor storage, including the borrowed B.
+        std::set<const double*> factors{bare.memptr(), c.memptr()};
+        if (gradients) { factors.insert(gamma.memptr()); factors.insert(out.bar_b.memptr()); }
+        out.peak_factor_buffers=std::max(out.peak_factor_buffers, factors.size());
         double point_energy=0;
         #pragma omp parallel for num_threads(threads) schedule(static) reduction(+:point_energy)
         for(size_t task=0;task<group.size()*no;++task) {

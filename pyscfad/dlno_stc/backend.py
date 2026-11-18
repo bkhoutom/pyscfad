@@ -11,11 +11,23 @@ from .protocol import (ARRAY_NAMES, validate_full_inputs, validate_full_result,
     matrix_request_fingerprint, validate_matrix_result, validate_input_cotangents)
 
 
-def host_inputs(inputs):
+def _native_factor_layout(value):
+    """Recognize the validated, contiguous-in-P host factor view."""
+    return (isinstance(value, np.ndarray) and value.ndim == 3
+            and value.flags.aligned and (not value.size or all(
+                size == 1 or stride == expected
+                for size, stride, expected in zip(value.shape, value.strides, (
+                    value.itemsize, value.shape[0] * value.shape[2] * value.itemsize,
+                    value.shape[0] * value.itemsize)))))
+
+
+def host_inputs(inputs, *, native_factors=False):
     """Transfer each preparation output once, retaining its float64 dtype."""
     if not isinstance(inputs, dict) or set(inputs) != set(ARRAY_NAMES):
         raise ValueError("inputs must contain exactly " + ", ".join(ARRAY_NAMES))
-    arrays = {key: np.ascontiguousarray(inputs[key]) for key in ARRAY_NAMES}
+    arrays = {key: (inputs[key] if key == 'B' and native_factors
+                   and _native_factor_layout(inputs[key])
+                   else np.ascontiguousarray(inputs[key])) for key in ARRAY_NAMES}
     validate_full_inputs(arrays)
     return arrays
 
@@ -37,8 +49,12 @@ def _solve_local(inputs, metadata, controls, *, with_grad, aux_offsets):
         raise ImportError("STC-MP2 extension is unavailable; build pyscfad/dlno_stc/cpp "
                           "with CMake as described in pyscfad/dlno_stc/README.md") from exc
     serial_blas = not with_grad and controls.get('mode', 'deterministic') == 'deterministic'
+    solve_selected = extension.solve_selected
+    if (controls.get('mode', 'deterministic') == 'deterministic'
+            and _native_factor_layout(inputs['B'])):
+        solve_selected = extension._solve_selected_borrowed
     with blas_threads(1) if serial_blas else nullcontext():
-        return extension.solve_selected(*(inputs[key] for key in ARRAY_NAMES),
+        return solve_selected(*(inputs[key] for key in ARRAY_NAMES),
             tuple(metadata['target_indices']), controls, aux_offsets=aux_offsets,
             with_grad=with_grad)
 
@@ -47,14 +63,15 @@ def solve(inputs, metadata, controls, *, with_grad=True, aux_offsets=None):
     """Solve one fragment locally; the driver distributes complete groups."""
     if not isinstance(metadata, dict) or not isinstance(controls, dict):
         raise ValueError("metadata and controls must be dictionaries")
-    arrays = host_inputs(inputs)
+    arrays = host_inputs(inputs, native_factors=controls.get('mode', 'deterministic') == 'deterministic')
     if aux_offsets is None:
         group_size = controls.get('auxiliary_group_size', 32)
         if (not isinstance(group_size, (int, np.integer))
                 or isinstance(group_size, (bool, np.bool_)) or group_size <= 0):
             raise ValueError('auxiliary_group_size must be a positive integer')
         naux = arrays['B'].shape[0]
-        aux_offsets = np.asarray([*range(0, naux, int(group_size)), naux], dtype=np.int64)
+        aux_offsets = np.asarray([*range(0, naux, int(group_size)), naux]
+                                 if naux else [0, 0], dtype=np.int64)
     seed = _stream_seed(controls.get('global_seed', 0), metadata.get('fragment_id', 0))
     result = _solve_local(arrays, metadata, dict(controls, global_seed=seed),
                           with_grad=with_grad, aux_offsets=aux_offsets)

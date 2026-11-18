@@ -50,7 +50,7 @@ class HalfTransformedDFCache:
             raise MemoryError('Insufficient user memory budget for one half-transformed DF tile')
         return min(self.scope.auxmol.nao, rows), budget
 
-    def transform(self, coeff, slices, low):
+    def transform(self, coeff, slices, low, *, host=False):
         if self.scope.finished:
             raise RuntimeError('Cannot use a finished local DF reverse')
         coeff = numpy.asarray(coeff)
@@ -60,7 +60,13 @@ class HalfTransformedDFCache:
         if entry is not None:
             self.scope.receipt['half_cache_hits'] += 1
             entry.consumed = False
-            return entry.fitted
+            if host:
+                # An existing AD consumer may have populated this entry.
+                # Replace its layout only in this internal cache; never
+                # delete or mutate an externally owned JAX array.
+                entry.fitted = numpy.asfortranarray(entry.fitted)
+                return entry.fitted
+            return np.asarray(entry.fitted)
 
         from ._df_direct import _local_direct_raw_int3c_blocks
         scope = self.scope
@@ -131,7 +137,7 @@ class HalfTransformedDFCache:
         with dense_blas_threads():
             result = scipy.linalg.solve_triangular(
                 low, result, lower=True, overwrite_b=True, check_finite=False)
-        fitted = np.asarray(result)
+        fitted = result if host else np.asarray(result)
         entry = SimpleNamespace(
             coeff=numpy.array(coeff, copy=True), slices=tuple(slices),
             left=left, right=right, h=h, fitted=fitted, consumed=False,

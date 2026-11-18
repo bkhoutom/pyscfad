@@ -545,6 +545,28 @@ Restart checkpoints remain supported independently of disk solver exchange.
 
 ## Build and verification
 
+Standalone deterministic MP2 shares one host-owned fitted factor between
+domain preparation, the native scalar solver, and the analytic DF pullback.
+During the fused energy/input-derivative solve, the four persistent full-sized
+factors are the original `B`, dressed `C`, `dE/dC`, and accumulated `dE/dB`.
+The factor remains in native column-major `(P,ia)` storage; its Python
+`(P,i,a)` representation is a view. Small orbital/Fock transformations still
+use JAX pullbacks. No JAX compilation cache is cleared by this handoff.
+
+This applies automatically to saved/deferred domains and system grouping,
+including MPI domain owners. Stochastic MP2 and the W/CC preparation retain
+their existing interfaces. The public native `solve_selected` accepts C-order
+inputs as before, with its compatibility layout copy; the internal host
+path uses `_solve_selected_borrowed`. Its diagnostics report
+`borrowed_input_B` and `peak_factor_buffers`. Rebuild the extension together
+with these Python changes.
+
+Four factors is not a process-memory limit: thread work arrays, the bounded
+pair-Gram cache, SCF/localization state, metric response, optional resident H,
+and direct-integral workspace are additional. For an isolated before/after
+RSS measurement, see `test/mp2_factor_memory_probe.py`; it measures synthetic
+factor preparation and the scalar solve, without SCF or AO integrals.
+
 With PySCFAD, pybind11, Armadillo and OpenMP available, build from the repo root:
 
 ```bash

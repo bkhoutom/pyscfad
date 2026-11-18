@@ -1,6 +1,7 @@
 """Apply solver cotangents to saved local preparation."""
 
 import math
+import numpy
 
 import jax
 from pyscfad import numpy as np
@@ -22,10 +23,13 @@ def apply_selected_pullback(pullback, inputs, result, *, energy_bar=1.0):
     if not math.isfinite(float(seed)):
         raise ValueError("energy_bar must be finite")
     validate_full_result(result, inputs)
-    cotangents = {
-        name: np.asarray(result["cotangents"][name], dtype=value.dtype) * seed
-        for name, value in inputs.items()
-    }
+    cotangents = {}
+    for name, value in inputs.items():
+        if name == 'B' and isinstance(value, numpy.ndarray):
+            bar = numpy.asarray(result['cotangents'][name], dtype=value.dtype)
+            cotangents[name] = bar if float(seed) == 1.0 else bar * float(seed)
+        else:
+            cotangents[name] = np.asarray(result['cotangents'][name], dtype=value.dtype) * seed
     return pullback(cotangents)
 
 

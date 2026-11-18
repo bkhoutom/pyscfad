@@ -45,7 +45,8 @@ def test_memory_uses_correlation_dimension_without_replacing_jk(reference, monke
     monkeypatch.setattr(_df_direct, '_local_direct_workspace_mb', lambda *a, **k: 0.)
     monkeypatch.setattr(_workflow, '_native_workspace_mb', lambda *a, **k: 0.)
     fragment = SimpleNamespace(strong_occ_metric_keep=(0,),
-        strong_virtual=SimpleNamespace(metric_keep=(0,)), extended_atoms=(0, 1))
+        strong_virtual=SimpleNamespace(metric_keep=(0,)), extended_atoms=(0, 1),
+        pao_center_atoms=(0, 1))
     static = SimpleNamespace(fragments=(fragment,))
     jk_auxmol = reference.with_df.auxmol
     corr_auxmol = pyscf_df.addons.make_auxmol(reference.mol.to_pyscf(), 'def2-svp-jkfit')

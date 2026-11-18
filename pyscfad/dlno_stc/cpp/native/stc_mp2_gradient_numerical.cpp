@@ -87,6 +87,7 @@ double stc_mp2_kernel::selected_dense(const arma::umat& keep, bool exchange,
 }
 
 void stc_mp2_kernel::retain_original_integrals(bool release_current) {
+    if (borrowed_original_) return;
     // These envelopes belong to the retained input and include support floors.
     // Rebuild for a new calculation rather than reusing previously floored norms.
     bare_orbital_norms_.reset(); bare_atom_weights_.reset(); bare_atom_weight_sums_.reset();
@@ -98,6 +99,7 @@ void stc_mp2_kernel::retain_original_integrals(bool release_current) {
 }
 
 void stc_mp2_kernel::restore_original_integrals(bool release_original) {
+    if (borrowed_original_) return;
     if (original_B_ia_.is_empty())
         throw std::runtime_error("Original STC-MP2 integrals were not retained");
     if (release_original) { B_ia_.reset(); B_ia_.swap(original_B_ia_); }

@@ -68,7 +68,7 @@ def _local_direct_effective_max_memory(max_memory, naux, nkl):
     return max(current_mb + lov_mb, min(float(max_memory), requested_mb))
 
 
-def _local_direct_nr_e2_impl(mol, auxmol, mo_coeff, max_memory, orbs_slice):
+def _local_direct_nr_e2_impl(mol, auxmol, mo_coeff, max_memory, orbs_slice, *, host=False):
     """Build fitted three-center MO integrals without an AO-pair CDERI.
 
     This is PySCF's integral-direct DF-MP2 transformation applied to an ED:
@@ -93,14 +93,14 @@ def _local_direct_nr_e2_impl(mol, auxmol, mo_coeff, max_memory, orbs_slice):
     if matching_scope(mol, auxmol) is not None:
         # The shared scope retains the metric and optionally H inputs.
         return _local_direct_wide_nr_e2(
-            mol, auxmol, mo_coeff, max_memory, orbs_slice)
+            mol, auxmol, mo_coeff, max_memory, orbs_slice, host=host)
     # PySCF's MP2 helper reuses an AO-pair buffer for its MO output.  An
     # all-pair CC transform can be wider, especially after AO projection.
     # Stream those transforms into their own result instead of overflowing
     # that buffer.  The usual occupied-virtual path remains unchanged.
     if nkl > mol.nao * (mol.nao + 1) // 2:
         return _local_direct_wide_nr_e2(
-            mol, auxmol, mo_coeff, max_memory, orbs_slice,
+            mol, auxmol, mo_coeff, max_memory, orbs_slice, host=host,
         )
     effective_memory = _local_direct_effective_max_memory(
         max_memory, auxmol.nao, nkl
@@ -113,10 +113,10 @@ def _local_direct_nr_e2_impl(mol, auxmol, mo_coeff, max_memory, orbs_slice):
         effective_memory,
         log=pyscf_lib.logger.new_logger(mol),
     )
-    return np.asarray(numpy.asarray(ovl.T))
+    return numpy.asfortranarray(ovl.T) if host else np.asarray(numpy.asarray(ovl.T))
 
 
-def _local_direct_wide_nr_e2(mol, auxmol, mo_coeff, max_memory, orbs_slice):
+def _local_direct_wide_nr_e2(mol, auxmol, mo_coeff, max_memory, orbs_slice, *, host=False):
     """Blocked transform for shared inputs or MO pairs wider than AO pairs."""
     from pyscf.ao2mo import _ao2mo as pyscf_ao2mo
 
@@ -133,8 +133,10 @@ def _local_direct_wide_nr_e2(mol, auxmol, mo_coeff, max_memory, orbs_slice):
     else:
         low = scope.metric_factor()
         if scope.half is not None:
-            return scope.half.transform(coeff, orbs_slice, low)
+            return scope.half.transform(coeff, orbs_slice, low, host=host)
     result = numpy.empty((auxmol.nao, nkl), order='F')
+    if not result.size:
+        return result if host else np.asarray(result)
     block_bytes = _local_direct_workspace_mb(
         max_memory if scope is None else scope.max_memory_mb,
         None if scope is None else scope.workspace_mb,
@@ -147,9 +149,12 @@ def _local_direct_wide_nr_e2(mol, auxmol, mo_coeff, max_memory, orbs_slice):
             aosym='s2', mosym='s1',
         )
     del raw
-    return np.asarray(scipy_linalg.solve_triangular(
+    result = scipy_linalg.solve_triangular(
         low, result, lower=True, overwrite_b=True, check_finite=False,
-    ))
+    )
+    # Scalar MP2 shares this host allocation with its native solver and
+    # analytic DF reverse; moving it through JAX would create another layout.
+    return result if host else np.asarray(result)
 
 
 def _local_direct_raw_int3c_blocks(

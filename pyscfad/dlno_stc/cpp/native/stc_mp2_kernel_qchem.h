@@ -12,7 +12,7 @@ class stc_mp2_kernel {
 public:
     stc_mp2_kernel(const arma::mat& fo, const arma::mat& fv, const arma::mat& b,
                    const arma::Col<size_t>& offsets, unsigned seed=20260920u,
-                   double energy_domain_tau=6.5e-3);
+                   double energy_domain_tau=6.5e-3, bool borrow_original=false);
 
     void estimate_n_sample(const arma::vec& beta, const arma::vec& weights,
                            double energy_tolerance);
@@ -111,6 +111,9 @@ private:
     arma::mat virtual_fock_;
     arma::mat B_ia_;
     arma::mat original_B_ia_;
+    // Scalar deterministic evaluation reads the caller's original factor.
+    // That caller must outlive the kernel; no transform may modify this view.
+    bool borrowed_original_ = false;
     arma::vec laplace_weights_;
     arma::vec variance_targets_;
     arma::mat orbital_norms_;

@@ -3,7 +3,6 @@
 import math
 
 import numpy
-from pyscf import df as pyscf_df
 from pyscf import lib as pyscf_lib
 
 from ._restart import df_source_fingerprint
@@ -73,7 +72,8 @@ def run_payload(mf, frozen, *, driver, correlation_auxbasis=None):
 
 def check_domain_memory(mf, static, fragment_index, *, with_grad,
                           virtual_block_size=16, mode="deterministic",
-                          target_batch_size=1, threads=None, correlation_auxbasis=None):
+                          target_batch_size=1, threads=None, correlation_auxbasis=None,
+                          shared_factor=False):
     """Guard one finite domain using its local auxiliary basis and buffers.
 
     This estimates the local solver/RI working set, not a measured process
@@ -87,13 +87,11 @@ def check_domain_memory(mf, static, fragment_index, *, with_grad,
     nvir = len(fragment.strong_virtual.metric_keep)
     if nvir == 0:
         return 0.0
-    local_mol = lno_df.make_local_mol(mf.mol, fragment.extended_atoms)
-    auxbasis = mf.with_df.auxbasis if correlation_auxbasis is None else correlation_auxbasis
-    auxmol = pyscf_df.addons.make_auxmol(local_mol.to_pyscf(), auxbasis)
+    auxmol = lno_df.make_local_auxmol(mf, fragment.pao_center_atoms, correlation_auxbasis)
     naux = int(auxmol.nao)
     # Preparation residual/input, host/layout buffers, dressed factors and
     # reverse bars. Target branches have only one occupied row.
-    factor = 10 if with_grad else 5
+    factor = ((4 if with_grad else 2) if shared_factor else (10 if with_grad else 5))
     elements = factor * naux * nocc * nvir
     elements += (6 if with_grad else 3) * naux * nvir
     elements += 4 * naux * naux  # fitting metric and its reverse work

@@ -426,8 +426,6 @@ def _select_current_fragment(state, static, index, group, frame, forward, *,
 def _allocate_triples_controls(controls, nfragments, *, static=None, indices=None):
     """Allocate a total triples SE budget over globally requested physical fragments."""
     smooth = getattr(getattr(static, 'lis_static', None), 'smooth_frames', None) is not None
-    if controls is not None and controls.get('integral_transform') == 'rotate' and not smooth:
-        raise ValueError('integral_transform=rotate requires smooth triples selections')
     if controls is not None and controls.get('mode') == 'stochastic':
         if not smooth:
             raise ValueError('stochastic triples requires full-LIS smooth frames; '

@@ -5,9 +5,8 @@ legs are left undressed, using separate T2 forms for virtual and occupied
 contractions. Physical projections are built directly with U.T and U.T O^2;
 no inverse exponential is formed. Matrix-function derivatives retain the full
 Fock and physical-projector response, including degenerate spectra.
-The DF path reuses available cached CCSD integral blocks and constructs only
-missing blocks once per fragment; rotate requires all three cached blocks.
-Both use the same stable native numerator.
+Available cached CCSD integral blocks are reused and only missing blocks are
+constructed from DF factors once per fragment, using the stable native numerator.
 Deterministic evaluation uses the MRCC half-Laplace partition and grouped
 adjoints in bounded occupied batches. Stochastic evaluation retains the
 asymmetric selected functional. Prepared tensors and cotangents have at most
@@ -26,8 +25,7 @@ import numpy as np
 from pyscfad import lib
 from pyscfad.tools import resource_profile
 from pyscf.lib import current_memory, param
-from .controls import (DEFAULT_TRIPLES_TRACE_EXPONENT, _finite_control,
-                       _triples_integral_transform)
+from .controls import DEFAULT_TRIPLES_TRACE_EXPONENT, _finite_control
 
 NAMES = ('t1', 't2', 'Bvo', 'Boo', 'Bvv', 'fov')
 INTEGRAL_NAMES = ('t1', 't2', 'ovvv', 'ovoo', 'ovov', 'fov')
@@ -83,8 +81,7 @@ def point_variance_fractions(foo, fvv, nodes, weights, *, exponent=DEFAULT_TRIPL
     return fractions / fractions.sum()
 
 
-def _native(inputs, samples, seed, target=0., with_grad=True, *, pilot=None,
-            integral_inputs=False):
+def _native(inputs, samples, seed, target=0., with_grad=True, *, pilot=None):
     native = importlib.import_module('pyscfad.dlno_stc._stc_mp2')
     values = [np.asarray(x, dtype=np.float64) for x in inputs]
     options = {} if pilot is None else {'pilot': pilot}
@@ -93,7 +90,7 @@ def _native(inputs, samples, seed, target=0., with_grad=True, *, pilot=None,
                     target_standard_error=float(target), **options)
 
 
-def _make_dresser(inputs, *, integral_inputs=False):
+def _make_dresser(inputs):
     native = importlib.import_module('pyscfad.dlno_stc._stc_mp2')
     return native.StableTriplesDressing(tuple(np.asarray(x, dtype=np.float64) for x in inputs))
 
@@ -110,20 +107,15 @@ def _dressing_cache_bytes(max_memory):
     return int(available)
 
 
-def _integral_blocks(eris, no, nv, *, require_cached):
+def _integral_blocks(eris, no, nv):
     """Reuse materialized integrals in the current ERI frame, including AD.
 
     Inspect storage directly in the DF fallback path: probing a lazy property
     must not build a block just to decide whether it was already cached.
     """
     names = ('ovvv', 'ovoo', 'ovov')
-    if require_cached:
-        blocks = [getattr(eris, name, None) for name in names]
-        if any(value is None for value in blocks):
-            raise ValueError('integral_transform=rotate requires cached ovvv, ovoo and ovov')
-    else:
-        stored = getattr(eris, '__dict__', {})
-        blocks = [stored.get(name) for name in names]
+    stored = getattr(eris, '__dict__', {})
+    blocks = [stored.get(name) for name in names]
     if blocks[0] is not None:
         blocks[0] = lib.unpack_tril(blocks[0].reshape(no * nv, -1)).reshape(no, nv, nv, nv)
     if any(value is None for value in blocks):
@@ -139,7 +131,7 @@ def _integral_blocks(eris, no, nv, *, require_cached):
 
 def make_solver(controls, grid, *, with_grad):
     nodes, weights, _ = grid
-    removed = {'dressing', 'dressing_backend', 'adaptive'} & controls.keys()
+    removed = {'dressing', 'dressing_backend', 'adaptive', 'integral_transform'} & controls.keys()
     if removed:
         raise ValueError('removed triples options: ' + ', '.join(sorted(removed)))
     stochastic = controls['mode'] == 'stochastic'
@@ -165,7 +157,6 @@ def make_solver(controls, grid, *, with_grad):
     if not stochastic and not getattr(importlib.import_module(
             'pyscfad.dlno_stc._stc_mp2'), 'TRIPLES_GROUPED_ADJOINT', False):
         raise RuntimeError('Rebuild the STC native extension for grouped Laplace triples adjoints')
-    rotate = _triples_integral_transform(controls) == 'rotate'
     native_options = {}
     trace_exponent = _finite_control('trace_exponent',
         controls.get('trace_exponent', DEFAULT_TRIPLES_TRACE_EXPONENT))
@@ -179,7 +170,7 @@ def make_solver(controls, grid, *, with_grad):
         if partition == 'mrcc':
             from .mrcc_triples import run_mrcc
             return run_mrcc(inputs, nodes, weights, with_grad=with_grad,
-                max_memory=max_memory, rotate=rotate)
+                max_memory=max_memory)
         started = time.perf_counter()
         count = len(nodes)
         pilot_count = controls.get('pilot_samples', 10000)
@@ -191,7 +182,7 @@ def make_solver(controls, grid, *, with_grad):
         pilot_counts = np.zeros(count, dtype=np.int64)
         allocation = np.zeros(count, dtype=np.int64)
         phase = time.perf_counter()
-        dresser = _make_dresser(inputs, integral_inputs=rotate)
+        dresser = _make_dresser(inputs)
         diagonal_virtual_points = sum(dresser.virtual_diagonal_at(float(node)) for node in nodes)
         prepare = dresser.prepare
         prepare_seconds, pilot_seconds = time.perf_counter() - phase, 0.
@@ -339,7 +330,6 @@ def make_solver(controls, grid, *, with_grad):
             deterministic_blocks=deterministic_blocks,
             diagonal_occupied_points=sum(dresser.occupied_diagonal_at(float(t)) for t in nodes),
             diagonal_virtual_points=diagonal_virtual_points,
-            rotated_integrals=rotate,
             dressing_cache_peak_bytes=dressing_cache_peak_bytes,
             dressing_cache_hits=dresser.cache_hits,
             dressing_cache_rebuilds=dresser.cache_rebuilds,
@@ -393,7 +383,7 @@ def make_solver(controls, grid, *, with_grad):
         u = jnp.eye(no, dtype=t1.dtype) if prjlo.shape == (no, no) else prjlo.T
         # Cached tensors retain the same physical integral response as DF
         # construction. Missing blocks are contracted once, outside quadrature.
-        tensors = _integral_blocks(eris, no, t1.shape[1], require_cached=rotate)
+        tensors = _integral_blocks(eris, no, t1.shape[1])
         inputs = (t1, t2, *tensors,
                   eris.fock[:no, no:], eris.fock[:no, :no], eris.fock[no:, no:], u)
         energy, diagnostics = evaluate(*inputs) if with_grad else run(inputs)[0]

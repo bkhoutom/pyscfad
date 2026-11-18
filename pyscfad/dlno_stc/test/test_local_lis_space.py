@@ -124,7 +124,7 @@ def test_domain_gradient_finite_difference_and_forward_one_pass(molecular_case, 
     monkeypatch.setattr(_df_shared.LocalDFReverse, 'close', closed)
     options = dict(**cc_options(case.controls, case.controls),
           ccsd_t=True,
-        triples_controls=dict(mode='deterministic', integral_transform='rotate'))
+        triples_controls=dict(mode='deterministic'))
     with (config_update('pyscfad_scf_implicit_diff', True),
           config_update('pyscfad_scf_first_order_custom', False)):
         value, gradient = ccsd.value_and_grad(case.mf.mol, accept.build_mf, static, **options)

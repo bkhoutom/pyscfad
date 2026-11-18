@@ -105,7 +105,7 @@ def test_molecular_domain_only_matches_global_oracle(molecular_group, monkeypatc
     options = dict(**cc_options(case.controls, case.controls),
         ccsd_t=True,
         return_components=True, triples_controls=dict(mode='stochastic', nsamples=16,
-            pilot_samples=16, global_seed=71, integral_transform='rotate'))
+            pilot_samples=16, global_seed=71))
     def select(mf):
         return ccsd.build_static_selections(mf, case.static.mp2_static,
             thresh_occ=1e-4, thresh_vir=3e-5, **cc_options(case.controls, case.controls))

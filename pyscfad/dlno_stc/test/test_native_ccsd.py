@@ -14,7 +14,7 @@ def test_native_dlno_ccsdt_energy_gradient(molecular_group, monkeypatch, record_
     options = dict(**cc_options(case.controls, case.controls),
                    ccsd_t=True,
                     return_components=True,
-                   triples_controls=dict(mode='deterministic', integral_transform='rotate'))
+                   triples_controls=dict(mode='deterministic'))
     results = []
     for enabled in (False, True):
         with config_update('pyscfad_dfccsd_native', enabled):

@@ -45,8 +45,8 @@ def test_energy_and_all_nine_bars(selected,spectrum):
         inputs[6]=np.diag([-.8,-1.2,-.4]);inputs[7]=np.diag([1.1,.3,1.6,.7])
     inputs=tuple(map(jnp.asarray,inputs));nodes=np.array([0.,.37]);weights=np.array([.2,.8])
     expected,expected_bars=jax.value_and_grad(lambda x:sum(w*reference(x,t) for t,w in zip(nodes,weights)))(inputs)
-    (actual,d),bars=run_mrcc(inputs,nodes,weights,with_grad=True,max_memory=2000.,rotate=True)
-    forward,_=run_mrcc(inputs,nodes,weights,with_grad=False,max_memory=2000.,rotate=True)
+    (actual,d),bars=run_mrcc(inputs,nodes,weights,with_grad=True,max_memory=2000.)
+    forward,_=run_mrcc(inputs,nodes,weights,with_grad=False,max_memory=2000.)
     np.testing.assert_allclose([actual,forward[0]],expected,rtol=3e-11,atol=3e-13)
     for i,(got,want) in enumerate(zip(bars,expected_bars)):
         np.testing.assert_allclose(got,want,rtol=3e-10,atol=3e-12,err_msg=f'input {i}')
@@ -56,7 +56,7 @@ def test_energy_and_all_nine_bars(selected,spectrum):
 
 
 def test_complete_partition_matches_asymmetric_and_selected_partition_differs():
-    def run(x):return run_mrcc(x,np.array([.37]),np.array([1.]),with_grad=False,max_memory=2000.,rotate=True)[0][0]
+    def run(x):return run_mrcc(x,np.array([.37]),np.array([1.]),with_grad=False,max_memory=2000.)[0][0]
     def asym(x):
         from pyscfad.dlno_stc.test.test_triples_stable import reference as asymmetric_reference
         return asymmetric_reference(tuple(map(jnp.asarray,x)),.37)
@@ -72,12 +72,11 @@ def test_complete_partition_matches_asymmetric_and_selected_partition_differs():
     np.testing.assert_allclose(run(partial),asym(partial),rtol=3e-11,atol=3e-13)
 
 
-@pytest.mark.parametrize('integral_transform',['df','rotate'])
-def test_public_option_and_custom_vjp(integral_transform):
+def test_public_default_and_custom_vjp():
     assert controls.normalize_triples_controls(None,ccsd_t=True)=={'mode':'deterministic','partition':'mrcc'}
     with pytest.raises(ValueError, match='removed'):
         controls.normalize_triples_controls({'partition':'asymmetric'},ccsd_t=True)
-    options=controls.normalize_triples_controls({'partition':'mrcc','integral_transform':integral_transform},ccsd_t=True)
+    options=controls.normalize_triples_controls({'partition':'mrcc'},ccsd_t=True)
     for bad in [{'partition':'wrong'},{'partition':'mrcc','mode':'stochastic','nsamples':16}]:
         with pytest.raises(ValueError,match='partition'):
             controls.normalize_triples_controls(bad,ccsd_t=True)
@@ -101,12 +100,12 @@ def test_public_option_and_custom_vjp(integral_transform):
 def test_roundoff_diagonal_shortcut_does_not_drop_offdiagonal_response():
     x=list(fixture(selected=2));x[6]=np.diag([-.8,-.8,-.4]);x[7]=np.diag([.3,.3,1.1,1.6])
     x=tuple(map(jnp.asarray,x))
-    (_,d),bars=run_mrcc(x,np.array([.37]),np.array([1.]),with_grad=True,max_memory=2000.,rotate=True)
+    (_,d),bars=run_mrcc(x,np.array([.37]),np.array([1.]),with_grad=True,max_memory=2000.)
     assert d['diagonal_occupied_points']==d['diagonal_virtual_points']==1
     for k in [6,7]:
         direction=np.zeros(x[k].shape);direction[0,1]=direction[1,0]=1.
         h=1e-5;p=list(x);m=list(x);p[k]+=h*direction;m[k]-=h*direction
-        def energy(values):return run_mrcc(values,np.array([.37]),np.array([1.]),with_grad=False,max_memory=2000.,rotate=True)[0][0]
+        def energy(values):return run_mrcc(values,np.array([.37]),np.array([1.]),with_grad=False,max_memory=2000.)[0][0]
         finite=(energy(p)-energy(m))/(2*h)
         np.testing.assert_allclose(np.sum(bars[k]*direction),finite,rtol=2e-7,atol=2e-10)
 
@@ -171,7 +170,7 @@ def test_retained_t2_and_blocked_gathers_across_partial_tiles(no,nv):
     x=tuple(map(jnp.asarray,x));node=.23;weight=-.7
     expected,want=jax.value_and_grad(lambda values:weight*reference(values,node))(x)
     (actual,_),bars=run_mrcc(x,np.array([node]),np.array([weight]),
-        with_grad=True,max_memory=3000.,rotate=True)
+        with_grad=True,max_memory=3000.)
     np.testing.assert_allclose(actual,expected,rtol=3e-11,atol=3e-13)
     for got,ref in zip(bars,want):
         np.testing.assert_allclose(got,ref,rtol=3e-10,atol=3e-12)

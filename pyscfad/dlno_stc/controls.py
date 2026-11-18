@@ -71,13 +71,6 @@ def _finite_control(name, value, *, positive=True):
     return value
 
 
-def _triples_integral_transform(controls):
-    value = controls.get('integral_transform', 'df')
-    if not isinstance(value, str) or value not in ('df', 'rotate'):
-        raise ValueError('integral_transform must be df or rotate')
-    return value
-
-
 def normalize_triples_controls(controls, *, ccsd_t):
     """Validate triples independently of baseline and W selection settings.
 
@@ -97,7 +90,7 @@ def normalize_triples_controls(controls, *, ccsd_t):
     settings = controls.copy()
     unknown = set(settings) - {'mode', 'nsamples', 'global_seed', 'energy_tolerance',
                                'pilot_samples', 'fragment_energies', 'trace_exponent',
-                               'integral_transform', 'variance_allocation', 'partition'}
+                               'variance_allocation', 'partition'}
     if unknown:
         raise ValueError('unsupported triples controls: '
                          + ', '.join(sorted(map(str, unknown))))
@@ -115,11 +108,8 @@ def normalize_triples_controls(controls, *, ccsd_t):
         if partition != 'asymmetric':
             raise ValueError('MRCC partition currently requires deterministic triples')
         settings.pop('partition', None)
-    if _triples_integral_transform(settings) == 'df':
-        # Explicit default and omission share a checkpoint identity.
-        settings.pop('integral_transform', None)
     if mode == 'deterministic':
-        if set(settings) - {'mode', 'integral_transform', 'partition'}:
+        if set(settings) - {'mode', 'partition'}:
             raise ValueError('deterministic triples do not accept sampling controls')
         return settings
     allocation = settings.get('variance_allocation', 'mp2_energy')

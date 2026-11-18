@@ -40,8 +40,8 @@ def _sgx_tolerance(value):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--scf-jk', choices=('df', 'dfj-sgx'), default='df',
-                        help='SCF and response J/K backend; dfj-sgx avoids global DF factors')
+    parser.add_argument('--scf-jk', choices=('df', 'dfj-sgx'), default='dfj-sgx',
+                        help='SCF and response J/K backend; dfj-sgx (default) avoids global DF factors')
     parser.add_argument('--sgx-grid-level', type=int, choices=range(8), default=2)
     parser.add_argument('--sgx-fit-overlap', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--sgx-integral-backend', choices=('auto', 'generated', 'libcint'),
@@ -83,7 +83,7 @@ def main():
     parser.add_argument("--df-builder", choices=("standard", "direct"), default="standard",
                         help="outcore builder: standard repacks a scratch tensor; direct writes final-layout panels")
     parser.add_argument("--df-memory-mb", type=float, default=4000,
-                        help="working-memory budget for streamed DF operations")
+                        help="shared working-memory budget for SCF J/K and correlation DF")
     parser.add_argument("--fragment-df-mode", choices=("direct", "half"),
                         default=os.environ.get('PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE', 'half'),
                         help="regenerate local integrals or retain H_ED for one-pass reuse (default)")
@@ -95,8 +95,6 @@ def main():
                         help="virtual W-eigenvalue cutoff for LIS selection")
     parser.add_argument("--triples-method", choices=("smooth",),
                         default="smooth")
-    parser.add_argument("--triples-integral-transform", choices=("df", "rotate"),
-                        default="df", help="dress DF factors or rotate cached CCSD integrals")
     parser.add_argument("--triples-laplace-points", type=int, default=4)
     parser.add_argument("--smooth-trace-exponent", type=float, default=5.)
     parser.add_argument("--triples-variance-allocation", choices=("occupied_count", "mp2_energy"),
@@ -189,6 +187,7 @@ def main():
         previous = json.loads((output / "settings.json").read_text())
         if previous.get('domain_thresholds') != asdict(domain_thresholds):
             raise ValueError('domain thresholds differ; use a new output directory')
+        # Missing scf_jk identifies legacy DF runs, independently of the CLI default.
         for key, value, old_default in (
                 ('scf_jk', args.scf_jk, 'df'),
                 ('sgx_grid_level', args.sgx_grid_level, 2),
@@ -203,8 +202,6 @@ def main():
                 raise ValueError(f'SGX {key} differs; use a new output directory')
         if previous.get('scf_df_precond', False) != args.scf_df_precond:
             raise ValueError('SCF preconditioning differs; use a new output directory')
-        if previous.get('triples_integral_transform', 'df') != args.triples_integral_transform:
-            raise ValueError('triples integral transform differs; use a new output directory')
         requested = dict(cc_conv_tol=args.cc_conv_tol,
                          cc_conv_tol_normt=args.cc_conv_tol_normt,
                          scf_jk_workspace_memory_mb=args.df_memory_mb,
@@ -289,6 +286,7 @@ def main():
     refmol = pgto.M(atom=str(xyz), basis=basis, unit="Angstrom",
                      max_memory=args.max_memory_mb, verbose=0)
     ref = pscf.RHF(refmol).density_fit(auxbasis=auxbasis)
+    ref.with_df.max_memory = args.df_memory_mb
     if args.scf_jk == 'dfj-sgx':
         from pyscfad.sgx import sgx_fit
         ref = sgx_fit(pscf.RHF(refmol), auxbasis=auxbasis,
@@ -339,12 +337,12 @@ def main():
 
     def build_mf(current):
         mf = scf.RHF(current).density_fit(auxbasis=auxbasis)
-        # Correlation DF reads this field independently of the SGX/J-K budget.
-        mf.with_df.max_memory = args.df_memory_mb
         if args.scf_jk == 'dfj-sgx':
             mf = sgx_fit(mf, auxbasis=auxbasis, grid_level=args.sgx_grid_level,
                          fit_ovlp=args.sgx_fit_overlap, df_memory_mb=args.df_memory_mb,
                          **sgx_options)
+        else:
+            mf.with_df.max_memory = args.df_memory_mb
         # This is scratch space, not a ceiling on the whole process RSS.
         # Keep J/K panels useful when retained correlation state exceeds it.
         mf.with_df.jk_workspace_memory = args.df_memory_mb
@@ -500,7 +498,6 @@ def main():
                         cc_conv_tol_normt=args.cc_conv_tol_normt, cc_max_cycle=200,
                         targets_meh=args.targets_meh, seeds=args.seeds,
                         pilot_samples=args.pilot_samples, triples_mode=args.triples_method,
-                        triples_integral_transform=args.triples_integral_transform,
                         smooth_frame_mode=frame_mode,
                         smooth_frame_blocks=frame_blocks,
                         jax_persistent_cache_enabled=bool(jax.config.jax_enable_compilation_cache),
@@ -531,8 +528,6 @@ def main():
                    return_components=True, merge_identical=True)
 
     deterministic_controls = dict(mode="deterministic")
-    if args.triples_integral_transform == "rotate":
-        deterministic_controls['integral_transform'] = 'rotate'
     jobs = []
     if not args.stochastic_only:
         jobs.append(("deterministic", deterministic_controls))
@@ -549,8 +544,6 @@ def main():
                             global_seed=seed, energy_tolerance=target / 1000,
                             variance_allocation=args.triples_variance_allocation)
             controls.update(trace_exponent=args.smooth_trace_exponent)
-            if args.triples_integral_transform == "rotate":
-                controls['integral_transform'] = 'rotate'
             jobs.append((label, controls))
     for label, controls in jobs:
         destination = output / f"{label}.json"
@@ -599,7 +592,6 @@ def main():
                       mp2_domains=settings["mp2_domains"],
                       mp2_energy_source="w_matrix_trace", mp2_response="joint_energy_w_pullback",
                       triples_mode=args.triples_method,
-                      triples_integral_transform=args.triples_integral_transform,
 
 
                       lis_eigenspace='domain',

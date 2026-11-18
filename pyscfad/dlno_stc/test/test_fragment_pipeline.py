@@ -148,7 +148,7 @@ def test_pipeline_matches_saved_labels_with_one_w_and_full_gradient(molecular_gr
     assert plan.mp2_fragment_energies is None
 
     triples = ccsd.normalize_triples_controls(dict(mode='stochastic', nsamples=16,
-        pilot_samples=16, global_seed=71, integral_transform='rotate'), ccsd_t=True)
+        pilot_samples=16, global_seed=71), ccsd_t=True)
 
     def run(static):
         counts.update(forward=0, reverse=0); forwards.clear(); reverses.clear()
@@ -196,7 +196,7 @@ def test_public_gradient_factory_with_occupied_count_budget(
     options = dict(**cc_options(case.controls, case.controls),
         ccsd_t=True,
         return_components=True, triples_controls=dict(mode='stochastic', nsamples=16,
-            pilot_samples=16, global_seed=71, integral_transform='rotate',
+            pilot_samples=16, global_seed=71,
             variance_allocation='occupied_count', energy_tolerance=1e-3))
     with (config_update('pyscfad_scf_implicit_diff', True),
           config_update('pyscfad_scf_first_order_custom', False)):

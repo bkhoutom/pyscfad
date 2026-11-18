@@ -46,10 +46,11 @@ both available. Experimental custom first-order RHF, the global-DF response
 preconditioner, JIT/JVP, basis derivatives, and range separation are rejected.
 For MPI correlated calculations, pass parallel_scf_jk=False.
 
-In the LNO benchmark, select --scf-jk dfj-sgx, optionally --sgx-grid-level 2
-and --no-sgx-fit-overlap. Omit --scf-df-precond. The existing --df-memory-mb
-controls J/K workspace; --df-storage/--df-builder do not build global SCF
-factors with this backend. Local correlation DF is configured independently.
+The LNO benchmark defaults to DF-J/SGX-K; use --scf-jk df for conventional DF.
+Optional SGX settings include --sgx-grid-level 2 and --no-sgx-fit-overlap.
+Omit --scf-df-precond with SGX. The existing --df-memory-mb controls both J/K
+and correlation DF workspace; --df-storage/--df-builder do not build global SCF
+factors with this backend. The correlation fitting basis remains independent.
 The water queue accepts scf_jk='dfj-sgx', sgx_grid_level=2, and
 sgx_fit_overlap=True in its JSON config. Changing config does not launch it.
 """

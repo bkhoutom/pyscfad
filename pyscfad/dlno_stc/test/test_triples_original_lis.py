@@ -32,7 +32,7 @@ def test_original_occupied_lis_matches_full_six_index_energy_and_all_derivatives
     expected, expected_bars = jax.value_and_grad(reference)(old, node)
     (energy, diagnostics), bars = run_mrcc(transformed,
         np.array([node]), np.array([1.]), with_grad=with_grad,
-        max_memory=2000., rotate=True)
+        max_memory=2000.)
     assert diagnostics['selected_occupied_frame']
     np.testing.assert_allclose(energy, expected, rtol=3e-11, atol=3e-13)
     if with_grad:
@@ -56,7 +56,7 @@ def test_semicanonical_occupied_dense_projection_full_response(degenerate):
     expected, expected_bars = jax.value_and_grad(reference)(old, .37)
     (energy, _), bars = run_mrcc(transformed,
         np.array([.37]), np.array([1.]), with_grad=True,
-        max_memory=2000., rotate=True)
+        max_memory=2000.)
     actual, = transpose(tuple(map(jnp.asarray, bars)))
     np.testing.assert_allclose(energy, expected, rtol=3e-11, atol=3e-13)
     for got, want in zip(actual, expected_bars):

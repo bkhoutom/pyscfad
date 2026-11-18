@@ -151,7 +151,7 @@ def test_streamed_ed_ccsdt_matches_fixed_ed_energy_and_full_gradient(molecular_g
             state, static, case.group, case.controls, case.controls, with_grad=True,
             verbose_imp=0, ccsd_t=True,
             triples_controls=ccsd.normalize_triples_controls(
-                dict(mode='deterministic', integral_transform='rotate'), ccsd_t=True))
+                dict(mode='deterministic'), ccsd_t=True))
         value, grad = driver._finish(state, with_grad=True, include_hf=False)
         return value, grad.coords, rows
     expected = run(fixed)

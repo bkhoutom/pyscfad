@@ -9,10 +9,7 @@ import pytest
 
 from pyscfad import lib
 from pyscfad.dlno_stc import smooth_triples
-from pyscfad.dlno_stc.test._triples_dressing_reference import dress, symmetric_exp
-from pyscfad.dlno_stc.test.test_triples import (
-    triples_fixture, triples_matrix_reference, triples_native,
-)
+from pyscfad.dlno_stc.test.test_triples import triples_fixture, triples_native
 from pyscfad.lno import ccsd as lno_ccsd
 
 
@@ -82,22 +79,16 @@ def _projected_reference(x, t1, t2):
 
 
 def _triples_reference(x):
-    """JAX matrix functions plus the independently enumerated slow numerator."""
+    """Independent six-index MRCC equation for the default deterministic mode."""
+    from pyscfad.dlno_stc.test.test_mrcc_triples import reference as mrcc_reference
+
     x = _physical(x)
-    no, nv = x['t1'].shape
-    total = 0.
-    for node, weight in zip(*GRID[:2]):
-        t1, t2, bvo, boo, bvv, fov = dress(
-            *(x[name] for name in ('t1', 't2', 'Bvo', 'Boo', 'Bvv', 'fov', 'foo', 'fvv')),
-            node)
-        left = symmetric_exp(-x['foo'] * node / 2) @ x['prjlo'].T
-        right = symmetric_exp(x['foo'] * node / 2) @ x['prjlo'].T
-        # Dressing makes the same-space factors nonsymmetric; the slow
-        # reference's chemist-index convention requires the explicit swaps.
-        total += weight * triples_matrix_reference(
-            t1, t2, bvo, boo.swapaxes(1, 2), bvv.swapaxes(1, 2),
-            -jnp.ones(no) / 3, jnp.zeros(nv), left @ right.T, fov)
-    return total
+    inputs = (x['t1'], x['t2'],
+        jnp.einsum('Pia,Pbc->iabc', x['Bvo'], x['Bvv']),
+        jnp.einsum('Pia,Pjk->iajk', x['Bvo'], x['Boo']),
+        jnp.einsum('Pia,Pjb->iajb', x['Bvo'], x['Bvo']),
+        x['fov'], x['foo'], x['fvv'], x['prjlo'].T)
+    return sum(weight * mrcc_reference(inputs, node) for node, weight in zip(*GRID[:2]))
 
 
 def _reference_energies(x):
@@ -120,14 +111,13 @@ def _assert_energy_and_response(evaluate, reference, x):
                                    rtol=3e-10, atol=3e-13, err_msg=name)
 
 
-@pytest.mark.parametrize('integral_transform', ['df', 'rotate'])
-def test_partial_projected_ccsd_and_triples_are_covariant(integral_transform):
+def test_partial_projected_ccsd_and_triples_are_covariant():
     """Catch a missing tensor leg or frozen physical-projector cotangent."""
     triples_native()
     x = _inputs()
     qo, qv = _rotations()
     solver = smooth_triples.make_solver(
-        dict(mode='deterministic', integral_transform=integral_transform),
+        dict(mode='deterministic'),
         GRID, with_grad=True)
 
     def evaluate(x):
@@ -177,15 +167,14 @@ def _shared_callback(qo, qv):
     return solve
 
 
-@pytest.mark.parametrize('integral_transform', ['df', 'rotate'])
 def test_shared_core_routes_physical_cc_and_triples_but_preserves_mp2(
-        monkeypatch, integral_transform):
+        monkeypatch):
     """A frame-carrying callback must control both downstream physical energies."""
     triples_native()
     monkeypatch.setattr(lno_ccsd, 'RCCSD', _PreparedCC)
     amplitude_solver = _shared_callback(*_rotations())
     triples_solver = smooth_triples.make_solver(
-        dict(mode='deterministic', integral_transform=integral_transform),
+        dict(mode='deterministic'),
         GRID, with_grad=True)
 
     def evaluate(x):

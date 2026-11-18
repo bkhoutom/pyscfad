@@ -21,12 +21,12 @@ def test_default_path_reuses_cached_blocks_with_their_response():
     ovoo = jnp.asarray(rng.normal(size=(no, nv, no, no)))
     ovov = jnp.asarray(rng.normal(size=(no, nv, no, nv)))
     eris = CachedOnly(ovvv=ovvv, ovoo=ovoo, ovov=ovov)
-    blocks = _integral_blocks(eris, no, nv, require_cached=False)
+    blocks = _integral_blocks(eris, no, nv)
     assert blocks[1] is ovoo and blocks[2] is ovov
     np.testing.assert_array_equal(blocks[0][..., 2, 0], ovvv[..., 3])
     def objective(x):
         cached = CachedOnly(ovvv=ovvv, ovoo=x, ovov=ovov)
-        return jnp.sum(_integral_blocks(cached, no, nv, require_cached=False)[1]**2)
+        return jnp.sum(_integral_blocks(cached, no, nv)[1]**2)
     np.testing.assert_allclose(jax.grad(objective)(ovoo), 2*ovoo)
 
 
@@ -54,7 +54,7 @@ def test_default_constructs_only_missing_blocks(missing):
             assert missing == 'ovvv', 'Rebuilt an already stored ovvv block'
             return lib.pack_tril(lvv)
     eris = Partial(**stored, Lov=lov)
-    blocks = _integral_blocks(eris, no, nv, require_cached=False)
+    blocks = _integral_blocks(eris, no, nv)
     for name, block in zip(('ovvv', 'ovoo', 'ovov'), blocks):
         np.testing.assert_allclose(block, raw[name], rtol=2e-14, atol=2e-14)
 
@@ -68,5 +68,5 @@ def test_default_does_not_probe_a_lazy_integral_property():
     lov = jnp.ones((4, no, nv));lvv = jnp.ones((4, nv*(nv+1)//2))
     eris = Lazy(Lov=lov, Lvv=lvv, ovoo=jnp.ones((no, nv, no, no)),
                 ovov=jnp.ones((no, nv, no, nv)))
-    blocks = _integral_blocks(eris, no, nv, require_cached=False)
+    blocks = _integral_blocks(eris, no, nv)
     np.testing.assert_array_equal(blocks[0], np.full((no, nv, nv, nv), 4.))

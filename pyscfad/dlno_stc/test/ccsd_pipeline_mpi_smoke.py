@@ -98,7 +98,7 @@ def run(output, *, serial=False, gradient=False,
                    ccsd_t=True,
                     return_components=True,
                    triples_controls=dict(mode='stochastic', nsamples=16,
-                       pilot_samples=16, global_seed=71, integral_transform='rotate',
+                       pilot_samples=16, global_seed=71,
                        variance_allocation='occupied_count', energy_tolerance=1e-3),
                    comm=None if serial else comm)
     # Preserve the omitted-option path to exercise the distributed default.

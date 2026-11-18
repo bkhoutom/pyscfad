@@ -66,8 +66,9 @@ def sgx_fit(mf, auxbasis=None, *, grid_level=2, fit_ovlp=True,
     ``screening='per_pair'`` in both modes to compare at the same skip cutoffs.
     The default is per-pair screening with FP64 only.
 
-    ``df_memory_mb`` is the shared DF/J/K working-memory allowance in MB
-    (default 4000). Pass the driver's DF budget; SGX has no separate budget.
+    ``df_memory_mb`` is the shared SCF J/K and correlation DF working-memory
+    allowance in MB (default 4000). It also sets the PySCFAD correlation
+    object's ``max_memory``; no separate correlation budget is required.
     No global three-index tensor or AO-pair derivative panel is built.
     Grid panels grow with the thread count and AO dimension, targeting four
     native grid jobs per thread within the workspace and current memory
@@ -166,6 +167,12 @@ def sgx_fit(mf, auxbasis=None, *, grid_level=2, fit_ovlp=True,
         mf = mf.copy()
         if getattr(mf, 'with_df', None) is None:
             mf = mf.density_fit(auxbasis=auxbasis)
+        else:
+            # Preserve its basis and cached factors without changing the
+            # input MF object's memory settings.
+            mf.with_df = mf.with_df.copy()
+        mf.with_df.max_memory = df_memory_mb
+        mf.with_df.jk_workspace_memory = df_memory_mb
         mf._sgx_backend = _Backend(auxbasis, grid_level, fit_ovlp, df_memory_mb, integral_backend, accuracy)
         mf._eri = None
         mf.direct_scf = False

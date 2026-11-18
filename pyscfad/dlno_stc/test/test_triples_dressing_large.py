@@ -56,8 +56,7 @@ def test_large_full_external_energy_and_all_responses(monkeypatch, selected, dia
     for cap in ('0', '16'):
         monkeypatch.setenv('PYSCFAD_TRIPLES_DRESSING_CACHE_MB', cap)
         (energy, diagnostics), bars = run_mrcc(
-            inputs, nodes, weights, with_grad=True, max_memory=4000.,
-            rotate=True)
+            inputs, nodes, weights, with_grad=True, max_memory=4000.)
         if cap == '0':
             assert diagnostics['dressing_cache_peak_bytes'] == 0
         else:
@@ -80,7 +79,7 @@ def test_large_full_external_energy_and_all_responses(monkeypatch, selected, dia
             assert not native.StableTriplesDressing(tuple(displaced)).virtual_diagonal_at(nodes[1])
             (energy, _), _ = run_mrcc(
                 tuple(displaced), nodes, weights, with_grad=False,
-                max_memory=4000., rotate=True)
+                max_memory=4000.)
             energies.append(energy)
         np.testing.assert_allclose(np.sum(results[1][1][7] * direction),
                                    (energies[1] - energies[0]) / (2 * step),

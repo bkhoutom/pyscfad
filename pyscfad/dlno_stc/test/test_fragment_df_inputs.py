@@ -50,13 +50,12 @@ def molecular_case(tmp_path_factory):
         static=static, group=group, indices=indices, controls=controls)
 
 
-@pytest.mark.parametrize('triples_mode,integral_transform',
-                         [('stochastic', 'rotate'), ('deterministic', 'df')])
+@pytest.mark.parametrize('triples_mode', ['stochastic', 'deterministic'])
 @pytest.mark.parametrize('auxiliary_tolerance', [None, 1e-4])
 def test_default_half_matches_direct_with_one_integral_pass(
-        molecular_case, monkeypatch, triples_mode, integral_transform, auxiliary_tolerance):
+        molecular_case, monkeypatch, triples_mode, auxiliary_tolerance):
     case = molecular_case
-    controls = dict(mode=triples_mode, integral_transform=integral_transform)
+    controls = dict(mode=triples_mode)
     if triples_mode == 'stochastic':
         controls.update(nsamples=16, pilot_samples=16, global_seed=71)
     triples = ccsd.normalize_triples_controls(controls, ccsd_t=True)

@@ -215,7 +215,7 @@ def test_checkpoint_rejects_changed_triples_controls_and_native_version(tmp_path
     manager.close()
     for changed in ({**options, 'triples_controls': {**options['triples_controls'], 'nsamples':3}},
                     {**options, 'triples_controls': {**options['triples_controls'], 'global_seed':72}},
-                    {**options, 'triples_controls': {**options['triples_controls'], 'integral_transform':'rotate'}},
+                    {**options, 'triples_controls': {**options['triples_controls'], 'pilot_samples':3}},
                     {**options, 'triples_controls': {'mode':'deterministic'}}):
         with pytest.raises(RestartMismatchError):
             open_checkpoint(state, static, groups, checkpoint_dir=tmp_path, resume=True, options=changed)

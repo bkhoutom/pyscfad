@@ -20,7 +20,7 @@ exec "$python_bin" -u "$script_dir/benchmark_lno_w_triples.py" \
   --threads "${THREADS:-32}" \
   --max-memory-mb "${MAX_MEMORY_MB:-900000}" \
   --df-memory-mb "${DF_MEMORY_MB:-500000}" \
-  --fragment-df-mode half --triples-integral-transform rotate \
+  --fragment-df-mode half \
   --deterministic-only --triples-laplace-points 3 \
   --cc-conv-tol 1e-7 --cc-conv-tol-normt 1e-5 \
   --output-dir output/water_16_bulk_sgx "$@"

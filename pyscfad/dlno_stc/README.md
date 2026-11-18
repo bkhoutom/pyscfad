@@ -227,8 +227,9 @@ These are integral-screening/classification thresholds, not SCF convergence
 criteria or guaranteed bounds on total molecular energy or force error.
 Explicit numeric tolerances must be finite and positive.
 
-The general benchmark runner enables SGX with `--scf-jk dfj-sgx` and exposes
-its accuracy settings as `--sgx-*` flags; its SCF default is DF. It passes
+The general benchmark runner defaults to integral-direct DF-J/SGX-K and exposes
+its accuracy settings as `--sgx-*` flags. Use `--scf-jk df` to select conventional
+DF SCF. It passes
 `--df-memory-mb` to `sgx_fit(df_memory_mb=...)` for both cold and warm SCF.
 The [bulk-water16 launcher](../../examples/dlno_stc/run_water_16_bulk_sgx.sh)
 sets SGX explicitly. SGX precision and screening are independent of whether
@@ -443,7 +444,6 @@ Leave it `None` when triples are disabled. Accepted keys are:
 | --- | --- | --- |
 | `mode` | `"deterministic"` | `"stochastic"` samples the asymmetric selected-space partition. |
 | `partition` | `"mrcc"` for deterministic, `"asymmetric"` for stochastic | These are the only supported mode/partition combinations. |
-| `integral_transform` | `"df"` | `"rotate"` reuses cached CCSD integrals; both support energies and forces. |
 | `nsamples` | Required for stochastic mode | Integer ≥ 2; nominal production budget per fragment in fixed-count mode. Still required with a tolerance. |
 | `energy_tolerance` | Omitted or `0` | A positive value targets total triples energy SE in Eh; `5e-5` Eh is `0.05` mEh. |
 | `pilot_samples` | `10000` | Independent discarded pilot draws per Laplace point per fragment. |
@@ -452,7 +452,10 @@ Leave it `None` when triples are disabled. Accepted keys are:
 | `variance_allocation` | `"occupied_count"` for fragment plans | Fragment variance shares follow original occupied target counts. |
 | `fragment_energies` | Omitted | Only for `mp2_energy` allocation with previously captured concrete labels; incompatible with plan-based occupied-count allocation. |
 
-Only `mode`, `integral_transform`, and `partition="mrcc"` are accepted for deterministic triples.
+Only `mode` and `partition="mrcc"` are accepted for deterministic triples.
+For energies and forces, triples automatically reuse available cached CCSD
+integral blocks and construct only missing blocks from DF factors once per
+fragment. There is no integral-transform setting.
 The former asymmetric deterministic implementation has been removed. The MRCC
 and asymmetric partitions can assign different energies to a selected fragment
 when its occupied projector does not commute with the occupied Fock matrix.

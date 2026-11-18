@@ -161,7 +161,7 @@ def test_public_ccsd_t_joint_scf_matches_separate_scf_data(molecular_case, monke
             **cc_options(case.controls, case.controls),
               include_hf=True,
             ccsd_t=True, return_components=True,
-            triples_controls=dict(mode='stochastic', integral_transform='rotate',
+            triples_controls=dict(mode='stochastic',
                 nsamples=16, pilot_samples=16, energy_tolerance=1e-3, global_seed=71))
 
     initialize = driver._initialize_scf

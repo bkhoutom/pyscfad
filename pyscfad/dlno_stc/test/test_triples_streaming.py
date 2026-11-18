@@ -12,7 +12,7 @@ def test_batched_mrcc_matches_full_small_batch(monkeypatch):
     for cap in ('0', '16'):
         monkeypatch.setenv('PYSCFAD_TRIPLES_NUMERATOR_CACHE_MB', cap)
         result, bars = run_mrcc(x, [.1, .4, .7], [.8, -.2, .3],
-            with_grad=True, max_memory=2000., rotate=True)
+            with_grad=True, max_memory=2000.)
         answers.append((result[0], bars))
         assert result[1]['occupied_block_batch_size'] <= 128
         if cap == '0':

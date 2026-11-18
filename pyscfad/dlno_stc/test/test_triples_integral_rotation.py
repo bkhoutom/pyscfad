@@ -137,7 +137,8 @@ def test_native_integral_input_contract(name, invalid):
 @pytest.mark.parametrize('mode', ['deterministic', 'fixed', 'adaptive'])
 @pytest.mark.parametrize('whole', [False, True])
 @pytest.mark.parametrize('canonical_virtual', [False, True])
-def test_solver_energy_and_full_response_match_factor_path(mode, whole, canonical_virtual, monkeypatch):
+def test_cached_and_constructed_integrals_match_energy_and_full_response(
+        mode, whole, canonical_virtual, monkeypatch):
     native_calls = []
     native = smooth_triples._native
 
@@ -163,39 +164,38 @@ def test_solver_energy_and_full_response_match_factor_path(mode, whole, canonica
     if mode == 'adaptive':
         settings['target_standard_error'] = 1e-3
 
-    def evaluate(x, transform, with_grad):
-        solver = smooth_triples.make_solver(dict(settings, integral_transform=transform),
-                                            grid, with_grad=with_grad)
+    def evaluate(x, cached, with_grad):
+        solver = smooth_triples.make_solver(settings, grid, with_grad=with_grad)
         # Match packed DF symmetry in both paths, including its pullback.
         bvv = lib.unpack_tril(lib.pack_tril(x['Bvv']))
         ovvv, ovoo, ovov = integrals(x['Bvo'], x['Boo'], bvv)
-        eris = SimpleNamespace(ovvv=lib.pack_tril(ovvv.reshape(no*nv, nv, nv)).reshape(no, nv, -1),
-            ovoo=ovoo, ovov=ovov, fock=jnp.block([[x['foo'], x['fov']], [x['fov'].T, x['fvv']]]))
-        # Rotation must work without any B factors in the ERI object.
-        if transform == 'df':
+        eris = SimpleNamespace(fock=jnp.block([[x['foo'], x['fov']], [x['fov'].T, x['fvv']]]))
+        if cached:
+            # Fully cached inputs must work without accessing any DF factors.
+            eris.ovvv = lib.pack_tril(ovvv.reshape(no*nv, nv, nv)).reshape(no, nv, -1)
+            eris.ovoo, eris.ovov = ovoo, ovov
+        else:
             eris.Lov, eris.Loo, eris.Lvv = x['Bvo'], x['Boo'], lib.pack_tril(bvv)
         return solver(None, eris, x['U'].T, t1=x['t1'], t2=x['t2'])
 
     for with_grad in (False, True):
         if with_grad:
             (expected, reference_diag), reference_bar = jax.value_and_grad(
-                lambda x: evaluate(x, 'df', True), has_aux=True)(x)
+                lambda x: evaluate(x, False, True), has_aux=True)(x)
             (actual, diagnostics), bar = jax.value_and_grad(
-                lambda x: evaluate(x, 'rotate', True), has_aux=True)(x)
+                lambda x: evaluate(x, True, True), has_aux=True)(x)
             for key in x:
                 np.testing.assert_allclose(bar[key], reference_bar[key], rtol=2e-10,
                                            atol=2e-13, err_msg=key)
         else:
-            expected, reference_diag = evaluate(x, 'df', False)
-            actual, diagnostics = evaluate(x, 'rotate', False)
+            expected, reference_diag = evaluate(x, False, False)
+            actual, diagnostics = evaluate(x, True, False)
         np.testing.assert_allclose(actual, expected, rtol=2e-11, atol=2e-14)
         np.testing.assert_allclose(diagnostics['standard_error'], reference_diag['standard_error'],
                                    rtol=2e-11, atol=2e-14)
         assert diagnostics['samples'] == reference_diag['samples']
         assert diagnostics['diagonal_virtual_points'] == (len(grid[0]) if canonical_virtual else 0)
         assert reference_diag['diagonal_virtual_points'] == diagnostics['diagonal_virtual_points']
-        assert diagnostics['rotated_integrals']
-        assert not reference_diag['rotated_integrals']
         assert diagnostics['stable_dressing'] and reference_diag['stable_dressing']
         for timing in (diagnostics, reference_diag):
             # Only stochastic sampling has allocation pilots.
@@ -214,30 +214,21 @@ def test_solver_energy_and_full_response_match_factor_path(mode, whole, canonica
         step = 1e-5
         plus = jax.tree.map(lambda value, delta: value + step*delta, x, direction)
         minus = jax.tree.map(lambda value, delta: value - step*delta, x, direction)
-        finite_difference = (evaluate(plus, 'rotate', False)[0]
-                             - evaluate(minus, 'rotate', False)[0]) / (2*step)
+        finite_difference = (evaluate(plus, True, False)[0]
+                             - evaluate(minus, True, False)[0]) / (2*step)
         response = sum(jnp.sum(bar[key] * direction[key]) for key in x)
         np.testing.assert_allclose(response, finite_difference, rtol=3e-6, atol=2e-10)
 
 
 @pytest.mark.parametrize('mode', ['deterministic', 'stochastic'])
-def test_integral_transform_controls(mode):
+@pytest.mark.parametrize('removed', ['df', 'rotate'])
+def test_removed_integral_transform_is_rejected(mode, removed):
     base = dict(mode=mode)
     if mode == 'stochastic':
         base['nsamples'] = 2
     normalize = lambda x: controls.normalize_triples_controls(x, ccsd_t=True)
-    assert normalize(dict(base, integral_transform='df')) == normalize(base)
-    assert normalize(dict(base, integral_transform='rotate'))['integral_transform'] == 'rotate'
-    for invalid in (None, True, 'unknown', []):
-        with pytest.raises(ValueError, match='integral_transform'):
-            normalize(dict(base, integral_transform=invalid))
-
-
-def test_rotation_requires_smooth_selection_and_cached_integrals():
-    from pyscfad.dlno_stc.ccsd import _allocate_triples_controls
-    settings = dict(mode='deterministic', integral_transform='rotate')
-    with pytest.raises(ValueError, match='smooth'):
-        _allocate_triples_controls(settings, 1)
-    solver = smooth_triples.make_solver(settings, (np.array([.3]), np.array([1.]), {}), with_grad=False)
-    with pytest.raises(ValueError, match='cached ovvv, ovoo and ovov'):
-        solver(None, SimpleNamespace(), np.eye(2), t1=np.zeros((2, 3)), t2=np.zeros((2, 2, 3, 3)))
+    with pytest.raises(ValueError, match='unsupported triples controls: integral_transform'):
+        normalize(dict(base, integral_transform=removed))
+    with pytest.raises(ValueError, match='removed triples options: integral_transform'):
+        smooth_triples.make_solver(dict(base, integral_transform=removed),
+            (np.array([.3]), np.array([1.]), {}), with_grad=False)

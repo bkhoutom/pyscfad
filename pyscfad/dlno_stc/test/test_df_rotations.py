@@ -37,14 +37,13 @@ def _backend():
             (lov.shape[1], lov.shape[1], lov.shape[2], lov.shape[2])))
 
 
-@pytest.mark.parametrize('integral_transform', ['df', 'rotate'])
-def test_joint_rotations_preserve_projected_energy_and_all_physical_responses(integral_transform):
+def test_joint_rotations_preserve_projected_energy_and_all_physical_responses():
     x = _inputs()
     qo, qv = _rotations()
     na = x['Bvo'].shape[0]
     qa = jnp.asarray(np.linalg.qr(np.random.default_rng(83).normal(size=(na, na)))[0])
     triples = smooth_triples.make_solver(
-        dict(mode='deterministic', integral_transform=integral_transform), GRID, with_grad=True)
+        dict(mode='deterministic'), GRID, with_grad=True)
 
     def evaluate(inputs):
         physical = _physical(inputs)

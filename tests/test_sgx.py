@@ -163,12 +163,40 @@ def test_default_screening_reaches_native_plan(mol, native):
     assert accuracy['potential_tol'] == 1e-8
 
 
+@pytest.mark.parametrize('existing_df', [False, True])
+@pytest.mark.parametrize('budget', [None, 200000.])
+def test_sgx_budget_reaches_correlation_domain(mol, existing_df, budget):
+    from pyscfad.lno._df_shared import reverse_scope
+
+    mol.max_memory = 450000
+    original = scf.RHF(mol)
+    if existing_df:
+        original = original.density_fit(auxbasis='def2-svp-jkfit')
+        original.with_df.max_memory = 450000
+    options = {} if budget is None else dict(df_memory_mb=budget)
+    mf = sgx_fit(original, auxbasis='weigend', **options)
+    expected = 4000 if budget is None else budget
+    assert mf._sgx_backend.df_memory_mb == expected
+    assert mf.with_df.jk_workspace_memory == expected
+    assert mf.mol.max_memory == 450000
+    # Exercise the actual budget consumed by local MP2/CC DF planning.
+    with reverse_scope(mf, [0, 1], with_grad=False) as domain:
+        assert domain.workspace_mb == expected
+        assert domain.max_memory_mb == 450000
+        domain.finish()
+    if existing_df:
+        assert original.with_df.max_memory == 450000
+        assert original.with_df.jk_workspace_memory is None
+        assert mf.with_df.auxbasis == 'def2-svp-jkfit'
+
+
 def test_correlation_df_preserved_and_unsupported_modes_rejected(mol):
     with pytest.raises(ValueError, match='grid_level'):
         sgx_fit(scf.RHF(mol), grid_level=8)
     original = scf.RHF(mol).density_fit(auxbasis='def2-svp-jkfit')
     mf = sgx_fit(original, auxbasis='weigend', grid_level=0)
-    assert mf.with_df is original.with_df
+    assert mf.with_df is not original.with_df
+    assert mf.with_df.auxbasis == original.with_df.auxbasis
     assert not hasattr(original, '_sgx_backend')
     dm = np.eye(mol.nao)
     for kwargs in ({'hermi': 0}, {'omega': .3}):

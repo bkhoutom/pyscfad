@@ -15,7 +15,7 @@ import numpy as np
 from pyscf.lib import current_memory
 
 
-def run_mrcc(inputs, nodes, weights, *, with_grad, max_memory, rotate):
+def run_mrcc(inputs, nodes, weights, *, with_grad, max_memory):
     from .smooth_triples import _dressing_cache_bytes
     native = importlib.import_module('pyscfad.dlno_stc._stc_mp2')
     start = time.perf_counter()
@@ -103,6 +103,6 @@ def run_mrcc(inputs, nodes, weights, *, with_grad, max_memory, rotate):
         dressing_cache_peak_bytes=engine.peak_cache_bytes,
         diagonal_occupied_points=sum(engine.occupied_diagonal_at(float(t)) for t in nodes),
         diagonal_virtual_points=sum(engine.virtual_diagonal_at(float(t)) for t in nodes),
-        selected_occupied_frame=engine.selected_occupied_frame, rotated_integrals=rotate,
+        selected_occupied_frame=engine.selected_occupied_frame,
         **maxima)
     return (jnp.asarray(sum(energies)), jax.tree_util.tree_map(jnp.asarray, diagnostics)), bars

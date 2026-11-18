@@ -153,7 +153,7 @@ def test_public_w_ccsd_stochastic_triples_combines_global_response(
             **cc_options(case.controls, case.controls),
 
             ccsd_t=True, return_components=True,
-            triples_controls=dict(mode='stochastic', integral_transform='rotate',
+            triples_controls=dict(mode='stochastic',
                 nsamples=16, pilot_samples=16, energy_tolerance=1e-3, global_seed=71)))
         jax.block_until_ready(results[-1][:2])
     np.testing.assert_allclose(results[1][0], results[0][0], atol=1e-11, rtol=0)

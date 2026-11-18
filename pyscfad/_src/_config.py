@@ -47,7 +47,9 @@ config.set_default('pyscfad_dfccsd_custom_response', True)
 config.set_default('pyscfad_dfccsd_native', True)
 config.set_default('pyscfad_dfccsd_cpp', True)
 #config.set_default('pyscfad_ccsd_checkpoint', False)
-config.set_default('pyscfad_moleintor_opt', False)
+# Prefer native integral/AO2MO response kernels; callers can explicitly select
+# the generic JAX path for unsupported differentiation modes or comparisons.
+config.set_default('pyscfad_moleintor_opt', True)
 
 
 class config_update:

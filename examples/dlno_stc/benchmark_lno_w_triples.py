@@ -162,6 +162,9 @@ def main():
     from pyscfad.tools.linear_solver import eager_gmres
 
     pyscfad.config.update('pyscfad_scf_df_precond', args.scf_df_precond)
+    # Large coordinate-gradient runs need the native packed-integral VJP.
+    # The generic JAX AO2MO pullback expands entire auxiliary blocks to s1.
+    pyscfad.config.update('pyscfad_moleintor_opt', True)
     if args.scf_df_precond:
         # Public CLI totals are decimal MB; this legacy cache cap uses MiB.
         # The preconditioner further limits storage to half actual headroom.
@@ -336,6 +339,8 @@ def main():
 
     def build_mf(current):
         mf = scf.RHF(current).density_fit(auxbasis=auxbasis)
+        # Correlation DF reads this field independently of the SGX/J-K budget.
+        mf.with_df.max_memory = args.df_memory_mb
         if args.scf_jk == 'dfj-sgx':
             mf = sgx_fit(mf, auxbasis=auxbasis, grid_level=args.sgx_grid_level,
                          fit_ovlp=args.sgx_fit_overlap, df_memory_mb=args.df_memory_mb,
@@ -469,6 +474,8 @@ def main():
                         cpu_affinity=benchmark_cpus, affinity_check=affinity,
                         max_memory_mb=args.max_memory_mb, cc_conv_tol=args.cc_conv_tol,
                         df_storage=args.df_storage, df_memory_mb=args.df_memory_mb,
+                        correlation_df_memory_mb=mf.with_df.max_memory,
+                        moleintor_opt=bool(pyscfad.config.moleintor_opt),
                         df_builder=args.df_builder,
                         omp_dynamic=os.environ.get('OMP_DYNAMIC'),
                         mkl_dynamic=os.environ.get('MKL_DYNAMIC'),

@@ -2,7 +2,7 @@ diff --git a/CMakeLists.txt b/CMakeLists.txt
 index f52e278..12159cd 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -168,22 +168,22 @@ if(ENABLE_STATIC)
+@@ -168,20 +168,20 @@ if(ENABLE_STATIC)
    set(BUILD_SHARED_LIBS 0)
  endif()
 
@@ -28,3 +28,15 @@ index f52e278..12159cd 100644
 -install(TARGETS cint DESTINATION "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}" COMPONENT "lib")
 +install(TARGETS cintad DESTINATION "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}" COMPONENT "lib")
  install(FILES ${CintHeaders} DESTINATION ${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_INCLUDEDIR} COMPONENT "dev")
+diff --git a/src/optimizer.h b/src/optimizer.h
+--- a/src/optimizer.h
++++ b/src/optimizer.h
+@@ -5,7 +5,7 @@
+ #include "cint.h"
+
+ #define NOVALUE                 ((void *)0xffffffffffffffffuL)
+-#define MAX_PGTO_FOR_PAIRDATA   2048
++#define MAX_PGTO_FOR_PAIRDATA   8192
+
+ void CINTinit_2e_optimizer(CINTOpt **opt, FINT *atm, FINT natm,
+                            FINT *bas, FINT nbas, double *env);

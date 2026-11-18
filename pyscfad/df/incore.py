@@ -333,7 +333,17 @@ def cholesky_eri(mol, auxmol=None, auxbasis='weigend+etb',
     if auxmol is None:
         auxmol = addons.make_auxmol(mol, auxbasis)
 
-    use_moleintor_opt = config.moleintor_opt and not _has_jvp_tracer(mol, auxmol)
+    # The native three-center VJP supports real packed integrals and coordinate
+    # derivatives only. A native default must not route s1 or basis-parameter
+    # derivatives into that kernel.
+    use_moleintor_opt = (
+        config.moleintor_opt and not _has_jvp_tracer(mol, auxmol)
+        and aosym in ('s2', 's2ij')
+        and int3c.startswith('int3c2e') and 'spinor' not in int3c
+        and all(getattr(m, name, None) is None for m in (mol, auxmol)
+                for name in ('exp', 'ctr_coeff', 'r0')))
+    if use_moleintor_opt:
+        aosym = 's2ij'
     if not use_moleintor_opt:
         if not config.moleintor_opt:
             log.warn('int3c2e symmetry turned off')

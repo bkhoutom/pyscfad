@@ -232,6 +232,11 @@ response is recomputed from the saved fragment cotangents. The output field
 `reference_scf_mode` reports `restored` or `solved`. A separate atomic
 `.scf-reference.h5` is saved immediately after successful warm SCF, allowing
 recovery even before domain selection or the first fragment finishes.
+Once CC selections have been committed, restart loads them directly, checks
+the requested geometry and selection settings, and attaches Boys response
+without running localization or BP/domain selection searches. It records
+`selection_source="checkpoint"` and zero selection-construction times. An
+early SCF-only checkpoint still needs its first domain selection.
 Old checkpoints containing only orbital hashes cannot restore a reference;
 the runner reports that limitation before running SCF.
 A completed result is never overwritten; use a new output directory for another

@@ -5,6 +5,7 @@ explicit tolerances, never rounded hashes. The original reference is retained
 across resumes so that repeated restarts cannot accumulate tolerance drift.
 """
 from dataclasses import fields, is_dataclass
+from collections.abc import Mapping
 import json
 import os
 from pathlib import Path
@@ -247,16 +248,77 @@ def _molecular_inputs(mol):
                 cart=bool(getattr(mol, 'cart', False)))
 
 
+def _validate_molecular_inputs(manifest, mol):
+    saved = _mapping(_mapping(manifest['base_summary'])['reference'])
+    for name, value in _molecular_inputs(mol).items():
+        if storage._encode_value(value) != saved.get(name):
+            raise storage.RestartMismatchError(f'checkpoint molecular input {name} differs')
+    return saved
+
+
+def load_selections(checkpoint_dir, mol, *, domain_options=None, selection_options=None):
+    """Load authenticated choices and check requested settings without selection."""
+    from ._selection import (BoysDomainThresholds, _normalize_boys_grouping,
+                             _resolve_boys_options, _validate_boys_target_groups)
+
+    for name, options in (('domain_options', domain_options), ('selection_options', selection_options)):
+        if options is not None and not isinstance(options, Mapping):
+            raise TypeError(f'{name} must be a mapping')
+    manifest = _manifest(checkpoint_dir)
+    _validate_molecular_inputs(manifest, mol)
+    saved = _saved_static(checkpoint_dir, manifest)
+    from .ccsd import CCSDSelections, CC_SELECTIONS_SCHEMA_VERSION
+    if not isinstance(saved, CCSDSelections) or saved.schema_version != CC_SELECTIONS_SCHEMA_VERSION:
+        raise storage.RestartMismatchError('incompatible saved CC selection schema')
+    domain = saved.mp2_static
+    domain_values = dict(frozen=domain.frozen, thresholds=domain.thresholds,
+        lo_kwargs=domain.lo_kwargs or {}, boys_grouping=domain.boys_grouping,
+        pair_energy_model=domain.pair_energy_model, frag_lolist=domain.frag_lolist)
+    for name, value in (domain_options or {}).items():
+        if name == 'full_domain':
+            if not isinstance(value, (bool, np.bool_)):
+                raise TypeError('full_domain must be a bool')
+            # Old static files record the effective domains, not the flag that
+            # produced them. A request for full domains must actually be full.
+            if value and (not np.all(domain.strong_mask) or any(
+                    not np.array_equal(fragment.extended_ao_indices, np.arange(mol.nao))
+                    or not np.array_equal(fragment.pao_center_atoms, np.arange(mol.natm))
+                    for fragment in domain.fragments)):
+                raise storage.RestartMismatchError('checkpoint full_domain setting differs')
+            continue
+        if name not in domain_values:
+            raise ValueError(f'unsupported restart domain option: {name}')
+        if name == 'thresholds':
+            value = BoysDomainThresholds() if value is None else value
+        elif name == 'lo_kwargs':
+            value = _resolve_boys_options(value)
+        elif name == 'boys_grouping':
+            value = _normalize_boys_grouping(value)
+        elif name == 'pair_energy_model':
+            value = str(value).lower().replace('_', '-')
+        elif name == 'frag_lolist':
+            value = _validate_boys_target_groups(value, len(domain.active_occ_indices))
+        if storage.scientific_digest(value) != storage.scientific_digest(domain_values[name]):
+            raise storage.RestartMismatchError(f'checkpoint domain setting {name} differs')
+    lis = saved.lis_static
+    selection_values = dict(thresh_occ=lis.thresh_occ, thresh_vir=lis.thresh_vir,
+        internal_rank_threshold=lis.internal_rank_threshold,
+        triples_laplace_points=(saved.selection_options or {}).get('triples_laplace_points'))
+    for name, value in (selection_options or {}).items():
+        if name not in selection_values:
+            raise ValueError(f'unsupported restart LIS option: {name}')
+        if storage.scientific_digest(value) != storage.scientific_digest(selection_values[name]):
+            raise storage.RestartMismatchError(f'checkpoint LIS setting {name} differs')
+    return saved
+
+
 def load_scf_reference(checkpoint_dir, mol):
     """Load authenticated numerical values without running either SCF solve."""
     if not (Path(checkpoint_dir) / 'run.json').exists():
         return _load_early_scf_reference(checkpoint_dir, mol)
     manifest = _manifest(checkpoint_dir)
     summary = _mapping(manifest['base_summary'])
-    saved_inputs = _mapping(summary['reference'])
-    for name, value in _molecular_inputs(mol).items():
-        if storage._encode_value(value) != saved_inputs.get(name):
-            raise storage.RestartMismatchError(f'checkpoint SCF guess {name} differs')
+    saved_inputs = _validate_molecular_inputs(manifest, mol)
     path = Path(checkpoint_dir) / 'records/cc-reference/state.h5'
     if not path.is_file():
         raise storage.RestartMismatchError(
@@ -276,12 +338,51 @@ def load_scf_reference(checkpoint_dir, mol):
         if storage._encode_value(canonical) != summary['canonical']:
             raise storage.RestartCorruptionError(
                 'numerical SCF reference does not match the original identity')
+        boys_coeff = None
+        entries = payload.get('trees', {}).get('common', {}).get('entries', ())
+        matches = [entry['leaf'] for entry in entries
+                   if entry.get('path') == [['attr', 'iao_coeff']]]
+        if len(matches) > 1:
+            raise storage.RestartCorruptionError('duplicate saved Boys frame')
+        if matches:
+            leaf = matches[0]
+            if leaf.get('kind') == 'array':
+                boys_coeff = reader.get(leaf)
+            elif leaf.get('kind') == 'zero':
+                boys_coeff = np.zeros(leaf['shape'], dtype=np.dtype(leaf['dtype']))
+            else:
+                raise storage.RestartCorruptionError('invalid saved Boys frame')
     finally:
         handle.close()
     _validate_canonical(canonical, mol)
     return dict(canonical=canonical, scf_settings=scalars['scf_settings'],
                 auxbasis=storage._decode_value(saved_inputs['auxbasis'], None),
-                scf_class=storage._decode_value(saved_inputs['scf_class'], None))
+                scf_class=storage._decode_value(saved_inputs['scf_class'], None),
+                boys_coeff=boys_coeff)
+
+
+def load_boys_reference(checkpoint_dir, mf, static, *, with_identity=False):
+    """Use the saved common-frame root, which may refine the initial anchors."""
+    if not (Path(checkpoint_dir) / 'records/cc-reference/state.h5').is_file():
+        # Legacy reference validation remains in open_checkpoint.
+        return (None, False) if with_identity else None
+    reference = load_scf_reference(checkpoint_dir, mf.mol)
+    _validate_scf_backend(mf, reference)
+    if not bool(mf.converged):
+        raise storage.RestartMismatchError('checkpoint restart requires converged SCF')
+    for name, value in reference['canonical'].items():
+        _close(getattr(mf, name), value, name,
+               atol=0. if name == 'mo_occ' else ENERGY_ATOL if name in ('e_tot', 'mo_energy') else ARRAY_ATOL,
+               rtol=0. if name in ('e_tot', 'mo_energy', 'mo_occ') else ARRAY_RTOL)
+    coeff = reference['boys_coeff']
+    if coeff is not None and (coeff.shape != np.shape(static.target_reference_coeff)
+                              or not np.isfinite(coeff).all()):
+        raise storage.RestartCorruptionError('saved Boys frame shape or values differ')
+    if with_identity:
+        exact = storage.scientific_digest(reference['canonical']) == storage.scientific_digest({
+            name: getattr(mf, name) for name in reference['canonical']})
+        return coeff, exact
+    return coeff
 
 
 def _validate_canonical(canonical, mol):
@@ -303,9 +404,7 @@ def scf_initial_guess(checkpoint_dir, mol):
     return (coeff * occupation) @ coeff.conj().T
 
 
-def restore_scf_reference(mf, reference):
-    """Validate backend settings and attach response to the saved RHF root."""
-    from pyscfad.scf._restart import restore_scf
+def _validate_scf_backend(mf, reference):
     if (storage.scientific_digest(_scf_settings(mf)) !=
             storage.scientific_digest(reference['scf_settings'])):
         raise storage.RestartMismatchError('checkpoint SCF/SGX settings differ')
@@ -313,6 +412,12 @@ def restore_scf_reference(mf, reference):
             or storage.scientific_digest(getattr(getattr(mf, 'with_df', None), 'auxbasis', None))
             != storage.scientific_digest(reference['auxbasis'])):
         raise storage.RestartMismatchError('checkpoint SCF class/auxiliary basis differs')
+
+
+def restore_scf_reference(mf, reference):
+    """Validate backend settings and attach response to the saved RHF root."""
+    from pyscfad.scf._restart import restore_scf
+    _validate_scf_backend(mf, reference)
     return restore_scf(mf, reference['canonical'])
 
 

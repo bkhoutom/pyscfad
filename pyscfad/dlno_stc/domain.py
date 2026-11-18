@@ -206,7 +206,8 @@ def _polar_rotation_jvp(primals, tangents):
 
 
 # Boys replay and metric operations originated in dlno/dlno_base.py.
-def _rebuild_boys_targets(mf, occupied, static, *, _stationary=False, fock=None):
+def _rebuild_boys_targets(mf, occupied, static, *, _stationary=False,
+                          _require_stationary=False, fock=None):
     """Replay a saved Boys branch with the existing implicit-response wrapper.
 
     Differentiate the reference alignment, including the moving AO overlap.
@@ -261,6 +262,8 @@ def _rebuild_boys_targets(mf, occupied, static, *, _stationary=False, fock=None)
                     key: options[key] for key in
                     ('conv_tol', 'conv_tol_grad', 'symmetry', 'gmres_options') if key in options})
             except BoysStationarityError:
+                if _require_stationary:
+                    raise
                 # Only an uncertified root falls back to refinement. Keep
                 # response-solver and gauge failures visible to the caller.
                 pass
@@ -515,16 +518,26 @@ def _build_selection_reference(
     return common, (parent_columns, products)
 
 
-def rebuild_domain_data(mf, static, *, scf_data=None):
-    """Rebuild Boys and PAOs, optionally using an existing live AO S/F pair."""
+def rebuild_domain_data(mf, static, *, scf_data=None, stationary_boys=False,
+                         boys_reference_coeff=None):
+    """Rebuild continuous data using fixed labels and an optional live S/F pair.
+
+    ``stationary_boys=True`` attaches response at the saved Boys frame without
+    localization refinement; an insufficiently stationary frame raises.
+    """
     if not isinstance(static, DomainSelections) or static.lo_type != "boys":
         raise TypeError("static must be STC Boys DomainSelections")
     overlap, fock = build_scf_data(mf) if scf_data is None else scf_data
     mo_coeff, mo_energy = np.asarray(mf.mo_coeff), np.asarray(mf.mo_energy)
     occupied, virtual = (mo_coeff[:, indices] for indices in (static.active_occ_indices, static.active_vir_indices))
-    targets = ((_rebuild_boys_targets(mf, occupied, static, fock=fock)
+    boys_options = (dict(_stationary=True, _require_stationary=True)
+                    if stationary_boys else {})
+    boys_static = (static if boys_reference_coeff is None else SimpleNamespace(
+        target_reference_coeff=boys_reference_coeff,
+        target_reference_coords=static.target_reference_coords, lo_kwargs=static.lo_kwargs))
+    targets = ((_rebuild_boys_targets(mf, occupied, boys_static, fock=fock, **boys_options)
                 if (static.lo_kwargs or {}).get('method') == 'lambda_boys' else
-                _rebuild_boys_targets(mf, occupied, static))
+                _rebuild_boys_targets(mf, occupied, boys_static, **boys_options))
                if occupied.shape[1] else occupied)
     projected_out = mo_coeff[:, static.pao_projected_out_indices]
     pao = response('stc.domain.common_pullback.pao',

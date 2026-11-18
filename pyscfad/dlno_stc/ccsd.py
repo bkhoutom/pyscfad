@@ -314,6 +314,33 @@ def build_static_selections(mf, mp2_static, *, thresh_occ, thresh_vir,
         mp2_grid=saved_grid, mp2_grid_diagnostics=grid_diagnostics)
 
 
+def load_static_selections(checkpoint_dir, mol, *, domain_options=None,
+                           selection_options=None):
+    """Load saved Boys/domain/LIS choices without constructing new selections.
+
+    Geometry, elements, charge, spin and basis must match the checkpoint.
+    Pass requested domain settings (e.g. frozen, thresholds, boys_grouping,
+    lo_kwargs) and LIS settings (thresh_occ, thresh_vir,
+    internal_rank_threshold, triples_laplace_points) in the two mappings to
+    validate them explicitly. Omitted options use the saved configuration.
+    The calculation still validates SCF/DF/SGX, solver and implementation
+    identity before restoring contributions, and rebuilds continuous response.
+    """
+    from ._ccsd_restart_reference import load_selections
+    return load_selections(checkpoint_dir, mol, domain_options=domain_options,
+                           selection_options=selection_options)
+
+
+def _resume_boys_options(checkpoint_dir, mf, static):
+    from ._ccsd_restart_reference import load_boys_reference
+    coeff, exact = load_boys_reference(checkpoint_dir, mf, static.mp2_static,
+                                       with_identity=True)
+    # A restored SCF keeps the saved root without any optimizer. A caller
+    # that explicitly reconverges SCF may need continuous Boys refinement
+    # at that slightly different root; its discrete selections stay fixed.
+    return dict(stationary_boys=exact, boys_reference_coeff=coeff)
+
+
 def _select_fragment_lis(mf, common, domains, index, group, frame, forward, *,
                          thresh_occ, thresh_vir, internal_rank_threshold,
                          triples_laplace_points, prepared_lis=None, with_grad=False):
@@ -916,7 +943,7 @@ def _run(initializer, worker_initializer, comm, *, checkpoint_dir, resume,
 
 
 @memory_calculation
-def kernel(mf, static, *, baseline_controls=None, matrix_controls=None, mp2_grid=None,
+def kernel(mf, static=None, *, baseline_controls=None, matrix_controls=None, mp2_grid=None,
            ccsd_t=False, triples_controls=None, verbose_imp=0, include_hf=False,
            return_components=False,
            merge_identical=True, comm=None,
@@ -994,6 +1021,8 @@ def kernel(mf, static, *, baseline_controls=None, matrix_controls=None, mp2_grid
     if resume and (comm is None or comm.Get_size() == 1):
         from ._ccsd_restart_reference import prepare_resume
         resume = prepare_resume(checkpoint_dir, resume)
+        if resume and static is None:
+            static = load_static_selections(checkpoint_dir, mf.mol)
     def initialize():
         solver_options = _cc_solver_options(cc_solver, stc_cc_controls, lis_aux_svd_tol)
         triples = normalize_triples_controls(triples_controls, ccsd_t=ccsd_t)
@@ -1009,7 +1038,9 @@ def kernel(mf, static, *, baseline_controls=None, matrix_controls=None, mp2_grid
         if any(isinstance(x, jax.core.Tracer) for x in jax.tree_util.tree_leaves(mf)):
             raise TypeError('STC CC kernel is forward-only; use value_and_grad')
         validate_selection_basis(mf, selected, correlation_auxbasis)
+        boys_options = _resume_boys_options(checkpoint_dir, mf, selected) if resume else {}
         state = driver._initialize(mf, selected.mp2_static, baseline, with_grad=False,
+                                   **boys_options,
                                    **basis_kwargs(correlation_auxbasis))
         state['cc_triples_controls'] = triples
         if solver_options:
@@ -1077,6 +1108,8 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls=None, matrix
     if resume and (comm is None or comm.Get_size() == 1):
         from ._ccsd_restart_reference import prepare_resume
         resume = prepare_resume(checkpoint_dir, resume)
+        if resume and static is None and build_static is None:
+            static = load_static_selections(checkpoint_dir, mol)
     def initialize():
         solver_options = _cc_solver_options(cc_solver, stc_cc_controls, lis_aux_svd_tol)
         triples = normalize_triples_controls(triples_controls, ccsd_t=ccsd_t)
@@ -1123,10 +1156,12 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls=None, matrix
         if build_static is not None:
             _stc_precision.validate_seed_independence(solver_options.get('stc_cc_controls'), indices)
         triples = _allocate_triples_controls(triples, len(indices), static=selected, indices=indices)
+        boys_options = _resume_boys_options(checkpoint_dir, mf, selected) if resume else {}
         state = driver._initialize(mf, selected.mp2_static, baseline, with_grad=True,
                                    scf_pullback=scf_pullback, scf_data=scf_data,
                                    scf_data_pullback=scf_data_pullback,
                                    prepared_domain=prepared_domain,
+                                   **boys_options,
                                    **basis_kwargs(correlation_auxbasis))
         state['cc_triples_controls'] = triples
         if solver_options:

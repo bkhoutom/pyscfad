@@ -286,6 +286,15 @@ def test_benchmark_resume_bypasses_both_scf_kernels(
     host.conv_tol, host.conv_tol_grad = 1e-9, 1e-6
     directory = tmp_path / 'checkpoint'
     if complete_cc_checkpoint:
+        from pyscfad.dlno_stc import build_domain_selections
+        # The runner now validates selection settings before entering CC.
+        domains = build_domain_selections(host, frozen=1, boys_grouping='atom',
+            lo_kwargs=dict(init_guess='atomic', conv_tol=1e-10,
+                           gmres_options=dict(restart=120, maxiter=100)))
+        static = ccsd.build_static_selections(host, domains, thresh_occ=1e-4,
+            thresh_vir=1e-5, baseline_controls=dict(mode='deterministic', threads=1,
+                                                  global_seed=666),
+            matrix_controls=dict(mode='deterministic', threads=1))
         _open(directory, host, static).close()
     else:
         reference.save_early_scf_reference(directory, host)
@@ -301,6 +310,7 @@ def test_benchmark_resume_bypasses_both_scf_kernels(
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     monkeypatch.setattr(module, 'configure_cpu_workload', lambda threads: [0])
+    monkeypatch.setattr(module, 'check_worker_affinity', lambda cpus: dict(runtime_threads=1))
     monkeypatch.setattr(sys, 'argv', ['benchmark', '--threads', '1', '--basis', 'sto-3g',
         '--xyz-file', str(xyz), '--frozen', '1', '--boys-grouping', 'atom',
         '--output-dir', str(tmp_path / 'output'), '--checkpoint-dir', str(directory), '--resume'])
@@ -315,13 +325,27 @@ def test_benchmark_resume_bypasses_both_scf_kernels(
         restored, _ = driver._initialize_scf(mol, build, share_scf_data=True)
         np.testing.assert_array_equal(restored.mo_coeff, mf.mo_coeff)
         assert kwargs['resume'] is complete_cc_checkpoint
+        if complete_cc_checkpoint:
+            loaded = kwargs['build_static'](restored)
+            assert storage.scientific_digest(loaded) == storage.scientific_digest(static)
         raise ReachedFragments
 
     monkeypatch.setattr(pyscf_hf, 'kernel', forbidden)
     monkeypatch.setattr(scf.hf, 'kernel', forbidden)
+    if complete_cc_checkpoint:
+        from pyscfad import dlno_stc
+        from pyscfad.lo import boys
+        monkeypatch.setattr(dlno_stc, 'build_domain_selections', forbidden)
+        monkeypatch.setattr(ccsd, 'build_static_selections', forbidden)
+        monkeypatch.setattr(boys, 'kernel', forbidden)
     monkeypatch.setattr(ccsd, 'value_and_grad', stop_before_fragments)
     with pytest.raises(ReachedFragments):
         module.main()
+    if complete_cc_checkpoint:
+        import json
+        settings = json.loads((tmp_path / 'output/settings.json').read_text())
+        assert settings['selection_source'] == 'checkpoint'
+        assert settings['domain_selection_seconds'] == settings['selection_seconds'] == 0.
 
 
 @pytest.mark.parametrize('failure', ['unconverged', 'energy_mismatch'])

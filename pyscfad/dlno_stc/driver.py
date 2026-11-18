@@ -202,9 +202,13 @@ def _select_domain_reference(mf, build_static, *, reuse_weak=True,
     return selected, scf_data, scf_data_pullback, prepared
 
 
-def _build_common_with_pullback(mf, static, scf_data, scf_data_pullback):
+def _build_common_with_pullback(mf, static, scf_data, scf_data_pullback, *,
+                                stationary_boys=False, boys_reference_coeff=None):
+    options = dict(stationary_boys=True) if stationary_boys else {}
+    if boys_reference_coeff is not None:
+        options['boys_reference_coeff'] = boys_reference_coeff
     common, construction_pullback = jax.vjp(
-        lambda current, data: rebuild_domain_data(current, static, scf_data=data),
+        lambda current, data: rebuild_domain_data(current, static, scf_data=data, **options),
         mf, scf_data)
     if scf_data_pullback is None:
         # Independent output seeds rejoin the single SCF tape in _finish.
@@ -237,7 +241,7 @@ def _weak_energy(state, static, pairs):
 
 def _initialize(mf, static, controls, *, with_grad, scf_pullback=None,
                 scf_data=None, scf_data_pullback=None, prepared_domain=None,
-                correlation_auxbasis=None):
+                correlation_auxbasis=None, stationary_boys=False, boys_reference_coeff=None):
     _validate_static(static)
     controls = _driver_controls(controls, static=static)
     _validate_reference(mf, static, **basis_kwargs(correlation_auxbasis))
@@ -254,8 +258,11 @@ def _initialize(mf, static, controls, *, with_grad, scf_pullback=None,
                 raise ValueError('live S/F data require their pullback for gradients')
             adopted = None if prepared_domain is None else prepared_domain.take(static)
             if adopted is None:
+                options = dict(stationary_boys=True) if stationary_boys else {}
+                if boys_reference_coeff is not None:
+                    options['boys_reference_coeff'] = boys_reference_coeff
                 common, common_pullback = _build_common_with_pullback(
-                    mf, static, scf_data, scf_data_pullback)
+                    mf, static, scf_data, scf_data_pullback, **options)
             else:
                 common, common_pullback, pending = adopted
 
@@ -266,7 +273,10 @@ def _initialize(mf, static, controls, *, with_grad, scf_pullback=None,
             if adopted is None:
                 if scf_data is None:
                     scf_data = getattr(mf, '_stc_scf_data', None)
-                common = rebuild_domain_data(mf, static, scf_data=scf_data)
+                options = dict(stationary_boys=True) if stationary_boys else {}
+                if boys_reference_coeff is not None:
+                    options['boys_reference_coeff'] = boys_reference_coeff
+                common = rebuild_domain_data(mf, static, scf_data=scf_data, **options)
             else:
                 common, pending_energy = adopted
             common_pullback = mf_bar = common_bar = None

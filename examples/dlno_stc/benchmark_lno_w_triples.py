@@ -263,13 +263,25 @@ def main():
             expected_groups = carbons
         else:
             raise ValueError("atom-grouped benchmark requires (H2O)_n or C_n H_(2n+2)")
-    saved_scf = None
+    saved_scf = saved_selection = None
+    boys_options = dict(init_guess="atomic", conv_tol=1e-10,
+                        gmres_options=dict(restart=120, maxiter=100))
     if args.resume:
         from pyscfad.dlno_stc._ccsd_restart_reference import prepare_resume, load_scf_reference
         args.resume = prepare_resume(args.checkpoint_dir, True)
         if args.resume or (args.checkpoint_dir / '.scf-reference.h5').is_file():
             saved_scf = load_scf_reference(args.checkpoint_dir, mol)
             report('Restoring converged SCF; no cold or warm SCF iterations')
+        if args.resume:
+            saved_selection = ccsd.load_static_selections(
+                args.checkpoint_dir, mol,
+                domain_options=dict(frozen=args.frozen, thresholds=domain_thresholds,
+                    boys_grouping=args.boys_grouping, full_domain=full_domain,
+                    lo_kwargs=boys_options, pair_energy_model='multipole'),
+                selection_options=dict(thresh_occ=args.lno_thresh_occ,
+                    thresh_vir=args.lno_thresh_vir, internal_rank_threshold=1e-6,
+                    triples_laplace_points=args.triples_laplace_points))
+            report('Loaded saved Boys/domain/LIS selections; no selection searches')
     reference_scf_mode = 'restored' if saved_scf is not None else 'solved'
     refmol = pgto.M(atom=str(xyz), basis=basis, unit="Angstrom",
                      max_memory=args.max_memory_mb, verbose=0)
@@ -375,15 +387,17 @@ def main():
             raise RuntimeError("reference and differentiable SCF disagree")
         if selection:
             return selection['static']
-        stage_start = time.perf_counter()
-        domains = dlno_stc.build_domain_selections(
-            mf, frozen=args.frozen, full_domain=full_domain,
-            thresholds=domain_thresholds,
-            boys_grouping=args.boys_grouping,
-            lo_kwargs=dict(init_guess="atomic", conv_tol=1e-10,
-                           gmres_options=dict(restart=120, maxiter=100)))
-        domain_selection_seconds = time.perf_counter() - stage_start
-        report(f"Domain selection complete in {domain_selection_seconds:.1f} s")
+        if saved_selection is None:
+            stage_start = time.perf_counter()
+            domains = dlno_stc.build_domain_selections(
+                mf, frozen=args.frozen, full_domain=full_domain,
+                thresholds=domain_thresholds, boys_grouping=args.boys_grouping,
+                lo_kwargs=boys_options)
+            domain_selection_seconds = time.perf_counter() - stage_start
+            report(f"Domain selection complete in {domain_selection_seconds:.1f} s")
+        else:
+            domains = saved_selection.mp2_static
+            domain_selection_seconds = 0.0
         if len(domains.physical_groups) != expected_groups:
             raise RuntimeError(f"expected {expected_groups} physical fragments")
         mp2_domains = []
@@ -421,11 +435,15 @@ def main():
                                  thresh_vir=args.lno_thresh_vir,
                                  baseline_controls=baseline, matrix_controls=matrix,
                                  merge_identical=True)
-        selected = ccsd.build_static_selections(
-            mf, domains,
-            triples_laplace_points=args.triples_laplace_points,
-            **selection_options)
-        selection_seconds = time.perf_counter() - selection_start
+        if saved_selection is None:
+            selected = ccsd.build_static_selections(
+                mf, domains,
+                triples_laplace_points=args.triples_laplace_points,
+                **selection_options)
+            selection_seconds = time.perf_counter() - selection_start
+        else:
+            selected = saved_selection
+            selection_seconds = 0.0
         dimensions = [ccsd._fragment_dimensions(selected, i) for i in range(expected_groups)]
         frame_blocks = []
         affinity = check_worker_affinity(benchmark_cpus)
@@ -467,6 +485,7 @@ def main():
                         reference_scf_mode=reference_scf_mode,
                         initial_ad_scf_seconds=initial_ad_scf_seconds,
                         selection_in_production=production_started is not None,
+                        selection_source=('checkpoint' if saved_selection is not None else 'constructed'),
                         domain_selection_seconds=domain_selection_seconds,
                         cc_conv_tol_normt=args.cc_conv_tol_normt, cc_max_cycle=200,
                         targets_meh=args.targets_meh, seeds=args.seeds,
@@ -530,10 +549,11 @@ def main():
             continue
         report(f"BEGIN {label}")
         phase = time.perf_counter()
-        selection_in_production = not selection
+        selection_in_production = saved_selection is None and not selection
         if selection_in_production:
             production_started = phase
-        report("Sharing production SCF with domain selection and weak-pair response")
+        report("Using saved domain selections and rebuilding response" if saved_selection is not None
+               else "Sharing production SCF with domain selection and weak-pair response")
         energy, molecule_bar, components = ccsd.value_and_grad(
             mol, build_mf, build_static=build_static,
             triples_controls=controls, checkpoint_dir=args.checkpoint_dir,

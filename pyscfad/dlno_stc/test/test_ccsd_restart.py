@@ -246,11 +246,22 @@ def test_scf_density_restart_resumes_interrupted_cc_gradient(tmp_path, monkeypat
             ccsd.value_and_grad(mol, build_mf, checkpoint_dir=checkpoint, **options)
     assert len(solved) == 1
     solved.clear()
-    resumed = ccsd.value_and_grad(mol, build_mf, checkpoint_dir=checkpoint, resume=True, **options)
-    assert len(solved) == 1
-    solved.clear()
-    completed = ccsd.value_and_grad(mol, build_mf, checkpoint_dir=checkpoint, resume=True, **options)
-    assert solved == []
+    resume_options = {key: value for key, value in options.items() if key != 'build_static'}
+    from pyscfad.dlno_stc import driver, _selection
+
+    def no_selection(*args, **kwargs):
+        pytest.fail('restart rebuilt domain selections')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(driver, '_select_domain_reference', no_selection)
+        patch.setattr(_selection, 'get_bp_domain', no_selection)
+        resumed = ccsd.value_and_grad(mol, build_mf, checkpoint_dir=checkpoint,
+                                     resume=True, **resume_options)
+        assert len(solved) == 1
+        solved.clear()
+        completed = ccsd.value_and_grad(mol, build_mf, checkpoint_dir=checkpoint,
+                                       resume=True, **resume_options)
+        assert solved == []
     reference = ccsd.value_and_grad(mol, build_mf, **options)
     assert len(solved) == 2
     assert density_restarts == [False, True, True, True]

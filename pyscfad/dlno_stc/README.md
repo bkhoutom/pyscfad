@@ -565,6 +565,33 @@ orbital gauge and its derivatives. The output records
 the earlier warm-start behavior. Legacy checkpoints without numerical orbitals
 produce an explicit error rather than silently starting cold.
 
+When CC selections are present, the runner also loads the saved Boys anchors,
+BP/domain choices, LIS plan and quadratures directly. Geometry, basis, frozen
+space, grouping, thresholds, localization options and LIS settings are checked
+against the request; SCF/DF/SGX, solver and implementation checks remain active.
+It records `selection_source="checkpoint"` and zero selection-construction
+times. Boys response is attached to the saved stationary frame without running
+the localization optimizer. An insufficiently stationary frame is rejected;
+it is not silently refined. Continuous integrals, PAO/domain projections and
+response needed for unfinished work are still rebuilt.
+API callers that explicitly reconverge SCF rather than restore its saved values
+may still need continuous Boys refinement at that slightly different SCF root;
+their saved discrete domain choices are reused.
+
+The API exposes `ccsd.load_static_selections(checkpoint_dir, mol,
+domain_options={...}, selection_options={...})`. Pass requested domain options
+such as `frozen`, `thresholds`, `boys_grouping`, `lo_kwargs` and
+`pair_energy_model`, and LIS options `thresh_occ`, `thresh_vir`,
+`internal_rank_threshold` and `triples_laplace_points`, to validate them without
+selection. Omitted options adopt the saved configuration. Serial
+`ccsd.kernel(..., resume=True)` and `ccsd.value_and_grad(..., resume=True)`
+automatically load it when neither explicit selections nor a selection callback
+is supplied. An explicitly supplied callback still runs; use the loader and
+pass its result as `static` to avoid rebuilding inside that callback.
+
+If only the early SCF checkpoint exists, no domain choices have been committed
+yet, so selection runs once before correlation can resume.
+
 Immediately after a successful warm SCF, the runner atomically saves
 `.scf-reference.h5` in the checkpoint directory. This independent reference
 survives interruptions during domain selection or CC checkpoint initialization.

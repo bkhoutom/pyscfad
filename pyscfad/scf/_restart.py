@@ -16,19 +16,42 @@ def _saved_root(dm, mf, overlap, hcore, factors):
     return dm, factors
 
 
-def restore_scf(mf, canonical):
+def _fock_from_saved(mf, density, hcore, saved_fock):
+    """Use saved F, but attach dH + dJ - dK/2 at this reference."""
+    value = saved_fock - ops.stop_grad(hcore)
+    backend = getattr(mf, '_sgx_backend', None)
+    if backend is not None:
+        from pyscfad.sgx.sgx import veff_from_saved
+        vhf = veff_from_saved(backend, mf.mol, density, value, mf.direct_scf_tol)
+    else:
+        from pyscfad.df._df_jk_opt import veff_from_saved
+        vhf = veff_from_saved(mf.with_df, density, value, mf.direct_scf_tol)
+    live = hcore + vhf
+    # Avoid even subtraction/addition roundoff in the exposed forward Fock.
+    return saved_fock + (live - ops.stop_grad(live))
+
+
+def restore_scf(mf, canonical, *, fock=None):
     """Install saved RHF values and attach their implicit nuclear response.
 
     The caller must authenticate the saved reference and its geometry/settings.
-    Integral/Fock construction is repeated, but no SCF kernel, DIIS iteration,
-    initial guess or forward orbital diagonalization is performed. Reverse
-    mode still solves the ordinary SCF response equations when requested.
+    The saved AO Fock supplies every forward value, including when setting
+    up the implicit pullback. Integral data and derivative machinery are
+    rebuilt; reverse mode still solves the ordinary SCF response equations.
     """
     if (not isinstance(mf, pyscf_hf.RHF) or isinstance(mf, pyscf_hf.KohnShamDFT)
             or mf.mol.spin != 0):
         raise NotImplementedError('saved SCF response requires closed-shell RHF')
     if not config.scf_implicit_diff or config.scf_first_order_custom:
         raise NotImplementedError('saved SCF response requires standard implicit differentiation')
+    backend = getattr(mf, '_sgx_backend', None)
+    if backend is None and (getattr(mf, 'with_df', None) is None
+                            or getattr(mf, 'only_dfj', False)):
+        raise NotImplementedError('saved Fock response requires DF-JK or SGX RHF')
+    saved_fock = numpy.asarray(fock)
+    if (saved_fock.shape != (mf.mol.nao, mf.mol.nao)
+            or numpy.iscomplexobj(saved_fock) or not numpy.isfinite(saved_fock).all()):
+        raise ValueError('restart requires a finite saved AO Fock matrix')
     coeff = numpy.asarray(canonical['mo_coeff'])
     occupation = numpy.asarray(canonical['mo_occ'])
     energies = numpy.asarray(canonical['mo_energy'])
@@ -48,31 +71,47 @@ def restore_scf(mf, canonical):
     # Materialize any lazy DF factors before the implicit primitive captures
     # mf's pytree. Building them afterwards would change its leaf structure
     # between the forward and backward passes.
-    mf.get_veff(mf.mol, np.asarray(saved_density), s1e=overlap)
-    if getattr(mf, '_sgx_backend', None) is not None:
+    if backend is None and mf.with_df._cderi is None:
+        mf.with_df.build()
+
+    def saved_fixed_point(dm, current, s1e, h1e, root_factors=None):
+        # The implicit VJP evaluates this only at the stored root. Krylov
+        # trial vectors go through its derivative, never this cached primal.
+        del root_factors
+        fock = _fock_from_saved(current, dm, h1e, saved_fock)
+        energy, coeff = current.eig(fock, s1e)
+        occ = current.get_occ(energy, coeff)
+        hf._stash_dfjk_mo_data(current, coeff, occ, s1e)
+        nocc = current.mol.nelectron // 2
+        if (backend is not None and numpy.all(occ[:nocc] == 2)
+                and numpy.all(occ[nocc:] == 0)):
+            dm = hf._density_from_fock_rhf(fock, s1e, energy, coeff, nocc)
+        else:
+            dm = hf._density_from_fock(fock, s1e, energy, coeff, occ)
+        return dm, (energy, coeff, occ)
+
+    if backend is not None:
         from pyscfad.tools.linear_solver import eager_gmres
         with eager_gmres():
             solver = hf.gen_gmres()
     else:
         solver = hf.gen_gmres()
+    from pyscfad.tools._response_checkpoint import tag_solver
+    solver = tag_solver(solver)
     attach_response = make_implicit_diff(
-        _saved_root, True, optimality_cond=hf._scf_fixed_point,
+        _saved_root, True, optimality_cond=saved_fixed_point,
         solver=solver, has_aux=True, optimality_fun_has_aux=True,
         gen_precond=hf._gen_precond, gen_precond_host_only=True,
         nondiff_argnums=(4,), use_converged_args={4: 1})
     density, _ = attach_response(np.asarray(saved_density), mf, overlap, hcore, factors)
-    vhf = mf.get_veff(mf.mol, density, s1e=overlap)
-    fock = mf.get_fock(hcore, overlap, vhf, density)
+    fock = _fock_from_saved(mf, density, hcore, saved_fock)
     # Preserve the exact saved orbital gauge while differentiating the
     # generalized eigenproblem at that reference.
     mo_energy, mo_coeff = hf.mo_from_fock_eq78(fock, overlap, energies, coeff)
     hf._stash_dfjk_mo_data(mf, mo_coeff, occupation, overlap)
     final_density = mf.make_rdm1(mo_coeff, occupation)
-    final_vhf = hf._get_veff_from_orbitals(
-        mf, mf.mol, final_density, mo_coeff, occupation,
-        dm_last=density, vhf_last=vhf, s1e=overlap)
-    energy = mf.energy_tot(final_density, hcore, final_vhf)
-    final_fock = mf.get_fock(hcore, overlap, final_vhf, final_density)
+    final_fock = _fock_from_saved(mf, final_density, hcore, saved_fock)
+    energy = mf.energy_tot(final_density, hcore, final_fock - hcore)
     record(mf, overlap, final_fock)
     mf.mo_energy, mf.mo_coeff, mf.mo_occ = mo_energy, mo_coeff, occupation
     # Keep the original scalar as well as its derivative; the replayed

@@ -364,3 +364,31 @@ def _bwd(backend, with_j, with_k, tol, residual, bars):
 
 
 _get_jk.defvjp(_fwd, _bwd, symbolic_zeros=True)
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(0, 4))
+def veff_from_saved(backend, mol, dm, value, tol):
+    """Replay a converged J-K/2 value with the usual density/geometry VJP.
+
+    Only valid at the authenticated checkpoint density and geometry. The
+    saved matrix is numerical data, not a differentiable input.
+    """
+    return value
+
+
+def _saved_veff_fwd(backend, mol, dm, value, tol):
+    active = lambda tree: any(isinstance(x, CustomVJPPrimal) and x.perturbed
+                             for x in jax.tree_util.tree_leaves(tree))
+    activity = (active(mol), active(dm))
+    unwrap = lambda x: x.value if isinstance(x, CustomVJPPrimal) else x
+    mol, dm, value = jax.tree_util.tree_map(unwrap, (mol, dm, value))
+    return value, (mol, dm, activity)
+
+
+def _saved_veff_bwd(backend, tol, residual, bar):
+    kbar = bar if isinstance(bar, SymbolicZero) else -.5 * bar
+    molbar, dmbar = _bwd(backend, True, True, tol, residual, (bar, kbar))
+    return molbar, dmbar, None
+
+
+veff_from_saved.defvjp(_saved_veff_fwd, _saved_veff_bwd, symbolic_zeros=True)

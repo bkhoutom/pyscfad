@@ -706,6 +706,8 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
             response_solver = gen_gmres()
     else:
         response_solver = gen_gmres()
+    from pyscfad.tools._response_checkpoint import tag_solver
+    response_solver = tag_solver(response_solver)
     _scf_wrapped = make_implicit_diff(
         _scf_with_factors,
         config.scf_implicit_diff,

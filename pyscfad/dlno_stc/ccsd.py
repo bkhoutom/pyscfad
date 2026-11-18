@@ -895,8 +895,10 @@ def _run_serial(state, static, baseline, matrix, *, with_grad, include_hf,
                               state['common_bar'], frag=group.representative_index+1)
             save_progress(checkpoint, state, records, position + 1, True, with_grad=with_grad)
             gc.collect()
-        return _finish(state, static, records, with_grad=with_grad, include_hf=include_hf,
-                       return_components=return_components)
+        from pyscfad.tools._response_checkpoint import scope
+        with scope(checkpoint):
+            return _finish(state, static, records, with_grad=with_grad, include_hf=include_hf,
+                           return_components=return_components)
     finally:
         if checkpoint is not None:
             checkpoint.close()

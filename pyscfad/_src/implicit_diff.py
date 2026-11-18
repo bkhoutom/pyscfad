@@ -137,15 +137,6 @@ def root_vjp(optimality_fun, sol, args, cotangent,
                 _, (vjp_fun_sol, optfn_aux) = fun_sol(sol)
             else:
                 _, vjp_fun_sol, optfn_aux = jax.vjp(fun_sol, sol, has_aux=True)
-            if gen_precond is not None:
-                if gen_precond_host_only:
-                    # A captured host solver may fall back to JAX under tracing.
-                    # Only host callbacks are suppressed; native JAX callbacks
-                    # must retain their behavior in traced iterative solves.
-                    if not traced:
-                        M = gen_precond(optfn_aux, *args, solver=solve)
-                else:
-                    M = gen_precond(optfn_aux, *args)
         else:
             _, vjp_fun_sol = jax.vjp(fun_sol, sol)
 
@@ -154,8 +145,24 @@ def root_vjp(optimality_fun, sol, args, cotangent,
                 return vjp_fun_sol(u)[0]
 
         v = _Scalar_mul(-1, cotangent)
+        from pyscfad.tools._response_checkpoint import session
+        checkpoint = session(solve, traced=traced)
+        guess, reused = ((None, False) if checkpoint is None
+                         else checkpoint.prepare(matvec, v, solver_kwargs))
         try:
-            u = solve(matvec, v, M=M, **solver_kwargs)[0]
+            if reused:
+                u = guess
+            else:
+                if optfn_has_aux and gen_precond is not None:
+                    if gen_precond_host_only:
+                        # Keep preconditioner setup lazy: a validated saved
+                        # lambda needs no iterative solver or preconditioner.
+                        if not traced:
+                            M = gen_precond(optfn_aux, *args, solver=solve)
+                    else:
+                        M = gen_precond(optfn_aux, *args)
+                u = (solve(matvec, v, M=M, **solver_kwargs)[0] if checkpoint is None
+                     else checkpoint.solve(matvec, v, guess, M=M, **solver_kwargs))
         finally:
             # Release optional preconditioner factors before returning their
             # reservation, including failures and nested root solves.

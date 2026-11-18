@@ -978,6 +978,76 @@ def get_jk_bwd(hermi, with_j, with_k, direct_scf_tol,
 get_jk.defvjp(get_jk_fwd, get_jk_bwd, symbolic_zeros=True)
 
 
+@partial(custom_vjp, nondiff_argnums=(3,))
+def veff_from_saved(dfobj, dm, value, direct_scf_tol):
+    """Replay checkpoint J-K/2 while retaining the physical J/K transpose.
+
+    The caller must supply the matching converged density and geometry.
+    """
+    return value
+
+
+def _saved_veff_fwd(dfobj, dm, value, direct_scf_tol):
+    dfobj, dm, activity = _unwrap_jk_primals(dfobj, dm)
+    factors = _capture_geometry_factors(dfobj, dm, 1, activity)
+    residual = (dfobj, dm, activity)
+    if factors is not None:
+        residual += (factors,)
+    value = value.value if isinstance(value, CustomVJPPrimal) else value
+    return value, residual
+
+
+def _saved_veff_bwd(direct_scf_tol, residual, bar):
+    dfobj, dm, activity = _jk_residual(residual)
+    nao = dm.shape[-1]
+    shape = getattr(dfobj._cderi, 'shape', ())
+    if (shape != (0, 0) and
+            (shape[1:] in ((nao * nao,), (nao, nao))
+             or _has_tracer(dfobj, dm, bar))):
+        return (*_saved_resident_veff_bwd(dfobj, dm, activity, bar), None)
+    kbar = bar if isinstance(bar, SymbolicZero) else -.5 * bar
+    dfbar, dmbar = get_jk_bwd(1, True, True, direct_scf_tol, residual, (bar, kbar))
+    return dfbar, dmbar, None
+
+
+def _saved_resident_veff_bwd(dfobj, dm, activity, bar):
+    """Transpose resident-factor algebra without evaluating forward J or K.
+
+    Covers full AO factors (the unoptimized integral path) and traced solves.
+    Only density contractions needed by the derivative are reconstructed.
+    """
+    dm_active, eri_active, _, _ = activity
+    eri_active = eri_active and not is_implicit_diff_solve_matvec()
+    if isinstance(bar, SymbolicZero) or not (dm_active or eri_active):
+        return None, None
+    nao = dm.shape[-1]
+    factors = _restore_s1_jax(dfobj._cderi, nao)
+    density = dm.reshape(-1, nao, nao)
+    seed = bar.reshape(-1, nao, nao)
+    jseed = jnp.einsum('xij,Lij->xL', seed, factors)
+    kseed = -.5 * jnp.einsum('xij,Lki->xLkj', seed, factors)
+    dmbar = None
+    if dm_active:
+        dmbar = (jnp.einsum('xL,Lij->xij', jseed, factors)
+                 + jnp.einsum('xLki,Lij->xjk', kseed, factors)).reshape(dm.shape)
+    dfbar = None
+    if eri_active:
+        rho = jnp.einsum('Lij,xij->xL', factors, density)
+        kdensity = jnp.einsum('Lij,xjk->xLki', factors, density)
+        factorbar = (jnp.einsum('xij,xL->Lij', seed, rho)
+                     + jnp.einsum('xL,xij->Lij', jseed, density)
+                     - .5*jnp.einsum('xij,xLkj->Lki', seed, kdensity)
+                     + jnp.einsum('xLki,xjk->Lij', kseed, density))
+        # The only generic VJP here is the linear packed-to-full conversion.
+        _, unpack_pull = jax.vjp(lambda value: _restore_s1_jax(value, nao), dfobj._cderi)
+        dfbar = tree_map(lambda x: None, dfobj)
+        dfbar._cderi, = unpack_pull(factorbar)
+    return dfbar, dmbar
+
+
+veff_from_saved.defvjp(_saved_veff_fwd, _saved_veff_bwd, symbolic_zeros=True)
+
+
 def _precond_memory_plan(dfobj, nao, naux, nocc, nvir):
     """Plan optional response storage without treating workspace as total RSS.
 

@@ -235,8 +235,12 @@ def save_reference(manager, state):
     if not bool(mf.converged):
         raise storage.RestartMismatchError('cannot save unconverged SCF')
     canonical = {name: getattr(mf, name) for name in ('mo_coeff', 'mo_energy', 'mo_occ', 'e_tot')}
-    manager.save_record('cc-reference', scalars=dict(canonical=canonical,
-        scf_settings=_scf_settings(mf)),
+    scalars = dict(canonical=canonical, scf_settings=_scf_settings(mf))
+    if not hasattr(state.get('common'), 'fock'):
+        # Normal domain checkpoints already contain common.fock. Reference-
+        # only callers must also retain it for zero-Fock SCF reconstruction.
+        scalars['fock'] = np.asarray(mf.get_fock())
+    manager.save_record('cc-reference', scalars=scalars,
         trees={'common': state['common']} if 'common' in state else {})
 
 
@@ -338,27 +342,33 @@ def load_scf_reference(checkpoint_dir, mol):
         if storage._encode_value(canonical) != summary['canonical']:
             raise storage.RestartCorruptionError(
                 'numerical SCF reference does not match the original identity')
-        boys_coeff = None
         entries = payload.get('trees', {}).get('common', {}).get('entries', ())
-        matches = [entry['leaf'] for entry in entries
-                   if entry.get('path') == [['attr', 'iao_coeff']]]
-        if len(matches) > 1:
-            raise storage.RestartCorruptionError('duplicate saved Boys frame')
-        if matches:
+        def common_value(name):
+            matches = [entry['leaf'] for entry in entries
+                       if entry.get('path') == [['attr', name]]]
+            if len(matches) > 1:
+                raise storage.RestartCorruptionError(f'duplicate saved common.{name}')
+            if not matches:
+                return None
             leaf = matches[0]
             if leaf.get('kind') == 'array':
-                boys_coeff = reader.get(leaf)
-            elif leaf.get('kind') == 'zero':
-                boys_coeff = np.zeros(leaf['shape'], dtype=np.dtype(leaf['dtype']))
-            else:
-                raise storage.RestartCorruptionError('invalid saved Boys frame')
+                return reader.get(leaf)
+            if leaf.get('kind') == 'zero':
+                return np.zeros(leaf['shape'], dtype=np.dtype(leaf['dtype']))
+            raise storage.RestartCorruptionError(f'invalid saved common.{name}')
+        boys_coeff = common_value('iao_coeff')
+        fock = common_value('fock')
+        if fock is None:
+            fock = scalars.get('fock')
     finally:
         handle.close()
     _validate_canonical(canonical, mol)
+    if fock is not None:
+        _validate_fock(fock, mol)
     return dict(canonical=canonical, scf_settings=scalars['scf_settings'],
                 auxbasis=storage._decode_value(saved_inputs['auxbasis'], None),
                 scf_class=storage._decode_value(saved_inputs['scf_class'], None),
-                boys_coeff=boys_coeff)
+                boys_coeff=boys_coeff, fock=fock)
 
 
 def load_boys_reference(checkpoint_dir, mf, static, *, with_identity=False):
@@ -418,10 +428,22 @@ def restore_scf_reference(mf, reference):
     """Validate backend settings and attach response to the saved RHF root."""
     from pyscfad.scf._restart import restore_scf
     _validate_scf_backend(mf, reference)
-    return restore_scf(mf, reference['canonical'])
+    fock = reference.get('fock')
+    if fock is None:
+        raise storage.RestartMismatchError(
+            'checkpoint has no saved AO Fock; cannot restore without rebuilding Fock')
+    _validate_fock(fock, mf.mol)
+    return restore_scf(mf, reference['canonical'], fock=fock)
 
 
-def save_early_scf_reference(checkpoint_dir, mf, *, reference_energy=None):
+def _validate_fock(fock, mol):
+    value = np.asarray(fock)
+    if (value.shape != (mol.nao, mol.nao) or np.iscomplexobj(value)
+            or not np.isfinite(value).all()):
+        raise storage.RestartCorruptionError('invalid saved AO Fock shape or values')
+
+
+def save_early_scf_reference(checkpoint_dir, mf, *, reference_energy=None, fock=None):
     """Atomically save successful warm SCF before any domain selection.
 
     Called with a detached host reference. The hidden file is independent of
@@ -435,10 +457,14 @@ def save_early_scf_reference(checkpoint_dir, mf, *, reference_energy=None):
     canonical = {name: np.asarray(getattr(mf, name))
                  for name in ('mo_coeff', 'mo_energy', 'mo_occ', 'e_tot')}
     _validate_canonical(canonical, mf.mol)
+    # Builders pass their already computed final Fock through stop_trace.
+    # Standalone callers outside a capture may construct it once when saving.
+    fock = np.asarray(mf.get_fock() if fock is None else fock)
+    _validate_fock(fock, mf.mol)
     value = dict(canonical=canonical, scf_settings=_scf_settings(mf),
                  auxbasis=getattr(getattr(mf, 'with_df', None), 'auxbasis', None),
                  scf_class=f'{type(mf).__module__}.{type(mf).__qualname__}',
-                 inputs=_molecular_inputs(mf.mol))
+                 inputs=_molecular_inputs(mf.mol), fock=fock)
     path = Path(checkpoint_dir).expanduser().resolve()
     storage._durable_mkdir(path)
     lease = storage.RestartManager(None, method='stc-ccsd', scientific_payload={})
@@ -473,6 +499,8 @@ def _load_early_scf_reference(checkpoint_dir, mol):
     if storage.scientific_digest(value['inputs']) != storage.scientific_digest(_molecular_inputs(mol)):
         raise storage.RestartMismatchError('saved early SCF molecular inputs differ')
     _validate_canonical(value['canonical'], mol)
+    if value.get('fock') is not None:
+        _validate_fock(value['fock'], mol)
     return value
 
 

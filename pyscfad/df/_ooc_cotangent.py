@@ -251,6 +251,33 @@ class GeometryScope:
 
     @fixed_threads()
     def finish(self, df_bar):
+        from pyscfad.tools._response_checkpoint import contraction, enabled
+        # Raw transformed-MO seeds may live in temporary HDF5 panels. Keep
+        # their existing streaming path; the SCF's thin J/K seeds are ordinary
+        # arrays and can identify a completed coordinate contraction cheaply.
+        if not enabled() or self.mo_pending:
+            return self._finish(df_bar)
+        if self.finished:
+            raise RuntimeError('OOC geometry scope already finalized')
+        if self.pending and _source_key(self.df_input) != self.key:
+            raise RuntimeError('OOC source changed before geometry finalization')
+        inputs = ([(s, g, h, j, k, mask) for _, s, g, h, j, k, mask in self.pending],
+                  df_bar.mol.coords, df_bar.auxmol.coords)
+
+        def compute():
+            result = self._finish(df_bar)
+            return result.mol.coords, result.auxmol.coords
+
+        values, reused = contraction('df-geometry', inputs, compute)
+        answer = jax.tree_util.tree_map(lambda x: x, df_bar)
+        answer.mol.coords, answer.auxmol.coords = values
+        if reused:
+            self.pending.clear()
+            self.finished = True
+            self.stats['checkpoint_hits'] = 1
+        return answer
+
+    def _finish(self, df_bar):
         """Add deferred geometry to the original DF-input cotangent exactly once."""
         if self.finished:
             raise RuntimeError('OOC geometry scope already finalized')

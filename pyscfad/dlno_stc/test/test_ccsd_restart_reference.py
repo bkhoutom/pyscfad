@@ -222,6 +222,8 @@ def test_gradient_resume_uses_saved_scf_without_iterations(tmp_path, checkpoint_
 
     monkeypatch.setattr(scf.hf, 'kernel', forbidden)
     monkeypatch.setattr(scf.hf, '_scf', forbidden)
+    monkeypatch.setattr(scf.hf.SCF, 'get_fock', forbidden)
+    monkeypatch.setattr(scf.hf.RHF, 'get_veff', forbidden)
     monkeypatch.setattr(ccsd, '_run_group', forbidden)
 
     def restored(current):
@@ -234,6 +236,29 @@ def test_gradient_resume_uses_saved_scf_without_iterations(tmp_path, checkpoint_
     np.testing.assert_allclose(resumed_energy, energy, atol=1e-10, rtol=0.)
     np.testing.assert_allclose(resumed_gradient.coords, gradient.coords, atol=1e-8, rtol=0.)
     assert (tmp_path / 'records/cc-progress/state.h5').read_bytes() == progress
+
+
+def test_saved_common_fock_is_loaded_without_building(tmp_path, checkpoint_reference, monkeypatch):
+    mf, static = checkpoint_reference
+    state = _state(mf)
+    state['common'] = domain.rebuild_domain_data(mf, static.mp2_static)
+    expected = np.asarray(state['common'].fock).copy()
+    def forbidden(*args, **kwargs):
+        pytest.fail('checkpoint saving/loading rebuilt a saved Fock')
+    monkeypatch.setattr(type(mf), 'get_fock', forbidden)
+    _open(tmp_path, mf, static, state=state).close()
+    saved = reference.load_scf_reference(tmp_path, mf.mol)
+    np.testing.assert_array_equal(saved['fock'], expected)
+
+
+@pytest.mark.parametrize('bad_fock', [None, np.zeros((1, 1)), np.full((7, 7), np.nan)])
+def test_restore_rejects_missing_or_invalid_fock(tmp_path, checkpoint_reference, bad_fock):
+    mf, static = checkpoint_reference
+    _open(tmp_path, mf, static).close()
+    saved = reference.load_scf_reference(tmp_path, mf.mol)
+    saved['fock'] = bad_fock
+    with pytest.raises((storage.RestartMismatchError, storage.RestartCorruptionError), match='Fock'):
+        reference.restore_scf_reference(copy(mf), saved)
 
 
 def test_early_scf_reference_survives_interrupted_selection(tmp_path, checkpoint_reference, monkeypatch):

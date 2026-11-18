@@ -227,11 +227,24 @@ and quadratures are reused. Larger reference changes are rejected; see the
 
 For `benchmark_lno_w_triples.py --checkpoint-dir ... --resume`, both cold and warm
 SCF iterations are bypassed once a converged reference has been saved. The runner
-restores its exact orbitals and rebuilds implicit response; incomplete common/SCF
-response is recomputed from the saved fragment cotangents. The output field
+restores its exact orbitals and rebuilds implicit response from the saved
+fragment cotangents. The output field
 `reference_scf_mode` reports `restored` or `solved`. A separate atomic
 `.scf-reference.h5` is saved immediately after successful warm SCF, allowing
 recovery even before domain selection or the first fragment finishes.
+The saved AO Fock supplies the forward matrix during reconstruction and during
+setup of the response pullback; restart does not rebuild forward J/K at the
+saved density. Density-response J/K actions and nuclear derivatives still run
+when needed. Completed CC checkpoints already contain this matrix in
+`common.fock`; new early SCF checkpoints save it as well. Older early checkpoints
+without a Fock matrix are rejected rather than silently rebuilding it.
+SCF-response lambda is saved after each GMRES restart cycle and used as `x0`
+after interruption. A separate converged lambda is saved before force assembly;
+restart checks its residual and skips the solve if it still satisfies tolerance.
+Completed shared SGX J/K geometry contractions and the shared disk-backed DF
+geometry contraction are also reused when their seeds match exactly. An
+unfinished contraction restarts at that stage's beginning; derivative setup
+and seed assembly are reconstructed. See the [checkpoint details](../../pyscfad/dlno_stc/README.md#mpi-and-checkpoints).
 Once CC selections have been committed, restart loads them directly, checks
 the requested geometry and selection settings, and attaches Boys response
 without running localization or BP/domain selection searches. It records

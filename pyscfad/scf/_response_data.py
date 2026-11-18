@@ -26,3 +26,10 @@ def record(mf, overlap, fock):
     records = _capture.get()
     if records is not None:
         records[id(mf)] = (mf, (overlap, fock))
+
+
+def lookup(mf):
+    """Return live final S/F during an active capture, if recorded."""
+    records = _capture.get()
+    saved = None if records is None else records.get(id(mf))
+    return saved[1] if saved is not None and saved[0] is mf else None

@@ -82,6 +82,7 @@ class GeometryScope:
         self.finished = False
         self.stats = dict(consumers=0, seed_groups=0, j_integral_passes=0,
                           k_integral_passes=0, retained_seed_bytes=0,
+                          checkpoint_hits=0,
                           peak_seed_bytes=0, geometry_seconds=0.,
                           j_geometry_seconds=0., k_geometry_seconds=0.,
                           geometry_batches=[])
@@ -127,8 +128,15 @@ class GeometryScope:
                     from pyscfad.tools import resource_profile
                     tick = time.perf_counter()
                     with resource_profile.section(f'sgx.shared_{name}_geometry'):
-                        result += kernel(obj, seeds, *(() if name == 'j' else (tol,)))
+                        from pyscfad.tools._response_checkpoint import contraction
+                        value, reused = contraction(
+                            'sgx-' + name, (tol, seeds),
+                            lambda: kernel(obj, seeds, *(() if name == 'j' else (tol,))))
+                        result += value
                     self.stats[name+'_geometry_seconds'] += time.perf_counter()-tick
+                    if reused:
+                        self.stats['checkpoint_hits'] += 1
+                        continue
                     self.stats[name+'_integral_passes'] += 1
                     details = (obj._dfj_geometry_stats if name == 'j'
                                else obj._pjs_data._geometry_stats)

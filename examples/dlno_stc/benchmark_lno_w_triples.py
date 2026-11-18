@@ -369,9 +369,12 @@ def main():
             raise RuntimeError("differentiable RHF failed")
         if saved_scf is None and args.checkpoint_dir is not None:
             from pyscfad.ops import stop_trace
+            from pyscfad.scf._response_data import lookup
             from pyscfad.dlno_stc._ccsd_restart_reference import save_early_scf_reference
-            stop_trace(lambda host: save_early_scf_reference(
-                args.checkpoint_dir, host, reference_energy=float(ref.e_tot)))(mf)
+            data = lookup(mf)
+            stop_trace(lambda host, fock: save_early_scf_reference(
+                args.checkpoint_dir, host, reference_energy=float(ref.e_tot),
+                fock=fock))(mf, None if data is None else data[1])
         return mf
 
     baseline = dict(mode="deterministic", threads=args.threads, global_seed=666)

@@ -560,7 +560,14 @@ format require a new checkpoint directory; this merge does not convert them.
 The `benchmark_lno_w_triples.py` runner restores the saved converged SCF on
 `--resume`, bypassing both cold and warm SCF iterations. It rebuilds integrals
 and the implicit SCF response at the saved density, preserving the original
-orbital gauge and its derivatives. The output records
+orbital gauge and its derivatives. The AO Fock is read from `common.fock`
+in the CC reference (or from the early SCF checkpoint) and reused as the
+forward value, including during pullback setup. No forward J/K construction
+at the saved density is needed. The DF/SGX density-response and geometry
+derivative operations still execute when requested; a saved Fock does not
+replace these derivatives. Early checkpoints created before Fock saving was
+added cannot use this path and produce an explicit missing-Fock error.
+The output records
 `reference_scf_mode="restored"` and zero reference-SCF solve time. This replaces
 the earlier warm-start behavior. Legacy checkpoints without numerical orbitals
 produce an explicit error rather than silently starting cold.
@@ -603,9 +610,33 @@ If interrupted before checkpoint initialization completes, `resume=True`
 restarts preparation. Partial manifest/static metadata is preserved in the
 checkpoint's hidden `.initialization-history/` directory. Once a progress
 record exists it is never reset by this recovery: completed weak work and
-domain groups are restored, and an unfinished group is recalculated. The
-final common/SCF response is recalculated after a restart. A crash during an
-atomic progress write retains the preceding committed group boundary.
+domain groups are restored, and an unfinished group is recalculated. A crash
+during an atomic progress write retains the preceding committed group boundary.
+
+The final SCF adjoint now checkpoints lambda automatically whenever a serial
+CC checkpoint is active. `records/scf-lambda-iterate/state.h5` holds the latest
+GMRES restart-cycle iterate and RHS. A cycle contains at most the solver's
+`restart` number of Arnoldi iterations (20 by default); saving does not change
+that setting or the convergence tolerances. Restart supplies this lambda as
+`x0`, rebuilding the Krylov basis. It does not resume the exact old Krylov state.
+`records/scf-lambda-converged/state.h5` is committed separately, immediately
+after convergence and before the external derivative contractions. On restart,
+the current operator checks its true residual against the current RHS and
+tolerance. A valid solution skips GMRES and preconditioner construction; a
+solution that no longer meets tolerance becomes an initial guess for refinement.
+Convergence failures never create a new converged record. JAX-only solver
+configurations use host GMRES while this checkpoint scope is active, preserving
+their tolerances and restart length. Higher-order traced VJPs are not checkpointed.
+
+Force assembly checkpoints completed shared SGX Coulomb and exchange geometry
+contractions separately (`records/scf-force-sgx-j/` and `scf-force-sgx-k/`). The
+shared disk-backed DF thin-factor geometry contraction is checkpointed in
+`records/scf-force-df-geometry/`. These small coordinate results are reused only
+when their derivative seeds match exactly. Common-response setup and seed
+assembly are reconstructed; an interrupted contraction stage repeats from its
+start. Individual integral blocks and raw transformed-MO disk panels are not
+checkpointed. All these records use the same checksums, atomic replacement and
+exclusive writer lease as the fragment checkpoints.
 
 Older checkpoints contain canonical hashes but no numerical reference. Exact
 reference resumes still work. For a completed old run, its exact `hf_energy`

@@ -5,7 +5,7 @@ pullback closures are consumed before this boundary and are never serialized.
 """
 from dataclasses import asdict
 
-from ._restart import RestartManager
+from ._ccsd_restart_reference import CCReferenceManager, save_reference, validate_reference
 from ._workflow import run_payload
 from ._df_basis import basis_kwargs
 
@@ -35,15 +35,17 @@ def open_checkpoint(state, static, groups, *, checkpoint_dir, resume, options):
     triples = options.get('triples_controls')
     if triples is not None:
         payload['native_triples_version'] = _stc_mp2.TRIPLES_VERSION
-    manager = RestartManager(checkpoint_dir, resume=resume, method='stc-ccsd',
+    manager = CCReferenceManager(checkpoint_dir, resume=resume, method='stc-ccsd',
                              scientific_payload=payload)
     try:
         if resume:
             manager.bind_static(static)
             if manager.load_static(expected_type=type(static)) is None:
                 raise FileNotFoundError('CC checkpoint has no saved LIS selections')
+            manager.reference_report = validate_reference(manager, state, static)
         else:
             manager.save_static(static)
+            save_reference(manager, state)
     except Exception:
         manager.close()
         raise

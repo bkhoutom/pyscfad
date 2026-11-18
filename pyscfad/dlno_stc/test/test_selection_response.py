@@ -187,6 +187,9 @@ def test_public_ccsd_selection_reuses_weak_only_for_fresh_baseline(
         monkeypatch, tmp_path, resume, expected_reuse):
     """A resumed checkpoint must decide whether weak work is needed first."""
     from pyscfad.dlno_stc import ccsd
+    from pyscfad.dlno_stc import _ccsd_restart_reference
+    # This control-flow test models an already initialized checkpoint.
+    monkeypatch.setattr(_ccsd_restart_reference, 'prepare_resume', lambda path, flag: flag)
 
     class SelectionReached(Exception):
         pass

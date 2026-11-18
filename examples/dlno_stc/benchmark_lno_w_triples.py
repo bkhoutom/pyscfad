@@ -3,7 +3,8 @@
 The serial queue runs one realization per process with deterministic domain/LIS
 selection. Fresh calculations share one differentiable SCF between selection
 and production, after an independent reference SCF. Each result is written
-immediately after completion.
+immediately after completion. Checkpoint restarts restore the converged SCF
+and rebuild implicit response without repeating either SCF solve.
 """
 
 import argparse
@@ -71,6 +72,10 @@ def main():
     parser.add_argument("--job-indices", type=int, nargs="+",
                         help="run these zero-based stochastic jobs from the full target/seed grid")
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--checkpoint-dir", type=Path,
+                        help="save serial CC progress; use a separate directory per realization")
+    parser.add_argument("--resume", action="store_true",
+                        help="resume compatible progress from --checkpoint-dir")
     parser.add_argument("--pilot-samples", type=int, default=20000)
     parser.add_argument("--max-memory-mb", type=float, default=800000)
     parser.add_argument("--df-storage", choices=("incore", "outcore"), default="incore",
@@ -102,6 +107,10 @@ def main():
     mode.add_argument("--compare-solvers", action="store_true",
                       help="run the deterministic reference and requested stochastic jobs")
     args = parser.parse_args()
+    if args.resume and args.checkpoint_dir is None:
+        parser.error('--resume requires --checkpoint-dir')
+    if args.checkpoint_dir is not None and (args.compare_solvers or args.stochastic_only):
+        parser.error('this checkpoint runner currently supports --deterministic-only')
     if args.boys_grouping == "molecule":
         args.boys_grouping = "system"
     sgx_options = {key: getattr(args, 'sgx_' + key) for key in _SGX_DEFAULTS}
@@ -254,6 +263,14 @@ def main():
             expected_groups = carbons
         else:
             raise ValueError("atom-grouped benchmark requires (H2O)_n or C_n H_(2n+2)")
+    saved_scf = None
+    if args.resume:
+        from pyscfad.dlno_stc._ccsd_restart_reference import prepare_resume, load_scf_reference
+        args.resume = prepare_resume(args.checkpoint_dir, True)
+        if args.resume or (args.checkpoint_dir / '.scf-reference.h5').is_file():
+            saved_scf = load_scf_reference(args.checkpoint_dir, mol)
+            report('Restoring converged SCF; no cold or warm SCF iterations')
+    reference_scf_mode = 'restored' if saved_scf is not None else 'solved'
     refmol = pgto.M(atom=str(xyz), basis=basis, unit="Angstrom",
                      max_memory=args.max_memory_mb, verbose=0)
     ref = pscf.RHF(refmol).density_fit(auxbasis=auxbasis)
@@ -288,8 +305,14 @@ def main():
         report(f"DF factors ready in {df_setup_seconds:.1f} s")
     ref.conv_tol, ref.conv_tol_grad = 1e-9, 1e-6
     stage_start = time.perf_counter()
-    ref.kernel()
-    reference_scf_seconds = time.perf_counter() - stage_start
+    if saved_scf is None:
+        ref.kernel()
+        reference_scf_seconds = time.perf_counter() - stage_start
+    else:
+        for name, value in saved_scf['canonical'].items():
+            setattr(ref, name, value)
+        ref.converged = True
+        reference_scf_seconds = 0.0
     if not ref.converged:
         raise RuntimeError("reference RHF failed")
     dm0 = np.asarray(ref.make_rdm1())
@@ -316,7 +339,14 @@ def main():
             mf.with_df.max_memory = args.df_memory_mb
             mf.with_df.attach_outcore_cderi(str(cderi_path))
         mf.conv_tol, mf.conv_tol_grad, mf.chkfile = 1e-9, 1e-6, None
-        if cderi_path is not None:
+        if saved_scf is not None:
+            from pyscfad.dlno_stc._ccsd_restart_reference import restore_scf_reference
+            if cderi_path is not None:
+                with eager_gmres():
+                    restore_scf_reference(mf, saved_scf)
+            else:
+                restore_scf_reference(mf, saved_scf)
+        elif cderi_path is not None:
             # The SCF response operator reads disk blocks. Construct its
             # GMRES solver outside JIT, preserving the existing tolerances.
             with eager_gmres():
@@ -325,6 +355,11 @@ def main():
             mf.kernel(dm0=dm0)
         if not mf.converged:
             raise RuntimeError("differentiable RHF failed")
+        if saved_scf is None and args.checkpoint_dir is not None:
+            from pyscfad.ops import stop_trace
+            from pyscfad.dlno_stc._ccsd_restart_reference import save_early_scf_reference
+            stop_trace(lambda host: save_early_scf_reference(
+                args.checkpoint_dir, host, reference_energy=float(ref.e_tot)))(mf)
         return mf
 
     baseline = dict(mode="deterministic", threads=args.threads, global_seed=666)
@@ -429,6 +464,7 @@ def main():
                         scf_precond_cache_cap_mib=os.environ.get('PYSCFAD_PRECOND_CACHE_MEMORY_MB'),
                         df_setup_seconds=df_setup_seconds,
                         reference_scf_seconds=reference_scf_seconds,
+                        reference_scf_mode=reference_scf_mode,
                         initial_ad_scf_seconds=initial_ad_scf_seconds,
                         selection_in_production=production_started is not None,
                         domain_selection_seconds=domain_selection_seconds,
@@ -500,7 +536,8 @@ def main():
         report("Sharing production SCF with domain selection and weak-pair response")
         energy, molecule_bar, components = ccsd.value_and_grad(
             mol, build_mf, build_static=build_static,
-            triples_controls=controls, **options)
+            triples_controls=controls, checkpoint_dir=args.checkpoint_dir,
+            resume=args.resume, **options)
         jax.block_until_ready((energy, molecule_bar))
         force = -np.asarray(molecule_bar.coords)
         if not np.isfinite(force).all() or not np.isfinite(float(energy)):

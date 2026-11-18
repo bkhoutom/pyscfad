@@ -991,23 +991,30 @@ def kernel(mf, static, *, baseline_controls=None, matrix_controls=None, mp2_grid
     must be deterministic. This SE excludes iteration/approximation bias and does
     not bound forces; cap/unmet-target diagnostics remain explicit.
     """
+    if resume and (comm is None or comm.Get_size() == 1):
+        from ._ccsd_restart_reference import prepare_resume
+        resume = prepare_resume(checkpoint_dir, resume)
     def initialize():
         solver_options = _cc_solver_options(cc_solver, stc_cc_controls, lis_aux_svd_tol)
         triples = normalize_triples_controls(triples_controls, ccsd_t=ccsd_t)
-        baseline, matrix = _validate_run(static, baseline_controls, matrix_controls, mp2_grid)
-        indices = _all_fragment_indices(static)
+        selected = static
+        if resume and checkpoint_dir is not None:
+            from ._ccsd_restart_reference import resume_selections
+            selected = resume_selections(checkpoint_dir, selected)
+        baseline, matrix = _validate_run(selected, baseline_controls, matrix_controls, mp2_grid)
+        indices = _all_fragment_indices(selected)
         _stc_precision.validate_stages(solver_options.get('stc_cc_controls'), baseline, matrix, triples)
         _stc_precision.validate_seed_independence(solver_options.get('stc_cc_controls'), indices)
-        triples = _allocate_triples_controls(triples, len(indices), static=static, indices=indices)
+        triples = _allocate_triples_controls(triples, len(indices), static=selected, indices=indices)
         if any(isinstance(x, jax.core.Tracer) for x in jax.tree_util.tree_leaves(mf)):
             raise TypeError('STC CC kernel is forward-only; use value_and_grad')
-        validate_selection_basis(mf, static, correlation_auxbasis)
-        state = driver._initialize(mf, static.mp2_static, baseline, with_grad=False,
+        validate_selection_basis(mf, selected, correlation_auxbasis)
+        state = driver._initialize(mf, selected.mp2_static, baseline, with_grad=False,
                                    **basis_kwargs(correlation_auxbasis))
         state['cc_triples_controls'] = triples
         if solver_options:
             state['cc_solver_options'] = solver_options
-        return state, static, baseline, matrix
+        return state, selected, baseline, matrix
 
     def initialize_worker(canonical):
         if mf is None:
@@ -1067,6 +1074,9 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls=None, matrix
     controls do not bound nuclear-gradient errors. Physical domain/LIS response
     remains active, including the original fragment projector.
     """
+    if resume and (comm is None or comm.Get_size() == 1):
+        from ._ccsd_restart_reference import prepare_resume
+        resume = prepare_resume(checkpoint_dir, resume)
     def initialize():
         solver_options = _cc_solver_options(cc_solver, stc_cc_controls, lis_aux_svd_tol)
         triples = normalize_triples_controls(triples_controls, ccsd_t=ccsd_t)
@@ -1099,6 +1109,12 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls=None, matrix
                 mf, build_static, reuse_weak=not resume,
                 scf_data=scf_data,
                 **basis_kwargs(correlation_auxbasis))
+        if resume and checkpoint_dir is not None:
+            from ._ccsd_restart_reference import resume_selections
+            selected = resume_selections(checkpoint_dir, selected)
+            # Rebuild against the saved Boys anchors and quadratures. Never
+            # apply stored cotangents to a newly selected orbital frame.
+            prepared_domain = None
         validate_selection_basis(mf, selected, correlation_auxbasis)
         baseline, matrix = _validate_run(selected, baseline_controls, matrix_controls, mp2_grid)
         indices = (_all_fragment_indices(selected)

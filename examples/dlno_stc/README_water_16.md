@@ -220,10 +220,21 @@ and settings are written to `result.json` in the output directory. Forces are
 the negative gradient. Fragment progress is checkpointed in `checkpoint/`;
 resume an interrupted run using the same input, settings and output directory
 with `--resume`. Changed settings or code may invalidate the checkpoint.
-The checkpoint requires an exact canonical reference; small numerical changes
-when rerunning multithreaded SCF can also reject a resume. Preserve that checkpoint
-and start a fresh calculation rather than bypassing the reference check. A
-completed result is never overwritten; use a new output directory for another
+SCF roundoff is checked numerically against the saved original reference, while
+inputs, settings and discrete selections remain exact. Saved orbital anchors
+and quadratures are reused. Larger reference changes are rejected; see the
+[reference checks and legacy recovery](../../pyscfad/dlno_stc/README.md#mpi-and-checkpoints).
+
+For `benchmark_lno_w_triples.py --checkpoint-dir ... --resume`, both cold and warm
+SCF iterations are bypassed once a converged reference has been saved. The runner
+restores its exact orbitals and rebuilds implicit response; incomplete common/SCF
+response is recomputed from the saved fragment cotangents. The output field
+`reference_scf_mode` reports `restored` or `solved`. A separate atomic
+`.scf-reference.h5` is saved immediately after successful warm SCF, allowing
+recovery even before domain selection or the first fragment finishes.
+Old checkpoints containing only orbital hashes cannot restore a reference;
+the runner reports that limitation before running SCF.
+A completed result is never overwritten; use a new output directory for another
 seed or calculation. Run the Python driver with `--help` for all options.
 
 Every run also writes `timing_events.jsonl` as stages finish, plus `timings.csv`

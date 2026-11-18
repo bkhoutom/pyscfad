@@ -534,7 +534,51 @@ out-of-core SCF factors must be accessible on every rank.
 Serial CC supports `checkpoint_dir` and `resume`. Checkpoints save completed
 numerical contributions, selections, scientific settings and implementation
 identity. Native replay handles and AD tapes are never serialized. CC
-selection schema 18 records the fragment plan and requires all fragments; older selections must be rebuilt.
+selection schema 19 records the fragment plan and requires all fragments; older selections must be rebuilt.
+
+Resume reuses the saved Boys anchors, discrete domain/LIS selections and
+quadratures before rebuilding shared response. Molecular inputs, occupations,
+selection thresholds, solver controls and implementation versions remain exact
+compatibility checks. New checkpoints also save numerical SCF and shared-frame
+reference arrays in `records/cc-reference/state.h5`. SCF total/orbital energies
+use an absolute `1e-8` Eh tolerance; coefficients and shared arrays use
+`atol=rtol=1e-8`. Unconverged SCF, nonfinite values and larger orbital/frame
+changes are rejected. Every resume compares against the original reference;
+the tolerance does not accumulate across restarts. Degenerate orbital rotations
+that exceed these bounds require a fresh calculation, not unchecked cotangent reuse.
+
+The `benchmark_lno_w_triples.py` runner restores the saved converged SCF on
+`--resume`, bypassing both cold and warm SCF iterations. It rebuilds integrals
+and the implicit SCF response at the saved density, preserving the original
+orbital gauge and its derivatives. The output records
+`reference_scf_mode="restored"` and zero reference-SCF solve time. This replaces
+the earlier warm-start behavior. Legacy checkpoints without numerical orbitals
+produce an explicit error rather than silently starting cold.
+
+Immediately after a successful warm SCF, the runner atomically saves
+`.scf-reference.h5` in the checkpoint directory. This independent reference
+survives interruptions during domain selection or CC checkpoint initialization.
+Once the CC checkpoint is complete, its `records/cc-reference/state.h5` is the
+authoritative reference. Both paths check molecular inputs and SCF/SGX settings.
+These serial RHF restore paths require standard implicit differentiation.
+
+If interrupted before checkpoint initialization completes, `resume=True`
+restarts preparation. Partial manifest/static metadata is preserved in the
+checkpoint's hidden `.initialization-history/` directory. Once a progress
+record exists it is never reset by this recovery: completed weak work and
+domain groups are restored, and an unfinished group is recalculated. The
+final common/SCF response is recalculated after a restart. A crash during an
+atomic progress write retains the preceding committed group boundary.
+
+Older checkpoints contain canonical hashes but no numerical reference. Exact
+reference resumes still work. For a completed old run, its exact `hf_energy`
+can be supplied using `_ccsd_restart_reference.recover_legacy_energy(directory,
+energy)`; the value must match the original checkpoint's checksum. This limited
+recovery additionally checks the saved active occupied space and Boys frame,
+and rejects nonzero canonical/virtual-frame cotangents whose original gauge
+cannot be verified. Keep a copy of the original checkpoint when recovering it.
+Missing original energy or incompatible frames cannot be repaired by changing
+the manifest. New runs need no such recovery step.
 
 Disk request/result exchange, export/import/replay drivers, per-domain MPI
 replica averaging and public fragment-subset/correction-only modes have been

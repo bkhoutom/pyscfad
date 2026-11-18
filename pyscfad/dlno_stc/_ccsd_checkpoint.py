@@ -5,7 +5,8 @@ pullback closures are consumed before this boundary and are never serialized.
 """
 from dataclasses import asdict
 
-from ._ccsd_restart_reference import CCReferenceManager, save_reference, validate_reference
+from ._ccsd_restart_reference import (CCReferenceManager, resume_selections,
+                                     save_reference, validate_reference)
 from ._workflow import run_payload
 from ._df_basis import basis_kwargs
 
@@ -17,6 +18,11 @@ def open_checkpoint(state, static, groups, *, checkpoint_dir, resume, options):
         return None
     from . import _stc_mp2
     from pyscfad.lno.ccsd import RCCSD
+    if resume:
+        # Validate the regenerated settings/labels, then identify this run
+        # using its original numerical frame and quadrature. Regenerated BP
+        # intermediates and roundoff must not change the checkpoint digest.
+        static = resume_selections(checkpoint_dir, static)
     payload = dict(reference=run_payload(state['mf'], static.mp2_static.frozen,
                                          driver='stc-global-hf-cc-v1',
                                          **basis_kwargs(state.get('correlation_auxbasis'))),

@@ -547,6 +547,16 @@ changes are rejected. Every resume compares against the original reference;
 the tolerance does not accumulate across restarts. Degenerate orbital rotations
 that exceed these bounds require a fresh calculation, not unchecked cotangent reuse.
 
+Intermediate BP construction lists may differ when tied populations produce
+the same effective fragment domains, retained ranks, pair graph and physical
+grouping. Resume validates those final choices and restores the original saved
+selections. This also supports a compatible SCF density-checkpoint restart;
+SCF/SGX settings and the stricter numerical tolerances above still apply.
+Memory/workspace limits may change. The integrated restart implementation keeps
+the `cc-reference` format and the SCF-restoration/interruption-recovery behavior
+described below. Checkpoints written in the separate `cc-scf-reference` branch
+format require a new checkpoint directory; this merge does not convert them.
+
 The `benchmark_lno_w_triples.py` runner restores the saved converged SCF on
 `--resume`, bypassing both cold and warm SCF iterations. It rebuilds integrals
 and the implicit SCF response at the saved density, preserving the original

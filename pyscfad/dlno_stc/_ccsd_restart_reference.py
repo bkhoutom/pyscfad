@@ -26,6 +26,10 @@ _NUMERICAL_SELECTION_FIELDS = {
     'CCSDSelections': {'mp2_fragment_energies', 'mp2_grid', 'mp2_grid_diagnostics'},
     'LISSelections': {'triples_grid', 'smooth_frames'},
 }
+_BP_CONSTRUCTION_FIELDS = {
+    'compact_bp_domain', 'primary_bp_domain', 'tight_bp_domain',
+    'pao_bp_domain', 'primary_domain',
+}
 
 
 def _mapping(node):
@@ -92,6 +96,11 @@ def _selection_check(current, saved, path='selection', numerical=False):
         raise storage.RestartMismatchError(f'{path}: selection type differs')
     if is_dataclass(saved):
         for field in fields(saved):
+            if type(saved).__name__ == 'DomainSelections' and field.name in _BP_CONSTRUCTION_FIELDS:
+                # Tied BP populations can change construction intermediates.
+                # Effective fragment domains, ranks and the pair graph below
+                # must still match; resumed work uses the original selections.
+                continue
             if field.name == 'controls_identity':
                 # Its first entry is the derived quadrature; seeds, modes and
                 # sampling controls in the remaining entries stay exact.

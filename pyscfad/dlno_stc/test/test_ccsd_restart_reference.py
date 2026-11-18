@@ -42,7 +42,9 @@ def test_roundoff_resumes_against_original_numerical_reference(tmp_path, checkpo
 
 
 @pytest.mark.parametrize('field,delta', [('mo_coeff', 1e-4), ('mo_energy', 1e-5),
-                                       ('e_tot', 1e-6), ('mo_occ', .1)])
+                                       ('e_tot', 1e-6), ('mo_occ', .1),
+                                       ('mo_coeff', 3e-6), ('mo_energy', 3e-7),
+                                       ('e_tot', 3e-8)])
 def test_reference_changes_are_rejected(tmp_path, checkpoint_reference, field, delta):
     mf, static = checkpoint_reference
     _open(tmp_path, mf, static).close()

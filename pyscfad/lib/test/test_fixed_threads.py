@@ -18,34 +18,37 @@ def runtime():
 
 
 @pytest.mark.parametrize('count', [1, 2, 3])
-def test_configured_count_dynamic_flags_and_exception_restoration(count):
+@pytest.mark.parametrize('requested_dynamic', [0, 1])
+def test_configured_count_dynamic_flags_and_exception_restoration(count, requested_dynamic):
     omp = runtime()
     dynamic = omp.omp_get_dynamic()
     pools = ThreadpoolController()
     try:
-        omp.omp_set_dynamic(1)
+        omp.omp_set_dynamic(requested_dynamic)
         with lib.with_omp_threads(count):
             before = pools.info()
             with pytest.raises(RuntimeError, match='deliberate failure'):
                 with fixed_threads():
                     assert lib.num_threads() == count
-                    assert omp.omp_get_dynamic() == 0
+                    assert omp.omp_get_dynamic() == requested_dynamic
                     assert {p['num_threads'] for p in pools.info()
                             if p.get('threading_layer') != 'disabled'} == {count}
                     # Deliberately serial BLAS inside a native OpenMP kernel
                     # must not be widened by a nested fixed-team scope.
                     with blas_threads(1), fixed_threads():
                         assert lib.num_threads() == count
+                        assert omp.omp_get_dynamic() == requested_dynamic
                         assert all(p['num_threads'] == 1 for p in pools.info()
                                    if p['user_api'] == 'blas')
                     raise RuntimeError('deliberate failure')
-            assert omp.omp_get_dynamic() == 1
+            assert omp.omp_get_dynamic() == requested_dynamic
             assert pools.info() == before
     finally:
         omp.omp_set_dynamic(dynamic)
 
 
-def test_eager_gmres_uses_configured_threads_and_restores_on_matvec_failure():
+@pytest.mark.parametrize('requested_dynamic', [0, 1])
+def test_eager_gmres_uses_configured_threads_and_restores_on_matvec_failure(requested_dynamic):
     from pyscfad._src.scipy.sparse.linalg import gmres
     omp = runtime()
     previous = omp.omp_get_dynamic()
@@ -54,18 +57,18 @@ def test_eager_gmres_uses_configured_threads_and_restores_on_matvec_failure():
         calls.append((lib.num_threads(), omp.omp_get_dynamic()))
         return np.array([2., 3., 4.])*x
     try:
-        omp.omp_set_dynamic(1)
+        omp.omp_set_dynamic(requested_dynamic)
         with lib.with_omp_threads(2):
             x, info = gmres(matvec, np.ones(3), tol=1e-12, atol=1e-14)
             assert info == 0
             np.testing.assert_allclose(x, 1/np.array([2., 3., 4.]), atol=1e-12)
-            assert calls and set(calls) == {(2, 0)}
-            assert omp.omp_get_dynamic() == 1
+            assert calls and set(calls) == {(2, requested_dynamic)}
+            assert omp.omp_get_dynamic() == requested_dynamic
             def fail(x):
-                assert omp.omp_get_dynamic() == 0
+                assert omp.omp_get_dynamic() == requested_dynamic
                 raise RuntimeError('matvec failure')
             with pytest.raises(RuntimeError, match='matvec failure'):
                 gmres(fail, np.ones(3), atol=1e-14)
-            assert omp.omp_get_dynamic() == 1
+            assert omp.omp_get_dynamic() == requested_dynamic
     finally:
         omp.omp_set_dynamic(previous)

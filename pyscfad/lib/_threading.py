@@ -2,7 +2,6 @@
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-import ctypes
 import operator
 import os
 
@@ -15,12 +14,13 @@ _FIXED_THREADS = ContextVar('pyscfad_fixed_threads', default=None)
 
 @contextmanager
 def fixed_threads():
-    """Use the current PySCF thread count with fixed OpenMP teams.
+    """Use the current PySCF thread budget, preserving dynamic-team policy.
 
     Intended for eager J/K, response solves and final integral pullbacks.
     Read the configured count at entry, rather than imposing a CPU budget.
-    Leave MKL dynamic adjustment to its runtime/caller setting, as in Q-Chem.
-    Restore OpenMP/BLAS limits and the OpenMP dynamic flag on every exit.
+    OpenMP and MKL dynamic adjustment remain controlled by the caller.
+    Restore OpenMP/BLAS thread limits on every exit. The historical name
+    refers to the configured thread budget, not the actual OpenMP team size.
     Inner kernel-specific BLAS limits (e.g. one BLAS thread inside OpenMP)
     remain effective. Competing policies in concurrent Python calls are
     unsupported, as with the other process-wide thread helpers.
@@ -31,26 +31,10 @@ def fixed_threads():
         yield
         return
     controller = ThreadpoolController()
-    dynamic = []
     token = _FIXED_THREADS.set(count)
     try:
         with controller.limit(limits=count):
-            try:
-                for pool in controller.lib_controllers:
-                    if pool.user_api != 'openmp':
-                        continue
-                    names = ('omp_get_dynamic', 'omp_set_dynamic')
-                    get = getattr(pool.dynlib, names[0], None)
-                    set_ = getattr(pool.dynlib, names[1], None)
-                    if get is not None and set_ is not None:
-                        get.restype = ctypes.c_int
-                        set_.argtypes = [ctypes.c_int]
-                        dynamic.append((set_, get()))
-                        set_(0)
-                yield
-            finally:
-                for set_, previous in reversed(dynamic):
-                    set_(previous)
+            yield
     finally:
         _FIXED_THREADS.reset(token)
 

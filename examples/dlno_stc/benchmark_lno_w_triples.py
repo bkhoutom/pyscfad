@@ -96,6 +96,8 @@ def main():
     parser.add_argument("--triples-method", choices=("smooth",),
                         default="smooth")
     parser.add_argument("--triples-laplace-points", type=int, default=4)
+    parser.add_argument("--triples-workspace-gib", type=float, default=16.,
+                        help="deterministic (T) cache plus worker scratch in GiB; default 16")
     parser.add_argument("--smooth-trace-exponent", type=float, default=5.)
     parser.add_argument("--triples-variance-allocation", choices=("occupied_count", "mp2_energy"),
                         default="occupied_count")
@@ -105,6 +107,8 @@ def main():
     mode.add_argument("--compare-solvers", action="store_true",
                       help="run the deterministic reference and requested stochastic jobs")
     args = parser.parse_args()
+    if not math.isfinite(args.triples_workspace_gib) or args.triples_workspace_gib <= 0:
+        parser.error('--triples-workspace-gib must be finite and positive')
     if args.resume and args.checkpoint_dir is None:
         parser.error('--resume requires --checkpoint-dir')
     if args.checkpoint_dir is not None and (args.compare_solvers or args.stochastic_only):
@@ -505,6 +509,7 @@ def main():
                         code_snapshot_sha256=os.environ.get("LNO_BENCHMARK_SNAPSHOT_SHA256"),
                         source_package_path=str(Path(pyscfad.__file__).resolve()),
                         triples_laplace_points=args.triples_laplace_points,
+                        triples_workspace_gib=args.triples_workspace_gib,
                         smooth_trace_exponent=args.smooth_trace_exponent,
                         selection_seconds=selection_seconds,
                         preselection_setup_seconds=selection_start-started,
@@ -527,7 +532,7 @@ def main():
                     ccsd_t=True, include_hf=True,
                    return_components=True, merge_identical=True)
 
-    deterministic_controls = dict(mode="deterministic")
+    deterministic_controls = dict(mode="deterministic", workspace_gib=args.triples_workspace_gib)
     jobs = []
     if not args.stochastic_only:
         jobs.append(("deterministic", deterministic_controls))

@@ -18,6 +18,12 @@ def open_checkpoint(state, static, groups, *, checkpoint_dir, resume, options):
         return None
     from . import _stc_mp2
     from pyscfad.lno.ccsd import RCCSD
+    # Workspace changes only execution, so compatible completed domains remain
+    # reusable across omitted, default, and explicitly enlarged workspace caps.
+    options = options.copy()
+    if options.get('triples_controls') is not None:
+        options['triples_controls'] = options['triples_controls'].copy()
+        options['triples_controls'].pop('workspace_gib', None)
     if resume:
         # Validate the regenerated settings/labels, then identify this run
         # using its original numerical frame and quadrature. Regenerated BP

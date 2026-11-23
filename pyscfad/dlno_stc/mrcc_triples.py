@@ -14,10 +14,16 @@ import jax.numpy as jnp
 import numpy as np
 from pyscf.lib import current_memory
 
+from .controls import DEFAULT_TRIPLES_WORKSPACE_GIB, _finite_control
 
-def run_mrcc(inputs, nodes, weights, *, with_grad, max_memory):
+
+def run_mrcc(inputs, nodes, weights, *, with_grad, max_memory,
+             workspace_gib=DEFAULT_TRIPLES_WORKSPACE_GIB):
     from .smooth_triples import _dressing_cache_bytes
+    workspace_gib = _finite_control('workspace_gib', workspace_gib)
     native = importlib.import_module('pyscfad.dlno_stc._stc_mp2')
+    if not getattr(native, 'TRIPLES_CONFIGURABLE_WORKSPACE', False):
+        raise RuntimeError('Rebuild the STC native extension for configurable triples workspace')
     start = time.perf_counter()
     inputs = tuple(np.asarray(x, dtype=np.float64) for x in inputs)
     nodes, weights = np.asarray(nodes), np.asarray(weights)
@@ -30,7 +36,8 @@ def run_mrcc(inputs, nodes, weights, *, with_grad, max_memory):
     ns = inputs[8].shape[1]
     blocks = ns*no*(no+1)//2
     block_bytes = nv**3*8*(2 if with_grad else 1)
-    batch = min(128, blocks)
+    # Leave more of the native workspace available for parallel worker scratch.
+    batch = min(32, blocks)
     cap = os.environ.get('PYSCFAD_TRIPLES_NUMERATOR_CACHE_MB')
     if cap is not None:
         cap = float(cap)
@@ -42,7 +49,7 @@ def run_mrcc(inputs, nodes, weights, *, with_grad, max_memory):
     maxima = dict(resident_tensor_bytes=0, reverse_buffer_bytes=0,
         deterministic_workspace_bytes=0, numerator_cache_peak_bytes=0,
         rank_four_packing_bytes=0, sampling_threads=0, setup_threads=0,
-        occupied_block_batch_size=0)
+        occupied_block_batch_size=0, workspace_budget_bytes=0)
     calls = groups = builds = 0
     profile_grouped = os.environ.get('PYSCFAD_TRIPLES_PROFILE_GROUPED', '0') == '1'
     grouped_profile, grouped_spin, grouped_plan, grouped_jobs, grouped_commit = ([] for _ in range(5))
@@ -51,7 +58,8 @@ def run_mrcc(inputs, nodes, weights, *, with_grad, max_memory):
         tick = time.perf_counter()
         prepared = engine.prepare(float(node), cache_limit_bytes=cache)
         prepare.append(time.perf_counter()-tick)
-        budget = int(max(0., max_memory-current_memory()[0])*1e6)
+        budget = int(min(workspace_gib * 1024**3,
+                         max(0., max_memory-current_memory()[0])*1e6))
         tick = time.perf_counter()
         result = native.triples_mrcc_point(prepared, float(weight), with_grad=with_grad,
             workspace_limit_bytes=budget, block_batch_size=batch, profile_grouped=profile_grouped)

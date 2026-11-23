@@ -18,8 +18,11 @@ from . import backend, driver, _stc_precision
 from ._profile import response as profile_response
 from ._memory import memory_calculation
 from ._cleanup import release_memory as _release_memory
-from ._selection import (DomainSelections, _physical_groups, _strong_preparation_key,
-                         build_domain_groups, physical_fragments_in_group as _group_cc_fragments)
+from ._selection import (
+    _physical_groups,
+    build_domain_groups,
+    physical_fragments_in_group as _group_cc_fragments,
+)
 from ._df_basis import (basis_kwargs, basis_identity, selection_auxbasis,
                         validate_selection_basis)
 from .adjoint import apply_input_pullback
@@ -125,7 +128,6 @@ class CCSDComponents:
     def triples_standard_error(self):
         """Energy SE for independently sampled LIS triples, excluding D error."""
         return sum(f.triples_standard_error**2 for f in self.fragments)**.5
-
 
     @property
     def stc_standard_error(self):

@@ -68,19 +68,6 @@ void triples_left_pack_forward(triples_left_pack& pack,const std::vector<tensor>
         }
     }
 }
-void triples_left_pack_reverse(const triples_left_pack& pack,std::vector<tensor>& bank,size_t n) {
-    for(auto id:pack.ids) {
-        const size_t pairs=bank[id].dims[0]*n*n;
-        #pragma omp for schedule(static)
-        for(size_t pair=0;pair<pairs;++pair) {
-            const size_t i=pair/(n*n),a=pair/n%n,b=pair%n;
-            const double* src=pack.bar[id].memptr()+((i*n+b)*n+a)*n;
-            double* dst=bank[id].bar.memptr()+pair*n;
-            #pragma omp simd
-            for(size_t d=0;d<n;++d) dst[d]+=src[d];
-        }
-    }
-}
 
 struct triples_output_order {
     bool alternate,singleton_first,swap_pair;

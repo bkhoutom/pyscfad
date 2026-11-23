@@ -398,18 +398,6 @@ inline deterministic_result evaluate_deterministic(const arma::mat& fo, const ar
     return out;
 }
 
-// Return the primal values and dL/dF_occ, dL/dF_virt, dL/dB. Fock inputs are
-// symmetric; their cotangents are symmetric as well. The propagator's common
-// spectral shift cancels between occupied and virtual exponentials.
-inline deterministic_result evaluate_deterministic_cotangent(
-        const arma::mat& fo, const arma::mat& fv, const arma::mat& bare,
-        const arma::vec& beta, const arma::vec& weights,
-        const std::vector<size_t>& group, int threads, double bar_energy,
-        const arma::mat& bar_occupied, const arma::mat& bar_virtuals,
-        bool energy_matrices=false) {
-    const deterministic_cotangent_seed seed{bar_energy,bar_occupied,bar_virtuals};
-    return evaluate_deterministic(fo,fv,bare,beta,weights,group,threads,&seed,energy_matrices);
-}
 
 // One selected-group forward density for the corresponding local CCSD(T) solve.
 // No amplitude cube is retained after this call.

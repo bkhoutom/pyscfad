@@ -20,10 +20,6 @@ public:
         last_(last), block_size_(block_size), nblocks_((last-1)/block_size+1),
         mass_(rows*nblocks_,0.0), probability_(rows*nblocks_,1.0),
         alias_(rows*nblocks_), total(0.0) { }
-    // Distinct rows may be populated concurrently; finalize after the barrier.
-    void set_mass(size_t row,size_t block,double value) {
-        mass_[row*nblocks_+block]=value;
-    }
     template<typename Value>
     triples_block_sampler(size_t rows, size_t last, size_t block_size, Value value) :
         triples_block_sampler(rows,last,block_size) {

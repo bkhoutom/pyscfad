@@ -21,20 +21,20 @@ fd2f3013608ec3293dfea4f42084ad264b61fd28eb6cf11fb7a0507f1357dfe9  stc_mp2_select
 a775c22096afc21290c5a5dd2d172b4f924de384a4f6419bb854b116f493dbf8  stc_mp2_stochastic_w.h
 
 SHA256 of adapted native source files:
-9ed661020d90291075d05cdcecaaca199f9e0cf9f9a8f1088c489faf43fa7fa0  stc_mp2_deterministic_d_w.h
+2e59ab1393553c932c81e5662a823df6ba89ffb1d5e83281595560e22a200eeb  stc_mp2_deterministic_d_w.h
 52fd796a0d4eb07f82f4c423ce8a884217008d89b071cb1e39e3f974af9e03b7  stc_mp2_deterministic_energy.h
 be0a56c34a09e5ce68cdb974704d0377755d914fe28e746a4682bc16c5521e14  stc_mp2_gradient_numerical.cpp
-6c4f3eea0e1c1aed1c398a2a34bb5d86be29c7c9aaae10bc157934b1ba80dd8a  stc_mp2_kernel_helpers.h
+5b09c4c14738b612cb06e735429857a9ee82f82383c32aeeb43dc2cd3fb8944f  stc_mp2_kernel_helpers.h
 473f021ea697de2dbbf5536d344a627afe33c8916731696bfcc8faf9edb918da  stc_mp2_kernel_numerical.cpp
 1fa8b2d41fdec4836b77cdbc353450c52b0e4c3879a6977e08bdbe8569633099  stc_mp2_kernel_qchem.h
 fd2f3013608ec3293dfea4f42084ad264b61fd28eb6cf11fb7a0507f1357dfe9  stc_mp2_selected_energy.h
-35a8319aeaa2e094030f0cc4fe67a8454d98a86e76aced7a9d72f83b710abdc0  stc_mp2_selected_energy_density.h
-1179608573466fc102196263118a47093a349554f1c01342bbc2425cbd4159b8  stc_mp2_stochastic_density.h
+fd073ef1f109d4c8777d7584db97a0fc9c9cfd41817bfa4f95dda31064eefff0  stc_mp2_stochastic_density.h
 a775c22096afc21290c5a5dd2d172b4f924de384a4f6419bb854b116f493dbf8  stc_mp2_stochastic_w.h
 
 Standalone adaptations:
-- Three public numerical headers are byte-identical to v2: stochastic_w,
-  selected_energy, selected_energy_density.
+- At import, stochastic_w, selected_energy and selected_energy_density
+  were byte-identical to v2. The unused selected_energy_density header is
+  removed as documented below.
 - deterministic_energy shares propagated factors and reverse accumulation
   across selected targets with a bounded bare-Gram cache.
 - deterministic_d_w uses a virtual eigenbasis for W, two spin-adapted virtual
@@ -58,7 +58,8 @@ Standalone adaptations:
 - helpers effective_sample_threads uses the explicit per-call OpenMP scope
   without QCHEM_SAMPLE_THREADS. V2 spectral getters retained verbatim.
 - stochastic_density uses dense cotangent buffers, independent of
-  QCHEM_STC_SPARSE_COTANGENT. All other numerical source text retained.
+  QCHEM_STC_SPARSE_COTANGENT. Other numerical source text is retained except
+  the unused helpers removed below.
 W contraction ordering and workspace allocation are optimized; its finite-grid
 functional, signs and prefactors are unchanged. RNG and sampling rules are unchanged.
 The native replay version is advanced to identify the optimized implementation.
@@ -88,10 +89,10 @@ results/triples_cleanup_20261030/before/pyscfad/dlno_stc/cpp/native/SOURCE_MANIF
 SHA256 of current retained triples sources:
 7e53353af3f0ccc70f5a7af4f436fdc84fbdbaa380b7d8c0e440f989ed8d5dc6  stc_triples.h
 0ff442c9f4bfcaf09d762006ac483b47b7f7258cdb110d2db7ecc112a1375e8d  stc_triples_asymmetric.C
-3cb84a2fd873ab706d3b67b9f0f9f3119981d22a9ca291535075dd78072f7a96  triples_block_sampler.h
+639625911dfec1d769466100c544f405af45f1c12790be0b445255c6ce5b9dfe  triples_block_sampler.h
 3bd5bff77f89bdfbf204fe0816bbd2ffec8cdcecf5e7a19570dbeee64f4825f5  triples_deterministic.inc
 9d784d9be98f5c04c8dce40dd0f52a1d7daea6e210cce9f35f6654bdbc4bce1d  triples_quadrature.inc
-530cfcb622004a35c4a3613a72aa06a0bb66fa6c2e61ffc10123b45e7744b92a  triples_one_permutation.inc
+ed046610e53aa70d0b94e28c5c369b214c21a5f4f23980c9e3eb410a98297576  triples_one_permutation.inc
 c144e1e8cdbfe22df4c2c95297278b68c299b76ec08199a2ac91e819e1a9aed0  triples_grouped_adjoint.inc
 34b3eac4b1e21cc4cd35343b22cf9d262fb83159d293418523ae20d096068f12  triples_streaming.inc
 
@@ -109,3 +110,13 @@ native-layout capsule. Preparation and its analytic DF reverse share the same
 host B. retain/restore are no-ops only for this read-only borrowed kernel;
 stochastic kernels retain their original ownership. The deterministic energy
 header reports distinct live full-factor buffers. Contractions are unchanged.
+
+Unused native helpers cleanup, 2026-11-23:
+Removed the unreferenced stc_mp2_selected_energy_density.h header and the
+unused set_orbital_matrix, parse_occupied_indices, virtual_numerator,
+estimate_virtual, sampled_occupied_pair_vjp, sampled_virtual_pair_vjp,
+evaluate_deterministic_cotangent, triples_left_pack_reverse and set_mass
+helpers. Public kernel accessors and reference implementations are retained.
+Active numerical bodies, sampling rules and replay versions are unchanged.
+The supplied-file hashes above retain the removed header as provenance;
+only hashes for retained files changed by this cleanup are refreshed.

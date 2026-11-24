@@ -282,6 +282,16 @@ def _scf(dm, mf, s1e, h1e, *,
     fock_last = None
     mol = mf.mol
 
+    if getattr(mf, '_sgx_backend', None) is not None:
+        from pyscfad.sgx._grid_sequence import converge_coarse_scf, fresh_diis
+        dm, coarse_converged = converge_coarse_scf(
+            dm, mf, s1e, h1e, conv_tol=conv_tol, conv_tol_grad=conv_tol_grad,
+            callback=callback, log=log, cput1=cput1)
+        if coarse_converged:
+            vhf = mf.get_veff(mol, dm, s1e=s1e)
+            e_tot = mf.energy_tot(dm, h1e, vhf)
+            diis = fresh_diis(mf, dm, s1e, h1e, vhf)
+
     for cycle in range(mf.max_cycle):
         dm_last = dm
         last_hf_e = e_tot
@@ -319,6 +329,7 @@ def _scf(dm, mf, s1e, h1e, *,
         if scf_conv:
             break
 
+    log.info('SCF iterations=%d (extra convergence cycle excluded)', cycle + 1)
     return dm, scf_conv, e_tot, mo_energy, mo_coeff, mo_occ
 
 
@@ -703,9 +714,13 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
     if getattr(mf, '_sgx_backend', None) is not None:
         from pyscfad.tools.linear_solver import eager_gmres
         with eager_gmres():
-            response_solver = gen_gmres()
+            response_solver = gen_gmres(log=log)
+        if mf._sgx_backend.grid_sequence and mf._sgx_backend.grid_level > 0:
+            from pyscfad.sgx._grid_sequence import converge_coarse_lambda
+            response_solver = partial(response_solver, warm_start=partial(
+                converge_coarse_lambda, mf._sgx_backend))
     else:
-        response_solver = gen_gmres()
+        response_solver = gen_gmres(log=log)
     from pyscfad.tools._response_checkpoint import tag_solver
     response_solver = tag_solver(response_solver)
     _scf_wrapped = make_implicit_diff(

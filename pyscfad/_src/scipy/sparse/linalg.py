@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from functools import reduce
+import time
 import jax
 import numpy
 import scipy
@@ -45,7 +46,10 @@ def _matvec_to_scipy(matvec, b):
 
 def gmres(A_or_matvec, b, x0=None, *,
           tol=1e-05, atol=None, restart=None, maxiter=None, M=None,
-          callback=None, callback_type=None):
+          callback=None, callback_type=None, warm_start=None, log=None):
+    if warm_start is not None and x0 is None:
+        x0 = warm_start(A_or_matvec, b, tol=tol, atol=atol, M=M,
+                        restart=restart, maxiter=maxiter)
     if _has_tracer(A_or_matvec, b, x0):
         del callback, callback_type
         if atol is None:
@@ -64,6 +68,32 @@ def gmres(A_or_matvec, b, x0=None, *,
     else:
         A = numpy.array(ops.to_numpy(A_or_matvec))
 
+    # Preserve iterate callbacks used by checkpoints. SciPy invokes these
+    # after each restart block's true-residual matvec, so subtract those
+    # checks and the optional initial residual to count Krylov steps exactly.
+    # Observing existing calls adds no operator or residual evaluations.
+    counts = dict(matvecs=0, iterations=0, restart_cycles=0)
+    started = time.perf_counter()
+    if log is not None:
+        operator = scipy.sparse.linalg.aslinearoperator(A)
+        def observed_matvec(x):
+            counts['matvecs'] += 1
+            return operator.matvec(x)
+        A = LinearOperator(operator.shape, matvec=observed_matvec, dtype=operator.dtype)
+        original_callback = callback
+        callback_type = ('x' if callback is None else (callback_type or 'legacy'))
+        initial_residual = int(x0 is not None and numpy.any(x0))
+        def observed_callback(value):
+            if callback_type == 'x':
+                counts['restart_cycles'] += 1
+                counts['iterations'] = (counts['matvecs'] - initial_residual
+                                        - counts['restart_cycles'])
+            else:
+                counts['iterations'] += 1
+            if original_callback is not None:
+                original_callback(value)
+        callback = observed_callback
+
     # SciPy promotes non-floating inputs to double. Use the effective dtype
     # and actual RHS size, independent of molecule/basis or solver defaults.
     dtype = numpy.result_type(*[d if numpy.dtype(d).char in 'fdFD' else numpy.float64
@@ -78,10 +108,23 @@ def gmres(A_or_matvec, b, x0=None, *,
             u, info = scipy_gmres(A, b.ravel(), x0=x0, rtol=tol, atol=atol,
                                   restart=restart, maxiter=maxiter, M=M,
                                   callback=callback, callback_type=callback_type)
+    if log is not None:
+        # With an exact initial guess or zero RHS there are no Krylov steps.
+        counts['restart_cycles'] = (counts['matvecs'] - counts['iterations']
+                                    - min(initial_residual, counts['matvecs']))
+        log.info('SCF lambda GMRES: iterations=%d restart_cycles=%d '
+                 'operator_evaluations=%d wall_seconds=%.3f info=%d',
+                 counts['iterations'], counts['restart_cycles'],
+                 counts['matvecs'], time.perf_counter() - started, info)
     if info > 0:
         raise RuntimeError(f'scipy gmres failed to converge in {info} iterations.')
     elif info < 0:
         raise RuntimeError('scipy gmres failed.')
+    # SciPy checks the true (unpreconditioned) residual before returning
+    # success, including for a nonzero warm-start vector. Do not repeat the
+    # expensive operator application here.
+    if not numpy.isfinite(u).all():
+        raise RuntimeError('scipy gmres returned a nonfinite solution.')
     return u.reshape(b.shape), info
 
 

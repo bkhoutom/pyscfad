@@ -40,6 +40,9 @@ def _sgx_tolerance(value):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--verbose', type=int, choices=range(10), default=5,
+                        help='PySCF verbosity for reference and differentiable SCF; '
+                             'default 5 records iterations and cycle timings')
     parser.add_argument('--scf-jk', choices=('df', 'dfj-sgx'), default='dfj-sgx',
                         help='SCF and response J/K backend; dfj-sgx (default) avoids global DF factors')
     parser.add_argument('--sgx-grid-level', type=int, choices=range(8), default=2)
@@ -245,7 +248,7 @@ def main():
                        if shell[0] == 0]}
         auxbasis = "def2-svp-jkfit"
     mol = gto.Mole(atom=str(xyz), basis=basis, unit="Angstrom",
-                   max_memory=args.max_memory_mb, verbose=4)
+                   max_memory=args.max_memory_mb, verbose=args.verbose)
     mol.build(trace_exp=False, trace_ctr_coeff=False)
     elements = [mol.atom_symbol(i) for i in range(mol.natm)]
     if args.boys_grouping == "system":
@@ -284,7 +287,7 @@ def main():
             report('Loaded saved Boys/domain/LIS selections; no selection searches')
     reference_scf_mode = 'restored' if saved_scf is not None else 'solved'
     refmol = pgto.M(atom=str(xyz), basis=basis, unit="Angstrom",
-                     max_memory=args.max_memory_mb, verbose=0)
+                     max_memory=args.max_memory_mb, verbose=args.verbose)
     ref = pscf.RHF(refmol).density_fit(auxbasis=auxbasis)
     ref.with_df.max_memory = args.df_memory_mb
     if args.scf_jk == 'dfj-sgx':
@@ -455,6 +458,7 @@ def main():
         affinity = check_worker_affinity(benchmark_cpus)
         settings["lis_space"] = "domain"  # Fixed scientific identity for saved references.
         settings.update(geometry=str(xyz), elements=elements, basis=args.basis,
+                        verbose=args.verbose,
                         auxbasis=auxbasis or "auto", frozen=args.frozen, boys_grouping=args.boys_grouping,
                         full_domain=full_domain, physical_fragments=expected_groups,
                         domain_thresholds=asdict(domains.thresholds), mp2_domains=mp2_domains,

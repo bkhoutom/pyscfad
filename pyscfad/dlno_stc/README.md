@@ -57,6 +57,23 @@ checkpoints using the old convention must be rebuilt; restart algorithm ABI
 
 ## Calculation interface
 
+For a deterministic forward-only trial, pass `sequential_virtual=True` to
+`ccsd.build_static_selections`. This selects the occupied LIS first, projects
+the cached full-domain MP2 amplitudes and bare integral contractions onto that
+occupied space, and constructs virtual W there. The physical target block is
+preserved, and the domain MP2 energy and downstream CCSD/(T) treatment are
+unchanged. The default remains independent occupied/virtual W selection.
+The trial retains all selected-target amplitude and integral slices until
+occupied selection, so it needs additional memory. Gradients and stochastic
+matrix construction are rejected until their corresponding response and
+sampling algorithms are implemented.
+
+Set `scale_lis_by_target_count=True` in `ccsd.build_static_selections` to
+interpret both cutoffs per original physical target LMO. A four-target
+fragment then uses four times each specified cutoff. The occupied cutoff
+is scaled before sequential virtual W is built; domain MP2 energies remain
+unscaled. This option is recorded in checkpoints and defaults to false.
+
 This small deterministic example runs all four workflows. `build_static`
 callbacks let force calculations share the differentiated SCF with screening
 and selection. `build_mf` can run cold SCF or use a caller-supplied warm density.
@@ -494,7 +511,7 @@ for lambda too; a force request does not automatically tighten them.
 disable it. These settings are independent of `triples_controls`.
 
 Native CPU DF-CCSD is the deterministic fragment default. The optional C++
-virtual-ladder extension and the JAX reference implementation are described
+residual extension and the JAX reference implementation are described
 under [build and verification](#build-and-verification) and in the
 [implementation notes](../../doc/source/user_guide/smooth_lis_triples.md#deterministic-ccsd-and-response).
 
@@ -697,7 +714,7 @@ python -m pytest pyscfad/dlno_stc/test/test_calculation_modes.py \
   pyscfad/dlno_stc/test/test_w_delayed_pullback.py
 ```
 
-The optional CPU CCSD ladder kernel requires CMake, pybind11, an OpenMP C++
+The optional CPU CCSD residual kernels require CMake, pybind11, an OpenMP C++
 compiler and the active Python/SciPy environment:
 
 ```bash
@@ -708,8 +725,17 @@ cmake -S pyscfad/cc/cpp -B build/ccsd -DCMAKE_BUILD_TYPE=Release \
 cmake --build build/ccsd -j 2
 ```
 
-It is used when available and applicable. `config.update('pyscfad_dfccsd_cpp', False)`
-disables the optional ladder kernel; `config.update('pyscfad_dfccsd_native', False)`
+For resident real RCCSD with cached virtual integrals, the extension evaluates
+the complete amplitude update: the virtual ladder, tiled `ovvv`, `ovov` and
+`oooo` contractions, intermediates, symmetrization and denominators. Python
+retains DIIS, convergence and memory/thread policy. The existing response and
+integral-adjoint implementations are unchanged. Unsupported modes and tight
+memory budgets use the Python reference equations. See the
+[native residual implementation notes](../cc/cpp/README.md) for the kernel
+boundary and diagnostic timing interface.
+
+`config.update('pyscfad_dfccsd_cpp', False)`
+disables the optional C++ kernels; `config.update('pyscfad_dfccsd_native', False)`
 selects the JAX fragment reference implementation. Higher derivatives require
 the JAX path; the native RCCSD adapter supports real float64 energies and first
 derivatives. Imports do not build or download dependencies.

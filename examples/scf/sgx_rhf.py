@@ -17,8 +17,18 @@ Planning also reserves AO matrices and native per-thread buffers and leaves
 mol.max_memory (or the enclosing SCF-response scope); df_memory_mb below is
 the J/K workspace allowance. Metric derivative tiles remain at most 32 MiB.
 
-The default uses symmetric overlap fitting, a fixed level-2 SGX grid, per-pair
-screening and FP64-only arithmetic. Set mixed_precision=True for mixed FP32/FP64
+The default uses symmetric overlap fitting and converges SCF first on grid 1,
+then restarts with fresh DIIS and converges on grid 2. The implicit lambda
+solve obtains a warm start on grid 1 using the GMRES residual estimate,
+without a final coarse residual check, then converges ordinary GMRES on grid 2.
+Each stage has its own full iteration limit; an unfinished coarse iterate
+can still seed the final solve.
+coarse_conv_factor=100 (the default) relaxes both SCF convergence tolerances
+and both lambda residual tolerances on the coarse grid only.
+grid_level=3 selects grids 2 then 3; grid_sequence=False disables staging.
+Final energies and implicit geometry derivatives use the requested final grid.
+Screening is per-pair with FP64-only arithmetic by default.
+Set mixed_precision=True for mixed FP32/FP64
 forward, response and geometry kernels. The default requires libsgx_ad
 version 4 and uses independent density-dependent skip thresholds:
 energy_tol=1e-10 and potential_tol=1e-8 (also the per-pair auto defaults).

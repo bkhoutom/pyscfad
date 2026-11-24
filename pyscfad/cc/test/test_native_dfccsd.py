@@ -42,6 +42,14 @@ def case(request):
 
 
 def test_native_forward_response_and_integral_adjoint(case, monkeypatch):
+    from pyscfad.cc import _native_ccsd_eris
+    ovvv_calls=[]
+    native_ovvv=_native_ccsd_eris._dfccsd_ovvv_vjp_native
+    def checked_ovvv(*args):
+        result=native_ovvv(*args)
+        ovvv_calls.append(True)
+        return result
+    monkeypatch.setattr(_native_ccsd_eris,'_dfccsd_ovvv_vjp_native',checked_ovvv)
     cc, eris = case
     t1, t2 = cc.t1, cc.t2
     options = native.settings(cc)
@@ -82,6 +90,7 @@ def test_native_forward_response_and_integral_adjoint(case, monkeypatch):
     actual_bars = native.integral_cotangent(host, he, np.asarray(t1), np.asarray(t2), bars[0], actual)
     for name, value in zip(native.BAR_NAMES, actual_bars):
         np.testing.assert_allclose(value, getattr(expected_bars, name), atol=2e-9, rtol=0, err_msg=name)
+    assert ovvv_calls, 'the compiled ovvv backward kernel must run, not its fallback'
 
 
 def test_fragment_ccsdt_energy_and_geometry_gradient(get_opt_mol, record_property):

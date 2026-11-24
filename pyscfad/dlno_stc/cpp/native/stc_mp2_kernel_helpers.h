@@ -321,6 +321,7 @@ class propagator {
         return 0.5*(result+result.t());
     }
 public:
+    const arma::mat& virtual_rotation() const { return virtual_eigenvectors_; }
     const arma::mat& factors() const {
         if (consumable_bare_) return *consumable_bare_;
         return virtual_eigenbasis_ ? eigenbasis_bare_ : bare_;

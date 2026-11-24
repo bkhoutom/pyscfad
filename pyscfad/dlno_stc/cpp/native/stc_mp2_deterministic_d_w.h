@@ -39,6 +39,15 @@ struct deterministic_w_cotangent_seed {
         energy(e),occupied(o),virtuals(v) {}
 };
 
+// Call-local two-stage W workspace. Never stored in checkpoints.
+struct sequential_w_workspace {
+    std::vector<arma::cube> amplitudes, grams;
+    arma::mat virtual_rotation;
+    size_t nocc=0, nvirt=0;
+    int threads=1;
+    bool consumed=false;
+};
+
 // Exact contractions for the supplied Laplace grid. All selected amplitudes are
 // retained; each dressed DF factor is shared by the entire selected group.
 inline deterministic_result evaluate_deterministic(const arma::mat& fo, const arma::mat& fv,
@@ -47,7 +56,8 @@ inline deterministic_result evaluate_deterministic(const arma::mat& fo, const ar
         const deterministic_cotangent_seed* seed=nullptr,
         bool energy_matrices=false, bool primal_outputs=true,
         const deterministic_w_cotangent_seed* w_seed=nullptr,
-        bool optimize_w=true, arma::mat* consumable_bare=nullptr) {
+        bool optimize_w=true, arma::mat* consumable_bare=nullptr,
+        sequential_w_workspace* sequential=nullptr) {
     const size_t no=fo.n_rows, nv=fv.n_rows, np=bare.n_rows;
     if (!no || !nv || !np || fo.n_cols!=no || fv.n_cols!=nv ||
         bare.n_cols!=no*nv || beta.is_empty() || beta.n_elem!=weights.n_elem ||
@@ -77,6 +87,15 @@ inline deterministic_result evaluate_deterministic(const arma::mat& fo, const ar
     const bool eigenbasis=optimize_w && !seed && !primal_outputs && (energy_matrices || w_seed);
     propagator dress(fo,fv,bare,beta,threads,eigenbasis,consumable_bare);
     const arma::mat& factors=dress.factors();
+    if (sequential) {
+        if (!eigenbasis || !energy_matrices || seed || w_seed)
+            throw std::invalid_argument("Sequential W requires deterministic forward W");
+        sequential->nocc=no; sequential->nvirt=nv; sequential->threads=threads;
+        sequential->consumed=false;
+        sequential->virtual_rotation=dress.virtual_rotation();
+        sequential->grams.resize(group.size());
+        for (auto& g:sequential->grams) g.set_size(nv,nv,no);
+    }
     std::vector<arma::cube> amplitudes(group.size());
     for (auto& t:amplitudes) t.zeros(nv,nv,no);
     deterministic_result out;
@@ -196,7 +215,7 @@ inline deterministic_result evaluate_deterministic(const arma::mat& fo, const ar
             arma::mat local;
             if (primal_outputs) local.zeros(nv,nv);
             arma::mat local_energy_virtuals;
-            if (energy_matrices) local_energy_virtuals.zeros(nv,nv);
+            if (energy_matrices && !sequential) local_energy_virtuals.zeros(nv,nv);
             arma::mat local_bi;
             if (energy_active) local_bi.zeros(np,nv);
             double local_energy=0;
@@ -218,6 +237,7 @@ inline deterministic_result evaluate_deterministic(const arma::mat& fo, const ar
                     const arma::mat spin_g=2*g-g.t();
                     gram_seconds+=omp_get_wtime()-gram_tick;
                     if (w_seed) bare_grams.slice(j)=g;
+                    if (sequential) sequential->grams[s].slice(j)=spin_g;
                     if (primal_outputs) local_energy+=arma::accu(tj%spin_g);
                     if (energy_matrices) {
                         const arma::vec spin_column(const_cast<double*>(spin_g.memptr()),
@@ -228,12 +248,14 @@ inline deterministic_result evaluate_deterministic(const arma::mat& fo, const ar
                         // reduces to D_vv when g=t.
                         // The other two products provide the transpose after
                         // spin expansion; symmetrize only after accumulation.
-                        const double virtual_tick=omp_get_wtime();
-                        if (eigenbasis)
-                            local_energy_virtuals+=0.5*(tj*spin_g.t()+tj.t()*spin_g);
-                        else local_energy_virtuals+=0.25*(tj*spin_g.t()+tj.t()*spin_g
-                                                         +g*spin.t()+g.t()*spin);
-                        virtual_seconds+=omp_get_wtime()-virtual_tick;
+                        if (!sequential) {
+                            const double virtual_tick=omp_get_wtime();
+                            if (eigenbasis)
+                                local_energy_virtuals+=0.5*(tj*spin_g.t()+tj.t()*spin_g);
+                            else local_energy_virtuals+=0.25*(tj*spin_g.t()+tj.t()*spin_g
+                                                             +g*spin.t()+g.t()*spin);
+                            virtual_seconds+=omp_get_wtime()-virtual_tick;
+                        }
                     }
                     if (energy_active) {
                         arma::mat& bar_tj=bar_amplitudes[s].slice(j);
@@ -264,7 +286,7 @@ inline deterministic_result evaluate_deterministic(const arma::mat& fo, const ar
             #pragma omp critical
             {
                 if (primal_outputs) { out.virtuals+=local; out.energy+=local_energy; }
-                if (energy_matrices) out.energy_virtuals+=local_energy_virtuals;
+                if (energy_matrices && !sequential) out.energy_virtuals+=local_energy_virtuals;
                 out.bare_gram_worker_seconds+=gram_seconds;
                 out.occupied_w_worker_seconds+=occupied_seconds;
                 out.virtual_w_worker_seconds+=virtual_seconds;
@@ -341,6 +363,7 @@ inline deterministic_result evaluate_deterministic(const arma::mat& fo, const ar
     }
     out.contraction_seconds=omp_get_wtime()-contraction_start;
     out.seconds=omp_get_wtime()-start;
+    if (sequential) sequential->amplitudes=std::move(amplitudes);
     if (!seed && !w_seed) return out;
 
     const double reverse_start=omp_get_wtime();

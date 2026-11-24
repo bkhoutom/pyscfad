@@ -93,9 +93,9 @@ def restore_scf(mf, canonical, *, fock=None):
     if backend is not None:
         from pyscfad.tools.linear_solver import eager_gmres
         with eager_gmres():
-            solver = hf.gen_gmres()
+            solver = hf.gen_gmres(log=hf.logger.new_logger(mf))
     else:
-        solver = hf.gen_gmres()
+        solver = hf.gen_gmres(log=hf.logger.new_logger(mf))
     from pyscfad.tools._response_checkpoint import tag_solver
     solver = tag_solver(solver)
     attach_response = make_implicit_diff(

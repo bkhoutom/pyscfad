@@ -50,13 +50,30 @@ def _configure(mol, auxbasis, grid_level, fit_ovlp, df_memory_mb,
 def sgx_fit(mf, auxbasis=None, *, grid_level=2, fit_ovlp=True,
             df_memory_mb=4000, integral_backend='auto', screening='per_pair',
             mixed_precision=False, energy_tol='auto', potential_tol='auto',
-            fp32_multiplier=1e5):
+            fp32_multiplier=1e5, grid_sequence=True, coarse_conv_factor=100.):
     """Return RHF using integral-direct DF-J and optimized symmetric SGX-K.
 
     Accepts PySCFAD or native PySCF RHF, so reference and differentiable SCFs
     can use identical settings. On PySCFAD, ``with_df`` remains the separate
     correlation DF object. ``auxbasis`` specifies the Coulomb fitting basis;
     an existing correlation auxiliary basis is preserved.
+
+    ``grid_level`` is the final grid. With ``grid_sequence=True`` (default),
+    SCF first converges at ``grid_level-1``, then restarts with that density
+    and fresh DIIS on the final grid. ``coarse_conv_factor`` multiplies both
+    SCF convergence tolerances on the coarse grid only (default 100).
+    ``max_cycle`` is allowed separately for each stage.
+    The implicit SCF lambda equation uses a coarse GMRES warm start, stopping
+    on its Arnoldi residual estimate without a final true-residual check,
+    then restarts ordinary GMRES on the final grid using that vector as x0.
+    The same factor multiplies lambda's relative and absolute tolerances on
+    the coarse grid. Final-grid tolerances and iteration limits are unchanged.
+    At the coarse lambda iteration limit, its current vector is passed to
+    the final solver; nonfinite values still raise. Only the final solver
+    certifies lambda convergence. Saved lambda guesses go directly to it.
+    Set ``grid_sequence=False`` for fixed-grid SCF and lambda solves.
+    Level zero always uses a fixed grid. Final results and implicit geometry
+    derivatives use the final grid.
 
     There are two precision modes, controlled by ``mixed_precision``:
     ``False`` uses FP64 throughout; ``True`` selects FP32 or FP64 for forward,
@@ -138,6 +155,12 @@ def sgx_fit(mf, auxbasis=None, *, grid_level=2, fit_ovlp=True,
         raise NotImplementedError('DF-J/SGX-K supports real closed-shell RHF only')
     if isinstance(grid_level, bool) or not isinstance(grid_level, int) or not 0 <= grid_level <= 7:
         raise ValueError('SGX grid_level must be an integer from 0 to 7')
+    if not isinstance(grid_sequence, bool):
+        raise TypeError('SGX grid_sequence must be a bool')
+    if (isinstance(coarse_conv_factor, bool) or
+            not isinstance(coarse_conv_factor, (int, float)) or
+            not math.isfinite(coarse_conv_factor) or coarse_conv_factor < 1):
+        raise ValueError('SGX coarse_conv_factor must be finite and at least 1')
     df_memory_mb = float(df_memory_mb)
     if not math.isfinite(df_memory_mb) or df_memory_mb <= 0:
         raise ValueError('SGX df_memory_mb must be finite and positive')
@@ -174,6 +197,8 @@ def sgx_fit(mf, auxbasis=None, *, grid_level=2, fit_ovlp=True,
         mf.with_df.max_memory = df_memory_mb
         mf.with_df.jk_workspace_memory = df_memory_mb
         mf._sgx_backend = _Backend(auxbasis, grid_level, fit_ovlp, df_memory_mb, integral_backend, accuracy)
+        mf._sgx_backend.grid_sequence = grid_sequence
+        mf._sgx_backend.coarse_conv_factor = float(coarse_conv_factor)
         mf._eri = None
         mf.direct_scf = False
         from . import _shared
@@ -183,6 +208,11 @@ def sgx_fit(mf, auxbasis=None, *, grid_level=2, fit_ovlp=True,
                      df_memory_mb, integral_backend, accuracy)
     result = native_sgx.sgx_fit(mf, with_df=obj, pjs=True)
     result.direct_scf = False
+    from ._grid_sequence import NativeGridSequence
+    result._sgx_grid_sequence = grid_sequence
+    result._sgx_coarse_conv_factor = float(coarse_conv_factor)
+    if not isinstance(result, NativeGridSequence):
+        result = lib.set_class(result, (NativeGridSequence, result.__class__))
     return result
 
 
@@ -211,6 +241,8 @@ class _Backend:
         self.df_memory_mb = df_memory_mb
         self.integral_backend = integral_backend
         self.accuracy = copy.deepcopy(accuracy)
+        self.grid_sequence = False
+        self.coarse_conv_factor = 100.
         self._key = self._native = None
         self._primal_cache = []
         self.primal_cache_stats = dict(hits=0, misses=0, j_builds=0, k_builds=0,
@@ -330,6 +362,10 @@ def _k_geometry(obj, dm, bar, tol):
 
 def _bwd(backend, with_j, with_k, tol, residual, bars):
     mol, dm, (geometry_active, dm_active) = residual
+    from ._grid_sequence import response_backend
+    # Only the coarse adjoint solve changes the density Jacobian. Geometry
+    # contractions and the final adjoint always use the original grid.
+    selected = response_backend(backend) if dm_active and not geometry_active else backend
     obj = backend.native(mol, tol)
     dm = _sym(_host(dm))
     dbar, rbar = np.zeros_like(dm), np.zeros((mol.natm, 3))
@@ -342,7 +378,7 @@ def _bwd(backend, with_j, with_k, tol, residual, bars):
             continue
         if dm_active:
             response = (_dfj.density_response(obj, bar, tol) if k == 0 else
-                        _sgx_grad.density_response(obj, bar, tol))
+                        _sgx_grad.density_response(selected.native(mol, tol), bar, tol))
             dbar += response
         if geometry_active:
             geometry_bars[k] = bar

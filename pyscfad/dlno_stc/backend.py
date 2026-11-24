@@ -327,3 +327,49 @@ def pullback_matrices(inputs, forward, *, energy_bar, occupied_bar, virtual_bar)
         resource_profile.checkpoint('stc.matrix.native_reverse_timings',
             frag=forward['metadata'].get('fragment_id', 0) + 1, timings=native_timings)
     return total
+
+
+def begin_sequential_matrices(inputs, metadata, controls):
+    """Occupied W and a call-local workspace for occupied-conditioned virtual W.
+
+    Deterministic energy-only experiment. All target amplitudes are retained
+    until their common occupied space has been selected; no DF or Laplace
+    work is repeated in the second stage. The energy remains full-ED MP2.
+    """
+    from .controls import normalize_matrix_controls
+    from ._memory import assess_memory
+    settings = normalize_matrix_controls(controls)
+    if settings['mode'] != 'deterministic':
+        raise NotImplementedError('sequential_virtual requires deterministic matrix controls')
+    validate_full_inputs(inputs)
+    naux, no, nv = inputs['B'].shape
+    targets = _matrix_targets(metadata, no)
+    # T and spin(G) for all physical targets plus one projected pair, the DF
+    # layout and small W matrices. Unlike the ordinary streaming path this
+    # intentionally retains all target slices until occupied selection.
+    retained_bytes = (16 * (len(targets)+1) * no
+                      + 8 * min(no, settings['threads'])) * nv * nv
+    assess_memory('sequential_w', (retained_bytes + 16*naux*no*nv)/1e6,
+                  configured_mb=settings.get('memory_limit_mb'),
+                  unavoidable_bytes=retained_bytes)
+    arrays = host_inputs(inputs)
+    extension = importlib.import_module('pyscfad.dlno_stc._stc_mp2')
+    native_controls = _matrix_batch_controls(settings, 1, settings['global_seed'])
+    with blas_threads(1):
+        result = extension.begin_sequential_matrices(
+            *(arrays[k] for k in ARRAY_NAMES), targets, native_controls)
+    result['matrix_kind'] = 'W'
+    return result
+
+
+def finish_sequential_virtual(forward, occupied_rotation):
+    """Consume the cached amplitudes/Grams using an orthonormal ED rotation."""
+    from time import perf_counter
+    extension = importlib.import_module('pyscfad.dlno_stc._stc_mp2')
+    started = perf_counter()
+    with blas_threads(1):
+        result = extension.finish_sequential_virtual(
+            forward.pop('workspace'), np.ascontiguousarray(occupied_rotation, dtype=np.float64))
+    forward['diagnostics'].update(retained_occupied=occupied_rotation.shape[1],
+                                 sequential_virtual_seconds=perf_counter()-started)
+    return result

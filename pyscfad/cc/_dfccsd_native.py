@@ -3,11 +3,11 @@
 """Host DF-CCSD and generalized lambda response, with resident fragment ERIs.
 
 Only the callback boundary uses JAX. Numerical kernels use PySCF, NumPy and
-BLAS, including the response action and the final integral adjoint. No PySCF
+BLAS and native C++ kernels, including dense response iteration. No PySCF
 AO2MO builder or HDF5 lambda intermediates are used.
 """
 import copy
-from types import SimpleNamespace
+from types import SimpleNamespace, MethodType
 
 import jax
 import numpy as np
@@ -109,6 +109,10 @@ def host_objects(options, arrays, nocc):
     cc.cpp_kernels = options.get('cpp_kernels', config.dfccsd_cpp)
     cc.vvvv_direct = options.get('vvvv_direct', False)
     cc._nocc, cc._nmo = nocc, nmo
+    from ._native_ccsd_forward import update_amps
+    from ._native_ccsd_solver import energy
+    cc.update_amps = MethodType(update_amps, cc)
+    cc.energy = MethodType(energy, cc)
     eris = _ResidentERIs(mol)
     for name, value in zip(ERI_NAMES, arrays):
         setattr(eris, name, value)
@@ -175,6 +179,10 @@ def energy_amplitude_cotangent(eris, t1, bar_e):
 
 
 def solve_response(cc, eris, t1, t2, bar_e, bar_t1, bar_t2):
+    from ._native_lambda_cpp import solve_response as compiled_response
+    result = compiled_response(cc, eris, t1, t2, bar_e, bar_t1, bar_t2)
+    if result is not None:
+        return result
     action = response_action(cc, eris, t1, t2)
     source = (energy_amplitude_cotangent(eris, t1, bar_e)
               + pack_cotangent(bar_t1, bar_t2))
@@ -230,7 +238,8 @@ def forward(mycc, eris, t1, t2):
         # OpenMP's thread count is thread-local; callbacks can run on workers.
         with lib.with_omp_threads(options['threads']), threadpool_limits(options['threads']):
             cc, host = host_objects(options, arrays[:-2], t1.shape[0])
-            out = ccsd.kernel(cc, host, np.asarray(arrays[-2]), np.asarray(arrays[-1]),
+            from ._native_ccsd_solver import kernel
+            out = kernel(cc, host, np.asarray(arrays[-2]), np.asarray(arrays[-1]),
                               max_cycle=cc.max_cycle, tol=cc.conv_tol,
                               tolnormt=cc.conv_tol_normt, verbose=cc.verbose)
             return tuple(np.asarray(x) for x in out)

@@ -44,7 +44,10 @@ void dfccsd_ovvv_vjp(
         double *tau_buf = malloc(sizeof(double) * (size_t)nocc2 * nvir);
         double *tmp_buf = malloc(sizeof(double) * (size_t)nocc2 * nvir);
 
-#pragma omp for schedule(dynamic)
+/* Each p owns disjoint packed rows and performs the same-shaped contractions.
+ * Match the static work assignment used by the native forward CCSD kernels.
+ * OMP_DYNAMIC controls team size independently of this loop schedule. */
+#pragma omp for schedule(static)
         for (int p = 0; p < nvir; p++) {
             for (int io = 0; io < nocc; io++) {
                 for (int jo = 0; jo < nocc; jo++) {

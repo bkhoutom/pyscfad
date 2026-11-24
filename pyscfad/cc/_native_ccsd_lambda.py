@@ -1,9 +1,9 @@
 # Copyright 2021-2026 The PySCFAD Authors
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
-"""In-memory NumPy/BLAS translation of the DF lambda contractions.
+"""Resident RCCSD lambda dispatch and NumPy/BLAS reference equations.
 
 Derived from pyscfad.cc.ccsd_lambda (itself based on PySCF RCCSD lambda).
-All updates use NumPy arrays. Virtual triples intermediates are built in
+The native C++ path uses shared forward tensor kernels. Reference intermediates are built in
 tiles and cached in RAM when affordable; no HDF5 scratch is created.
 """
 from functools import reduce
@@ -221,6 +221,9 @@ def _contract_wvvov_l2_df(t1, t2, l2, eris, *, store=None):
 def update_lambda(mycc, t1, t2, l1, l2, eris=None, imds=None):
     if imds is None:
         imds = make_intermediates(mycc, t1, t2, eris)
+    from . import _native_lambda_cpp as compiled
+    if isinstance(imds,compiled.Intermediates):
+        return compiled.update(mycc,l1,l2,imds)
     if imds.wvvov is not None:
         # Reuse PySCF's blocked native update with our resident intermediates.
         # Only its default intermediate builder uses HDF5; that builder is
@@ -322,4 +325,7 @@ def update_lambda(mycc, t1, t2, l1, l2, eris=None, imds=None):
     l2new = l2new / eijab
     return (l1new, l2new)
 
-make_intermediates = _make_intermediates_df
+def make_intermediates(mycc,t1,t2,eris):
+    from ._native_lambda_cpp import prepare
+    native=prepare(mycc,t1,t2,eris)
+    return _make_intermediates_df(mycc,t1,t2,eris) if native is None else native

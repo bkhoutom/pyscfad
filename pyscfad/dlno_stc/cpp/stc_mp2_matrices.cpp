@@ -524,6 +524,95 @@ py::dict solve_matrices(py::handle foo, py::handle fvv, py::handle b,
     return matrix_result(output, settings.replay);
 }
 
+// The retained occupied basis is in the original ED frame. The optimized
+// propagator rotates virtuals only, so the partner-occupied projection needs
+// no Fock re-diagonalization and does not change the original MP2 denominators.
+py::dict begin_sequential(py::handle foo, py::handle fvv, py::handle b,
+                          py::handle targets, const py::dict& controls) {
+    auto inputs=input_arrays(foo,fvv,b);
+    positive_gap(inputs);
+    auto settings=read_settings(inputs,targets,controls);
+    if (settings.replay->stochastic)
+        throw py::value_error("Sequential virtual W supports deterministic forward only");
+    auto cache=std::make_shared<density::sequential_w_workspace>();
+    density::deterministic_result result;
+    {
+        py::gil_scoped_release release;
+        ThreadScope team(settings.replay->threads,true);
+        result=density::evaluate_deterministic(inputs.foo,inputs.fvv,inputs.B,
+            settings.replay->beta,settings.replay->weights,settings.replay->targets,
+            settings.replay->threads,nullptr,true,false,nullptr,true,&inputs.B,cache.get());
+    }
+    py::dict out;
+    out["energy"]=result.energy;
+    out["occupied"]=as_array(result.energy_occupied);
+    out["virtual"]=as_array(result.energy_virtuals);
+    out["workspace"]=cache;
+    py::dict diagnostics;
+    diagnostics["mode"]="deterministic";
+    diagnostics["matrix_kind"]="W";
+    diagnostics["sequential_virtual"]=true;
+    diagnostics["threads"]=cache->threads;
+    diagnostics["target_indices"]=settings.replay->targets;
+    diagnostics["native_version"]=settings.replay->native_version;
+    diagnostics["native_timings"]=deterministic_timings(result);
+    diagnostics["energy_standard_error"]=0.;
+    out["diagnostics"]=diagnostics;
+    return out;
+}
+
+py::array_t<double> finish_sequential(density::sequential_w_workspace& cache,
+                                     py::handle rotation) {
+    const arma::mat u=from_array(checked_array(rotation,"occupied rotation",2));
+    if (cache.consumed) throw py::value_error("Sequential W workspace already consumed");
+    if (u.n_rows!=cache.nocc || u.n_cols>cache.nocc ||
+        arma::norm(u.t()*u-arma::eye(u.n_cols,u.n_cols),"fro")>1e-8)
+        throw py::value_error("Retained occupied columns must be orthonormal ED coordinates");
+    arma::mat result(cache.nvirt,cache.nvirt,arma::fill::zeros);
+    {
+        py::gil_scoped_release release;
+        ThreadScope team(cache.threads,true);
+        const size_t nv=cache.nvirt, no=cache.nocc, nr=u.n_cols;
+        for (size_t s=0;s<cache.amplitudes.size();++s) {
+            arma::cube t(nv,nv,nr),g(nv,nv,nr);
+            const arma::mat tf(cache.amplitudes[s].memptr(),nv*nv,no,false,true);
+            const arma::mat gf(cache.grams[s].memptr(),nv*nv,no,false,true);
+            arma::mat tp(t.memptr(),nv*nv,nr,false,true),gp(g.memptr(),nv*nv,nr,false,true);
+            const size_t panel=std::max(size_t(1),std::min(size_t(2048),
+                (nv*nv+4*cache.threads-1)/(4*cache.threads)));
+            #pragma omp parallel for num_threads(cache.threads) schedule(static)
+            for (size_t first=0;first<nv*nv;first+=panel) {
+                const size_t last=std::min(nv*nv,first+panel)-1;
+                tp.rows(first,last)=tf.rows(first,last)*u;
+                gp.rows(first,last)=gf.rows(first,last)*u;
+            }
+            // Input amplitudes and Grams are no longer needed after projection.
+            cache.amplitudes[s].reset(); cache.grams[s].reset();
+            // Reuse the original W kernel's full-size GEMMs. Thin output
+            // panels repeat BLAS packing and lose much of its throughput.
+            // Dynamic teams may shrink; private accumulators are bounded by
+            // min(nr, threads), and BLAS stays serial within this outer team.
+            const int workers=std::max(1,std::min(cache.threads,int(nr)));
+            #pragma omp parallel num_threads(workers)
+            {
+                arma::mat local(nv,nv,arma::fill::zeros);
+                #pragma omp for schedule(static)
+                for (size_t j=0;j<nr;++j) {
+                    const arma::mat& a=t.slice(j); const arma::mat& b=g.slice(j);
+                    local+=.5*(a*b.t()+a.t()*b);
+                }
+                #pragma omp critical
+                result+=local;
+            }
+        }
+        result=.5*(result+result.t());
+        result=cache.virtual_rotation*result*cache.virtual_rotation.t();
+        cache.amplitudes.clear(); cache.grams.clear(); cache.virtual_rotation.reset();
+        cache.consumed=true;
+    }
+    return as_array(result);
+}
+
 Result replay_pullback(Inputs& inputs, const MatrixReplay& replay,
                        double energy_bar, const arma::mat& occupied_bar,
                        const arma::mat& virtual_bar, MatrixTimings& timings) {
@@ -636,6 +725,10 @@ Result solve_deterministic_energy(const Inputs& inputs,
 }
 
 void bind_matrices(py::module_& module) {
+    py::class_<density::sequential_w_workspace, std::shared_ptr<density::sequential_w_workspace>>(module,"SequentialWWorkspace");
+    module.def("begin_sequential_matrices",&begin_sequential);
+    module.def("finish_sequential_virtual",&finish_sequential);
+
     module.attr("matrix_kernel_version") = matrix_kernel_version;
     py::class_<MatrixReplay, std::shared_ptr<MatrixReplay>>(module, "MatrixReplay");
     module.def("solve_matrices", &solve_matrices,

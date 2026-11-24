@@ -338,7 +338,8 @@ def test_benchmark_resume_bypasses_both_scf_kernels(
     monkeypatch.setattr(module, 'check_worker_affinity', lambda cpus: dict(runtime_threads=1))
     monkeypatch.setattr(sys, 'argv', ['benchmark', '--threads', '1', '--basis', 'sto-3g',
         '--xyz-file', str(xyz), '--frozen', '1', '--boys-grouping', 'atom',
-        '--output-dir', str(tmp_path / 'output'), '--checkpoint-dir', str(directory), '--resume'])
+        '--output-dir', str(tmp_path / 'output'), '--checkpoint-dir', str(directory),
+        '--scf-jk', 'df', '--resume'])
 
     def forbidden(*args, **kwargs):
         raise AssertionError('benchmark restart ran cold or warm SCF')

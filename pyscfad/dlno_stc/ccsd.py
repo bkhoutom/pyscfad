@@ -250,8 +250,17 @@ def build_static_selections(mf, mp2_static, *, thresh_occ, thresh_vir,
                             baseline_controls=None, matrix_controls=None, mp2_grid=None,
                             internal_rank_threshold=1e-6, merge_identical=True,
                             triples_laplace_points=4,
-                            correlation_auxbasis=None):
+                            correlation_auxbasis=None, sequential_virtual=False,
+                            scale_lis_by_target_count=False):
     """Record physical-fragment LIS cutoffs and controls for the W pipeline.
+
+    ``sequential_virtual=True`` is an opt-in deterministic forward-only trial:
+    select occupied W first, then rebuild virtual W with the retained partner
+    occupied projector. Full-ED MP2 energy and occupied W remain unchanged.
+    Gradient calls reject this option until its complete response is available.
+
+    ``scale_lis_by_target_count=True`` multiplies both cutoffs by the original
+    physical target LMO count, including before sequential virtual construction.
 
     Use the run's ``correlation_auxbasis`` for W factors. ``None`` uses the
     SCF fit, or inherits the fit inside a driver-owned selection callback.
@@ -281,6 +290,10 @@ def build_static_selections(mf, mp2_static, *, thresh_occ, thresh_vir,
     Resident H_ED reuse is the default for energies and gradients; set
     PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE=direct for regeneration.
     """
+    if not isinstance(sequential_virtual, bool):
+        raise TypeError('sequential_virtual must be a bool')
+    if not isinstance(scale_lis_by_target_count, bool):
+        raise TypeError('scale_lis_by_target_count must be a bool')
     correlation_auxbasis = selection_auxbasis(mf, correlation_auxbasis)
     validate_selection_basis(mf, mp2_static, correlation_auxbasis)
     identity = (None if correlation_auxbasis is None else
@@ -306,7 +319,8 @@ def build_static_selections(mf, mp2_static, *, thresh_occ, thresh_vir,
     frames, grids = [None] * len(physical), [None] * len(physical)
     lis = LISSelections(mp2_static, thresh_occ, thresh_vir,
         internal_rank_threshold, tuple(selections),
-        tuple(frames), tuple(grids))
+        tuple(frames), tuple(grids), sequential_virtual=sequential_virtual,
+        scale_lis_by_target_count=scale_lis_by_target_count)
     return CCSDSelections(lis, _scientific_identity(baseline, matrix),
         selection_options=dict(indices=tuple(indices),
             triples_laplace_points=triples_laplace_points),
@@ -400,17 +414,24 @@ def _select_fragment_lis(mf, common, domains, index, group, frame, forward, *,
     return selection, frames, grid
 
 
+def _fragment_lis_cutoffs(static, index):
+    lis = static.lis_static
+    factor = (len(_physical_groups(static.mp2_static)[index])
+              if getattr(lis, 'scale_lis_by_target_count', False) else 1)
+    return factor * lis.thresh_occ, factor * lis.thresh_vir
+
+
 def _select_current_fragment(state, static, index, group, frame, forward, *,
                              prepared_lis=None, with_grad=False):
     """Create this fragment's immutable selection while its input VJP is live."""
     if static.fragments[index] is not None:
         return static
     options = static.selection_options
+    thresh_occ, thresh_vir = _fragment_lis_cutoffs(static, index)
     with resource_profile.section('stc.cc.lis_selection', frag=index+1):
         selection, frames, grid = _select_fragment_lis(
             state['mf'], state['common'], static.mp2_static, index, group, frame, forward,
-            thresh_occ=static.lis_static.thresh_occ,
-            thresh_vir=static.lis_static.thresh_vir,
+            thresh_occ=thresh_occ, thresh_vir=thresh_vir,
             internal_rank_threshold=static.lis_static.internal_rank_threshold,
             triples_laplace_points=options['triples_laplace_points'],
             prepared_lis=prepared_lis, with_grad=with_grad)
@@ -653,6 +674,11 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
     by domain MP2/W and every physical-fragment correction in this group.
     """
     from pyscfad.lno._df_shared import release_consumed_inputs
+    sequential = getattr(getattr(static, "lis_static", None), "sequential_virtual", False)
+    if sequential and with_grad:
+        raise NotImplementedError('sequential_virtual currently supports forward energies only')
+    if sequential and matrix_controls.get('mode', 'deterministic') != 'deterministic':
+        raise NotImplementedError('sequential_virtual requires deterministic matrix controls')
     with resource_profile.section('stc.cc.prepare'):
         inputs, host, prepare_pullback, frame = driver._prepare(
             state, static.mp2_static, group, baseline_controls, with_grad,
@@ -666,9 +692,18 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
     records = []
     for index, targets in _group_cc_fragments(static, group):
         with resource_profile.section('stc.cc.matrix_forward', frag=index+1):
-            forward = backend.solve_matrices(
+            matrix_solver = (backend.begin_sequential_matrices if sequential
+                             else backend.solve_matrices)
+            forward = matrix_solver(
                 host, {'fragment_id': index, 'target_indices': targets},
                 matrix_controls)
+        if sequential:
+            from .lis import occupied_selection_rotation
+            with resource_profile.section('stc.cc.sequential_virtual', frag=index+1):
+                rotation = occupied_selection_rotation(
+                    state['mf'], static.mp2_static, index, frame, forward['occupied'],
+                    common=state['common'], threshold=_fragment_lis_cutoffs(static, index)[0])
+                forward['virtual'] = backend.finish_sequential_virtual(forward, rotation)
         state['energy'] = state['energy'] + forward['energy']
         state['baseline_energy'] = state.get('baseline_energy', 0.) + float(forward['energy'])
         state['variance'] += float(forward['diagnostics']['energy_standard_error']) ** 2

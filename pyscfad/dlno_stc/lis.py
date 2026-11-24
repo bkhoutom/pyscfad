@@ -69,6 +69,8 @@ class LISSelections:
     fragments: tuple[FragmentLISSelection, ...]
     smooth_frames: object = None
     triples_grid: object = None
+    sequential_virtual: bool = False
+    scale_lis_by_target_count: bool = False
 
 
 @dataclass(frozen=True)
@@ -458,3 +460,23 @@ def build_fragment_lis(mf, common, static, fragment_index, *, matrices,
         common, static.mp2_static, representative, frame, matrices)
     return _build_domain_lis(mf, common, static, index, frame, occupied_ed, virtual_ed,
                              frame_selector=frame_selector)
+
+
+def occupied_selection_rotation(mf, domains, index, frame, occupied, *,
+                                common, threshold):
+    """Occupied LIS in ED coordinates, before any virtual eigensolve.
+
+    Preserve every projected physical target; compress only its orthogonal
+    complement, using the same compact eigenspace and cutoff as ordinary LIS.
+    """
+    occupied = numpy.asarray(occupied)
+    if threshold == 0:
+        return numpy.eye(occupied.shape[0])
+    target = numpy.asarray(_domain_targets(common, domains, index, frame))
+    external = _external_map(np.eye(occupied.shape[0]), target)
+    columns = _range_columns(external)
+    mapping, compact = _compact_mapped_density(external, occupied, columns)
+    values, vectors = scipy_linalg.eigh(numpy.asarray(compact))
+    keep = numpy.abs(values) > threshold
+    return numpy.ascontiguousarray(numpy.concatenate(
+        (target, numpy.asarray(mapping) @ vectors[:, keep]), axis=1))

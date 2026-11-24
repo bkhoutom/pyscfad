@@ -2332,13 +2332,6 @@ public:
     }
 };
 
-inline double virtual_numerator(const point_data& l, const point_data& m,
-        const arma::Col<size_t>& offsets, const virtual_tuple& x, size_t term) {
-    const auto p=virtual_legs(x,term); const size_t nv=l.norm.n_cols;
-    return (term<2 ? 1. : -.5)
-        *block_dot(l.c,offsets,x.A,p[0].first*nv+p[0].second,p[1].first*nv+p[1].second)
-        *block_dot(m.c,offsets,x.T,p[2].first*nv+p[2].second,p[3].first*nv+p[3].second);
-}
 
 // Domain indices are sorted. Contract their intersection without embedding
 // either integral block in a zero-filled nvirt x nvirt matrix.
@@ -2498,11 +2491,6 @@ struct virtual_policy {
     }
 };
 
-inline result estimate_virtual(const arma::mat& fo, const arma::mat& fv, const arma::mat& bare,
-        const arma::Col<size_t>& offsets, const arma::vec& beta, const arma::vec& weights,
-        const std::vector<size_t>& group, const options& opt, std::ostream* log=nullptr) {
-    return estimate_block<virtual_policy>(fo,fv,bare,offsets,beta,weights,group,opt,log);
-}
 
 }}}}
 // Density reverse pass
@@ -2998,78 +2986,6 @@ inline void accumulate_virtual_pair_vjp(const virtual_proposal& table,
     }
 }
 
-inline void sampled_occupied_pair_vjp(const point_data& l,const point_data& m,
-        arma::mat& bar_l,arma::mat& bar_m,const arma::mat& seed,
-        const arma::Col<size_t>& offsets,double factor,
-        const std::vector<std::unique_ptr<proposal>>& tables,
-        const arma::Col<size_t>& counts,size_t batches,size_t key,
-        unsigned random_seed,int threads) {
-    if (arma::accu(arma::abs(seed))==0) return;
-    density_block_locks left(l.norm.n_rows,offsets.n_elem-1),right(m.norm.n_rows,offsets.n_elem-1);
-    density_block_locks& right_locks=&bar_l==&bar_m ? left : right;
-    const size_t nv=l.norm.n_cols;
-    #pragma omp parallel for num_threads(threads) schedule(static)
-    for (size_t replica=0;replica<batches;++replica) {
-        for (size_t stream=0;stream<tables.size();++stream) {
-            const size_t count=counts(stream);
-            if (!count || !(tables[stream]->normalization>0)) continue;
-            auto rng=generator(random_seed,1,key,replica,stream);
-            const bool exchange=stream>=4;
-            for (size_t draw=0;draw<count;++draw) {
-                const tuple x=tables[stream]->draw(rng);
-                const double p=tables[stream]->probability(x);
-                if (!(p>0)) continue;
-                const size_t la=x.i*nv+x.a,lb=x.j*nv+x.b;
-                const size_t ma=x.i*nv+(exchange ? x.b : x.a);
-                const size_t mb=x.k*nv+(exchange ? x.a : x.b);
-                const double left_dot=block_dot(l.c,offsets,x.A,la,lb);
-                const double right_dot=block_dot(m.c,offsets,x.T,ma,mb);
-                const double scale=factor*seed(x.j,x.k)*(exchange ? -1. : 2.)
-                    /(double(batches)*double(count)*p);
-                add_block_dot_vjp(l,bar_l,left,offsets,x.A,la,lb,scale*right_dot);
-                add_block_dot_vjp(m,bar_m,right_locks,offsets,x.T,ma,mb,scale*left_dot);
-            }
-        }
-    }
-}
-
-inline void sampled_virtual_pair_vjp(const point_data& l,const point_data& m,
-        arma::mat& bar_l,arma::mat& bar_m,const arma::mat& seed,
-        const arma::Col<size_t>& offsets,double factor,
-        const std::vector<std::unique_ptr<virtual_proposal>>& tables,
-        const arma::Col<size_t>& counts,size_t batches,size_t key,
-        unsigned random_seed,int threads) {
-    if (arma::accu(arma::abs(seed))==0) return;
-    density_block_locks left(l.norm.n_rows,offsets.n_elem-1),right(m.norm.n_rows,offsets.n_elem-1);
-    density_block_locks& right_locks=&bar_l==&bar_m ? left : right;
-    const size_t nv=l.norm.n_cols;
-    #pragma omp parallel for num_threads(threads) schedule(static)
-    for (size_t replica=0;replica<batches;++replica) {
-        for (size_t stream=0;stream<tables.size();++stream) {
-            const size_t count=counts(stream);
-            if (!count || !(tables[stream]->normalization>0)) continue;
-            auto rng=generator(random_seed,1,key,replica,stream);
-            const size_t term=tables[stream]->term();
-            for (size_t draw=0;draw<count;++draw) {
-                const virtual_tuple x=tables[stream]->draw(rng);
-                const double p=tables[stream]->probability(x);
-                if (!(p>0)) continue;
-                const auto legs=virtual_legs(x,term);
-                const size_t la=legs[0].first*nv+legs[0].second;
-                const size_t lb=legs[1].first*nv+legs[1].second;
-                const size_t ma=legs[2].first*nv+legs[2].second;
-                const size_t mb=legs[3].first*nv+legs[3].second;
-                const double left_dot=block_dot(l.c,offsets,x.A,la,lb);
-                const double right_dot=block_dot(m.c,offsets,x.T,ma,mb);
-                const double scale=factor*seed(x.a,x.b)*(term<2 ? 1. : -.5)
-                    *double(tables[stream]->selection_weight(x))
-                    /(double(batches)*double(count)*p);
-                add_block_dot_vjp(l,bar_l,left,offsets,x.A,la,lb,scale*right_dot);
-                add_block_dot_vjp(m,bar_m,right_locks,offsets,x.T,ma,mb,scale*left_dot);
-            }
-        }
-    }
-}
 
 }}}}
 // Combined occupied and virtual estimator

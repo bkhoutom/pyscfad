@@ -73,7 +73,8 @@ stc_triples::triples_result triples_stream_kernel(const stc_triples::triples_pre
     const size_t workspace=(8*cube+6*no*nv*nv+8*nv*nv)*sizeof(double)
         +(gradient ? triples_group_scratch::bytes(no,nv) : 0);
     const size_t block_bytes=cube*sizeof(double)*(gradient ? 2 : 1);
-    const size_t budget=std::min(size_t(16)*1024*1024*1024,workspace_limit);
+    // The caller combines its configurable workspace cap with available headroom.
+    const size_t budget=workspace_limit;
     // Preserve one worker under a zero advisory budget. All other allocations
     // obey the available scratch/cache headroom and the hard 128-block cap.
     const size_t cache_budget=budget>workspace ? budget-workspace : 0;
@@ -92,6 +93,7 @@ stc_triples::triples_result triples_stream_kernel(const stc_triples::triples_pre
     if(!mkl) workers=1;
 #endif
     stc_triples::triples_result result{};
+    result.workspace_budget_bytes=budget;
     result.right_profile_enabled=profile_right;
     result.point_right_wall_seconds.resize(points.size(),0.);
     result.point_right_batch_wall_seconds.resize(points.size());

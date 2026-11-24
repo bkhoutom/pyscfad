@@ -23,6 +23,31 @@ def _open(directory, mf, selected, *, resume=False):
                            checkpoint_dir=directory, resume=resume, options=_options())
 
 
+@pytest.mark.parametrize('old_cap', [None, 16.])
+def test_triples_workspace_change_reuses_completed_domains(tmp_path, checkpoint_reference, old_cap):
+    mf, selected = checkpoint_reference
+    options = dict(_options(), ccsd_t=True,
+                   triples_controls={'mode': 'deterministic', 'partition': 'mrcc'})
+    if old_cap is not None:
+        options['triples_controls']['workspace_gib'] = old_cap
+    groups = ccsd.build_domain_groups(selected.mp2_static)
+    manager = open_checkpoint(dict(mf=mf), selected, groups, checkpoint_dir=tmp_path,
+                              resume=False, options=options)
+    save_progress(manager, dict(energy=-.125, variance=0., baseline_energy=-.125,
+                                weak_energy=-.01), [], 1, True, with_grad=False)
+    manager.close()
+    options['triples_controls']['workspace_gib'] = 64.
+    manager = open_checkpoint(dict(mf=mf), selected, groups, checkpoint_dir=tmp_path,
+                              resume=True, options=options)
+    try:
+        restored = dict(energy=0., variance=0., baseline_energy=0., weak_energy=0.)
+        assert restore_progress(manager, restored, with_grad=False) == (1, True, [])
+        assert restored['energy'] == -.125
+        assert options['triples_controls']['workspace_gib'] == 64.
+    finally:
+        manager.close()
+
+
 @pytest.mark.parametrize('change', ['scf', 'boys', 'grid', 'compact_bp_domain',
                                   'primary_bp_domain', 'tight_bp_domain',
                                   'pao_bp_domain', 'primary_domain'])
@@ -149,6 +174,8 @@ def test_resume_initializes_response_from_saved_selection(tmp_path, checkpoint_r
 def test_scf_method_settings_and_workspace(tmp_path, checkpoint_reference, change):
     mf, selected = checkpoint_reference
     current = copy(mf)
+    # This test changes metadata only; its SGX stub cannot build the saved Fock.
+    current.get_fock = mf.get_fock
     current._sgx_backend = SimpleNamespace(
         auxbasis=None, grid_level=2, fit_ovlp=True, integral_backend='auto',
         accuracy=dict(screening='static', mixed_precision=False), df_memory_mb=4000.)
@@ -179,7 +206,8 @@ def test_numeric_reference_keeps_integrity_checks(tmp_path, checkpoint_reference
     with h5py.File(path, 'r+') as handle:
         arrays = []
         handle.visititems(lambda name, obj: arrays.append(obj)
-                          if isinstance(obj, h5py.Dataset) and obj.shape == mf.mo_coeff.shape else None)
+                          if (isinstance(obj, h5py.Dataset) and obj.shape == mf.mo_coeff.shape
+                              and np.array_equal(obj[...], np.asarray(mf.mo_coeff))) else None)
         assert len(arrays) == 1
         arrays[0][0, 0] += 1e-12
     with pytest.raises(RestartCorruptionError):

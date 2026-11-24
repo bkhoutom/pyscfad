@@ -10,11 +10,14 @@ PySCFAD's differentiable `eigh`. Use a threaded SciPy build for parallel
 diagonalization. The custom eigenvector derivative and degeneracy handling
 remain in PySCFAD; no Python callback is used during a compiled solve.
 
-The packed three-center coordinate VJP and tiled AO density contraction use
-dynamic OpenMP teams and dynamic job scheduling by default. Each kernel
-respects a smaller caller-supplied thread budget and limits its team to 32.
-The density kernel uses serial BLAS within each worker. Both kernels restore
-the caller's OpenMP dynamic-team flag on exit; other kernels are unaffected.
+The packed three-center coordinate VJP and tiled AO density contraction
+preserve the caller's OpenMP dynamic-team setting throughout their work.
+Set `OMP_DYNAMIC=FALSE` before starting Python to prevent automatic team
+shrinking, or `OMP_DYNAMIC=TRUE` to permit it. The shared Python thread-budget
+scope also preserves this policy. Each kernel respects a smaller caller-supplied
+thread budget and limits its team to 32. The density kernel uses serial BLAS
+within each worker. Dynamic job scheduling remains the default, independently
+of the dynamic-team setting.
 For the coordinate VJP, `PYSCFAD_INTEGRAL_VJP_SCHEDULE=static` restores
 contiguous static assignment, and `cyclic` selects cyclic static assignment.
 All schedules retain private gradient buffers and the ordered final

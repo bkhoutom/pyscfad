@@ -42,12 +42,6 @@ inline arma::mat orbital_matrix(const arma::mat& packed, arma::uword P,
             result(i,a) = packed(P, i*nv+a);
     return result;
 }
-inline void set_orbital_matrix(arma::mat& packed, arma::uword P,
-                               const arma::mat& matrix) {
-    for (arma::uword i = 0; i < matrix.n_rows; ++i)
-        for (arma::uword a = 0; a < matrix.n_cols; ++a)
-            packed(P, i*matrix.n_cols+a) = matrix(i,a);
-}
 inline Spectrum spectrum(const arma::mat& matrix) {
     Spectrum result;
     if (!arma::eig_sym(result.values, result.vectors, matrix))

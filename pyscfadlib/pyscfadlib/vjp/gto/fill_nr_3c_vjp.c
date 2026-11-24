@@ -190,18 +190,14 @@ void GTOnr3c_ij_r0_vjp(int (*intor)(), void (*fill)(), double *vjp, double *ybar
                                                  atm, natm, bas, nbas, env);
         const int njobs = (MAX(nish,njsh) / BLKSIZE + 1) * nksh;
         // Shell costs vary strongly. Let available workers take the next job
-        // dynamically, with an adaptive team bounded by the caller and 32.
+        // dynamically, with a team bounded by the caller and 32. Preserve
+        // the caller's OpenMP dynamic-team policy (including OMP_DYNAMIC).
         // Retain static/cyclic assignment for reproducibility comparisons.
         const char *schedule = getenv("PYSCFAD_INTEGRAL_VJP_SCHEDULE");
         const int contiguous_schedule = schedule != NULL && strcmp(schedule, "static") == 0;
         const int cyclic_schedule = schedule != NULL && strcmp(schedule, "cyclic") == 0;
         const int dynamic_schedule = !contiguous_schedule && !cyclic_schedule;
         const int nthreads = MIN(32, omp_get_max_threads_safe());
-#ifdef _OPENMP
-        const int previous_dynamic = omp_get_dynamic();
-        omp_set_dynamic(1);
-#endif
-
         double **vjp_loc_bufs = calloc(nthreads, sizeof(double *));
 #pragma omp parallel num_threads(nthreads)
 {
@@ -243,7 +239,4 @@ void GTOnr3c_ij_r0_vjp(int (*intor)(), void (*fill)(), double *vjp, double *ybar
         }
 }
         free(vjp_loc_bufs);
-#ifdef _OPENMP
-        omp_set_dynamic(previous_dynamic);
-#endif
 }

@@ -52,6 +52,7 @@ public:
         double vjp_finalize_seconds;
         size_t deterministic_blocks;
         size_t deterministic_workspace_bytes;
+        size_t workspace_budget_bytes=0;
         size_t numerator_cache_peak_bytes;
         size_t rank_four_packing_bytes;
         double left_build_worker_seconds;

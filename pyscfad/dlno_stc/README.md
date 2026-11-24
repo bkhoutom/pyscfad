@@ -461,6 +461,7 @@ Leave it `None` when triples are disabled. Accepted keys are:
 | --- | --- | --- |
 | `mode` | `"deterministic"` | `"stochastic"` samples the asymmetric selected-space partition. |
 | `partition` | `"mrcc"` for deterministic, `"asymmetric"` for stochastic | These are the only supported mode/partition combinations. |
+| `workspace_gib` | `16` | Deterministic (T) numerator-cache plus worker-scratch budget in GiB (1024³ bytes), further bounded by `max_memory` headroom. Finite and positive. |
 | `nsamples` | Required for stochastic mode | Integer ≥ 2; nominal production budget per fragment in fixed-count mode. Still required with a tolerance. |
 | `energy_tolerance` | Omitted or `0` | A positive value targets total triples energy SE in Eh; `5e-5` Eh is `0.05` mEh. |
 | `pilot_samples` | `10000` | Independent discarded pilot draws per Laplace point per fragment. |
@@ -469,7 +470,17 @@ Leave it `None` when triples are disabled. Accepted keys are:
 | `variance_allocation` | `"occupied_count"` for fragment plans | Fragment variance shares follow original occupied target counts. |
 | `fragment_energies` | Omitted | Only for `mp2_energy` allocation with previously captured concrete labels; incompatible with plan-based occupied-count allocation. |
 
-Only `mode` and `partition="mrcc"` are accepted for deterministic triples.
+Deterministic triples accept `mode`, `partition="mrcc"`, and `workspace_gib`.
+For example, `triples_controls={"mode": "deterministic", "workspace_gib": 64}`
+raises the default 16 GiB workspace allowance to 64 GiB when headroom permits.
+This is an advisory workspace budget, not a total-process memory limit:
+shared tensors and library allocations are additional, and the minimum one
+worker/one block is retained even when it exceeds the budget. The existing
+cache/worker allocation policy remains in effect, so a larger budget does not
+guarantee use of every requested thread. `workspace_budget_bytes` reports the
+largest effective native budget across quadrature points. Changing this
+execution setting preserves compatible completed-domain checkpoints. Rebuild
+the native extension to obtain `TRIPLES_CONFIGURABLE_WORKSPACE` support.
 For energies and forces, triples automatically reuse available cached CCSD
 integral blocks and construct only missing blocks from DF factors once per
 fragment. There is no integral-transform setting.

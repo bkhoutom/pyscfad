@@ -153,6 +153,19 @@ def test_multiple_batches_and_minimum_workspace_preserve_prepared_bars():
     np.testing.assert_allclose(results[0]['energy'],results[1]['energy'],rtol=3e-12,atol=3e-13)
     for a,b in zip(results[0]['cotangents'],results[1]['cotangents']):
         np.testing.assert_allclose(a,b,rtol=3e-10,atol=3e-12)
+    # Exercise the public driver's smaller cache across a partial last batch;
+    # energy and every original-input derivative must match the 128-block run.
+    expected_bars=engine.pullback(.37,results[1]['cotangents'])
+    for with_grad in (False,True):
+        (energy,diagnostics),bars=run_mrcc(tuple(x),np.array([.37]),np.array([-.2]),
+            with_grad=with_grad,max_memory=2000.)
+        assert diagnostics['occupied_block_batch_size']==32
+        np.testing.assert_allclose(energy,results[1]['energy'],rtol=3e-12,atol=3e-13)
+        if with_grad:
+            for got,want in zip(bars,expected_bars):
+                np.testing.assert_allclose(got,want,rtol=3e-10,atol=3e-12)
+        else:
+            assert bars is None
 
 
 @pytest.mark.parametrize('no,nv',[(3,17),(2,46)])

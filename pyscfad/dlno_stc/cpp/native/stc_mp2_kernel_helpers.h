@@ -21,28 +21,6 @@ namespace libgmbpt {
 namespace qchem {
 namespace stc_mp2 {
 
-inline std::vector<size_t> parse_occupied_indices(const std::string& text, size_t nocc) {
-    std::vector<size_t> indices;
-    size_t first = 0;
-    do {
-        const size_t end = text.find(',', first);
-        std::string token = text.substr(first, end == std::string::npos ? end : end-first);
-        const size_t begin = token.find_first_not_of(" \t");
-        if (begin == std::string::npos) throw std::invalid_argument("Empty selected occupied index");
-        token = token.substr(begin, token.find_last_not_of(" \t")-begin+1);
-        if (token.find_first_not_of("0123456789") != std::string::npos)
-            throw std::invalid_argument("Selected occupied indices must be zero-based integers");
-        const unsigned long long i = std::stoull(token);
-        if (i >= nocc) throw std::invalid_argument("Selected occupied index out of range");
-        indices.push_back(static_cast<size_t>(i));
-        if (end == std::string::npos) break;
-        first = end+1;
-    } while (true);
-    std::sort(indices.begin(), indices.end());
-    if (std::adjacent_find(indices.begin(), indices.end()) != indices.end())
-        throw std::invalid_argument("Duplicate selected occupied index");
-    return indices;
-}
 
 class alias_distribution {
 public:

@@ -44,9 +44,10 @@ assert any(pool.internal_api == 'mkl' for pool in controller.lib_controllers)
 initial_omp, initial_mkl = omp.omp_get_dynamic(), mkl.MKL_Get_Dynamic()
 try:
     with fixed_threads():
-        assert omp.omp_get_dynamic() == 0
+        assert omp.omp_get_dynamic() == initial_omp
         assert mkl.MKL_Get_Dynamic() == initial_mkl
         with blas_threads(1), fixed_threads():
+            assert omp.omp_get_dynamic() == initial_omp
             assert mkl.MKL_Get_Max_Threads() == 1
             assert mkl.MKL_Get_Dynamic() == initial_mkl
         raise RuntimeError('check restoration')

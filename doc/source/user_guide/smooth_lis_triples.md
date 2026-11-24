@@ -138,6 +138,15 @@ Deterministic evaluation uses the MRCC half-Laplace partition through
 a combined connected cotangent for the grouped reverse contractions. Occupied
 blocks are cached in batches of at most 128, bounded further by
 `PYSCFAD_TRIPLES_NUMERATOR_CACHE_MB`. No fifth-order global numerator is retained.
+The combined numerator-cache and worker-scratch allowance defaults to 16 GiB.
+Set `triples_controls={"mode": "deterministic", "workspace_gib": 64}` to request
+64 GiB, still bounded by the `max_memory` headroom calculated before the native
+call. `workspace_gib` must be finite and positive; it is not a total-process
+memory limit. Shared tensors and library allocations are additional, and the
+minimum one-worker/one-block allocation may exceed a very small allowance.
+The `workspace_budget_bytes` diagnostic records the largest effective budget.
+This requires rebuilding the extension with `TRIPLES_CONFIGURABLE_WORKSPACE`.
+The benchmark CLI exposes the same setting as `--triples-workspace-gib 64`.
 The leading connected forward work is
 `12 * nq * nS * no*(no+1)/2 * nv**3 * (nv+no)` floating-point operations.
 The implementation preserves full occupied and virtual Fock response, including

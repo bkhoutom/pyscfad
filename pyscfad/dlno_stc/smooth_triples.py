@@ -169,8 +169,10 @@ def make_solver(controls, grid, *, with_grad):
     def run(inputs):
         if partition == 'mrcc':
             from .mrcc_triples import run_mrcc
+            from .controls import DEFAULT_TRIPLES_WORKSPACE_GIB
             return run_mrcc(inputs, nodes, weights, with_grad=with_grad,
-                max_memory=max_memory)
+                max_memory=max_memory,
+                workspace_gib=controls.get('workspace_gib', DEFAULT_TRIPLES_WORKSPACE_GIB))
         started = time.perf_counter()
         count = len(nodes)
         pilot_count = controls.get('pilot_samples', 10000)

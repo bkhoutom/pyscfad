@@ -449,7 +449,7 @@ static void half_to_packed_tiles(
     const double D1 = 1.0, D0 = 0.0;
     const char T = 'T', N = 'N';
     // Respect the supplied workspace and caller's budget, with a 32-thread
-    // ceiling. Enable adaptive teams only for this kernel's parallel region.
+    // ceiling. Preserve the caller's OpenMP dynamic-team policy.
     if (nthreads > 32) nthreads = 32;
     if (nthreads > omp_get_max_threads_safe()) nthreads = omp_get_max_threads_safe();
     // Adjacent AO tiles can share output cache lines. Hand out a complete
@@ -459,10 +459,6 @@ static void half_to_packed_tiles(
     size_t chunk = (size_t)naux * ntasks / (4 * (size_t)nthreads);
     if (chunk < 1) chunk = 1;
     if (chunk > ntasks) chunk = ntasks;
-#ifdef _OPENMP
-    const int previous_dynamic = omp_get_dynamic();
-    omp_set_dynamic(1);
-#endif
 #pragma omp parallel num_threads(nthreads)
     {
         double *buf = work + (size_t)omp_get_thread_num() * tile * tile;
@@ -511,9 +507,6 @@ static void half_to_packed_tiles(
             }
         }
     }
-#ifdef _OPENMP
-    omp_set_dynamic(previous_dynamic);
-#endif
 }
 
 void AO2MOhalf_to_packed_tiles(

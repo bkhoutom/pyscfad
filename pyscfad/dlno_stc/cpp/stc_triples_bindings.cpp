@@ -348,6 +348,7 @@ py::dict mrcc_result(const Triples::triples_result& result) {
     out["reverse_buffer_bytes"]=result.reverse_buffer_bytes;
     out["deterministic_blocks"]=result.deterministic_blocks;
     out["deterministic_workspace_bytes"]=result.deterministic_workspace_bytes;
+    out["workspace_budget_bytes"]=result.workspace_budget_bytes;
     return out;
 }
 py::tuple owned_prepared_bars(Triples::triples_vjp& bars,const libgmbpt::qchem::triples_layout& layout) {
@@ -385,6 +386,7 @@ void bind_triples(py::module_& module) {
     module.attr("TRIPLES_RIGHT_PROFILE")=true;
     module.attr("TRIPLES_MAX_STREAMING_BLOCKS")=Triples::maximum_streaming_blocks;
     module.attr("TRIPLES_MRCC_PARTITION")=true;
+    module.attr("TRIPLES_CONFIGURABLE_WORKSPACE")=true;
     module.def("triples_mrcc_point",[](py::tuple values,double weight,bool with_grad,
             py::handle workspace_limit,py::handle block_batch_size,bool profile_grouped) {
         PreparedInput input(values);

@@ -6,6 +6,7 @@ import numpy
 
 DEFAULT_ENERGY_TOLERANCE = 3e-4  # Hartree (0.3 mHa)
 DEFAULT_TRIPLES_TRACE_EXPONENT = 5.0
+DEFAULT_TRIPLES_WORKSPACE_GIB = 16.0
 
 
 def default_laplace_grid():
@@ -90,7 +91,7 @@ def normalize_triples_controls(controls, *, ccsd_t):
     settings = controls.copy()
     unknown = set(settings) - {'mode', 'nsamples', 'global_seed', 'energy_tolerance',
                                'pilot_samples', 'fragment_energies', 'trace_exponent',
-                               'variance_allocation', 'partition'}
+                               'variance_allocation', 'partition', 'workspace_gib'}
     if unknown:
         raise ValueError('unsupported triples controls: '
                          + ', '.join(sorted(map(str, unknown))))
@@ -109,9 +110,13 @@ def normalize_triples_controls(controls, *, ccsd_t):
             raise ValueError('MRCC partition currently requires deterministic triples')
         settings.pop('partition', None)
     if mode == 'deterministic':
-        if set(settings) - {'mode', 'partition'}:
+        if 'workspace_gib' in settings:
+            settings['workspace_gib'] = _finite_control('workspace_gib', settings['workspace_gib'])
+        if set(settings) - {'mode', 'partition', 'workspace_gib'}:
             raise ValueError('deterministic triples do not accept sampling controls')
         return settings
+    if 'workspace_gib' in settings:
+        raise ValueError('workspace_gib applies only to deterministic triples')
     allocation = settings.get('variance_allocation', 'mp2_energy')
     if allocation not in ('mp2_energy', 'occupied_count'):
         raise ValueError('variance_allocation must be mp2_energy or occupied_count')

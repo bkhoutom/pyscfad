@@ -67,7 +67,7 @@ def main():
     parser.add_argument("--xyz-file", type=Path, required=True)
     parser.add_argument("--basis", required=True)
     parser.add_argument("--frozen", type=int, required=True)
-    parser.add_argument("--boys-grouping", choices=("system", "atom", "molecule"), required=True)
+    parser.add_argument("--boys-grouping", choices=("system", "atom", "atom_singleton", "molecule"), required=True)
     parser.add_argument("--domain-thresholds", type=Path,
                         help="JSON object of BoysDomainThresholds overrides; omitted fields use library defaults")
     parser.add_argument("--targets-meh", type=float, nargs="+", default=[])

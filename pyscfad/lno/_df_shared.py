@@ -4,6 +4,8 @@ Consumers reverse their MO coefficient transformations immediately, optionally
 using resident H tensors. Their integral adjoints are summed in bounded AO
 pair tiles before a single three-center and auxiliary-metric response.
 MO integral adjoints remain in RAM until the shared contraction completes.
+An optional common domain basis combines them into one accumulator as each
+consumer reverses, avoiding a retained seed per LIS.
 Symmetric LIS seeds are expanded once for coefficient and geometry response.
 Integral inputs are generated directly; no local DF inputs or adjoints use
 disk. The metric and Cholesky factor/tapes are retained per scope.
@@ -58,6 +60,7 @@ class LocalDFReverse:
         self.max_memory_mb = float(mf.mol.max_memory)
         self.workspace_mb = float(mf.with_df.max_memory)
         self.terms = []
+        self.adjoint_basis = None
         self.with_grad = with_grad
         self.metric_bar = None
         self.metric = self.low = None
@@ -140,6 +143,22 @@ class LocalDFReverse:
                 'continuing with one auxiliary row',
                 RuntimeWarning, stacklevel=2)
 
+    def accumulate_in_basis(self, coeff):
+        """Accumulate integral seeds in one domain span, independent of LIS count.
+
+        This is a numerical change of coordinates for already-computed
+        cotangents. The consumers still perform their full coefficient VJP.
+        A reduced Euclidean QR avoids inverting the nonorthogonal ED metric;
+        no singular-value truncation or physical approximation is introduced.
+        """
+        if self.finished or self.terms or self.adjoint_basis is not None:
+            raise RuntimeError('Set the shared adjoint basis before integral responses')
+        coeff = numpy.asarray(coeff)
+        if (coeff.ndim != 2 or coeff.shape[0] != self.mol.nao
+                or coeff.dtype != numpy.float64 or not numpy.isfinite(coeff).all()):
+            raise ValueError('Invalid shared local DF adjoint basis')
+        self.adjoint_basis = numpy.linalg.qr(coeff, mode='reduced')[0]
+
     def add(self, coeff, z, low_bar, slices, *, symmetric_packed=False):
         """Own a fresh MO seed in RAM and return its full orbital-pair view.
 
@@ -169,9 +188,26 @@ class LocalDFReverse:
             z = _df_symmetric.unpack_symmetric(z, k1-k0)
         else:
             z = z.reshape(self.auxmol.nao, k1-k0, l1-l0)
-        coeff = numpy.array(coeff, copy=True)
-        self.terms.append(_IntegralAdjoint(z, coeff, tuple(slices), symmetric_packed))
-        self.receipt['adjoint_resident_bytes'] += z.nbytes + coeff.nbytes
+        if self.adjoint_basis is None:
+            coeff = numpy.array(coeff, copy=True)
+            self.terms.append(_IntegralAdjoint(z, coeff, tuple(slices), symmetric_packed))
+            self.receipt['adjoint_resident_bytes'] += z.nbytes + coeff.nbytes
+        else:
+            basis = self.adjoint_basis
+            left, right = basis.T @ coeff[:, k0:k1], basis.T @ coeff[:, l0:l1]
+            for source, rotation in ((coeff[:, k0:k1], left), (coeff[:, l0:l1], right)):
+                if numpy.linalg.norm(source - basis @ rotation) > 1e-10 * max(1., numpy.linalg.norm(source)):
+                    raise ValueError('RI consumer lies outside the shared domain adjoint span')
+            rank = basis.shape[1]
+            if not self.terms:
+                accumulator = numpy.zeros((self.auxmol.nao, rank, rank))
+                self.terms.append(_IntegralAdjoint(accumulator, basis, (0, rank, 0, rank), False))
+                self.receipt['adjoint_resident_bytes'] = accumulator.nbytes + basis.nbytes
+            accumulator = self.terms[0].z
+            rows = self._rows(max(rank*rank, pair_count), max(rank, k1-k0, l1-l0))
+            for first in range(0, self.auxmol.nao, rows):
+                last = min(first + rows, self.auxmol.nao)
+                accumulator[first:last] += left @ z[first:last] @ right.T
         self.receipt['adjoint_peak_bytes'] = max(
             self.receipt['adjoint_peak_bytes'], self.receipt['adjoint_resident_bytes'])
         if self.metric_bar is None:
@@ -242,6 +278,7 @@ class LocalDFReverse:
         numpy.add.at(coords, self.aux_atoms,
                      numpy.asarray(aux_bar.coords) + numpy.asarray(metric_bar.coords))
         self.terms.clear()
+        self.adjoint_basis = None
         self.receipt['adjoint_resident_bytes'] = 0
         self.metric_bar = None
         self.metric = self.low = None
@@ -254,6 +291,7 @@ class LocalDFReverse:
             self.half.close()
             self.half = None
         self.terms.clear()
+        self.adjoint_basis = None
         self.receipt['adjoint_resident_bytes'] = 0
         self.metric_bar = None
         self.metric = self.low = None
@@ -274,6 +312,13 @@ def reverse_scope(mf, atoms, correlation_auxbasis=None, aux_atoms=None, *, with_
     finally:
         _ACTIVE.reset(token)
         scope.close()
+
+
+def accumulate_in_basis(coeff):
+    """Enable bounded shared RI adjoints in the active domain scope, if any."""
+    scope = _ACTIVE.get()
+    if scope is not None and scope.with_grad:
+        scope.accumulate_in_basis(coeff)
 
 
 def matching_scope(mol, auxmol):

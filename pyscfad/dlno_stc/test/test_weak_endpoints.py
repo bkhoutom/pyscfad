@@ -568,10 +568,11 @@ def test_joint_screening_uses_exact_scores_for_classification(monkeypatch, corre
     np.testing.assert_allclose(response['energy'], weak[0, 2]+weak[1, 2], atol=1e-14)
 
 
-def test_forced_partner_does_not_promote_its_other_group_members(monkeypatch):
+@pytest.mark.parametrize('grouping', ['atom', 'atom_singleton'])
+def test_forced_partner_does_not_promote_its_other_group_members(monkeypatch, grouping):
     mf, common, static, endpoint = _screening_fixture(2)
     _install_split(monkeypatch, endpoint)
-    static.boys_grouping, static.physical_groups = 'atom', ((0, 1), (2, 3))
+    static.boys_grouping, static.physical_groups = grouping, ((0, 1), (2, 3))
     response = {}
     _, weak, _, raw = _pairs.screen_pairs(
         mf, common, static, prepared_endpoints={}, _pair_response=response)

@@ -57,7 +57,9 @@ inline deterministic_result evaluate_deterministic(const arma::mat& fo, const ar
         bool energy_matrices=false, bool primal_outputs=true,
         const deterministic_w_cotangent_seed* w_seed=nullptr,
         bool optimize_w=true, arma::mat* consumable_bare=nullptr,
-        sequential_w_workspace* sequential=nullptr) {
+        sequential_w_workspace* sequential=nullptr,
+        std::vector<deterministic_result>* target_outputs=nullptr,
+        const std::vector<deterministic_w_cotangent_seed>* target_seeds=nullptr) {
     const size_t no=fo.n_rows, nv=fv.n_rows, np=bare.n_rows;
     if (!no || !nv || !np || fo.n_cols!=no || fv.n_cols!=nv ||
         bare.n_cols!=no*nv || beta.is_empty() || beta.n_elem!=weights.n_elem ||
@@ -73,6 +75,19 @@ inline deterministic_result evaluate_deterministic(const arma::mat& fo, const ar
         seed->virtuals.n_rows!=nv || seed->virtuals.n_cols!=nv ||
         !seed->occupied.is_finite() || !seed->virtuals.is_finite()))
         throw std::invalid_argument("Invalid deterministic output cotangent");
+    if (target_outputs && (!energy_matrices || primal_outputs || sequential))
+        throw std::invalid_argument("Per-target W requires ordinary forward W");
+    if (target_seeds) {
+        if (target_seeds->size()!=group.size() || seed || w_seed || target_outputs)
+            throw std::invalid_argument("Per-target W seed count/mode mismatch");
+        for (const auto& item:*target_seeds)
+            if (!std::isfinite(item.energy) || item.occupied.n_rows!=no ||
+                item.occupied.n_cols!=no || item.virtuals.n_rows!=nv ||
+                item.virtuals.n_cols!=nv || !item.occupied.is_finite() ||
+                !item.virtuals.is_finite())
+                throw std::invalid_argument("Invalid per-target W cotangent");
+        w_seed=&target_seeds->front();
+    }
     if (w_seed && (!std::isfinite(w_seed->energy) ||
         w_seed->occupied.n_rows!=no || w_seed->occupied.n_cols!=no ||
         w_seed->virtuals.n_rows!=nv || w_seed->virtuals.n_cols!=nv ||
@@ -171,11 +186,25 @@ inline deterministic_result evaluate_deterministic(const arma::mat& fo, const ar
         out.occupied.zeros(no,no);
         out.virtuals.zeros(nv,nv);
     }
-    if (energy_matrices) {
+    if (energy_matrices && !target_outputs) {
         out.energy_occupied.zeros(no,no);
         out.energy_virtuals.zeros(nv,nv);
     }
+    if (target_outputs) target_outputs->resize(group.size());
     for (size_t s=0;s<group.size();++s) {
+        auto& target = target_outputs ? (*target_outputs)[s] : out;
+        if (target_outputs) {
+            target.energy_occupied.zeros(no,no);
+            target.energy_virtuals.zeros(nv,nv);
+        }
+        if (target_seeds) {
+            w_seed=&(*target_seeds)[s];
+            w_wo=0.5*(w_seed->occupied+w_seed->occupied.t());
+            w_wo.diag()+=w_seed->energy;
+            w_wv=dress.virtual_frame(0.5*(w_seed->virtuals+w_seed->virtuals.t()),true);
+            w_occupied_active=arma::accu(arma::abs(w_wo))!=0.;
+            w_virtual_active=arma::accu(arma::abs(w_wv))!=0.;
+        }
         const arma::cube& t=amplitudes[s];
         arma::mat flat(const_cast<double*>(t.memptr()),nv*nv,no,false,true);
         double tick=omp_get_wtime();
@@ -278,7 +307,7 @@ inline deterministic_result evaluate_deterministic(const arma::mat& fo, const ar
               if (energy_matrices) {
                   const double occupied_tick=omp_get_wtime();
                   // Each task owns disjoint partner/output columns.
-                  out.energy_occupied.cols(first,last-1)+=
+                  target.energy_occupied.cols(first,last-1)+=
                       flat.t()*occupied_panel.cols(0,last-first-1);
                   occupied_seconds+=omp_get_wtime()-occupied_tick;
               }
@@ -286,7 +315,7 @@ inline deterministic_result evaluate_deterministic(const arma::mat& fo, const ar
             #pragma omp critical
             {
                 if (primal_outputs) { out.virtuals+=local; out.energy+=local_energy; }
-                if (energy_matrices && !sequential) out.energy_virtuals+=local_energy_virtuals;
+                if (energy_matrices && !sequential) target.energy_virtuals+=local_energy_virtuals;
                 out.bare_gram_worker_seconds+=gram_seconds;
                 out.occupied_w_worker_seconds+=occupied_seconds;
                 out.virtual_w_worker_seconds+=virtual_seconds;
@@ -350,12 +379,19 @@ inline deterministic_result evaluate_deterministic(const arma::mat& fo, const ar
             }
         }
         out.virtual_energy_seconds+=omp_get_wtime()-tick;
+        if (target_outputs) {
+            target.energy_occupied=0.5*(target.energy_occupied+target.energy_occupied.t());
+            target.energy_virtuals=0.5*(target.energy_virtuals+target.energy_virtuals.t());
+            if (eigenbasis) target.energy_virtuals=dress.virtual_frame(target.energy_virtuals,false);
+            target.energy=arma::trace(target.energy_occupied);
+            out.energy+=target.energy;
+        }
     }
     if (primal_outputs) {
         out.occupied=0.5*(out.occupied+out.occupied.t());
         out.virtuals=0.5*(out.virtuals+out.virtuals.t());
     }
-    if (energy_matrices) {
+    if (energy_matrices && !target_outputs) {
         out.energy_occupied=0.5*(out.energy_occupied+out.energy_occupied.t());
         out.energy_virtuals=0.5*(out.energy_virtuals+out.energy_virtuals.t());
         if (eigenbasis) out.energy_virtuals=dress.virtual_frame(out.energy_virtuals,false);

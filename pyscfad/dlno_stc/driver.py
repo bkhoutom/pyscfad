@@ -241,7 +241,10 @@ def _weak_energy(state, static, pairs):
 
 def _initialize(mf, static, controls, *, with_grad, scf_pullback=None,
                 scf_data=None, scf_data_pullback=None, prepared_domain=None,
-                correlation_auxbasis=None, stationary_boys=False, boys_reference_coeff=None):
+                correlation_auxbasis=None, stationary_boys=False, boys_reference_coeff=None,
+                mp2_aux_svd_tol=1e-3):
+    from ._aux_compress import normalize_tolerance
+    mp2_aux_svd_tol = normalize_tolerance(mp2_aux_svd_tol, name='mp2_aux_svd_tol')
     _validate_static(static)
     controls = _driver_controls(controls, static=static)
     _validate_reference(mf, static, **basis_kwargs(correlation_auxbasis))
@@ -282,6 +285,7 @@ def _initialize(mf, static, controls, *, with_grad, scf_pullback=None,
             common_pullback = mf_bar = common_bar = None
         jax.block_until_ready(common)
     return {"mf": mf, "correlation_auxbasis": correlation_auxbasis, "static": static,
+            "mp2_aux_svd_tol": mp2_aux_svd_tol,
             "common": common, "common_pullback": common_pullback,
             "scf_pullback": scf_pullback, "mf_bar": mf_bar, "common_bar": common_bar,
             "energy": np.zeros((), dtype=common.s1e.dtype), "variance": 0.0,
@@ -290,6 +294,32 @@ def _initialize(mf, static, controls, *, with_grad, scf_pullback=None,
 
 
 def _prepare(state, static, group, controls, with_grad, *, return_frame=False):
+    """Compress the ED OV factor once; merge its response before the ED VJP."""
+    prepared = _prepare_uncompressed(state, static, group, controls, with_grad,
+                                     return_frame=return_frame)
+    tolerance = state.get('mp2_aux_svd_tol')
+    if not tolerance:
+        return prepared
+    from ._mp2_aux import compress_ov
+    inputs, host, ed_pullback, *frame = prepared
+    with resource_profile.section('stc.domain.mp2_naf', group=group.representative_index):
+        reduced, naf_pullback, _, diagnostics = compress_ov(
+            inputs['B'], tolerance, with_grad=with_grad)
+    state.setdefault('mp2_auxiliary_compression', {})[group.representative_index] = diagnostics
+    inputs = dict(inputs, B=reduced)
+    native_factors = not return_frame and controls.get('mode', 'deterministic') == 'deterministic'
+    host = backend.host_inputs(inputs, native_factors=native_factors)
+    pullback = None
+    if with_grad:
+        def pullback(seed):
+            bars, extra = seed if return_frame else (seed, None)
+            with resource_profile.section('stc.domain.mp2_naf_pullback'):
+                original_bars = dict(bars, B=naf_pullback(bars['B']))
+            return ed_pullback((original_bars, extra) if return_frame else original_bars)
+    return (inputs, host, pullback, *frame)
+
+
+def _prepare_uncompressed(state, static, group, controls, with_grad, *, return_frame=False):
     """Prepare a domain, optionally exposing its frame and combined VJP.
 
     The optional fourth return value is the frame. Its occupied/virtual
@@ -775,9 +805,12 @@ def _serial_scf_pullback(pullback):
 @memory_calculation
 def kernel(mf, static=None, *, boys_grouping=None, frozen=None, controls, comm=None,
            lo_kwargs=None, merge_identical=True, parallel_scf_jk=True,
-           correlation_auxbasis=None):
+           correlation_auxbasis=None, mp2_aux_svd_tol=1e-3):
     """Return correlation energy on root.
 
+    ``mp2_aux_svd_tol=1e-3`` compresses the ED OV factors before MP2;
+    keep auxiliary eigenvalues strictly greater than this cutoff. ``None``
+    or zero disables it. Weak-pair screening/completion is unchanged.
     ``correlation_auxbasis`` overrides local correlation fitting only. Its
     default ``None`` retains the existing SCF fitting configuration/workflow.
     Domain jobs share identical saved frames by default. ``merge_identical=False``
@@ -806,7 +839,8 @@ def kernel(mf, static=None, *, boys_grouping=None, frozen=None, controls, comm=N
             selected = build_domain_selections(
                 mf, boys_grouping=boys_grouping, frozen=0 if frozen is None else frozen,
                 lo_kwargs=lo_kwargs, **basis_kwargs(correlation_auxbasis))
-        return _initialize(mf, selected, controls, with_grad=False, **basis_kwargs(correlation_auxbasis))
+        return _initialize(mf, selected, controls, with_grad=False,
+                           mp2_aux_svd_tol=mp2_aux_svd_tol, **basis_kwargs(correlation_auxbasis))
 
     if comm is not None and comm.Get_size() > 1:
         from ._mpi import _run_domain_mpi
@@ -830,9 +864,13 @@ def kernel(mf, static=None, *, boys_grouping=None, frozen=None, controls, comm=N
 @memory_calculation
 def value_and_grad(mol, build_mf, static=None, *, boys_grouping=None, frozen=None,
                    controls, comm=None, include_hf=False, lo_kwargs=None, merge_identical=True,
-                   build_static=None, parallel_scf_jk=True, correlation_auxbasis=None):
+                   build_static=None, parallel_scf_jk=True, correlation_auxbasis=None,
+                   mp2_aux_svd_tol=1e-3):
     """Return ``(energy, mol_bar)`` on root; worker ranks return ``None``.
 
+    ``mp2_aux_svd_tol=1e-3`` follows :func:`kernel`. The fixed-rank NAF
+    subspace response joins the ED factor cotangent before its DF reverse;
+    it does not add an integral pass. Derivatives at rank changes are undefined.
     ``correlation_auxbasis`` selects local correlation fitting independently
     of HF/Fock/SCF response. ``None`` preserves the existing fitting workflow.
     A selection callback inherits the explicit correlation basis.
@@ -912,6 +950,7 @@ def value_and_grad(mol, build_mf, static=None, *, boys_grouping=None, frozen=Non
                 scf_data=scf_data,
                 **basis_kwargs(correlation_auxbasis))
         return _initialize(mf, selected, controls, with_grad=True,
+                           mp2_aux_svd_tol=mp2_aux_svd_tol,
                            scf_pullback=scf_pullback, scf_data=scf_data,
                            scf_data_pullback=scf_data_pullback,
                            prepared_domain=prepared_domain, **basis_kwargs(correlation_auxbasis))

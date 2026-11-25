@@ -21,7 +21,7 @@ def main():
     parser.add_argument('--xyz-file', type=Path, required=True)
     parser.add_argument('--basis', default='cc-pvdz')
     parser.add_argument('--frozen', type=int, default=0)
-    parser.add_argument('--boys-grouping', choices=('singleton', 'atom', 'system', 'molecule'), default='system')
+    parser.add_argument('--boys-grouping', choices=('singleton', 'atom', 'atom_singleton', 'system', 'molecule'), default='system')
     parser.add_argument('--lno-thresh-occ', type=float, default=0.)
     parser.add_argument('--lno-thresh-vir', type=float, default=0.)
     parser.add_argument('--finite-domains', action='store_true')

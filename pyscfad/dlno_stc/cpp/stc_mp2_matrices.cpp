@@ -40,7 +40,7 @@ using NativeKernel = libgmbpt::qchem::stc_mp2_kernel;
 namespace {
 
 constexpr const char* matrix_kernel_version =
-    "src_code_rdm_v2:427459d9b91fc70f:standalone-6-d-w";
+    "src_code_rdm_v2:427459d9b91fc70f:standalone-7-d-w-orbital";
 
 // OpenMP ICVs belong to this calling thread. Deterministic W construction may
 // shrink teams within the explicit budget; other calls retain fixed teams.
@@ -601,6 +601,72 @@ py::dict solve_matrices(py::handle foo, py::handle fvv, py::handle b,
     return matrix_result(output, settings.replay);
 }
 
+// Keep per-target W outputs while sharing propagation and selected amplitudes.
+py::list solve_orbital_matrices(py::handle foo, py::handle fvv, py::handle b,
+        py::handle targets, const py::dict& controls, py::object offsets) {
+    auto inputs=input_arrays(foo,fvv,b);
+    read_offsets(inputs,offsets);
+    positive_gap(inputs);
+    auto settings=read_settings(inputs,targets,controls);
+    if (settings.replay->stochastic)
+        throw py::value_error("Batched orbital W requires deterministic controls");
+    std::vector<density::deterministic_result> outputs;
+    density::deterministic_result total;
+    {
+        py::gil_scoped_release release;
+        ThreadScope team(settings.replay->threads,true);
+        total=density::evaluate_deterministic(inputs.foo,inputs.fvv,inputs.B,
+            settings.replay->beta,settings.replay->weights,settings.replay->targets,
+            settings.replay->threads,nullptr,true,false,nullptr,true,&inputs.B,
+            nullptr,&outputs);
+    }
+    py::list results;
+    for (auto& item:outputs) {
+        MatrixOutput output;
+        output.energy=item.energy;
+        output.occupied=std::move(item.energy_occupied);
+        output.virtuals=std::move(item.energy_virtuals);
+        output.occupied_se.zeros(output.occupied.n_rows,output.occupied.n_cols);
+        output.virtual_se.zeros(output.virtuals.n_rows,output.virtuals.n_cols);
+        // Shared timings are reported once, on the first target.
+        if (results.size()==0) output.timings=deterministic_timings(total);
+        results.append(matrix_result(output,settings.replay));
+    }
+    return results;
+}
+
+py::dict pullback_orbital_matrices(py::handle foo, py::handle fvv, py::handle b,
+        const MatrixReplay& replay, const std::vector<double>& energy_bars,
+        const py::list& occupied_bars, const py::list& virtual_bars) {
+    auto inputs=input_arrays(foo,fvv,b);
+    inputs.aux_offsets=replay.offsets;
+    if (replay.density_matrix || replay.stochastic || replay.native_version!=matrix_kernel_version ||
+        fingerprint(inputs)!=replay.fingerprint)
+        throw py::value_error("Orbital W replay inputs/version/mode changed");
+    if (energy_bars.size()!=replay.targets.size() ||
+        occupied_bars.size()!=replay.targets.size() || virtual_bars.size()!=replay.targets.size())
+        throw py::value_error("Orbital W cotangent count mismatch");
+    std::vector<density::deterministic_w_cotangent_seed> seeds;
+    for (size_t i=0;i<energy_bars.size();++i)
+        seeds.emplace_back(energy_bars[i],from_array(checked_array(occupied_bars[i],"occupied_bar",2)),
+                           from_array(checked_array(virtual_bars[i],"virtual_bar",2)));
+    density::deterministic_result bars;
+    {
+        py::gil_scoped_release release;
+        ThreadScope team(replay.threads);
+        bars=density::evaluate_deterministic(inputs.foo,inputs.fvv,inputs.B,
+            replay.beta,replay.weights,replay.targets,replay.threads,
+            nullptr,false,false,nullptr,true,&inputs.B,nullptr,nullptr,&seeds);
+    }
+    if (!bars.bar_fo.is_finite() || !bars.bar_fv.is_finite() || !bars.bar_b.is_finite())
+        throw std::runtime_error("Nonfinite orbital W cotangent");
+    py::dict result;
+    result["foo"]=as_array(bars.bar_fo);
+    result["fvv"]=as_array(bars.bar_fv);
+    result["B"]=as_df_array(bars.bar_b,inputs.foo.n_rows,inputs.fvv.n_rows);
+    return result;
+}
+
 // The retained occupied basis is in the original ED frame. The optimized
 // propagator rotates virtuals only, so the partner-occupied projection needs
 // no Fock re-diagonalization and does not change the original MP2 denominators.
@@ -817,6 +883,10 @@ void bind_matrices(py::module_& module) {
     module.def("begin_sequential_matrices",&begin_sequential);
     module.def("finish_sequential_virtual",&finish_sequential);
 
+    module.def("solve_orbital_matrices", &solve_orbital_matrices,
+        py::arg("foo"), py::arg("fvv"), py::arg("B"), py::arg("target_indices"),
+        py::arg("controls"), py::arg("aux_offsets")=py::none());
+    module.def("pullback_orbital_matrices", &pullback_orbital_matrices);
     module.attr("matrix_kernel_version") = matrix_kernel_version;
     py::class_<MatrixReplay, std::shared_ptr<MatrixReplay>>(module, "MatrixReplay")
         .def_readonly("energy_reverse_workspace_bytes", &MatrixReplay::energy_reverse_workspace_bytes);

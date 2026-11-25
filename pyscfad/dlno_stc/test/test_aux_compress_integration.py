@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from pyscfad import gto, scf
-from pyscfad.dlno_stc import ccsd
+from pyscfad.dlno_stc import ccsd, _aux_compress
 from pyscfad.lno import ccsd as lno_ccsd
 from pyscfad.dlno_stc.test.test_fragment_df_inputs import molecular_case
 
@@ -43,7 +43,8 @@ def test_compressor_precedes_every_integral_block(hydrogen):
     for name in ('oooo', 'ovoo', 'ovov', 'oovv'):
         np.testing.assert_allclose(getattr(compressed, name),
                                    0.25 * getattr(original, name), atol=1e-13)
-    np.testing.assert_array_equal(compressed.fock, original.fock)
+    # Independent threaded Fock builds may differ at reduction roundoff.
+    np.testing.assert_allclose(compressed.fock, original.fock, atol=1e-14, rtol=0)
 
 
 def test_actual_impurity_vjp_factors_once(hydrogen, monkeypatch):
@@ -52,13 +53,13 @@ def test_actual_impurity_vjp_factors_once(hydrogen, monkeypatch):
     mf = hydrogen
     compressor = _aux_compress.make_compressor(1e-4)
     calls = []
-    original_svd = np.linalg.svd
+    original_svd = _aux_compress._auxiliary_eigensystem
 
     def counted(*args, **kwargs):
         calls.append(1)
         return original_svd(*args, **kwargs)
 
-    monkeypatch.setattr(np.linalg, 'svd', counted)
+    monkeypatch.setattr(_aux_compress, '_auxiliary_eigensystem', counted)
     occupied = mf.mo_coeff[:, :1]
     fock, overlap = mf.get_fock(), mf.get_ovlp()
 
@@ -81,13 +82,13 @@ def test_domain_correction_reports_completed_compression(molecular_case, monkeyp
     state = ccsd.driver._initialize(case.mf, case.domains, case.controls,
         with_grad=True, scf_pullback=case.pullback)
     calls = []
-    original_svd = np.linalg.svd
+    original_svd = _aux_compress._auxiliary_eigensystem
 
     def counted(*args, **kwargs):
         calls.append(1)
         return original_svd(*args, **kwargs)
 
-    monkeypatch.setattr(np.linalg, 'svd', counted)
+    monkeypatch.setattr(_aux_compress, '_auxiliary_eigensystem', counted)
     records = ccsd._run_group(state, case.static, case.group,
         case.controls, case.controls, with_grad=True, verbose_imp=0,
         ccsd_t=False,
@@ -102,7 +103,8 @@ def test_domain_correction_reports_completed_compression(molecular_case, monkeyp
         assert record.triples_diagnostics is None
 
 
-def test_restart_rejects_different_compression(molecular_case, tmp_path):
+@pytest.mark.parametrize('threshold', ['lis_aux_svd_tol', 'mp2_aux_svd_tol'])
+def test_restart_rejects_different_compression(molecular_case, tmp_path, threshold):
     """An existing CC energy cannot be resumed with another integral model."""
     from pyscfad.dlno_stc._restart import RestartMismatchError
     case = molecular_case
@@ -112,7 +114,7 @@ def test_restart_rejects_different_compression(molecular_case, tmp_path):
     reference = ccsd.kernel(case.mf, case.static, **options)
     resumed = ccsd.kernel(case.mf, case.static, resume=True, **options)
     np.testing.assert_allclose(resumed, reference, atol=1e-13, rtol=0)
-    options['lis_aux_svd_tol'] = 1e-6
+    options[threshold] = 1e-6
     with pytest.raises(RestartMismatchError):
         ccsd.kernel(case.mf, case.static, resume=True, **options)
 

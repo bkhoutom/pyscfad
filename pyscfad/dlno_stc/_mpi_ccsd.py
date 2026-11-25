@@ -95,7 +95,8 @@ def _run_jobs(initializer, worker_initializer, comm, *, with_grad,
         options.update(state.get('cc_solver_options', {}))
         return (static, baseline, matrix, groups, state['weak_pairs'], options,
                 _reference_signature(state['mf']),
-                {'correlation_auxbasis': state.get('correlation_auxbasis')})
+                {'correlation_auxbasis': state.get('correlation_auxbasis'),
+                     'mp2_aux_svd_tol': state.get('mp2_aux_svd_tol')})
 
     metadata = driver._root_call(comm, rank, root_metadata, 'CC owner work selection')
     static, baseline, matrix, groups, pairs, options, signature, correlation = comm.bcast(metadata, root=0)

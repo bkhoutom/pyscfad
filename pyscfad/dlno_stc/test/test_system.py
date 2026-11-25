@@ -171,17 +171,17 @@ def test_system_matches_native_dfmp2_with_frozen_and_coordinate_response(molecul
     native_mf_bar, = native_pullback(jax.numpy.ones_like(native_energy))
     native_bar, = scf_pullback(native_mf_bar)
     energy, bar = dlno_stc.value_and_grad(molecule, _mf, boys_grouping="system", frozen=1,
-                                         controls=controls)
+                                         controls=controls, mp2_aux_svd_tol=None)
     np.testing.assert_allclose(energy, native_energy, atol=2e-10, rtol=0)
     np.testing.assert_allclose(bar.coords, native_bar.coords, atol=2e-7, rtol=2e-5)
     np.testing.assert_allclose(dlno_stc.kernel(mf, boys_grouping="system", frozen=[0],
-                                              controls=controls), energy, atol=2e-10, rtol=0)
+                                              controls=controls, mp2_aux_svd_tol=None), energy, atol=2e-10, rtol=0)
     list_energy, list_bar = dlno_stc.value_and_grad(molecule, _mf, boys_grouping="system", frozen=[0],
-                                                   controls=controls)
+                                                   controls=controls, mp2_aux_svd_tol=None)
     np.testing.assert_allclose(list_energy, energy, atol=2e-10, rtol=0)
     np.testing.assert_allclose(list_bar.coords, bar.coords, atol=2e-9, rtol=0)
     total, total_bar = dlno_stc.value_and_grad(molecule, _mf, boys_grouping="system", frozen=1,
-                                             controls=controls, include_hf=True)
+                                             controls=controls, include_hf=True, mp2_aux_svd_tol=None)
     hf_energy, hf_pullback = jax.vjp(lambda mf: mf.e_tot, mf)
     hf_mf_bar, = hf_pullback(jax.numpy.ones_like(hf_energy))
     hf_bar, = scf_pullback(hf_mf_bar)
@@ -194,7 +194,7 @@ def test_system_matches_native_dfmp2_with_frozen_and_coordinate_response(molecul
     def displaced(sign):
         moved = molecule.set_geom_(np.asarray(molecule.atom_coords()) + sign * step * direction,
                                    unit="Bohr", inplace=False)
-        return dlno_stc.kernel(_mf(moved), boys_grouping="system", frozen=1, controls=controls)
+        return dlno_stc.kernel(_mf(moved), boys_grouping="system", frozen=1, controls=controls, mp2_aux_svd_tol=None)
     finite_difference = (displaced(1) - displaced(-1)) / (2 * step)
     np.testing.assert_allclose(np.sum(np.asarray(bar.coords) * direction), finite_difference,
                                atol=1e-6, rtol=0)

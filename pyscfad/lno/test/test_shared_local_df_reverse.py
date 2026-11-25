@@ -85,9 +85,10 @@ def test_shared_packed_density_matches_both_ao_legs(backend, order, monkeypatch)
     assert not scope._packing_workspace
 
 
+@pytest.mark.parametrize('common_basis', [False, True])
 @pytest.mark.parametrize('nmo', [4, 7])
 @pytest.mark.parametrize('seed', [.7, -.3])
-def test_shared_coordinate_and_orbital_bars_match_separate_reverses(nmo, seed, monkeypatch):
+def test_shared_coordinate_and_orbital_bars_match_separate_reverses(nmo, seed, monkeypatch, common_basis):
     mol, coeff = _problem(nmo)
     objective = lambda m, c: seed * _energy(m, c)
     value_ref, (mol_ref, coeff_ref) = jax.value_and_grad(objective, argnums=(0, 1))(mol, coeff)
@@ -95,8 +96,14 @@ def test_shared_coordinate_and_orbital_bars_match_separate_reverses(nmo, seed, m
     monkeypatch.setattr(_df_shared.LocalDFReverse, '_rows',
         lambda self, *args: min(2, original_rows(self, *args)))
     with _df_shared.reverse_scope(_mf(mol), ATOMS) as scope:
+        if common_basis:
+            from pyscfad.lno import tools as lno_tools
+            ao = lno_tools.ao_index_by_atom(mol, ATOMS)
+            overlap = numpy.asarray(mol.intor_symmetric('int1e_ovlp'))
+            projected = numpy.linalg.solve(overlap[numpy.ix_(ao, ao)], overlap[ao] @ coeff)
+            scope.accumulate_in_basis(projected)
         value, (mol_bar, coeff_bar) = jax.value_and_grad(objective, argnums=(0, 1))(mol, coeff)
-        assert len(scope.terms) == 2
+        assert len(scope.terms) == (1 if common_basis else 2)
         assert all(isinstance(term.z, numpy.ndarray) for term in scope.terms)
         retained = sum(term.z.nbytes + term.coeff.nbytes for term in scope.terms)
         assert scope.receipt['adjoint_resident_bytes'] == retained

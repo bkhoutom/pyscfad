@@ -16,7 +16,7 @@ import numpy
 import scipy.linalg as scipy_linalg
 from pyscfad import numpy as np, scipy
 from pyscfad.lno import lno_base
-from ._selection import DomainSelections, _physical_groups
+from ._selection import DomainSelections, _cc_groups
 from .domain import BoysEDFrame, DomainData, build_boys_ed_frame, rebuild_domain_data
 
 LIS_INTERNAL_RANK_THRESHOLD = 1e-6
@@ -59,7 +59,8 @@ class LISSelections:
     is part of the checkpoint format. Zero occupied or virtual LNO thresholds
     retain the full corresponding ED parent space.
     ``smooth_frames`` and ``triples_grid``, when present, are tuples indexed
-    by physical fragment. Empty or unselected fragments have None entries.
+    by CC fragment (individual orbital for atom_singleton). Empty or unselected
+    fragments have None entries.
     """
 
     mp2_static: DomainSelections
@@ -106,7 +107,7 @@ class FragmentLIS:
 
 
 def _physical_target_block(common, static, fragment_index):
-    members = _physical_groups(static)[fragment_index]
+    members = _cc_groups(static)[fragment_index]
     return np.concatenate(tuple(common.fragment_occupied_data[member].iao_coeff
                                 for member in members), axis=1)
 
@@ -192,7 +193,7 @@ def _fragment_index(static, fragment_index):
     if not isinstance(static, DomainSelections) or static.lo_type != 'boys':
         raise TypeError('mp2_static must be STC Boys DomainSelections')
     index = int(fragment_index)
-    physical = _physical_groups(static)
+    physical = _cc_groups(static)
     if not 0 <= index < len(physical):
         raise IndexError(f'fragment_index={index} is outside [0, {len(physical)})')
     if any(len(static.frag_lolist[member]) != 1 for member in physical[index]):
@@ -416,7 +417,7 @@ def build_fragment_lis_selection(
     index = _fragment_index(mp2_static, fragment_index)
     if common is None:
         common = rebuild_domain_data(mf, mp2_static)
-    representative = (_physical_groups(mp2_static)[index][0] if frame_fragment_index is None
+    representative = (_cc_groups(mp2_static)[index][0] if frame_fragment_index is None
                       else frame_fragment_index)
     frame, occupied, virtual = _frame_and_matrices(common, mp2_static, representative, frame, matrices)
     internal = _domain_targets(common, mp2_static, index, frame)
@@ -455,7 +456,7 @@ def build_fragment_lis(mf, common, static, fragment_index, *, matrices,
         raise ValueError('obsolete LIS selection; rebuild domain-space selections')
     if selection.fragment_index != index:
         raise ValueError('fragment selection order is inconsistent')
-    representative = (_physical_groups(static.mp2_static)[index][0] if frame_fragment_index is None
+    representative = (_cc_groups(static.mp2_static)[index][0] if frame_fragment_index is None
                       else frame_fragment_index)
     frame, occupied_ed, virtual_ed = _frame_and_matrices(
         common, static.mp2_static, representative, frame, matrices)

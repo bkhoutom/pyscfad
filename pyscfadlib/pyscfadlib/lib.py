@@ -1,4 +1,5 @@
 import os
+import threading
 import numpy
 
 def load_library(libname):
@@ -22,8 +23,26 @@ class _FallbackCDLL:
                 last_err = err
         raise last_err
 
+
+class _LazyCDLL:
+    """Load compatibility kernels only when a legacy symbol is requested."""
+    def __init__(self, libname):
+        self._libname = libname
+        self._library = None
+        self._lock = threading.Lock()
+
+    def __getattr__(self, name):
+        with self._lock:
+            if self._library is None:
+                self._library = load_library(self._libname)
+        return getattr(self._library, name)
+
+
 libao2mo_vjp = load_library('libao2mo_vjp')
-libcc_vjp = load_library('libcc_vjp')
+# Deterministic DLNO uses _ccsd_kernels for DF pullbacks and _stc_mp2 for
+# Laplace triples. Keep the older canonical/LNO triples ABI available without
+# loading its BLAS/OpenMP dependencies into that route at import time.
+libcc_vjp = _LazyCDLL('libcc_vjp')
 libcgto_ad = load_library('libcgto_ad')
 libcgto_vjp = _FallbackCDLL(load_library('libcgto_vjp'), libcgto_ad)
 libcvhf_vjp = load_library('libcvhf_vjp')

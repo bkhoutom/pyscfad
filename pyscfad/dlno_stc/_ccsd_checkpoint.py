@@ -21,6 +21,9 @@ def open_checkpoint(state, static, groups, *, checkpoint_dir, resume, options):
     # Workspace changes only execution, so compatible completed domains remain
     # reusable across omitted, default, and explicitly enlarged workspace caps.
     options = options.copy()
+    # Omit disabled NAF for compatibility with historical uncompressed runs.
+    if state.get('mp2_aux_svd_tol'):
+        options['mp2_aux_svd_tol'] = state['mp2_aux_svd_tol']
     if options.get('triples_controls') is not None:
         options['triples_controls'] = options['triples_controls'].copy()
         options['triples_controls'].pop('workspace_gib', None)
@@ -30,8 +33,10 @@ def open_checkpoint(state, static, groups, *, checkpoint_dir, resume, options):
         # intermediates and roundoff must not change the checkpoint digest.
         static = resume_selections(checkpoint_dir, static)
     native_version = _stc_mp2.matrix_kernel_version
-    # The D adapter restoration retains the same W calculation. Keep the
-    # W checkpoint identity for this specific native version transition.
+    # The combined adapter changes replay APIs, while retaining each provider's
+    # calculation. Keep their checkpoint identities across these known versions.
+    if native_version == 'src_code_rdm_v2:427459d9b91fc70f:standalone-7-d-w-orbital':
+        native_version = 'src_code_rdm_v2:427459d9b91fc70f:standalone-6-d-w'
     if (static.lis_static.matrix_kind == 'W'
             and native_version == 'src_code_rdm_v2:427459d9b91fc70f:standalone-6-d-w'):
         native_version = 'src_code_rdm_v2:427459d9b91fc70f:standalone-5-w-only'

@@ -9,6 +9,23 @@ from pyscfad.dlno_stc.test.test_shared_domain_frame import molecular_group
 
 
 def test_native_dlno_ccsdt_energy_gradient(molecular_group, monkeypatch, record_property):
+    from pyscfadlib import libcc_vjp
+    from pyscfad.cc import _native_integral_pullback as pullbacks
+    def forbidden_legacy_symbol(name):
+        raise AssertionError('deterministic DLNO must not call libcc_vjp: ' + name)
+    class ForbiddenLegacy:
+        __getattr__ = staticmethod(forbidden_legacy_symbol)
+    # The new pyscfadlib loader is lazy. Poison its target to catch any actual
+    # legacy call, including imports held by the canonical/LNO triples modules.
+    if hasattr(type(libcc_vjp), '__getattr__') and '_library' in vars(libcc_vjp):
+        monkeypatch.setattr(libcc_vjp, '_library', ForbiddenLegacy())
+    calls = dict(ovvv=0, vvvv=0)
+    for name in calls:
+        function = getattr(pullbacks.cpp, 'dfccsd_' + name + '_vjp')
+        def counted(*args, _name=name, _function=function):
+            calls[_name] += 1
+            return _function(*args)
+        monkeypatch.setattr(pullbacks.cpp, 'dfccsd_' + name + '_vjp', counted)
     case = molecular_group
     monkeypatch.setenv('PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE', 'direct')
     options = dict(**cc_options(case.controls, case.controls),
@@ -30,3 +47,5 @@ def test_native_dlno_ccsdt_energy_gradient(molecular_group, monkeypatch, record_
     for left, right in zip(new[2].fragments, old[2].fragments):
         np.testing.assert_allclose([left.e_ccsd, left.e_triples],
                                    [right.e_ccsd, right.e_triples], atol=1e-9, rtol=0)
+    assert all(calls.values()), calls
+    record_property('cpp_factor_pullback_calls', str(calls))

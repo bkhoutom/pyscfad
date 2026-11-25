@@ -5,7 +5,6 @@
 Equations mirror cc.ccsd.update_amps and cc.dfccsd's explicit ERI adjoint.
 This module performs no JAX operations and creates no disk scratch.
 """
-import ctypes
 import numpy as np
 import numpy
 from pyscf import lib
@@ -254,26 +253,12 @@ def _adjoint_unpack_t2_tril_jiba(bar, nocc, nvir):
     return packed_bar
 
 
-def _dfccsd_ovvv_vjp_native(Lov, Lvv, t1, theta, tau, t1new_bar, fvv_bar, wVOov_bar, tmp_acc_bar, wooVV_flat_bar):
-    if Lov.dtype != numpy.double or Lvv.dtype != numpy.double:
-        raise NotImplementedError('native DF-CCSD ovvv VJP supports float64 only')
-    from pyscfadlib import libcc_vjp as libcc
-    Lov_c = numpy.asarray(Lov, dtype=numpy.double, order='C')
-    Lvv_c = numpy.asarray(Lvv, dtype=numpy.double, order='C')
-    t1_c = numpy.asarray(t1, dtype=numpy.double, order='C')
-    theta_c = numpy.asarray(theta, dtype=numpy.double, order='C')
-    tau_c = numpy.asarray(tau, dtype=numpy.double, order='C')
-    t1new_bar_c = numpy.asarray(t1new_bar, dtype=numpy.double, order='C')
-    fvv_bar_c = numpy.asarray(fvv_bar, dtype=numpy.double, order='C')
-    wVOov_bar_c = numpy.asarray(wVOov_bar, dtype=numpy.double, order='C')
-    tmp_acc_bar_c = numpy.asarray(tmp_acc_bar, dtype=numpy.double, order='C')
-    wooVV_flat_bar_c = numpy.asarray(wooVV_flat_bar, dtype=numpy.double, order='C')
-    (naux, nocc, nvir) = Lov_c.shape
-    Lov_bar = numpy.empty_like(Lov_c)
-    Lvv_bar = numpy.empty_like(Lvv_c)
-    drv = libcc.dfccsd_ovvv_vjp
-    drv(Lov_bar.ctypes.data_as(ctypes.c_void_p), Lvv_bar.ctypes.data_as(ctypes.c_void_p), Lov_c.ctypes.data_as(ctypes.c_void_p), Lvv_c.ctypes.data_as(ctypes.c_void_p), t1_c.ctypes.data_as(ctypes.c_void_p), theta_c.ctypes.data_as(ctypes.c_void_p), tau_c.ctypes.data_as(ctypes.c_void_p), t1new_bar_c.ctypes.data_as(ctypes.c_void_p), fvv_bar_c.ctypes.data_as(ctypes.c_void_p), wVOov_bar_c.ctypes.data_as(ctypes.c_void_p), tmp_acc_bar_c.ctypes.data_as(ctypes.c_void_p), wooVV_flat_bar_c.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(naux), ctypes.c_int(nocc), ctypes.c_int(nvir))
-    return (Lov_bar, Lvv_bar)
+def _dfccsd_ovvv_vjp_native(Lov, Lvv, t1, theta, tau, t1new_bar,
+                            fvv_bar, wVOov_bar, tmp_acc_bar, wooVV_flat_bar):
+    from ._native_integral_pullback import ovvv
+    return ovvv(Lov, Lvv, t1, theta, tau, t1new_bar, fvv_bar,
+                wVOov_bar, tmp_acc_bar, wooVV_flat_bar)
+
 
 
 def _dfccsd_update_amps_eris_cotangent(mycc, eris, t1, t2, t1new_bar, t2new_bar, *, intermediates=None):
@@ -455,6 +440,14 @@ def _energy_eris_cotangent(eris, t1, t2, bar_e):
     return (fock_bar, ovov_bar)
 
 def _G_Lbar(tau, L, G_bar):
+    from ._native_integral_pullback import vvvv
+    try:
+        return vvvv(tau, L, G_bar)
+    except NotImplementedError:
+        return _G_Lbar_numpy(tau, L, G_bar)
+
+
+def _G_Lbar_numpy(tau, L, G_bar):
     o2, v, _ = tau.shape
     q = L.shape[0]
     B = np.concatenate((tau, tau.transpose(0, 2, 1)), axis=0)

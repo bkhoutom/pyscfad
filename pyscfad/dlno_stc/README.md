@@ -34,6 +34,33 @@ domains = dlno_stc.build_domain_selections(
 )
 ```
 
+`boys_grouping="atom_singleton"` uses the same domain construction, strong/weak
+partition and MP2 baseline as `atom`, with one W pair, LIS and CCSD(T) correction
+per original occupied target orbital. Set it in `build_domain_selections`;
+the existing CC selection and energy/gradient APIs then use it automatically.
+The saved `physical_groups` remain the atom partition used for domains; CC/LIS
+records are indexed by individual orbital records.
+
+With ordinary virtual selection (`sequential_virtual=False`), all per-orbital
+W matrices are constructed before the group's CC solves. Deterministic W shares
+factor propagation and amplitude construction across targets, bounded by
+`target_batch_size`; no summed atom W is constructed. Stochastic W uses the
+existing independent target streams and replay plans. Each target's W trace
+contributes its MP2 energy once; the weak-domain correction is unchanged.
+
+With `matrix_kind="D"`, each orbital uses the D provider and its explicit MP2
+scalar. Domain preparation and integral geometry response remain shared.
+
+Each CC/LIS reverse completes before the next solver. Its W cotangents are
+retained until the group's combined MP2 reverse; coefficient and Fock responses
+are accumulated immediately. Shared RI geometry adjoints are transformed into
+one common domain-basis accumulator, so completed solvers do not retain separate
+RI adjoints or CC tapes. This buffer scales as auxiliary size times the square
+of the common domain rank, rather than as the number of LIS solves. Temporary
+current-solver buffers are still required. The shared integral geometry response
+and domain-preparation response are each applied once. Stochastic CC replica
+precision retains its existing separate RI-response handling.
+
 `boys_grouping="system"` puts all active occupied targets in one fragment,
 uses full-system domains, and runs the same preparation, solver and response
 pipeline. `full_domain=True` expands every fragment's
@@ -41,7 +68,7 @@ occupied, primary, PAO and extended domains to the entire system while
 preserving physical fragment membership. Frozen orbitals remain excluded;
 LNO cutoffs still apply.
 
-`boys_grouping` accepts `singleton`, `atom` and `system`; `molecule` remains a
+`boys_grouping` accepts `singleton`, `atom`, `atom_singleton` and `system`; `molecule` remains a
 compatibility alias for `system`. The separate `scope` keyword has been removed.
 Pair screening and
 `BoysDomainThresholds` control finite domains. Domain selection fixes discrete
@@ -128,8 +155,8 @@ are in Eh/bohr. Use `value_and_grad` for derivatives; the forward-only `kernel`
 interfaces are not outer JAX differentiation targets. Alternatively, pass
 explicit `domains` or a CC plan as `static` instead of `build_static`.
 The MP2 entry points also accept `boys_grouping="system", frozen=...` with no
-`static` to select one system-wide fragment automatically. Explicit `singleton`
-or `atom` grouping also builds the corresponding selections automatically.
+`static` to select one system-wide fragment automatically. Explicit `singleton`, `atom` or `atom_singleton` grouping also builds the
+corresponding selections automatically.
 When supplying `static` or `build_static`, choose grouping, frozen orbitals and
 localization options in that selection instead of passing them to the solver.
 
@@ -282,7 +309,7 @@ the correlation solvers use deterministic or stochastic evaluation.
 | Keyword | Default | Meaning |
 | --- | --- | --- |
 | `frozen` | Required | Frozen-space specification; `0` retains all occupied orbitals. |
-| `boys_grouping` | `"singleton"` | Physical fragment grouping: `singleton`, `atom` or `system`. |
+| `boys_grouping` | `"singleton"` | Domain/CC grouping: `singleton`, `atom`, `atom_singleton` or `system`. |
 | `full_domain` | `False` | Expand domains without combining fragments; system grouping enables it automatically. |
 | `thresholds` | `BoysDomainThresholds()` | Domain completeness, ranks and weak-pair screening thresholds. |
 | `lo_kwargs` | `None` | [Boys or lambda-Boys localization options](#boys-and-lambda-boys-localization). |
@@ -290,6 +317,7 @@ the correlation solvers use deterministic or stochastic evaluation.
 | `frag_lolist` | `None` | Optional complete singleton occupied-column partition; use `boys_grouping` for physical grouping. |
 | `pair_energy_model` | `"multipole"` | Also `multipole-os`/`os-multipole`, `exact`, and `all`/`all-strong`. |
 | `correlation_auxbasis` | `None` | Correlation fit override; defaults to the SCF fit. |
+| `mp2_aux_svd_tol` | `1e-3` | ED OV auxiliary compression before MP2; `None` or zero disables it. |
 | `mp2_laplace_points`, `mp2_grid` | `6`, `None` | Global fitted MP2 quadrature size or an explicit pair of arrays. |
 
 `BoysDomainThresholds` defaults:
@@ -374,7 +402,8 @@ for compatibility; actual preparation grouping occurs during execution.
 | `comm`, `parallel_scf_jk` | `None`, `True` | Both methods; MPI and shared DF J/K work. |
 | `correlation_auxbasis` | `None` | Both methods; use the same fit for selection and execution. |
 | `checkpoint_dir`, `resume` | `None`, `False` | Serial CC progress checkpoints. |
-| `vvvv_direct`, `lis_aux_svd_tol` | `False`, `1e-5` | CC virtual-ladder storage and LIS auxiliary compression. |
+| `vvvv_direct`, `lis_aux_svd_tol` | `False`, `None` | CC virtual-ladder storage and LIS auxiliary compression (disabled by default). |
+| `mp2_aux_svd_tol` | `1e-3` | ED OV auxiliary compression before MP2/W and LIS selection. |
 | `cc_solver`, `stc_cc_controls` | `"deterministic"`, `None` | CC amplitude solver and optional stochastic controls. |
 | `verbose_imp` | `0` | CC impurity solver verbosity. |
 
@@ -568,11 +597,30 @@ both modes additionally contract derivative integrals and metric response
 once per group.
 
 `vvvv_direct=True` separately controls the CC virtual-ladder integral cache.
-`lis_aux_svd_tol` controls LIS auxiliary-space compression (default `1e-5`;
-`None` or zero disables it). These memory/accuracy choices are independent of
+`lis_aux_svd_tol` controls LIS auxiliary-space compression (default `None`,
+disabled; a positive threshold enables it, and zero also disables it).
+These memory/accuracy choices are independent of
 H storage. Memory forecasts warn when budgets are exceeded; proven impossible
 new allocations are rejected. No global AO-pair tensor is required by local
 correlation preparation.
+
+`mp2_aux_svd_tol` independently compresses the metric-whitened ED `(ia|P)`
+factors before MP2/W (default `1e-3`, retaining eigenvalues strictly above
+the cutoff). OV products carry no symmetric-pair weights. LIS auxiliary
+compression still starts in the original auxiliary basis. Weak-pair screening
+and completion use their existing factors. Set `mp2_aux_svd_tol=None` or zero
+to reproduce the uncompressed ED calculation.
+
+The MP2 NAF pullback includes the retained-subspace response at fixed rank,
+including the omitted left null space for tall factors. It transforms the
+summed MP2/W factor cotangent before the existing ED DF pullback. This adds
+no AO integral pass: direct mode retains one ordinary three-center pass for
+the ED coefficient reverse and one derivative contraction pass; half-cache
+mode reuses the resident intermediates for the coefficient reverse. The shared
+geometry and auxiliary-metric responses are each evaluated once per group.
+Gradients are local derivatives of the truncated model, away from cutoff
+crossings; they are not gradients of uncompressed MP2. CC progress checkpoints
+include the MP2 NAF cutoff and reject incompatible resumed calculations.
 
 ## MPI and checkpoints
 

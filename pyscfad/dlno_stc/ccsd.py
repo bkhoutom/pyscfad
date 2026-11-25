@@ -19,7 +19,7 @@ from ._profile import response as profile_response
 from ._memory import memory_calculation
 from ._cleanup import release_memory as _release_memory
 from ._selection import (
-    _physical_groups,
+    _cc_groups,
     build_domain_groups,
     physical_fragments_in_group as _group_cc_fragments,
 )
@@ -330,8 +330,8 @@ def build_static_selections(mf, mp2_static, *, thresh_occ, thresh_vir,
     baseline, matrix = _normalize_controls(baseline_controls, matrix_controls, saved_grid,
                                            matrix_kind)
     saved_grid = (baseline['laplace_roots'].copy(), baseline['laplace_weights'].copy())
-    indices = tuple(range(len(_physical_groups(mp2_static))))
-    physical = _physical_groups(mp2_static)
+    indices = tuple(range(len(_cc_groups(mp2_static))))
+    physical = _cc_groups(mp2_static)
     selections = [None] * len(physical)
     frames, grids = [None] * len(physical), [None] * len(physical)
     lis = LISSelections(mp2_static, thresh_occ, thresh_vir,
@@ -391,7 +391,7 @@ def _select_fragment_lis(mf, common, domains, index, group, frame, forward, *,
     frames = grid = None
     from .smooth import select_frame
     from .smooth_triples import make_grid
-    selections = [None] * len(_physical_groups(domains))
+    selections = [None] * len(_cc_groups(domains))
     selections[index] = selection
     partial_lis = LISSelections(domains, thresh_occ, thresh_vir,
                                internal_rank_threshold, tuple(selections))
@@ -433,7 +433,7 @@ def _select_fragment_lis(mf, common, domains, index, group, frame, forward, *,
 
 def _fragment_lis_cutoffs(static, index):
     lis = static.lis_static
-    factor = (len(_physical_groups(static.mp2_static)[index])
+    factor = (len(_cc_groups(static.mp2_static)[index])
               if getattr(lis, 'scale_lis_by_target_count', False) else 1)
     return factor * lis.thresh_occ, factor * lis.thresh_vir
 
@@ -480,7 +480,7 @@ def _allocate_triples_controls(controls, nfragments, *, static=None, indices=Non
         if static is None or 'fragment_energies' in controls:
             raise ValueError('occupied_count allocation requires domains and no energy proxies')
         domains = static.mp2_static
-        groups = _physical_groups(domains)
+        groups = _cc_groups(domains)
         counts = [sum(len(domains.frag_lolist[i]) for i in members) for members in groups]
         total = len(domains.active_occ_indices)
         if total <= 0 or min(counts) <= 0 or sum(counts) != total:
@@ -710,13 +710,24 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
     frame_bars = tuple(np.zeros_like(coeff) for coeff in frame_coeff) if with_grad else None
     input_bars = None
     records = []
-    for index, targets in _group_cc_fragments(static, group):
+    fragments = _group_cc_fragments(static, group)
+    orbital_batch = None
+    orbital_bars = []
+    if getattr(domains, 'boys_grouping', None) == 'atom_singleton' and not sequential and fragments:
+        if with_grad:
+            from pyscfad.lno._df_shared import accumulate_in_basis
+            accumulate_in_basis(numpy.concatenate(tuple(numpy.asarray(c) for c in frame_coeff), axis=1))
+        if matrix_kind == 'W':
+            with resource_profile.section('stc.cc.orbital_matrix_forward'):
+                orbital_batch = backend.solve_orbital_matrices(host, fragments, matrix_controls)
+    for slot, (index, targets) in enumerate(fragments):
         with resource_profile.section('stc.cc.matrix_forward', frag=index+1):
             matrix_solver = (backend.begin_sequential_matrices if sequential
                              else backend.solve_matrices)
-            forward = matrix_solver(
-                host, {'fragment_id': index, 'target_indices': targets},
-                matrix_controls, **({'matrix_kind': matrix_kind} if matrix_kind != 'W' else {}))
+            forward = (orbital_batch.forwards[slot] if orbital_batch is not None else
+                       matrix_solver(host, {'fragment_id': index, 'target_indices': targets},
+                                     matrix_controls,
+                                     **({'matrix_kind': matrix_kind} if matrix_kind != 'W' else {})))
         if sequential:
             from .lis import occupied_selection_rotation
             with resource_profile.section('stc.cc.sequential_virtual', frag=index+1):
@@ -828,21 +839,27 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
             _clear_jax_caches('before_matrix_pullback', state['mf_bar'],
                               state['common_bar'], frame_bars, matrix_bars,
                               frag=index+1)
-            with resource_profile.section('stc.cc.matrix_pullback', frag=index+1):
-                bars = backend.pullback_matrices(
-                    host, forward, energy_bar=1., occupied_bar=matrix_bars['occupied'],
-                    virtual_bar=matrix_bars['virtual'])
-            validate_input_cotangents(bars, inputs)
-            if input_bars is None:
-                # Native outputs are owned and writable, including the empty
-                # fast path. Adopt them without duplicating the domain-sized
-                # B bar; diagnostic wrappers may return read-only snapshots.
-                input_bars = {name: value if value.flags.writeable else value.copy()
-                              for name, value in bars.items()}
+            if orbital_batch is not None:
+                # Only W seeds survive this solver; CC/LIS tapes and direct RI
+                # coefficient responses have already been consumed above.
+                orbital_bars.append({name: numpy.asarray(value) for name, value in matrix_bars.items()})
+                del matrix_bars
             else:
-                for name in inputs:
-                    input_bars[name] += bars[name]
-            del matrix_bars, bars
+                with resource_profile.section('stc.cc.matrix_pullback', frag=index+1):
+                    bars = backend.pullback_matrices(
+                        host, forward, energy_bar=1., occupied_bar=matrix_bars['occupied'],
+                        virtual_bar=matrix_bars['virtual'])
+                validate_input_cotangents(bars, inputs)
+                if input_bars is None:
+                    # Native outputs are owned and writable, including the empty
+                    # fast path. Adopt them without duplicating the domain-sized
+                    # B bar; diagnostic wrappers may return read-only snapshots.
+                    input_bars = {name: value if value.flags.writeable else value.copy()
+                                  for name, value in bars.items()}
+                else:
+                    for name in inputs:
+                        input_bars[name] += bars[name]
+                del matrix_bars, bars
         else:
             direct_norm = None
         values, diagnostics = auxiliary
@@ -881,6 +898,11 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
         del prepared_lis
         release_consumed_inputs(forward_only=not with_grad)
         gc.collect()
+    if orbital_batch is not None and with_grad:
+        with resource_profile.section('stc.cc.orbital_matrix_pullback'):
+            input_bars = backend.pullback_orbital_matrices(host, orbital_batch, orbital_bars)
+        orbital_bars.clear()
+    del orbital_batch
     if input_bars is not None:
         with resource_profile.section('stc.cc.input_pullback'):
             # AD adds the coefficient bars from DF/Fock construction to the
@@ -1004,15 +1026,18 @@ def kernel(mf, static=None, *, baseline_controls=None, matrix_controls=None, mp2
            merge_identical=True, comm=None,
            checkpoint_dir=None, resume=False, parallel_scf_jk=True, vvvv_direct=False,
            cc_solver='deterministic', stc_cc_controls=None, correlation_auxbasis=None,
-           lis_aux_svd_tol=1e-5):
+           lis_aux_svd_tol=None, mp2_aux_svd_tol=1e-3):
     """Return correlation energy, or total energy with ``include_hf=True``.
 
     ``correlation_auxbasis`` selects local MP2, D/W and CC fitting; HF/Fock
     retain the SCF fit. Use the same basis for selection and execution.
     ``lis_aux_svd_tol`` compresses only LIS auxiliary factors with the strict
-    squared-singular-value cutoff ``s**2 > tol`` (default ``1e-5``).
-    Pass ``None`` or zero to disable compression.
-    Domain MP2, D/W and orbital selection remain unchanged. Compression
+    squared-singular-value cutoff ``s**2 > tol``. It defaults to ``None``
+    (disabled); pass a positive threshold to enable it. Zero also disables it.
+    ``mp2_aux_svd_tol=1e-3`` independently compresses ED OV factors before
+    MP2 and D/W selection; ``None`` or zero disables it. LIS NAF continues
+    to use the original auxiliary basis, independently of the ED NAF basis.
+    Weak-pair screening/completion is unchanged. LIS compression
     diagnostics are included in each fragment's ``auxiliary_compression``.
     ``return_components=True`` returns ``(energy, CCSDComponents)``. With W,
     strong-domain MP2 energy is read directly from its traces, in deterministic
@@ -1097,6 +1122,7 @@ def kernel(mf, static=None, *, baseline_controls=None, matrix_controls=None, mp2
         validate_selection_basis(mf, selected, correlation_auxbasis)
         boys_options = _resume_boys_options(checkpoint_dir, mf, selected) if resume else {}
         state = driver._initialize(mf, selected.mp2_static, baseline, with_grad=False,
+                                   mp2_aux_svd_tol=mp2_aux_svd_tol,
                                    **boys_options,
                                    **basis_kwargs(correlation_auxbasis))
         state['cc_triples_controls'] = triples
@@ -1129,12 +1155,14 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls=None, matrix
                    checkpoint_dir=None, resume=False,
                    parallel_scf_jk=True, vvvv_direct=False,
                    cc_solver='deterministic', stc_cc_controls=None, correlation_auxbasis=None,
-                   lis_aux_svd_tol=1e-5):
+                   lis_aux_svd_tol=None, mp2_aux_svd_tol=1e-3):
     """Return ``(energy, mol_bar)``; ``mol_bar.coords`` is a nuclear gradient.
 
+    ``mp2_aux_svd_tol=1e-3`` includes the fixed-rank ED NAF subspace response.
+    MP2/W seeds are accumulated before this response and the single ED VJP.
     ``correlation_auxbasis`` follows :func:`kernel`; ``build_static`` inherits
     it on its detached reference. The live SCF DF object remains unchanged.
-    ``lis_aux_svd_tol`` defaults to ``1e-5`` and follows :func:`kernel`,
+    ``lis_aux_svd_tol`` defaults to ``None`` (disabled) and follows :func:`kernel`,
     including the response of the retained auxiliary subspace at its fixed rank.
     Pass ``None`` or zero to disable compression.
     Include HF once with ``include_hf=True``. Append ``CCSDComponents`` with
@@ -1215,6 +1243,7 @@ def value_and_grad(mol, build_mf, static=None, *, baseline_controls=None, matrix
         triples = _allocate_triples_controls(triples, len(indices), static=selected, indices=indices)
         boys_options = _resume_boys_options(checkpoint_dir, mf, selected) if resume else {}
         state = driver._initialize(mf, selected.mp2_static, baseline, with_grad=True,
+                                   mp2_aux_svd_tol=mp2_aux_svd_tol,
                                    scf_pullback=scf_pullback, scf_data=scf_data,
                                    scf_data_pullback=scf_data_pullback,
                                    prepared_domain=prepared_domain,

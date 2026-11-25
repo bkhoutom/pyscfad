@@ -715,7 +715,7 @@ def _screen_pair_response(endpoints, static, forced, exact_scores, response):
             weak[left, right] = weak[right, left] = value
     scores = weak if exact_scores is None else exact_scores
     mask = (np.abs(scores) > static.thresholds.pair_energy) | forced
-    if getattr(static, 'boys_grouping', 'singleton') == 'atom':
+    if getattr(static, 'boys_grouping', 'singleton') in ('atom', 'atom_singleton'):
         mask = _group_domain_mask(mask, static.physical_groups)
     selected = SimpleNamespace(strong_mask=mask, fragments=static.fragments)
     pairs = weak_pair_indices(selected)

@@ -141,7 +141,7 @@ def _matrix_batch_controls(settings, batch_count, seed):
 
 def _check_matrix_memory(inputs, ntarget, settings, offsets, *,
                          matrix_kind="W", stage="forward", warned=None,
-                         energy_reverse_workspace_bytes=0):
+                         energy_reverse_workspace_bytes=0, output_count=1):
     """Check each staged call against current residency before tensor copies."""
     from ._memory import observe_memory
     from .controls import estimate_matrix_memory, check_solver_memory
@@ -153,6 +153,11 @@ def _check_matrix_memory(inputs, ntarget, settings, offsets, *,
     if energy_reverse_workspace_bytes:
         estimate["energy_reverse_updates"] = energy_reverse_workspace_bytes
         estimate["total_bytes"] += energy_reverse_workspace_bytes
+    if output_count > 1:
+        # Per-target native outputs, Python results/SEs and reverse seed copies.
+        extra = 4 * (output_count - 1) * 8 * (nocc*nocc + nvir*nvir)
+        estimate['orbital_outputs'] = extra
+        estimate['total_bytes'] += extra
     observation = observe_memory()
     resident_mb = observation.rss_mb
     peak_bytes = (None if resident_mb is None else
@@ -282,6 +287,114 @@ def solve_matrices(inputs, metadata, controls, *, matrix_kind="W", aux_offsets=N
                                      energy_reverse_workspace_bytes, memory_warned)
     validate_matrix_result(result, arrays)
     return result
+
+
+@dataclass(frozen=True)
+class OrbitalMatrices:
+    """Per-orbital W outputs and small replays sharing one domain's inputs."""
+    forwards: tuple
+    metadata: dict
+    controls: dict
+    aux_offsets: np.ndarray
+    fingerprint: str
+    batches: tuple
+
+
+def solve_orbital_matrices(inputs, fragments, controls):
+    """Construct every singleton W before CC, sharing deterministic MP2 work.
+
+    Stochastic matrices retain independent target streams and their existing
+    replay rules. Neither path constructs a summed atom W. Target batching
+    bounds amplitude storage without changing the deterministic functional.
+    """
+    from .controls import normalize_matrix_controls
+    settings = normalize_matrix_controls(controls)
+    arrays = host_inputs(inputs)
+    fragments = tuple(fragments)
+    targets = tuple(t for _, selected in fragments for t in selected)
+    if any(len(selected) != 1 for _, selected in fragments):
+        raise ValueError('orbital matrices require singleton targets')
+    metadata = dict(target_indices=targets, fragment_ids=tuple(i for i, _ in fragments))
+    _matrix_targets(metadata, arrays['foo'].shape[0])
+    offsets = _matrix_aux_offsets(arrays['B'].shape[0], None, settings['auxiliary_group_size'])
+    fingerprint = matrix_request_fingerprint(arrays, metadata, settings, offsets)
+    if settings['mode'] == 'stochastic' or not arrays['B'].size:
+        forwards = tuple(solve_matrices(arrays, dict(fragment_id=i, target_indices=selected),
+                                        settings, aux_offsets=offsets) for i, selected in fragments)
+        return OrbitalMatrices(forwards, metadata, settings, offsets, fingerprint, ())
+    extension = importlib.import_module('pyscfad.dlno_stc._stc_mp2')
+    if not hasattr(extension, 'solve_orbital_matrices'):
+        raise ImportError('rebuild the STC extension for atom_singleton orbital W support')
+    size = settings['target_batch_size'] or len(targets)
+    forwards, batches = [], []
+    for first in range(0, len(targets), size):
+        selected = targets[first:first+size]
+        _check_matrix_memory(arrays, len(selected), settings, offsets, output_count=len(selected))
+        native_controls = _matrix_batch_controls(settings, 1, settings['global_seed'])
+        local = extension.solve_orbital_matrices(*(arrays[key] for key in ARRAY_NAMES),
+            selected, native_controls, aux_offsets=offsets)
+        if len(local) != len(selected):
+            raise ValueError('native orbital matrix count mismatch')
+        batches.append((first, len(local), local[0]['replay']))
+        for slot, forward in enumerate(local, first):
+            validate_matrix_result(forward, arrays)
+            forward['metadata'] = dict(fragment_id=fragments[slot][0],
+                                       target_indices=(targets[slot],))
+            forward['controls'] = settings
+            forward['matrix_kind'] = 'W'
+            forwards.append(forward)
+    return OrbitalMatrices(tuple(forwards), metadata, settings, offsets, fingerprint, tuple(batches))
+
+
+def pullback_orbital_matrices(inputs, batch, matrix_bars):
+    """Consume labeled W seeds after all CC reverses; return one input bar tree.
+
+    Every target contributes its MP2 energy once. Arbitrary W seeds stay
+    separate until their target-specific contractions have been reversed.
+    """
+    if not isinstance(batch, OrbitalMatrices):
+        raise TypeError('orbital reverse requires its forward batch')
+    if len(matrix_bars) != len(batch.forwards):
+        raise ValueError('orbital matrix cotangent count mismatch')
+    arrays = host_inputs(inputs)
+    if matrix_request_fingerprint(arrays, batch.metadata, batch.controls,
+                                  batch.aux_offsets) != batch.fingerprint:
+        raise ValueError('orbital matrix replay inputs or controls changed')
+    for forward, bars in zip(batch.forwards, matrix_bars):
+        validate_matrix_result(forward, arrays)
+        if set(bars) != {'occupied', 'virtual'}:
+            raise ValueError('orbital seeds must contain occupied and virtual')
+        for name, source in (('occupied', 'foo'), ('virtual', 'fvv')):
+            value = np.asarray(bars[name])
+            if (value.dtype != np.float64 or value.shape != arrays[source].shape
+                    or not np.isfinite(value).all()):
+                raise ValueError('orbital W cotangents must be finite float64 matrices')
+    total = None
+    if not batch.batches:
+        packets = (pullback_matrices(arrays, forward, energy_bar=1.,
+                    occupied_bar=bars['occupied'], virtual_bar=bars['virtual'])
+                   for forward, bars in zip(batch.forwards, matrix_bars))
+    else:
+        extension = importlib.import_module('pyscfad.dlno_stc._stc_mp2')
+        def native_packets():
+            for first, count, replay in batch.batches:
+                _check_matrix_memory(arrays, count, batch.controls, batch.aux_offsets,
+                                     stage='reverse', output_count=count)
+                seeds = matrix_bars[first:first+count]
+                yield extension.pullback_orbital_matrices(
+                    *(arrays[key] for key in ARRAY_NAMES), replay, [1.] * count,
+                    [np.ascontiguousarray(b['occupied']) for b in seeds],
+                    [np.ascontiguousarray(b['virtual']) for b in seeds])
+        packets = native_packets()
+    for bars in packets:
+        validate_input_cotangents(bars, arrays)
+        if total is None:
+            total = {key: value if value.flags.writeable else value.copy()
+                     for key, value in bars.items()}
+        else:
+            for key in ARRAY_NAMES:
+                total[key] += bars[key]
+    return total
 
 
 def pullback_matrices(inputs, forward, *, energy_bar, occupied_bar, virtual_bar):

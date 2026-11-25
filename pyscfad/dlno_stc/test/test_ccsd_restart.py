@@ -140,6 +140,32 @@ def test_incompatible_restart_is_rejected(tmp_path, checkpoint_reference, change
         manager.close()
 
 
+@pytest.mark.parametrize('kind, saved_version', [
+    ('W', LEGACY_W_MATRIX_VERSION),
+    ('D', RESTORED_D_MATRIX_VERSION),
+])
+def test_matrix_restart_accepts_combined_native_provider(
+        tmp_path, checkpoint_reference, monkeypatch, kind, saved_version):
+    from pyscfad.dlno_stc import _stc_mp2
+
+    mf, selected = checkpoint_reference
+    selected = replace(selected, lis_static=replace(selected.lis_static, matrix_kind=kind))
+    monkeypatch.setattr(_stc_mp2, 'matrix_kernel_version', saved_version)
+    manager = _open(tmp_path, mf, selected)
+    save_progress(manager, dict(energy=-.125, variance=0., baseline_energy=-.125,
+                               weak_energy=0.), [], 1, True, with_grad=False)
+    manager.close()
+    monkeypatch.setattr(_stc_mp2, 'matrix_kernel_version',
+                        'src_code_rdm_v2:427459d9b91fc70f:standalone-7-d-w-orbital')
+    manager = _open(tmp_path, mf, selected, resume=True)
+    try:
+        state = dict(energy=0., variance=0., baseline_energy=0., weak_energy=0.)
+        assert restore_progress(manager, state, with_grad=False) == (1, True, [])
+        assert state['energy'] == -.125
+    finally:
+        manager.close()
+
+
 @pytest.mark.parametrize('saved_kind, resume_kind, resume_version, mismatch', [
     ('W', 'D', RESTORED_D_MATRIX_VERSION, 'matrix_kind'),
     ('W', 'W', 'unrelated-future-matrix-version', 'native_version'),

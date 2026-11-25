@@ -21,7 +21,7 @@ fd2f3013608ec3293dfea4f42084ad264b61fd28eb6cf11fb7a0507f1357dfe9  stc_mp2_select
 a775c22096afc21290c5a5dd2d172b4f924de384a4f6419bb854b116f493dbf8  stc_mp2_stochastic_w.h
 
 SHA256 of adapted native source files:
-cc8882544568674fef3c64752dedd9666722e54d2c3b0f161d127af7f8d2ea90  stc_mp2_deterministic_d_w.h
+506a22cfd335de32a35cba0ade4a2152e0375b0b417ff9a63c4e53bae111cefd  stc_mp2_deterministic_d_w.h
 52fd796a0d4eb07f82f4c423ce8a884217008d89b071cb1e39e3f974af9e03b7  stc_mp2_deterministic_energy.h
 be0a56c34a09e5ce68cdb974704d0377755d914fe28e746a4682bc16c5521e14  stc_mp2_gradient_numerical.cpp
 ed76f7ac1530b3bc51d4aa648169224f7f5980f6f49da8ed58dd56a33b000e60  stc_mp2_kernel_helpers.h
@@ -67,7 +67,8 @@ Native seed maps uint64 to unsigned by low32 XOR high32.
 
 Adapter integration:
 - Matrix forward and reverse use supplied group overloads. Results sum the
-  selected targets; no separate per-target output matrix is introduced.
+  selected targets. The atom_singleton interface additionally returns separate
+  per-target matrices with shared deterministic propagation and a joint reverse.
 - Stochastic W sets virtual w_virtual_reform=true, matching the supplied
   driver; all other sampling-affecting source defaults are retained.
 - Native W energy and covariance-aware SE are returned without replacement.
@@ -126,4 +127,12 @@ The restored selected_energy_density header shares stochastic propagation
 across the density and energy estimators and saves the production plan for
 the combined pullback. The adapter reports scalar energy pilot and production
 draws and forecasts the reverse update workspace using the saved allocation.
-The matrix replay version is standalone-6-d-w.
+The combined matrix replay version is standalone-7-d-w-orbital.
+
+Atom-singleton W, 2026-11-23:
+The deterministic W evaluator can emit one matrix pair per selected target
+without forming their sum, and accept a distinct matrix cotangent pair for
+each target. Amplitude construction, factor propagation and the final input
+adjoints are shared within each target batch. Existing summed-W callers keep
+their original interface. The standalone replay version is advanced to
+standalone-7-d-w-orbital. Stochastic orbital calls use independent target replays.

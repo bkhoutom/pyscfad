@@ -264,6 +264,7 @@ def _reference_signature(mf):
 
 def _install_correlation_config(state, config):
     """Install root's correlation fit without changing the SCF/JK reference."""
+    state['mp2_aux_svd_tol'] = config.get('mp2_aux_svd_tol')
     basis = config.get('correlation_auxbasis')
     if ('correlation_auxbasis' in state
             and _freeze(state['correlation_auxbasis']) != _freeze(basis)):
@@ -443,7 +444,8 @@ def _run_domain_jobs(initializer, worker_initializer, static, controls, comm, *,
             return (authoritative, groups, state['weak_pairs'], resolved,
                     allocate_domain_controls(resolved, len(groups)),
                     _reference_signature(state['mf']),
-                    {'correlation_auxbasis': state.get('correlation_auxbasis')})
+                    {'correlation_auxbasis': state.get('correlation_auxbasis'),
+                     'mp2_aux_svd_tol': state.get('mp2_aux_svd_tol')})
 
         metadata = driver._root_call(comm, rank, root_metadata, 'shared domain selection')
         static, groups, pairs, controls, settings, signature, correlation = comm.bcast(metadata, root=0)

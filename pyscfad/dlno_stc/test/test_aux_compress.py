@@ -53,7 +53,7 @@ def test_weighted_packing_and_reference_eris():
     result = np.asarray(compressor(jnp.asarray(factors)))
     _, singular, right = np.linalg.svd(packed(factors), full_matrices=False)
     reference = unpack(singular[:2, None] * right[:2], 3)
-    np.testing.assert_allclose(result, reference, atol=3e-14)
+    # Eigenvectors and singular vectors may choose different signs/gauges.
     np.testing.assert_allclose(np.einsum('Lpq,Lrs->pqrs', result, result),
                                np.einsum('Lpq,Lrs->pqrs', reference, reference),
                                atol=3e-14)
@@ -115,7 +115,7 @@ def test_compression_uses_dense_blas_budget_and_restores_baseline(monkeypatch, t
 
     factors = jnp.asarray(example([3., 2., .2, .1]))
     observed = []
-    factorize = np.linalg.svd
+    factorize = aux._auxiliary_eigensystem
 
     def recording_svd(*args, **kwargs):
         observed.extend((pool['num_threads'], pool.get('threading_layer'))
@@ -124,7 +124,7 @@ def test_compression_uses_dense_blas_budget_and_restores_baseline(monkeypatch, t
         return factorize(*args, **kwargs)
 
     monkeypatch.setenv('PYSCFAD_DENSE_BLAS_THREADS', '2')
-    monkeypatch.setattr(np.linalg, 'svd', recording_svd)
+    monkeypatch.setattr(aux, '_auxiliary_eigensystem', recording_svd)
     with threadpool_limits(limits=1, user_api='blas'):
         if tolerance > 9.:
             with pytest.raises(ValueError, match='every auxiliary direction'):
@@ -139,16 +139,16 @@ def test_compression_uses_dense_blas_budget_and_restores_baseline(monkeypatch, t
                 if pool['user_api'] == 'blas'} == {1}
 
 
-def test_one_forward_svd_and_no_pullback_factorization(monkeypatch):
+def test_one_forward_decomposition_and_no_pullback_factorization(monkeypatch):
     factors = jnp.asarray(example([3., 2., .2, .1]))
-    original_svd = np.linalg.svd
+    original_svd = aux._auxiliary_eigensystem
     calls = []
 
     def counted_svd(*args, **kwargs):
         calls.append(args[0].shape)
         return original_svd(*args, **kwargs)
 
-    monkeypatch.setattr(np.linalg, 'svd', counted_svd)
+    monkeypatch.setattr(aux, '_auxiliary_eigensystem', counted_svd)
     compressor = aux.make_compressor(.5)
     # Match the custom-VJP correction's eager inner fragment response.
     @jax.custom_vjp
@@ -171,6 +171,8 @@ def test_one_forward_svd_and_no_pullback_factorization(monkeypatch):
 
     monkeypatch.setattr(np.linalg, 'svd', forbidden)
     monkeypatch.setattr(np.linalg, 'eigh', forbidden)
+    monkeypatch.setattr(aux, 'eigh', forbidden)
+    monkeypatch.setattr(aux, '_auxiliary_eigensystem', forbidden)
     monkeypatch.setattr(np.linalg, 'cholesky', forbidden)
     monkeypatch.setattr(aux, 'solve_triangular', forbidden)
     gradient = pullback(jnp.asarray(1.))[0]
@@ -208,3 +210,74 @@ def test_tall_retaining_all_thin_svd_directions():
     numeric = np.vdot(cotangent, (compressor(factors + step * direction)
                                  - compressor(factors - step * direction)) / (2 * step))
     np.testing.assert_allclose(analytic, numeric, atol=2e-8, rtol=2e-7)
+
+
+@pytest.mark.parametrize('layout', ['C', 'F', 'strided'])
+def test_gram_storage_layout(monkeypatch, layout):
+    matrix = np.random.default_rng(73).normal(size=(7, 22))
+    matrix = matrix[:, ::2] if layout == 'strided' else np.array(matrix, order=layout)
+    original = aux.get_blas_funcs
+    calls = []
+
+    def get_blas(name, arrays):
+        routine = original(name, arrays)
+
+        def syrk(alpha, operand, **kwargs):
+            calls.append((operand.flags.f_contiguous,
+                          np.shares_memory(operand, matrix), kwargs['trans']))
+            gram = routine(alpha, operand, **kwargs)
+            np.testing.assert_allclose(np.tril(gram), np.tril(matrix @ matrix.T),
+                                       atol=2e-14, rtol=2e-14)
+            return gram
+
+        return syrk
+
+    monkeypatch.setattr(aux, 'get_blas_funcs', get_blas)
+    vectors, values, diagnostics = aux._auxiliary_eigensystem(matrix, .01)
+    assert diagnostics['method'] == 'gram_eigh'
+    assert calls == [(True, layout != 'strided', int(layout == 'C'))]
+    assert diagnostics['gram_copy_bytes'] == (matrix.nbytes if layout == 'strided' else 0)
+    np.testing.assert_allclose((vectors * values) @ vectors.T, matrix @ matrix.T,
+                               atol=5e-14, rtol=5e-14)
+
+
+def test_gram_matches_svd_with_fixed_anchor():
+    factors = example([3., 2., .2, .1])
+    matrix = packed(factors)
+    left, singular, _ = np.linalg.svd(matrix, full_matrices=False)
+    anchor = aux.AuxiliarySelection(2, left[:, :2])
+    compressor = aux.make_compressor(.5, selection=anchor)
+    compressed = compressor(jnp.asarray(factors))
+    np.testing.assert_allclose(compressed, unpack(left[:, :2].T @ matrix, 3), atol=3e-14)
+    assert compressor.diagnostics['method'] == 'gram_eigh'
+    np.testing.assert_allclose(compressor.diagnostics['boundary_kept_eigenvalue'], singular[1]**2)
+
+
+def test_gram_falls_back_when_cutoff_is_below_roundoff():
+    # The tiny retained direction would be vulnerable to Gram cancellation.
+    factors = example([3., 1e-8, 1e-10])
+    _, values, diagnostics = aux._auxiliary_eigensystem(packed(factors), 1e-18)
+    assert np.count_nonzero(values > 1e-18) == 2
+    assert diagnostics['method'] == 'svd_cutoff_fallback'
+    # Preserve the existing rejection of unresolved response boundaries.
+    with pytest.raises(ValueError, match='boundary is degenerate'):
+        aux.make_compressor(1e-18)(jnp.asarray(factors))
+
+
+def test_gram_fixed_anchor_gradient_matches_svd(monkeypatch):
+    factors = jnp.asarray(example([3., 3., .2, .1]))
+    anchor = aux.make_compressor(.5)
+    anchor(factors)
+    cotangent = jnp.asarray(np.random.default_rng(71).normal(size=(2, 3, 3)))
+    value, pullback = jax.vjp(aux.make_compressor(.5, selection=anchor.selection), factors)
+    gradient = pullback(cotangent)[0]
+
+    def svd(matrix, tol, selection=None):
+        left, singular, _ = np.linalg.svd(matrix, full_matrices=False)
+        return left, singular**2, {}
+
+    monkeypatch.setattr(aux, '_auxiliary_eigensystem', svd)
+    reference, reference_pullback = jax.vjp(
+        aux.make_compressor(.5, selection=anchor.selection), factors)
+    np.testing.assert_allclose(value, reference, atol=3e-14)
+    np.testing.assert_allclose(gradient, reference_pullback(cotangent)[0], atol=1e-12)

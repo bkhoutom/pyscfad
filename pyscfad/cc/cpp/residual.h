@@ -19,3 +19,4 @@ void bind_residual(pybind11::module_&, ResidualGemm, ResidualLadder);
 void bind_solver(pybind11::module_&);
 
 void bind_lambda(pybind11::module_&);
+void bind_integral_pullback(pybind11::module_&);

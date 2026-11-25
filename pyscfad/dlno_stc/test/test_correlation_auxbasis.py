@@ -93,13 +93,13 @@ def test_system_distinct_fit_total_energy_and_coordinate_gradient(molecule):
     native()
     total, gradient = dlno_stc.value_and_grad(
         molecule, _mf, boys_grouping="system", frozen=1, controls=_controls(),
-        correlation_auxbasis=RIFIT, include_hf=True)
+        correlation_auxbasis=RIFIT, include_hf=True, mp2_aux_svd_tol=None)
     np.testing.assert_allclose(total, _independent_mp2_total(molecule),
                                atol=3e-10, rtol=0)
     mf = _mf(molecule)
     energy_only = mf.e_tot + dlno_stc.kernel(
         mf, boys_grouping="system", frozen=1, controls=_controls(),
-        correlation_auxbasis=RIFIT)
+        correlation_auxbasis=RIFIT, mp2_aux_svd_tol=None)
     np.testing.assert_allclose(energy_only, total, atol=2e-11, rtol=0)
     direction = np.zeros((molecule.natm, 3))
     direction[1, 2] = 1

@@ -1,4 +1,4 @@
-"""Fragment-local auxiliary SVD compression with a cached subspace response.
+"""Fragment-local auxiliary compression with a cached subspace response.
 
 The forward factor uses an anchored orthonormal frame, so its derivative remains
 well defined when singular values repeat inside either side of the cutoff. This
@@ -11,21 +11,22 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
-from scipy.linalg import solve_triangular
+from scipy.linalg import eigh, solve_triangular
+from scipy.linalg.blas import get_blas_funcs
 
 from pyscfad.lib._threading import dense_blas_threads
 from pyscfad.tools import resource_profile
 
 
-def normalize_tolerance(tol):
+def normalize_tolerance(tol, *, name="lis_aux_svd_tol"):
     """Return a positive finite real cutoff, or None for disabled compression."""
     if tol is None:
         return None
     if isinstance(tol, (bool, np.bool_)) or not isinstance(tol, numbers.Real):
-        raise TypeError('lis_aux_svd_tol tolerance must be a nonnegative finite real number')
+        raise TypeError(f'{name} tolerance must be a nonnegative finite real number')
     value = float(tol)
     if not np.isfinite(value) or value < 0:
-        raise ValueError('lis_aux_svd_tol tolerance must be a nonnegative finite real number')
+        raise ValueError(f'{name} tolerance must be a nonnegative finite real number')
     return value if value > 0 else None
 
 
@@ -51,8 +52,59 @@ def _unpack(matrix, nmo):
     return result
 
 
+def _auxiliary_eigensystem(matrix, tol, selection=None):
+    """Return descending auxiliary eigenpairs without unused right vectors.
+
+    The auxiliary Gram is smaller for wide factors. Its roundoff is absolute
+    on the scale of the largest eigenvalue, so use the direct SVD when that
+    uncertainty could change a cutoff decision or the replay boundary.
+    Tall factors retain the thin SVD and its implicit left null space.
+    """
+    timings = dict(gram_s=0., eigensolve_s=0., svd_s=0.)
+    naux, npair = matrix.shape
+    method = 'svd_tall'
+    if naux <= npair:
+        start = time.perf_counter()
+        # f2py expects column-major storage. A C-order factor's transpose is
+        # already a Fortran-order view; SYRK's transpose flag avoids copying
+        # the full factor while still forming matrix @ matrix.T.
+        if matrix.flags.f_contiguous:
+            operand, trans, layout = matrix, 0, 'F'
+        elif matrix.flags.c_contiguous:
+            operand, trans, layout = matrix.T, 1, 'C'
+        else:
+            operand, trans, layout = np.asfortranarray(matrix), 0, 'strided'
+        timings.update(gram_copy_s=time.perf_counter() - start,
+                       gram_copy_bytes=matrix.nbytes if layout == 'strided' else 0,
+                       gram_input_order=layout, gram_trans=trans)
+        syrk = get_blas_funcs('syrk', (operand,))
+        multiply_start = time.perf_counter()
+        gram = syrk(1., operand, trans=trans, lower=1)
+        timings['gram_multiply_s'] = time.perf_counter() - multiply_start
+        timings['gram_s'] = time.perf_counter() - start
+        start = time.perf_counter()
+        values, vectors = eigh(gram, lower=True, overwrite_a=True, driver='evd')
+        values, vectors = values[::-1].copy(), vectors[:, ::-1].copy()
+        timings['eigensolve_s'] = time.perf_counter() - start
+        resolution = np.finfo(values.dtype).eps * max(matrix.shape) * abs(values[0])
+        uncertain = values[-1] < -resolution
+        if selection is None:
+            uncertain = uncertain or np.any(np.abs(values - tol) <= resolution)
+        elif isinstance(selection.rank, numbers.Integral) and 0 < selection.rank < naux:
+            rank = selection.rank
+            uncertain = uncertain or values[rank-1] - values[rank] <= 2 * resolution
+        if not uncertain:
+            # Roundoff can make a discarded zero eigenvalue slightly negative.
+            return vectors, np.maximum(values, 0.), dict(method='gram_eigh', **timings)
+        method = 'svd_cutoff_fallback'
+    start = time.perf_counter()
+    left, singular, _ = np.linalg.svd(matrix, full_matrices=False)
+    timings['svd_s'] = time.perf_counter() - start
+    return left, singular ** 2, dict(method=method, **timings)
+
+
 class AuxiliaryCompressor:
-    """One fragment's fixed selection; full SVD factors live only in its VJP."""
+    """One fragment's fixed selection; eigenpairs live only in its VJP."""
 
     def __init__(self, tol, *, selection=None):
         self.tol = normalize_tolerance(tol)
@@ -98,8 +150,9 @@ class AuxiliaryCompressor:
                 raise TypeError('auxiliary SVD compression requires real factors')
             rows, cols, weights = _packing(nmo, array.dtype)
             matrix = array[:, rows, cols] * weights
-            left, singular, _ = np.linalg.svd(matrix, full_matrices=False)
-            eigenvalues = singular ** 2
+            left, eigenvalues, decomposition = _auxiliary_eigensystem(
+                matrix, self.tol, self.selection)
+            self.diagnostics.update(decomposition)
             if self.selection is None:
                 rank = int(np.count_nonzero(eigenvalues > self.tol))
                 if rank == 0:
@@ -112,7 +165,7 @@ class AuxiliaryCompressor:
             if not isinstance(rank, numbers.Integral) or not 0 < rank <= min(matrix.shape):
                 raise ValueError('fixed auxiliary selection has an invalid retained rank')
             kept = float(eigenvalues[rank - 1])
-            discarded = float(eigenvalues[rank]) if rank < len(singular) else 0.
+            discarded = float(eigenvalues[rank]) if rank < len(eigenvalues) else 0.
             gap = kept - discarded
             discarded_weight = float(np.sum(eigenvalues[rank:]))
             total_weight = float(np.sum(eigenvalues))
@@ -161,15 +214,26 @@ def _pullback(residual, cotangent):
     # Adjoint of symmetric unpacking: both off-diagonal output entries count.
     packed_bar = (cotangent[:, rows, cols]
                   + jnp.where(rows == cols, 0., cotangent[:, cols, rows])) / weights
-    matrix_bar = frame @ packed_bar
-    frame_bar = matrix @ packed_bar.T
+    matrix_bar = _matrix_pullback(residual, packed_bar)
+
+    # Adjoint of lower-triangle weighted packing (upper input entries unused).
+    gradient = jnp.zeros((matrix.shape[0], nmo, nmo), dtype=matrix_bar.dtype)
+    return gradient.at[:, rows, cols].set(matrix_bar * weights)
+
+
+def _matrix_pullback(residual, matrix_cotangent, *, xp=jnp):
+    """Adjoint of the anchored spectral projection, for any pair layout."""
+    matrix, left, eigenvalues, anchor, projected, chol, inverse, frame = residual
+    rank = frame.shape[1]
+    matrix_bar = frame @ matrix_cotangent
+    frame_bar = matrix @ matrix_cotangent.T
 
     # Q = Y L^-T, LL^T = Y^T Y. Differentiate this exact forward gauge.
     projected_bar = frame_bar @ inverse.T
     inverse_bar = projected.T @ frame_bar
     chol_bar = -inverse @ inverse_bar.T @ inverse
     middle = chol.T @ chol_bar
-    middle = jnp.tril(middle) - .5 * jnp.diag(jnp.diag(middle))
+    middle = xp.tril(middle) - .5 * xp.diag(xp.diag(middle))
     gram_bar = inverse @ middle @ inverse.T
     projected_bar += projected @ (gram_bar + gram_bar.T)
 
@@ -189,9 +253,7 @@ def _pullback(residual, cotangent):
         null_mixing = (mixing_bar - left @ (left.T @ mixing_bar)) / eigenvalues[:rank]
         matrix_bar += null_mixing @ (retained.T @ matrix)
 
-    # Adjoint of lower-triangle weighted packing (upper input entries unused).
-    gradient = jnp.zeros((matrix.shape[0], nmo, nmo), dtype=matrix_bar.dtype)
-    return gradient.at[:, rows, cols].set(matrix_bar * weights)
+    return matrix_bar
 
 
 def make_compressor(tol, *, selection=None):

@@ -227,3 +227,22 @@ buffers, arena capacity, and populated storage. The planner reserves future
 DIIS growth and compares overlapping phase peaks with the caller's budget;
 there is no fixed system-size or RSS cap. Complex, unsupported, direct-DF ladder,
 and insufficient-memory cases retain the existing reference path.
+
+## DF integral pullbacks
+
+`integral_pullback.cpp` implements the real `ovvv` and `vvvv` adjoints directly
+to the DF factors. The Python adapter `_native_integral_pullback.py` supplies
+aligned C-contiguous float64 inputs and scopes BLAS to one thread, restoring
+the caller's settings on return. Both kernels use the same SciPy Cython BLAS
+function pointer and OpenMP runtime as lambda. The factor contractions use
+the shared `parallel_gemm` helper; GEMMs inside the `ovvv` slab loop stay serial.
+The `vvvv` kernel reuses one cubic virtual slab across iterations, rather than
+allocating one per worker. Older extensions retain the NumPy fallback.
+
+The deterministic DLNO route no longer calls `libcc_vjp`. Its canonical and
+legacy LNO triples entry points remain available through a lazy library loader;
+ordinary DLNO imports do not load that compatibility library.
+
+Directional derivative, reference contraction, layout and threading checks are
+in `test_native_integral_pullback.py`. The full DLNO energy/gradient regression
+also forbids legacy CC library calls and checks that both C++ pullbacks ran.

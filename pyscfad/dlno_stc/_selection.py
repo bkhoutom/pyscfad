@@ -145,7 +145,7 @@ class DomainSelections:
     weak_pair_energy: object = None
     forced_strong_mask: object = None
     boys_grouping: str = "singleton"
-    physical_groups: tuple[tuple[int, ...], ...] = ()
+    physical_groups: tuple[tuple[int, ...], ...] = ()  # domain-building partition; see _cc_groups
     correlation_basis_identity: str | None = None
     domain_convention: str = "individual-partners-pair4-pcd-aux-pao-norm2-v3"
     ed_selection_pending: bool = False
@@ -165,8 +165,8 @@ def _normalize_boys_grouping(grouping):
     """Use one name for the full-system partition, including old checkpoints."""
     if grouping == 'molecule':
         return 'system'
-    if grouping not in ('singleton', 'atom', 'system'):
-        raise ValueError("boys_grouping must be 'singleton', 'atom' or 'system'")
+    if grouping not in ('singleton', 'atom', 'atom_singleton', 'system'):
+        raise ValueError("boys_grouping must be 'singleton', 'atom', 'atom_singleton' or 'system'")
     return grouping
 
 
@@ -189,6 +189,14 @@ def _physical_groups(static):
     if mode == "system" and normalized != (tuple(range(len(static.fragments))),):
         raise ValueError("system physical fragment membership must contain every orbital record in one complete group")
     return normalized
+
+
+def _cc_groups(static):
+    """CC/LIS targets, independently of the saved domain-building partition."""
+    groups = _physical_groups(static)
+    if getattr(static, 'boys_grouping', None) == 'atom_singleton':
+        return tuple((i,) for i in range(len(static.fragments)))
+    return groups
 
 
 @dataclass(frozen=True)
@@ -802,6 +810,8 @@ def build_domain_selections(
     are finalized from the current reference when each fragment is prepared.
     ``boys_grouping="atom"`` shares strong frames within Löwdin atom groups;
     weak screens and target records remain individual occupied orbitals.
+    ``boys_grouping="atom_singleton"`` uses the same atom domains and MP2
+    partition, with one W/LIS/CC correction per original occupied orbital.
     ``boys_grouping="system"`` automatically uses full molecular domains
     and puts every active occupied target in one physical fragment.
     ``"molecule"`` is accepted as a compatibility alias for ``"system"``.
@@ -900,7 +910,7 @@ def build_domain_selections(
         products = _WeakScreenProducts(pao_products, tuple(overlap_targets[:, group] for group in groups))
     if boys_grouping == "system":
         physical_groups = (numpy.arange(len(groups), dtype=numpy.int32),)
-    elif boys_grouping == "atom":
+    elif boys_grouping in ("atom", "atom_singleton"):
         physical_groups = _boys_atom_groups(mol, targets, groups)
     else:
         physical_groups = tuple(numpy.array([i], dtype=numpy.int32) for i in range(len(groups)))
@@ -916,7 +926,7 @@ def build_domain_selections(
     if full_domain:
         compact, primary_bp, tight, primary = [tuple(numpy.arange(mol.natm, dtype=numpy.int32) for _ in groups) for _ in range(4)]
         pao_bp = tuple(numpy.arange(mol.natm, dtype=numpy.int32) for _ in range(pao_parent.size))
-    if boys_grouping == "atom":
+    if boys_grouping in ("atom", "atom_singleton"):
         # Each orbital keeps its own weak target on the group's common support.
         # Compact lists stay individual for the existing near-distance forcing.
         primary_bp, primary = list(primary_bp), list(primary)
@@ -1028,7 +1038,7 @@ def build_domain_selections(
     del reference_endpoints
     if primary_preparations is not None:
         primary_preparations.clear()
-    if boys_grouping == "atom":
+    if boys_grouping in ("atom", "atom_singleton"):
         strong = _group_domain_mask(strong, physical_groups)
     if response is not None:
         response.complete_weak(static, strong, endpoints, pair_response)
@@ -1071,7 +1081,7 @@ def physical_fragments_in_group(static, group):
     domains = static.mp2_static if hasattr(static, 'mp2_static') else static
     if not isinstance(domains, DomainSelections):
         raise TypeError('physical grouping requires STC Boys DomainSelections')
-    physical = _physical_groups(domains)
+    physical = _cc_groups(domains)
     owned = [(index, members) for index, members in enumerate(physical)
              if members[0] in group.fragment_indices]
     if not owned:

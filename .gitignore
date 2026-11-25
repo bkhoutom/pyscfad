@@ -142,6 +142,9 @@ dmypy.json
 /output/
 /tmp/
 
+# Local cluster submission script
+/submit.sh
+
 # Generated example calculations (keep large DF factors out of workspace diffs)
 /examples/dlno_stc/output/
 /examples/lno/*_cderi.h5

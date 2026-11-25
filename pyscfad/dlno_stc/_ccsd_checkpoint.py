@@ -29,12 +29,18 @@ def open_checkpoint(state, static, groups, *, checkpoint_dir, resume, options):
         # using its original numerical frame and quadrature. Regenerated BP
         # intermediates and roundoff must not change the checkpoint digest.
         static = resume_selections(checkpoint_dir, static)
+    native_version = _stc_mp2.matrix_kernel_version
+    # The D adapter restoration retains the same W calculation. Keep the
+    # W checkpoint identity for this specific native version transition.
+    if (static.lis_static.matrix_kind == 'W'
+            and native_version == 'src_code_rdm_v2:427459d9b91fc70f:standalone-6-d-w'):
+        native_version = 'src_code_rdm_v2:427459d9b91fc70f:standalone-5-w-only'
     payload = dict(reference=run_payload(state['mf'], static.mp2_static.frozen,
                                          driver='stc-global-hf-cc-v1',
                                          **basis_kwargs(state.get('correlation_auxbasis'))),
                    canonical={name: getattr(state['mf'], name)
                               for name in ('mo_coeff', 'mo_energy', 'mo_occ', 'e_tot')},
-                   native_version=_stc_mp2.matrix_kernel_version,
+                   native_version=native_version,
                    cc_convergence=(RCCSD.conv_tol, RCCSD.conv_tol_normt, RCCSD.max_cycle),
                    controls=static.controls_identity, options=options, groups=groups,
                    cc_selection_schema=static.schema_version,

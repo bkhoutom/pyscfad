@@ -1,6 +1,6 @@
-"""Physical Boys-fragment CCSD(T) corrections with shared W energy.
+"""Physical Boys-fragment CCSD(T) corrections with shared MP2 energy/response.
 
-Discrete domains and LIS ranks are fixed. Native W chooses each LIS in its
+Discrete domains and LIS ranks are fixed. Native D or W chooses each LIS in its
 STC frame. The solver uses normalized domain projections of the original
 physical Boys targets.
 """
@@ -97,7 +97,7 @@ class FragmentComponents:
 
 @dataclass(frozen=True)
 class CCSDComponents:
-    """Correlation accounting; W supplies its own strong-domain MP2 energy."""
+    """Correlation accounting with explicit D energy or the W energy trace."""
     e_mp2_base: float
     e_mp2_weak: float
     fragments: tuple
@@ -167,8 +167,9 @@ def _cc_solver_options(cc_solver, stc_cc_controls, lis_aux_svd_tol=None):
     return dict(options, cc_solver='stc', stc_cc_controls=normalize_controls(stc_cc_controls))
 
 
-def _normalize_controls(baseline_controls, matrix_controls, mp2_grid=None):
-    """Resolve one MP2/W quadrature, independently of the fitted triples grid."""
+def _normalize_controls(baseline_controls, matrix_controls, mp2_grid=None,
+                        matrix_kind='W'):
+    """Resolve one MP2/density quadrature, independently of the triples grid."""
     from .controls import resolve_mp2_grid
     grid = resolve_mp2_grid(mp2_grid)
     def with_grid(controls):
@@ -177,13 +178,13 @@ def _normalize_controls(baseline_controls, matrix_controls, mp2_grid=None):
         if not isinstance(controls, dict):
             raise TypeError('controls must be a dictionary')
         if {'laplace_roots', 'laplace_weights'} & controls.keys():
-            raise ValueError('CC MP2/W quadrature belongs in mp2_grid=(roots, weights), '
+            raise ValueError('CC MP2/density quadrature belongs in mp2_grid=(roots, weights), '
                              'not baseline_controls or matrix_controls')
         return dict(controls, **grid)
     baseline = driver._driver_controls(with_grid(baseline_controls))
     baseline.setdefault('mode', 'deterministic')
     baseline.setdefault('global_seed', 0)
-    matrix = normalize_matrix_controls(with_grid(matrix_controls))
+    matrix = normalize_matrix_controls(with_grid(matrix_controls), matrix_kind)
     return baseline, matrix
 
 
@@ -213,8 +214,11 @@ def _validate_run(static, baseline_controls, matrix_controls, mp2_grid=None):
         raise ValueError('only smooth LIS treatment is supported; rebuild smooth selections')
     if static.mp2_grid is None:
         raise ValueError('CC selections have no saved MP2 grid; rebuild selections')
+    if static.lis_static.sequential_virtual and static.lis_static.matrix_kind != 'W':
+        raise NotImplementedError('sequential_virtual supports W matrices only')
     baseline, matrix = _normalize_controls(
-        baseline_controls, matrix_controls, static.mp2_grid if mp2_grid is None else mp2_grid)
+        baseline_controls, matrix_controls, static.mp2_grid if mp2_grid is None else mp2_grid,
+        static.lis_static.matrix_kind)
     if static.selection_options is None and any(f is None for f in static.fragments):
         raise ValueError('CC selections must include every physical fragment; rebuild selections')
     if _scientific_identity(baseline, matrix) != static.controls_identity:
@@ -253,8 +257,14 @@ def build_static_selections(mf, mp2_static, *, thresh_occ, thresh_vir,
                             internal_rank_threshold=1e-6, merge_identical=True,
                             triples_laplace_points=4,
                             correlation_auxbasis=None, sequential_virtual=False,
-                            scale_lis_by_target_count=False):
-    """Record physical-fragment LIS cutoffs and controls for the W pipeline.
+                            scale_lis_by_target_count=False, matrix_kind='W'):
+    """Record physical-fragment LIS cutoffs and controls for D or W selection.
+
+    ``matrix_kind='W'`` is the default. ``'D'`` selects the MP2 amplitude-density
+    matrices and evaluates the domain MP2 scalar explicitly from amplitudes and
+    bare integrals. Both providers return energy and densities together and
+    combine their responses in one delayed pullback. D and W cutoffs are used
+    as supplied and are not numerically interchangeable.
 
     ``sequential_virtual=True`` is an opt-in deterministic forward-only trial:
     select occupied W first, then rebuild virtual W with the retained partner
@@ -264,23 +274,23 @@ def build_static_selections(mf, mp2_static, *, thresh_occ, thresh_vir,
     ``scale_lis_by_target_count=True`` multiplies both cutoffs by the original
     physical target LMO count, including before sequential virtual construction.
 
-    Use the run's ``correlation_auxbasis`` for W factors. ``None`` uses the
+    Use the run's ``correlation_auxbasis`` for density factors. ``None`` uses the
     SCF fit, or inherits the fit inside a driver-owned selection callback.
-    ``mp2_static`` is a concrete Boys ``DomainSelections``. Absolute W
+    ``mp2_static`` is a concrete Boys ``DomainSelections``. Absolute density
     eigenvalue cutoffs select the occupied and virtual spaces.
 
     Smooth anchored frames with full occupied and virtual Fock matrices are
     the only supported treatment.
-    W subspace and AO overlap response are retained; there are no internal
+    Density subspace and AO overlap response are retained; there are no internal
     Fock cluster projectors. Ranks, anchors and quadratures are held fixed
     during differentiation.
-    ``mp2_grid=(roots, weights)`` overrides the global fitted MP2/W grid
+    ``mp2_grid=(roots, weights)`` overrides the global fitted MP2/density grid
     saved by domain selection. ``None`` reuses that saved grid. Control dictionaries contain no
     quadrature keys. ``triples_laplace_points`` independently fits four points
     per LIS by default, using triple-excitation denominators.
-    This function records selection settings without building W. Each fragment
-    builds W once in production, selects its LIS and fits its independent (T)
-    grid, then consumes the same W in CCSD(T) and the combined pullback.
+    This function records selection settings without building matrices. Each
+    fragment builds D or W once in production, selects its LIS and fits its
+    independent (T) grid, then reuses that result in CCSD(T) and the pullback.
     Discrete labels and both grids remain fixed during that fragment's response.
     Occupied and virtual LNO eigenproblems always
     use compact extended-domain coordinates, preserving the projected target
@@ -292,8 +302,12 @@ def build_static_selections(mf, mp2_static, *, thresh_occ, thresh_vir,
     Resident H_ED reuse is the default for energies and gradients; set
     PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE=direct for regeneration.
     """
+    if matrix_kind not in ('D', 'W'):
+        raise ValueError("matrix_kind must be 'D' or 'W'")
     if not isinstance(sequential_virtual, bool):
         raise TypeError('sequential_virtual must be a bool')
+    if sequential_virtual and matrix_kind != 'W':
+        raise NotImplementedError('sequential_virtual supports W matrices only')
     if not isinstance(scale_lis_by_target_count, bool):
         raise TypeError('scale_lis_by_target_count must be a bool')
     correlation_auxbasis = selection_auxbasis(mf, correlation_auxbasis)
@@ -313,7 +327,8 @@ def build_static_selections(mf, mp2_static, *, thresh_occ, thresh_vir,
         saved_grid, grid_diagnostics = select_mp2_grid(
             spectrum[mp2_static.active_occ_indices], spectrum[mp2_static.active_vir_indices],
             grid=mp2_grid)
-    baseline, matrix = _normalize_controls(baseline_controls, matrix_controls, saved_grid)
+    baseline, matrix = _normalize_controls(baseline_controls, matrix_controls, saved_grid,
+                                           matrix_kind)
     saved_grid = (baseline['laplace_roots'].copy(), baseline['laplace_weights'].copy())
     indices = tuple(range(len(_physical_groups(mp2_static))))
     physical = _physical_groups(mp2_static)
@@ -322,7 +337,7 @@ def build_static_selections(mf, mp2_static, *, thresh_occ, thresh_vir,
     lis = LISSelections(mp2_static, thresh_occ, thresh_vir,
         internal_rank_threshold, tuple(selections),
         tuple(frames), tuple(grids), sequential_virtual=sequential_virtual,
-        scale_lis_by_target_count=scale_lis_by_target_count)
+        scale_lis_by_target_count=scale_lis_by_target_count, matrix_kind=matrix_kind)
     return CCSDSelections(lis, _scientific_identity(baseline, matrix),
         selection_options=dict(indices=tuple(indices),
             triples_laplace_points=triples_laplace_points),
@@ -460,7 +475,7 @@ def _allocate_triples_controls(controls, nfragments, *, static=None, indices=Non
     plan = getattr(static, 'selection_options', None)
     allocation = controls.get('variance_allocation', 'occupied_count' if plan else 'mp2_energy')
     if plan and allocation != 'occupied_count':
-        raise ValueError('the W pipeline requires occupied_count variance allocation')
+        raise ValueError('the deferred LIS pipeline requires occupied_count variance allocation')
     if allocation == 'occupied_count':
         if static is None or 'fragment_energies' in controls:
             raise ValueError('occupied_count allocation requires domains and no energy proxies')
@@ -673,10 +688,13 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
     scalar component records and the accumulated numerical host bars survive.
     One preparation pullback consumes the sum of its input cotangents and
     direct LIS frame cotangents. The domain frame and its reverse are shared
-    by domain MP2/W and every physical-fragment correction in this group.
+    by domain MP2/density and every physical-fragment correction in this group.
     """
     from pyscfad.lno._df_shared import release_consumed_inputs
     sequential = getattr(getattr(static, "lis_static", None), "sequential_virtual", False)
+    matrix_kind = getattr(getattr(static, 'lis_static', None), 'matrix_kind', 'W')
+    if sequential and matrix_kind != 'W':
+        raise NotImplementedError('sequential_virtual supports W matrices only')
     if sequential and with_grad:
         raise NotImplementedError('sequential_virtual currently supports forward energies only')
     if sequential and matrix_controls.get('mode', 'deterministic') != 'deterministic':
@@ -698,7 +716,7 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
                              else backend.solve_matrices)
             forward = matrix_solver(
                 host, {'fragment_id': index, 'target_indices': targets},
-                matrix_controls)
+                matrix_controls, **({'matrix_kind': matrix_kind} if matrix_kind != 'W' else {}))
         if sequential:
             from .lis import occupied_selection_rotation
             with resource_profile.section('stc.cc.sequential_virtual', frag=index+1):
@@ -942,7 +960,7 @@ def _run_serial(state, static, baseline, matrix, *, with_grad, include_hf,
 def _finish(state, static, records, *, with_grad, include_hf, return_components):
     components = CCSDComponents(state.get('baseline_energy', 0.), state.get('weak_energy', 0.),
                                 tuple(sorted(records, key=lambda item: item.fragment_index)),
-                                'W', state['variance'] ** .5)
+                                static.lis_static.matrix_kind, state['variance'] ** .5)
     if components.stc_standard_error is not None:
         driver.lib.logger.info(state['mf'],
             'STC final selected-correction empirical SE %.6g mEh; target %.6g mEh; met %s',
@@ -989,18 +1007,20 @@ def kernel(mf, static=None, *, baseline_controls=None, matrix_controls=None, mp2
            lis_aux_svd_tol=1e-5):
     """Return correlation energy, or total energy with ``include_hf=True``.
 
-    ``correlation_auxbasis`` selects local MP2, W and CC fitting; HF/Fock
+    ``correlation_auxbasis`` selects local MP2, D/W and CC fitting; HF/Fock
     retain the SCF fit. Use the same basis for selection and execution.
     ``lis_aux_svd_tol`` compresses only LIS auxiliary factors with the strict
     squared-singular-value cutoff ``s**2 > tol`` (default ``1e-5``).
     Pass ``None`` or zero to disable compression.
-    Domain MP2, W and orbital selection remain unchanged. Compression
+    Domain MP2, D/W and orbital selection remain unchanged. Compression
     diagnostics are included in each fragment's ``auxiliary_compression``.
     ``return_components=True`` returns ``(energy, CCSDComponents)``. With W,
     strong-domain MP2 energy is read directly from its traces, in deterministic
-    and stochastic modes. Matrix
-    controls set its precision; there is no separate strong-domain MP2 solve.
-    ``mp2_grid=(roots, weights)`` supplies MP2/W quadrature and must match
+    and stochastic modes. With D, the matrix provider computes MP2 explicitly
+    from amplitudes and bare integrals. Matrix controls set the provider's
+    precision; D's ``energy_tolerance`` controls its separate scalar sampling.
+    Both combine energy and LIS derivatives in the same delayed reverse.
+    ``mp2_grid=(roots, weights)`` supplies MP2/density quadrature and must match
     selection. ``None`` reuses the grid saved in the selections. The separately fitted
     (T) grids come from the saved selections. The MP2 baseline includes weak
     completion.
@@ -1015,7 +1035,7 @@ def kernel(mf, static=None, *, baseline_controls=None, matrix_controls=None, mp2
     divides variance according to ``variance_allocation``. ``occupied_count``
     uses each physical fragment's occupied targets divided by all active
     occupied orbitals; it is required by
-    the W pipeline. The legacy ``mp2_energy`` allocation uses saved
+    the deferred LIS pipeline. The legacy ``mp2_energy`` allocation uses saved
     absolute MP2 fragment energies; ``fragment_energies`` overrides those
     proxies. In the smooth path, ``pilot_samples`` defaults to 10000 per
     point and determines independent production counts.

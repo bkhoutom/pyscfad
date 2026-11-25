@@ -1,4 +1,4 @@
-"""Resumable smooth LNO(W)-CCSD(T) energy/force benchmark.
+"""Resumable smooth LNO(D/W)-CCSD(T) energy/force benchmark.
 
 The serial queue runs one realization per process with deterministic domain/LIS
 selection. Fresh calculations share one differentiable SCF between selection
@@ -92,10 +92,12 @@ def main():
                         help="regenerate local integrals or retain H_ED for one-pass reuse (default)")
     parser.add_argument("--cc-conv-tol", type=float, default=1e-7)
     parser.add_argument("--cc-conv-tol-normt", type=float, default=1e-5)
+    parser.add_argument("--matrix-kind", choices=("W", "D"), default="W",
+                        help="LIS selection matrix; D evaluates MP2 energy explicitly")
     parser.add_argument("--lno-thresh-occ", type=float, default=1e-4,
-                        help="occupied W-eigenvalue cutoff for LIS selection")
+                        help="occupied density-eigenvalue cutoff for LIS selection")
     parser.add_argument("--lno-thresh-vir", type=float, default=1e-5,
-                        help="virtual W-eigenvalue cutoff for LIS selection")
+                        help="virtual density-eigenvalue cutoff for LIS selection")
     parser.add_argument("--triples-method", choices=("smooth",),
                         default="smooth")
     parser.add_argument("--triples-laplace-points", type=int, default=4)
@@ -129,7 +131,7 @@ def main():
         parser.error('--scf-df-precond requires --scf-jk df')
     os.environ['PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE'] = args.fragment_df_mode
     if args.triples_variance_allocation != 'occupied_count':
-        parser.error('W pipeline requires occupied_count variance allocation')
+        parser.error('deferred LIS pipeline requires occupied_count variance allocation')
     if args.threads < 1:
         parser.error("--threads must be positive")
     benchmark_cpus = configure_cpu_workload(args.threads)
@@ -196,6 +198,7 @@ def main():
             raise ValueError('domain thresholds differ; use a new output directory')
         # Missing scf_jk identifies legacy DF runs, independently of the CLI default.
         for key, value, old_default in (
+                ('matrix_kind', args.matrix_kind, 'W'),
                 ('scf_jk', args.scf_jk, 'df'),
                 ('sgx_grid_level', args.sgx_grid_level, 2),
                 ('sgx_fit_overlap', args.sgx_fit_overlap, True),
@@ -286,6 +289,7 @@ def main():
                     boys_grouping=args.boys_grouping, full_domain=full_domain,
                     lo_kwargs=boys_options, pair_energy_model='multipole'),
                 selection_options=dict(thresh_occ=args.lno_thresh_occ,
+                    matrix_kind=args.matrix_kind,
                     thresh_vir=args.lno_thresh_vir, internal_rank_threshold=1e-6,
                     triples_laplace_points=args.triples_laplace_points))
             report('Loaded saved Boys/domain/LIS selections; no selection searches')
@@ -441,9 +445,10 @@ def main():
         roots, weights = domains.mp2_grid
         diagnostics = domains.mp2_grid_diagnostics
         selection_start = time.perf_counter()
-        report(f"Configuring W-LIS selection: occupied cutoff={args.lno_thresh_occ:g}, "
+        report(f"Configuring {args.matrix_kind}-LIS selection: occupied cutoff={args.lno_thresh_occ:g}, "
                f"virtual cutoff={args.lno_thresh_vir:g}")
         selection_options = dict( thresh_occ=args.lno_thresh_occ,
+                                 matrix_kind=args.matrix_kind,
 
                                  thresh_vir=args.lno_thresh_vir,
                                  baseline_controls=baseline, matrix_controls=matrix,
@@ -466,7 +471,9 @@ def main():
                         auxbasis=auxbasis or "auto", frozen=args.frozen, boys_grouping=args.boys_grouping,
                         full_domain=full_domain, physical_fragments=expected_groups,
                         domain_thresholds=asdict(domains.thresholds), mp2_domains=mp2_domains,
-                        mp2_energy_source="w_matrix_trace", mp2_response="joint_energy_w_pullback",
+                        matrix_kind=args.matrix_kind,
+                        mp2_energy_source=("w_matrix_trace" if args.matrix_kind == "W" else "explicit_mp2_contraction"),
+                        mp2_response=f"joint_energy_{args.matrix_kind.lower()}_pullback",
                         pair_energy_model=domains.pair_energy_model,
                         lno_thresh_occ=args.lno_thresh_occ, lno_thresh_vir=args.lno_thresh_vir,
 
@@ -525,7 +532,7 @@ def main():
         settings.update(sgx_settings)
         save(output / "settings.json", settings)
         report(f"CPU affinity {benchmark_cpus}; all {affinity['runtime_threads']} runtime threads verified")
-        report(f"Planned {expected_groups} fragments: one W build and shared input pullback; "
+        report(f"Planned {expected_groups} fragments: one {args.matrix_kind} build and shared input pullback; "
                "LIS ranks/anchors will be selected within each production fragment")
         report(f"Smooth frame blocks {frame_blocks}; persistent JAX cache enabled: "
                f"{bool(jax.config.jax_enable_compilation_cache)}")
@@ -599,7 +606,9 @@ def main():
                       full_domain=full_domain,
                       domain_thresholds=settings["domain_thresholds"],
                       mp2_domains=settings["mp2_domains"],
-                      mp2_energy_source="w_matrix_trace", mp2_response="joint_energy_w_pullback",
+                      matrix_kind=args.matrix_kind,
+                      mp2_energy_source=settings["mp2_energy_source"],
+                      mp2_response=settings["mp2_response"],
                       triples_mode=args.triples_method,
 
 

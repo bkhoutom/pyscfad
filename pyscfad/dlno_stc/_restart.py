@@ -292,6 +292,9 @@ def _encode_value(value, writer=None, *, require_registered_dataclass=True):
                 if not (type(value).__name__ == 'LISSelections'
                         and field.name in ('sequential_virtual', 'scale_lis_by_target_count')
                         and not getattr(value, field.name))
+                # W is the historical default; old checkpoint digests stay valid.
+                if not (type(value).__name__ == 'LISSelections'
+                        and field.name == 'matrix_kind' and value.matrix_kind == 'W')
             ],
         }
     if isinstance(value, tuple):
@@ -439,7 +442,7 @@ def _decode_value(node, reader):
                     if cls.__name__ == 'DomainSelections' else
                     {'ed_pao_rank'} if cls.__name__ == 'BoysDomainThresholds' else
                     {'correlation_basis_identity'} if cls.__name__ == 'CCSDSelections' else
-                    {'sequential_virtual', 'scale_lis_by_target_count'}
+                    {'sequential_virtual', 'scale_lis_by_target_count', 'matrix_kind'}
                     if cls.__name__ == 'LISSelections' else set())
         compatible = tuple(name for name in expected if name in names or name not in optional)
         if names != compatible:

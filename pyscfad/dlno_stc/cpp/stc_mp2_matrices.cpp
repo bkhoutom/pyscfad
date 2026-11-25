@@ -1,11 +1,13 @@
-// Thin standalone array adapter for the supplied selected energy/W kernels.
+// Thin standalone array adapter for the supplied selected energy and D/W kernels.
 #include "stc_mp2_matrices.h"
 #include "native/stc_mp2_deterministic_energy.h"
 #include "native/stc_mp2_deterministic_d_w.h"
+#include "native/stc_mp2_selected_energy_density.h"
 #include "native/stc_mp2_stochastic_w.h"
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 #include <map>
+#include <numeric>
 #include <set>
 
 namespace libgmbpt {
@@ -38,7 +40,7 @@ using NativeKernel = libgmbpt::qchem::stc_mp2_kernel;
 namespace {
 
 constexpr const char* matrix_kernel_version =
-    "src_code_rdm_v2:427459d9b91fc70f:standalone-5-w-only";
+    "src_code_rdm_v2:427459d9b91fc70f:standalone-6-d-w";
 
 // OpenMP ICVs belong to this calling thread. Deterministic W construction may
 // shrink teams within the explicit budget; other calls retain fixed teams.
@@ -255,6 +257,7 @@ double real_control(const py::dict& controls, const char* key, double fallback,
 // Owned record, independent of Python arrays. No registry or retained B tensor.
 struct MatrixReplay {
     bool stochastic = false;
+    bool density_matrix = false;
     std::string native_version = matrix_kernel_version;
     std::uint64_t fingerprint = 0;
     std::uint64_t seed = 0;
@@ -263,6 +266,11 @@ struct MatrixReplay {
     std::vector<size_t> targets;
     std::vector<arma::uword> offsets;
     density::options occupied_options, virtual_options;
+    double energy_target = 3e-4;
+    double energy_domain_tau = .0065;
+    size_t energy_peak_production_draws = 0;
+    size_t energy_reverse_workspace_bytes = 0;
+    source::selected_density_replay_plan d_plan;
     density::stochastic_w_replay_plan w_plan;
 };
 
@@ -290,6 +298,9 @@ void check_control_keys(const py::dict& controls, const MatrixReplay& replay) {
     if (replay.stochastic) {
         allowed.insert({"matrix_tolerance", "domain_tau", "virtual_domain_tau",
                         "pair_pilot_samples", "min_samples"});
+        if (replay.density_matrix) {
+            allowed.insert({"energy_tolerance", "system_workload_cutoff", "resident_points"});
+        }
     }
     for (auto item : controls) {
         const auto key = py::cast<std::string>(item.first);
@@ -318,10 +329,11 @@ struct MatrixSettings {
 };
 
 MatrixSettings read_settings(const Inputs& inputs, py::handle targets,
-                             const py::dict& controls) {
+                             const py::dict& controls, bool density_matrix = false) {
     MatrixSettings settings;
     settings.replay = std::make_shared<MatrixReplay>();
     auto& replay = *settings.replay;
+    replay.density_matrix = density_matrix;
     replay.targets = read_targets(targets, inputs.foo.n_rows);
     replay.offsets = inputs.aux_offsets;
     const auto mode = controls.contains("mode")
@@ -349,9 +361,17 @@ MatrixSettings read_settings(const Inputs& inputs, py::handle targets,
     occupied.min_samples = integer_control(controls, "min_samples", 64, 2);
     occupied.seed = native_seed(replay.seed);
     occupied.threads = replay.threads;
+    if (replay.density_matrix) {
+        occupied.resident_points = integer_control(controls, "resident_points", 3);
+        if (occupied.resident_points != 2 && occupied.resident_points != 3) {
+            throw py::value_error("resident_points must be 2 or 3");
+        }
+        replay.energy_target = real_control(controls, "energy_tolerance", 3e-4);
+        replay.energy_domain_tau = real_control(controls, "system_workload_cutoff", .0065);
+    }
     settings.virtuals = occupied;
     settings.virtuals.domain_tau = real_control(controls, "virtual_domain_tau", .0003, true);
-    settings.virtuals.w_virtual_reform = true;
+    settings.virtuals.w_virtual_reform = !replay.density_matrix;
     replay.occupied_options = settings.occupied;
     replay.virtual_options = settings.virtuals;
     return settings;
@@ -388,21 +408,65 @@ struct MatrixOutput {
     double occupied_frobenius_se = 0, virtual_frobenius_se = 0;
     bool occupied_target_met = true, virtual_target_met = true;
     size_t pilot_draws = 0, production_draws = 0;
+    size_t energy_pilot_draws = 0, energy_production_draws = 0;
     arma::mat occupied, virtuals, occupied_se, virtual_se;
     MatrixTimings timings;
 };
 
 MatrixOutput deterministic_forward(Inputs& inputs, const MatrixReplay& replay) {
-    auto result = density::selected_deterministic_mp2_w_forward_consume(
+    auto result = replay.density_matrix ? density::selected_deterministic_mp2_forward(
+        inputs.foo, inputs.fvv, inputs.B, replay.beta, replay.weights,
+        replay.targets, replay.threads) : density::selected_deterministic_mp2_w_forward_consume(
         inputs.foo, inputs.fvv, inputs.B, replay.beta, replay.weights,
         replay.targets, replay.threads);
     MatrixOutput output;
     output.timings = deterministic_timings(result);
     output.energy = result.energy;
-    output.occupied = std::move(result.energy_occupied);
-    output.virtuals = std::move(result.energy_virtuals);
+    output.occupied = replay.density_matrix
+        ? std::move(result.occupied) : std::move(result.energy_occupied);
+    output.virtuals = replay.density_matrix
+        ? std::move(result.virtuals) : std::move(result.energy_virtuals);
     output.occupied_se.zeros(output.occupied.n_rows, output.occupied.n_cols);
     output.virtual_se.zeros(output.virtuals.n_rows, output.virtuals.n_cols);
+    return output;
+}
+
+MatrixOutput stochastic_d_forward(const Inputs& inputs, MatrixSettings& settings) {
+    auto& replay = *settings.replay;
+    NativeKernel kernel(inputs.foo, inputs.fvv, inputs.B, offsets_array(inputs),
+                        native_seed(replay.seed), replay.energy_domain_tau);
+    auto forward = source::selected_mp2_forward(
+        kernel, replay.beta, replay.weights, replay.targets, replay.energy_target,
+        replay.occupied_options, replay.virtual_options);
+    replay.d_plan = std::move(forward.replay);
+    // The scalar sampler releases its update records after each point.
+    for (const auto& point : replay.d_plan.energy_points) {
+        const auto& counts = point.production_counts;
+        replay.energy_peak_production_draws = std::max(replay.energy_peak_production_draws,
+            std::accumulate(counts.begin(), counts.end(), size_t{0}));
+    }
+    replay.energy_reverse_workspace_bytes = NativeKernel::gradient_sampling_workspace(
+        replay.energy_peak_production_draws, inputs.B.n_cols, inputs.aux_offsets.size() - 1,
+        replay.threads);
+    auto& result = forward.primal;
+    auto& occupied = result.densities.occupied;
+    auto& virtuals = result.densities.virtuals;
+    MatrixOutput output;
+    output.energy = result.energy;
+    output.energy_se = std::sqrt(result.variance);
+    output.occupied = std::move(occupied.matrix);
+    output.virtuals = std::move(virtuals.matrix);
+    output.occupied_se = std::move(occupied.standard_error);
+    output.virtual_se = std::move(virtuals.standard_error);
+    output.occupied_frobenius_se = occupied.frobenius_se;
+    output.virtual_frobenius_se = virtuals.frobenius_se;
+    output.occupied_target_met = occupied.target_met;
+    output.virtual_target_met = virtuals.target_met;
+    output.energy_pilot_draws = result.energy_pilot_samples;
+    output.energy_production_draws = result.energy_production_samples;
+    output.pilot_draws = occupied.pilot_draws + virtuals.pilot_draws + output.energy_pilot_draws;
+    output.production_draws = occupied.production_draws + virtuals.production_draws
+        + output.energy_production_draws;
     return output;
 }
 
@@ -467,7 +531,7 @@ py::dict matrix_result(const MatrixOutput& output,
     finite_outputs(output.energy, output.occupied, output.virtuals);
     py::dict diagnostics;
     diagnostics["mode"] = replay->stochastic ? "stochastic" : "deterministic";
-    diagnostics["matrix_kind"] = "W";
+    diagnostics["matrix_kind"] = replay->density_matrix ? "D" : "W";
     diagnostics["target_indices"] = replay->targets;
     diagnostics["global_seed"] = replay->seed;
     diagnostics["native_seed"] = native_seed(replay->seed);
@@ -479,6 +543,10 @@ py::dict matrix_result(const MatrixOutput& output,
         ? option_values(replay->occupied_options) : py::dict();
     effective_options["virtual"] = replay->stochastic
         ? option_values(replay->virtual_options) : py::dict();
+    if (replay->stochastic && replay->density_matrix) {
+        effective_options["energy_tolerance"] = replay->energy_target;
+        effective_options["system_workload_cutoff"] = replay->energy_domain_tau;
+    }
     diagnostics["effective_options"] = effective_options;
     diagnostics["energy_standard_error"] = output.energy_se;
     diagnostics["occupied_standard_error"] = as_array(output.occupied_se);
@@ -489,6 +557,11 @@ py::dict matrix_result(const MatrixOutput& output,
     diagnostics["virtual_target_met"] = output.virtual_target_met;
     diagnostics["pilot_draws"] = output.pilot_draws;
     diagnostics["production_draws"] = output.production_draws;
+    if (replay->stochastic && replay->density_matrix) {
+        diagnostics["energy_pilot_draws"] = output.energy_pilot_draws;
+        diagnostics["energy_production_draws"] = output.energy_production_draws;
+        diagnostics["energy_peak_production_draws"] = replay->energy_peak_production_draws;
+    }
     diagnostics["native_timings"] = output.timings;
     py::dict result;
     result["energy"] = output.energy;
@@ -501,20 +574,24 @@ py::dict matrix_result(const MatrixOutput& output,
 
 py::dict solve_matrices(py::handle foo, py::handle fvv, py::handle b,
                         py::handle targets, const py::dict& controls,
-                        py::object offsets) {
+                        py::object offsets, const std::string& kind) {
+    if (kind != "D" && kind != "W") {
+        throw py::value_error("matrix_kind must be D or W");
+    }
     auto inputs = input_arrays(foo, fvv, b);
     read_offsets(inputs, offsets);
     positive_gap(inputs);
-    auto settings = read_settings(inputs, targets, controls);
+    auto settings = read_settings(inputs, targets, controls, kind == "D");
     MatrixOutput output;
     {
         py::gil_scoped_release release;
         ThreadScope team(settings.replay->threads,
-                         !settings.replay->stochastic);
+                         !settings.replay->density_matrix && !settings.replay->stochastic);
         const double started = omp_get_wtime();
         if (!settings.replay->stochastic) {
             output = deterministic_forward(inputs, *settings.replay);
-
+        } else if (settings.replay->density_matrix) {
+            output = stochastic_d_forward(inputs, settings);
         } else {
             output = stochastic_w_forward(inputs, settings);
         }
@@ -618,12 +695,23 @@ Result replay_pullback(Inputs& inputs, const MatrixReplay& replay,
                        const arma::mat& virtual_bar, MatrixTimings& timings) {
     Result bars;
     if (!replay.stochastic) {
-        auto result = density::selected_deterministic_mp2_w_vjp_consume(
+        auto result = replay.density_matrix ? density::selected_deterministic_mp2_vjp(
+            inputs.foo, inputs.fvv, inputs.B, replay.beta, replay.weights,
+            replay.targets, replay.threads, energy_bar, occupied_bar, virtual_bar)
+            : density::selected_deterministic_mp2_w_vjp_consume(
             inputs.foo, inputs.fvv, inputs.B, replay.beta, replay.weights,
             replay.targets, replay.threads, energy_bar, occupied_bar, virtual_bar);
         timings = deterministic_timings(result);
         bars.foo = std::move(result.bar_fo);
         bars.fvv = std::move(result.bar_fv);
+        bars.B = std::move(result.bar_b);
+    } else if (replay.density_matrix) {
+        NativeKernel kernel(inputs.foo, inputs.fvv, inputs.B, offsets_array(inputs),
+                            native_seed(replay.seed), replay.energy_domain_tau);
+        auto result = source::selected_mp2_vjp(
+            kernel, replay.d_plan, energy_bar, occupied_bar, virtual_bar);
+        bars.foo = std::move(result.bar_occ);
+        bars.fvv = std::move(result.bar_virt);
         bars.B = std::move(result.bar_b);
     } else {
         auto result = density::selected_stochastic_w_vjp(
@@ -730,11 +818,12 @@ void bind_matrices(py::module_& module) {
     module.def("finish_sequential_virtual",&finish_sequential);
 
     module.attr("matrix_kernel_version") = matrix_kernel_version;
-    py::class_<MatrixReplay, std::shared_ptr<MatrixReplay>>(module, "MatrixReplay");
+    py::class_<MatrixReplay, std::shared_ptr<MatrixReplay>>(module, "MatrixReplay")
+        .def_readonly("energy_reverse_workspace_bytes", &MatrixReplay::energy_reverse_workspace_bytes);
     module.def("solve_matrices", &solve_matrices,
                py::arg("foo"), py::arg("fvv"), py::arg("B"), py::arg("target_indices"),
                py::arg("controls"),
-               py::arg("aux_offsets") = py::none());
+               py::arg("aux_offsets") = py::none(), py::arg("matrix_kind") = "W");
     module.def("pullback_matrices", [](py::handle foo, py::handle fvv, py::handle b,
             const MatrixReplay& replay, double energy_bar,
             py::handle occupied_bar, py::handle virtual_bar) {

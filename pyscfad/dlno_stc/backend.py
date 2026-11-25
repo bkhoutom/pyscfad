@@ -1,4 +1,4 @@
-"""In-memory domain MP2 and W solvers with explicit host cotangents."""
+"""In-memory domain MP2 and matrix solvers with explicit host cotangents."""
 import importlib
 import math
 from contextlib import nullcontext
@@ -89,6 +89,7 @@ class _MatrixReplay:
     aux_offsets: np.ndarray
     batches: tuple
     native_version: str
+    energy_reverse_workspace_bytes: int = 0
     memory_warned: set = field(default_factory=set, compare=False, repr=False)
 
 
@@ -139,15 +140,19 @@ def _matrix_batch_controls(settings, batch_count, seed):
 
 
 def _check_matrix_memory(inputs, ntarget, settings, offsets, *,
-                         stage="forward", warned=None):
+                         matrix_kind="W", stage="forward", warned=None,
+                         energy_reverse_workspace_bytes=0):
     """Check each staged call against current residency before tensor copies."""
     from ._memory import observe_memory
     from .controls import estimate_matrix_memory, check_solver_memory
 
     naux, nocc, nvir = inputs["B"].shape
     estimate = estimate_matrix_memory(naux, nocc, nvir, ntarget, settings,
-                                       with_grad=True,
-                                      auxiliary_group_count=len(offsets)-1)
+                                      matrix_kind=matrix_kind, with_grad=True,
+                                      auxiliary_group_count=len(offsets) - 1)
+    if energy_reverse_workspace_bytes:
+        estimate["energy_reverse_updates"] = energy_reverse_workspace_bytes
+        estimate["total_bytes"] += energy_reverse_workspace_bytes
     observation = observe_memory()
     resident_mb = observation.rss_mb
     peak_bytes = (None if resident_mb is None else
@@ -163,32 +168,35 @@ def _check_matrix_memory(inputs, ntarget, settings, offsets, *,
         for name in names)
     forecast = estimate if peak_bytes is None else {"total_bytes": peak_bytes}
     check_solver_memory(forecast, settings.get("memory_limit_mb"),
-                        stage=f"matrix W {stage}",
+                        stage=f"matrix {matrix_kind} {stage}",
                         estimate_kind="workspace" if peak_bytes is None else "peak",
                         unavoidable_bytes=unavoidable_bytes, warned=warned,
                         observation=observation)
     return estimate, resident_mb, peak_bytes
 
 
-def solve_matrices(inputs, metadata, controls, *, aux_offsets=None):
-    """Return native E and W blocks, with a delayed arbitrary-seed reverse.
+def solve_matrices(inputs, metadata, controls, *, matrix_kind="W", aux_offsets=None):
+    """Return native energy and matrix blocks with a delayed arbitrary-seed reverse.
 
     Blocks are sums over selected targets in exactly the input frame. W's
     sampling allocation controls matrix error. Its native energy is the half
     sum of occupied and virtual traces, with their covariance included in SE.
+    D returns the density blocks and allocates stochastic sampling for the
+    selected MP2 energy separately.
     CCSD/(T) consumes this forward result for its MP2 baseline and LIS response.
     Standalone MP2 uses the scalar solve interface instead.
     """
     from .controls import normalize_matrix_controls
 
-    settings = normalize_matrix_controls(controls)
+    settings = normalize_matrix_controls(controls, matrix_kind)
     validate_full_inputs(inputs)
     naux, nocc, nvir = inputs["B"].shape
     targets = _matrix_targets(metadata, nocc)
     offsets = _matrix_aux_offsets(naux, aux_offsets, settings["auxiliary_group_size"])
     memory_warned = set()
     estimate, resident_mb, peak_bytes = _check_matrix_memory(
-        inputs, len(targets), settings, offsets, warned=memory_warned)
+        inputs, len(targets), settings, offsets, matrix_kind=matrix_kind,
+        warned=memory_warned)
     # Check before making host/layout copies or entering the native allocator.
     arrays = host_inputs(inputs)
     saved_metadata = deepcopy(metadata)
@@ -206,19 +214,22 @@ def solve_matrices(inputs, metadata, controls, *, aux_offsets=None):
     saved_metadata["native_version"] = native_version
     saved_metadata["native_options"] = []
     result = {"energy": np.float64(0.), "occupied": np.zeros((nocc, nocc)),
-              "virtual": np.zeros((nvir, nvir)), "matrix_kind": "W",
+              "virtual": np.zeros((nvir, nvir)), "matrix_kind": matrix_kind,
               "metadata": saved_metadata, "controls": deepcopy(settings)}
     plans, batch_diagnostics = [], []
     native_timings = {}
     variance = {name: 0. for name in ("energy", "occupied", "virtual")}
     matrix_variance = {name: np.zeros_like(result[name]) for name in ("occupied", "virtual")}
     production_draws = 0
+    energy_reverse_workspace_bytes = 0
+    native_kwargs = {"aux_offsets": offsets}
+    if matrix_kind == "D":
+        native_kwargs["matrix_kind"] = matrix_kind
     for targets_in_batch, seed in zip(target_batches, seeds):
         native_controls = _matrix_batch_controls(settings, len(target_batches), seed)
         local = extension.solve_matrices(*(arrays[key] for key in ARRAY_NAMES),
-                                         targets_in_batch, native_controls,
-                                          aux_offsets=offsets)
-        validate_matrix_result(local, arrays)
+                                         targets_in_batch, native_controls, **native_kwargs)
+        validate_matrix_result(local, arrays, matrix_kind=matrix_kind)
         for name in ("energy", "occupied", "virtual"):
             result[name] += local[name]
         diagnostics = dict(local["diagnostics"])
@@ -237,9 +248,15 @@ def solve_matrices(inputs, metadata, controls, *, aux_offsets=None):
         production_draws += int(diagnostics.get("production_draws", 0))
         # Keep summaries and the small replay, never each batch's tensor outputs.
         batch_diagnostics.append(diagnostics)
-        plans.append(local["replay"])
+        plan = local["replay"]
+        plans.append(plan)
+        if matrix_kind == "D" and settings["mode"] == "stochastic":
+            # Batches replay in sequence. Use the owned native plan, whose
+            # sample allocations cannot be changed by editing diagnostics.
+            energy_reverse_workspace_bytes = max(energy_reverse_workspace_bytes,
+                                                 plan.energy_reverse_workspace_bytes)
     diagnostics = {
-        "mode": settings["mode"], "matrix_kind": "W",
+        "mode": settings["mode"], "matrix_kind": matrix_kind,
         "batch_count": len(plans), "batch_seeds": seeds,
         "batches": batch_diagnostics, "production_draws": production_draws,
         "memory_estimate_bytes": estimate, "current_rss_mb": resident_mb,
@@ -260,9 +277,9 @@ def solve_matrices(inputs, metadata, controls, *, aux_offsets=None):
             frag=metadata.get('fragment_id', 0) + 1, timings=native_timings)
     # Fingerprint resolved source defaults as well as the requested controls.
     fingerprint = matrix_request_fingerprint(arrays, saved_metadata, settings,
-                                             offsets)
+                                             offsets, matrix_kind=matrix_kind)
     result["replay"] = _MatrixReplay(fingerprint, offsets, tuple(plans), native_version,
-                                     memory_warned)
+                                     energy_reverse_workspace_bytes, memory_warned)
     validate_matrix_result(result, arrays)
     return result
 
@@ -274,22 +291,26 @@ def pullback_matrices(inputs, forward, *, energy_bar, occupied_bar, virtual_bar)
     replay = forward["replay"]
     if not isinstance(replay, _MatrixReplay):
         raise ValueError("matrix replay must come from solve_matrices in this process")
+    matrix_kind = forward.get("matrix_kind")
     fingerprint = matrix_request_fingerprint(
         inputs, forward["metadata"], forward["controls"],
-        replay.aux_offsets)
+        replay.aux_offsets, matrix_kind=matrix_kind)
     if fingerprint != replay.fingerprint:
-        raise ValueError("matrix replay fingerprint changed: inputs, frame or controls differ")
+        raise ValueError("matrix replay fingerprint changed: inputs, frame, kind or controls differ")
     extension = (importlib.import_module("pyscfad.dlno_stc._stc_mp2")
                  if replay.batches else None)
     if extension and _matrix_kernel_version(extension) != replay.native_version:
         raise ValueError("matrix replay native version differs from the loaded extension")
-    # Downstream work may have allocated memory since the forward call.
-    _check_matrix_memory(inputs, len(forward["metadata"]["target_indices"]),
-                         forward["controls"], replay.aux_offsets,
-                         stage="reverse", warned=replay.memory_warned)
     seed = np.asarray(energy_bar)
     if seed.shape != () or not np.isfinite(seed):
         raise ValueError("energy_bar must be a finite scalar")
+    # Downstream work may have allocated memory since the forward call.
+    _check_matrix_memory(inputs, len(forward["metadata"]["target_indices"]),
+                         forward["controls"], replay.aux_offsets,
+                         matrix_kind=matrix_kind, stage="reverse",
+                         warned=replay.memory_warned,
+                         energy_reverse_workspace_bytes=(
+                             replay.energy_reverse_workspace_bytes if seed != 0. else 0))
     seeds = {"occupied": np.asarray(occupied_bar), "virtual": np.asarray(virtual_bar)}
     for name, source in (("occupied", "foo"), ("virtual", "fvv")):
         value = seeds[name]

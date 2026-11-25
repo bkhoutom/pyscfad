@@ -71,6 +71,7 @@ class LISSelections:
     triples_grid: object = None
     sequential_virtual: bool = False
     scale_lis_by_target_count: bool = False
+    matrix_kind: str = 'W'
 
 
 @dataclass(frozen=True)
@@ -80,7 +81,7 @@ class FragmentLIS:
     All ``*_coeff`` arrays have global AO rows, with zeros outside the ED.
     ``mo_coeff`` contains LIS occupied then virtual columns; ``frozen`` is
     empty. The solver receives the explicit occupied LIS count. Projectors
-    and W blocks use the separately orthonormal ED coordinates. The virtual
+    and D/W blocks use the separately orthonormal ED coordinates. The virtual
     projector records LNO selection before occupied-LIS removal; final virtual
     coefficients additionally include that removal and normalization.
     The target field contains the normalized domain projection of the

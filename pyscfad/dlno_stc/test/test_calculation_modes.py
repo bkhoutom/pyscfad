@@ -112,7 +112,7 @@ def test_cc_energy_and_force_use_single_system_fragment(molecule, monkeypatch, t
     np.testing.assert_allclose(np.sum(gradient.coords * direction), finite, atol=2e-6, rtol=0)
 
 
-def test_matrix_defaults_and_removed_density_mode():
+def test_matrix_defaults_and_restored_density_mode():
     from pyscfad.dlno_stc import backend, controls
     from pyscfad.dlno_stc.test.test_backend import native
     from pyscfad.dlno_stc.test.test_full_kernel import full_fixture
@@ -123,15 +123,14 @@ def test_matrix_defaults_and_removed_density_mode():
     assert ccsd._cc_solver_options('deterministic', None) == {}
     default = backend.solve_matrices(x, {'target_indices': (0,)}, {})
     explicit = backend.solve_matrices(x, {'target_indices': (0,)},
-                                      {'mode': 'deterministic'})
+                                      {'mode': 'deterministic'}, matrix_kind='W')
     for name in ('energy', 'occupied', 'virtual'):
         np.testing.assert_array_equal(default[name], explicit[name])
-    with pytest.raises(TypeError):
-        controls.normalize_matrix_controls({}, 'D')
-    with pytest.raises(TypeError):
-        backend.solve_matrices(x, {'target_indices': (0,)}, {}, matrix_kind='D')
-    with pytest.raises(TypeError):
-        native().solve_matrices(x['foo'], x['fvv'], x['B'], [0], {}, matrix_kind='D')
+    assert controls.normalize_matrix_controls({}, 'D')['mode'] == 'deterministic'
+    density = backend.solve_matrices(x, {'target_indices': (0,)}, {}, matrix_kind='D')
+    assert default['matrix_kind'] == 'W' and density['matrix_kind'] == 'D'
+    np.testing.assert_allclose(density['energy'], default['energy'], atol=2e-13)
+    assert not np.allclose(density['occupied'], default['occupied'])
 
 
 def test_non_smooth_selections_are_rejected(molecule):

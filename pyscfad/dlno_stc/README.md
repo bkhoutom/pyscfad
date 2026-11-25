@@ -16,8 +16,10 @@ energy calls for total molecular results. MP2 `kernel` returns correlation
 energy; add `mf.e_tot` for total energy. Forward calls do not create response
 tapes. Use `ccsd_t=True` to include triples.
 
-For CC, W selection and smooth anchored LIS frames are the only supported choices.
-Every solver mode defaults to deterministic. Stochastic MP2, W, CCSD and
+For CC, W selection is the default; D selection is available with
+`ccsd.build_static_selections(..., matrix_kind="D")`. Both use smooth anchored
+LIS frames and the same fragment, CC correction and force workflow.
+Every solver mode defaults to deterministic. Stochastic MP2, D/W, CCSD and
 triples remain available explicitly.
 
 ## Fragments and domains
@@ -57,7 +59,7 @@ checkpoints using the old convention must be rebuilt; restart algorithm ABI
 
 ## Calculation interface
 
-For a deterministic forward-only trial, pass `sequential_virtual=True` to
+For a deterministic W forward-only trial, pass `sequential_virtual=True` to
 `ccsd.build_static_selections`. This selects the occupied LIS first, projects
 the cached full-domain MP2 amplitudes and bare integral contractions onto that
 occupied space, and constructs virtual W there. The physical target block is
@@ -66,7 +68,7 @@ unchanged. The default remains independent occupied/virtual W selection.
 The trial retains all selected-target amplitude and integral slices until
 occupied selection, so it needs additional memory. Gradients and stochastic
 matrix construction are rejected until their corresponding response and
-sampling algorithms are implemented.
+sampling algorithms are implemented. This trial requires `matrix_kind="W"`.
 
 Set `scale_lis_by_target_count=True` in `ccsd.build_static_selections` to
 interpret both cutoffs per original physical target LMO. A four-target
@@ -137,9 +139,29 @@ baseline, including weak-pair completion:
 `E_corr = E_MP2_domain + sum_f (E_CCSD,f + E_(T),f - E_MP2_LIS,f)`.
 
 W construction supplies the strong-domain MP2 energy through
-`(trace(W_occ) + trace(W_vir))/2`. One delayed W pullback combines its energy
-seed with the LIS-response cotangents. The shared `mp2_grid=(roots, weights)` supplies both MP2 and W. `return_components=True` returns fragment energies and uncertainty
+`(trace(W_occ) + trace(W_vir))/2`. D instead evaluates the MP2 scalar explicitly
+by contracting the selected amplitudes with the bare spin-adapted integrals;
+the trace of D is not an energy. The D matrices use the historical positive
+occupied/virtual selection-density convention. The provider shares its
+amplitudes and quadrature between energy and density construction. One delayed
+pullback combines the energy seed with the LIS-response cotangents before
+returning to the shared preparation. The shared `mp2_grid=(roots, weights)`
+supplies MP2 and either density. `return_components=True` returns fragment energies and uncertainty
 and resource diagnostics.
+
+D and W eigenvalues have different scales and meanings. `thresh_occ` and
+`thresh_vir` apply directly to the chosen matrix; no automatic conversion is
+made. With stochastic D, `matrix_controls` additionally accepts
+`energy_tolerance` (default `3e-4` Eh), `system_workload_cutoff` (default
+`0.0065`) and `resident_points` (`2` or `3`, default `3`). Energy and matrix
+sampling use their respective error targets. In deterministic D, the scalar
+is evaluated without sampling. As for W, `baseline_controls` does not launch
+an additional strong-domain MP2 calculation.
+
+The matrix choice is saved in selections and checked on restart. Saved
+W selections from the current schema continue to load with W as the default;
+requesting D for a W checkpoint is rejected. The benchmark runner exposes
+the same choice as `--matrix-kind D` and defaults to W.
 
 There is one pipeline and no `single_pass` option:
 
@@ -147,7 +169,7 @@ There is one pipeline and no `single_pass` option:
 2. Screen weak pairs and group Boys orbitals into physical fragments; retain
    the weak-pair response when screening runs inside the force callback.
 3. Prepare each fragment domain. Standalone MP2 computes the scalar energy
-   directly, without W. CCSD/(T) computes W once, selects its smooth LIS and
+   directly, without a density. CCSD/(T) computes D or W once, selects its smooth LIS and
    solves the correction. Consume the pullbacks on that owner.
 4. Accumulate the common-data response and solve the SCF response for forces.
 
@@ -168,7 +190,7 @@ The host kernels use actual endpoint dimensions without JAX padding buckets.
 Rank labels and eigengap regularization are unchanged.
 
 
-The CC builder returns a plan, without computing W. Its production W selects
+The CC builder returns a plan, without computing a density. Its production D/W selects
 ranks, anchors and the independent (T) grid, held fixed in that fragment's
 energy and pullback. The LIS orbitals are constructed once while choosing
 the anchors, then passed directly to CCSD/(T). Force calculations retain that
@@ -312,29 +334,31 @@ Both methods accept `init_guess`, `conv_tol`, `conv_tol_grad`, `max_cycle`,
 
 Set the occupied and virtual cutoffs explicitly on
 `ccsd.build_static_selections(mf, domains, thresh_occ=..., thresh_vir=...)`.
-These select the CC local interacting space (LIS) from W and apply to both
+These select the CC local interacting space (LIS) from D or W and apply to both
 CCSD and CCSD(T), for energies and forces. Standalone domain MP2 does not use
-these cutoffs or build W.
+these cutoffs or build selection matrices.
 
 | Keyword | Public API default | Meaning |
 | --- | --- | --- |
-| `thresh_occ` | Required | Retain external occupied W eigenvectors with `abs(eigenvalue) > thresh_occ`; the internal target span is retained. |
-| `thresh_vir` | Required | Retain virtual W eigenvectors with `abs(eigenvalue) > thresh_vir`. |
+| `matrix_kind` | `"W"` | Use energy-weighted W or amplitude-density D for LIS selection. |
+| `thresh_occ` | Required | Retain external occupied density eigenvectors with `abs(eigenvalue) > thresh_occ`; the internal target span is retained. |
+| `thresh_vir` | Required | Retain virtual density eigenvectors with `abs(eigenvalue) > thresh_vir`. |
 
-Both cutoffs are nonnegative energy thresholds in Eh. The quickstart and
+Both cutoffs are nonnegative: W thresholds are energies in Eh; D thresholds
+are dimensionless. The quickstart and
 general water-16 runner use `thresh_occ=1e-4`, `thresh_vir=1e-5`; the
 [archived-run example](../../examples/dlno_stc/README_water_16.md#bulk-water16-from-the-completed-sgx-benchmark)
 explicitly uses `1e-4`/`3e-5`. A zero cutoff retains
 the full corresponding domain parent space, including zero-eigenvalue modes.
 Smaller positive cutoffs retain more orbitals. `full_domain=True` expands the
 parent domains but still applies these LIS cutoffs. Ranks and labels are
-selected once from each fragment's W and held fixed during its pullback.
+selected once from each fragment's density and held fixed during its pullback.
 
 ### CC plan and execution
 
 `ccsd.build_static_selections(mf, domains, ...)` requires `thresh_occ` and
 `thresh_vir`, the [LIS cutoffs](#lis-cutoffs) described above. Its other settings
-are `baseline_controls=None`, `matrix_controls=None`, `mp2_grid=None`,
+are `matrix_kind="W"`, `baseline_controls=None`, `matrix_controls=None`, `mp2_grid=None`,
 `internal_rank_threshold=1e-6`, `triples_laplace_points=4` and
 `correlation_auxbasis=None`. `merge_identical=True` is accepted by this builder
 for compatibility; actual preparation grouping occurs during execution.
@@ -361,7 +385,7 @@ CC returns `(energy, components)` or `(energy, mol_bar, components)`.
 
 ## Separate MP2 and triples quadratures
 
-`build_domain_selections` automatically fits **one global MP2/W grid** from
+`build_domain_selections` automatically fits **one global MP2/density grid** from
 all active canonical occupied/virtual energies, excluding frozen orbitals.
 `mp2_laplace_points=6` sets its size. Every domain uses the same saved grid;
 `boys_grouping="system"` follows the same rule. Nodes/weights are saved as
@@ -682,7 +706,8 @@ the manifest. New runs need no such recovery step.
 Disk request/result exchange, export/import/replay drivers, per-domain MPI
 replica averaging and public fragment-subset/correction-only modes have been
 removed. The old `force_full_domains` alias is removed; use `full_domain`.
-The fixed-value `matrix_kind`, `smooth` and `lis_space` arguments are removed.
+The fixed-value `smooth` and `lis_space` arguments are removed.
+`matrix_kind` is selectable again, with W as the default.
 Use `triples_laplace_points` in place of `smooth_laplace_points`.
 Restart checkpoints remain supported independently of disk solver exchange.
 

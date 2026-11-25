@@ -27,7 +27,7 @@ public:
 struct selected_energy_point_result {
     double energy=0, variance=0, table_seconds=0, pilot_seconds=0;
     double production_seconds=0, gradient_seconds=0;
-    size_t production_samples=0;
+    size_t pilot_samples=0, production_samples=0;
 };
 
 // Shared by energy-only and E+D. The latter supplies its existing C proposal
@@ -65,6 +65,8 @@ inline selected_energy_point_result sample_selected_energy_point(
         record->direct_seed=context.direct_seed;
     }
     out.pilot_seconds=omp_get_wtime()-tick;
+    for (const auto& pilot : context.exchange_pilots) out.pilot_samples+=pilot.count;
+    for (const auto& pilot : context.direct_pilots) out.pilot_samples+=pilot.count;
     for (size_t n:context.production_counts) out.production_samples+=n;
     if (gamma) kernel.begin_gradient_sampling();
     tick=omp_get_wtime();

@@ -306,6 +306,7 @@ def load_selections(checkpoint_dir, mol, *, domain_options=None, selection_optio
             raise storage.RestartMismatchError(f'checkpoint domain setting {name} differs')
     lis = saved.lis_static
     selection_values = dict(thresh_occ=lis.thresh_occ, thresh_vir=lis.thresh_vir,
+        matrix_kind=lis.matrix_kind,
         sequential_virtual=lis.sequential_virtual,
         scale_lis_by_target_count=lis.scale_lis_by_target_count,
         internal_rank_threshold=lis.internal_rank_threshold,

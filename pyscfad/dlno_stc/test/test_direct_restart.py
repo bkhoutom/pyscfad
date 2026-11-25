@@ -44,8 +44,11 @@ def _forbid_searches(monkeypatch):
             monkeypatch.setattr(module, name, forbidden)
 
 
-def test_load_choices_checks_configuration_without_search(tmp_path, checkpoint_reference, monkeypatch):
+@pytest.mark.parametrize('matrix_kind', ['W', 'D'])
+def test_load_choices_checks_configuration_without_search(tmp_path, checkpoint_reference, monkeypatch,
+                                                         matrix_kind):
     mf, selected = checkpoint_reference
+    selected = replace(selected, lis_static=replace(selected.lis_static, matrix_kind=matrix_kind))
     _save(tmp_path, mf, selected)
     _forbid_searches(monkeypatch)
     domains, lis = selected.mp2_static, selected.lis_static
@@ -54,6 +57,7 @@ def test_load_choices_checks_configuration_without_search(tmp_path, checkpoint_r
             lo_kwargs=domains.lo_kwargs, boys_grouping=domains.boys_grouping,
             pair_energy_model=domains.pair_energy_model, full_domain=True),
         selection_options=dict(thresh_occ=lis.thresh_occ, thresh_vir=lis.thresh_vir,
+            matrix_kind=matrix_kind,
             internal_rank_threshold=lis.internal_rank_threshold,
             triples_laplace_points=selected.selection_options['triples_laplace_points']))
     assert storage.scientific_digest(loaded) == storage.scientific_digest(selected)
@@ -62,7 +66,7 @@ def test_load_choices_checks_configuration_without_search(tmp_path, checkpoint_r
 @pytest.mark.parametrize('changed', [
     'frozen', 'thresholds', 'lo_kwargs', 'boys_grouping', 'pair_energy_model',
     'frag_lolist', 'thresh_occ', 'thresh_vir', 'internal_rank_threshold',
-    'triples_laplace_points',
+    'triples_laplace_points', 'matrix_kind',
 ])
 def test_changed_requested_settings_are_rejected(tmp_path, checkpoint_reference, changed):
     mf, selected = checkpoint_reference
@@ -73,7 +77,7 @@ def test_changed_requested_settings_are_rejected(tmp_path, checkpoint_reference,
         lo_kwargs=dict(domains.lo_kwargs, conv_tol=1e-5), boys_grouping='atom',
         pair_energy_model='exact', frag_lolist=tuple(reversed(domains.frag_lolist)),
         thresh_occ=1e-3, thresh_vir=1e-3, internal_rank_threshold=1e-3,
-        triples_laplace_points=8)
+        triples_laplace_points=8, matrix_kind='D')
     keyword = 'domain_options' if changed in {
         'frozen', 'thresholds', 'lo_kwargs', 'boys_grouping', 'pair_energy_model',
         'frag_lolist'} else 'selection_options'

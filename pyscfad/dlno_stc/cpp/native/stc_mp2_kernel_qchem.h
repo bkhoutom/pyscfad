@@ -61,6 +61,26 @@ public:
                                   arma::mat* b_gradient = nullptr,
                                   bool gamma_preinitialized = false,
                                   double energy_cotangent = 1.0);
+    static size_t gradient_sampling_workspace(size_t draws, size_t orbital_pairs,
+                                              size_t aux_groups, size_t threads) {
+        constexpr size_t limit = std::numeric_limits<size_t>::max();
+        const auto multiply = [=](size_t a, size_t b) {
+            return b && a > limit / b ? limit : a * b;
+        };
+        const auto add = [=](size_t a, size_t b) {
+            return a > limit - b ? limit : a + b;
+        };
+        // Four updates per draw. A growing vector can temporarily own both its
+        // old and doubled allocation; scatter keeps capacity plus one pointer
+        // per record. Budget the larger phase and the scatter indexing tables.
+        const size_t per_record = std::max(3 * sizeof(gamma_update),
+            2 * sizeof(gamma_update) + sizeof(const gamma_update*));
+        const size_t events = multiply(draws, 4 * per_record);
+        const size_t keys = multiply(orbital_pairs, aux_groups);
+        const size_t indices = multiply(add(multiply(2, keys), 1), sizeof(size_t));
+        const size_t workers = multiply(threads, sizeof(std::vector<gamma_update>));
+        return add(events, add(indices, workers));
+    }
     void backpropagate_laplace_point(double beta, arma::mat& gamma,
                                     arma::mat& f_occ_gradient,
                                     arma::mat& f_virt_gradient,

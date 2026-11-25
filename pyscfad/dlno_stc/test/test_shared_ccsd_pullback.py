@@ -85,6 +85,7 @@ def group_case(monkeypatch):
         group = SimpleNamespace(representative_index=0, fragment_indices=(0, 1),
                                 target_indices=group_targets)
         static = SimpleNamespace(mp2_static=SimpleNamespace(),
+                                 lis_static=SimpleNamespace(matrix_kind=matrix_kind),
                                  test_fragments=fragments, fragments=(True, True))
         state = dict(mf=jnp.asarray(mf), common=jnp.asarray(common), energy=jnp.zeros(()),
                      variance=0., mf_bar=jnp.asarray(.17), common_bar=jnp.asarray(-.23))

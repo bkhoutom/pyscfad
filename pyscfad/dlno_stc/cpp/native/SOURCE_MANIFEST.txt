@@ -26,15 +26,14 @@ cc8882544568674fef3c64752dedd9666722e54d2c3b0f161d127af7f8d2ea90  stc_mp2_determ
 be0a56c34a09e5ce68cdb974704d0377755d914fe28e746a4682bc16c5521e14  stc_mp2_gradient_numerical.cpp
 ed76f7ac1530b3bc51d4aa648169224f7f5980f6f49da8ed58dd56a33b000e60  stc_mp2_kernel_helpers.h
 473f021ea697de2dbbf5536d344a627afe33c8916731696bfcc8faf9edb918da  stc_mp2_kernel_numerical.cpp
-1fa8b2d41fdec4836b77cdbc353450c52b0e4c3879a6977e08bdbe8569633099  stc_mp2_kernel_qchem.h
-fd2f3013608ec3293dfea4f42084ad264b61fd28eb6cf11fb7a0507f1357dfe9  stc_mp2_selected_energy.h
+8bb5fc6afa602bbecf59437677ae718e382aa944199b87f54d509744836aaf8c  stc_mp2_kernel_qchem.h
+7b82bfe92776a8fae8f7c3d94b4cac47a365f9aec93d72850b579d069e9b68ff  stc_mp2_selected_energy.h
+0312a56ff40dd2ad06f1acd52c1b71cd926edeec6eda9cd8e46cd60bf8b28a57  stc_mp2_selected_energy_density.h
 fd073ef1f109d4c8777d7584db97a0fc9c9cfd41817bfa4f95dda31064eefff0  stc_mp2_stochastic_density.h
 a775c22096afc21290c5a5dd2d172b4f924de384a4f6419bb854b116f493dbf8  stc_mp2_stochastic_w.h
 
 Standalone adaptations:
-- At import, stochastic_w, selected_energy and selected_energy_density
-  were byte-identical to v2. The unused selected_energy_density header is
-  removed as documented below.
+- stochastic_w is byte-identical to the supplied v2 source.
 - deterministic_energy shares propagated factors and reverse accumulation
   across selected targets with a bounded bare-Gram cache.
 - deterministic_d_w uses a virtual eigenbasis for W, two spin-adapted virtual
@@ -120,3 +119,11 @@ helpers. Public kernel accessors and reference implementations are retained.
 Active numerical bodies, sampling rules and replay versions are unchanged.
 The supplied-file hashes above retain the removed header as provenance;
 only hashes for retained files changed by this cleanup are refreshed.
+
+Selected D restoration:
+The adapter again exposes the native D contractions and explicit MP2 energy.
+The restored selected_energy_density header shares stochastic propagation
+across the density and energy estimators and saves the production plan for
+the combined pullback. The adapter reports scalar energy pilot and production
+draws and forecasts the reverse update workspace using the saved allocation.
+The matrix replay version is standalone-6-d-w.

@@ -94,14 +94,20 @@ def _update_input_digest(digest, inputs):
             digest.update(block.tobytes(order="C"))
 
 
-def matrix_request_fingerprint(inputs, metadata, controls, aux_offsets):
+def validate_matrix_kind(matrix_kind):
+    if not isinstance(matrix_kind, str) or matrix_kind not in ("D", "W"):
+        raise ValueError("matrix_kind must be D or W")
+
+
+def matrix_request_fingerprint(inputs, metadata, controls, aux_offsets, *, matrix_kind="W"):
     """Identify the frame, native version and resolved options of a matrix call."""
     validate_full_inputs(inputs)
     _check_mapping(metadata, "matrix metadata")
     _check_mapping(controls, "matrix controls")
+    validate_matrix_kind(matrix_kind)
     digest = hashlib.sha256(b"dlno_stc_matrix_request_v2\0")
     digest.update(canonical_json({
-        "metadata": metadata, "controls": controls, "matrix_kind": "W",
+        "metadata": metadata, "controls": controls, "matrix_kind": matrix_kind,
         "aux_offsets": aux_offsets,
     }).encode("utf-8"))
     _update_input_digest(digest, inputs)
@@ -162,7 +168,7 @@ def validate_input_cotangents(cotangents, inputs):
                      symmetric=name in ("foo", "fvv"))
 
 
-def validate_matrix_result(result, inputs):
+def validate_matrix_result(result, inputs, *, matrix_kind=None):
     """Validate matrix primals without requiring scalar unit-energy bars."""
     _check_mapping(result, "matrix result")
     for field in ("energy", "occupied", "virtual", "diagnostics", "replay"):
@@ -178,6 +184,11 @@ def validate_matrix_result(result, inputs):
                  symmetric=True)
     _check_mapping(result["diagnostics"], "matrix diagnostics")
     diagnostics = result["diagnostics"]
+    reported_kind = diagnostics.get("matrix_kind")
+    validate_matrix_kind(reported_kind)
+    if (result.get("matrix_kind", reported_kind) != reported_kind
+            or (matrix_kind is not None and matrix_kind != reported_kind)):
+        raise ValueError("matrix result kind differs from the request")
     for name in ("energy_standard_error", "occupied_frobenius_se", "virtual_frobenius_se"):
         value = np.asarray(diagnostics.get(name))
         if (value.shape != () or value.dtype.kind not in "fi"

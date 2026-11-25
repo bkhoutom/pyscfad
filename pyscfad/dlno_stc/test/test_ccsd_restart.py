@@ -12,6 +12,10 @@ from pyscfad.dlno_stc._restart import RestartMismatchError, RestartCorruptionErr
 from pyscfad.dlno_stc.test.test_triples import checkpoint_reference
 
 
+LEGACY_W_MATRIX_VERSION = 'src_code_rdm_v2:427459d9b91fc70f:standalone-5-w-only'
+RESTORED_D_MATRIX_VERSION = 'src_code_rdm_v2:427459d9b91fc70f:standalone-6-d-w'
+
+
 def _options():
     return dict(with_grad=False, include_hf=True, ccsd_t=False,
                 triples_controls=None, vvvv_direct=False, merge_identical=True)
@@ -136,6 +140,27 @@ def test_incompatible_restart_is_rejected(tmp_path, checkpoint_reference, change
         manager.close()
 
 
+@pytest.mark.parametrize('saved_kind, resume_kind, resume_version, mismatch', [
+    ('W', 'D', RESTORED_D_MATRIX_VERSION, 'matrix_kind'),
+    ('W', 'W', 'unrelated-future-matrix-version', 'native_version'),
+    ('D', 'D', LEGACY_W_MATRIX_VERSION, 'native_version'),
+])
+def test_matrix_restart_rejects_incompatible_kind_or_version(
+        tmp_path, checkpoint_reference, monkeypatch,
+        saved_kind, resume_kind, resume_version, mismatch):
+    from pyscfad.dlno_stc import _stc_mp2
+
+    mf, selected = checkpoint_reference
+    saved = replace(selected, lis_static=replace(selected.lis_static, matrix_kind=saved_kind))
+    current = replace(selected, lis_static=replace(selected.lis_static, matrix_kind=resume_kind))
+    monkeypatch.setattr(_stc_mp2, 'matrix_kernel_version', RESTORED_D_MATRIX_VERSION)
+    manager = _open(tmp_path, mf, saved)
+    manager.close()
+    monkeypatch.setattr(_stc_mp2, 'matrix_kernel_version', resume_version)
+    with pytest.raises(RestartMismatchError, match=mismatch):
+        _open(tmp_path, mf, current, resume=True)
+
+
 @pytest.mark.parametrize('with_grad', [False, True])
 def test_resume_initializes_response_from_saved_selection(tmp_path, checkpoint_reference,
                                                         monkeypatch, with_grad):
@@ -214,11 +239,12 @@ def test_numeric_reference_keeps_integrity_checks(tmp_path, checkpoint_reference
         _open(tmp_path, mf, selected, resume=True)
 
 
-def test_scf_density_restart_resumes_interrupted_cc_gradient(tmp_path, monkeypatch):
+@pytest.mark.parametrize('legacy_w', [False, True], ids=['current-version', 'legacy-w-version'])
+def test_scf_density_restart_resumes_interrupted_cc_gradient(tmp_path, monkeypatch, legacy_w):
     """Resume one of two real CC groups, including all common and SCF response."""
     from pyscf.lib import chkfile
     from pyscfad import scf
-    from pyscfad.dlno_stc import _ccsd_checkpoint, build_domain_selections
+    from pyscfad.dlno_stc import _ccsd_checkpoint, _stc_mp2, build_domain_selections
     from pyscfad.dlno_stc.test._boys_acceptance import molecule, LO_OPTIONS
 
     mol = molecule()
@@ -268,8 +294,17 @@ def test_scf_density_restart_resumes_interrupted_cc_gradient(tmp_path, monkeypat
         if next_group == 1:
             raise Interrupted
 
+    open_current = _ccsd_checkpoint.open_checkpoint
+
+    def open_legacy(*args, **kwargs):
+        with monkeypatch.context() as patch:
+            patch.setattr(_stc_mp2, 'matrix_kernel_version', LEGACY_W_MATRIX_VERSION)
+            return open_current(*args, **kwargs)
+
     with monkeypatch.context() as patch:
         patch.setattr(_ccsd_checkpoint, 'save_progress', interrupt)
+        if legacy_w:
+            patch.setattr(_ccsd_checkpoint, 'open_checkpoint', open_legacy)
         with pytest.raises(Interrupted):
             ccsd.value_and_grad(mol, build_mf, checkpoint_dir=checkpoint, **options)
     assert len(solved) == 1

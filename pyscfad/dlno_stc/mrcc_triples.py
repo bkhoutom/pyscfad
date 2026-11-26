@@ -21,7 +21,7 @@ def run_mrcc(inputs, nodes, weights, *, with_grad, max_memory,
              workspace_gib=DEFAULT_TRIPLES_WORKSPACE_GIB):
     from .smooth_triples import _dressing_cache_bytes
     workspace_gib = _finite_control('workspace_gib', workspace_gib)
-    native = importlib.import_module('pyscfad.dlno_stc._stc_mp2')
+    from . import _native_triples as native
     if not getattr(native, 'TRIPLES_CONFIGURABLE_WORKSPACE', False):
         raise RuntimeError('Rebuild the STC native extension for configurable triples workspace')
     start = time.perf_counter()

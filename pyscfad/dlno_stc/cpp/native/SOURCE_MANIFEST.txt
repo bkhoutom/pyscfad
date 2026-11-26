@@ -56,6 +56,9 @@ Standalone adaptations:
   Original v1/v2 gradient .C is identical; adapted .cpp unchanged from baseline.
 - helpers effective_sample_threads uses the explicit per-call OpenMP scope
   without QCHEM_SAMPLE_THREADS. V2 spectral getters retained verbatim.
+  Energy RNG streams retain the fixed-budget partition but are scheduled as
+  logical tasks so dynamic team sizing cannot change forward/replayed draws.
+  The selected-energy-density wrapper no longer overrides caller dynamic policy.
 - stochastic_density uses dense cotangent buffers, independent of
   QCHEM_STC_SPARSE_COTANGENT. Other numerical source text is retained except
   the unused helpers removed below.

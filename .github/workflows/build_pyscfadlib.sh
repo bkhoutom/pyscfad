@@ -1,11 +1,7 @@
 #!/usr/bin/env bash
 
-sudo apt-get -qq install liblapack-dev
-
-pip install nanobind
-
-cd pyscfadlib/pyscfadlib
-mkdir build
-cmake -B build
-cmake --build build -j2
-rm -rf build
+set -euo pipefail
+sudo apt-get -qq install libopenblas-dev
+export CMAKE_BUILD_PARALLEL_LEVEL=2
+python -m pip install ./pyscfadlib
+python -m pip install -e .

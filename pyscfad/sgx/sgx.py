@@ -140,8 +140,9 @@ def sgx_fit(mf, auxbasis=None, *, grid_level=2, fit_ovlp=True,
     accuracy settings.
 
     Forward J/K and eager geometry kernels use the current PySCF thread
-    budget with dynamic OpenMP/MKL shrinking disabled, restoring the caller's
-    settings afterward. Modern native contractions retain all density pairs.
+    budget with OpenMP dynamic team sizing disabled, restoring each runtime's
+    caller setting afterward. MKL dynamic policy is unchanged. Modern native
+    contractions retain all density pairs.
     The STC driver combines complete SCF geometry seeds into one J pass and
     one K traversal; ordinary standalone VJPs also support immediate response.
 

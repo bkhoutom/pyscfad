@@ -142,21 +142,16 @@ def make_solver(controls, grid, *, with_grad):
         raise ValueError('deterministic asymmetric triples were removed; use partition=mrcc')
     if partition == 'mrcc' and stochastic:
         raise ValueError('MRCC partition currently requires deterministic triples')
-    if partition == 'mrcc' and not getattr(importlib.import_module(
-            'pyscfad.dlno_stc._stc_mp2'), 'TRIPLES_MRCC_PARTITION', False):
-        raise RuntimeError('Rebuild the STC native extension for the MRCC partition')
-    if not stochastic and not getattr(importlib.import_module(
-            'pyscfad.dlno_stc._stc_mp2'), 'TRIPLES_DETERMINISTIC_BLOCKS', False):
-        raise RuntimeError('Rebuild the STC native extension for deterministic block Laplace triples')
-    if not getattr(importlib.import_module('pyscfad.dlno_stc._stc_mp2'),
-                   'TRIPLES_DIAGONAL_VIRTUAL_DRESSING', False):
-        raise RuntimeError('Rebuild the STC native extension for diagonal virtual Laplace dressing')
-    if not stochastic and not getattr(importlib.import_module(
-            'pyscfad.dlno_stc._stc_mp2'), 'TRIPLES_QUADRATURE_STREAMING', False):
-        raise RuntimeError('Rebuild the STC native extension for streaming Laplace triples')
-    if not stochastic and not getattr(importlib.import_module(
-            'pyscfad.dlno_stc._stc_mp2'), 'TRIPLES_GROUPED_ADJOINT', False):
-        raise RuntimeError('Rebuild the STC native extension for grouped Laplace triples adjoints')
+    if stochastic:
+        native = importlib.import_module('pyscfad.dlno_stc._stc_mp2')
+    else:
+        from . import _native_triples as native
+    capabilities = ['TRIPLES_DIAGONAL_VIRTUAL_DRESSING']
+    if not stochastic:
+        capabilities += ['TRIPLES_MRCC_PARTITION', 'TRIPLES_DETERMINISTIC_BLOCKS',
+                         'TRIPLES_QUADRATURE_STREAMING', 'TRIPLES_GROUPED_ADJOINT']
+    if any(not getattr(native, name, False) for name in capabilities):
+        raise RuntimeError('Rebuild the native extension for the requested triples route')
     native_options = {}
     trace_exponent = _finite_control('trace_exponent',
         controls.get('trace_exponent', DEFAULT_TRIPLES_TRACE_EXPONENT))

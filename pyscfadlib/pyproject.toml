@@ -42,6 +42,8 @@ input = "pyscfadlib/version.py"
 
 [tool.scikit-build]
 cmake.source-dir = "pyscfadlib"
+# Source archives exclude local build products; wheel repair may bundle runtimes.
+sdist.exclude = ["**/*.so", "**/*.so.*", "**/*.dylib", "**/*.dll", "**/*.a"]
 
 [tool.cibuildwheel]
 build-verbosity = 1
@@ -65,9 +67,9 @@ before-all = [
 #    "yum-config-manager --enable epel",
     "yum install -y openblas-devel",
 ]
-repair-wheel-command = "auditwheel -v repair -w {dest_dir} {wheel}"
 
 [tool.cibuildwheel.macos]
 archs = ["auto64"]
-repair-wheel-command = "delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel}"
+before-all = "brew install openblas libomp"
+environment = { CMAKE_PREFIX_PATH = "$(brew --prefix openblas):$(brew --prefix libomp)" }
 

@@ -15,6 +15,7 @@ from pyscf.dft import numint as ni
 from pyscf.sgx import sgx as native_sgx, sgx_jk
 from pyscf.sgx.grad.rhf import scalable_grids_response_cc
 from pyscfad.lib._threading import fixed_threads
+from ._threading import fixed_openmp_teams
 
 
 def _system_available_bytes():
@@ -230,6 +231,8 @@ def _geometry_contract(dao, fg, gv, dgv, projected, weights, mask, loc,
     dxed += grid_motion
 
 
+@fixed_threads()
+@fixed_openmp_teams()
 def get_k(obj, dm, hermi, tol):
     """SGX contractions with a fixed reference or generated adaptive kernels."""
     mol, grids = obj.mol, obj.grids
@@ -304,6 +307,7 @@ def geometry(obj, dm, bar, tol):
 
 
 @fixed_threads()
+@fixed_openmp_teams()
 def geometry_many(obj, contributions, tol):
     """Sum bilinear geometry seeds in one value/derivative integral traversal.
 

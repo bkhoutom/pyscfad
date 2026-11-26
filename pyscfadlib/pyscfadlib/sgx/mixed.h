@@ -142,9 +142,6 @@ int adaptive_contract(const Plan& p,int ns,int total,const double* coords,const 
         double etol,double ktol,double fp32_multiplier,int screen,int threads,uint64_t* counts) {
     const bool derivative=dgv!=nullptr,mixed=fp32_multiplier>0.;
     const bool cumulative=screen==1,per_pair=screen==2;
-    #ifdef _OPENMP
-    const int previous_dynamic=omp_get_dynamic();omp_set_dynamic(0);
-    #endif
     std::atomic<bool> failed(false);
     std::fill(counts,counts+6,uint64_t(0));
     #pragma omp parallel num_threads(threads)
@@ -264,9 +261,6 @@ int adaptive_contract(const Plan& p,int ns,int total,const double* coords,const 
         #pragma omp critical
         {for(int i=0;i<6;++i)counts[i]+=local[i];}
     }
-    #ifdef _OPENMP
-    omp_set_dynamic(previous_dynamic);
-    #endif
     if(failed){last_error="Unable to allocate mixed SGX thread scratch";return 1;}
     return 0;
 }

@@ -39,8 +39,8 @@ class _LazyCDLL:
 
 
 libao2mo_vjp = load_library('libao2mo_vjp')
-# Deterministic DLNO uses _ccsd_kernels for DF pullbacks and _stc_mp2 for
-# Laplace triples. Keep the older canonical/LNO triples ABI available without
+# Deterministic DLNO uses _ccsd_kernels for DF pullbacks and Laplace triples.
+# Keep the older canonical/LNO triples ABI available without
 # loading its BLAS/OpenMP dependencies into that route at import time.
 libcc_vjp = _LazyCDLL('libcc_vjp')
 libcgto_ad = load_library('libcgto_ad')

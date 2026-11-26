@@ -76,7 +76,8 @@ def test_four_target_w_batches_preserve_values_and_all_input_cotangents():
 
 @pytest.mark.parametrize('matrix_kind', ['W'])
 def test_native_matrix_timing_receipts_preserve_cotangents(matrix_kind, monkeypatch):
-    extension = native()
+    native()
+    extension = backend._matrix_extension(grid(), matrix_kind)
     if not hasattr(extension, 'pullback_matrices_with_timings'):
         pytest.skip('installed STC extension predates native timing receipts')
     x = full_fixture()
@@ -92,7 +93,7 @@ def test_native_matrix_timing_receipts_preserve_cotangents(matrix_kind, monkeypa
 
     monkeypatch.setattr(extension, 'pullback_matrices_with_timings', timed)
     with backend.resource_profile.capture_events(events.append):
-        forward = backend.solve_matrices(x, metadata, dict(grid(), target_batch_size=1))
+        forward = backend.solve_matrices(x, metadata, dict(grid(), target_batch_size=1), matrix_kind=matrix_kind)
         bars = backend.pullback_matrices(x, forward, **seeds)
     assert set(bars) == set(x)
     forward_timings = forward['diagnostics']['native_timings']

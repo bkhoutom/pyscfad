@@ -16,7 +16,6 @@ def open_checkpoint(state, static, groups, *, checkpoint_dir, resume, options):
         if resume:
             raise ValueError('resume=True requires checkpoint_dir')
         return None
-    from . import _stc_mp2
     from pyscfad.lno.ccsd import RCCSD
     # Workspace changes only execution, so compatible completed domains remain
     # reusable across omitted, default, and explicitly enlarged workspace caps.
@@ -32,10 +31,20 @@ def open_checkpoint(state, static, groups, *, checkpoint_dir, resume, options):
         # using its original numerical frame and quadrature. Regenerated BP
         # intermediates and roundoff must not change the checkpoint digest.
         static = resume_selections(checkpoint_dir, static)
-    native_version = _stc_mp2.matrix_kernel_version
+    # The deterministic SciPy port preserves these numerical identities;
+    # replay implementation versions are deliberately process-local.
+    from . import _native_w
+    matrix_settings = dict(static.controls_identity[2])
+    if matrix_settings.get('mode', 'deterministic') == 'stochastic':
+        from . import _stc_mp2
+        native_version = _stc_mp2.matrix_kernel_version
+    else:
+        native_version = _native_w.checkpoint_matrix_version
     # The combined adapter changes replay APIs, while retaining each provider's
     # calculation. Keep their checkpoint identities across these known versions.
-    if native_version == 'src_code_rdm_v2:427459d9b91fc70f:standalone-7-d-w-orbital':
+    if native_version in (
+            'src_code_rdm_v2:427459d9b91fc70f:standalone-7-d-w-orbital',
+            'src_code_rdm_v2:427459d9b91fc70f:standalone-8-caller-dynamic'):
         native_version = 'src_code_rdm_v2:427459d9b91fc70f:standalone-6-d-w'
     if (static.lis_static.matrix_kind == 'W'
             and native_version == 'src_code_rdm_v2:427459d9b91fc70f:standalone-6-d-w'):
@@ -57,7 +66,11 @@ def open_checkpoint(state, static, groups, *, checkpoint_dir, resume, options):
         payload['external_stc_implementation'] = external_implementation_identity()
     triples = options.get('triples_controls')
     if triples is not None:
-        payload['native_triples_version'] = _stc_mp2.TRIPLES_VERSION
+        if triples.get('mode', 'deterministic') == 'stochastic':
+            from . import _stc_mp2 as triples_provider
+        else:
+            from . import _native_triples as triples_provider
+        payload['native_triples_version'] = triples_provider.TRIPLES_VERSION
     manager = CCReferenceManager(checkpoint_dir, resume=resume, method='stc-ccsd',
                              scientific_payload=payload)
     try:

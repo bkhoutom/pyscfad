@@ -16,6 +16,53 @@ def dll():
     return result
 
 
+@pytest.mark.parametrize('adaptive', [False, True])
+def test_contractions_fix_teams_and_restore_caller_policy(dll, adaptive, monkeypatch):
+    import ctypes
+    from pyscf import lib
+    if not hasattr(dll, 'omp_get_dynamic'):
+        pytest.skip('SGX was built without OpenMP')
+    # Query the runtime linked by this library, which may differ from PySCF's.
+    dll.omp_get_dynamic.restype = ctypes.c_int
+    dll.omp_set_dynamic.argtypes = [ctypes.c_int]
+    previous = dll.omp_get_dynamic()
+    native_calls = []
+    for name in ('SGX_generated_contract', 'SGX_generated_contract_deriv',
+                 'SGX_generated_contract_adaptive'):
+        original = getattr(dll, name)
+        def checked(*args, _original=original, _name=name):
+            assert dll.omp_get_dynamic() == 0
+            native_calls.append(_name)
+            return _original(*args)
+        monkeypatch.setattr(dll, name, checked)
+    mol = gto.M(atom='He 0 0 0; He 0 0 3', basis='cc-pvdz', verbose=0)
+    plan = _native.IntegralPlan(mol, np.ones((mol.nbas, mol.nbas)), 0., 10**8)
+    rng = np.random.default_rng(173)
+    coords = rng.normal(size=(257, 3))
+    factors = rng.normal(size=(2, mol.nao, len(coords)))
+    kwargs = {}
+    if adaptive:
+        plan.configure_accuracy(mixed=True, energy_tol=1e5, potential_tol=1e5,
+                                fp32_multiplier=1e10, ngrids=len(coords))
+        kwargs = dict(weights=rng.uniform(-1., 1., len(coords)),
+                      ao_l1=np.sum(np.abs(mol.eval_gto('GTOval', coords)), axis=1))
+    results = []
+    try:
+        with lib.with_omp_threads(4):
+            for dynamic in (0, 1):
+                dll.omp_set_dynamic(dynamic)
+                value = plan.contract(mol, coords, factors, **kwargs)
+                assert dll.omp_get_dynamic() == dynamic
+                joint = plan.contract_with_grad(mol, coords, factors, **kwargs)
+                assert dll.omp_get_dynamic() == dynamic
+                results.append((value, *joint))
+        for left, right in zip(*results):
+            np.testing.assert_array_equal(left, right)
+        assert native_calls
+    finally:
+        dll.omp_set_dynamic(previous)
+
+
 def test_boys_all_orders(dll):
     # Table midpoints, the asymptotic boundary, and mixed/far-field tiles.
     samples = [np.linspace(0., 64., 128),

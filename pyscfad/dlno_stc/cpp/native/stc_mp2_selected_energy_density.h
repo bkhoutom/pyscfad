@@ -32,15 +32,6 @@ struct selected_density_forward_result {
     selected_density_replay_plan replay;
 };
 
-struct fixed_sample_team {
-    bool active;
-    int previous;
-    explicit fixed_sample_team(bool enabled): active(enabled),previous(omp_get_dynamic()) {
-        if (active) omp_set_dynamic(0);
-    }
-    ~fixed_sample_team() { if (active) omp_set_dynamic(previous); }
-};
-
 inline selected_density_result estimate_selected_energy_density(stc_mp2_kernel& kernel,
         const arma::vec& beta, const arma::vec& weights, const std::vector<size_t>& group,
         double energy_target, const density::options& occupied_opt,
@@ -55,7 +46,6 @@ inline selected_density_result estimate_selected_energy_density(stc_mp2_kernel& 
         throw std::invalid_argument("Both density cotangent seeds are required");
     if (record_plan && replay_plan)
         throw std::invalid_argument("Cannot record and replay the same MP2 pass");
-    fixed_sample_team team(record_plan || replay_plan);
     if (replay_plan && (replay_plan->group!=group ||
         replay_plan->beta.n_elem!=beta.n_elem || replay_plan->weights.n_elem!=weights.n_elem ||
         !arma::approx_equal(replay_plan->beta,beta,"absdiff",0.) ||

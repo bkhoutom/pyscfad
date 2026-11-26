@@ -21,6 +21,7 @@ from pyscfad.lib._threading import blas_threads, dense_blas_scope
 from pyscfad.lno import tools
 from pyscfad.lo.boys import boys
 from pyscfad.scf.hf import RHF
+from pyscfad.tools import resource_profile
 
 _PAO_ORTH_THRESHOLD = 1e-6
 
@@ -552,6 +553,68 @@ def _extract_active_indices(mf, frozen):
     return active_occ, active_vir, projected_out
 
 
+class _BPCompleteness:
+    """Grow an overlap Cholesky factor and its transformed orbital RHS.
+
+    AO blocks are appended in atom-selection order. For S_DD = L L.T,
+    completeness is ||solve(L, (S C)_D)||**2. Only the Schur complement
+    of a newly appended block needs factoring. Non-positive-definite
+    blocks retain the previous general-solve behavior.
+    """
+
+    def __init__(self, overlap, rhs):
+        self.overlap, self.rhs = overlap, rhs
+        self.indices = numpy.empty(0, dtype=int)
+        self.factor = numpy.empty((0, 0), dtype=overlap.dtype)
+        self.transformed = numpy.empty(0, dtype=rhs.dtype)
+        self.general_solve = False
+
+    def direct(self):
+        if not self.indices.size:
+            return 0.
+        block = self.overlap[numpy.ix_(self.indices, self.indices)]
+        rhs = self.rhs[self.indices]
+        return numpy.dot(rhs, numpy.linalg.solve(block, rhs))
+
+    def append(self, indices):
+        indices = numpy.asarray(indices, dtype=int)
+        old = self.indices
+        self.indices = numpy.concatenate((old, indices))
+        if self.general_solve:
+            return self.direct()
+        if not indices.size:
+            return numpy.dot(self.transformed, self.transformed)
+        diagonal = self.overlap[numpy.ix_(indices, indices)]
+        rhs = self.rhs[indices]
+        try:
+            if old.size:
+                cross = scipy_linalg.solve_triangular(
+                    self.factor, self.overlap[numpy.ix_(old, indices)],
+                    lower=True, check_finite=False)
+                diagonal = diagonal - cross.T @ cross
+                rhs = rhs - cross.T @ self.transformed
+            block = scipy_linalg.cholesky(diagonal, lower=True, check_finite=False)
+            transformed = scipy_linalg.solve_triangular(
+                block, rhs, lower=True, check_finite=False)
+        except numpy.linalg.LinAlgError:
+            self.general_solve = True
+            return self.direct()
+        factor = numpy.zeros((len(self.indices), len(self.indices)), dtype=block.dtype)
+        factor[:len(old), :len(old)] = self.factor
+        if old.size:
+            factor[len(old):, :len(old)] = cross.T
+        factor[len(old):, len(old):] = block
+        self.factor = factor
+        self.transformed = numpy.concatenate((self.transformed, transformed))
+        return numpy.dot(self.transformed, self.transformed)
+
+    def at_threshold(self, value, threshold):
+        # Avoid changing discrete labels solely through roundoff at a cutoff.
+        if abs(value - threshold) <= 1e-10 * max(1., abs(threshold)):
+            return self.direct()
+        return value
+
+
 def get_bp_domain(mol, mos, s1e=None, bp_thr=0.999,
                   q_thr=None, atmlst=None, *, atom_order="distance"):
     """BP domains based on partial Mulliken charges.
@@ -584,7 +647,8 @@ def get_bp_domain(mol, mos, s1e=None, bp_thr=0.999,
     # Gross orbital populations for all orbitals at once. This matches the
     # per-orbital expression sum_v C_ui S_uv C_vi used below, but avoids
     # rebuilding an AO x AO outer product for every orbital.
-    gop = mos * (s1e @ mos)
+    overlap_mos = s1e @ mos
+    gop = mos * overlap_mos
     q_by_atom = numpy.abs(numpy.asarray([
         numpy.sum(gop[slice(*aoslices[a])], axis=0) for a in atmlst
     ]))
@@ -592,11 +656,12 @@ def get_bp_domain(mol, mos, s1e=None, bp_thr=0.999,
                        if atom_order == "distance" else None)
 
     for i in range(nmo):
-        orbi = mos[:, i]
         q = q_by_atom[:, i]
 
         _atms = atmlst[q > q_thr]
-        av = _compute_av_numpy(mol, orbi, s1e, _atms) if _atms.size else 0.
+        completeness = _BPCompleteness(s1e, overlap_mos[:, i])
+        av = completeness.append(tools.ao_index_by_atom(mol, _atms)) if _atms.size else 0.
+        av = completeness.at_threshold(av, bp_thr)
 
         if av < bp_thr:
             population_order = numpy.argsort(-q)
@@ -608,7 +673,8 @@ def get_bp_domain(mol, mos, s1e=None, bp_thr=0.999,
                 a = atmlst[iatm]
                 if a not in _atms:
                     _atms = numpy.append(_atms, a)
-                    av = _compute_av_numpy(mol, orbi, s1e, _atms)
+                    av = completeness.append(numpy.arange(*aoslices[a]))
+                    av = completeness.at_threshold(av, bp_thr)
                     if av >= bp_thr:
                         break
         bp_atmlst.append(_atms)
@@ -871,10 +937,11 @@ def build_domain_selections(
     spectrum = _host_array(mf.mo_energy)
     selected_grid, grid_diagnostics = select_mp2_grid(
         spectrum[active_occ], spectrum[active_vir], grid=mp2_grid, points=mp2_laplace_points)
-    targets = _host_array((_build_boys_targets(mol, occupied, options, fock=fock)
-                          if options.get('method') == 'lambda_boys' else
-                          _build_boys_targets(mol, occupied, options))
-                         if target_coeff is None else target_coeff)
+    with resource_profile.section('stc.domain.selection.boys', reused=target_coeff is not None):
+        targets = _host_array((_build_boys_targets(mol, occupied, options, fock=fock)
+                              if options.get('method') == 'lambda_boys' else
+                              _build_boys_targets(mol, occupied, options))
+                             if target_coeff is None else target_coeff)
     if numpy.iscomplexobj(targets):
         raise NotImplementedError("Boys targets must be real")
     if (targets.shape != occupied.shape or not numpy.isfinite(targets).all()
@@ -908,34 +975,35 @@ def build_domain_selections(
         pao_products = _reference_pao_products(pao_coeff, overlap)
         overlap_targets = overlap @ targets
         products = _WeakScreenProducts(pao_products, tuple(overlap_targets[:, group] for group in groups))
-    if boys_grouping == "system":
-        physical_groups = (numpy.arange(len(groups), dtype=numpy.int32),)
-    elif boys_grouping in ("atom", "atom_singleton"):
-        physical_groups = _boys_atom_groups(mol, targets, groups)
-    else:
-        physical_groups = tuple(numpy.array([i], dtype=numpy.int32) for i in range(len(groups)))
-    ao2pao = numpy.full(mol.nao, -1, dtype=numpy.int32)
-    ao2pao[pao_parent] = numpy.arange(pao_parent.size)
-    ordered = targets[:, [int(group[0]) for group in groups]]
-    compact, primary_bp, tight = (get_bp_domain(mol, ordered, overlap, bp_thr=cutoff,
-                                               atom_order="population")
-                                  for cutoff in (thresholds.bp_occ, thresholds.bp_primary, thresholds.bp_ed))
-    pao_bp = get_bp_domain(mol, pao_coeff, overlap, bp_thr=thresholds.bp_pao)
-    primary = get_primary_domain(mol, primary_bp, pao_bp, ao2pao)
-    nfrag = len(groups)
-    if full_domain:
-        compact, primary_bp, tight, primary = [tuple(numpy.arange(mol.natm, dtype=numpy.int32) for _ in groups) for _ in range(4)]
-        pao_bp = tuple(numpy.arange(mol.natm, dtype=numpy.int32) for _ in range(pao_parent.size))
-    if boys_grouping in ("atom", "atom_singleton"):
-        # Each orbital keeps its own weak target on the group's common support.
-        # Compact lists stay individual for the existing near-distance forcing.
-        primary_bp, primary = list(primary_bp), list(primary)
-        for members in physical_groups:
-            common_bp = _union_index_lists([primary_bp[i] for i in members])
-            common_primary = _union_index_lists([primary[i] for i in members])
-            for i in members:
-                primary_bp[i], primary[i] = common_bp, common_primary
-        primary_bp, primary = tuple(primary_bp), tuple(primary)
+    with resource_profile.section('stc.domain.selection.atom_support'):
+        if boys_grouping == "system":
+            physical_groups = (numpy.arange(len(groups), dtype=numpy.int32),)
+        elif boys_grouping in ("atom", "atom_singleton"):
+            physical_groups = _boys_atom_groups(mol, targets, groups)
+        else:
+            physical_groups = tuple(numpy.array([i], dtype=numpy.int32) for i in range(len(groups)))
+        ao2pao = numpy.full(mol.nao, -1, dtype=numpy.int32)
+        ao2pao[pao_parent] = numpy.arange(pao_parent.size)
+        ordered = targets[:, [int(group[0]) for group in groups]]
+        compact, primary_bp, tight = (get_bp_domain(mol, ordered, overlap, bp_thr=cutoff,
+                                                   atom_order="population")
+                                      for cutoff in (thresholds.bp_occ, thresholds.bp_primary, thresholds.bp_ed))
+        pao_bp = get_bp_domain(mol, pao_coeff, overlap, bp_thr=thresholds.bp_pao)
+        primary = get_primary_domain(mol, primary_bp, pao_bp, ao2pao)
+        nfrag = len(groups)
+        if full_domain:
+            compact, primary_bp, tight, primary = [tuple(numpy.arange(mol.natm, dtype=numpy.int32) for _ in groups) for _ in range(4)]
+            pao_bp = tuple(numpy.arange(mol.natm, dtype=numpy.int32) for _ in range(pao_parent.size))
+        if boys_grouping in ("atom", "atom_singleton"):
+            # Each orbital keeps its own weak target on the group's common support.
+            # Compact lists stay individual for the existing near-distance forcing.
+            primary_bp, primary = list(primary_bp), list(primary)
+            for members in physical_groups:
+                common_bp = _union_index_lists([primary_bp[i] for i in members])
+                common_primary = _union_index_lists([primary[i] for i in members])
+                for i in members:
+                    primary_bp[i], primary[i] = common_bp, common_primary
+            primary_bp, primary = tuple(primary_bp), tuple(primary)
     empty = numpy.zeros(0, dtype=numpy.int32)
     fragments = [None] * nfrag
     reuse_primary = (response is None and not full_domain
@@ -953,56 +1021,57 @@ def build_domain_selections(
     primary_order = [i for indices in primary_supports.values() for i in indices]
     last_support = ao_moments = None
     pao_preprojections = {}
-    for i in primary_order:
-        group = groups[i]
-        support = tuple(int(a) for a in primary[i])
-        if support != last_support:
-            ao_moments = None
-            pao_preprojections.clear()
-            last_support = support
-        if prepare_primary_response:
-            from ._primary_response import prepare_primary
-            ao, norm_keep, span_keep, weak_virtual, preparation = prepare_primary(
-                common, response.products_preparation, mol, ao2pao, thresholds,
-                i, primary_bp[i], primary[i], pao_preprojections)
-            if preparation is not None:
-                primary_preparations[i] = preparation
-            fragments[i] = FragmentDomainSelection(
-                i, group.copy(), None, empty, empty, empty, empty, empty, None,
-                primary[i], ao, primary_bp[i], norm_keep, span_keep, weak_virtual, -1)
-            del preparation
-            continue
-        ao = tools.ao_index_by_atom(mol, primary[i]).astype(numpy.int32)
-        s22 = overlap[numpy.ix_(ao, ao)]
-        raw_occ = numpy.linalg.solve(s22, overlap_targets[numpy.ix_(ao, group)])
-        norm2 = numpy.einsum("ui,uv,vi->i", raw_occ, s22, raw_occ)
-        norm_keep = numpy.where(norm2 > thresholds.metric_rank)[0].astype(numpy.int32)
-        span_keep = empty
-        weak_virtual = None
-        if norm_keep.size:
-            normalized = raw_occ[:, norm_keep] / numpy.sqrt(norm2[norm_keep])
-            occ_span, span_keep = _reference_metric_space(normalized, s22, thresholds.metric_rank)
-            weak_virtual, weak_coeff = _reference_pao_overlap_selection(
-                mol, pao_coeff, ao2pao, overlap, parent_atoms=primary_bp[i], support_atoms=primary_bp[i],
-                representation_atoms=primary[i], completeness_threshold=thresholds.bp_pao,
-                overlap_threshold=thresholds.domain_pao, occupied_for_projection=occ_span, metric_threshold=thresholds.metric_rank,
-                preprojection_cache=pao_preprojections, pao_products=pao_products,
-            )
-            if not weak_coeff.shape[1]:
-                weak_virtual = None
-            elif reuse_primary:
-                if ao_moments is None:
-                    ao_moments = _origin_zero_moments(
-                        _fake_mol_with_traced_centers(mol, support),
-                        max(1, thresholds.multipole_order - 1))
-                screen = _finish_weak_screen_reference(
-                    normalized, weak_coeff, fock[numpy.ix_(ao, ao)], i)
-                reference_endpoints[i] = pad_endpoint(_multipole_orbital_data(
-                    mol, screen, support, thresholds.multipole_order, ao_moments=ao_moments))
-                del screen
-            del weak_coeff
-        fragments[i] = FragmentDomainSelection(i, group.copy(), None, empty, empty, empty, empty, empty,
-                        None, primary[i], ao, primary_bp[i], norm_keep, span_keep, weak_virtual, -1)
+    with resource_profile.section('stc.domain.selection.primary_spaces'):
+        for i in primary_order:
+            group = groups[i]
+            support = tuple(int(a) for a in primary[i])
+            if support != last_support:
+                ao_moments = None
+                pao_preprojections.clear()
+                last_support = support
+            if prepare_primary_response:
+                from ._primary_response import prepare_primary
+                ao, norm_keep, span_keep, weak_virtual, preparation = prepare_primary(
+                    common, response.products_preparation, mol, ao2pao, thresholds,
+                    i, primary_bp[i], primary[i], pao_preprojections)
+                if preparation is not None:
+                    primary_preparations[i] = preparation
+                fragments[i] = FragmentDomainSelection(
+                    i, group.copy(), None, empty, empty, empty, empty, empty, None,
+                    primary[i], ao, primary_bp[i], norm_keep, span_keep, weak_virtual, -1)
+                del preparation
+                continue
+            ao = tools.ao_index_by_atom(mol, primary[i]).astype(numpy.int32)
+            s22 = overlap[numpy.ix_(ao, ao)]
+            raw_occ = numpy.linalg.solve(s22, overlap_targets[numpy.ix_(ao, group)])
+            norm2 = numpy.einsum("ui,uv,vi->i", raw_occ, s22, raw_occ)
+            norm_keep = numpy.where(norm2 > thresholds.metric_rank)[0].astype(numpy.int32)
+            span_keep = empty
+            weak_virtual = None
+            if norm_keep.size:
+                normalized = raw_occ[:, norm_keep] / numpy.sqrt(norm2[norm_keep])
+                occ_span, span_keep = _reference_metric_space(normalized, s22, thresholds.metric_rank)
+                weak_virtual, weak_coeff = _reference_pao_overlap_selection(
+                    mol, pao_coeff, ao2pao, overlap, parent_atoms=primary_bp[i], support_atoms=primary_bp[i],
+                    representation_atoms=primary[i], completeness_threshold=thresholds.bp_pao,
+                    overlap_threshold=thresholds.domain_pao, occupied_for_projection=occ_span, metric_threshold=thresholds.metric_rank,
+                    preprojection_cache=pao_preprojections, pao_products=pao_products,
+                )
+                if not weak_coeff.shape[1]:
+                    weak_virtual = None
+                elif reuse_primary:
+                    if ao_moments is None:
+                        ao_moments = _origin_zero_moments(
+                            _fake_mol_with_traced_centers(mol, support),
+                            max(1, thresholds.multipole_order - 1))
+                    screen = _finish_weak_screen_reference(
+                        normalized, weak_coeff, fock[numpy.ix_(ao, ao)], i)
+                    reference_endpoints[i] = pad_endpoint(_multipole_orbital_data(
+                        mol, screen, support, thresholds.multipole_order, ao_moments=ao_moments))
+                    del screen
+                del weak_coeff
+            fragments[i] = FragmentDomainSelection(i, group.copy(), None, empty, empty, empty, empty, empty,
+                            None, primary[i], ao, primary_bp[i], norm_keep, span_keep, weak_virtual, -1)
     del pao_preprojections, ao_moments
     if common is None:
         common = DomainData(overlap, fock, occupied, virtual,

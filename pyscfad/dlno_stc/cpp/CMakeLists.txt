@@ -24,6 +24,13 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(test_sample_team_policy test_sample_team_policy.cpp)
+    target_compile_features(test_sample_team_policy PRIVATE cxx_std_14)
+    target_include_directories(test_sample_team_policy PRIVATE ${ARMADILLO_INCLUDE_DIRS})
+    target_link_libraries(test_sample_team_policy PRIVATE ${ARMADILLO_LIBRARIES} OpenMP::OpenMP_CXX)
+    add_test(NAME sample_team_policy COMMAND test_sample_team_policy)
+    set_tests_properties(sample_team_policy PROPERTIES
+        ENVIRONMENT "OMP_THREAD_LIMIT=8;OPENBLAS_NUM_THREADS=1;MKL_NUM_THREADS=1")
     # Keep an independent full-system oracle out of production builds.
     target_sources(_stc_mp2 PRIVATE test_reference/stc_mp2_kernel.cpp test_reference/stc_mp2_full.cpp)
     target_compile_definitions(_stc_mp2 PRIVATE PYSCFAD_STC_TEST_REFERENCE=1)

@@ -1,7 +1,6 @@
 """In-memory domain MP2 and matrix solvers with explicit host cotangents."""
 import importlib
 import math
-from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field
 import numpy as np
@@ -43,20 +42,18 @@ def _stream_seed(global_seed, fragment_id, stream=0):
 
 
 def _solve_local(inputs, metadata, controls, *, with_grad, aux_offsets):
+    if controls.get('mode', 'deterministic') == 'deterministic':
+        from . import _native_w
+        return _native_w.solve_selected(*(inputs[key] for key in ARRAY_NAMES),
+            tuple(metadata['target_indices']), controls, aux_offsets=aux_offsets, with_grad=with_grad)
     try:
         extension = importlib.import_module("pyscfad.dlno_stc._stc_mp2")
     except ImportError as exc:
         raise ImportError("STC-MP2 extension is unavailable; build pyscfad/dlno_stc/cpp "
                           "with CMake as described in pyscfad/dlno_stc/README.md") from exc
-    serial_blas = not with_grad and controls.get('mode', 'deterministic') == 'deterministic'
-    solve_selected = extension.solve_selected
-    if (controls.get('mode', 'deterministic') == 'deterministic'
-            and _native_factor_layout(inputs['B'])):
-        solve_selected = extension._solve_selected_borrowed
-    with blas_threads(1) if serial_blas else nullcontext():
-        return solve_selected(*(inputs[key] for key in ARRAY_NAMES),
-            tuple(metadata['target_indices']), controls, aux_offsets=aux_offsets,
-            with_grad=with_grad)
+    return extension.solve_selected(*(inputs[key] for key in ARRAY_NAMES),
+        tuple(metadata['target_indices']), controls, aux_offsets=aux_offsets,
+        with_grad=with_grad)
 
 
 def solve(inputs, metadata, controls, *, with_grad=True, aux_offsets=None):
@@ -98,6 +95,13 @@ def _matrix_kernel_version(extension):
     if not isinstance(version, str) or not version:
         raise ImportError("rebuild the STC extension with native matrix v2 support")
     return version
+
+
+def _matrix_extension(settings, matrix_kind='W'):
+    if settings.get('mode', 'deterministic') == 'deterministic':
+        from . import _native_w
+        return _native_w
+    return importlib.import_module('pyscfad.dlno_stc._stc_mp2')
 
 
 def _matrix_targets(metadata, nocc):
@@ -163,7 +167,7 @@ def _check_matrix_memory(inputs, ntarget, settings, offsets, *,
     peak_bytes = (None if resident_mb is None else
                   estimate["total_bytes"] + int(resident_mb*1e6))
     # Every call creates occupied/virtual output matrices. Nonempty native
-    # calls unconditionally copy all three inputs into owned Armadillo arrays;
+    # calls copy the factors into owned native matrix storage;
     # reverse also creates input-shaped bars, including on the empty fast path.
     # Count the largest single new allocation, never original input residency
     # or the conservative estimator's safety factors, as a proven lower bound.
@@ -213,7 +217,7 @@ def solve_matrices(inputs, metadata, controls, *, matrix_kind="W", aux_offsets=N
     seeds = [_stream_seed(settings["global_seed"], metadata.get("fragment_id", 0), batch)
              for batch in range(len(target_batches))]
     saved_metadata["effective_seeds"] = seeds
-    extension = (importlib.import_module("pyscfad.dlno_stc._stc_mp2")
+    extension = (_matrix_extension(settings, matrix_kind)
                  if target_batches else None)
     native_version = _matrix_kernel_version(extension) if extension else "empty_matrix_v2"
     saved_metadata["native_version"] = native_version
@@ -322,7 +326,7 @@ def solve_orbital_matrices(inputs, fragments, controls):
         forwards = tuple(solve_matrices(arrays, dict(fragment_id=i, target_indices=selected),
                                         settings, aux_offsets=offsets) for i, selected in fragments)
         return OrbitalMatrices(forwards, metadata, settings, offsets, fingerprint, ())
-    extension = importlib.import_module('pyscfad.dlno_stc._stc_mp2')
+    extension = _matrix_extension(settings)
     if not hasattr(extension, 'solve_orbital_matrices'):
         raise ImportError('rebuild the STC extension for atom_singleton orbital W support')
     size = settings['target_batch_size'] or len(targets)
@@ -375,7 +379,7 @@ def pullback_orbital_matrices(inputs, batch, matrix_bars):
                     occupied_bar=bars['occupied'], virtual_bar=bars['virtual'])
                    for forward, bars in zip(batch.forwards, matrix_bars))
     else:
-        extension = importlib.import_module('pyscfad.dlno_stc._stc_mp2')
+        extension = _matrix_extension(batch.controls)
         def native_packets():
             for first, count, replay in batch.batches:
                 _check_matrix_memory(arrays, count, batch.controls, batch.aux_offsets,
@@ -410,7 +414,7 @@ def pullback_matrices(inputs, forward, *, energy_bar, occupied_bar, virtual_bar)
         replay.aux_offsets, matrix_kind=matrix_kind)
     if fingerprint != replay.fingerprint:
         raise ValueError("matrix replay fingerprint changed: inputs, frame, kind or controls differ")
-    extension = (importlib.import_module("pyscfad.dlno_stc._stc_mp2")
+    extension = (_matrix_extension(forward['controls'], matrix_kind)
                  if replay.batches else None)
     if extension and _matrix_kernel_version(extension) != replay.native_version:
         raise ValueError("matrix replay native version differs from the loaded extension")
@@ -487,7 +491,7 @@ def begin_sequential_matrices(inputs, metadata, controls):
                   configured_mb=settings.get('memory_limit_mb'),
                   unavoidable_bytes=retained_bytes)
     arrays = host_inputs(inputs)
-    extension = importlib.import_module('pyscfad.dlno_stc._stc_mp2')
+    extension = _matrix_extension(settings)
     native_controls = _matrix_batch_controls(settings, 1, settings['global_seed'])
     with blas_threads(1):
         result = extension.begin_sequential_matrices(
@@ -499,7 +503,9 @@ def begin_sequential_matrices(inputs, metadata, controls):
 def finish_sequential_virtual(forward, occupied_rotation):
     """Consume the cached amplitudes/Grams using an orthonormal ED rotation."""
     from time import perf_counter
-    extension = importlib.import_module('pyscfad.dlno_stc._stc_mp2')
+    from . import _native_w
+    extension = (_native_w if forward['diagnostics'].get('native_version') == _native_w.matrix_kernel_version
+                 else importlib.import_module('pyscfad.dlno_stc._stc_mp2'))
     started = perf_counter()
     with blas_threads(1):
         result = extension.finish_sequential_virtual(

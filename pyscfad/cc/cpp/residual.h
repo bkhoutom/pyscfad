@@ -20,3 +20,6 @@ void bind_solver(pybind11::module_&);
 
 void bind_lambda(pybind11::module_&);
 void bind_integral_pullback(pybind11::module_&);
+void bind_deterministic_w(pybind11::module_&);
+
+void bind_native_triples(pybind11::module_&);

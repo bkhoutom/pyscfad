@@ -2,121 +2,52 @@ name: Publish pyscfadlib
 
 on:
   release:
-    types:
-      - released
+    types: [released]
   workflow_dispatch:
-    inputs:
-      build_linux_x86_64:
-        description: "Build linux x86_64 wheels"
-        type: boolean
-        default: true
-      build_linux_aarch64:
-        description: "Build linux aarch64 wheels"
-        type: boolean
-        default: true
-      build_macos_arm64:
-        description: "Build macos arm64 wheels"
-        type: boolean
-        default: true
 
 jobs:
-  build_wheel_linux_x86_64:
-    if: github.event_name == 'release' || inputs.build_linux_x86_64 == true
-    name: Build linux_x86_64 wheels
-    runs-on: ubuntu-latest
-
+  build_wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
-
-      - name: Build wheels
-        uses: pypa/cibuildwheel@v3.3.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build repaired binary wheels
+        run: |
+          python -m pip install --upgrade cibuildwheel
+          python -m cibuildwheel pyscfadlib --output-dir wheelhouse
         env:
-          CIBW_ARCHS_LINUX: x86_64
+          CIBW_ENVIRONMENT: "CMAKE_BUILD_PARALLEL_LEVEL=2"
+      - uses: actions/upload-artifact@v4
         with:
-          package-dir: pyscfadlib
-          output-dir: pyscfadlib/wheelhouse
-          config-file: "{package}/pyproject.toml"
-
-      - name: Upload wheels
-        uses: actions/upload-artifact@v4
-        with:
-          name: cibw_wheels_linux_x86_64
-          path: pyscfadlib/wheelhouse/*.whl
-          overwrite: true
-
-  build_wheel_linux_aarch64:
-    if: github.event_name == 'release' || inputs.build_linux_aarch64 == true
-    name: Build linux_aarch64 wheels
-    runs-on: ubuntu-24.04-arm
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Build wheels
-        uses: pypa/cibuildwheel@v3.3.0
-        env:
-          CIBW_ARCHS_LINUX: aarch64
-        with:
-          package-dir: pyscfadlib
-          output-dir: pyscfadlib/wheelhouse
-          config-file: "{package}/pyproject.toml"
-
-      - name: Upload wheels
-        uses: actions/upload-artifact@v4
-        with:
-          name: cibw_wheels_linux_aarch64
-          path: pyscfadlib/wheelhouse/*.whl
-          overwrite: true
-
-  build_wheel_macos_arm64:
-    if: github.event_name == 'release' || inputs.build_macos_arm64 == true
-    name: Build macos_arm64 wheels
-    runs-on: macos-latest
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Build wheels
-        uses: pypa/cibuildwheel@v3.3.0
-        env:
-          CMAKE_OSX_ARCHITECTURES: arm64;x86_64
-        with:
-          package-dir: pyscfadlib
-          output-dir: pyscfadlib/wheelhouse
-          config-file: "{package}/pyproject.toml"
-
-      - name: Upload wheels
-        uses: actions/upload-artifact@v4
-        with:
-          name: cibw_wheels_macos_arm64
-          path: pyscfadlib/wheelhouse/*.whl
-          overwrite: true
+          name: pyscfadlib-wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
 
   publish_pypi:
-    name: publish wheels to pypi
-    needs: [build_wheel_linux_x86_64, build_wheel_linux_aarch64, build_wheel_macos_arm64]
-    if: |
-      always() &&
-      (
-        needs.build_wheel_linux_x86_64.result == 'success'  ||
-        needs.build_wheel_linux_aarch64.result == 'success' ||
-        needs.build_wheel_macos_arm64.result == 'success'
-      )
+    needs: build_wheels
     runs-on: ubuntu-latest
-
     environment: release
     permissions:
       id-token: write
-
     steps:
-      - name: Download wheels
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
         with:
+          python-version: "3.11"
+      - name: Build source distribution
+        run: |
+          python -m pip install --upgrade build
+          python -m build --sdist pyscfadlib --outdir dist
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pyscfadlib-wheels-*
           path: dist
           merge-multiple: true
-
-      - run: ls -R dist
-
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:

@@ -27,6 +27,33 @@ shared buffers, streamed pullbacks and response caches.
 
 For this implementation, install the current checkout (`pip install -e .`) and
 follow the [native STC build instructions](pyscfad/dlno_stc/README.md#build-and-verification).
+
+The CPU source build requires a C/C++17 toolchain with a shared OpenMP runtime.
+Installation builds the deterministic CCSD/MP2/triples extension automatically;
+it obtains BLAS from SciPy at runtime. Armadillo is needed only for the optional
+legacy stochastic extension. Binary wheels may bundle the OpenMP runtime used
+by their build toolchain; separate runtime copies are allowed.
+
+With BLAS development libraries, Git, and the compiler available, install from
+this checkout using:
+
+```bash
+python -m pip install 'pyscf>=2.14'
+python -m pip install ./pyscfadlib
+python -m pip install .
+```
+
+On macOS, install a compiler-compatible OpenMP runtime such as Homebrew `libomp`;
+on Linux, use the runtime supplied with the selected compiler. Installed wheel
+runtimes are left intact. Thread-budget scopes manage the loaded runtimes;
+DF-J and SGX use fixed teams during their kernels and restore caller settings.
+PySCFADlib retains its pinned, patched `libcintad`; its legacy C support kernels
+use an external LP64 BLAS, while the deterministic C++ kernels and generalized
+eigensolver use SciPy's BLAS/LAPACK interfaces.
+
+MPI is optional. Install or load the system/cluster MPI implementation, then
+use `python -m pip install '.[mpi]'` to add `mpi4py`. This extra does not install
+MPICH, Open MPI, or Intel MPI runtime wheels. Serial calculations need no MPI.
 The release and upstream installation commands below install upstream PySCFAD.
 
 Installation
@@ -53,7 +80,8 @@ The dependent C/C++ library `pyscfadlib` can be compiled from source following t
 `pyscfad` depends on
 `jax>=0.7.1,<0.11`,
 `pyscfadlib>=0.3`,
-`pyscf>=2.3`, and
+`pyscf>=2.14`,
+`scipy>=1.11`, and
 `pyscf-properties`.
 
 Citing PySCFAD

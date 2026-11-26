@@ -40,24 +40,20 @@ using NativeKernel = libgmbpt::qchem::stc_mp2_kernel;
 namespace {
 
 constexpr const char* matrix_kernel_version =
-    "src_code_rdm_v2:427459d9b91fc70f:standalone-7-d-w-orbital";
+    "src_code_rdm_v2:427459d9b91fc70f:standalone-8-caller-dynamic";
 
-// OpenMP ICVs belong to this calling thread. Deterministic W construction may
-// shrink teams within the explicit budget; other calls retain fixed teams.
-// Restore the caller's policy before returning to subsequent stages (CCSD).
-// MKL's independent dynamic adjustment is left untouched.
+// Set only the per-call thread budget. Dynamic team sizing belongs to the
+// caller for every solver and for both forward and reverse. MKL's independent
+// dynamic adjustment is also left untouched.
 struct ThreadScope {
     int previous = omp_get_max_threads();
-    int dynamic = omp_get_dynamic();
 
-    explicit ThreadScope(int threads, bool dynamic_teams = false) {
-        omp_set_dynamic(dynamic_teams ? 1 : 0);
+    explicit ThreadScope(int threads) {
         omp_set_num_threads(threads);
     }
 
     ~ThreadScope() {
         omp_set_num_threads(previous);
-        omp_set_dynamic(dynamic);
     }
 };
 
@@ -585,8 +581,7 @@ py::dict solve_matrices(py::handle foo, py::handle fvv, py::handle b,
     MatrixOutput output;
     {
         py::gil_scoped_release release;
-        ThreadScope team(settings.replay->threads,
-                         !settings.replay->density_matrix && !settings.replay->stochastic);
+        ThreadScope team(settings.replay->threads);
         const double started = omp_get_wtime();
         if (!settings.replay->stochastic) {
             output = deterministic_forward(inputs, *settings.replay);
@@ -614,7 +609,7 @@ py::list solve_orbital_matrices(py::handle foo, py::handle fvv, py::handle b,
     density::deterministic_result total;
     {
         py::gil_scoped_release release;
-        ThreadScope team(settings.replay->threads,true);
+        ThreadScope team(settings.replay->threads);
         total=density::evaluate_deterministic(inputs.foo,inputs.fvv,inputs.B,
             settings.replay->beta,settings.replay->weights,settings.replay->targets,
             settings.replay->threads,nullptr,true,false,nullptr,true,&inputs.B,
@@ -681,7 +676,7 @@ py::dict begin_sequential(py::handle foo, py::handle fvv, py::handle b,
     density::deterministic_result result;
     {
         py::gil_scoped_release release;
-        ThreadScope team(settings.replay->threads,true);
+        ThreadScope team(settings.replay->threads);
         result=density::evaluate_deterministic(inputs.foo,inputs.fvv,inputs.B,
             settings.replay->beta,settings.replay->weights,settings.replay->targets,
             settings.replay->threads,nullptr,true,false,nullptr,true,&inputs.B,cache.get());
@@ -714,7 +709,7 @@ py::array_t<double> finish_sequential(density::sequential_w_workspace& cache,
     arma::mat result(cache.nvirt,cache.nvirt,arma::fill::zeros);
     {
         py::gil_scoped_release release;
-        ThreadScope team(cache.threads,true);
+        ThreadScope team(cache.threads);
         const size_t nv=cache.nvirt, no=cache.nocc, nr=u.n_cols;
         for (size_t s=0;s<cache.amplitudes.size();++s) {
             arma::cube t(nv,nv,nr),g(nv,nv,nr);

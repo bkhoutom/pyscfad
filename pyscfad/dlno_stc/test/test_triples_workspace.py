@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from pyscfad.dlno_stc import controls, mrcc_triples, _stc_mp2 as native
+from pyscfad.dlno_stc import controls, mrcc_triples, _native_triples as native
 from pyscfad.dlno_stc.test.test_triples_stable import fixture
 from pyscfad.dlno_stc.smooth_triples import make_solver
 from pyscfad import lib
@@ -74,7 +74,7 @@ def test_workspace_cap_and_headroom_reach_native_without_changing_result(monkeyp
 
 
 def test_old_native_module_requires_rebuild(monkeypatch):
-    monkeypatch.delattr(native, 'TRIPLES_CONFIGURABLE_WORKSPACE', raising=False)
+    monkeypatch.delattr(native.cpp, 'TRIPLES_CONFIGURABLE_WORKSPACE', raising=False)
     with pytest.raises(RuntimeError, match='Rebuild.*workspace'):
         mrcc_triples.run_mrcc(fixture(selected=2), np.array([.37]), np.array([1.]),
                              with_grad=False, max_memory=2000., workspace_gib=64.)

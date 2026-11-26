@@ -146,16 +146,19 @@ moments draw_moments(size_t sample_count, unsigned seed, size_t point,
                      size_t stream, const Sampler& sample) {
     const int nthreads=effective_sample_threads();
     std::vector<moments> thread_moments(nthreads);
-    #pragma omp parallel num_threads(nthreads)
-    {
-        const int tid = omp_get_thread_num();
+    // Keep the historical fixed-team streams and sample counts, but schedule
+    // them as logical tasks. A smaller actual team must not change the draws
+    // replayed by the delayed pullback. No dynamic-policy override is needed.
+    #pragma omp parallel for num_threads(nthreads) schedule(static)
+    for (int tid=0;tid<nthreads;++tid) {
         std::mt19937 generator(seed + 104729u*static_cast<unsigned>(point)
                               + 1000003u*static_cast<unsigned>(stream)
                               + 7919u*static_cast<unsigned>(tid));
         moments& local = thread_moments[tid];
         const double start = omp_get_wtime();
-        #pragma omp for schedule(static)
-        for (size_t n = 0; n < sample_count; ++n) {
+        const size_t count=sample_count/size_t(nthreads)
+            + (size_t(tid)<sample_count%size_t(nthreads));
+        for (size_t n = 0; n < count; ++n) {
             const double value = sample(generator);
             ++local.count;
             const double delta = value-local.mean;

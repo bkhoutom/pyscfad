@@ -144,19 +144,22 @@ def test_incompatible_restart_is_rejected(tmp_path, checkpoint_reference, change
     ('W', LEGACY_W_MATRIX_VERSION),
     ('D', RESTORED_D_MATRIX_VERSION),
 ])
+@pytest.mark.parametrize('current_version', [
+    'src_code_rdm_v2:427459d9b91fc70f:standalone-7-d-w-orbital',
+    'src_code_rdm_v2:427459d9b91fc70f:standalone-8-caller-dynamic',
+])
 def test_matrix_restart_accepts_combined_native_provider(
-        tmp_path, checkpoint_reference, monkeypatch, kind, saved_version):
-    from pyscfad.dlno_stc import _stc_mp2
+        tmp_path, checkpoint_reference, monkeypatch, kind, saved_version, current_version):
+    from pyscfad.dlno_stc import _native_w
 
     mf, selected = checkpoint_reference
     selected = replace(selected, lis_static=replace(selected.lis_static, matrix_kind=kind))
-    monkeypatch.setattr(_stc_mp2, 'matrix_kernel_version', saved_version)
+    monkeypatch.setattr(_native_w, 'checkpoint_matrix_version', saved_version)
     manager = _open(tmp_path, mf, selected)
     save_progress(manager, dict(energy=-.125, variance=0., baseline_energy=-.125,
                                weak_energy=0.), [], 1, True, with_grad=False)
     manager.close()
-    monkeypatch.setattr(_stc_mp2, 'matrix_kernel_version',
-                        'src_code_rdm_v2:427459d9b91fc70f:standalone-7-d-w-orbital')
+    monkeypatch.setattr(_native_w, 'checkpoint_matrix_version', current_version)
     manager = _open(tmp_path, mf, selected, resume=True)
     try:
         state = dict(energy=0., variance=0., baseline_energy=0., weak_energy=0.)
@@ -174,15 +177,15 @@ def test_matrix_restart_accepts_combined_native_provider(
 def test_matrix_restart_rejects_incompatible_kind_or_version(
         tmp_path, checkpoint_reference, monkeypatch,
         saved_kind, resume_kind, resume_version, mismatch):
-    from pyscfad.dlno_stc import _stc_mp2
+    from pyscfad.dlno_stc import _native_w
 
     mf, selected = checkpoint_reference
     saved = replace(selected, lis_static=replace(selected.lis_static, matrix_kind=saved_kind))
     current = replace(selected, lis_static=replace(selected.lis_static, matrix_kind=resume_kind))
-    monkeypatch.setattr(_stc_mp2, 'matrix_kernel_version', RESTORED_D_MATRIX_VERSION)
+    monkeypatch.setattr(_native_w, 'checkpoint_matrix_version', RESTORED_D_MATRIX_VERSION)
     manager = _open(tmp_path, mf, saved)
     manager.close()
-    monkeypatch.setattr(_stc_mp2, 'matrix_kernel_version', resume_version)
+    monkeypatch.setattr(_native_w, 'checkpoint_matrix_version', resume_version)
     with pytest.raises(RestartMismatchError, match=mismatch):
         _open(tmp_path, mf, current, resume=True)
 
@@ -270,10 +273,13 @@ def test_scf_density_restart_resumes_interrupted_cc_gradient(tmp_path, monkeypat
     """Resume one of two real CC groups, including all common and SCF response."""
     from pyscf.lib import chkfile
     from pyscfad import scf
-    from pyscfad.dlno_stc import _ccsd_checkpoint, _stc_mp2, build_domain_selections
+    from pyscfad.dlno_stc import _ccsd_checkpoint, _native_w, build_domain_selections
     from pyscfad.dlno_stc.test._boys_acceptance import molecule, LO_OPTIONS
 
     mol = molecule()
+    # This suite retains JAX executables from earlier traced reverses. The
+    # test budget must cover that process residency as well as its DF tile.
+    mol.max_memory = 8000
     scf_path = tmp_path / 'scf.chk'
     checkpoint = tmp_path / 'domains'
     density_restarts = []
@@ -324,7 +330,7 @@ def test_scf_density_restart_resumes_interrupted_cc_gradient(tmp_path, monkeypat
 
     def open_legacy(*args, **kwargs):
         with monkeypatch.context() as patch:
-            patch.setattr(_stc_mp2, 'matrix_kernel_version', LEGACY_W_MATRIX_VERSION)
+            patch.setattr(_native_w, 'checkpoint_matrix_version', LEGACY_W_MATRIX_VERSION)
             return open_current(*args, **kwargs)
 
     with monkeypatch.context() as patch:

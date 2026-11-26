@@ -83,17 +83,10 @@ else()
   message(STATUS "BLAS libraries: ${BLAS_LIBRARIES}")
 endif()
 
-if (NOT LAPACK_LIBRARIES)
-  find_package(LAPACK)
-endif()
+# The generalized eigensolver obtains LAPACK through SciPy's Cython API;
+# linking another LAPACK implementation would add an unused numerical runtime.
 
-if (NOT LAPACK_LIBRARIES)
-  message(FATAL_ERROR "A required library with LAPACK API not found.")
-else()
-  message(STATUS "LAPACK libraries: ${LAPACK_LIBRARIES}")
-endif()
-
-option(ENABLE_OPENMP "Compiling C extensions with openmp" ON)
+option(ENABLE_OPENMP "Compiling C extensions with OpenMP" ON)
 set(OPENMP_C_PROPERTIES "")
 if(ENABLE_OPENMP)
   if(APPLE)
@@ -121,8 +114,8 @@ if(ENABLE_OPENMP)
     unset(_pyscfad_openmp_root)
     unset(_pyscfad_openmp_roots)
   endif()
-  find_package(OpenMP)
-  if(OPENMP_FOUND)
+  find_package(OpenMP COMPONENTS C CXX)
+  if(OpenMP_C_FOUND)
     set(HAVE_OPENMP 1)
     set(OPENMP_C_PROPERTIES OpenMP::OpenMP_C)
   endif()
@@ -157,6 +150,17 @@ add_subdirectory(gto)
 add_subdirectory(sgx)
 add_subdirectory(vjp)
 add_subdirectory(lapack)
+
+install(TARGETS np_helper_ad cgto_ad vjp_util cgto_vjp np_helper_vjp
+        ao2mo_vjp cvhf_vjp mp_vjp cc_vjp
+        LIBRARY DESTINATION pyscfadlib RUNTIME DESTINATION pyscfadlib)
+# libcintad is the pinned, patched integral implementation, not an OpenMP/MPI
+# runtime. Keep it and its headers with the support package.
+install(DIRECTORY "${PROJECT_SOURCE_DIR}/thirdparty/lib/"
+        DESTINATION pyscfadlib/thirdparty/lib OPTIONAL
+        FILES_MATCHING PATTERN "libcintad*")
+install(DIRECTORY "${PROJECT_SOURCE_DIR}/thirdparty/include/"
+        DESTINATION pyscfadlib/thirdparty/include OPTIONAL)
 
 set(C_LINK_TEMPLATE "<CMAKE_C_COMPILER> <CMAKE_SHARED_LIBRARY_C_FLAGS> <LANGUAGE_COMPILE_FLAGS> <LINK_FLAGS> <CMAKE_SHARED_LIBRARY_CREATE_C_FLAGS> -o <TARGET> <OBJECTS> <LINK_LIBRARIES>")
 

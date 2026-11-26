@@ -246,3 +246,34 @@ ordinary DLNO imports do not load that compatibility library.
 Directional derivative, reference contraction, layout and threading checks are
 in `test_native_integral_pullback.py`. The full DLNO energy/gradient regression
 also forbids legacy CC library calls and checks that both C++ pullbacks ran.
+
+## Deterministic W
+
+`deterministic_w.cpp` implements selected MP2 W and its delayed input adjoint
+without Armadillo. Column-major matrix views carry leading dimensions and
+retain the existing virtual-eigenbasis propagation and occupied-partner tiles.
+GEMMs use the shared SciPy pointer, with `parallel_gemm` outside worker regions
+and serial GEMM within them. The adapter `dlno_stc/_native_w.py` obtains the
+symmetric spectra through SciPy LAPACK, scopes thread counts, and preserves
+the existing matrix result/replay contract. It keeps no factors or amplitudes
+in ordinary delayed replays. Sequential W explicitly retains its call-local
+amplitudes and Grams until the occupied projection is consumed.
+
+## Deterministic MP2/D and MRCC triples
+
+The W propagator also supplies scalar MP2 without constructing W outputs and
+D matrices with both amplitude legs differentiated. Scalar target batching
+bounds amplitude storage; matrix-exponential pullbacks include degenerate
+and off-diagonal Fock response.
+
+`triples.cpp` and `triples_dressing.cpp` retain the bounded occupied-block MRCC
+algorithm, shared dressing graph and grouped adjoints. `dense_matrix.h` owns
+column-major buffers and strict borrowed views; transpose descriptors go
+directly to the same SciPy LP64 GEMM pointer used by CCSD. Symmetric eigensolves
+use SciPy LAPACK. The Python adapter scopes serial BLAS around native calls,
+while C++ owns OpenMP parallelism and preserves the caller's dynamic policy.
+There is no Armadillo header, link dependency or runtime loader on this path.
+
+The stochastic legacy extension remains separate. Deterministic checkpoint
+identities preserve mathematically compatible completed contributions; replay
+objects remain local to their provider and are never checkpointed.

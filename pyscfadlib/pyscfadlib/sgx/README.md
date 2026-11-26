@@ -223,6 +223,9 @@ Grid loops use ordinary C++ and OpenMP SIMD directives, with optional OpenMP
 threading. There are no ISA intrinsics, fixed SIMD widths, `-march=native`,
 AVX requirements or fast-math flags. The thread count is passed explicitly from
 PySCF, including when the two libraries use distinct OpenMP runtimes.
+FP64 and adaptive/mixed contractions preserve the caller's dynamic-team
+policy throughout forward and derivative evaluation. A requested thread
+count is a budget; `OMP_DYNAMIC=TRUE` permits the runtime to shrink the team.
 
 Each 128-point tile transforms F to Cartesian AOs once, evaluates shell pairs,
 contracts each small integral tile into G, and transforms G back once. Only

@@ -1,0 +1,5 @@
+# Only publish package sources and the root build metadata.
+global-exclude *
+include LICENSE README.md pyproject.toml setup.py MANIFEST.in
+graft pyscfad
+global-exclude *.so *.so.* *.dylib *.dll *.a *.pyc

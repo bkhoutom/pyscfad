@@ -10,6 +10,7 @@ import weakref
 
 import numpy as np
 from pyscf import gto, lib
+from ._threading import fixed_openmp_teams
 
 
 @lru_cache(None)
@@ -70,9 +71,10 @@ def reduce_geometry(dao, fg, gv, dgv, weights, start, stop, index, tmp,
         return False
     nao, ngrids = fg.shape
     arrays = (weights, fg, gv, dgv, dao, index, tmp, atom_ao, xed, dxed)
-    if dll.SGX_contract_geometry(nao, ngrids, start, stop-start,
-                                 *map(_ptr, arrays), lib.num_threads()):
-        raise MemoryError('Unable to allocate SGX geometry contraction scratch')
+    with fixed_openmp_teams():
+        if dll.SGX_contract_geometry(nao, ngrids, start, stop-start,
+                                     *map(_ptr, arrays), lib.num_threads()):
+            raise MemoryError('Unable to allocate SGX geometry contraction scratch')
     return True
 
 
@@ -164,6 +166,7 @@ class IntegralPlan:
         fg = np.ascontiguousarray(fg)
         return coords, fg
 
+    @fixed_openmp_teams()
     def contract(self, mol, coords, fg, weights=None, b0=None, *, algorithm=0, ao_l1=None):
         coords, fg = self._inputs(coords, fg)
         out = np.empty_like(fg)
@@ -177,6 +180,7 @@ class IntegralPlan:
             raise MemoryError(self.dll.SGX_generated_error().decode())
         return out
 
+    @fixed_openmp_teams()
     def contract_with_grad(self, mol, coords, fg, weights=None, b0=None, *, ao_l1=None):
         """Return G and its bra spatial derivative, matching int1e_grids_ip.
 

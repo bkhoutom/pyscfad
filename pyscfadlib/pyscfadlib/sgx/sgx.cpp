@@ -456,11 +456,7 @@ static int contract_impl(void* ptr,int ns,int total,const double* coords,
     const Plan& p=*static_cast<Plan*>(ptr);
     const bool derivative=dgv!=nullptr;
     std::atomic<bool> failed(false);
-    // This runtime may have been loaded after Python's fixed-thread scope.
-    #ifdef _OPENMP
-    const int previous_dynamic=omp_get_dynamic();
-    omp_set_dynamic(0);
-    #endif
+    // Request the caller's budget without overriding dynamic team sizing.
     #pragma omp parallel num_threads(threads)
     {
         std::unique_ptr<Scratch> w;
@@ -484,9 +480,6 @@ static int contract_impl(void* ptr,int ns,int total,const double* coords,
             if(derivative)from_cart(p,3*ns,ng,start,total,dgv,w->dg.data());
         }
     }
-    #ifdef _OPENMP
-    omp_set_dynamic(previous_dynamic);
-    #endif
     if(failed){last_error="Unable to allocate SGX thread scratch";return 1;}
     return 0;
 }

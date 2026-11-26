@@ -228,6 +228,8 @@ PYBIND11_MODULE(_ccsd_kernels, m) {
     bind_solver(m);
     bind_lambda(m);
     bind_integral_pullback(m);
+    bind_deterministic_w(m);
+    bind_native_triples(m);
     m.def("ladder", &ladder, py::arg("pairs").noconvert(),
           py::arg("t").noconvert(), py::arg("workspace_bytes"));
     m.def("panel_shape", [](size_t v, size_t bytes, size_t threads) {

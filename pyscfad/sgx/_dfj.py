@@ -19,9 +19,11 @@ from pyscf import gto, lib
 from pyscf.df import df_jk
 from pyscf.scf import _vhf
 from pyscfad.lib._threading import fixed_threads
+from ._threading import fixed_openmp_teams
 
 
 @fixed_threads()
+@fixed_openmp_teams()
 def get_j(obj, dm, hermi=1, tol=1e-13):
     """Forward J with PySCF's Schwarz and density screens at the current tol.
 
@@ -121,6 +123,7 @@ def _solve_metric(opt, rhs):
 
 
 @fixed_threads()
+@fixed_openmp_teams()
 def density_response(obj, dm, tol=1e-13):
     """Linear J response with the same fixed Schwarz mask in both passes."""
     opt = _initialize(obj, dm, tol)
@@ -188,6 +191,7 @@ def geometry(obj, dm, bar):
 
 
 @fixed_threads()
+@fixed_openmp_teams()
 def geometry_many(obj, contributions):
     """Contract every bilinear seed while each derivative shell tile is live."""
     contributions = [(d, b) for d, b in contributions if np.any(d) and np.any(b)]

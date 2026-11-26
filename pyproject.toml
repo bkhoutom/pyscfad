@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=65"]
+requires = ["setuptools>=65", "wheel", "cmake>=3.18", "pybind11>=2.13"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -16,8 +16,9 @@ authors = [
 
 dependencies = [
   "jax>=0.7.1,<0.11",
+  "scipy>=1.11",
   "pyscfadlib>=0.3.0",
-  "pyscf>=2.3",
+  "pyscf>=2.14",
   "pyscf-properties",
   "threadpoolctl>=3.1",
 ]
@@ -33,6 +34,9 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
+mpi = [
+  "mpi4py>=4.1",
+]
 cuda12 = [
   "jax[cuda12]>=0.7.1,<0.11",
   "pyscfad-cuda12-plugin[with_cuda]>=0.3.0",
@@ -45,13 +49,14 @@ Homepage = "https://github.com/fishjojo/pyscfad"
 version = { attr = "pyscfad.version.__version__" }
 
 [tool.setuptools.packages.find]
+include = ["pyscfad", "pyscfad.*"]
 exclude = ["examples", "*test*"]
 
 [tool.setuptools]
-include-package-data = true
+include-package-data = false
 
 [tool.setuptools.package-data]
-"pyscfad.cc" = ["cpp/*.cpp", "cpp/*.h", "cpp/CMakeLists.txt", "cpp/README.md"]
+"pyscfad.cc" = ["cpp/*.cpp", "cpp/*.h", "cpp/*.inc", "cpp/CMakeLists.txt", "cpp/README.md"]
 "pyscfad.geomopt" = ["log.ini"]
 "pyscfad.xtb.basis" = ["gfn1.dat"]
 "pyscfad.xtb.data" = ["gfn1-xtb.toml"]

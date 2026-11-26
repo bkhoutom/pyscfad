@@ -147,7 +147,10 @@ def test_selected_source_proposals_seeded_reverse_and_all_kept():
     assert abs(out['energy']-exact['energy']) < 7*out['energy_standard_error']+1e-13
     assert out['diagnostics']['actual_sample_count'] > 0
     for key in KEYS:
-        np.testing.assert_array_equal(out['cotangents'][key], again['cotangents'][key])
+        # The draws are identical; parallel gradient reductions can regroup
+        # floating-point additions when caller-controlled teams vary.
+        np.testing.assert_allclose(out['cotangents'][key], again['cotangents'][key],
+                                   rtol=2e-13, atol=2e-14)
     assert solve(x, (1,), controls, aux_offsets=np.array([0, 1, 4]), with_grad=False)['energy'] == out['energy']
     kept = solve(x, (1,), dict(controls, system_workload_cutoff=1e-100))
     assert kept['energy_standard_error'] == 0
@@ -193,7 +196,8 @@ def test_full_is_one_fragment_with_identical_sampling_and_response(mode, with_gr
     if with_grad:
         for key in KEYS:
             if mode == 'stochastic':
-                np.testing.assert_array_equal(full['cotangents'][key], selected['cotangents'][key])
+                np.testing.assert_allclose(full['cotangents'][key], selected['cotangents'][key],
+                                           rtol=2e-13, atol=2e-14)
             else:
                 # Parallel adjoint reductions can differ in their final bits
                 # between calls to the same deterministic implementation.

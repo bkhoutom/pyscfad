@@ -22,6 +22,29 @@ LIS frames and the same fragment, CC correction and force workflow.
 Every solver mode defaults to deterministic. Stochastic MP2, D/W, CCSD and
 triples remain available explicitly.
 
+Deterministic MP2, D/W and MRCC triples use the `_ccsd_kernels` extension built with
+`pyscfad/cc/cpp`: SciPy LAPACK supplies its symmetric eigensolves, and the
+native contractions share CCSD's SciPy BLAS pointer and OpenMP runtime.
+OpenMP owns kernel parallelism with serial BLAS inside workers; the requested
+thread budget is scoped to the call and the caller's dynamic-team policy is
+preserved throughout forward and reverse.
+This covers scalar MP2, summed D/W, per-orbital W and the forward-only sequential W option.
+The delayed reverse retains the full matrix-exponential derivative, including
+degenerate eigenspaces, and returns cotangents in the original ED frame.
+The deterministic DLNO-CCSD(T) route does not import `_stc_mp2`, Armadillo,
+or `libcc_vjp`. Build only `pyscfad/cc/cpp` for this route. The optional
+`dlno_stc/cpp` extension remains necessary for stochastic MP2, D/W and triples.
+An older CCSD extension must be rebuilt; deterministic requests do not silently
+fall back to Armadillo.
+
+All library kernels preserve the caller's OpenMP dynamic-team policy,
+including the Armadillo compatibility paths and SGX. `OMP_DYNAMIC=TRUE`
+permits smaller teams; `FALSE` disables that adjustment. Neither choice is
+overridden internally. Stochastic energy replay assigns its saved streams
+to logical tasks so a change in actual team size does not change the samples
+(the replay's configured thread budget must still match). BLAS thread limits
+and OpenMP loop scheduling are separate from this policy.
+
 ## Fragments and domains
 
 ```python
@@ -761,29 +784,22 @@ Restart checkpoints remain supported independently of disk solver exchange.
 
 ## Build and verification
 
-Standalone deterministic MP2 shares one host-owned fitted factor between
-domain preparation, the native scalar solver, and the analytic DF pullback.
-During the fused energy/input-derivative solve, the four persistent full-sized
-factors are the original `B`, dressed `C`, `dE/dC`, and accumulated `dE/dB`.
-The factor remains in native column-major `(P,ia)` storage; its Python
-`(P,i,a)` representation is a view. Small orbital/Fock transformations still
-use JAX pullbacks. No JAX compilation cache is cleared by this handoff.
+Standalone deterministic MP2 uses the same native propagator as D/W, with
+energy-only contractions rather than W output matrices. Forward plus input
+cotangents share one amplitude construction. `target_batch_size` bounds the
+selected-target amplitude storage (one target by default for scalar MP2).
+The adapter owns a virtual-eigenbasis DF copy and may need a C-layout staging
+copy for strided factors. Fock spectra and their full derivatives use SciPy
+LAPACK and the native Frechet pullback. No JAX compilation cache is cleared.
 
-This applies automatically to saved/deferred domains and system grouping,
-including MPI domain owners. Stochastic MP2 and the W/CC preparation retain
-their existing interfaces. The public native `solve_selected` accepts C-order
-inputs as before, with its compatibility layout copy; the internal host
-path uses `_solve_selected_borrowed`. Its diagnostics report
-`borrowed_input_B` and `peak_factor_buffers`. Rebuild the extension together
-with these Python changes.
+The old `_stc_mp2.solve_selected` and `_solve_selected_borrowed` APIs remain
+available for legacy tests and stochastic users. Their four-factor/pair-Gram
+memory diagnostics describe that legacy implementation, not the new scalar
+propagator. Process memory also includes host factors, SCF/localization state,
+DF response, worker scratch and retained JAX executables.
 
-Four factors is not a process-memory limit: thread work arrays, the bounded
-pair-Gram cache, SCF/localization state, metric response, optional resident H,
-and direct-integral workspace are additional. For an isolated before/after
-RSS measurement, see `test/mp2_factor_memory_probe.py`; it measures synthetic
-factor preparation and the scalar solve, without SCF or AO integrals.
-
-With PySCFAD, pybind11, Armadillo and OpenMP available, build from the repo root:
+For **stochastic** MP2, D/W or triples only, build the optional legacy extension
+with PySCFAD, pybind11, Armadillo and OpenMP available:
 
 ```bash
 cmake -S pyscfad/dlno_stc/cpp -B build/dlno_stc \
@@ -798,8 +814,16 @@ python -m pytest pyscfad/dlno_stc/test/test_calculation_modes.py \
   pyscfad/dlno_stc/test/test_w_delayed_pullback.py
 ```
 
-The optional CPU CCSD residual kernels require CMake, pybind11, an OpenMP C++
-compiler and the active Python/SciPy environment:
+For deterministic DLNO-CCSD(T), build the native CCSD/MP2/triples extension.
+It requires CMake, pybind11, an OpenMP C++ compiler and the active Python/SciPy
+environment; Armadillo and MKL are not build dependencies.
+
+`python -m pip install .` now builds this extension automatically using the
+compiler's OpenMP runtime. CMake and pybind11 are declared build
+dependencies. The commands below remain available for an explicit developer
+build. MPI is separate and optional: install/load the host MPI implementation
+and install `pyscfad[mpi]` (or `'.[mpi]'` from this checkout). Binary wheels may
+bundle OpenMP; separate runtime copies are allowed and are not rewritten.
 
 ```bash
 cmake -S pyscfad/cc/cpp -B build/ccsd -DCMAKE_BUILD_TYPE=Release \
@@ -812,14 +836,15 @@ cmake --build build/ccsd -j 2
 For resident real RCCSD with cached virtual integrals, the extension evaluates
 the complete amplitude update: the virtual ladder, tiled `ovvv`, `ovov` and
 `oooo` contractions, intermediates, symmetrization and denominators. Python
-retains DIIS, convergence and memory/thread policy. The existing response and
-integral-adjoint implementations are unchanged. Unsupported modes and tight
+retains DIIS, convergence and memory/thread policy. The extension also supplies lambda response, DF integral pullbacks,
+deterministic MP2/D/W and the MRCC triples numerator/dressing pullback. Unsupported modes and tight
 memory budgets use the Python reference equations. See the
 [native residual implementation notes](../cc/cpp/README.md) for the kernel
 boundary and diagnostic timing interface.
 
 `config.update('pyscfad_dfccsd_cpp', False)`
-disables the optional C++ kernels; `config.update('pyscfad_dfccsd_native', False)`
+disables the optional CCSD residual/lambda kernels (MP2 and deterministic
+triples still require the native extension); `config.update('pyscfad_dfccsd_native', False)`
 selects the JAX fragment reference implementation. Higher derivatives require
 the JAX path; the native RCCSD adapter supports real float64 energies and first
 derivatives. Imports do not build or download dependencies.

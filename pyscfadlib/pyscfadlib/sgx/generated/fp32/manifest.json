@@ -186,7 +186,14 @@
     },
     {
       "file": "VD_F_D.C",
-      "source_sha256": "313c311cd1b3ef5147680630317eaed315bc89364dc5b712566590211cdadd24"
+      "source_sha256": "313c311cd1b3ef5147680630317eaed315bc89364dc5b712566590211cdadd24",
+      "split": {
+        "helpers": 4,
+        "max_declarations": 732,
+        "output_assignments": 420,
+        "declaration_limit": 768,
+        "output_limit": 112
+      }
     },
     {
       "file": "VD_F_D_SAMECENTER.C",
@@ -194,7 +201,14 @@
     },
     {
       "file": "VD_F_F.C",
-      "source_sha256": "18f457df7be0daf1b8f348618d6d0c75b970415a10c0ab69526ddec6b7891ca4"
+      "source_sha256": "18f457df7be0daf1b8f348618d6d0c75b970415a10c0ab69526ddec6b7891ca4",
+      "split": {
+        "helpers": 9,
+        "max_declarations": 768,
+        "output_assignments": 700,
+        "declaration_limit": 768,
+        "output_limit": 112
+      }
     },
     {
       "file": "VD_F_F_SAMECENTER.C",
@@ -218,7 +232,14 @@
     },
     {
       "file": "VD_G_D.C",
-      "source_sha256": "83a3a8ebd0e9ddb18d9d15334744292ae5a263cd7fd203ff046932a842ffb7b6"
+      "source_sha256": "83a3a8ebd0e9ddb18d9d15334744292ae5a263cd7fd203ff046932a842ffb7b6",
+      "split": {
+        "helpers": 8,
+        "max_declarations": 768,
+        "output_assignments": 630,
+        "declaration_limit": 768,
+        "output_limit": 112
+      }
     },
     {
       "file": "VD_G_D_SAMECENTER.C",
@@ -226,7 +247,14 @@
     },
     {
       "file": "VD_G_F.C",
-      "source_sha256": "886572b166a67d5aa483308064ebefbed419fbebaad773d9b6b3ab4d63988975"
+      "source_sha256": "886572b166a67d5aa483308064ebefbed419fbebaad773d9b6b3ab4d63988975",
+      "split": {
+        "helpers": 17,
+        "max_declarations": 768,
+        "output_assignments": 1050,
+        "declaration_limit": 768,
+        "output_limit": 112
+      }
     },
     {
       "file": "VD_G_F_SAMECENTER.C",
@@ -234,7 +262,14 @@
     },
     {
       "file": "VD_G_G.C",
-      "source_sha256": "60d25fba01b829fa7358e9c980b1a53298b2aace031641b77213f4cc9b97d6ad"
+      "source_sha256": "60d25fba01b829fa7358e9c980b1a53298b2aace031641b77213f4cc9b97d6ad",
+      "split": {
+        "helpers": 34,
+        "max_declarations": 768,
+        "output_assignments": 1575,
+        "declaration_limit": 768,
+        "output_limit": 112
+      }
     },
     {
       "file": "VD_G_G_SAMECENTER.C",
@@ -410,7 +445,14 @@
     },
     {
       "file": "VRR_G_F.C",
-      "source_sha256": "7953cac5ac280c7082f08180c59d1369a44bc4c6c80dea247f7f38218edbedd8"
+      "source_sha256": "7953cac5ac280c7082f08180c59d1369a44bc4c6c80dea247f7f38218edbedd8",
+      "split": {
+        "helpers": 22,
+        "max_declarations": 768,
+        "output_assignments": 300,
+        "declaration_limit": 768,
+        "output_limit": 112
+      }
     },
     {
       "file": "VRR_G_F.h",
@@ -426,7 +468,14 @@
     },
     {
       "file": "VRR_G_G.C",
-      "source_sha256": "ef9abf7a96ba6cde5fc89afb712065be79e089d02024a6a0276d9a8805f3ea84"
+      "source_sha256": "ef9abf7a96ba6cde5fc89afb712065be79e089d02024a6a0276d9a8805f3ea84",
+      "split": {
+        "helpers": 52,
+        "max_declarations": 768,
+        "output_assignments": 450,
+        "declaration_limit": 768,
+        "output_limit": 112
+      }
     },
     {
       "file": "VRR_G_G.h",

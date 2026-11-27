@@ -60,6 +60,23 @@ The derivative sources occupy about 2.7 MiB. Splitting the largest graphs
 recomputes some intermediates between groups; Boys values and primitive-pair
 geometry remain shared. No additional integral tensor is retained.
 
+The distinct-center FP32 `VD_F_D`, `VD_F_F`, `VD_G_D`, `VD_G_F`, `VD_G_G`,
+`VRR_G_F`, and `VRR_G_G` sources use bounded, non-inlined SIMD helpers to limit compiler
+optimization work. Each helper contains at most 768 local declarations and
+112 output assignments. The float generator extracts the dependencies of
+each output group from the original expression graph; derivative values and
+their six components are grouped together to retain shared intermediates.
+Primitive accumulation order and output layout are preserved. Intermediates
+needed by separate helpers are recomputed, so runtime performance can differ;
+this is not a precision fallback or a lower optimization level. All seven
+kernels remain FP32 and use the normal build optimization settings.
+
+Regenerate these sources with `python codegen/generate_float.py` from this
+directory. `generated/fp32/manifest.json` records the helper bounds and counts.
+`tests/test_sgx_split_kernels.py` compares all seven kernels directly with the
+original unsplit expressions, including signed primitive contributions and
+short/full grid batches; the mixed SGX tests also compare against libcint.
+
 ## Build and use
 
 Normal pyscfadlib builds include this library. It can also be built separately

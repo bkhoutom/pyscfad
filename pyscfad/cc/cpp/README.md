@@ -257,7 +257,16 @@ and serial GEMM within them. The adapter `dlno_stc/_native_w.py` obtains the
 symmetric spectra through SciPy LAPACK, scopes thread counts, and preserves
 the existing matrix result/replay contract. It keeps no factors or amplitudes
 in ordinary delayed replays. Sequential W explicitly retains its call-local
-amplitudes and Grams until the occupied projection is consumed.
+amplitudes and Grams until the occupied projection is consumed. Its delayed
+reverse rebuilds them once, projects both amplitude and Gram legs, and returns
+the summed occupied-rotation seed to the fixed-rank selection VJP. The resulting
+occupied-W seed joins the direct seed before the single factor/propagator
+reverse. Temporary target tensors are released as consumed; only the small
+rotation and selection tape survive the forward CC solve.
+Sequential D uses the same projection with `spin(T)` in place of the bare
+integral Gram. Its reverse adds both density-factor cotangents to the full-ED
+amplitudes, while the MP2 energy retains its separate bare-integral leg.
+D density seeding therefore requires no extra bare-integral Gram build.
 
 ## Deterministic MP2/D and MRCC triples
 

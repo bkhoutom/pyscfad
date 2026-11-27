@@ -133,10 +133,10 @@ def _run_jobs(initializer, worker_initializer, comm, *, with_grad,
     if with_grad:
         _collect_tree_schema(comm, (state['mf_bar'], state['common_bar']))
     del initialized, shared, payload, metadata
-    # Weak completion belongs to the separate baseline and is counted once.
-    _collective_call(comm, lambda: ccsd._run_weak(state, static, with_grad=with_grad)
+    # Global MP2 or weak completion is evaluated once, on root, before reduction.
+    _collective_call(comm, lambda: ccsd._run_baseline(state, static, baseline, with_grad=with_grad)
                      if rank == 0 else None,
-                     'CC baseline weak completion')
+                     'CC independent baseline')
     records, error, group_id = [], None, None
     try:
         for position in range(rank, len(groups), size):

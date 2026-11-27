@@ -17,10 +17,10 @@ def test_invalid_density_rejected_before_reference_use(kind):
                                      matrix_kind=kind)
 
 
-def test_sequential_virtual_d_rejected_before_reference_use():
+def test_sequential_virtual_v_rejected_before_reference_use():
     with pytest.raises(NotImplementedError, match='W'):
         ccsd.build_static_selections(None, None, thresh_occ=0., thresh_vir=0.,
-                                     matrix_kind='D', sequential_virtual=True)
+                                     matrix_kind='V', sequential_virtual=True, baseline_kind='global')
 
 
 def test_density_checkpoint_identity_and_legacy_w_default():

@@ -35,7 +35,10 @@ def open_checkpoint(state, static, groups, *, checkpoint_dir, resume, options):
     # replay implementation versions are deliberately process-local.
     from . import _native_w
     matrix_settings = dict(static.controls_identity[2])
-    if matrix_settings.get('mode', 'deterministic') == 'stochastic':
+    if static.lis_static.matrix_kind == 'V':
+        from ._v_matrices import matrix_kernel_version
+        native_version = matrix_kernel_version
+    elif matrix_settings.get('mode', 'deterministic') == 'stochastic':
         from . import _stc_mp2
         native_version = _stc_mp2.matrix_kernel_version
     else:
@@ -64,6 +67,17 @@ def open_checkpoint(state, static, groups, *, checkpoint_dir, resume, options):
     if options.get('cc_solver') == 'stc':
         from .stc_ccsd import external_implementation_identity
         payload['external_stc_implementation'] = external_implementation_identity()
+    if static.baseline_kind != 'domain':
+        payload['baseline_kind'] = static.baseline_kind
+        baseline_settings = dict(static.controls_identity[1])
+        if baseline_settings.get('mode', 'deterministic') == 'stochastic':
+            from . import _stc_mp2
+            payload['global_mp2_version'] = dict(
+                provider='stc_mp2_selected', native_version=_stc_mp2.matrix_kernel_version,
+                energy_identity='boys_target_laplace_mp2_v1')
+        else:
+            # Keep deterministic global-baseline checkpoints compatible.
+            payload['global_mp2_version'] = _native_w.checkpoint_matrix_version
     triples = options.get('triples_controls')
     if triples is not None:
         if triples.get('mode', 'deterministic') == 'stochastic':

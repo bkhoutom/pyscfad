@@ -185,7 +185,7 @@ def _check_matrix_memory(inputs, ntarget, settings, offsets, *,
 
 
 def solve_matrices(inputs, metadata, controls, *, matrix_kind="W", aux_offsets=None):
-    """Return native energy and matrix blocks with a delayed arbitrary-seed reverse.
+    """Return selection matrices with a delayed arbitrary-seed reverse.
 
     Blocks are sums over selected targets in exactly the input frame. W's
     sampling allocation controls matrix error. Its native energy is the half
@@ -194,9 +194,13 @@ def solve_matrices(inputs, metadata, controls, *, matrix_kind="W", aux_offsets=N
     selected MP2 energy separately.
     CCSD/(T) consumes this forward result for its MP2 baseline and LIS response.
     Standalone MP2 uses the scalar solve interface instead.
+    V returns direct Coulomb matrices only, without a scalar energy.
     """
     from .controls import normalize_matrix_controls
 
+    if matrix_kind == 'V':
+        from . import _v_matrices
+        return _v_matrices.solve(inputs, metadata, controls)
     settings = normalize_matrix_controls(controls, matrix_kind)
     validate_full_inputs(inputs)
     naux, nocc, nvir = inputs["B"].shape
@@ -350,14 +354,19 @@ def solve_orbital_matrices(inputs, fragments, controls):
     return OrbitalMatrices(tuple(forwards), metadata, settings, offsets, fingerprint, tuple(batches))
 
 
-def pullback_orbital_matrices(inputs, batch, matrix_bars):
+def pullback_orbital_matrices(inputs, batch, matrix_bars, *, energy_bar=1.):
     """Consume labeled W seeds after all CC reverses; return one input bar tree.
 
-    Every target contributes its MP2 energy once. Arbitrary W seeds stay
+    Each target's MP2 energy has the supplied scalar seed (zero with a global
+    baseline). Arbitrary W seeds stay
     separate until their target-specific contractions have been reversed.
     """
     if not isinstance(batch, OrbitalMatrices):
         raise TypeError('orbital reverse requires its forward batch')
+    energy_bar = np.asarray(energy_bar)
+    if energy_bar.shape != () or not np.isfinite(energy_bar):
+        raise ValueError('energy_bar must be a finite scalar')
+    energy_bar = float(energy_bar)
     if len(matrix_bars) != len(batch.forwards):
         raise ValueError('orbital matrix cotangent count mismatch')
     arrays = host_inputs(inputs)
@@ -375,7 +384,7 @@ def pullback_orbital_matrices(inputs, batch, matrix_bars):
                 raise ValueError('orbital W cotangents must be finite float64 matrices')
     total = None
     if not batch.batches:
-        packets = (pullback_matrices(arrays, forward, energy_bar=1.,
+        packets = (pullback_matrices(arrays, forward, energy_bar=energy_bar,
                     occupied_bar=bars['occupied'], virtual_bar=bars['virtual'])
                    for forward, bars in zip(batch.forwards, matrix_bars))
     else:
@@ -386,7 +395,7 @@ def pullback_orbital_matrices(inputs, batch, matrix_bars):
                                      stage='reverse', output_count=count)
                 seeds = matrix_bars[first:first+count]
                 yield extension.pullback_orbital_matrices(
-                    *(arrays[key] for key in ARRAY_NAMES), replay, [1.] * count,
+                    *(arrays[key] for key in ARRAY_NAMES), replay, [energy_bar] * count,
                     [np.ascontiguousarray(b['occupied']) for b in seeds],
                     [np.ascontiguousarray(b['virtual']) for b in seeds])
         packets = native_packets()
@@ -405,6 +414,10 @@ def pullback_matrices(inputs, forward, *, energy_bar, occupied_bar, virtual_bar)
     """Replay production plans and return already-seeded foo/fvv/B bars."""
     validate_full_inputs(inputs)
     validate_matrix_result(forward, inputs)
+    if forward.get('matrix_kind') == 'V':
+        from . import _v_matrices
+        return _v_matrices.pullback(inputs, forward, energy_bar=energy_bar,
+                                   occupied_bar=occupied_bar, virtual_bar=virtual_bar)
     replay = forward["replay"]
     if not isinstance(replay, _MatrixReplay):
         raise ValueError("matrix replay must come from solve_matrices in this process")
@@ -467,16 +480,18 @@ def pullback_matrices(inputs, forward, *, energy_bar, occupied_bar, virtual_bar)
     return total
 
 
-def begin_sequential_matrices(inputs, metadata, controls):
-    """Occupied W and a call-local workspace for occupied-conditioned virtual W.
+def begin_sequential_matrices(inputs, metadata, controls, *, matrix_kind="W"):
+    """Occupied W/D and a workspace for occupied-conditioned virtual W/D.
 
-    Deterministic energy-only experiment. All target amplitudes are retained
+    Deterministic matrix construction. All target amplitudes are retained
     until their common occupied space has been selected; no DF or Laplace
     work is repeated in the second stage. The energy remains full-ED MP2.
     """
     from .controls import normalize_matrix_controls
     from ._memory import assess_memory
-    settings = normalize_matrix_controls(controls)
+    if matrix_kind not in ('W', 'D'):
+        raise ValueError('sequential matrices require W or D')
+    settings = normalize_matrix_controls(controls, matrix_kind)
     if settings['mode'] != 'deterministic':
         raise NotImplementedError('sequential_virtual requires deterministic matrix controls')
     validate_full_inputs(inputs)
@@ -495,8 +510,8 @@ def begin_sequential_matrices(inputs, metadata, controls):
     native_controls = _matrix_batch_controls(settings, 1, settings['global_seed'])
     with blas_threads(1):
         result = extension.begin_sequential_matrices(
-            *(arrays[k] for k in ARRAY_NAMES), targets, native_controls)
-    result['matrix_kind'] = 'W'
+            *(arrays[k] for k in ARRAY_NAMES), targets, native_controls, matrix_kind=matrix_kind)
+    result['matrix_kind'] = matrix_kind
     return result
 
 
@@ -507,9 +522,51 @@ def finish_sequential_virtual(forward, occupied_rotation):
     extension = (_native_w if forward['diagnostics'].get('native_version') == _native_w.matrix_kernel_version
                  else importlib.import_module('pyscfad.dlno_stc._stc_mp2'))
     started = perf_counter()
+    occupied_rotation = np.asarray(occupied_rotation, dtype=np.float64)
+    no = forward['occupied'].shape[0]
+    if (occupied_rotation.ndim != 2 or occupied_rotation.shape[0] != no
+            or occupied_rotation.shape[1] > no or not np.isfinite(occupied_rotation).all()):
+        raise ValueError('occupied rotation must be a finite ED coefficient matrix')
     with blas_threads(1):
         result = extension.finish_sequential_virtual(
-            forward.pop('workspace'), np.ascontiguousarray(occupied_rotation, dtype=np.float64))
+            forward.pop('workspace'), np.ascontiguousarray(occupied_rotation))
+    # Retain only the small occupied rotation, never the amplitude workspace.
+    forward['occupied_rotation'] = np.array(occupied_rotation, dtype=np.float64, order='C', copy=True)
+    forward['occupied_rotation'].flags.writeable = False
     forward['diagnostics'].update(retained_occupied=occupied_rotation.shape[1],
                                  sequential_virtual_seconds=perf_counter()-started)
     return result
+
+
+def pullback_sequential_matrices(inputs, forward, *, energy_bar, occupied_bar,
+                                 virtual_bar, rotation_pullback):
+    """Reverse sequential W/D, including the selected occupied-space response.
+
+    ``rotation_pullback`` consumes dE/dU and returns the additional occupied-matrix
+    seed. Its caller also accumulates the target/metric/ED-frame cotangents.
+    """
+    from . import _native_w
+    from ._memory import assess_memory
+    validate_full_inputs(inputs)
+    if forward['diagnostics'].get('native_version') != _native_w.matrix_kernel_version:
+        raise NotImplementedError('sequential W/D reverse requires the native SciPy BLAS kernel')
+    if 'occupied_rotation' not in forward:
+        raise ValueError('finish sequential virtual W before its pullback')
+    naux, no, nv = inputs['B'].shape
+    replay = forward['replay']
+    nt, threads = len(replay.targets), replay.controls['threads']
+    # T, dT, G per target; dG stays in the retained occupied space until its
+    # target is consumed. Include projected scratch, one full dG and workers.
+    nr = forward['occupied_rotation'].shape[1]
+    retained = (8*(3*nt*no+(nt+3)*nr+no) + 16*min(no, threads))*nv*nv
+    assess_memory('sequential_w_reverse', (retained+48*naux*no*nv)/1e6,
+                  configured_mb=replay.controls.get('memory_limit_mb'),
+                  unavoidable_bytes=retained)
+    arrays = host_inputs(inputs)
+    with blas_threads(1):
+        bars, timings = _native_w.pullback_sequential_matrices(
+            *(arrays[k] for k in ARRAY_NAMES), replay, forward['occupied_rotation'],
+            rotation_pullback, energy_bar, occupied_bar, virtual_bar)
+    validate_input_cotangents(bars, arrays)
+    forward['diagnostics']['native_reverse_timings'] = timings
+    return bars

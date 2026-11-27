@@ -95,8 +95,8 @@ def _update_input_digest(digest, inputs):
 
 
 def validate_matrix_kind(matrix_kind):
-    if not isinstance(matrix_kind, str) or matrix_kind not in ("D", "W"):
-        raise ValueError("matrix_kind must be D or W")
+    if not isinstance(matrix_kind, str) or matrix_kind not in ("D", "W", "V"):
+        raise ValueError("matrix_kind must be D, W or V")
 
 
 def matrix_request_fingerprint(inputs, metadata, controls, aux_offsets, *, matrix_kind="W"):
@@ -171,13 +171,17 @@ def validate_input_cotangents(cotangents, inputs):
 def validate_matrix_result(result, inputs, *, matrix_kind=None):
     """Validate matrix primals without requiring scalar unit-energy bars."""
     _check_mapping(result, "matrix result")
-    for field in ("energy", "occupied", "virtual", "diagnostics", "replay"):
+    matrix_only = result.get('matrix_kind') == 'V'
+    for field in ("occupied", "virtual", "diagnostics", "replay"):
         if field not in result:
             raise ValueError(f"matrix result missing {field}")
-    energy = np.asarray(result["energy"])
-    if (energy.shape != () or energy.dtype != np.dtype("float64")
-            or not np.isfinite(energy)):
-        raise ValueError("matrix energy must be a finite float64 scalar")
+    if not matrix_only:
+        if 'energy' not in result:
+            raise ValueError('matrix result missing energy')
+        energy = np.asarray(result["energy"])
+        if (energy.shape != () or energy.dtype != np.dtype("float64")
+                or not np.isfinite(energy)):
+            raise ValueError("matrix energy must be a finite float64 scalar")
     _check_array(result["occupied"], "occupied matrix", inputs["foo"].shape,
                  symmetric=True)
     _check_array(result["virtual"], "virtual matrix", inputs["fvv"].shape,
@@ -189,7 +193,10 @@ def validate_matrix_result(result, inputs, *, matrix_kind=None):
     if (result.get("matrix_kind", reported_kind) != reported_kind
             or (matrix_kind is not None and matrix_kind != reported_kind)):
         raise ValueError("matrix result kind differs from the request")
-    for name in ("energy_standard_error", "occupied_frobenius_se", "virtual_frobenius_se"):
+    errors = ('occupied_frobenius_se', 'virtual_frobenius_se')
+    if not matrix_only:
+        errors += ('energy_standard_error',)
+    for name in errors:
         value = np.asarray(diagnostics.get(name))
         if (value.shape != () or value.dtype.kind not in "fi"
                 or not np.isfinite(value) or value < 0):

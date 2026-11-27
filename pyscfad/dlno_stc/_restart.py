@@ -295,6 +295,8 @@ def _encode_value(value, writer=None, *, require_registered_dataclass=True):
                 # W is the historical default; old checkpoint digests stay valid.
                 if not (type(value).__name__ == 'LISSelections'
                         and field.name == 'matrix_kind' and value.matrix_kind == 'W')
+                if not (type(value).__name__ == 'CCSDSelections'
+                        and field.name == 'baseline_kind' and value.baseline_kind == 'domain')
             ],
         }
     if isinstance(value, tuple):
@@ -441,7 +443,7 @@ def _decode_value(node, reader):
         optional = ({'correlation_basis_identity', 'ed_selection_pending', 'ao_atom_slices'}
                     if cls.__name__ == 'DomainSelections' else
                     {'ed_pao_rank'} if cls.__name__ == 'BoysDomainThresholds' else
-                    {'correlation_basis_identity'} if cls.__name__ == 'CCSDSelections' else
+                    {'correlation_basis_identity', 'baseline_kind'} if cls.__name__ == 'CCSDSelections' else
                     {'sequential_virtual', 'scale_lis_by_target_count', 'matrix_kind'}
                     if cls.__name__ == 'LISSelections' else set())
         compatible = tuple(name for name in expected if name in names or name not in optional)

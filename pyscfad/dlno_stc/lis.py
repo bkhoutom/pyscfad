@@ -465,20 +465,42 @@ def build_fragment_lis(mf, common, static, fragment_index, *, matrices,
 
 
 def occupied_selection_rotation(mf, domains, index, frame, occupied, *,
-                                common, threshold):
-    """Occupied LIS in ED coordinates, before any virtual eigensolve.
+                                common, threshold, selection=None, with_grad=False):
+    """Occupied LIS rotation and optionally its fixed-rank selection pullback.
 
-    Preserve every projected physical target; compress only its orthogonal
-    complement, using the same compact eigenspace and cutoff as ordinary LIS.
+    Differentiate the physical target, compact complement and retained span;
+    rotations inside that span are gauge choices. Saved labels are replayed
+    when supplied, so finite differences use the same selection as CCSD(T).
     """
-    occupied = numpy.asarray(occupied)
-    if threshold == 0:
-        return numpy.eye(occupied.shape[0])
-    target = numpy.asarray(_domain_targets(common, domains, index, frame))
-    external = _external_map(np.eye(occupied.shape[0]), target)
-    columns = _range_columns(external)
-    mapping, compact = _compact_mapped_density(external, occupied, columns)
-    values, vectors = scipy_linalg.eigh(numpy.asarray(compact))
-    keep = numpy.abs(values) > threshold
-    return numpy.ascontiguousarray(numpy.concatenate(
-        (target, numpy.asarray(mapping) @ vectors[:, keep]), axis=1))
+    from ._retained_space import retained_basis
+    occupied = np.asarray(occupied)
+    full = threshold == 0 if selection is None else selection.full_occupied_space
+    columns = keep = None
+    if not full:
+        if selection is None:
+            target = _domain_targets(common, domains, index, frame)
+            external = _external_map(np.eye(occupied.shape[0]), target)
+            columns = _range_columns(external)
+            _, compact = _compact_mapped_density(external, occupied, columns)
+            values = scipy_linalg.eigh(numpy.asarray(compact), eigvals_only=True)
+            keep = numpy.flatnonzero(numpy.abs(values) > threshold)
+        else:
+            columns, keep = selection.occupied_map_columns, selection.occupied_lno_keep
+        keep = tuple(int(i) for i in keep)
+
+    def build(block, data, coeff):
+        if full:
+            return np.eye(block.shape[0], dtype=block.dtype)
+        current = frame._replace(occupied_coeff=coeff)
+        target = _domain_targets(data, domains, index, current)
+        if not keep:
+            return target
+        mapping, compact = _compact_mapped_density(
+            _external_map(np.eye(block.shape[0]), target), block, columns)
+        return np.concatenate((target, mapping @ retained_basis(keep)(compact)), axis=1)
+
+    arguments = (occupied, common, frame.occupied_coeff)
+    if with_grad:
+        rotation, pullback = jax.vjp(build, *arguments)
+        return numpy.ascontiguousarray(rotation), pullback
+    return numpy.ascontiguousarray(build(*arguments))

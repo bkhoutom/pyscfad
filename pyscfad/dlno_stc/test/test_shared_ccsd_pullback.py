@@ -77,14 +77,14 @@ def group_case(monkeypatch):
 
     def run(with_grad=True, mf=.2, common=-.1,
             matrix_kind='W', matrix_controls=None, vvvv_direct=False,
-            baseline_controls=None, group_targets=(0, 1),
+            baseline_controls=None, baseline_kind='domain', group_targets=(0, 1),
             fragments=((0, (0,)), (1, (1,))),
             cc_solver='deterministic', stc_cc_controls=None):
         matrix = controls if matrix_controls is None else matrix_controls
         baseline = controls if baseline_controls is None else baseline_controls
         group = SimpleNamespace(representative_index=0, fragment_indices=(0, 1),
                                 target_indices=group_targets)
-        static = SimpleNamespace(mp2_static=SimpleNamespace(),
+        static = SimpleNamespace(mp2_static=SimpleNamespace(), baseline_kind=baseline_kind,
                                  lis_static=SimpleNamespace(matrix_kind=matrix_kind),
                                  test_fragments=fragments, fragments=(True, True))
         state = dict(mf=jnp.asarray(mf), common=jnp.asarray(common), energy=jnp.zeros(()),

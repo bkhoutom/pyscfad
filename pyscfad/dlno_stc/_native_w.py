@@ -52,7 +52,8 @@ def _check_replay(foo, fvv, factors, replay):
         raise ValueError('native W replay inputs or controls changed')
 
 
-def _run(foo, fvv, factors, replay, seeds=None, *, per_target=False, sequential=False, energy_only=False):
+def _run(foo, fvv, factors, replay, seeds=None, *, per_target=False, sequential=False, energy_only=False,
+         occupied_rotation=None, rotation_pullback=None):
     if not available():
         raise ImportError('rebuild pyscfad/cc/cpp for deterministic MP2/D/W')
     threads = replay.controls['threads']
@@ -79,10 +80,16 @@ def _run(foo, fvv, factors, replay, seeds=None, *, per_target=False, sequential=
         arrays = (factors, uo, uv, eo, ev, replay.controls['laplace_roots'],
                   replay.controls['laplace_weights'])
         arrays = tuple(np.require(a, dtype=np.float64, requirements=['C', 'A']) for a in arrays)
+        sequential_options = {}
+        if occupied_rotation is not None:
+            sequential_options = dict(
+                occupied_rotation=np.require(occupied_rotation, dtype=np.float64, requirements=['C', 'A']),
+                rotation_pullback=rotation_pullback)
         with threadpool_limits(1, user_api='blas'):
             result = cpp.deterministic_w(*arrays, replay.targets,
                 *(np.require(a, requirements=['C', 'A']) for a in (eb, ob, vb)),
-                per_target, sequential, replay.matrix_kind == "D", energy_only)
+                per_target, sequential, replay.matrix_kind == "D", energy_only,
+                **sequential_options)
     result['timings']['eigensolve_seconds'] = eig_seconds
     result['timings']['adapter_total_seconds'] = perf_counter() - started
     return result
@@ -135,8 +142,8 @@ def pullback_orbital_matrices(foo, fvv, factors, replay, energies, occupied, vir
     return {key: raw[key] for key in ('foo', 'fvv', 'B')}
 
 
-def begin_sequential_matrices(foo, fvv, factors, targets, controls):
-    replay = _request(foo, fvv, factors, targets, controls)
+def begin_sequential_matrices(foo, fvv, factors, targets, controls, *, matrix_kind="W"):
+    replay = _request(foo, fvv, factors, targets, controls, matrix_kind=matrix_kind)
     raw = _run(foo, fvv, factors, replay, sequential=True)
     result = _result(raw, 0, replay)
     result['workspace'] = (raw['workspace'], replay.controls['threads'])
@@ -148,6 +155,21 @@ def finish_sequential_virtual(workspace, rotation):
     cache, threads = workspace
     with threadpool_limits(threads, user_api='openmp'), threadpool_limits(1, user_api='blas'):
         return cpp.finish_deterministic_w(cache, np.require(rotation, dtype=np.float64, requirements=['C', 'A']))
+
+
+def pullback_sequential_matrices(foo, fvv, factors, replay, rotation, rotation_pullback,
+                                 energy, occupied, virtual):
+    """One delayed replay, with the occupied-selection VJP between native stages."""
+    _check_replay(foo, fvv, factors, replay)
+    nt = len(replay.targets)
+    def checked_pullback(bar):
+        value = np.asarray(rotation_pullback(bar), dtype=np.float64)
+        if value.shape != foo.shape or not np.isfinite(value).all():
+            raise ValueError('occupied selection pullback must return a finite occupied-matrix cotangent')
+        return np.require(value, requirements=['C', 'A'])
+    raw = _run(foo, fvv, factors, replay, ([energy]*nt, [occupied]*nt, [virtual]*nt),
+               occupied_rotation=rotation, rotation_pullback=checked_pullback)
+    return {key: raw[key] for key in ('foo', 'fvv', 'B')}, raw['timings']
 
 
 def solve_selected(foo, fvv, factors, targets, controls, *, aux_offsets=None, with_grad=True):

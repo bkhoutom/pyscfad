@@ -196,7 +196,8 @@ struct Result {
 
 Result evaluate(const Array& ba,const Array& uoa,const Array& uva,const Array& eoa,const Array& eva,
         const Array& beta,const Array& weights,const std::vector<Index>& targets,
-        const Array& eb,const Array& ob,const Array& vb,bool per_target,bool sequential,bool density=false,bool energy_only=false) {
+        const Array& eb,const Array& ob,const Array& vb,bool per_target,bool sequential,bool density,bool energy_only,
+        const Array& rotation,const py::object& rotation_pullback) {
     const double start=omp_get_wtime();Result out;
     for(const auto* key:{"propagation_seconds","amplitude_seconds","contraction_seconds","seed_seconds",
             "reverse_seconds","reverse_factor_seconds","amplitude_vjp_seconds","propagator_vjp_seconds",
@@ -205,6 +206,7 @@ Result evaluate(const Array& ba,const Array& uoa,const Array& uva,const Array& e
             "virtual_w_worker_seconds","virtual_energy_seconds"})out.times[key]=0.;
     const Index no=ba.shape(1),nv=ba.shape(2),np=ba.shape(0),vv=nv*nv,nt=targets.size();
     const bool reverse=eb.size()!=0;
+    const bool sequential_reverse=reverse && rotation.ndim()==2;
     out.energies.resize(per_target?nt:1,0.);
     Propagator dress(ba,uoa,uva,eoa,eva,beta);
     out.times["eigensystem_layout_seconds"]=omp_get_wtime()-start;
@@ -232,6 +234,53 @@ Result evaluate(const Array& ba,const Array& uoa,const Array& uva,const Array& e
             out.sequential->rotation=dress.uv;
         }
     }
+    // Delayed sequential reverse: build each Gram once (spin(T) for D), project both
+    // factors, and accumulate the occupied-rotation cotangent before applying
+    // the occupied-W seed. Only this small selection VJP crosses into Python;
+    // all amplitude/DF work remains in the threaded native pass.
+    std::vector<M> sequential_grams,sequential_bargrams;
+    M extra_occupied,sequential_rotation;
+    if(sequential_reverse) {
+        const double tick=omp_get_wtime();
+        const Index nr=rotation.shape(1);
+        sequential_rotation=from_c(rotation.data(),no,nr);
+        const M& u=sequential_rotation;M bu(no,nr,true);
+        for(Index s=0;s<nt;++s) {
+            M grams(vv,no);
+            const M bi=dress.b.columns(targets[s]*nv,nv);
+            #pragma omp parallel for schedule(static)
+            for(Index j=0;j<no;++j)
+                copy(grams.view(nv,nv,j*vv,nv),spin(density?amplitudes[s].view(nv,nv,j*vv,nv):
+                    multiply(bi,dress.b.columns(j*nv,nv),'T')));
+            M t=multiply(amplitudes[s],u),g=multiply(grams,u);
+            M bt(vv,nr),bgr(vv,nr);
+            M seed=frame(from_c(vb.data()+s*vv,nv,nv),dress.uv,true);
+            #pragma omp parallel for schedule(static)
+            for(Index j=0;j<nr;++j) {
+                const M tj=t.view(nv,nv,j*vv,nv),gj=g.view(nv,nv,j*vv,nv);
+                M dt=bt.view(nv,nv,j*vv,nv),dg=bgr.view(nv,nv,j*vv,nv);
+                product(seed,gj,dt,'N','N',.5);product(gj,seed,dt,'N','N',.5,1.);
+                product(seed,tj,dg,'N','N',.5);product(tj,seed,dg,'N','N',.5,1.);
+            }
+            product(amplitudes[s],bt,bu,'T','N',1.,1.);
+            product(grams,bgr,bu,'T','N',1.,1.);
+            product(bt,u,bar_amplitudes[s],'N','T');
+            sequential_grams.push_back(std::move(grams));
+            // Keep this leg in the smaller selected occupied space until
+            // its target is consumed below. No additional integral replay.
+            sequential_bargrams.push_back(std::move(bgr));
+        }
+        out.times["sequential_seed_seconds"]=omp_get_wtime()-tick;
+        const double selection_start=omp_get_wtime();
+        {
+            py::gil_scoped_acquire acquire;
+            Array correction=rotation_pullback(array(bu)).cast<Array>();
+            shape_is(T{Input(correction)},{no,no});
+            extra_occupied=from_c(correction.data(),no,no);
+        }
+        symmetrize(extra_occupied);
+        out.times["occupied_selection_pullback_seconds"]=omp_get_wtime()-selection_start;
+    }
     const double contractions=omp_get_wtime();
     for(Index s=0;s<nt;++s) {
         const M& t=amplitudes[s];const M bi=dress.b.columns(targets[s]*nv,nv);
@@ -239,55 +288,65 @@ Result evaluate(const Array& ba,const Array& uoa,const Array& uva,const Array& e
         bool occupied_active=false,virtual_active=false;
         if(reverse) {
             wo=from_c(ob.data()+s*no*no,no,no);symmetrize(wo);
+            if(sequential_reverse)add(wo,extra_occupied);
             if(!density)for(Index i=0;i<no;++i)wo(i,i)+=eb.data()[s];
-            wv=frame(from_c(vb.data()+s*vv,nv,nv),dress.uv,true);
             for(Index j=0;j<no*no;++j)occupied_active|=wo.p[j]!=0.;
-            for(Index j=0;j<vv;++j)virtual_active|=wv.p[j]!=0.;
-            grams=M(vv,no);bargrams=M(vv,no,true);
+            if(!sequential_reverse) {
+                wv=frame(from_c(vb.data()+s*vv,nv,nv),dress.uv,true);
+                for(Index j=0;j<vv;++j)virtual_active|=wv.p[j]!=0.;
+            }
+            grams=sequential_reverse?std::move(sequential_grams[s]):M(vv,no);
+            bargrams=M(vv,no,!sequential_reverse);
+            if(sequential_reverse) {
+                product(sequential_bargrams[s],sequential_rotation,bargrams,'N','T');
+                sequential_bargrams[s]=M();
+            }
         } else if(sequential)grams=M(vv,no);
         std::vector<double> target_energy(no,0.);
         const Index panel=reverse?1:std::max<Index>(1,std::min<Index>(4,no/omp_get_max_threads()));
-        #pragma omp parallel
-        {
-            M local;
-            if(!reverse && !sequential && !energy_only)local=M(nv,nv,true);
-            M occupied_panel(vv,panel);
-            double gram_time=0.,occ_time=0.,vir_time=0.;
-            #pragma omp for schedule(static)
-            for(Index first=0;first<no;first+=panel) {
-                const Index last=std::min(no,first+panel);
-                for(Index j=first;j<last;++j) {
-                    const double tick=omp_get_wtime();
-                    M g=multiply(bi,dress.b.columns(j*nv,nv),'T');M sg=spin(g);
-                    const M tj=t.view(nv,nv,j*vv,nv);
-                    {
-                        double e=0.;for(Index k=0;k<vv;++k)e+=tj.p[k]*sg.p[k];
-                        target_energy[j]=e;
-                    }
-                    if(density)sg=spin(tj);
-                    gram_time+=omp_get_wtime()-tick;
-                    if(reverse || sequential)copy(grams.view(nv,nv,j*vv,nv),sg);
-                    if(!reverse && !energy_only) {
-                        copy(occupied_panel.columns(j-first,1),sg.view(vv,1,0,vv));
-                        if(!sequential) {
-                            const double vstart=omp_get_wtime();const M tj=t.view(nv,nv,j*vv,nv);
-                            product(tj,sg,local,'N','T',.5,1.);product(tj,sg,local,'T','N',.5,1.);
-                            vir_time+=omp_get_wtime()-vstart;
+        if(!sequential_reverse) {
+            #pragma omp parallel
+            {
+                M local;
+                if(!reverse && !sequential && !energy_only)local=M(nv,nv,true);
+                M occupied_panel(vv,panel);
+                double gram_time=0.,occ_time=0.,vir_time=0.;
+                #pragma omp for schedule(static)
+                for(Index first=0;first<no;first+=panel) {
+                    const Index last=std::min(no,first+panel);
+                    for(Index j=first;j<last;++j) {
+                        const double tick=omp_get_wtime();
+                        M g=multiply(bi,dress.b.columns(j*nv,nv),'T');M sg=spin(g);
+                        const M tj=t.view(nv,nv,j*vv,nv);
+                        {
+                            double e=0.;for(Index k=0;k<vv;++k)e+=tj.p[k]*sg.p[k];
+                            target_energy[j]=e;
+                        }
+                        if(density)sg=spin(tj);
+                        gram_time+=omp_get_wtime()-tick;
+                        if(reverse || sequential)copy(grams.view(nv,nv,j*vv,nv),sg);
+                        if(!reverse && !energy_only) {
+                            copy(occupied_panel.columns(j-first,1),sg.view(vv,1,0,vv));
+                            if(!sequential) {
+                                const double vstart=omp_get_wtime();const M tj=t.view(nv,nv,j*vv,nv);
+                                product(tj,sg,local,'N','T',.5,1.);product(tj,sg,local,'T','N',.5,1.);
+                                vir_time+=omp_get_wtime()-vstart;
+                            }
                         }
                     }
+                    if(!reverse && !energy_only) {
+                        const double tick=omp_get_wtime();
+                        product(t,occupied_panel.columns(0,last-first),out.wo[per_target?s:0].columns(first,last-first),'T','N',1.,1.);
+                        occ_time+=omp_get_wtime()-tick;
+                    }
                 }
-                if(!reverse && !energy_only) {
-                    const double tick=omp_get_wtime();
-                    product(t,occupied_panel.columns(0,last-first),out.wo[per_target?s:0].columns(first,last-first),'T','N',1.,1.);
-                    occ_time+=omp_get_wtime()-tick;
+                #pragma omp critical(dw_forward_reduce)
+                {
+                    if(!reverse && !sequential && !energy_only)add(out.wv[per_target?s:0],local);
+                    out.times["bare_gram_worker_seconds"]+=gram_time;
+                    out.times["occupied_w_worker_seconds"]+=occ_time;
+                    out.times["virtual_w_worker_seconds"]+=vir_time;
                 }
-            }
-            #pragma omp critical(dw_forward_reduce)
-            {
-                if(!reverse && !sequential && !energy_only)add(out.wv[per_target?s:0],local);
-                out.times["bare_gram_worker_seconds"]+=gram_time;
-                out.times["occupied_w_worker_seconds"]+=occ_time;
-                out.times["virtual_w_worker_seconds"]+=vir_time;
             }
         }
         for(double e:target_energy)out.energies[per_target?s:0]+=e;
@@ -299,7 +358,7 @@ Result evaluate(const Array& ba,const Array& uoa,const Array& uva,const Array& e
                 for(Index first=0;first<vv;first+=8192) {
                     const Index n=std::min<Index>(8192,vv-first);
                     product(grams.row_panel(first,n),wo,bt.row_panel(first,n),'N','T',1.,1.);
-                    product(t.row_panel(first,n),wo,bargrams.row_panel(first,n));
+                    product(t.row_panel(first,n),wo,bargrams.row_panel(first,n),'N','N',1.,sequential_reverse?1.:0.);
                 }
             }
             #pragma omp parallel
@@ -309,7 +368,7 @@ Result evaluate(const Array& ba,const Array& uoa,const Array& uva,const Array& e
                 for(Index j=0;j<no;++j) {
                     M tj=t.view(nv,nv,j*vv,nv),bar_t=bt.view(nv,nv,j*vv,nv);
                     M bg=bargrams.view(nv,nv,j*vv,nv);
-                    if(virtual_active) {
+                    if(virtual_active && !sequential_reverse) {
                         const M sg=grams.view(nv,nv,j*vv,nv);
                         product(wv,sg,bar_t,'N','N',.5,1.);product(sg,wv,bar_t,'N','N',.5,1.);
                         product(wv,tj,bg,'N','N',.5,1.);product(tj,wv,bg,'N','N',.5,1.);
@@ -376,7 +435,8 @@ Result evaluate(const Array& ba,const Array& uoa,const Array& uva,const Array& e
 
 py::dict run(const Array& b,const Array& uo,const Array& uv,const Array& eo,const Array& ev,
         const Array& roots,const Array& weights,const std::vector<Index>& targets,
-        const Array& eb,const Array& ob,const Array& vb,bool per_target,bool sequential,bool density=false,bool energy_only=false) {
+        const Array& eb,const Array& ob,const Array& vb,bool per_target,bool sequential,bool density,bool energy_only,
+        const Array& rotation,const py::object& rotation_pullback) {
     if(b.ndim()!=3 || !b.shape(0) || !b.shape(1) || !b.shape(2))throw py::value_error("W requires nonempty rank-three factors");
     const Index no=b.shape(1),nv=b.shape(2),nt=targets.size();
     for(const auto* a:{&b,&uo,&uv,&eo,&ev,&roots,&weights,&eb,&ob,&vb})T{Input(*a)};
@@ -387,13 +447,20 @@ py::dict run(const Array& b,const Array& uo,const Array& uv,const Array& eo,cons
     if(!nt)throw py::value_error("W requires selected occupied targets");
     std::vector<bool> seen(no,false);
     for(auto i:targets) {if(i<0 || i>=no || seen[i])throw py::value_error("Invalid W target");seen[i]=true;}
-    if(sequential && (density || energy_only))throw py::value_error("Sequential mode requires W matrices");
+    if(sequential && energy_only)throw py::value_error("Sequential mode requires W or D matrices");
     if(eb.size()) {
         shape_is(T{Input(eb)},{nt});shape_is(T{Input(ob)},{nt,no,no});shape_is(T{Input(vb)},{nt,nv,nv});
-        if(sequential)throw py::value_error("Sequential W is forward only");
+        if(sequential)throw py::value_error("Sequential reverse uses an occupied rotation, not a forward workspace");
     }
+    if(rotation.ndim()==2) {
+        if(!eb.size() || sequential || energy_only || per_target || rotation_pullback.is_none())
+            throw py::value_error("Sequential reverse requires matrix seeds and a rotation pullback");
+        T{Input(rotation)};
+        if(rotation.shape(0)!=no || rotation.shape(1)>no)
+            throw py::value_error("Invalid occupied rotation");
+    } else if(!rotation_pullback.is_none())throw py::value_error("Missing sequential occupied rotation");
     Result result;
-    {py::gil_scoped_release release;result=evaluate(b,uo,uv,eo,ev,roots,weights,targets,eb,ob,vb,per_target,sequential,density,energy_only);}
+    {py::gil_scoped_release release;result=evaluate(b,uo,uv,eo,ev,roots,weights,targets,eb,ob,vb,per_target,sequential,density,energy_only,rotation,rotation_pullback);}
     py::dict out;out["timings"]=result.times;out["openmp_dynamic"]=omp_get_dynamic()!=0;out["energy"]=result.energies;
     if(eb.size()) {
         out["foo"]=array(result.fo);out["fvv"]=array(result.fv);
@@ -448,6 +515,7 @@ void bind_deterministic_w(py::module_& m) {
     m.def("deterministic_w",&run,py::arg("B").noconvert(),py::arg("Uo").noconvert(),py::arg("Uv").noconvert(),
         py::arg("eo").noconvert(),py::arg("ev").noconvert(),py::arg("roots").noconvert(),py::arg("weights").noconvert(),
         py::arg("targets"),py::arg("energy_bars").noconvert(),py::arg("occupied_bars").noconvert(),py::arg("virtual_bars").noconvert(),
-        py::arg("per_target")=false,py::arg("sequential")=false,py::arg("density")=false,py::arg("energy_only")=false);
+        py::arg("per_target")=false,py::arg("sequential")=false,py::arg("density")=false,py::arg("energy_only")=false,
+        py::arg("occupied_rotation")=ccsd_native::Array(0),py::arg("rotation_pullback")=py::none());
     m.def("finish_deterministic_w",&finish,py::arg("workspace"),py::arg("rotation").noconvert());
 }

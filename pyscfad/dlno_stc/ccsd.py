@@ -1,6 +1,6 @@
 """Physical Boys-fragment CCSD(T) corrections with shared MP2 energy/response.
 
-Discrete domains and LIS ranks are fixed. Native D or W chooses each LIS in its
+Discrete domains and LIS ranks are fixed. D, W or V chooses each LIS in its
 STC frame. The solver uses normalized domain projections of the original
 physical Boys targets.
 """
@@ -59,6 +59,7 @@ class CCSDSelections:
     correlation_basis_identity: str | None = None
     mp2_grid: tuple | None = None
     mp2_grid_diagnostics: dict | None = None
+    baseline_kind: str = 'domain'
 
     @property
     def mp2_static(self):
@@ -75,7 +76,7 @@ class FragmentComponents:
     e_mp2_lis: float
     e_ccsd: float
     e_triples: float
-    matrix_energy_diagnostic: float
+    matrix_energy_diagnostic: float | None
     nocc_lis: int | None = None
     nvir_lis: int | None = None
     direct_host_bar_norm: float | None = None
@@ -97,12 +98,13 @@ class FragmentComponents:
 
 @dataclass(frozen=True)
 class CCSDComponents:
-    """Correlation accounting with explicit D energy or the W energy trace."""
+    """Correlation accounting with a domain or global MP2 baseline."""
     e_mp2_base: float
     e_mp2_weak: float
     fragments: tuple
     matrix_kind: str
     baseline_standard_error: float
+    baseline_kind: str = 'domain'
 
     @property
     def e_ccsd(self):
@@ -184,8 +186,19 @@ def _normalize_controls(baseline_controls, matrix_controls, mp2_grid=None,
     baseline = driver._driver_controls(with_grid(baseline_controls))
     baseline.setdefault('mode', 'deterministic')
     baseline.setdefault('global_seed', 0)
-    matrix = normalize_matrix_controls(with_grid(matrix_controls), matrix_kind)
+    matrix = normalize_matrix_controls(
+        ({} if matrix_controls is None else matrix_controls) if matrix_kind == 'V'
+        else with_grid(matrix_controls), matrix_kind)
     return baseline, matrix
+
+
+def _validate_baseline(baseline_kind, matrix_kind, baseline_controls):
+    if baseline_controls is not None and not isinstance(baseline_controls, dict):
+        raise TypeError('baseline_controls must be a dictionary')
+    if baseline_kind not in ('domain', 'global'):
+        raise ValueError("baseline_kind must be 'domain' or 'global'")
+    if matrix_kind == 'V' and baseline_kind != 'global':
+        raise ValueError("matrix_kind='V' requires baseline_kind='global'")
 
 
 def _scientific_identity(baseline, matrix):
@@ -214,8 +227,9 @@ def _validate_run(static, baseline_controls, matrix_controls, mp2_grid=None):
         raise ValueError('only smooth LIS treatment is supported; rebuild smooth selections')
     if static.mp2_grid is None:
         raise ValueError('CC selections have no saved MP2 grid; rebuild selections')
-    if static.lis_static.sequential_virtual and static.lis_static.matrix_kind != 'W':
-        raise NotImplementedError('sequential_virtual supports W matrices only')
+    _validate_baseline(static.baseline_kind, static.lis_static.matrix_kind, baseline_controls)
+    if static.lis_static.sequential_virtual and static.lis_static.matrix_kind not in ('W', 'D'):
+        raise NotImplementedError('sequential_virtual supports W and D matrices only')
     baseline, matrix = _normalize_controls(
         baseline_controls, matrix_controls, static.mp2_grid if mp2_grid is None else mp2_grid,
         static.lis_static.matrix_kind)
@@ -257,8 +271,22 @@ def build_static_selections(mf, mp2_static, *, thresh_occ, thresh_vir,
                             internal_rank_threshold=1e-6, merge_identical=True,
                             triples_laplace_points=4,
                             correlation_auxbasis=None, sequential_virtual=False,
-                            scale_lis_by_target_count=False, matrix_kind='W'):
-    """Record physical-fragment LIS cutoffs and controls for D or W selection.
+                            scale_lis_by_target_count=False, matrix_kind='W',
+                            baseline_kind='domain'):
+    """Record physical-fragment LIS cutoffs and controls for D, W or V selection.
+
+    ``baseline_kind='global'`` evaluates full-active-space MP2
+    once using ``baseline_controls`` and the saved MP2 Laplace grid. Pair
+    screening still defines domains, but no weak-pair energy is added.
+    The baseline defaults to deterministic; ``baseline_controls['mode'] =
+    'stochastic'`` enables the scalar sampler, with ``energy_tolerance`` or
+    explicit ``production_samples``. Matrix controls remain independent.
+    ``matrix_kind='V'`` requires this baseline and builds direct Coulomb Gram
+    matrices without amplitudes, denominators or exchange. V uses the existing
+    LIS cutoffs in Eh**2, with unit occupied and half-summed virtual Gram
+    normalization; it supplies no domain MP2 energy. V currently supports
+    deterministic construction only. D/W can also use the global baseline;
+    their domain energies are then diagnostic only.
 
     ``matrix_kind='W'`` is the default. ``'D'`` selects the MP2 amplitude-density
     matrices and evaluates the domain MP2 scalar explicitly from amplitudes and
@@ -266,10 +294,13 @@ def build_static_selections(mf, mp2_static, *, thresh_occ, thresh_vir,
     combine their responses in one delayed pullback. D and W cutoffs are used
     as supplied and are not numerically interchangeable.
 
-    ``sequential_virtual=True`` is an opt-in deterministic forward-only trial:
-    select occupied W first, then rebuild virtual W with the retained partner
-    occupied projector. Full-ED MP2 energy and occupied W remain unchanged.
-    Gradient calls reject this option until its complete response is available.
+    ``sequential_virtual=True`` selects a deterministic sequential W/D construction:
+    select the occupied matrix first, then rebuild the virtual matrix with the
+    retained partner occupied projector. Full-ED MP2 energy and the occupied
+    matrix remain unchanged. D projects the full-ED amplitudes on both density
+    legs; W projects the amplitude and bare-integral legs.
+    Gradients include the retained occupied projector, targets and ED frame
+    response at fixed selection ranks.
 
     ``scale_lis_by_target_count=True`` multiplies both cutoffs by the original
     physical target LMO count, including before sequential virtual construction.
@@ -289,7 +320,7 @@ def build_static_selections(mf, mp2_static, *, thresh_occ, thresh_vir,
     quadrature keys. ``triples_laplace_points`` independently fits four points
     per LIS by default, using triple-excitation denominators.
     This function records selection settings without building matrices. Each
-    fragment builds D or W once in production, selects its LIS and fits its
+    fragment builds its matrices once in production, selects its LIS and fits its
     independent (T) grid, then reuses that result in CCSD(T) and the pullback.
     Discrete labels and both grids remain fixed during that fragment's response.
     Occupied and virtual LNO eigenproblems always
@@ -302,12 +333,13 @@ def build_static_selections(mf, mp2_static, *, thresh_occ, thresh_vir,
     Resident H_ED reuse is the default for energies and gradients; set
     PYSCFAD_LNO_SHARED_LOCAL_DF_CACHE_MODE=direct for regeneration.
     """
-    if matrix_kind not in ('D', 'W'):
-        raise ValueError("matrix_kind must be 'D' or 'W'")
+    if matrix_kind not in ('D', 'W', 'V'):
+        raise ValueError("matrix_kind must be 'D', 'W' or 'V'")
+    _validate_baseline(baseline_kind, matrix_kind, baseline_controls)
     if not isinstance(sequential_virtual, bool):
         raise TypeError('sequential_virtual must be a bool')
-    if sequential_virtual and matrix_kind != 'W':
-        raise NotImplementedError('sequential_virtual supports W matrices only')
+    if sequential_virtual and matrix_kind not in ('W', 'D'):
+        raise NotImplementedError('sequential_virtual supports W and D matrices only')
     if not isinstance(scale_lis_by_target_count, bool):
         raise TypeError('scale_lis_by_target_count must be a bool')
     correlation_auxbasis = selection_auxbasis(mf, correlation_auxbasis)
@@ -342,7 +374,8 @@ def build_static_selections(mf, mp2_static, *, thresh_occ, thresh_vir,
         selection_options=dict(indices=tuple(indices),
             triples_laplace_points=triples_laplace_points),
         correlation_basis_identity=identity,
-        mp2_grid=saved_grid, mp2_grid_diagnostics=grid_diagnostics)
+        mp2_grid=saved_grid, mp2_grid_diagnostics=grid_diagnostics,
+        baseline_kind=baseline_kind)
 
 
 def load_static_selections(checkpoint_dir, mol, *, domain_options=None,
@@ -693,10 +726,8 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
     from pyscfad.lno._df_shared import release_consumed_inputs
     sequential = getattr(getattr(static, "lis_static", None), "sequential_virtual", False)
     matrix_kind = getattr(getattr(static, 'lis_static', None), 'matrix_kind', 'W')
-    if sequential and matrix_kind != 'W':
-        raise NotImplementedError('sequential_virtual supports W matrices only')
-    if sequential and with_grad:
-        raise NotImplementedError('sequential_virtual currently supports forward energies only')
+    if sequential and matrix_kind not in ('W', 'D'):
+        raise NotImplementedError('sequential_virtual supports W and D matrices only')
     if sequential and matrix_controls.get('mode', 'deterministic') != 'deterministic':
         raise NotImplementedError('sequential_virtual requires deterministic matrix controls')
     with resource_profile.section('stc.cc.prepare'):
@@ -731,13 +762,20 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
         if sequential:
             from .lis import occupied_selection_rotation
             with resource_profile.section('stc.cc.sequential_virtual', frag=index+1):
-                rotation = occupied_selection_rotation(
+                selected_rotation = occupied_selection_rotation(
                     state['mf'], static.mp2_static, index, frame, forward['occupied'],
-                    common=state['common'], threshold=_fragment_lis_cutoffs(static, index)[0])
+                    common=state['common'], threshold=_fragment_lis_cutoffs(static, index)[0],
+                    selection=static.fragments[index], with_grad=with_grad)
+                if with_grad:
+                    rotation, rotation_tape = selected_rotation
+                else:
+                    rotation = selected_rotation
                 forward['virtual'] = backend.finish_sequential_virtual(forward, rotation)
-        state['energy'] = state['energy'] + forward['energy']
-        state['baseline_energy'] = state.get('baseline_energy', 0.) + float(forward['energy'])
-        state['variance'] += float(forward['diagnostics']['energy_standard_error']) ** 2
+        domain_baseline = getattr(static, 'baseline_kind', 'domain') == 'domain'
+        if domain_baseline:
+            state['energy'] = state['energy'] + forward['energy']
+            state['baseline_energy'] = state.get('baseline_energy', 0.) + float(forward['energy'])
+            state['variance'] += float(forward['diagnostics']['energy_standard_error']) ** 2
         matrices = {name: np.asarray(forward[name]) for name in ('occupied', 'virtual')}
         # Call-local orbitals and tape: share selection's construction with all
         # solver replicas, without freezing the physical LIS response.
@@ -846,9 +884,26 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
                 del matrix_bars
             else:
                 with resource_profile.section('stc.cc.matrix_pullback', frag=index+1):
-                    bars = backend.pullback_matrices(
-                        host, forward, energy_bar=1., occupied_bar=matrix_bars['occupied'],
-                        virtual_bar=matrix_bars['virtual'])
+                    selection_bars = []
+                    if sequential:
+                        def rotation_pullback(bar):
+                            block_bar, common_bar, coeff_bar = rotation_tape(np.asarray(bar))
+                            jax.block_until_ready((block_bar, common_bar, coeff_bar))
+                            selection_bars.append((common_bar, coeff_bar))
+                            return numpy.asarray(block_bar)
+                        bars = backend.pullback_sequential_matrices(
+                            host, forward, energy_bar=float(domain_baseline),
+                            occupied_bar=matrix_bars['occupied'], virtual_bar=matrix_bars['virtual'],
+                            rotation_pullback=rotation_pullback)
+                        common_bar, coeff_bar = selection_bars.pop()
+                        state['common_bar'] = jax.tree.map(
+                            driver._add_cotangent, state['common_bar'], common_bar)
+                        frame_bars = (frame_bars[0] + coeff_bar, frame_bars[1])
+                        del rotation_tape, rotation_pullback, selected_rotation, common_bar, coeff_bar
+                    else:
+                        bars = backend.pullback_matrices(
+                            host, forward, energy_bar=float(domain_baseline), occupied_bar=matrix_bars['occupied'],
+                            virtual_bar=matrix_bars['virtual'])
                 validate_input_cotangents(bars, inputs)
                 if input_bars is None:
                     # Native outputs are owned and writable, including the empty
@@ -877,7 +932,7 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
         state['energy'] = state['energy'] + energy
         jax.block_until_ready((state['energy'], state['mf_bar'], state['common_bar']))
         records.append(FragmentComponents(index, *(float(value) for value in values),
-                                           float(forward['energy']),
+                                           (float(forward['energy']) if 'energy' in forward else None),
                                            *_fragment_dimensions(fragment_static, index),
                                            direct_norm, None,
                                            {key: value for key, value in forward['diagnostics'].items()
@@ -900,7 +955,9 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
         gc.collect()
     if orbital_batch is not None and with_grad:
         with resource_profile.section('stc.cc.orbital_matrix_pullback'):
-            input_bars = backend.pullback_orbital_matrices(host, orbital_batch, orbital_bars)
+            input_bars = backend.pullback_orbital_matrices(
+                host, orbital_batch, orbital_bars,
+                **({'energy_bar': 0.} if getattr(static, 'baseline_kind', 'domain') == 'global' else {}))
         orbital_bars.clear()
     del orbital_batch
     if input_bars is not None:
@@ -917,6 +974,8 @@ def _run_group_responses(state, static, group, baseline_controls, matrix_control
 
 def _run_weak(state, static, *, with_grad, pairs=None):
     """Complete separately owned baseline weak terms once."""
+    if getattr(static, 'baseline_kind', 'domain') == 'global':
+        return
     pairs = state['weak_pairs'] if pairs is None else pairs
     if not pairs:
         return
@@ -929,6 +988,19 @@ def _run_weak(state, static, *, with_grad, pairs=None):
     state['energy'] = state['energy'] + energy
     state['baseline_energy'] = state.get('baseline_energy', 0.) + float(energy)
     state['weak_energy'] = state.get('weak_energy', 0.) + float(energy)
+
+
+def _run_baseline(state, static, baseline, *, with_grad):
+    """The independent baseline stage, committed once before local groups."""
+    if getattr(static, 'baseline_kind', 'domain') == 'global':
+        # Screening already fixed the pair graph; its cached energy/response
+        # is not part of the global-baseline functional.
+        state.pop('_prepared_weak', None)
+        state.pop('_prepared_weak_energy', None)
+        from ._global_mp2 import accumulate
+        accumulate(state, static, baseline, with_grad=with_grad)
+    else:
+        _run_weak(state, static, with_grad=with_grad)
 
 
 def _run_serial(state, static, baseline, matrix, *, with_grad, include_hf,
@@ -956,7 +1028,7 @@ def _run_serial(state, static, baseline, matrix, *, with_grad, include_hf,
         if not 0 <= start <= len(groups):
             raise ValueError('CC checkpoint progress is outside the saved group worklist')
         if not weak_done:
-            _run_weak(state, static, with_grad=with_grad)
+            _run_baseline(state, static, baseline, with_grad=with_grad)
             save_progress(checkpoint, state, records, start, True, with_grad=with_grad)
         for position in range(start, len(groups)):
             group = groups[position]
@@ -982,7 +1054,8 @@ def _run_serial(state, static, baseline, matrix, *, with_grad, include_hf,
 def _finish(state, static, records, *, with_grad, include_hf, return_components):
     components = CCSDComponents(state.get('baseline_energy', 0.), state.get('weak_energy', 0.),
                                 tuple(sorted(records, key=lambda item: item.fragment_index)),
-                                static.lis_static.matrix_kind, state['variance'] ** .5)
+                                static.lis_static.matrix_kind, state['variance'] ** .5,
+                                baseline_kind=getattr(static, 'baseline_kind', 'domain'))
     if components.stc_standard_error is not None:
         driver.lib.logger.info(state['mf'],
             'STC final selected-correction empirical SE %.6g mEh; target %.6g mEh; met %s',
@@ -1029,15 +1102,23 @@ def kernel(mf, static=None, *, baseline_controls=None, matrix_controls=None, mp2
            lis_aux_svd_tol=None, mp2_aux_svd_tol=1e-3):
     """Return correlation energy, or total energy with ``include_hf=True``.
 
-    ``correlation_auxbasis`` selects local MP2, D/W and CC fitting; HF/Fock
+    Selections with ``baseline_kind='global'`` use full-active-space MP2 plus
+    local CCSD(T)-MP2 corrections, without weak-pair completion. Global MP2 is
+    controlled by ``baseline_controls`` and uses the saved Laplace grid.
+    Stochastic baseline uncertainty is returned as ``baseline_standard_error``
+    in components; gradients replay the sampled products in the scalar solver.
+    Its factors are not compressed by ``mp2_aux_svd_tol``. V matrices are
+    deterministic, require this baseline, and have no MP2 energy contribution.
+
+    ``correlation_auxbasis`` selects global/local MP2, LIS matrices and CC fitting; HF/Fock
     retain the SCF fit. Use the same basis for selection and execution.
     ``lis_aux_svd_tol`` compresses only LIS auxiliary factors with the strict
     squared-singular-value cutoff ``s**2 > tol``. It defaults to ``None``
     (disabled); pass a positive threshold to enable it. Zero also disables it.
     ``mp2_aux_svd_tol=1e-3`` independently compresses ED OV factors before
-    MP2 and D/W selection; ``None`` or zero disables it. LIS NAF continues
+    MP2 and D/W/V selection; ``None`` or zero disables it. LIS NAF continues
     to use the original auxiliary basis, independently of the ED NAF basis.
-    Weak-pair screening/completion is unchanged. LIS compression
+    Weak-pair screening is unchanged; completion applies to domain baselines. LIS compression
     diagnostics are included in each fragment's ``auxiliary_compression``.
     ``return_components=True`` returns ``(energy, CCSDComponents)``. With W,
     strong-domain MP2 energy is read directly from its traces, in deterministic
@@ -1047,8 +1128,8 @@ def kernel(mf, static=None, *, baseline_controls=None, matrix_controls=None, mp2
     Both combine energy and LIS derivatives in the same delayed reverse.
     ``mp2_grid=(roots, weights)`` supplies MP2/density quadrature and must match
     selection. ``None`` reuses the grid saved in the selections. The separately fitted
-    (T) grids come from the saved selections. The MP2 baseline includes weak
-    completion.
+    (T) grids come from the saved selections. The domain MP2 baseline includes
+    weak completion; the global baseline already covers all active pairs.
     With ``ccsd_t=True``, omitted ``triples_controls`` selects deterministic
     MRCC symmetric half-Laplace triples (2024+ spin expression).
     It shares one connected numerator and its adjoint per quadrature point.
@@ -1065,8 +1146,7 @@ def kernel(mf, static=None, *, baseline_controls=None, matrix_controls=None, mp2
     proxies. In the smooth path, ``pilot_samples`` defaults to 10000 per
     point and determines independent production counts.
     Omitted/zero tolerance uses fixed production counts.
-    Every physical fragment contributes a correction; the complete MP2 baseline
-    and weak completion are always included.
+    Every physical fragment contributes a correction to the selected MP2 baseline.
     Deterministic fragment RCCSD uses the in-memory PySCF/NumPy CPU path by
     default. Set ``pyscfad_dfccsd_native=False`` for the JAX reference path;
     ``vvvv_direct=False`` (default) caches the virtual ladder when it fits

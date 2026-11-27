@@ -191,6 +191,8 @@ def normalize_matrix_controls(controls, matrix_kind='W'):
     mode = settings.setdefault('mode', 'deterministic')
     if mode not in ('deterministic', 'stochastic'):
         raise ValueError('mode must be deterministic or stochastic')
+    if matrix_kind == 'V' and mode != 'deterministic':
+        raise NotImplementedError('V matrices currently require deterministic mode')
     if mode == 'deterministic':
         invalid = settings.keys() & sampling.keys()
         if invalid:
@@ -199,12 +201,16 @@ def normalize_matrix_controls(controls, matrix_kind='W'):
     else:
         for name, value in sampling.items():
             settings.setdefault(name, value)
-    settings.update(resolve_mp2_grid(
-        None if not {'laplace_roots', 'laplace_weights'} & settings.keys() else
-        (settings.get('laplace_roots'), settings.get('laplace_weights'))))
-    weights = settings['laplace_weights']
-    if mode == 'stochastic' and numpy.any(weights <= 0):
-        raise ValueError('stochastic matrix Laplace weights must be strictly positive')
+    if matrix_kind == 'V':
+        if {'laplace_roots', 'laplace_weights'} & settings.keys():
+            raise ValueError('V matrices do not use a Laplace grid')
+    else:
+        settings.update(resolve_mp2_grid(
+            None if not {'laplace_roots', 'laplace_weights'} & settings.keys() else
+            (settings.get('laplace_roots'), settings.get('laplace_weights'))))
+        weights = settings['laplace_weights']
+        if mode == 'stochastic' and numpy.any(weights <= 0):
+            raise ValueError('stochastic matrix Laplace weights must be strictly positive')
     for name, default in (('global_seed', 0), ('threads', 1),
                           ('auxiliary_group_size', 32)):
         settings[name] = _integer_control(name, settings.get(name, default),
@@ -257,6 +263,15 @@ def estimate_matrix_memory(naux, nocc, nvir, ntarget, controls, *, matrix_kind='
     matrices = 8 * (nocc * nocc + nvir * nvir)
     threads = settings['threads']
     batch = ntarget if settings['target_batch_size'] is None else min(ntarget, settings['target_batch_size'])
+    if matrix_kind == 'V':
+        # No four-index amplitudes. Bound layout copies, target panels,
+        # Gram matrices and the explicit polynomial reverse.
+        breakdown = dict(factor_buffers=(8 if with_grad else 3) * factor,
+                         target_buffers=8 * (5 if with_grad else 3) * naux * batch * nvir,
+                         auxiliary_grams=8 * (6 if with_grad else 3) * naux**2,
+                         output_buffers=8 * matrices)
+        breakdown['total_bytes'] = sum(breakdown.values())
+        return breakdown
     single_amplitude = 8 * nocc * nvir * nvir
     breakdown = {
         'input_copies': 2 * (factor + matrices),

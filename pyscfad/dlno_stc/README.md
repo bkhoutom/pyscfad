@@ -19,6 +19,8 @@ tapes. Use `ccsd_t=True` to include triples.
 For CC, W selection is the default; D selection is available with
 `ccsd.build_static_selections(..., matrix_kind="D")`. Both use smooth anchored
 LIS frames and the same fragment, CC correction and force workflow.
+Direct Coulomb V selection is available with `matrix_kind="V"` and
+`baseline_kind="global"`, using deterministic V and deterministic or stochastic global MP2.
 Every solver mode defaults to deterministic. Stochastic MP2, D/W, CCSD and
 triples remain available explicitly.
 
@@ -109,16 +111,23 @@ checkpoints using the old convention must be rebuilt; restart algorithm ABI
 
 ## Calculation interface
 
-For a deterministic W forward-only trial, pass `sequential_virtual=True` to
+For deterministic sequential W or D selection, pass `sequential_virtual=True` to
 `ccsd.build_static_selections`. This selects the occupied LIS first, projects
 the cached full-domain MP2 amplitudes and bare integral contractions onto that
-occupied space, and constructs virtual W there. The physical target block is
+occupied space, and constructs the virtual matrix there. D projects both amplitude legs;
+W projects the amplitude and bare-integral legs. The physical target block is
 preserved, and the domain MP2 energy and downstream CCSD/(T) treatment are
 unchanged. The default remains independent occupied/virtual W selection.
-The trial retains all selected-target amplitude and integral slices until
-occupied selection, so it needs additional memory. Gradients and stochastic
-matrix construction are rejected until their corresponding response and
-sampling algorithms are implemented. This trial requires `matrix_kind="W"`.
+The forward retains target amplitudes and integral slices only until occupied
+selection, so it needs additional memory. Gradients replay those tensors once
+and include the occupied-selection response through the occupied W/D matrix, the physical targets,
+and the ED frame. Ranks and selection labels stay fixed during differentiation;
+cutoff crossings require new selections. The reverse contracts the virtual
+seed in the retained occupied space before a small selection VJP, then combines
+its occupied-matrix seed with the direct CC response in the same native replay.
+Native GEMMs use outer OpenMP teams and serial BLAS inside workers.
+Stochastic matrix construction remains unsupported; this option requires
+`matrix_kind="W"` or `"D"`.
 
 Set `scale_lis_by_target_count=True` in `ccsd.build_static_selections` to
 interpret both cutoffs per original physical target LMO. A four-target
@@ -183,12 +192,115 @@ corresponding selections automatically.
 When supplying `static` or `build_static`, choose grouping, frozen orbitals and
 localization options in that selection instead of passing them to the solver.
 
-CC always includes every physical fragment and the complete domain MP2
-baseline, including weak-pair completion:
+With the default `baseline_kind="domain"`, CC includes every physical fragment
+and the complete domain MP2 baseline, including weak-pair completion:
 
 `E_corr = E_MP2_domain + sum_f (E_CCSD,f + E_(T),f - E_MP2_LIS,f)`.
 
-W construction supplies the strong-domain MP2 energy through
+### Global MP2 baseline and direct Coulomb V selection
+
+```python
+domain_thresholds = dlno_stc.BoysDomainThresholds()
+domains = dlno_stc.build_domain_selections(
+    mf, frozen=1, boys_grouping="atom", thresholds=domain_thresholds)
+plan = ccsd.build_static_selections(
+    mf, domains, baseline_kind="global", matrix_kind="V",
+    thresh_occ=1e-4, thresh_vir=1e-5,
+    baseline_controls={"mode": "deterministic", "threads": 8},
+    matrix_controls={"mode": "deterministic", "threads": 8})
+energy, parts = ccsd.kernel(
+    mf, plan, ccsd_t=True, return_components=True,
+    baseline_controls={"mode": "deterministic", "threads": 8},
+    matrix_controls={"mode": "deterministic", "threads": 8})
+```
+
+The cutoffs above illustrate the API; V thresholds need their own accuracy
+assessment. Define `domain_thresholds` with the existing `BoysDomainThresholds`.
+Domain construction, pair-energy screening, grouping and LIS cutoffs are
+unchanged. Pair energies define the strong-pair graph only; no weak-pair energy
+or weak-pair response is added in this mode. The correlation energy is
+
+`E_corr = E_MP2_global + sum_f (E_CCSD,f + E_(T),f - E_MP2_LIS,f)`.
+
+Global MP2 covers the full active occupied/virtual space, honors frozen
+orbitals and `correlation_auxbasis`, includes exchange, and uses the saved
+`mp2_grid`. The existing `baseline_controls` chooses deterministic (default)
+or stochastic evaluation. The scalar uses the existing Laplace kernels, so
+quadrature error is controlled by `mp2_laplace_points` or an explicit grid.
+Global factors are not compressed by `mp2_aux_svd_tol`. That option continues
+to control local ED factors used for LIS construction.
+
+To sample global MP2 while keeping V deterministic:
+
+```python
+baseline_controls = {
+    "mode": "stochastic",
+    "energy_tolerance": 3e-4,  # target global MP2 sampling SE, in Eh
+    "global_seed": 19,
+}
+plan = ccsd.build_static_selections(
+    mf, domains, baseline_kind="global", matrix_kind="V",
+    thresh_occ=1e-4, thresh_vir=1e-5,
+    baseline_controls=baseline_controls)
+energy, parts = ccsd.kernel(
+    mf, plan, ccsd_t=True, baseline_controls=baseline_controls,
+    return_components=True)
+mp2_sampling_se = parts.baseline_standard_error
+```
+
+The optional stochastic `_stc_mp2` extension is required. One full-system
+scalar solve estimates direct and exchange residuals across all active
+occupied targets; the tolerance is not divided over local CC fragments.
+Omitting both `energy_tolerance` and `production_samples` defaults to `3e-4` Eh.
+For fixed sampling, pass `production_samples` instead of `energy_tolerance`.
+Existing scalar controls such as `pilot_samples`, `min_production_samples`,
+`max_production_samples`, `system_workload_cutoff` and `auxiliary_group_size`
+remain available. A sample cap that prevents the requested allocation raises
+an error. The measured SE is a statistical estimate, not a bound on quadrature,
+LIS truncation or force error.
+
+Stochastic scalar MP2 follows the existing OpenMP thread settings (for example
+`OMP_NUM_THREADS`); its native interface does not accept `threads` or
+`target_batch_size`. Matrix threads remain independent in `matrix_controls`.
+Fixed-count runs reproduce the sample stream with the same seed, inputs and
+configured OpenMP thread count. Adaptive allocation also uses pilot timings,
+so production counts may vary between fresh runs. A completed baseline and
+its variance are saved once in a serial progress checkpoint and restored
+without resampling. MPI evaluates this one baseline on rank zero and reduces
+its variance once. Sampled gradients use the scalar solver's product replay.
+
+The existing stochastic-CC replica precision mode still requires deterministic
+baseline, matrices and triples because its reported replica error excludes
+their sampling uncertainty.
+
+V uses bare real Coulomb integrals `g[i,j,a,b]=(ia|jb)`, summed over physical
+target indices `i` in the domain input frame:
+
+```
+V_occ[j,k] = sum(i,a,b) g[i,j,a,b] * g[i,k,a,b]
+V_vir[a,c] = 0.5 * sum(i,j,b) (
+    g[i,j,a,b] * g[i,j,c,b] + g[i,j,b,a] * g[i,j,b,c])
+```
+
+There is no exchange contraction or additional spin prefactor in V. Both
+matrices are positive semidefinite, with eigenvalues in Eh squared. The same
+`thresh_occ`, `thresh_vir` and optional `scale_lis_by_target_count` apply;
+zero cutoffs still retain the full ED. Density-fitting Gram contractions
+give quartic dense scaling without four-index integrals or MP2 amplitudes.
+V has no Laplace-grid dependence and currently accepts deterministic matrix
+controls only. It returns matrices and their response, without an MP2 scalar;
+fragment `matrix_energy_diagnostic` is `None`.
+
+Global baselines also support D/W selection; their domain MP2 scalars are then
+diagnostic only. `baseline_kind="domain"` remains the default for D/W, and V
+requires `baseline_kind="global"`. Both choices are saved and checked on
+restart. Serial checkpoints commit global MP2 once before local groups; MPI
+evaluates it once on rank zero. `value_and_grad` includes global MP2 and V
+response through the existing shared SCF response pipeline.
+
+### D/W selection
+
+For the domain baseline, W construction supplies the strong-domain MP2 energy through
 `(trace(W_occ) + trace(W_vir))/2`. D instead evaluates the MP2 scalar explicitly
 by contracting the selected amplitudes with the bare spin-adapted integrals;
 the trace of D is not an energy. The D matrices use the historical positive

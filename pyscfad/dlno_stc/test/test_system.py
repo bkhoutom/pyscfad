@@ -56,7 +56,8 @@ def test_scope_removed_from_selection_and_gradient_api():
 
 
 @pytest.mark.parametrize('grouping', ['singleton', 'atom', 'system', 'molecule'])
-def test_automatic_grouping_is_forwarded_to_selection(monkeypatch, grouping):
+@pytest.mark.parametrize('domain_link', [False, True])
+def test_automatic_grouping_is_forwarded_to_selection(monkeypatch, grouping, domain_link):
     selected = object()
     seen = []
     def select(mf, **options):
@@ -66,8 +67,9 @@ def test_automatic_grouping_is_forwarded_to_selection(monkeypatch, grouping):
     monkeypatch.setattr(driver, '_empty_reference', lambda *a, **k: None)
     monkeypatch.setattr(driver, '_initialize', lambda mf, static, *a, **k: static)
     monkeypatch.setattr(driver, '_run_serial', lambda initialize, *a, **k: initialize())
-    assert dlno_stc.kernel(None, boys_grouping=grouping, frozen=1,
+    assert dlno_stc.kernel(None, boys_grouping=grouping, frozen=1, domain_link=domain_link,
                           controls=_controls()) is selected
+    assert seen[0]['domain_link'] is domain_link
     assert seen[0]['boys_grouping'] == ('system' if grouping == 'molecule' else grouping)
     assert seen[0]['frozen'] == 1 and 'scope' not in seen[0]
 

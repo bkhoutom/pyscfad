@@ -153,6 +153,7 @@ class DomainSelections:
     ao_atom_slices: object = None
     mp2_grid: tuple | None = None
     mp2_grid_diagnostics: dict | None = None
+    domain_link: bool = False
 
     def __post_init__(self):
         # Synthetic new selections retain the historical singleton default.
@@ -867,7 +868,7 @@ def build_domain_selections(
     mf, *, frozen, thresholds=None, lo_kwargs=None, target_coeff=None,
     frag_lolist=None, pair_energy_model="multipole",
     boys_grouping="singleton", correlation_auxbasis=None, full_domain=False,
-    mp2_laplace_points=6, mp2_grid=None,
+    mp2_laplace_points=6, mp2_grid=None, domain_link=False,
 ):
     """Select the global pair graph and lightweight fragment domain plans.
 
@@ -883,13 +884,15 @@ def build_domain_selections(
     ``"molecule"`` is accepted as a compatibility alias for ``"system"``.
     ``full_domain=True`` expands every fragment's domains to the full system
     without changing its targets or physical grouping.
+    ``domain_link=True`` tightens intra-component pair screening and shares
+    virtual support for targets in linked compact Boughton–Pulay domains.
     Fit one global MP2/W quadrature from the full active canonical spectrum
     and save it for all domains. ``mp2_laplace_points`` defaults to six;
     ``mp2_grid=(roots, weights)`` saves an explicit override. Neither changes
     the independently fitted per-fragment triples grids.
     """
     from .domain import DomainData, TargetOccupiedData, build_scf_data
-    from ._pairs import (screen_pairs, _WeakScreenProducts, _finish_weak_screen_reference,
+    from ._pairs import (screen_pair_domains, _WeakScreenProducts, _finish_weak_screen_reference,
                          _multipole_orbital_data, _origin_zero_moments,
                          _fake_mol_with_traced_centers, pad_endpoint)
     from ._df_basis import basis_kwargs, basis_identity, selection_auxbasis
@@ -904,6 +907,8 @@ def build_domain_selections(
     boys_grouping = _normalize_boys_grouping(boys_grouping)
     if not isinstance(full_domain, (bool, numpy.bool_)):
         raise TypeError("full_domain must be a boolean")
+    if not isinstance(domain_link, (bool, numpy.bool_)):
+        raise TypeError("domain_link must be a boolean")
     full_domain = full_domain or boys_grouping == "system"
     _validate_reference(mf, frozen)
     options = _resolve_boys_options(lo_kwargs)
@@ -1082,7 +1087,7 @@ def build_domain_selections(
                               lo_kwargs=options, target_reference_coeff=targets.copy(), target_reference_coords=_host_array(mol.atom_coords()).copy(),
                               compact_bp_domain=compact, primary_bp_domain=primary_bp, tight_bp_domain=tight,
                               pao_bp_domain=pao_bp, primary_domain=primary, pair_energy_model=model,
-                              boys_grouping=boys_grouping,
+                              boys_grouping=boys_grouping, domain_link=bool(domain_link),
                               mp2_grid=selected_grid, mp2_grid_diagnostics=grid_diagnostics,
                               physical_groups=tuple(tuple(int(i) for i in members)
                                                     for members in physical_groups),
@@ -1095,7 +1100,7 @@ def build_domain_selections(
         screening_mf = response.mf
         endpoints = {}
         pair_response = {}
-    pair, weak_pair, forced, strong = screen_pairs(
+    screen = screen_pair_domains(
         screening_mf, common, static, model=model, full_domain=full_domain,
         **basis_kwargs(correlation_auxbasis),
         **({'prepared_endpoints': endpoints,
@@ -1107,16 +1112,17 @@ def build_domain_selections(
     del reference_endpoints
     if primary_preparations is not None:
         primary_preparations.clear()
-    if boys_grouping in ("atom", "atom_singleton"):
-        strong = _group_domain_mask(strong, physical_groups)
+    strong = screen.domain_mask
     if response is not None:
         response.complete_weak(static, strong, endpoints, pair_response)
     fragments = list(static.fragments)
     for members in physical_groups:
         i = int(members[0])
         partners = numpy.flatnonzero(strong[i]).astype(numpy.int32)
-        centers = _union_index_lists([compact[p] for p in partners])
-        atoms = _union_index_lists([tight[p] for p in partners])
+        extra = [screen.linked_members[m] for m in members if m in screen.linked_members]
+        sources = _union_index_lists([partners, *extra]) if extra else partners
+        centers = _union_index_lists([compact[p] for p in sources])
+        atoms = _union_index_lists([tight[p] for p in sources])
         ao = tools.ao_index_by_atom(mol, atoms).astype(numpy.int32)
         for member in members:
             member = int(member)
@@ -1130,8 +1136,8 @@ def build_domain_selections(
                 strong_virtual=None, target_index=int(slots[0]), virtual_anchor_columns=None)
     static = replace(static, fragments=tuple(fragments), ed_selection_pending=True,
                      ao_atom_slices=mol.aoslice_by_atom()[:, 2:].copy(),
-                     strong_mask=strong, pair_energy=pair,
-                     weak_pair_energy=weak_pair, forced_strong_mask=forced)
+                     strong_mask=strong, pair_energy=screen.pair_energy,
+                     weak_pair_energy=screen.weak_energy, forced_strong_mask=screen.forced)
     if response is not None:
         response.bind(static)
     else:

@@ -277,7 +277,8 @@ def load_selections(checkpoint_dir, mol, *, domain_options=None, selection_optio
     domain = saved.mp2_static
     domain_values = dict(frozen=domain.frozen, thresholds=domain.thresholds,
         lo_kwargs=domain.lo_kwargs or {}, boys_grouping=domain.boys_grouping,
-        pair_energy_model=domain.pair_energy_model, frag_lolist=domain.frag_lolist)
+        pair_energy_model=domain.pair_energy_model, frag_lolist=domain.frag_lolist,
+        domain_link=domain.domain_link)
     for name, value in (domain_options or {}).items():
         if name == 'full_domain':
             if not isinstance(value, (bool, np.bool_)):
@@ -300,6 +301,10 @@ def load_selections(checkpoint_dir, mol, *, domain_options=None, selection_optio
             value = _normalize_boys_grouping(value)
         elif name == 'pair_energy_model':
             value = str(value).lower().replace('_', '-')
+        elif name == 'domain_link':
+            if not isinstance(value, (bool, np.bool_)):
+                raise TypeError('domain_link must be a bool')
+            value = bool(value)
         elif name == 'frag_lolist':
             value = _validate_boys_target_groups(value, len(domain.active_occ_indices))
         if storage.scientific_digest(value) != storage.scientific_digest(domain_values[name]):

@@ -100,7 +100,8 @@ def test_scientific_and_live_tree_mismatches_are_rejected(tmp_path):
         _manager(tmp_path, resume=True, payload={'x': np.arange(4.)})
 
 
-def test_full_static_records_round_trip_with_stc_class_identity(tmp_path):
+@pytest.mark.parametrize('domain_link', [False, True])
+def test_full_static_records_round_trip_with_stc_class_identity(tmp_path, domain_link):
     restart = _restart()
     from pyscfad.dlno_stc._selection import (BoysDomainThresholds, FixedPAOSubspaceSelection,
                                            FragmentDomainSelection, DomainSelections)
@@ -113,11 +114,15 @@ def test_full_static_records_round_trip_with_stc_class_identity(tmp_path):
                               idx, idx, np.array([0, -1], dtype=np.int32), (idx,), (idx,),
                               np.ones((1, 1), dtype=bool), (fragment,),
                               target_reference_coeff=np.array([[1.], [0.]]),
-                              target_reference_coords=np.zeros((1, 3)))
+                              target_reference_coords=np.zeros((1, 3)), domain_link=domain_link)
+    encoded_fields = dict(restart._encode_value(static)['fields'])
+    # Omitting the default preserves the serialized identity of older off-mode runs.
+    assert ('domain_link' in encoded_fields) == domain_link
     manager = _manager(tmp_path)
     manager.save_static(static)
     restored = manager.load_static(expected_type=DomainSelections)
     assert type(restored) is DomainSelections
+    assert restored.domain_link is domain_link
     assert type(restored.fragments[0]) is FragmentDomainSelection
     assert type(restored.fragments[0].strong_virtual) is FixedPAOSubspaceSelection
     assert restart.scientific_digest(restored) == restart.scientific_digest(static)

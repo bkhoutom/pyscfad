@@ -124,14 +124,14 @@ def test_atom_public_builder_shares_strong_frames_and_preserves_endpoints(
                for fragment in explicit_singleton.fragments)
 
     captured = {}
-    original_screen = _pairs.screen_pairs
+    original_screen = _pairs.screen_pair_domains
     def inspect_screen(current_mf, common, static, **kwargs):
         captured["provisional"] = static
         result = original_screen(current_mf, common, static, **kwargs)
-        captured["orbital_graph"] = result[3].copy()
+        captured["orbital_graph"] = result.strong_pairs.copy()
         captured["pair_estimates"] = result[:3]
         return result
-    monkeypatch.setattr(_pairs, "screen_pairs", inspect_screen)
+    monkeypatch.setattr(_pairs, "screen_pair_domains", inspect_screen)
     original_frame = domain.build_boys_ed_frame
     original_qr = domain.scipy_linalg.qr
     pivoted_frames = []

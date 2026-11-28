@@ -21,7 +21,7 @@ def materialize_domain_selections(mf, static, *, common=None):
     return materialize(mf, static, common=common)
 
 
-def kernel(mf, static=None, *, boys_grouping=None, frozen=None, controls, comm=None,
+def kernel(mf, static=None, *, boys_grouping=None, frozen=None, domain_link=False, controls, comm=None,
            lo_kwargs=None, merge_identical=True, parallel_scf_jk=True,
            correlation_auxbasis=None, mp2_aux_svd_tol=1e-3):
     """Run domain or system correlation energy with an optional separate fit.
@@ -32,18 +32,19 @@ def kernel(mf, static=None, *, boys_grouping=None, frozen=None, controls, comm=N
     ``mp2_aux_svd_tol=1e-3`` compresses ED OV factors; ``None`` or zero disables it.
     ``boys_grouping="system"`` selects one full-system fragment and uses the domain
     executor. ``"atom"`` and ``"singleton"`` also select their fragments
-    automatically. With ``static``, omit ``boys_grouping`` and use its saved
+    automatically. Set ``domain_link=True`` to link occupied and virtual domains.
+    With ``static``, omit ``boys_grouping`` and use its saved
     settings. For explicit domain options use ``build_domain_selections``.
     """
     from .driver import kernel as domain_kernel
     return domain_kernel(mf, static, boys_grouping=boys_grouping, frozen=frozen,
-                         controls=controls, comm=comm, lo_kwargs=lo_kwargs,
+                         controls=controls, comm=comm, lo_kwargs=lo_kwargs, domain_link=domain_link,
                          merge_identical=merge_identical, parallel_scf_jk=parallel_scf_jk,
                          mp2_aux_svd_tol=mp2_aux_svd_tol,
                          **basis_kwargs(correlation_auxbasis))
 
 
-def value_and_grad(mol, build_mf, static=None, *, boys_grouping=None, frozen=None,
+def value_and_grad(mol, build_mf, static=None, *, boys_grouping=None, frozen=None, domain_link=False,
                    controls, comm=None, include_hf=False, lo_kwargs=None, merge_identical=True,
                    build_static=None, parallel_scf_jk=True, correlation_auxbasis=None,
                    mp2_aux_svd_tol=1e-3):
@@ -55,14 +56,15 @@ def value_and_grad(mol, build_mf, static=None, *, boys_grouping=None, frozen=Non
     callback that selects them from the returned SCF reference. The callback
     inherits ``correlation_auxbasis``; standalone selection must use the same
     basis. ``None`` preserves the existing SCF fitting workflow.
-    Alternatively, explicit ``boys_grouping`` selects fragments automatically;
+    Alternatively, explicit ``boys_grouping`` selects fragments automatically,
+    optionally using ``domain_link=True`` for occupied and virtual linking.
     ``"system"`` uses one full-system fragment. Do not combine it with
     ``static`` or ``build_static``.
     """
     from .driver import value_and_grad as domain_value_and_grad
     return domain_value_and_grad(
         mol, build_mf, static, boys_grouping=boys_grouping, frozen=frozen, controls=controls,
-        comm=comm, include_hf=include_hf, lo_kwargs=lo_kwargs,
+        comm=comm, include_hf=include_hf, lo_kwargs=lo_kwargs, domain_link=domain_link,
         merge_identical=merge_identical, build_static=build_static,
         mp2_aux_svd_tol=mp2_aux_svd_tol,
         parallel_scf_jk=parallel_scf_jk, **basis_kwargs(correlation_auxbasis))

@@ -643,7 +643,7 @@ def _run_serial(initializer, static, controls, *, with_grad, include_hf=False,
         return _finish(state, with_grad=with_grad, include_hf=include_hf)
 
 
-def _select_grouping(static, boys_grouping, frozen, lo_kwargs=None):
+def _select_grouping(static, boys_grouping, frozen, lo_kwargs=None, domain_link=False):
     """Validate root-owned grouping before automatic or saved selection."""
     if boys_grouping is not None:
         from ._selection import _normalize_boys_grouping
@@ -654,12 +654,14 @@ def _select_grouping(static, boys_grouping, frozen, lo_kwargs=None):
         raise ValueError("frozen must come from static; automatic selection requires boys_grouping")
     elif lo_kwargs is not None:
         raise ValueError("localization options must come from static.lo_kwargs; automatic selection requires boys_grouping")
+    elif domain_link:
+        raise ValueError("set domain_link when building selections or pass boys_grouping for automatic selection")
     return boys_grouping
 
 
-def _shared_grouping(static, boys_grouping, frozen, comm, lo_kwargs=None):
+def _shared_grouping(static, boys_grouping, frozen, comm, lo_kwargs=None, domain_link=False):
     rank = 0 if comm is None else comm.Get_rank()
-    selected = _root_call(comm, rank, lambda: _select_grouping(static, boys_grouping, frozen, lo_kwargs),
+    selected = _root_call(comm, rank, lambda: _select_grouping(static, boys_grouping, frozen, lo_kwargs, domain_link),
                           "grouping selection")
     return selected if comm is None else comm.bcast(selected, root=0)
 
@@ -803,7 +805,7 @@ def _serial_scf_pullback(pullback):
 
 
 @memory_calculation
-def kernel(mf, static=None, *, boys_grouping=None, frozen=None, controls, comm=None,
+def kernel(mf, static=None, *, boys_grouping=None, frozen=None, domain_link=False, controls, comm=None,
            lo_kwargs=None, merge_identical=True, parallel_scf_jk=True,
            correlation_auxbasis=None, mp2_aux_svd_tol=1e-3):
     """Return correlation energy on root.
@@ -823,7 +825,7 @@ def kernel(mf, static=None, *, boys_grouping=None, frozen=None, controls, comm=N
     SCF preceding this energy-only API is caller-owned.
     Explicit boys_grouping selects fragments automatically; "system" uses one full-system fragment.
     """
-    boys_grouping = _shared_grouping(static, boys_grouping, frozen, comm, lo_kwargs)
+    boys_grouping = _shared_grouping(static, boys_grouping, frozen, comm, lo_kwargs, domain_link)
     rank = 0 if comm is None else comm.Get_rank()
     controls = _root_call(comm, rank, lambda: _driver_controls(controls, defer_grid=True),
                           "control validation")
@@ -838,7 +840,7 @@ def kernel(mf, static=None, *, boys_grouping=None, frozen=None, controls, comm=N
                 return empty
             selected = build_domain_selections(
                 mf, boys_grouping=boys_grouping, frozen=0 if frozen is None else frozen,
-                lo_kwargs=lo_kwargs, **basis_kwargs(correlation_auxbasis))
+                lo_kwargs=lo_kwargs, domain_link=domain_link, **basis_kwargs(correlation_auxbasis))
         return _initialize(mf, selected, controls, with_grad=False,
                            mp2_aux_svd_tol=mp2_aux_svd_tol, **basis_kwargs(correlation_auxbasis))
 
@@ -862,7 +864,7 @@ def kernel(mf, static=None, *, boys_grouping=None, frozen=None, controls, comm=N
 
 
 @memory_calculation
-def value_and_grad(mol, build_mf, static=None, *, boys_grouping=None, frozen=None,
+def value_and_grad(mol, build_mf, static=None, *, boys_grouping=None, frozen=None, domain_link=False,
                    controls, comm=None, include_hf=False, lo_kwargs=None, merge_identical=True,
                    build_static=None, parallel_scf_jk=True, correlation_auxbasis=None,
                    mp2_aux_svd_tol=1e-3):
@@ -909,7 +911,7 @@ def value_and_grad(mol, build_mf, static=None, *, boys_grouping=None, frozen=Non
     build_mf must include their DF producer. A caller-owned complete reverse
     scope is reused. See README_SERIAL_DF_SCF.md for staged/prebuilt DF cases.
     """
-    boys_grouping = _shared_grouping(static, boys_grouping, frozen, comm, lo_kwargs)
+    boys_grouping = _shared_grouping(static, boys_grouping, frozen, comm, lo_kwargs, domain_link)
     rank = 0 if comm is None else comm.Get_rank()
     controls = _root_call(comm, rank, lambda: _driver_controls(controls, defer_grid=True),
                           "control validation")
@@ -938,7 +940,7 @@ def value_and_grad(mol, build_mf, static=None, *, boys_grouping=None, frozen=Non
                 return empty
             selector = lambda reference: build_domain_selections(
                 reference, boys_grouping=boys_grouping, frozen=0 if frozen is None else frozen,
-                lo_kwargs=lo_kwargs, **basis_kwargs(correlation_auxbasis))
+                lo_kwargs=lo_kwargs, domain_link=domain_link, **basis_kwargs(correlation_auxbasis))
         selected = static
         scf_data = getattr(scf_pullback, 'scf_data', None)
         scf_data_pullback = prepared_domain = None

@@ -445,6 +445,7 @@ the correlation solvers use deterministic or stochastic evaluation.
 | --- | --- | --- |
 | `frozen` | Required | Frozen-space specification; `0` retains all occupied orbitals. |
 | `boys_grouping` | `"singleton"` | Domain/CC grouping: `singleton`, `atom`, `atom_singleton` or `system`. |
+| `domain_link` | `False` | Enable occupied-pair linking and shared virtual support during Boys domain selection. |
 | `full_domain` | `False` | Expand domains without combining fragments; system grouping enables it automatically. |
 | `thresholds` | `BoysDomainThresholds()` | Domain completeness, ranks and weak-pair screening thresholds. |
 | `lo_kwargs` | `None` | [Boys or lambda-Boys localization options](#boys-and-lambda-boys-localization). |
@@ -454,6 +455,14 @@ the correlation solvers use deterministic or stochastic evaluation.
 | `correlation_auxbasis` | `None` | Correlation fit override; defaults to the SCF fit. |
 | `mp2_aux_svd_tol` | `1e-3` | ED OV auxiliary compression before MP2; `None` or zero disables it. |
 | `mp2_laplace_points`, `mp2_grid` | `6`, `None` | Global fitted MP2 quadrature size or an explicit pair of arrays. |
+
+With `domain_link=True`, two occupied Boys orbitals are connected when their compact
+Boughton–Pulay atom lists share at least two atoms. In a connected component containing
+a weak pair at the reference cutoff of `1e-5` Eh, internal pairs use one hundredth of
+the requested pair cutoff. A target group containing a member also draws PAO centers
+and extended AO support from the whole component. Other target groups use their usual
+strong partners. Pass the option to `build_domain_selections`, or directly to
+`kernel` or `value_and_grad` when using automatic `boys_grouping`.
 
 `BoysDomainThresholds` defaults:
 

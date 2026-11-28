@@ -278,11 +278,10 @@ def _encode_value(value, writer=None, *, require_registered_dataclass=True):
                     require_registered_dataclass=require_registered_dataclass,
                 )]
                 for field in dataclasses.fields(value)
-                # Preserve the digest of fully selected checkpoints written
-                # before deferred ED plans existed. Their default plan fields
-                # carry no additional scientific data.
+                # Omit default settings added after the original checkpoint format.
                 if not (type(value).__name__ == 'DomainSelections' and (
                     (field.name == 'ed_selection_pending' and not value.ed_selection_pending)
+                    or (field.name == 'domain_link' and not value.domain_link)
                     or (field.name == 'ao_atom_slices' and value.ao_atom_slices is None)))
                 # Preserve pre-override checkpoint bytes/digests for None.
                 if not (type(value).__name__ in ('DomainSelections', 'CCSDSelections')
@@ -440,7 +439,7 @@ def _decode_value(node, reader):
                 f"legacy {cls.__name__} checkpoint lacks current domain/physical fragment metadata. "
                 "Rebuild selections and checkpoints; migration is unsupported."
             )
-        optional = ({'correlation_basis_identity', 'ed_selection_pending', 'ao_atom_slices'}
+        optional = ({'correlation_basis_identity', 'ed_selection_pending', 'ao_atom_slices', 'domain_link'}
                     if cls.__name__ == 'DomainSelections' else
                     {'ed_pao_rank'} if cls.__name__ == 'BoysDomainThresholds' else
                     {'correlation_basis_identity', 'baseline_kind'} if cls.__name__ == 'CCSDSelections' else

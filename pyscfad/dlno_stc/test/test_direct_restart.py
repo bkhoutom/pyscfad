@@ -55,7 +55,7 @@ def test_load_choices_checks_configuration_without_search(tmp_path, checkpoint_r
     loaded = ccsd.load_static_selections(tmp_path, mf.mol,
         domain_options=dict(frozen=domains.frozen, thresholds=domains.thresholds,
             lo_kwargs=domains.lo_kwargs, boys_grouping=domains.boys_grouping,
-            pair_energy_model=domains.pair_energy_model, full_domain=True),
+            pair_energy_model=domains.pair_energy_model, domain_link=domains.domain_link, full_domain=True),
         selection_options=dict(thresh_occ=lis.thresh_occ, thresh_vir=lis.thresh_vir,
             matrix_kind=matrix_kind,
             internal_rank_threshold=lis.internal_rank_threshold,
@@ -64,7 +64,7 @@ def test_load_choices_checks_configuration_without_search(tmp_path, checkpoint_r
 
 
 @pytest.mark.parametrize('changed', [
-    'frozen', 'thresholds', 'lo_kwargs', 'boys_grouping', 'pair_energy_model',
+    'frozen', 'thresholds', 'lo_kwargs', 'boys_grouping', 'pair_energy_model', 'domain_link',
     'frag_lolist', 'thresh_occ', 'thresh_vir', 'internal_rank_threshold',
     'triples_laplace_points', 'matrix_kind',
 ])
@@ -75,12 +75,13 @@ def test_changed_requested_settings_are_rejected(tmp_path, checkpoint_reference,
     choices = dict(frozen=0,
         thresholds=replace(domains.thresholds, pair_energy=1e-3),
         lo_kwargs=dict(domains.lo_kwargs, conv_tol=1e-5), boys_grouping='atom',
-        pair_energy_model='exact', frag_lolist=tuple(reversed(domains.frag_lolist)),
+        pair_energy_model='exact', domain_link=not domains.domain_link,
+        frag_lolist=tuple(reversed(domains.frag_lolist)),
         thresh_occ=1e-3, thresh_vir=1e-3, internal_rank_threshold=1e-3,
         triples_laplace_points=8, matrix_kind='D')
     keyword = 'domain_options' if changed in {
         'frozen', 'thresholds', 'lo_kwargs', 'boys_grouping', 'pair_energy_model',
-        'frag_lolist'} else 'selection_options'
+        'frag_lolist', 'domain_link'} else 'selection_options'
     with pytest.raises(storage.RestartMismatchError, match='setting'):
         ccsd.load_static_selections(tmp_path, mf.mol, **{keyword: {changed: choices[changed]}})
 

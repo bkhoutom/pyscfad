@@ -16,7 +16,7 @@ def test_primary_reuse_matches_replay_and_releases_ao_operators(
     boys_water_dimer, monkeypatch, grouping, order,
 ):
     mf, _, reference = boys_water_dimer
-    original_screen = _pairs.screen_pairs
+    original_screen = _pairs.screen_pair_domains
     results = []
     def replay(*args, **kwargs):
         kwargs.pop('_reference_endpoints', None)
@@ -28,7 +28,7 @@ def test_primary_reuse_matches_replay_and_releases_ao_operators(
                   target_coeff=reference.target_reference_coeff,
                   thresholds=replace(reference.thresholds, multipole_order=order),
                   boys_grouping=grouping)
-    monkeypatch.setattr(_pairs, 'screen_pairs', replay)
+    monkeypatch.setattr(_pairs, 'screen_pair_domains', replay)
     expected = _selection.build_domain_selections(mf, **kwargs)
 
     builds, live = [], []
@@ -50,7 +50,7 @@ def test_primary_reuse_matches_replay_and_releases_ao_operators(
     def forbidden(*args, **kwargs):
         raise AssertionError('forward selection rebuilt its primary virtuals')
 
-    monkeypatch.setattr(_pairs, 'screen_pairs', reused)
+    monkeypatch.setattr(_pairs, 'screen_pair_domains', reused)
     monkeypatch.setattr(_pairs, '_origin_zero_moments', moments)
     monkeypatch.setattr(domain, '_rebuild_selected_pao_preprojection', forbidden)
     actual = _selection.build_domain_selections(mf, **kwargs)
@@ -58,8 +58,8 @@ def test_primary_reuse_matches_replay_and_releases_ao_operators(
     assert len(builds) == len(supports)
     for got, want in zip(results[-1][:2], results[0][:2]):
         np.testing.assert_allclose(got, want, atol=2e-12, rtol=2e-10)
-    for got, want in zip(results[-1][2:], results[0][2:]):
-        np.testing.assert_array_equal(got, want)
+    for name in ('forced', 'strong_pairs', 'domain_mask'):
+        np.testing.assert_array_equal(getattr(results[-1], name), getattr(results[0], name))
     for got, want in zip(actual.fragments, expected.fragments):
         for name in ('strong_fragments', 'extended_atoms', 'extended_ao_indices',
                      'virtual_anchor_columns'):

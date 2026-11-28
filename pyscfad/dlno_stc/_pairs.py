@@ -16,6 +16,8 @@ from typing import NamedTuple
 import jax
 import numpy as np
 import scipy.linalg as scipy_linalg
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
 
 from pyscfad.lno.tools import fake_mol_by_atom
 from pyscfad.tools import resource_profile
@@ -698,25 +700,41 @@ def _exact_boys_pair_scores(mf, common, static, *, correlation_auxbasis=None):
     return physical
 
 
-def _screen_pair_response(endpoints, static, forced, exact_scores, response):
-    """Classify orbital pairs, then differentiate only missing domain shares."""
+def _link_compact_domains(compact, strength, forced, strong, threshold):
+    """Promote internal pairs in place and map tagged targets to shared virtual support."""
+    # Each BP list contains distinct atom indices. The product counts shared atoms.
+    sizes = np.array([len(atoms) for atoms in compact])
+    atoms = np.concatenate(compact).astype(np.intp, copy=False)
+    incidence = csr_matrix((np.ones(atoms.size, dtype=np.int32), atoms,
+                            np.r_[0, sizes.cumsum()]),
+                           shape=(len(compact), int(atoms.max(initial=-1)) + 1))
+    _, labels = connected_components((incidence @ incidence.T) >= 2, directed=False)
+    linked_members = {}
+    for label in np.flatnonzero(np.bincount(labels) > 1):
+        members = np.flatnonzero(labels == label)
+        block = np.ix_(members, members)
+        internal = strength[block]
+        # Keep component eligibility fixed at the normal cutoff throughout a sweep.
+        if np.any((internal <= 1e-5) & ~forced[block]):
+            strong[block] |= internal > threshold / 100
+            for member in members:
+                linked_members[member] = members
+    return linked_members
+
+
+class _PairScreen(NamedTuple):
+    pair_energy: np.ndarray
+    weak_energy: np.ndarray
+    forced: np.ndarray
+    strong_pairs: np.ndarray  # symmetric, before target grouping
+    domain_mask: np.ndarray   # directed, after target grouping
+    linked_members: dict
+
+
+def _screen_pair_response(endpoints, static, mask, response):
+    """Differentiate only missing shares in the final occupied domains."""
     from .adjoint import add_cotangent
-    from ._selection import _group_domain_mask
-    nfrag = len(endpoints)
-    weak = np.zeros((nfrag, nfrag))
     order = static.thresholds.multipole_order
-    for left in range(nfrag):
-        for right in range(left):
-            if forced[left, right]:
-                continue
-            value = float(_multipole_pair_energy(endpoints[left], endpoints[right], order))
-            if not np.isfinite(value):
-                raise RuntimeError(f'nonfinite Boys screening pair estimate for targets {left}, {right}')
-            weak[left, right] = weak[right, left] = value
-    scores = weak if exact_scores is None else exact_scores
-    mask = (np.abs(scores) > static.thresholds.pair_energy) | forced
-    if getattr(static, 'boys_grouping', 'singleton') in ('atom', 'atom_singleton'):
-        mask = _group_domain_mask(mask, static.physical_groups)
     selected = SimpleNamespace(strong_mask=mask, fragments=static.fragments)
     pairs = weak_pair_indices(selected)
     accumulated = {}
@@ -733,14 +751,18 @@ def _screen_pair_response(endpoints, static, forced, exact_scores, response):
                     jax.tree_util.tree_map(add_cotangent, accumulated[index], bar))
             jax.block_until_ready((energy, accumulated))
     response.update(pairs=pairs, energy=xp.real(energy), endpoint_bars=accumulated)
-    return weak
 
 
-def screen_pairs(mf, common, static, model='multipole', full_domain=False,
-                 *, prepared_endpoints=None, _products_preparation=None, _products=None,
-                 _pair_response=None, correlation_auxbasis=None, _reference_endpoints=None,
-                 _primary_preparations=None):
-    """Concrete Boys pair classification on provisional primary selections.
+def screen_pairs(mf, common, static, model='multipole', full_domain=False, **kwargs):
+    """Return the pair scores, weak estimates, forced pairs and raw strong pairs."""
+    return screen_pair_domains(mf, common, static, model, full_domain, **kwargs)[:4]
+
+
+def screen_pair_domains(mf, common, static, model='multipole', full_domain=False,
+                        *, prepared_endpoints=None, _products_preparation=None, _products=None,
+                        _pair_response=None, correlation_auxbasis=None, _reference_endpoints=None,
+                        _primary_preparations=None):
+    """Classify pairs and form the membership masks used by both energies and forces.
 
     When supplied, ``prepared_endpoints`` is cleared and filled with each
     available endpoint and its orbital pullback from this evaluation. The
@@ -772,8 +794,9 @@ def screen_pairs(mf, common, static, model='multipole', full_domain=False,
         _pair_response.update(pairs=(), energy=xp.zeros(()), endpoint_bars={})
     nfrag = len(static.fragments)
     if full_domain or static.thresholds.pair_energy <= 0 or model in ('all', 'all-strong'):
-        return (np.zeros((nfrag, nfrag)), np.zeros((nfrag, nfrag)),
-                np.ones((nfrag, nfrag), dtype=bool), np.ones((nfrag, nfrag), dtype=bool))
+        strong = np.ones((nfrag, nfrag), dtype=bool)
+        return _PairScreen(np.zeros((nfrag, nfrag)), np.zeros((nfrag, nfrag)),
+                           strong.copy(), strong, strong, {})
     order = static.thresholds.multipole_order
     if _reference_endpoints is not None:
         if set(_reference_endpoints) != set(range(nfrag)):
@@ -845,18 +868,26 @@ def screen_pairs(mf, common, static, model='multipole', full_domain=False,
                     or separation < static.thresholds.near_pair_distance):
                 forced[left, right] = forced[right, left] = True
                 continue
-            if _pair_response is None:
-                value = float(_multipole_pair_energy(endpoints[left], endpoints[right], order))
-                if not np.isfinite(value):
-                    raise RuntimeError(f"nonfinite Boys screening pair estimate for targets {left}, {right}")
-                weak[left, right] = weak[right, left] = value
+            value = float(_multipole_pair_energy(endpoints[left], endpoints[right], order))
+            if not np.isfinite(value):
+                raise RuntimeError(f"nonfinite Boys screening pair estimate for targets {left}, {right}")
+            weak[left, right] = weak[right, left] = value
     from ._df_basis import basis_kwargs
     exact = (_exact_boys_pair_scores(mf, common, static, **basis_kwargs(correlation_auxbasis))
              if model == 'exact' else None)
-    if _pair_response is not None:
-        weak = _screen_pair_response(endpoints, static, forced, exact, _pair_response)
     pair = exact if exact is not None else weak
-    strong = (np.abs(pair) > static.thresholds.pair_energy) | forced
+    strength = np.abs(pair)
+    threshold = static.thresholds.pair_energy
+    strong = (strength > threshold) | forced
+    linked_members = {}
+    if getattr(static, 'domain_link', False):
+        linked_members = _link_compact_domains(static.compact_bp_domain, strength, forced, strong, threshold)
     strong = strong | strong.T
     np.fill_diagonal(strong, True)
-    return pair, weak, forced, strong
+    mask = strong
+    if getattr(static, 'boys_grouping', 'singleton') in ('atom', 'atom_singleton'):
+        from ._selection import _group_domain_mask
+        mask = _group_domain_mask(strong, static.physical_groups)
+    if _pair_response is not None:
+        _screen_pair_response(endpoints, static, mask, _pair_response)
+    return _PairScreen(pair, weak, forced, strong, mask, linked_members)
